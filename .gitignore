@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+.pnp.*
+
+# Build output
+backend/dist/
+frontend/dist/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.production
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.db-journal
+prisma/migrations/migration_lock.toml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Runtime
+*.pid
+*.seed
+
+# Test
+coverage/
+
+# Docker
+docker-compose.override.yml
+
+# Uploads & user data
+uploads/
+projects/
+assets/avatars/
+assets/branding/
+
+# Source maps (don't ship to GitHub)
+*.map
