@@ -1,0 +1,239 @@
+/**
+ * ExecApprovalModal — Dark glass-morphism modal for exec command approvals.
+ * 
+ * Shows when the agent requests permission to run a shell command.
+ * The user can Approve, Always Allow, or Deny the command.
+ * 
+ * Auto-expires based on the expiresAtMs from the approval request.
+ */
+import { useEffect, useState, useCallback } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Shield, Terminal, Clock, CheckCircle2, XCircle, ShieldCheck } from 'lucide-react';
+import type { ExecApprovalRequest } from './useAgentRuntime';
+
+interface ExecApprovalModalProps {
+  approval: ExecApprovalRequest;
+  onResolve: (approvalId: string, decision: 'approve' | 'deny' | 'always') => void;
+  onDismiss: () => void;
+}
+
+export function ExecApprovalModal({ approval, onResolve, onDismiss }: ExecApprovalModalProps) {
+  const [timeLeft, setTimeLeft] = useState<number>(0);
+  const [isClosing, setIsClosing] = useState(false);
+
+  // Calculate and update time remaining
+  useEffect(() => {
+    const updateTimeLeft = () => {
+      const remaining = Math.max(0, approval.expiresAtMs - Date.now());
+      setTimeLeft(remaining);
+
+      // Auto-dismiss when expired
+      if (remaining <= 0) {
+        handleDismiss();
+      }
+    };
+
+    updateTimeLeft();
+    const interval = setInterval(updateTimeLeft, 100);
+    return () => clearInterval(interval);
+  }, [approval.expiresAtMs]);
+
+  const handleDismiss = useCallback(() => {
+    setIsClosing(true);
+    setTimeout(() => {
+      onDismiss();
+    }, 200);
+  }, [onDismiss]);
+
+  const handleDecision = useCallback((decision: 'approve' | 'deny' | 'always') => {
+    setIsClosing(true);
+    setTimeout(() => {
+      onResolve(approval.id, decision);
+    }, 200);
+  }, [approval.id, onResolve]);
+
+  // Format command for display (handle long commands)
+  const formatCommand = (cmd: string) => {
+    if (cmd.length > 200) {
+      return cmd.substring(0, 200) + '…';
+    }
+    return cmd;
+  };
+
+  // Format time remaining
+  const formatTimeLeft = (ms: number) => {
+    const seconds = Math.ceil(ms / 1000);
+    return `${seconds}s`;
+  };
+
+  // Calculate progress for the countdown ring
+  const totalDuration = approval.expiresAtMs - approval.createdAtMs;
+  const progress = Math.max(0, Math.min(1, timeLeft / totalDuration));
+
+  return (
+    <AnimatePresence>
+      {!isClosing && (
+        <>
+          {/* Backdrop */}
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50"
+            onClick={() => handleDecision('deny')}
+          />
+
+          {/* Modal */}
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95, y: 20 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.95, y: 20 }}
+            transition={{ duration: 0.2, ease: 'easeOut' }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none"
+          >
+            <div className="pointer-events-auto w-full max-w-lg bg-[#0D1130]/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl shadow-black/50 overflow-hidden">
+              {/* Header */}
+              <div className="px-6 py-4 border-b border-white/10 flex items-center gap-3">
+                <div className="p-2 bg-amber-500/20 rounded-xl">
+                  <Shield className="w-5 h-5 text-amber-400" />
+                </div>
+                <div className="flex-1">
+                  <h2 className="text-lg font-semibold text-white">Command Approval Required</h2>
+                  <p className="text-sm text-white/60">The agent wants to run a command</p>
+                </div>
+                {/* Countdown timer */}
+                <div className="flex items-center gap-2 px-3 py-1.5 bg-white/5 rounded-full">
+                  <Clock className="w-4 h-4 text-white/50" />
+                  <span className={`text-sm font-mono ${timeLeft < 5000 ? 'text-red-400' : 'text-white/70'}`}>
+                    {formatTimeLeft(timeLeft)}
+                  </span>
+                  {/* Progress ring */}
+                  <svg className="w-4 h-4 -rotate-90" viewBox="0 0 20 20">
+                    <circle
+                      cx="10"
+                      cy="10"
+                      r="8"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      className="text-white/10"
+                    />
+                    <circle
+                      cx="10"
+                      cy="10"
+                      r="8"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeDasharray={50.27}
+                      strokeDashoffset={50.27 * (1 - progress)}
+                      className={timeLeft < 5000 ? 'text-red-400' : 'text-amber-400'}
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                </div>
+              </div>
+
+              {/* Command display */}
+              <div className="px-6 py-4 space-y-4">
+                {/* Command */}
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 text-sm text-white/60">
+                    <Terminal className="w-4 h-4" />
+                    <span>Command</span>
+                  </div>
+                  <div className="bg-black/40 rounded-xl p-4 border border-white/5 overflow-x-auto">
+                    <code className="text-sm font-mono text-emerald-300 whitespace-pre-wrap break-all">
+                      {formatCommand(approval.request.command)}
+                    </code>
+                  </div>
+                </div>
+
+                {/* Working directory */}
+                {approval.request.cwd && (
+                  <div className="flex items-center gap-3 text-sm">
+                    <span className="text-white/50">Working directory:</span>
+                    <code className="px-2 py-1 bg-white/5 rounded-md font-mono text-white/80">
+                      {approval.request.cwd}
+                    </code>
+                  </div>
+                )}
+
+                {/* Agent info */}
+                {approval.request.agentId && (
+                  <div className="flex items-center gap-3 text-sm">
+                    <span className="text-white/50">Agent:</span>
+                    <span className="text-white/80">{approval.request.agentId}</span>
+                  </div>
+                )}
+
+                {/* Host/Security info */}
+                <div className="flex items-center gap-4 text-sm">
+                  {approval.request.host && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-white/50">Host:</span>
+                      <span className="px-2 py-0.5 bg-violet-500/20 text-violet-300 rounded-md text-xs font-medium">
+                        {approval.request.host}
+                      </span>
+                    </div>
+                  )}
+                  {approval.request.security && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-white/50">Security:</span>
+                      <span className={`px-2 py-0.5 rounded-md text-xs font-medium ${
+                        approval.request.security === 'full' 
+                          ? 'bg-red-500/20 text-red-300' 
+                          : 'bg-amber-500/20 text-amber-300'
+                      }`}>
+                        {approval.request.security}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Action buttons */}
+              <div className="px-6 py-4 border-t border-white/10 flex items-center gap-3">
+                {/* Deny button */}
+                <button
+                  onClick={() => handleDecision('deny')}
+                  className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-xl transition-colors font-medium"
+                >
+                  <XCircle className="w-5 h-5" />
+                  Deny
+                </button>
+
+                {/* Always Allow button */}
+                <button
+                  onClick={() => handleDecision('always')}
+                  className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-violet-500/20 hover:bg-violet-500/30 text-violet-400 rounded-xl transition-colors font-medium"
+                >
+                  <ShieldCheck className="w-5 h-5" />
+                  Always Allow
+                </button>
+
+                {/* Approve button */}
+                <button
+                  onClick={() => handleDecision('approve')}
+                  className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 rounded-xl transition-colors font-medium"
+                >
+                  <CheckCircle2 className="w-5 h-5" />
+                  Approve
+                </button>
+              </div>
+
+              {/* Warning footer */}
+              <div className="px-6 py-3 bg-amber-500/5 border-t border-amber-500/10">
+                <p className="text-xs text-amber-400/70 text-center">
+                  ⚠️ This command will execute with the permissions of the server process.
+                  Review carefully before approving.
+                </p>
+              </div>
+            </div>
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>
+  );
+}

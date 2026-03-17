@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Discussions
+    url: https://github.com/BridgesLLM-ai/portal/discussions
+    about: Ask questions, share ideas, or show off your setup
+  - name: Documentation
+    url: https://bridgesllm.ai
+    about: Setup guide, troubleshooting, and FAQ
