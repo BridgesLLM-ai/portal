@@ -33,7 +33,7 @@
     "express-rate-limit": "^7.1.5",
     "express-session": "^1.19.0",
     "geoip-lite": "^1.4.10",
-    "helmet": "^7.1.0",
+    "helmet": "^8.1.0",
     "http-proxy-middleware": "^3.0.5",
     "jsonwebtoken": "^9.0.2",
     "mime-types": "^3.0.2",
