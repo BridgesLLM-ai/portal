@@ -41,7 +41,7 @@
     "nanoid": "^3.3.11",
     "node-cron": "^4.2.1",
     "node-pty": "^1.0.0",
-    "nodemailer": "^8.0.1",
+    "nodemailer": "^8.0.2",
     "otplib": "^13.3.0",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
