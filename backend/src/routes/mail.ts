@@ -35,6 +35,7 @@ import {
   getSignature,
   saveSignature,
   getUnreadCount,
+  processAutoForward,
 } from '../services/mailService';
 import { getUserUploadDir } from './files';
 
@@ -180,14 +181,31 @@ router.get('/messages', async (req: Request, res: Response) => {
     }
 
     const { mailboxId, mailboxRole, position, limit, sort } = req.query;
+    const effectiveRole = (mailboxRole as string) || 'inbox';
     const result = await listEmails(account.user, account.pass, {
       mailboxId: mailboxId as string,
-      mailboxRole: (mailboxRole as string) || 'inbox',
+      mailboxRole: effectiveRole,
       position: position ? parseInt(position as string) : 0,
       limit: limit ? Math.min(parseInt(limit as string), 100) : 50,
       sort: sort === 'date-asc' ? 'date-asc' : 'date-desc',
     });
     res.json(result);
+
+    // Auto-forward: trigger in background after response (non-blocking)
+    if (result.emails?.length && effectiveRole === 'inbox') {
+      const creds = await getUserMailCredentials(req.user!.userId);
+      if (creds) {
+        const mailbox = await prisma.mailboxAccount.findFirst({
+          where: { id: creds.accountId },
+          select: { autoForwardTo: true },
+        });
+        if (mailbox?.autoForwardTo) {
+          processAutoForward(result.emails, mailbox.autoForwardTo, account.user, account.pass).catch(err => {
+            console.error('[mail] auto-forward error:', err.message);
+          });
+        }
+      }
+    }
   } catch (error: any) {
     console.error('[mail] listEmails error:', error.message);
     res.status(500).json({ error: 'Failed to list emails' });
@@ -522,10 +540,42 @@ router.post('/bulk/move', async (req: Request, res: Response) => {
 });
 
 // ── GET /api/mail/signature ───────────────────────────────────
-router.get('/signature', async (_req: Request, res: Response) => {
+router.get('/signature', async (req: Request, res: Response) => {
   try {
-    const signature = getSignature();
-    res.json({ signature });
+    const accountParam = (req.query.account as string) || '';
+    const creds = await getUserMailCredentials(req.user!.userId, accountParam || undefined);
+    
+    if (!creds) {
+      // Fallback to legacy global signature
+      const legacySig = getSignature();
+      res.json({ signature: legacySig, signatureHtml: '' });
+      return;
+    }
+
+    const mailbox = await prisma.mailboxAccount.findFirst({
+      where: { userId: req.user!.userId, id: creds.accountId },
+      select: { signature: true, signatureHtml: true, username: true },
+    });
+
+    if (mailbox?.signature || mailbox?.signatureHtml) {
+      res.json({ 
+        signature: mailbox.signature || '', 
+        signatureHtml: mailbox.signatureHtml || '' 
+      });
+    } else {
+      // Auto-generate default signature for first time
+      const settings = await prisma.systemSetting.findFirst({ where: { key: 'portalName' } });
+      const logoSetting = await prisma.systemSetting.findFirst({ where: { key: 'logoUrl' } });
+      const portalName = settings?.value || 'BridgesLLM Portal';
+      const logoUrl = logoSetting?.value || '';
+      const email = `${mailbox?.username || creds.username}@${MAIL_DOMAIN}`;
+      const displayName = mailbox?.username || creds.username;
+
+      const defaultText = `${displayName}\n${email}\n${portalName}`;
+      const defaultHtml = generateDefaultSignatureHtml(displayName, email, portalName, logoUrl);
+      
+      res.json({ signature: defaultText, signatureHtml: defaultHtml });
+    }
   } catch (error: any) {
     console.error('[mail] getSignature error:', error.message);
     res.status(500).json({ error: 'Failed to get signature' });
@@ -535,18 +585,139 @@ router.get('/signature', async (_req: Request, res: Response) => {
 // ── PUT /api/mail/signature ───────────────────────────────────
 router.put('/signature', async (req: Request, res: Response) => {
   try {
-    const { signature } = req.body;
-    if (typeof signature !== 'string') {
-      res.status(400).json({ error: 'signature string required' });
-      return;
+    const { signature, signatureHtml } = req.body;
+    const accountParam = (req.query.account as string) || '';
+    const creds = await getUserMailCredentials(req.user!.userId, accountParam || undefined);
+
+    if (creds) {
+      await prisma.mailboxAccount.update({
+        where: { id: creds.accountId },
+        data: {
+          signature: signature || null,
+          signatureHtml: signatureHtml || null,
+        },
+      });
+    } else {
+      // Legacy fallback
+      saveSignature(signature || '');
     }
-    saveSignature(signature);
+
     res.json({ success: true });
   } catch (error: any) {
     console.error('[mail] saveSignature error:', error.message);
     res.status(500).json({ error: 'Failed to save signature' });
   }
 });
+
+// ── GET /api/mail/forward-settings ────────────────────────────
+router.get('/forward-settings', async (req: Request, res: Response) => {
+  try {
+    const creds = await getUserMailCredentials(req.user!.userId);
+    if (!creds) {
+      res.json({ autoForwardTo: null });
+      return;
+    }
+
+    const mailbox = await prisma.mailboxAccount.findFirst({
+      where: { id: creds.accountId },
+      select: { autoForwardTo: true },
+    });
+
+    res.json({ autoForwardTo: mailbox?.autoForwardTo || null });
+  } catch (error: any) {
+    console.error('[mail] forward-settings get error:', error.message);
+    res.status(500).json({ error: 'Failed to get forward settings' });
+  }
+});
+
+// ── PUT /api/mail/forward-settings ────────────────────────────
+router.put('/forward-settings', async (req: Request, res: Response) => {
+  try {
+    const { autoForwardTo } = req.body;
+    const creds = await getUserMailCredentials(req.user!.userId);
+
+    if (!creds) {
+      res.status(400).json({ error: 'No mailbox configured' });
+      return;
+    }
+
+    // Validate email format if provided
+    if (autoForwardTo) {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(autoForwardTo)) {
+        res.status(400).json({ error: 'Invalid email address' });
+        return;
+      }
+      // Don't allow forwarding to self (infinite loop)
+      if (autoForwardTo.toLowerCase() === `${creds.username}@${MAIL_DOMAIN}`.toLowerCase()) {
+        res.status(400).json({ error: 'Cannot forward to your own portal email' });
+        return;
+      }
+    }
+
+    await prisma.mailboxAccount.update({
+      where: { id: creds.accountId },
+      data: { autoForwardTo: autoForwardTo || null },
+    });
+
+    res.json({ success: true, autoForwardTo: autoForwardTo || null });
+  } catch (error: any) {
+    console.error('[mail] forward-settings put error:', error.message);
+    res.status(500).json({ error: 'Failed to update forward settings' });
+  }
+});
+
+// ── GET /api/mail/credentials ─────────────────────────────────
+router.get('/credentials', async (req: Request, res: Response) => {
+  try {
+    const creds = await getUserMailCredentials(req.user!.userId);
+    if (!creds) {
+      res.status(404).json({ error: 'No mailbox configured' });
+      return;
+    }
+
+    res.json({
+      username: creds.username,
+      email: `${creds.username}@${MAIL_DOMAIN}`,
+      password: creds.password,
+      imap: {
+        server: `mail.${MAIL_DOMAIN}`,
+        port: 993,
+        security: 'SSL/TLS',
+      },
+      smtp: {
+        server: `mail.${MAIL_DOMAIN}`,
+        port: 587,
+        security: 'STARTTLS',
+      },
+    });
+  } catch (error: any) {
+    console.error('[mail] credentials error:', error.message);
+    res.status(500).json({ error: 'Failed to get credentials' });
+  }
+});
+
+// Helper function to generate default HTML signature
+function generateDefaultSignatureHtml(name: string, email: string, portalName: string, logoUrl: string): string {
+  const logoTag = logoUrl 
+    ? `<img src="${logoUrl}" alt="${portalName}" style="height:40px;width:auto;margin-bottom:8px;" /><br/>`
+    : '';
+  
+  return `<table cellpadding="0" cellspacing="0" border="0" style="font-family:system-ui,-apple-system,sans-serif;font-size:13px;color:#374151;line-height:1.5;">
+  <tr>
+    <td style="padding-right:16px;border-right:2px solid #8b5cf6;vertical-align:top;">
+      ${logoTag}
+    </td>
+    <td style="padding-left:16px;vertical-align:top;">
+      <div style="font-size:15px;font-weight:600;color:#111827;">${name}</div>
+      <div style="color:#6b7280;font-size:12px;margin-top:2px;">${portalName}</div>
+      <div style="margin-top:6px;">
+        <a href="mailto:${email}" style="color:#8b5cf6;text-decoration:none;font-size:12px;">${email}</a>
+      </div>
+    </td>
+  </tr>
+</table>`;
+}
 
 // ── POST /api/mail/attachments/:blobId/save-to-files ──────────
 const MAX_SAVE_SIZE = 50 * 1024 * 1024; // 50MB

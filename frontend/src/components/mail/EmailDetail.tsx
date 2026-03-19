@@ -62,15 +62,17 @@ export default function EmailDetail({
     return () => document.removeEventListener('mousedown', handler);
   }, [showMoveMenu]);
 
-  // Write HTML into sandboxed iframe
+  // Write HTML into sandboxed iframe - mobile-first approach
   useEffect(() => {
     if (!email || !iframeRef.current) return;
     const htmlPart = email.htmlBody?.[0];
     const textPart = email.textBody?.[0];
     let content = '';
+    let isHtml = false;
 
     if (htmlPart && email.bodyValues[htmlPart.partId]) {
       content = email.bodyValues[htmlPart.partId].value;
+      isHtml = true;
     } else if (textPart && email.bodyValues[textPart.partId]) {
       content = `<pre style="white-space:pre-wrap;font-family:system-ui,sans-serif;font-size:14px;color:#e2e8f0;margin:0;">${
         email.bodyValues[textPart.partId].value
@@ -81,16 +83,48 @@ export default function EmailDetail({
     const doc = iframeRef.current.contentDocument;
     if (doc) {
       doc.open();
-      doc.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
-        body { margin: 16px; background: #0a0e1a; color: #e2e8f0; font-family: system-ui, sans-serif; font-size: 14px; line-height: 1.6; overflow-wrap: break-word; word-break: break-word; }
-        a { color: #818cf8; }
-        img { max-width: 100%; height: auto; }
-        blockquote { border-left: 3px solid #334155; padding-left: 12px; margin-left: 0; color: #94a3b8; }
-        table { border-collapse: collapse; max-width: 100%; }
-        td, th { padding: 4px 8px; border: 1px solid #334155; }
-        @media (max-width: 640px) { body { margin: 12px; font-size: 15px; } }
-      </style></head><body>${content}</body></html>`);
+      if (isHtml) {
+        // For HTML emails: preserve original styling, add responsive scaling
+        doc.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+          /* Don't force dark mode on HTML emails — respect their design */
+          body { margin: 0; padding: 16px; font-family: system-ui, sans-serif; font-size: 14px; line-height: 1.6; overflow-wrap: break-word; word-break: break-word; }
+          a { color: #6366f1; }
+          img { max-width: 100% !important; height: auto !important; }
+          table { max-width: 100% !important; }
+          /* Make email content scale to fit mobile */
+          @media (max-width: 640px) {
+            body { padding: 12px; font-size: 15px; }
+            table { width: 100% !important; }
+            td { display: block !important; width: 100% !important; box-sizing: border-box; }
+          }
+        </style></head><body>${content}</body></html>`);
+      } else {
+        // For plain text: dark mode is fine
+        doc.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+          body { margin: 0; padding: 16px; background: #0a0e1a; color: #e2e8f0; font-family: system-ui, sans-serif; font-size: 14px; line-height: 1.6; overflow-wrap: break-word; word-break: break-word; }
+          a { color: #818cf8; }
+          blockquote { border-left: 3px solid #334155; padding-left: 12px; margin-left: 0; color: #94a3b8; }
+          @media (max-width: 640px) { body { padding: 12px; font-size: 15px; } }
+        </style></head><body>${content}</body></html>`);
+      }
       doc.close();
+
+      // Auto-resize iframe to content height (eliminates scrollbar-in-scrollbar)
+      const resizeIframe = () => {
+        if (iframeRef.current?.contentDocument?.body) {
+          const height = iframeRef.current.contentDocument.body.scrollHeight;
+          iframeRef.current.style.height = `${height + 20}px`;
+        }
+      };
+
+      // Resize after images load
+      setTimeout(resizeIframe, 100);
+      setTimeout(resizeIframe, 500);
+      setTimeout(resizeIframe, 2000);
+      
+      // Also listen for load events on images
+      const images = doc.querySelectorAll('img');
+      images.forEach(img => img.addEventListener('load', resizeIframe));
     }
   }, [email]);
 
@@ -291,16 +325,14 @@ export default function EmailDetail({
       )}
 
       {/* Email header */}
-      <div className="px-4 md:px-5 py-4 border-b border-white/[0.06] flex-shrink-0">
+      <div className={`px-4 md:px-5 ${isMobile ? 'py-3' : 'py-4'} border-b border-white/[0.06] flex-shrink-0`}>
         {/* Subject (mobile shows inline, desktop shows here) */}
         {!isMobile && (
           <h2 className="text-lg font-semibold text-white mb-3">{email.subject}</h2>
         )}
         <div className="flex items-start gap-3">
           {/* Sender avatar */}
-          <div className={`w-10 h-10 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-semibold ${
-            'bg-violet-600/20 text-violet-300'
-          }`}>
+          <div className={`${isMobile ? 'w-8 h-8' : 'w-10 h-10'} rounded-full flex-shrink-0 flex items-center justify-center text-xs font-semibold bg-violet-600/20 text-violet-300`}>
             {senderInitials(email.from)}
           </div>
           <div className="flex-1 min-w-0">
@@ -374,11 +406,12 @@ export default function EmailDetail({
       )}
 
       {/* Body iframe */}
-      <div className="flex-1 min-h-0">
+      <div className="flex-1 overflow-y-auto">
         <iframe
           ref={iframeRef}
           sandbox="allow-same-origin"
-          className="w-full h-full border-0"
+          className="w-full border-0"
+          style={{ minHeight: '200px' }}
           title="Email content"
         />
       </div>

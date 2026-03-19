@@ -1,7 +1,7 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
-import { ChevronDown, Mail, Settings as SettingsIcon } from 'lucide-react';
+import { ChevronDown, Mail, Settings as SettingsIcon, X, Copy, Check, Eye, EyeOff, Loader2 } from 'lucide-react';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { apiFetch, fetchMailAccounts, type MailAccount } from '../components/mail/api';
 import MailSidebar from '../components/mail/MailSidebar';
@@ -36,6 +36,22 @@ export default function MailPage() {
   const [hasMailbox, setHasMailbox] = useState<boolean>(true);
   const [noMailbox, setNoMailbox] = useState<boolean>(false);
   const [accountDropdownOpen, setAccountDropdownOpen] = useState(false);
+
+  // Setup guide and forwarding modals
+  const [showSetupGuide, setShowSetupGuide] = useState(false);
+  const [showForwardSettings, setShowForwardSettings] = useState(false);
+  const [credentials, setCredentials] = useState<{
+    username: string;
+    email: string;
+    password: string;
+    imap: { server: string; port: number; security: string };
+    smtp: { server: string; port: number; security: string };
+  } | null>(null);
+  const [showPassword, setShowPassword] = useState(false);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+  const [forwardEmail, setForwardEmail] = useState('');
+  const [forwardLoading, setForwardLoading] = useState(false);
+  const [forwardError, setForwardError] = useState('');
 
   // Load accounts
   useEffect(() => {
@@ -133,6 +149,52 @@ export default function MailPage() {
     setActiveMailbox('inbox');
   };
 
+  // Setup guide handlers
+  const handleOpenSetupGuide = async () => {
+    setShowSetupGuide(true);
+    try {
+      const data = await apiFetch('/credentials', { account: activeAccount });
+      setCredentials(data);
+    } catch {
+      setCredentials(null);
+    }
+  };
+
+  const copyToClipboard = (text: string, field: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedField(field);
+    setTimeout(() => setCopiedField(null), 2000);
+  };
+
+  // Forward settings handlers
+  const handleOpenForwardSettings = async () => {
+    setShowForwardSettings(true);
+    setForwardError('');
+    try {
+      const data = await apiFetch('/forward-settings', { account: activeAccount });
+      setForwardEmail(data.autoForwardTo || '');
+    } catch {
+      setForwardEmail('');
+    }
+  };
+
+  const handleSaveForwardSettings = async () => {
+    setForwardLoading(true);
+    setForwardError('');
+    try {
+      await apiFetch('/forward-settings', {
+        method: 'PUT',
+        body: JSON.stringify({ autoForwardTo: forwardEmail.trim() || null }),
+        account: activeAccount,
+      });
+      setShowForwardSettings(false);
+    } catch (err: any) {
+      setForwardError(err.message || 'Failed to save');
+    } finally {
+      setForwardLoading(false);
+    }
+  };
+
   const inboxUnread = mailboxes.find(m => m.role === 'inbox')?.unreadEmails || 0;
   const showDetail = selectedId !== null;
   const currentAccount = accounts.find(a => a.id === activeAccount);
@@ -171,6 +233,8 @@ export default function MailPage() {
         isOpen={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
         isMobile={isMobile}
+        onSetupGuide={handleOpenSetupGuide}
+        onForwardSettings={handleOpenForwardSettings}
       >
         {/* Account switcher — rendered inside sidebar above folders */}
         {accounts.length > 1 && (
@@ -306,6 +370,157 @@ export default function MailPage() {
             isMobile={isMobile}
             account={activeAccount}
           />
+        )}
+      </AnimatePresence>
+
+      {/* IMAP Setup Guide Modal */}
+      <AnimatePresence>
+        {showSetupGuide && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-[#0D1130] border border-white/[0.08] rounded-2xl w-full max-w-lg mx-4 shadow-2xl overflow-hidden max-h-[90vh] flex flex-col"
+            >
+              <div className="flex items-center justify-between px-5 py-3 border-b border-white/[0.06]">
+                <h3 className="text-sm font-semibold text-white">📱 Connect Your Phone</h3>
+                <button onClick={() => setShowSetupGuide(false)} className="p-1.5 rounded-lg hover:bg-white/[0.06] text-slate-400 hover:text-white transition-colors">
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="p-5 overflow-y-auto space-y-4">
+                <p className="text-sm text-slate-400">Your portal email works with any mail app that supports IMAP.</p>
+                
+                {credentials ? (
+                  <>
+                    <div className="space-y-3">
+                      <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">📧 Account Settings</h4>
+                      <div className="bg-white/[0.04] border border-white/[0.06] rounded-xl p-3 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-slate-400">Email:</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm text-white font-mono">{credentials.email}</span>
+                            <button onClick={() => copyToClipboard(credentials.email, 'email')} className="p-1 rounded hover:bg-white/[0.06] text-slate-400 hover:text-white">
+                              {copiedField === 'email' ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+                            </button>
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-slate-400">Password:</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm text-white font-mono">{showPassword ? credentials.password : '••••••••'}</span>
+                            <button onClick={() => setShowPassword(!showPassword)} className="p-1 rounded hover:bg-white/[0.06] text-slate-400 hover:text-white">
+                              {showPassword ? <EyeOff size={12} /> : <Eye size={12} />}
+                            </button>
+                            <button onClick={() => copyToClipboard(credentials.password, 'password')} className="p-1 rounded hover:bg-white/[0.06] text-slate-400 hover:text-white">
+                              {copiedField === 'password' ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="space-y-2">
+                        <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">📥 Incoming (IMAP)</h4>
+                        <div className="bg-white/[0.04] border border-white/[0.06] rounded-xl p-3 text-xs space-y-1">
+                          <div className="flex justify-between"><span className="text-slate-400">Server:</span><span className="text-white font-mono">{credentials.imap.server}</span></div>
+                          <div className="flex justify-between"><span className="text-slate-400">Port:</span><span className="text-white font-mono">{credentials.imap.port}</span></div>
+                          <div className="flex justify-between"><span className="text-slate-400">Security:</span><span className="text-white font-mono">{credentials.imap.security}</span></div>
+                        </div>
+                      </div>
+                      <div className="space-y-2">
+                        <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">📤 Outgoing (SMTP)</h4>
+                        <div className="bg-white/[0.04] border border-white/[0.06] rounded-xl p-3 text-xs space-y-1">
+                          <div className="flex justify-between"><span className="text-slate-400">Server:</span><span className="text-white font-mono">{credentials.smtp.server}</span></div>
+                          <div className="flex justify-between"><span className="text-slate-400">Port:</span><span className="text-white font-mono">{credentials.smtp.port}</span></div>
+                          <div className="flex justify-between"><span className="text-slate-400">Security:</span><span className="text-white font-mono">{credentials.smtp.security}</span></div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="space-y-3 pt-2">
+                      <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">Quick Setup Guides</h4>
+                      <div className="text-xs text-slate-400 space-y-3">
+                        <div>
+                          <strong className="text-slate-300">iPhone:</strong> Settings → Mail → Accounts → Add Account → Other → Add Mail Account → Enter your portal email and password → Choose IMAP → Enter the server settings above
+                        </div>
+                        <div>
+                          <strong className="text-slate-300">Android / Gmail:</strong> Gmail → Settings → Add Account → Other → Enter your portal email → Choose IMAP → Enter server settings above
+                        </div>
+                        <div>
+                          <strong className="text-slate-300">Outlook:</strong> Add Account → Advanced Setup → IMAP → Enter the server settings above
+                        </div>
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <div className="flex items-center justify-center py-8">
+                    <Loader2 className="animate-spin text-slate-400" size={24} />
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Auto-Forward Settings Modal */}
+      <AnimatePresence>
+        {showForwardSettings && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-[#0D1130] border border-white/[0.08] rounded-2xl w-full max-w-md mx-4 shadow-2xl overflow-hidden"
+            >
+              <div className="flex items-center justify-between px-5 py-3 border-b border-white/[0.06]">
+                <h3 className="text-sm font-semibold text-white">Auto-Forward Emails</h3>
+                <button onClick={() => setShowForwardSettings(false)} className="p-1.5 rounded-lg hover:bg-white/[0.06] text-slate-400 hover:text-white transition-colors">
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="p-5 space-y-4">
+                <p className="text-sm text-slate-400">
+                  Automatically forward incoming emails to your personal email address.
+                </p>
+                <div>
+                  <label className="text-xs text-slate-400 block mb-1.5">Forward to email address</label>
+                  <input
+                    type="email"
+                    value={forwardEmail}
+                    onChange={(e) => setForwardEmail(e.target.value)}
+                    placeholder="your.email@gmail.com"
+                    className="w-full bg-white/[0.04] border border-white/[0.06] rounded-xl px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-violet-500/50 focus:border-violet-500/30 transition-colors"
+                  />
+                </div>
+                {forwardError && (
+                  <p className="text-xs text-red-400">{forwardError}</p>
+                )}
+                <p className="text-xs text-slate-500">
+                  Leave empty to disable auto-forwarding. Emails will still be delivered to your portal inbox.
+                </p>
+              </div>
+              <div className="flex justify-end gap-2 px-5 py-3 border-t border-white/[0.06]">
+                <button
+                  onClick={() => setShowForwardSettings(false)}
+                  className="px-3 py-1.5 text-xs rounded-xl bg-white/[0.04] hover:bg-white/[0.08] text-slate-300 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSaveForwardSettings}
+                  disabled={forwardLoading}
+                  className="px-4 py-1.5 text-xs rounded-xl bg-violet-600 hover:bg-violet-500 text-white font-medium disabled:opacity-50 flex items-center gap-1.5 transition-colors"
+                >
+                  {forwardLoading ? <Loader2 size={12} className="animate-spin" /> : null}
+                  Save
+                </button>
+              </div>
+            </motion.div>
+          </div>
         )}
       </AnimatePresence>
     </div>

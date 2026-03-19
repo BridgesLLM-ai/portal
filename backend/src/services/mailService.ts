@@ -868,6 +868,65 @@ export async function sendSystemAlert(to: string[], subject: string, htmlBody: s
 }
 
 /**
+ * Auto-forward a single email to another address
+ */
+export async function autoForwardEmail(emailId: string, forwardTo: string, user: string, pass: string): Promise<void> {
+  const email = await getEmail(emailId, user, pass);
+  const textPart = email.textBody?.[0];
+  const htmlPart = email.htmlBody?.[0];
+  const textBody = textPart && email.bodyValues[textPart.partId] ? email.bodyValues[textPart.partId].value : email.preview;
+  const htmlBody = htmlPart && email.bodyValues[htmlPart.partId] ? email.bodyValues[htmlPart.partId].value : undefined;
+
+  await sendEmail({
+    from: `${user}@${getMailDomain()}`,
+    to: [{ email: forwardTo }],
+    subject: `Fwd: ${email.subject}`,
+    textBody: `---------- Forwarded from ${user}@${getMailDomain()} ----------\nFrom: ${email.from.map((f: any) => f.email).join(', ')}\nDate: ${new Date(email.receivedAt).toLocaleString()}\nSubject: ${email.subject}\n\n${textBody}`,
+    htmlBody: htmlBody || undefined,
+  }, user, pass);
+}
+
+/**
+ * Process auto-forwarding for new inbox emails.
+ * Checks for $forwarded keyword to avoid re-forwarding.
+ * Max 5 emails per batch, only emails from last 24 hours.
+ */
+export async function processAutoForward(emails: EmailSummary[], forwardTo: string, user: string, pass: string): Promise<void> {
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const toForward = emails.filter(e => e.isUnread && new Date(e.receivedAt) > cutoff);
+
+  for (const email of toForward.slice(0, 5)) {
+    try {
+      const session = await getSession(user, pass);
+      // Check if already forwarded
+      const detail = await jmapCall(session, user, pass, [
+        ['Email/get', {
+          accountId: session.accountId,
+          ids: [email.id],
+          properties: ['keywords'],
+        }, '0'],
+      ]);
+      const keywords = detail.methodResponses[0][1].list?.[0]?.keywords || {};
+      if (keywords['$forwarded']) continue;
+
+      // Forward the email
+      await autoForwardEmail(email.id, forwardTo, user, pass);
+
+      // Mark as forwarded so we don't re-forward
+      await jmapCall(session, user, pass, [
+        ['Email/set', {
+          accountId: session.accountId,
+          update: { [email.id]: { 'keywords/$forwarded': true } },
+        }, '0'],
+      ]);
+      console.log(`[mail] Auto-forwarded email ${email.id} to ${forwardTo}`);
+    } catch (err: any) {
+      console.error(`[mail] Auto-forward failed for ${email.id}:`, err.message);
+    }
+  }
+}
+
+/**
  * Get unread count for badge display (for a specific account)
  */
 export async function getUnreadCount(user: string, pass: string): Promise<number> {

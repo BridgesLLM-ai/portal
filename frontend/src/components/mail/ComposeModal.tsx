@@ -60,21 +60,27 @@ export default function ComposeModal({
   const [error, setError] = useState('');
   const [attachments, setAttachments] = useState<AttachmentFile[]>([]);
   const [signature, setSignature] = useState('');
+  const [signatureHtml, setSignatureHtml] = useState('');
   const [showSignatureEditor, setShowSignatureEditor] = useState(false);
   const [signatureInput, setSignatureInput] = useState('');
+  const [signatureHtmlInput, setSignatureHtmlInput] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
 
   useEffect(() => {
-    apiFetch('/signature')
+    apiFetch('/signature', { account })
       .then(data => {
+        if (data.signatureHtml) {
+          setSignatureHtml(data.signatureHtml);
+          setSignatureHtmlInput(data.signatureHtml);
+        }
         if (data.signature) {
           setSignature(data.signature);
           setSignatureInput(data.signature);
         }
       })
       .catch(() => {});
-  }, []);
+  }, [account]);
 
   const getQuotedBody = () => {
     if (mode !== 'forward' || !replyTo) return '';
@@ -92,11 +98,23 @@ export default function ComposeModal({
     if (!to.trim()) { setError('Recipients required'); return; }
     if (!subject.trim()) { setError('Subject required'); return; }
 
-    let fullBody = body;
-    if (signature) fullBody = `${body}\n\n-- \n${signature}`;
-    if (mode === 'forward' && !fullBody.trim() && !replyTo) { setError('Message body required'); return; }
-    if (mode === 'forward') fullBody = fullBody + getQuotedBody();
-    if (!fullBody.trim() && mode !== 'forward') { setError('Message body required'); return; }
+    // Build body with signature
+    let fullTextBody = body;
+    let fullHtmlBody = '';
+    
+    if (signature) {
+      fullTextBody = `${body}\n\n-- \n${signature}`;
+    }
+    
+    if (signatureHtml) {
+      const escapedBody = body.replace(/\n/g, '<br/>').replace(/  /g, '&nbsp; ');
+      fullHtmlBody = `<div style="font-family:system-ui,sans-serif;font-size:14px;color:#333;">${escapedBody}</div>
+<br/><div style="border-top:1px solid #e5e7eb;padding-top:12px;margin-top:12px;">${signatureHtml}</div>`;
+    }
+
+    if (mode === 'forward' && !fullTextBody.trim() && !replyTo) { setError('Message body required'); return; }
+    if (mode === 'forward') fullTextBody = fullTextBody + getQuotedBody();
+    if (!fullTextBody.trim() && mode !== 'forward') { setError('Message body required'); return; }
 
     setSending(true);
     setError('');
@@ -118,8 +136,12 @@ export default function ComposeModal({
       } else {
         const data: any = {
           to: recipients, cc: ccList, bcc: bccList,
-          subject, textBody: fullBody,
+          subject, textBody: fullTextBody,
         };
+        // Include HTML body if we have an HTML signature
+        if (fullHtmlBody) {
+          data.htmlBody = fullHtmlBody;
+        }
         if (replyTo?.messageId && (mode === 'reply' || mode === 'replyAll')) {
           data.inReplyTo = replyTo.messageId;
           data.references = [...(replyTo.references || []), ...(replyTo.messageId || [])];
@@ -165,9 +187,14 @@ export default function ComposeModal({
     try {
       await apiFetch('/signature', {
         method: 'PUT',
-        body: JSON.stringify({ signature: signatureInput }),
+        body: JSON.stringify({ 
+          signature: signatureInput,
+          signatureHtml: signatureHtmlInput,
+        }),
+        account,
       });
       setSignature(signatureInput);
+      setSignatureHtml(signatureHtmlInput);
       setShowSignatureEditor(false);
     } catch {}
   };

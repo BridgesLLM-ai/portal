@@ -1,5 +1,5 @@
 import { motion, AnimatePresence } from 'framer-motion';
-import { MailPlus, X } from 'lucide-react';
+import { MailPlus, X, Smartphone, ArrowRightFromLine } from 'lucide-react';
 import { FolderIcon } from './helpers';
 import type { MailboxInfo } from './types';
 
@@ -23,11 +23,13 @@ interface MailSidebarProps {
   onClose: () => void;
   isMobile: boolean;
   children?: React.ReactNode;
+  onSetupGuide?: () => void;
+  onForwardSettings?: () => void;
 }
 
 export default function MailSidebar({
   mailboxes, activeMailbox, onSelectMailbox, onCompose,
-  isOpen, onClose, isMobile, children,
+  isOpen, onClose, isMobile, children, onSetupGuide, onForwardSettings,
 }: MailSidebarProps) {
   const sorted = sortMailboxes(mailboxes);
 
@@ -90,6 +92,28 @@ export default function MailSidebar({
           );
         })}
       </nav>
+
+      {/* Settings links */}
+      <div className="px-3 py-2 space-y-1">
+        {onSetupGuide && (
+          <button
+            onClick={() => { onSetupGuide(); if (isMobile) onClose(); }}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-xs text-slate-400 hover:text-white hover:bg-white/[0.04] transition-colors"
+          >
+            <Smartphone size={14} />
+            <span>Connect Your Phone</span>
+          </button>
+        )}
+        {onForwardSettings && (
+          <button
+            onClick={() => { onForwardSettings(); if (isMobile) onClose(); }}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-xs text-slate-400 hover:text-white hover:bg-white/[0.04] transition-colors"
+          >
+            <ArrowRightFromLine size={14} />
+            <span>Auto-Forward</span>
+          </button>
+        )}
+      </div>
 
       {/* Spacer at bottom */}
       <div className="p-4 border-t border-white/[0.06]" />

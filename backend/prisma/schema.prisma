@@ -59,13 +59,16 @@ model User {
 }
 
 model MailboxAccount {
-  id           String   @id @default(uuid())
-  userId       String
-  username     String   @unique
-  mailPassword String
-  isPrimary    Boolean  @default(false)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id            String   @id @default(uuid())
+  userId        String
+  username      String   @unique
+  mailPassword  String
+  isPrimary     Boolean  @default(false)
+  signature     String?  @db.Text  // Plain text signature
+  signatureHtml String?  @db.Text  // HTML signature (rendered in emails)
+  autoForwardTo String?             // Email address to auto-forward incoming mail to
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
