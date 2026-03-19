@@ -8,6 +8,16 @@ function matchesAny(id: string, needles: string[]): boolean {
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
 
+  // Guard: VITE_API_URL must be set for production builds.
+  // Without it, the frontend makes API calls to wrong paths and silently breaks.
+  if (mode === 'production' && !env.VITE_API_URL) {
+    throw new Error(
+      '\n\n❌ VITE_API_URL is not set!\n' +
+      'Create frontend/.env with: VITE_API_URL=/api\n' +
+      'Without this, the production build will be broken.\n'
+    );
+  }
+
   // Vite blocks unknown Host headers in dev to prevent DNS rebinding attacks.
   // Keep this scoped to localhost + this tailnet by default (not "all").
   const allowedHosts = new Set([

@@ -1281,7 +1281,7 @@ export default function AppsPage() {
     if (!selectedProject) return;
     setCheckingProject(true);
     try {
-      const res = await fetch(`${import.meta.env.VITE_API_URL || ''}/api/projects/${encodeURIComponent(selectedProject)}/check`, {
+      const res = await fetch(`${import.meta.env.VITE_API_URL || '/api'}/projects/${encodeURIComponent(selectedProject)}/check`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',

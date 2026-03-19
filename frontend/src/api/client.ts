@@ -2,7 +2,16 @@ import axios, { AxiosInstance } from 'axios';
 import { useAuthStore } from '../contexts/AuthContext';
 import { captureError } from '../utils/errorHandler';
 
-const API_URL = import.meta.env.VITE_API_URL || '';
+const API_URL = import.meta.env.VITE_API_URL || '/api';
+
+// Safety check: if VITE_API_URL was not set at build time, the bundle is misconfigured.
+// Log a visible warning so it's immediately obvious during testing.
+if (!import.meta.env.VITE_API_URL) {
+  console.warn(
+    '[BridgesLLM] VITE_API_URL was not set at build time — falling back to "/api". ' +
+    'Ensure frontend/.env contains VITE_API_URL=/api before building.'
+  );
+}
 
 const client: AxiosInstance = axios.create({
   baseURL: API_URL,
