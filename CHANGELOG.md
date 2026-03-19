@@ -2,6 +2,35 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.15.0] — 2026-03-19
+
+### Added
+- **Runtime Projects** — Create Python (🐍) and C++ (⚙️) projects alongside HTML, React, and Node.js. Hit "Run" and they execute on the Remote Desktop in an xterm window. Build real apps from a tablet.
+- **Syntax/Compile Checker** — "Check" button replaces Preview for runtime projects. Validates Python (`py_compile`), C++ (`g++ -fsyntax-only`), and Node (`node --check`) without executing.
+- **Auto-Forward Email** — Forward incoming portal emails to your personal email address. Toggle in the mail sidebar. Tracks forwarded messages to prevent duplicates.
+- **IMAP Setup Guide** — "Connect Your Phone" button in mail sidebar. Shows your credentials, IMAP/SMTP server settings, and step-by-step instructions for iPhone, Android, and Outlook.
+- **HTML Email Signatures** — Auto-generated signature with your portal logo, name, and email. Per-user (stored in DB, not a global file). Editable.
+- **Build Safety Guard** — `npx vite build` now **fails loudly** if `VITE_API_URL` is not set. Prevents silent deployment of broken frontend bundles. Runtime fallback to `/api` with console warning as backup.
+- **Mail Credentials Endpoint** — `GET /api/mail/credentials` returns IMAP/SMTP settings for external mail client setup.
+
+### Fixed
+- **HTML Email Rendering** — HTML emails (newsletters, receipts, notifications) now display with their original styling instead of forced dark mode. Only plain text emails use dark background.
+- **Mobile Email Layout** — Auto-resizing iframe eliminates scrollbar-in-scrollbar. Responsive scaling for images and tables. Compact headers on mobile.
+- **API Client Fallback** — `client.ts` falls back to `/api` instead of empty string when `VITE_API_URL` is missing. Prevents all-endpoints-broken scenario.
+- **Check Endpoint Double Prefix** — Fixed `/api/api/projects/...` bug in the frontend check call.
+
+### Security
+- **Shell Injection Hardening** — All user-derived filenames and project names in `execSync` calls are now shell-escaped via `shellEscape()`. Project names sanitized to `[a-zA-Z0-9_-]`.
+- **Signature XSS Prevention** — User-submitted HTML signatures sanitized with `sanitize-html` before storage. Default signature template HTML-escapes all interpolated values.
+- **Duplicate Process Prevention** — `pkill` kills existing xterm for a project before launching a new one.
+- **Self-Forward Protection** — Cannot set auto-forward to your own portal email (prevents infinite loop).
+
+### Changed
+- Email signatures migrated from global file (`mail-signature.txt`) to per-user database fields on `MailboxAccount`
+- Template picker grid changed from 3-column to 5-column for clean layout with 5 project types
+- Deploy button shows ▶️ "Run" (Play icon) for runtime projects instead of 🚀 "Deploy" (Rocket icon)
+- `detectDeployType()` return type expanded: `'static' | 'fullstack' | 'runtime'`
+
 ## [3.14.0] — 2026-03-17
 
 ### Fixed
