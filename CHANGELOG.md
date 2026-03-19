@@ -2,6 +2,14 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.15.1] — 2026-03-19
+
+### Fixed
+- **Owner email account broken on fresh install (CRITICAL)** — Setup wizard never called `provisionUserMailbox` for the owner account. The mailbox was only created on first mail page visit via auto-provision, which failed because the `signature` column didn't exist yet (no migration). This left Stalwart and the DB with mismatched passwords, causing permanent 401 errors for the owner's email.
+- **Missing database migration** — Added migration `20260319_add_mail_signature_forward` for the `signature`, `signatureHtml`, and `autoForwardTo` columns on `MailboxAccount`. Without this, fresh installs using `prisma migrate deploy` never created these columns, causing Prisma errors on any mailbox operation.
+- **Password drift on provisioning retry** — `provisionUserMailbox` generated a new random password on every retry attempt. If Stalwart already had the account (409), it patched Stalwart with the new password, but if the DB upsert then failed, the passwords diverged permanently. Now reuses the existing DB password when one exists.
+- **Blank white page on fresh install** — Tarball `--exclude='assets'` glob stripped `frontend/dist/assets/` (all JS/CSS bundles). Express served `index.html` for every asset request, returning `text/html` MIME type for `.js` files. Fixed exclude to be path-anchored (`--exclude='./assets'`).
+
 ## [3.15.0] — 2026-03-19
 
 ### Added
