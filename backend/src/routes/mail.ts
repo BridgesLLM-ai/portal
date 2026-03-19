@@ -15,6 +15,7 @@ import { authenticateToken } from '../middleware/auth';
 import { requireApproved } from '../middleware/requireApproved';
 import { getUserMailAccounts, getUserMailCredentials } from '../services/userMailService';
 import { prisma } from '../config/database';
+import sanitizeHtmlLib from 'sanitize-html';
 import { isElevatedRole } from '../utils/authz';
 import { scanBuffer } from '../services/virusScan';
 import {
@@ -590,11 +591,27 @@ router.put('/signature', async (req: Request, res: Response) => {
     const creds = await getUserMailCredentials(req.user!.userId, accountParam || undefined);
 
     if (creds) {
+      // Sanitize HTML signature to prevent XSS in outgoing emails
+      const cleanHtml = signatureHtml ? sanitizeHtmlLib(signatureHtml, {
+        allowedTags: sanitizeHtmlLib.defaults.allowedTags.concat([
+          'img', 'h1', 'h2', 'span', 'div', 'center', 'font', 'u', 'hr', 'br',
+          'table', 'thead', 'tbody', 'tr', 'td', 'th',
+        ]),
+        allowedAttributes: {
+          '*': ['style', 'class', 'align', 'valign', 'width', 'height', 'border', 'cellpadding', 'cellspacing'],
+          'a': ['href', 'target', 'rel'],
+          'img': ['src', 'alt', 'width', 'height'],
+          'td': ['colspan', 'rowspan', 'width', 'height', 'align', 'valign', 'style'],
+          'font': ['color', 'face', 'size'],
+        },
+        allowedSchemes: ['http', 'https', 'mailto'],
+      }) : null;
+
       await prisma.mailboxAccount.update({
         where: { id: creds.accountId },
         data: {
           signature: signature || null,
-          signatureHtml: signatureHtml || null,
+          signatureHtml: cleanHtml,
         },
       });
     } else {
@@ -697,10 +714,19 @@ router.get('/credentials', async (req: Request, res: Response) => {
   }
 });
 
+// HTML-escape user-controlled strings to prevent XSS in signatures
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 // Helper function to generate default HTML signature
 function generateDefaultSignatureHtml(name: string, email: string, portalName: string, logoUrl: string): string {
-  const logoTag = logoUrl 
-    ? `<img src="${logoUrl}" alt="${portalName}" style="height:40px;width:auto;margin-bottom:8px;" /><br/>`
+  const safeName = escapeHtml(name);
+  const safeEmail = escapeHtml(email);
+  const safePortalName = escapeHtml(portalName);
+  const safeLogoUrl = escapeHtml(logoUrl);
+  const logoTag = safeLogoUrl 
+    ? `<img src="${safeLogoUrl}" alt="${safePortalName}" style="height:40px;width:auto;margin-bottom:8px;" /><br/>`
     : '';
   
   return `<table cellpadding="0" cellspacing="0" border="0" style="font-family:system-ui,-apple-system,sans-serif;font-size:13px;color:#374151;line-height:1.5;">
@@ -709,10 +735,10 @@ function generateDefaultSignatureHtml(name: string, email: string, portalName: s
       ${logoTag}
     </td>
     <td style="padding-left:16px;vertical-align:top;">
-      <div style="font-size:15px;font-weight:600;color:#111827;">${name}</div>
-      <div style="color:#6b7280;font-size:12px;margin-top:2px;">${portalName}</div>
+      <div style="font-size:15px;font-weight:600;color:#111827;">${safeName}</div>
+      <div style="color:#6b7280;font-size:12px;margin-top:2px;">${safePortalName}</div>
       <div style="margin-top:6px;">
-        <a href="mailto:${email}" style="color:#8b5cf6;text-decoration:none;font-size:12px;">${email}</a>
+        <a href="mailto:${safeEmail}" style="color:#8b5cf6;text-decoration:none;font-size:12px;">${safeEmail}</a>
       </div>
     </td>
   </tr>
