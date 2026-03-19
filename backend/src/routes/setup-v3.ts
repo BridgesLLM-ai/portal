@@ -23,6 +23,7 @@ import { config } from '../config/env';
 import { APPEARANCE_DEFAULTS, SECURITY_DEFAULTS } from '../config/settings.schema';
 import multer from 'multer';
 import { setAuthCookies } from '../utils/authCookies';
+import { provisionUserMailbox } from '../services/userMailService';
 import {
   buildIpFallbackCaddyConfig,
   configureDomainAndHttps,
@@ -1151,6 +1152,11 @@ router.post('/complete', requireSetupToken, async (req: Request, res: Response, 
         sandboxEnabled: false,
       },
     } as any);
+
+    // Provision mail account for owner (non-blocking — don't fail setup if mail isn't ready)
+    provisionUserMailbox(username, user.id, { makePrimary: true }).catch((err) => {
+      console.error('[setup] Mail provisioning for owner failed (non-fatal):', err.message);
+    });
 
     // Save settings
     const settingsToUpsert: Record<string, string> = {

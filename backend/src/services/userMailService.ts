@@ -83,9 +83,16 @@ export async function provisionUserMailbox(
   userId: string,
   options?: { makePrimary?: boolean }
 ): Promise<string> {
-  const password = generateMailPassword();
   const stalwartName = normalizeMailboxUsername(username);
   const email = `${stalwartName}@${getMailDomain()}`;
+
+  // If this user already has a DB record with a password, reuse it to avoid
+  // Stalwart/DB password drift from partial failures.
+  const existingMailbox = await prisma.mailboxAccount.findUnique({
+    where: { username: stalwartName },
+    select: { mailPassword: true },
+  });
+  const password = existingMailbox?.mailPassword || generateMailPassword();
 
   try {
     const createRes = await fetch(`${getStalwartUrl()}/api/principal`, {
