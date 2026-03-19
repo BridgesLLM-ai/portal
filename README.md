@@ -43,11 +43,12 @@ That's it. Takes about 5 minutes. Opens a setup wizard in your browser when done
 | Feature | Description |
 |---------|-------------|
 | **Multi-Provider Agent Chat** | Claude, Codex, Gemini, Ollama — all via flat-rate OAuth subscriptions, not per-token billing. Switch models mid-conversation. Powered by [OpenClaw](https://github.com/openclaw/openclaw). |
-| **AI-Powered Projects** | Create projects, edit code in-browser, assign AI agents to tasks. Git integration, live preview, and autonomous background agents. |
+| **AI-Powered Projects** | Create HTML, React, Python, C++, and Node.js projects. Edit code in-browser, assign AI agents to tasks. Git integration, live preview, syntax checking, and autonomous background agents. |
+| **Runtime Projects** | **NEW** — Build Python scripts, C++ programs, and Node CLI tools. Hit "Run" and watch them execute on the Remote Desktop. Vibe code real apps from a tablet. |
 | **Sandboxed Code Execution** | Run AI-generated code in isolated Docker containers per project. Nothing breaks your server. |
 | **Browser-Based Remote Desktop** | Full graphical desktop via NoVNC. Run GUI apps, browser automation, or visual workflows from any device. |
 | **File Manager** | Browse, upload, edit, and manage server files. Drag-and-drop, in-browser editing, archive extraction. |
-| **Built-In Email Server** | Stalwart mail server included. Send from your own domain — no third-party required. |
+| **Built-In Email Server** | Stalwart mail server with IMAP support. Send from your own domain, auto-forward to personal email, connect your phone's mail app. HTML signatures with your portal logo. |
 | **Self-Updating Dashboard** | One-click updates from the browser. Admin dashboard with user management, storage, and session monitoring. |
 | **Setup Wizard** | Everything configured in-browser. Domain, SSL, OAuth, users — no CLI expertise needed. |
 
@@ -127,9 +128,11 @@ Updates preserve all your data, projects, and configuration.
 
 ## 📋 Roadmap
 
+- [x] **Runtime projects** — Python, C++, and Node CLI projects that execute on the Remote Desktop
+- [x] **Email overhaul** — auto-forwarding, HTML signatures with logo, IMAP phone setup guide, mobile-first rendering
+- [x] **Build safety** — production builds fail loudly if misconfigured, preventing broken deploys
 - [ ] **Full OpenClaw feature parity** — FYI mode, tool approval workflows, and new agent capabilities as OpenClaw ships them
 - [ ] **Agent Zero integration** — add full provider support for Agent Zero alongside Claude, Codex, Gemini, and Ollama
-- [ ] **Email polish** — automated forwarding rules, HTML signatures with images, folder management
 - [ ] **Upstream tracking** — keep pace with daily updates to OpenClaw, Ollama, Caddy, and coding CLIs
 - [ ] **GitHub integration** — push/pull from the project panel
 - [ ] **Team collaboration** — multi-user project sharing and permissions
