@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+frontend/dist/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# User data & uploads
+.data/
+projects/
+backend/uploads/
+backend/secure-downloads/*
+!backend/secure-downloads/.gitkeep
+backend/.data/
+
+# Database
+*.db
+*.db-journal
+backend/prisma/migrations/
+
+# Logs
+*.log
+
+# Archives & backups
+*.tar.gz
+.backup
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Specific exclusions
+backend/public/career-pivot-plan.html
+
+# Audit/task files (ephemeral)
+*-audit-*.md
+TASK-*.md
+OPENCLAW-*.md
+ARCHITECTURE-*.md
+ROADMAP*.md
