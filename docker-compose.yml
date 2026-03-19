@@ -1,0 +1,117 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: bridgesllm-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bridges
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: bridgesllm_portal
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bridges -d bridgesllm_portal"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - portal-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bridgesllm-backend
+    restart: unless-stopped
+    # Keep Docker aligned with the live systemd deployment by loading the same
+    # backend env file for JWT / gateway auth material.
+    env_file:
+      - ./backend/.env.production
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: "postgresql://bridges:${POSTGRES_PASSWORD}@bridgesllm-db:5432/bridgesllm_portal"
+      PORT: 3001
+      HOST: 0.0.0.0
+      CORS_ORIGIN: "${PORTAL_DOMAIN:-https://localhost}"
+      OLLAMA_API_URL: "http://host.docker.internal:11436"
+      OLLAMA_MODEL: "qwen2.5-coder:7b"
+      OPENCLAW_API_URL: "http://host.docker.internal:18789"
+      OPENCLAW_GATEWAY_URL: "http://host.docker.internal:18789"
+      FRED_API_KEY: "${FRED_API_KEY}"
+      GUACAMOLE_USERNAME: "${GUACAMOLE_USERNAME}"
+      GUACAMOLE_PASSWORD: "${GUACAMOLE_PASSWORD}"
+      PORTAL_NATIVE_AGENT_SESSIONS_DIR: "/root/.openclaw/portal-native-agent-sessions"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend/src:/app/src
+      - ./backend/dist:/app/dist
+      - ./backend/node_modules:/app/node_modules
+      - ./frontend/dist:/frontend/dist:ro
+      - /portal/projects:/portal/projects:rw
+      - ${PORTAL_ROOT:-/opt/bridgesllm}/assets:${PORTAL_ROOT:-/opt/bridgesllm}/assets:rw
+      - /root/backups:/root/backups:rw
+      - /root/.openclaw/logs:/root/.openclaw/logs:ro
+      - /root/.openclaw/agents:/root/.openclaw/agents:ro
+      - /root/.openclaw/portal-native-agent-sessions:/root/.openclaw/portal-native-agent-sessions:rw
+      - /var/portal-files:/var/portal-files:rw
+      # Claude & Codex CLI access
+      - /usr/lib/node_modules/@anthropic-ai:/usr/lib/node_modules/@anthropic-ai:ro
+      - /usr/lib/node_modules/@openai/codex:/usr/lib/node_modules/@openai/codex:ro
+      - /usr/bin/claude:/usr/bin/claude:ro
+      - /usr/bin/codex:/usr/bin/codex:ro
+      - /root/.claude:/root/.claude:ro
+      - /root/.codex:/root/.codex:ro
+    networks:
+      - portal-network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: bridgesllm-frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: "/api"
+    ports:
+      - "127.0.0.1:5173:5173"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/node_modules:/app/node_modules
+    networks:
+      - portal-network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+
+  # novnc-bridge removed — noVNC static files are now served directly by Express
+  # and websockify runs as a host systemd service (bridges-rd-websockify.service).
+  # See Phase 1 of the noVNC architecture fix (March 2026).
+
+volumes:
+  postgres_data:
+
+networks:
+  portal-network:
+    driver: bridge
