@@ -422,11 +422,14 @@ su - "$RD_USER" -c "
   sleep 0.5
   # Start PulseAudio daemon with virtual null sink as default
   pulseaudio --start --exit-idle-time=-1 2>>$LOG_DIR/pulseaudio.log
-  sleep 0.5
-  # Verify and set default sink
+  sleep 1
+  # Configure for audio streaming
   export PULSE_SERVER=unix:$XDG_DIR/pulse/native
   pactl set-default-sink auto_null 2>/dev/null || true
-  echo 'PulseAudio started'
+  # CRITICAL: Unload suspend-on-idle so the monitor source always streams
+  # Without this, parec blocks when no audio is playing and the browser gets no data
+  pactl unload-module module-suspend-on-idle 2>/dev/null || true
+  echo 'PulseAudio started (suspend-on-idle disabled)'
 " &
 PA_PID=$!
 wait $PA_PID 2>/dev/null || true
