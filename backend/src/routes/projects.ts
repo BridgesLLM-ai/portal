@@ -3829,6 +3829,8 @@ router.get('/:name/download', authenticateToken, async (req: Request, res: Respo
       '.assistant-*',
       '.git/**',
       'node_modules/**',
+      '.venv/**',
+      '.deps-installed',
       '.env',
       '.env.local',
       '.env.*.local',
