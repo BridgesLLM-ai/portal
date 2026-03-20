@@ -44,24 +44,67 @@ export default function DesktopPage() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioGainRef = useRef<GainNode | null>(null);
   const [audioVolume, setAudioVolume] = useState(0.8);
+  const audioVolumeRef = useRef(0.8); // Ref mirror to avoid closure staleness
+  const audioReconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const audioEnabledRef = useRef(false); // Ref mirror for reconnect logic
+  const nextPlayTimeRef = useRef(0);
+  const audioConfigRef = useRef({ sampleRate: 44100, channels: 2 });
 
-  // Audio WebSocket connection
+  // Keep refs in sync
+  useEffect(() => { audioVolumeRef.current = audioVolume; }, [audioVolume]);
+  useEffect(() => { audioEnabledRef.current = audioEnabled; }, [audioEnabled]);
+
+  // Create AudioContext on user gesture (critical for mobile Safari)
+  const getOrCreateAudioContext = useCallback((): AudioContext | null => {
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      return audioContextRef.current;
+    }
+    try {
+      // Safari fallback: webkitAudioContext
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) {
+        console.error('[Audio] AudioContext not supported');
+        return null;
+      }
+      const ctx = new AudioCtx({ sampleRate: audioConfigRef.current.sampleRate });
+      const gain = ctx.createGain();
+      gain.gain.value = audioVolumeRef.current;
+      gain.connect(ctx.destination);
+      audioContextRef.current = ctx;
+      audioGainRef.current = gain;
+      nextPlayTimeRef.current = ctx.currentTime;
+      console.log('[Audio] AudioContext created (state:', ctx.state, ')');
+      return ctx;
+    } catch (err) {
+      console.error('[Audio] Failed to create AudioContext:', err);
+      return null;
+    }
+  }, []);
+
+  // WebSocket connection (no dependencies that cause reconnects)
   const connectAudio = useCallback(() => {
+    // Cleanup existing
     if (audioWsRef.current) {
       audioWsRef.current.close();
       audioWsRef.current = null;
     }
+    if (audioReconnectTimer.current) {
+      clearTimeout(audioReconnectTimer.current);
+      audioReconnectTimer.current = null;
+    }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/novnc/audio`;
-    const ws = new WebSocket(wsUrl);
+    
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (err) {
+      console.error('[Audio] WebSocket creation failed:', err);
+      setAudioConnected(false);
+      return;
+    }
     ws.binaryType = 'arraybuffer';
-
-    let audioCtx: AudioContext | null = null;
-    let gainNode: GainNode | null = null;
-    let sampleRate = 44100;
-    let channels = 2;
-    let nextPlayTime = 0;
 
     ws.onopen = () => {
       setAudioConnected(true);
@@ -70,45 +113,36 @@ export default function DesktopPage() {
 
     ws.onmessage = (event) => {
       if (typeof event.data === 'string') {
-        // Config message
+        // Config message from server
         try {
           const config = JSON.parse(event.data);
           if (config.type === 'config') {
-            sampleRate = config.sampleRate || 44100;
-            channels = config.channels || 2;
-            
-            // Create AudioContext on first config
-            if (!audioCtx) {
-              audioCtx = new AudioContext({ sampleRate });
-              gainNode = audioCtx.createGain();
-              gainNode.gain.value = audioVolume;
-              gainNode.connect(audioCtx.destination);
-              audioContextRef.current = audioCtx;
-              audioGainRef.current = gainNode;
-              nextPlayTime = audioCtx.currentTime;
-            }
+            audioConfigRef.current = {
+              sampleRate: config.sampleRate || 44100,
+              channels: config.channels || 2,
+            };
           }
-        } catch { /* ignore */ }
+        } catch { /* ignore parse errors */ }
         return;
       }
 
       // Binary PCM data
+      const audioCtx = audioContextRef.current;
+      const gainNode = audioGainRef.current;
       if (!audioCtx || !gainNode || audioCtx.state === 'closed') return;
 
-      // Resume if suspended (browser autoplay policy)
+      // Resume if suspended (autoplay policy — the initial resume happens on user gesture in toggleAudio)
       if (audioCtx.state === 'suspended') {
-        audioCtx.resume();
+        audioCtx.resume().catch(() => {});
       }
 
+      const { sampleRate, channels } = audioConfigRef.current;
       const pcmData = new Int16Array(event.data);
-      const numSamples = pcmData.length / channels;
-      
+      const numSamples = Math.floor(pcmData.length / channels);
       if (numSamples <= 0) return;
 
-      // Create audio buffer
+      // Create audio buffer and decode
       const audioBuffer = audioCtx.createBuffer(channels, numSamples, sampleRate);
-      
-      // Convert Int16 to Float32 and deinterleave channels
       for (let ch = 0; ch < channels; ch++) {
         const channelData = audioBuffer.getChannelData(ch);
         for (let i = 0; i < numSamples; i++) {
@@ -116,68 +150,117 @@ export default function DesktopPage() {
         }
       }
 
-      // Schedule playback
+      // Schedule playback with jitter buffer
       const source = audioCtx.createBufferSource();
       source.buffer = audioBuffer;
       source.connect(gainNode);
 
-      const currentTime = audioCtx.currentTime;
-      // If we've fallen behind, catch up
-      if (nextPlayTime < currentTime) {
-        nextPlayTime = currentTime + 0.02; // 20ms buffer
+      const now = audioCtx.currentTime;
+      let playAt = nextPlayTimeRef.current;
+
+      // If we've fallen behind (tab was backgrounded, network lag, etc.),
+      // skip ahead instead of playing a burst of stale audio
+      if (playAt < now - 0.5) {
+        // More than 500ms behind — hard reset
+        playAt = now + 0.05;
+      } else if (playAt < now) {
+        // Slight drift — soft catch-up
+        playAt = now + 0.02;
       }
-      source.start(nextPlayTime);
-      nextPlayTime += audioBuffer.duration;
+
+      source.start(playAt);
+      nextPlayTimeRef.current = playAt + audioBuffer.duration;
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       setAudioConnected(false);
-      console.log('[Audio] WebSocket disconnected');
+      console.log('[Audio] WebSocket disconnected (code:', ev.code, ')');
+      audioWsRef.current = null;
+      
+      // Auto-reconnect if audio is still enabled (network hiccup, server restart)
+      if (audioEnabledRef.current) {
+        const delay = ev.code === 1000 ? 0 : 3000; // Clean close = no retry, abnormal = retry
+        if (ev.code !== 1000) {
+          console.log(`[Audio] Reconnecting in ${delay}ms...`);
+          audioReconnectTimer.current = setTimeout(() => {
+            if (audioEnabledRef.current) connectAudio();
+          }, delay);
+        }
+      }
     };
 
     ws.onerror = () => {
+      // Error fires before close — close handler does the reconnect
       setAudioConnected(false);
     };
 
     audioWsRef.current = ws;
-  }, [audioVolume]);
+  }, []);  // No deps — uses refs for all mutable state
 
   const disconnectAudio = useCallback(() => {
+    if (audioReconnectTimer.current) {
+      clearTimeout(audioReconnectTimer.current);
+      audioReconnectTimer.current = null;
+    }
     if (audioWsRef.current) {
-      audioWsRef.current.close();
+      audioWsRef.current.close(1000, 'User disabled audio');
       audioWsRef.current = null;
     }
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
     }
     audioGainRef.current = null;
     setAudioConnected(false);
   }, []);
 
-  // Toggle audio
+  // Toggle audio — MUST be called from user gesture (click handler) for mobile Safari
   const toggleAudio = useCallback(() => {
     if (audioEnabled) {
       disconnectAudio();
       setAudioEnabled(false);
     } else {
+      // Create AudioContext HERE in the click handler (user gesture requirement)
+      const ctx = getOrCreateAudioContext();
+      if (ctx && ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
       setAudioEnabled(true);
       connectAudio();
     }
-  }, [audioEnabled, connectAudio, disconnectAudio]);
+  }, [audioEnabled, connectAudio, disconnectAudio, getOrCreateAudioContext]);
 
-  // Update volume when slider changes
+  // Update volume via ref + gain node (no reconnect)
   useEffect(() => {
     if (audioGainRef.current) {
-      audioGainRef.current.gain.value = audioVolume;
+      audioGainRef.current.gain.setValueAtTime(audioVolume, audioContextRef.current?.currentTime || 0);
     }
   }, [audioVolume]);
+
+  // Handle page visibility changes (mobile tab switch, screen lock)
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && audioContextRef.current) {
+        // Resume AudioContext when tab comes back to foreground
+        if (audioContextRef.current.state === 'suspended') {
+          audioContextRef.current.resume().catch(() => {});
+        }
+        // Reset play time to avoid burst playback of buffered chunks
+        nextPlayTimeRef.current = audioContextRef.current.currentTime + 0.05;
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+  }, []);
 
   // Cleanup audio on unmount
   useEffect(() => {
     return () => {
-      if (audioWsRef.current) audioWsRef.current.close();
-      if (audioContextRef.current) audioContextRef.current.close();
+      if (audioReconnectTimer.current) clearTimeout(audioReconnectTimer.current);
+      if (audioWsRef.current) audioWsRef.current.close(1000);
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+        audioContextRef.current.close().catch(() => {});
+      }
     };
   }, []);
 

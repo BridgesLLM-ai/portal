@@ -26,10 +26,19 @@ const PULSE_SOCKET = 'unix:/tmp/bridges-rd-runtime/pulse/native';
 const CHUNK_SIZE = 8820;
 
 let wss: WebSocketServer | null = null;
+let httpServer: http.Server | null = null;
 let parecProcess: ChildProcess | null = null;
 let clientCount = 0;
+let parecRestartTimer: ReturnType<typeof setTimeout> | null = null;
+let stopGraceTimer: ReturnType<typeof setTimeout> | null = null;
 
 function startParec(): ChildProcess | null {
+  // Clear any pending restart timer
+  if (parecRestartTimer) {
+    clearTimeout(parecRestartTimer);
+    parecRestartTimer = null;
+  }
+
   if (parecProcess && !parecProcess.killed) {
     return parecProcess;
   }
@@ -57,11 +66,15 @@ function startParec(): ChildProcess | null {
 
     proc.on('close', (code) => {
       console.log(`[AudioProxy] parec exited with code ${code}`);
-      parecProcess = null;
-      // Restart if clients are still connected
-      if (clientCount > 0) {
+      const wasCurrent = parecProcess === proc;
+      if (wasCurrent) parecProcess = null;
+      
+      // Only restart if this was the current process AND clients are still connected
+      if (wasCurrent && clientCount > 0) {
         console.log('[AudioProxy] Restarting parec (clients still connected)...');
-        setTimeout(() => startParec(), 1000);
+        parecRestartTimer = setTimeout(() => {
+          if (clientCount > 0) startParec();
+        }, 1000);
       }
     });
 
@@ -86,7 +99,7 @@ function startParec(): ChildProcess | null {
               try {
                 client.send(chunk);
               } catch {
-                // Client disconnected
+                // Client disconnected — handled by close event
               }
             }
           }
@@ -104,6 +117,10 @@ function startParec(): ChildProcess | null {
 }
 
 function stopParec() {
+  if (parecRestartTimer) {
+    clearTimeout(parecRestartTimer);
+    parecRestartTimer = null;
+  }
   if (parecProcess && !parecProcess.killed) {
     parecProcess.kill('SIGTERM');
     parecProcess = null;
@@ -132,6 +149,12 @@ export function startAudioProxy(): WebSocketServer | null {
       clientCount++;
       console.log(`[AudioProxy] Client connected (${clientCount} total)`);
 
+      // Clear any pending stop timer
+      if (stopGraceTimer) {
+        clearTimeout(stopGraceTimer);
+        stopGraceTimer = null;
+      }
+
       // Send audio config to client
       ws.send(JSON.stringify({
         type: 'config',
@@ -147,14 +170,14 @@ export function startAudioProxy(): WebSocketServer | null {
       }
 
       ws.on('close', () => {
-        clientCount--;
+        clientCount = Math.max(0, clientCount - 1);
         console.log(`[AudioProxy] Client disconnected (${clientCount} remaining)`);
-        // Stop parec if no clients (save CPU)
+        // Stop parec if no clients (save CPU) — grace period
         if (clientCount <= 0) {
-          clientCount = 0;
-          setTimeout(() => {
+          stopGraceTimer = setTimeout(() => {
             if (clientCount <= 0) stopParec();
-          }, 5000); // Grace period
+            stopGraceTimer = null;
+          }, 5000);
         }
       });
 
@@ -162,6 +185,8 @@ export function startAudioProxy(): WebSocketServer | null {
         // Handled by close event
       });
     });
+
+    httpServer = server;
 
     server.listen(AUDIO_PORT, '127.0.0.1', () => {
       console.log(`[AudioProxy] WebSocket server listening on 127.0.0.1:${AUDIO_PORT}`);
@@ -172,6 +197,8 @@ export function startAudioProxy(): WebSocketServer | null {
         console.warn(`[AudioProxy] Port ${AUDIO_PORT} in use, retrying in 3s...`);
         setTimeout(() => {
           server.close();
+          wss = null;
+          httpServer = null;
           startAudioProxy();
         }, 3000);
       } else {
@@ -187,6 +214,10 @@ export function startAudioProxy(): WebSocketServer | null {
 }
 
 export function stopAudioProxy() {
+  if (stopGraceTimer) {
+    clearTimeout(stopGraceTimer);
+    stopGraceTimer = null;
+  }
   stopParec();
   if (wss) {
     for (const client of wss.clients) {
@@ -194,6 +225,10 @@ export function stopAudioProxy() {
     }
     wss.close();
     wss = null;
-    console.log('[AudioProxy] Stopped');
   }
+  if (httpServer) {
+    httpServer.close();
+    httpServer = null;
+  }
+  console.log('[AudioProxy] Stopped');
 }
