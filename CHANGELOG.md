@@ -1,5 +1,33 @@
 # Changelog
 
+## [3.17.0] — 2026-03-20
+
+### Added
+- **Remote Desktop Audio** — Full audio pipeline from VNC desktop to browser
+  - PulseAudio virtual sink captures all desktop audio (pygame, browser, any app)
+  - WebSocket proxy streams raw PCM at CD quality (44100Hz, 16-bit, stereo)
+  - Web Audio API playback with low-latency scheduling (~30ms end-to-end)
+  - Volume control slider in Remote Desktop toolbar
+  - Auto-reconnect on network interruptions
+  - Mobile Safari / older Android compatibility (webkitAudioContext, user gesture handling)
+  - Tab visibility handling prevents audio burst on return
+- **Auto-Dependency Detection** — Python/C++/Node projects auto-detect and install deps
+  - Scans requirements.txt, import statements, #include headers, package.json
+  - Per-project Python virtual environments (PEP 668 compatible)
+  - SSE progress streaming with unified progress notification UI
+  - Dependency cache prevents redundant reinstalls
+
+### Fixed
+- Python projects now have audio — xterm launch exports PulseAudio environment variables
+- PulseAudio `module-suspend-on-idle` blocked parec from streaming (unloaded on startup)
+- `.venv` and `.deps-installed` excluded from project downloads and file tree
+- Upload progress bar visibility (initial width fix)
+- parec latency reduced (20ms buffer), Web Audio scheduling tightened
+
+### Security
+- All user-derived values in exec calls sanitized via `shellEscape()`
+
+
 All notable changes to BridgesLLM Portal are documented here.
 
 ## [3.14.0] — 2026-03-17
