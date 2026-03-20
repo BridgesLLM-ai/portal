@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.17.1] — 2026-03-20
+
+### Fixed
+- **ZIP uploads use pure JS extraction** — Replaced system `unzip` binary dependency with `extract-zip` (yauzl). Fresh servers no longer need `unzip` installed. Also eliminates shell injection risk from string-interpolated exec calls.
+- **Remote Desktop race condition** — Stock `vncserver@1.service` (from tigervnc package) competed with `bridges-rd-xtigervnc` for display `:1`. On fresh installs it could win the race, launching a bare VNC session with no desktop theme, no PulseAudio, no XFCE. Auto-setup now disables and masks the stock service.
+- **Dashboard updater version tracking** — `PORTAL_VERSION` was stuck at `3.14.0` since initial release; update checker never showed available updates.
+
 ## [3.17.0] — 2026-03-20
 
 ### Added
