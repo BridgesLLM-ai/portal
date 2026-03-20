@@ -8,6 +8,7 @@ import { execFileSync, execSync } from 'child_process';
 import { nanoid } from 'nanoid';
 import bcrypt from 'bcrypt';
 import { authenticateToken } from '../middleware/auth';
+import extract from 'extract-zip';
 import { scanFile } from '../services/virusScan';
 import { prisma } from '../config/database';
 import { config } from '../config/env';
@@ -60,23 +61,8 @@ router.post('/', authenticateToken, upload.single('file'), async (req: Request, 
     const appDir = path.join(APPS_DIR, `${req.user!.userId}-${name}-${Date.now()}`);
 
     fs.mkdirSync(appDir, { recursive: true });
-    // Use -j to prevent path traversal (zip slip), then verify extracted paths
-    execFileSync('unzip', ['-o', req.file.path, '-d', appDir], { timeout: 30000 });
-
-    // Post-extract: verify no files escaped the target directory
-    try {
-      const files = execFileSync('find', [appDir, '-type', 'f'], { encoding: 'utf-8', timeout: 5000 }).trim().split('\n');
-      for (const f of files) {
-        const resolved = path.resolve(f);
-        if (!resolved.startsWith(path.resolve(appDir))) {
-          // Zip slip detected — nuke the directory
-          execFileSync('rm', ['-rf', appDir], { timeout: 5000 });
-          fs.unlinkSync(req.file.path);
-          res.status(400).json({ error: 'Malicious zip detected: path traversal attempt blocked' });
-          return;
-        }
-      }
-    } catch {}
+    // extract-zip uses yauzl which validates entry paths against zip slip by default
+    await extract(req.file.path, { dir: path.resolve(appDir) });
 
 
     // Auto-detect project type

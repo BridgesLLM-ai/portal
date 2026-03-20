@@ -13,6 +13,7 @@ import { nanoid } from 'nanoid';
 import { gatewayRpcCall, patchSessionModel, getSessionInfo, listGatewayModels, deleteSession } from '../utils/openclawGatewayRpc';
 import { detectDeployType, allocatePort, startApp, stopApp, getAppStatus, getAppPort, listRunningApps } from '../services/app-process.service';
 import { getWorkspaceOwnerId } from '../utils/workspaceScope';
+import extract from 'extract-zip';
 import { getGatewayToken } from '../utils/gatewayToken';
 
 /** Shell-escape a filename for safe use in execSync commands */
@@ -980,8 +981,8 @@ router.post('/upload-zip', authenticateToken, zipUpload.single('file'), async (r
 
     fs.mkdirSync(projectDir, { recursive: true });
 
-    // Extract ZIP
-    execSync(`unzip -o "${req.file.path}" -d "${projectDir}"`, { timeout: 30000 });
+    // Extract ZIP (pure JS — no system unzip dependency)
+    await extract(req.file.path, { dir: path.resolve(projectDir) });
 
     // If there's a single subdirectory, move its contents up
     const entries = fs.readdirSync(projectDir);
@@ -1068,8 +1069,8 @@ router.post('/create-from-upload', authenticateToken, async (req: Request, res: 
 
     fs.mkdirSync(projectDir, { recursive: true });
 
-    // Extract ZIP
-    execSync(`unzip -o "${fullPath}" -d "${projectDir}"`, { timeout: 60000 });
+    // Extract ZIP (pure JS — no system unzip dependency)
+    await extract(fullPath, { dir: path.resolve(projectDir) });
 
     // If there's a single subdirectory, move its contents up
     const entries = fs.readdirSync(projectDir);
