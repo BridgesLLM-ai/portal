@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { motion } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
-import { Monitor, Maximize2, Minimize2, RefreshCw, ExternalLink, AlertTriangle, Wifi, WifiOff, Settings, Play } from 'lucide-react';
+import { Monitor, Maximize2, Minimize2, RefreshCw, ExternalLink, AlertTriangle, Wifi, WifiOff, Settings, Play, Volume2, VolumeX } from 'lucide-react';
 
 type RemoteDesktopHealth = 'loading' | 'ready' | 'degraded' | 'unavailable';
 
@@ -36,6 +36,150 @@ export default function DesktopPage() {
   const [setupResult, setSetupResult] = useState<{ ok: boolean; message: string } | null>(null);
   // Track whether backend reports services not installed (no systemd units)
   const [servicesInstalled, setServicesInstalled] = useState<boolean | null>(null);
+
+  // Audio state
+  const [audioEnabled, setAudioEnabled] = useState(false);
+  const [audioConnected, setAudioConnected] = useState(false);
+  const audioWsRef = useRef<WebSocket | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioGainRef = useRef<GainNode | null>(null);
+  const [audioVolume, setAudioVolume] = useState(0.8);
+
+  // Audio WebSocket connection
+  const connectAudio = useCallback(() => {
+    if (audioWsRef.current) {
+      audioWsRef.current.close();
+      audioWsRef.current = null;
+    }
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/novnc/audio`;
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+
+    let audioCtx: AudioContext | null = null;
+    let gainNode: GainNode | null = null;
+    let sampleRate = 44100;
+    let channels = 2;
+    let nextPlayTime = 0;
+
+    ws.onopen = () => {
+      setAudioConnected(true);
+      console.log('[Audio] WebSocket connected');
+    };
+
+    ws.onmessage = (event) => {
+      if (typeof event.data === 'string') {
+        // Config message
+        try {
+          const config = JSON.parse(event.data);
+          if (config.type === 'config') {
+            sampleRate = config.sampleRate || 44100;
+            channels = config.channels || 2;
+            
+            // Create AudioContext on first config
+            if (!audioCtx) {
+              audioCtx = new AudioContext({ sampleRate });
+              gainNode = audioCtx.createGain();
+              gainNode.gain.value = audioVolume;
+              gainNode.connect(audioCtx.destination);
+              audioContextRef.current = audioCtx;
+              audioGainRef.current = gainNode;
+              nextPlayTime = audioCtx.currentTime;
+            }
+          }
+        } catch { /* ignore */ }
+        return;
+      }
+
+      // Binary PCM data
+      if (!audioCtx || !gainNode || audioCtx.state === 'closed') return;
+
+      // Resume if suspended (browser autoplay policy)
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+
+      const pcmData = new Int16Array(event.data);
+      const numSamples = pcmData.length / channels;
+      
+      if (numSamples <= 0) return;
+
+      // Create audio buffer
+      const audioBuffer = audioCtx.createBuffer(channels, numSamples, sampleRate);
+      
+      // Convert Int16 to Float32 and deinterleave channels
+      for (let ch = 0; ch < channels; ch++) {
+        const channelData = audioBuffer.getChannelData(ch);
+        for (let i = 0; i < numSamples; i++) {
+          channelData[i] = pcmData[i * channels + ch] / 32768;
+        }
+      }
+
+      // Schedule playback
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(gainNode);
+
+      const currentTime = audioCtx.currentTime;
+      // If we've fallen behind, catch up
+      if (nextPlayTime < currentTime) {
+        nextPlayTime = currentTime + 0.02; // 20ms buffer
+      }
+      source.start(nextPlayTime);
+      nextPlayTime += audioBuffer.duration;
+    };
+
+    ws.onclose = () => {
+      setAudioConnected(false);
+      console.log('[Audio] WebSocket disconnected');
+    };
+
+    ws.onerror = () => {
+      setAudioConnected(false);
+    };
+
+    audioWsRef.current = ws;
+  }, [audioVolume]);
+
+  const disconnectAudio = useCallback(() => {
+    if (audioWsRef.current) {
+      audioWsRef.current.close();
+      audioWsRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+    audioGainRef.current = null;
+    setAudioConnected(false);
+  }, []);
+
+  // Toggle audio
+  const toggleAudio = useCallback(() => {
+    if (audioEnabled) {
+      disconnectAudio();
+      setAudioEnabled(false);
+    } else {
+      setAudioEnabled(true);
+      connectAudio();
+    }
+  }, [audioEnabled, connectAudio, disconnectAudio]);
+
+  // Update volume when slider changes
+  useEffect(() => {
+    if (audioGainRef.current) {
+      audioGainRef.current.gain.value = audioVolume;
+    }
+  }, [audioVolume]);
+
+  // Cleanup audio on unmount
+  useEffect(() => {
+    return () => {
+      if (audioWsRef.current) audioWsRef.current.close();
+      if (audioContextRef.current) audioContextRef.current.close();
+    };
+  }, []);
 
   useEffect(() => {
     const loadSettings = async () => {
@@ -242,6 +386,35 @@ export default function DesktopPage() {
           {configState.kind === 'ok' && (
             <a href={configUrl} target="_blank" rel="noopener noreferrer" className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-w-[44px] min-h-[44px] items-center justify-center hidden sm:flex" title="Open in new tab"><ExternalLink size={16} /></a>
           )}
+          {/* Audio controls */}
+          <div className="flex items-center gap-1 border-l border-white/10 pl-2 ml-1">
+            <button
+              onClick={toggleAudio}
+              className={`p-2 rounded-lg transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center ${
+                audioEnabled
+                  ? audioConnected
+                    ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
+                    : 'bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'
+                  : 'hover:bg-white/5 text-slate-400 hover:text-white'
+              }`}
+              title={audioEnabled ? (audioConnected ? 'Audio on (click to mute)' : 'Audio connecting...') : 'Enable audio'}
+            >
+              {audioEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
+            </button>
+            {audioEnabled && (
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={audioVolume}
+                onChange={(e) => setAudioVolume(parseFloat(e.target.value))}
+                className="w-16 sm:w-20 h-1 accent-emerald-500 cursor-pointer"
+                title={`Volume: ${Math.round(audioVolume * 100)}%`}
+              />
+            )}
+          </div>
+
           <button onClick={toggleFullscreen} className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center" title="Fullscreen">{fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}</button>
         </div>
       </div>

@@ -50,6 +50,7 @@ import { initPersistentGatewayWs, shutdownPersistentGatewayWs } from './agents/p
 import { canAccessPortal, canUseInteractivePortal, isElevatedRole } from './utils/authz';
 import { isAllowedWebSocketOrigin } from './utils/websocketOrigin';
 import { startTelemetryService, stopTelemetryService } from './services/telemetryService';
+import { startAudioProxy, stopAudioProxy } from './services/audioProxy';
 
 const app = express();
 const httpServer = createServer(app);
@@ -256,6 +257,25 @@ const novncWsProxy = createProxyMiddleware({
     },
   },
 } as any);
+
+// Remote Desktop Audio WebSocket proxy → audio proxy on port 4714
+const audioWsTarget = process.env.RD_AUDIO_TARGET || 'http://127.0.0.1:4714';
+const audioWsProxy = createProxyMiddleware({
+  target: audioWsTarget,
+  ws: true,
+  changeOrigin: true,
+  pathRewrite: { '^/novnc/audio': '/' },
+  on: {
+    error: (err: Error, _req: any, res: any) => {
+      console.error('[Audio WS] Proxy error:', err.message);
+      if (res && typeof res.writeHead === 'function') {
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end('Audio bridge unavailable');
+      }
+    },
+  },
+} as any);
+
 // Cookie parsing — must be before any auth middleware that reads req.cookies
 app.use(cookieParser());
 
@@ -286,8 +306,9 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // Auth-gated noVNC — portal JWT required (after cookieParser so req.cookies is available)
-// WebSocket proxy must be registered BEFORE the static handler to avoid path conflicts
+// WebSocket proxies must be registered BEFORE the static handler to avoid path conflicts
 app.use('/novnc/websockify', authenticateToken, novncWsProxy);
+app.use('/novnc/audio', authenticateToken, audioWsProxy);
 
 // Serve noVNC static files directly (version-pinned, cache-busting headers)
 app.use('/novnc', authenticateToken, express.static(path.join(__dirname, '../../static/novnc'), {
@@ -797,6 +818,7 @@ const shutdownHandler = async (signal: string) => {
   stopStatusWatcher();
   shutdownCronJobs();
   stopTelemetryService();
+  stopAudioProxy();
   shutdownPersistentGatewayWs();
   try {
     io.close();
@@ -853,6 +875,9 @@ const startServer = async () => {
     // Start telemetry sender
     startTelemetryService();
 
+    // Start Remote Desktop audio proxy (PulseAudio → WebSocket)
+    startAudioProxy();
+
     // Attach portal chat WebSocket server (browser ↔ portal)
     attachPortalWebSocket(httpServer);
 
@@ -891,6 +916,41 @@ const startServer = async () => {
           }
           // noVNC WebSocket upgrade — only /novnc/websockify goes to websockify
           (novncWsProxy as any).upgrade(req, socket, head);
+        }).catch(() => {
+          socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+          socket.destroy();
+        });
+      } else if (req.url?.startsWith('/novnc/audio')) {
+        // Audio WebSocket upgrade — same auth as VNC
+        const origin = req.headers.origin;
+        if (!isAllowedWebSocketOrigin(origin)) {
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        const cookies = parseCookies(req.headers.cookie || '');
+        const token = cookies.accessToken;
+        if (!token) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        const payload = verifyAccessToken(token);
+        if (!payload) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        prisma.user.findUnique({
+          where: { id: payload.userId },
+          select: { id: true, role: true, accountStatus: true, isActive: true },
+        } as any).then((user) => {
+          if (!user || !canUseInteractivePortal(user.role, (user as any).accountStatus, user.isActive)) {
+            socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+            socket.destroy();
+            return;
+          }
+          (audioWsProxy as any).upgrade(req, socket, head);
         }).catch(() => {
           socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
           socket.destroy();
