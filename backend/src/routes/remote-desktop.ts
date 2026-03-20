@@ -255,7 +255,7 @@ export async function runRemoteDesktopAutoSetup(): Promise<{ ok: boolean; steps:
 
     // Step 1: Install packages if missing (idempotent — apt skips already-installed)
     // Matches production setup: full XFCE desktop + goodies, x11-utils for xdpyinfo, Google Chrome for browsing
-    const requiredPkgs = ['tigervnc-standalone-server', 'novnc', 'websockify', 'xfce4', 'xfce4-goodies', 'xfce4-terminal', 'dbus-x11', 'x11-utils', 'firefox', 'pulseaudio', 'pulseaudio-utils'];
+    const requiredPkgs = ['tigervnc-standalone-server', 'novnc', 'websockify', 'xfce4', 'xfce4-goodies', 'xfce4-terminal', 'dbus-x11', 'x11-utils', 'xterm', 'firefox', 'pulseaudio', 'pulseaudio-utils', 'librsvg2-common'];
     const pkgCheck = await runShell(`dpkg -s ${requiredPkgs.join(' ')} 2>/dev/null | grep -c "Status: install ok installed"`);
     const installedCount = parseInt(pkgCheck.stdout, 10) || 0;
     if (installedCount < requiredPkgs.length) {
@@ -386,6 +386,9 @@ pkill -u "$RD_USER" -f "Xvfb" 2>/dev/null || true
 
 # Kill any leftover XFCE sessions from this user before starting fresh
 pkill -u "$RD_USER" -f "xfce4-session" 2>/dev/null || true
+
+# Clear saved session cache so fresh configs always apply on restart
+rm -rf /home/"$RD_USER"/.cache/sessions/* 2>/dev/null || true
 
 # Ensure XDG_RUNTIME_DIR exists for the desktop user
 mkdir -p "$XDG_DIR"
