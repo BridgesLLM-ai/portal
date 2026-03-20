@@ -1606,13 +1606,15 @@ async function detectPythonDeps(projectDir: string, files: string[]): Promise<De
     return { needsInstall: false, language: 'python', packages: [] };
   }
   
-  // Check which packages are already installed
+  // Check which packages are already installed (check venv first, then system)
   const installedPackages: string[] = [];
   const missingPackages: string[] = [];
+  const venvPip = path.join(projectDir, '.venv', 'bin', 'pip');
+  const pipCmd = fs.existsSync(venvPip) ? venvPip : 'pip3';
   
   for (const pkg of requiredPackages) {
     try {
-      execSync(`pip3 show ${shellEscape(pkg)} 2>/dev/null`, { encoding: 'utf-8' });
+      execSync(`${shellEscape(pipCmd)} show ${shellEscape(pkg)} 2>/dev/null`, { encoding: 'utf-8' });
       installedPackages.push(pkg);
     } catch {
       missingPackages.push(pkg);
@@ -1624,7 +1626,7 @@ async function detectPythonDeps(projectDir: string, files: string[]): Promise<De
     language: 'python',
     packages: missingPackages,
     installedPackages,
-    command: missingPackages.length > 0 ? `pip3 install ${missingPackages.join(' ')}` : undefined,
+    command: missingPackages.length > 0 ? `pip install ${missingPackages.join(' ')}` : undefined,
   };
 }
 
@@ -1812,8 +1814,22 @@ router.post('/:name/install-deps', authenticateToken, async (req: Request, res: 
     let installProcess: ReturnType<typeof spawn>;
     
     if (result.language === 'python') {
-      // Install Python packages
-      installProcess = spawn('pip3', ['install', ...result.packages], {
+      // Install Python packages in a virtual environment
+      const venvDir = path.join(projectDir, '.venv');
+      if (!fs.existsSync(venvDir)) {
+        // Create venv first
+        sendEvent('log', { text: 'Creating virtual environment...', type: 'stdout' });
+        try {
+          execSync(`python3 -m venv ${shellEscape(venvDir)}`, { timeout: 30000 });
+        } catch (venvErr: any) {
+          // python3-venv may not be installed
+          sendEvent('log', { text: 'Installing python3-venv...', type: 'stdout' });
+          execSync('sudo apt-get install -y python3-venv', { timeout: 60000, env: { ...process.env, DEBIAN_FRONTEND: 'noninteractive' } });
+          execSync(`python3 -m venv ${shellEscape(venvDir)}`, { timeout: 30000 });
+        }
+      }
+      const pipPath = path.join(venvDir, 'bin', 'pip');
+      installProcess = spawn(pipPath, ['install', ...result.packages], {
         cwd: projectDir,
         env: { ...process.env },
       });
@@ -1989,12 +2005,16 @@ router.post('/:name/deploy', authenticateToken, async (req: Request, res: Respon
       let installCommand = '';
       
       if (files.includes('main.py') || files.includes('requirements.txt')) {
-        // Python project
+        // Python project — use venv if it exists (created by install-deps), fall back to system python
+        const venvPython = path.join(projectDir, '.venv', 'bin', 'python');
+        const venvPip = path.join(projectDir, '.venv', 'bin', 'pip');
+        const usePython = fs.existsSync(venvPython) ? venvPython : 'python3';
+        const usePip = fs.existsSync(venvPip) ? venvPip : 'pip3';
         if (files.includes('requirements.txt')) {
-          installCommand = `pip3 install -r requirements.txt 2>&1`;
+          installCommand = `${shellEscape(usePip)} install -r requirements.txt 2>&1`;
         }
         const mainFile = files.includes('main.py') ? 'main.py' : files.find(f => f.endsWith('.py')) || 'main.py';
-        runCommand = `python3 ${shellEscape(mainFile)}`;
+        runCommand = `${shellEscape(usePython)} ${shellEscape(mainFile)}`;
         buildOutput += '\nDetected: Python project';
       } else if (files.includes('main.cpp') || files.includes('Makefile')) {
         // C++ project
