@@ -231,11 +231,12 @@ function UploadProgressCard({ upload }: { upload: ActiveUpload }) {
           {isComplete && <span className="text-[11px] text-emerald-400 font-medium">✓ Upload complete</span>}
 
           {/* Mini progress bar */}
-          <div className="relative h-1 bg-white/5 rounded-full overflow-hidden">
+          <div className="relative h-1.5 bg-white/10 rounded-full overflow-hidden">
             <motion.div
               className={`absolute left-0 top-0 h-full rounded-full ${
                 isError ? 'bg-red-500' : isPaused ? 'bg-amber-500' : 'bg-gradient-to-r from-emerald-500 to-blue-500'
               }`}
+              initial={{ width: '0%' }}
               animate={{ width: `${pct}%` }}
               transition={{ duration: 0.5, ease: [0.34, 1.56, 0.64, 1] }}
             />
