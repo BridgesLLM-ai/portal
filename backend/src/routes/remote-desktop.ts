@@ -255,7 +255,7 @@ export async function runRemoteDesktopAutoSetup(): Promise<{ ok: boolean; steps:
 
     // Step 1: Install packages if missing (idempotent — apt skips already-installed)
     // Matches production setup: full XFCE desktop + goodies, x11-utils for xdpyinfo, Google Chrome for browsing
-    const requiredPkgs = ['tigervnc-standalone-server', 'novnc', 'websockify', 'xfce4', 'xfce4-goodies', 'xfce4-terminal', 'dbus-x11', 'x11-utils', 'firefox'];
+    const requiredPkgs = ['tigervnc-standalone-server', 'novnc', 'websockify', 'xfce4', 'xfce4-goodies', 'xfce4-terminal', 'dbus-x11', 'x11-utils', 'firefox', 'pulseaudio', 'pulseaudio-utils'];
     const pkgCheck = await runShell(`dpkg -s ${requiredPkgs.join(' ')} 2>/dev/null | grep -c "Status: install ok installed"`);
     const installedCount = parseInt(pkgCheck.stdout, 10) || 0;
     if (installedCount < requiredPkgs.length) {
@@ -414,11 +414,30 @@ for i in $(seq 1 20); do
   sleep 0.5
 done
 
+# Start PulseAudio for audio support (virtual null sink → browser WebSocket)
+su - "$RD_USER" -c "
+  export XDG_RUNTIME_DIR=$XDG_DIR
+  # Kill stale PulseAudio
+  pulseaudio --kill 2>/dev/null || true
+  sleep 0.5
+  # Start PulseAudio daemon with virtual null sink as default
+  pulseaudio --start --exit-idle-time=-1 2>>$LOG_DIR/pulseaudio.log
+  sleep 0.5
+  # Verify and set default sink
+  export PULSE_SERVER=unix:$XDG_DIR/pulse/native
+  pactl set-default-sink auto_null 2>/dev/null || true
+  echo 'PulseAudio started'
+" &
+PA_PID=$!
+wait $PA_PID 2>/dev/null || true
+echo "PulseAudio initialized"
+
 # Start XFCE as bridgesrd user on display :1
 # Note: redirect is inside su -c to avoid fs.protected_regular issues with /tmp
 su - "$RD_USER" -c "
   export DISPLAY=$DISPLAY_NUM
   export XDG_RUNTIME_DIR=$XDG_DIR
+  export PULSE_SERVER=unix:$XDG_DIR/pulse/native
   dbus-launch --exit-with-session startxfce4 >>$LOG_DIR/xfce.log 2>&1
 " &
 
