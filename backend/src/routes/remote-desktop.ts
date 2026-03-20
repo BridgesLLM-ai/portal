@@ -256,9 +256,11 @@ export async function runRemoteDesktopAutoSetup(): Promise<{ ok: boolean; steps:
     // Step 1: Install packages if missing (idempotent — apt skips already-installed)
     // Matches production setup: full XFCE desktop + goodies, x11-utils for xdpyinfo, Google Chrome for browsing
     const requiredPkgs = ['tigervnc-standalone-server', 'novnc', 'websockify', 'xfce4', 'xfce4-goodies', 'xfce4-terminal', 'dbus-x11', 'x11-utils', 'xterm', 'firefox', 'pulseaudio', 'pulseaudio-utils', 'librsvg2-common'];
-    const pkgCheck = await runShell(`dpkg -s ${requiredPkgs.join(' ')} 2>/dev/null | grep -c "Status: install ok installed"`);
-    const installedCount = parseInt(pkgCheck.stdout, 10) || 0;
-    if (installedCount < requiredPkgs.length) {
+    // Check each package individually — count-based check was unreliable because
+    // meta-packages (xfce4-goodies) inflate the count, masking missing packages
+    const missingCheck = await runShell(`for pkg in ${requiredPkgs.join(' ')}; do dpkg -s "$pkg" &>/dev/null || echo "$pkg"; done`);
+    const missingPkgs = missingCheck.stdout.trim();
+    if (missingPkgs.length > 0) {
       const install = await runShell(
         `DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${requiredPkgs.join(' ')}`,
         600000, // 10 minutes — xfce4 + firefox can take 3-5 min on fresh servers
