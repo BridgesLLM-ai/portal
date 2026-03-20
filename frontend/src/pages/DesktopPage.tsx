@@ -108,12 +108,17 @@ export default function DesktopPage() {
 
     ws.onopen = () => {
       setAudioConnected(true);
-      console.log('[Audio] WebSocket connected');
+      console.log('[Audio] WebSocket connected to', wsUrl);
     };
 
+    let messageCount = 0;
+    let totalBinaryBytes = 0;
+
     ws.onmessage = (event) => {
+      messageCount++;
       if (typeof event.data === 'string') {
         // Config message from server
+        console.log('[Audio] Config received:', event.data);
         try {
           const config = JSON.parse(event.data);
           if (config.type === 'config') {
@@ -121,19 +126,29 @@ export default function DesktopPage() {
               sampleRate: config.sampleRate || 44100,
               channels: config.channels || 2,
             };
+            console.log('[Audio] Config set:', audioConfigRef.current);
           }
         } catch { /* ignore parse errors */ }
         return;
       }
 
       // Binary PCM data
+      totalBinaryBytes += event.data.byteLength;
+      if (messageCount <= 5 || messageCount % 100 === 0) {
+        console.log(`[Audio] Binary chunk #${messageCount}: ${event.data.byteLength} bytes (total: ${totalBinaryBytes})`);
+      }
+
       const audioCtx = audioContextRef.current;
       const gainNode = audioGainRef.current;
-      if (!audioCtx || !gainNode || audioCtx.state === 'closed') return;
+      if (!audioCtx || !gainNode || audioCtx.state === 'closed') {
+        if (messageCount <= 3) console.warn('[Audio] No AudioContext or gain node, dropping chunk. ctx:', audioCtx?.state, 'gain:', !!gainNode);
+        return;
+      }
 
       // Resume if suspended (autoplay policy — the initial resume happens on user gesture in toggleAudio)
       if (audioCtx.state === 'suspended') {
-        audioCtx.resume().catch(() => {});
+        console.log('[Audio] Resuming suspended AudioContext...');
+        audioCtx.resume().catch((e) => console.error('[Audio] Resume failed:', e));
       }
 
       const { sampleRate, channels } = audioConfigRef.current;
@@ -160,12 +175,13 @@ export default function DesktopPage() {
 
       // If we've fallen behind (tab was backgrounded, network lag, etc.),
       // skip ahead instead of playing a burst of stale audio
-      if (playAt < now - 0.5) {
-        // More than 500ms behind — hard reset
-        playAt = now + 0.05;
+      if (playAt < now - 0.3) {
+        // More than 300ms behind — hard reset, play almost immediately
+        playAt = now + 0.01;
+        if (messageCount <= 10) console.log('[Audio] Hard reset playback (was >300ms behind)');
       } else if (playAt < now) {
         // Slight drift — soft catch-up
-        playAt = now + 0.02;
+        playAt = now + 0.005;
       }
 
       source.start(playAt);
@@ -216,14 +232,16 @@ export default function DesktopPage() {
 
   // Toggle audio — MUST be called from user gesture (click handler) for mobile Safari
   const toggleAudio = useCallback(() => {
+    console.log('[Audio] Toggle clicked. Currently:', audioEnabled ? 'ON' : 'OFF');
     if (audioEnabled) {
       disconnectAudio();
       setAudioEnabled(false);
     } else {
       // Create AudioContext HERE in the click handler (user gesture requirement)
       const ctx = getOrCreateAudioContext();
+      console.log('[Audio] AudioContext:', ctx?.state, 'sampleRate:', ctx?.sampleRate);
       if (ctx && ctx.state === 'suspended') {
-        ctx.resume().catch(() => {});
+        ctx.resume().then(() => console.log('[Audio] AudioContext resumed')).catch((e) => console.error('[Audio] Resume failed:', e));
       }
       setAudioEnabled(true);
       connectAudio();

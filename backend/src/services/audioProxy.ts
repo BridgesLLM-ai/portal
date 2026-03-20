@@ -54,6 +54,7 @@ function startParec(): ChildProcess | null {
       `--format=${FORMAT}`,
       `--rate=${SAMPLE_RATE}`,
       `--channels=${CHANNELS}`,
+      '--latency-msec=20',
       '-d', 'auto_null.monitor',
     ], {
       stdio: ['ignore', 'pipe', 'pipe'],
