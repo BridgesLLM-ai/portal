@@ -12,6 +12,7 @@ import ProjectChatPanel from '../components/chat/ProjectChatPanel';
 import { useIsMobile } from '../hooks/useIsMobile';
 import MobileOverflowMenu, { MenuAction } from '../components/mobile/MobileOverflowMenu';
 import sounds from '../utils/sounds';
+import { ProgressNotification, ProgressNotificationProps } from '../components/shared/ProgressNotification';
 import {
   Rocket, Play, Plus, Trash2, X, Loader2, FolderOpen, FileText, FileCode,
   GitBranch, GitCommit, Upload, ChevronRight, ChevronDown,
@@ -622,6 +623,10 @@ export default function AppsPage() {
   const [deployStatus, setDeployStatus] = useState<'idle' | 'deploying' | 'success' | 'failed'>('idle');
   const [isRuntimeProject, setIsRuntimeProject] = useState(false);
   const [checkingProject, setCheckingProject] = useState(false);
+  
+  // Progress notification state for deploy/install flow
+  const [progressNotification, setProgressNotification] = useState<ProgressNotificationProps | null>(null);
+  const installEventSourceRef = useRef<EventSource | null>(null);
 
   // Create dialog
   const [showCreate, setShowCreate] = useState(false);
@@ -1248,33 +1253,243 @@ export default function AppsPage() {
     } catch (err) { showErrorToast(err, `Resetting file: ${filePath}`); }
   };
 
+  // Install dependencies via SSE stream (using fetch for POST with SSE)
+  const installDependencies = async (projectName: string): Promise<boolean> => {
+    const apiUrl = import.meta.env.VITE_API_URL || '/api';
+    const abortController = new AbortController();
+    installEventSourceRef.current = { close: () => abortController.abort() } as any;
+    
+    const logs: string[] = [];
+    let success = false;
+    
+    try {
+      const response = await fetch(`${apiUrl}/projects/${encodeURIComponent(projectName)}/install-deps`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        signal: abortController.signal,
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to start installation');
+      }
+      
+      // Check if response is SSE or JSON
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        // Already completed or no deps needed
+        const data = await response.json();
+        if (data.success || data.cached) {
+          return true;
+        }
+        return false;
+      }
+      
+      // Parse SSE stream
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('No response body');
+      
+      const decoder = new TextDecoder();
+      let buffer = '';
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        
+        let eventType = '';
+        let eventData = '';
+        
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            eventType = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            eventData = line.slice(6);
+            
+            if (eventType && eventData) {
+              try {
+                const data = JSON.parse(eventData);
+                
+                if (eventType === 'start') {
+                  setProgressNotification({
+                    id: `install-${projectName}`,
+                    title: 'Installing Dependencies',
+                    status: 'active',
+                    progress: 5,
+                    statusText: `Installing ${data.packages?.length || 0} packages...`,
+                    logs: [`$ ${data.command || 'Installing...'}`],
+                    onCancel: () => {
+                      abortController.abort();
+                      installEventSourceRef.current = null;
+                      setProgressNotification(null);
+                    },
+                    onDismiss: () => setProgressNotification(null),
+                  });
+                } else if (eventType === 'progress') {
+                  if (data.text) logs.push(data.text);
+                  setProgressNotification(prev => prev ? {
+                    ...prev,
+                    progress: Math.min(90, data.progress || prev.progress + 5),
+                    statusText: data.text || prev.statusText,
+                    logs: [...logs].slice(-50),
+                  } : null);
+                } else if (eventType === 'log') {
+                  if (data.text) logs.push(data.text);
+                  setProgressNotification(prev => prev ? {
+                    ...prev,
+                    logs: [...logs].slice(-50),
+                  } : null);
+                } else if (eventType === 'complete') {
+                  success = true;
+                  setProgressNotification(prev => prev ? {
+                    ...prev,
+                    status: 'complete',
+                    progress: 100,
+                    statusText: data.message || 'Dependencies installed!',
+                    onCancel: undefined,
+                  } : null);
+                } else if (eventType === 'error') {
+                  setProgressNotification(prev => prev ? {
+                    ...prev,
+                    status: 'error',
+                    statusText: 'Installation failed',
+                    error: data.message || 'Unknown error',
+                    onCancel: undefined,
+                  } : null);
+                }
+              } catch (parseError) {
+                console.warn('Failed to parse SSE data:', eventData);
+              }
+              eventType = '';
+              eventData = '';
+            }
+          }
+        }
+      }
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        return false;
+      }
+      setProgressNotification(prev => prev ? {
+        ...prev,
+        status: 'error',
+        statusText: 'Installation failed',
+        error: err.message || 'Unknown error',
+        onCancel: undefined,
+      } : null);
+      return false;
+    } finally {
+      installEventSourceRef.current = null;
+    }
+    
+    if (success) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+    return success;
+  };
+
   const deployProject = async () => {
     if (!selectedProject) return;
+    
+    // First check for dependencies (for runtime projects)
+    if (isRuntimeProject) {
+      try {
+        const depsResult = await projectsAPI.checkDeps(selectedProject);
+        
+        if (depsResult.needsInstall && depsResult.packages?.length > 0) {
+          // Show notification and install dependencies
+          setProgressNotification({
+            id: `deps-${selectedProject}`,
+            title: 'Checking Dependencies',
+            status: 'pending',
+            progress: 0,
+            statusText: `Found ${depsResult.packages.length} missing packages`,
+            logs: [`Packages: ${depsResult.packages.join(', ')}`],
+            onDismiss: () => setProgressNotification(null),
+          });
+          
+          const installSuccess = await installDependencies(selectedProject);
+          if (!installSuccess) {
+            showErrorToast(new Error('Dependency installation cancelled or failed'), 'Installing dependencies');
+            return;
+          }
+          
+          // Brief pause before deploy
+          await new Promise(r => setTimeout(r, 300));
+        }
+      } catch (err) {
+        // Dependency check failed, continue with deploy anyway
+        console.warn('Dependency check failed:', err);
+      }
+    }
+    
+    // Now deploy
     setDeploying(true);
     setDeployStatus('deploying');
+    
+    // Show deploy notification
+    setProgressNotification({
+      id: `deploy-${selectedProject}`,
+      title: isRuntimeProject ? 'Running Project' : 'Deploying Project',
+      status: 'active',
+      progress: 20,
+      statusText: isRuntimeProject ? 'Launching on desktop...' : 'Building and deploying...',
+      onDismiss: () => setProgressNotification(null),
+    });
+    
     try {
       const data = await projectsAPI.deploy(selectedProject);
+      
+      setProgressNotification(prev => prev ? {
+        ...prev,
+        status: 'complete',
+        progress: 100,
+        statusText: data.deployType === 'runtime' ? 'Running on Desktop!' : `Deployed to ${data.url}`,
+      } : null);
+      
       setDeployStatus('success');
       
       // Handle runtime projects - redirect to desktop
       if (data.deployType === 'runtime') {
-        showToast('Running on Desktop ▶️', 'success');
         await loadProjects();
         setTimeout(() => {
           setDeployStatus('idle');
+          setProgressNotification(null);
           navigate('/desktop');
         }, 1500);
       } else {
-        showToast(`Deployed! ${data.url}`);
         await loadProjects();
-        setTimeout(() => setDeployStatus('idle'), 5000);
+        setTimeout(() => {
+          setDeployStatus('idle');
+        }, 3000);
       }
     } catch (err) {
+      setProgressNotification(prev => prev ? {
+        ...prev,
+        status: 'error',
+        statusText: 'Deploy failed',
+        error: extractError(err),
+      } : null);
+      
       setDeployStatus('failed');
-      showErrorToast(err, `Deploying project: ${selectedProject}`);
       setTimeout(() => setDeployStatus('idle'), 5000);
-    } finally { setDeploying(false); }
+    } finally { 
+      setDeploying(false); 
+    }
   };
+  
+  // Cleanup SSE on unmount
+  useEffect(() => {
+    return () => {
+      if (installEventSourceRef.current) {
+        installEventSourceRef.current.close();
+      }
+    };
+  }, []);
 
   // Check syntax/compile for runtime projects
   const checkProject = async () => {
@@ -3563,6 +3778,13 @@ export default function AppsPage() {
               </div>
             </motion.div>
           </motion.div>
+        )}
+      </AnimatePresence>
+      
+      {/* Progress Notification for deploy/install */}
+      <AnimatePresence>
+        {progressNotification && (
+          <ProgressNotification {...progressNotification} />
         )}
       </AnimatePresence>
     </motion.div>

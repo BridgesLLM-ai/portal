@@ -1408,6 +1408,509 @@ router.post('/:name/check', authenticateToken, async (req: Request, res: Respons
   }
 });
 
+// ─── Dependency Detection & Installation ─────────────────────────────────────
+
+// Common Python module → pip package mappings
+const COMMON_PIP_MAPPINGS: Record<string, string> = {
+  'cv2': 'opencv-python',
+  'PIL': 'Pillow',
+  'sklearn': 'scikit-learn',
+  'skimage': 'scikit-image',
+  'yaml': 'pyyaml',
+  'bs4': 'beautifulsoup4',
+  'dotenv': 'python-dotenv',
+  'jwt': 'pyjwt',
+  'serial': 'pyserial',
+  'usb': 'pyusb',
+  'dateutil': 'python-dateutil',
+  'magic': 'python-magic',
+  'gi': 'pygobject',
+  'MySQLdb': 'mysqlclient',
+  'psycopg2': 'psycopg2-binary',
+  'cv': 'opencv-python',
+  'faiss': 'faiss-cpu',
+  'telegram': 'python-telegram-bot',
+  'discord': 'discord.py',
+  'aiohttp': 'aiohttp',
+  'websockets': 'websockets',
+  'pygame': 'pygame',
+  'numpy': 'numpy',
+  'pandas': 'pandas',
+  'matplotlib': 'matplotlib',
+  'seaborn': 'seaborn',
+  'requests': 'requests',
+  'flask': 'flask',
+  'django': 'django',
+  'fastapi': 'fastapi',
+  'uvicorn': 'uvicorn',
+  'sqlalchemy': 'sqlalchemy',
+  'transformers': 'transformers',
+  'torch': 'torch',
+  'tensorflow': 'tensorflow',
+  'keras': 'keras',
+  'scipy': 'scipy',
+  'nltk': 'nltk',
+  'spacy': 'spacy',
+  'openai': 'openai',
+  'anthropic': 'anthropic',
+  'langchain': 'langchain',
+  'gradio': 'gradio',
+  'streamlit': 'streamlit',
+  'plotly': 'plotly',
+  'bokeh': 'bokeh',
+  'httpx': 'httpx',
+  'pydantic': 'pydantic',
+  'cryptography': 'cryptography',
+  'bcrypt': 'bcrypt',
+  'redis': 'redis',
+  'celery': 'celery',
+  'boto3': 'boto3',
+  'google': 'google-cloud-core',
+};
+
+// Common C++ includes → apt package mappings
+const COMMON_APT_MAPPINGS: Record<string, string> = {
+  'SDL2/SDL.h': 'libsdl2-dev',
+  'SDL.h': 'libsdl2-dev',
+  'SDL2/SDL_image.h': 'libsdl2-image-dev',
+  'SDL2/SDL_ttf.h': 'libsdl2-ttf-dev',
+  'SDL2/SDL_mixer.h': 'libsdl2-mixer-dev',
+  'ncurses.h': 'libncurses-dev',
+  'curses.h': 'libncurses-dev',
+  'GL/gl.h': 'libgl1-mesa-dev',
+  'GL/glut.h': 'freeglut3-dev',
+  'GLFW/glfw3.h': 'libglfw3-dev',
+  'opencv2/opencv.hpp': 'libopencv-dev',
+  'opencv2/core.hpp': 'libopencv-dev',
+  'boost/': 'libboost-all-dev',
+  'pthread.h': 'libc6-dev',
+  'curl/curl.h': 'libcurl4-openssl-dev',
+  'openssl/ssl.h': 'libssl-dev',
+  'sqlite3.h': 'libsqlite3-dev',
+  'mysql/mysql.h': 'libmysqlclient-dev',
+  'pq-fe.h': 'libpq-dev',
+  'json/json.h': 'libjsoncpp-dev',
+  'zlib.h': 'zlib1g-dev',
+  'png.h': 'libpng-dev',
+  'jpeglib.h': 'libjpeg-dev',
+  'portaudio.h': 'portaudio19-dev',
+};
+
+// Standard library modules that don't need installation
+const PYTHON_STDLIB = new Set([
+  'os', 'sys', 're', 'json', 'time', 'datetime', 'math', 'random', 'collections',
+  'itertools', 'functools', 'pathlib', 'typing', 'dataclasses', 'enum', 'abc',
+  'io', 'struct', 'copy', 'pickle', 'shelve', 'csv', 'configparser', 'argparse',
+  'logging', 'warnings', 'traceback', 'unittest', 'doctest', 'pdb', 'profile',
+  'timeit', 'threading', 'multiprocessing', 'subprocess', 'socket', 'http',
+  'urllib', 'email', 'html', 'xml', 'hashlib', 'hmac', 'base64', 'binascii',
+  'codecs', 'unicodedata', 'locale', 'gettext', 'textwrap', 'difflib', 'ast',
+  'dis', 'inspect', 'importlib', 'pkgutil', 'modulefinder', 'platform', 'errno',
+  'ctypes', 'contextlib', 'decimal', 'fractions', 'statistics', 'cmath', 'array',
+  'bisect', 'heapq', 'queue', 'weakref', 'types', 'operator', 'string', 'shutil',
+  'glob', 'fnmatch', 'linecache', 'tempfile', 'gzip', 'bz2', 'lzma', 'zipfile',
+  'tarfile', 'getpass', 'netrc', 'pty', 'tty', 'termios', 'curses', 'select',
+  'selectors', 'asyncio', 'concurrent', 'sched', 'signal', 'mmap', 'readline',
+  'rlcompleter', 'code', 'codeop', 'zipimport', 'runpy', 'token', 'keyword',
+  'tokenize', 'tabnanny', 'pyclbr', 'formatter', 'ssl', 'ftplib', 'poplib',
+  'imaplib', 'smtplib', 'uuid', 'socketserver', 'xmlrpc', 'ipaddress', 'cgi',
+  'cgitb', 'wsgiref', 'webbrowser', 'turtle', 'cmd', 'pprint', '__future__',
+  'builtins', '_thread', 'gc', 'site', 'secrets', 'graphlib', 'zoneinfo',
+]);
+
+// Standard C++ headers that don't need apt packages
+const CPP_STDLIB = new Set([
+  'iostream', 'fstream', 'sstream', 'string', 'vector', 'map', 'set', 'list',
+  'queue', 'stack', 'deque', 'array', 'unordered_map', 'unordered_set', 'algorithm',
+  'cmath', 'cstdlib', 'cstdio', 'cstring', 'ctime', 'cctype', 'climits', 'cfloat',
+  'cassert', 'cerrno', 'clocale', 'csignal', 'csetjmp', 'cstdarg', 'cstddef',
+  'memory', 'functional', 'utility', 'tuple', 'type_traits', 'chrono', 'thread',
+  'mutex', 'condition_variable', 'future', 'atomic', 'random', 'regex', 'iterator',
+  'stdexcept', 'exception', 'limits', 'numeric', 'iomanip', 'bitset', 'complex',
+  'valarray', 'ratio', 'initializer_list', 'any', 'optional', 'variant', 'filesystem',
+  'span', 'ranges', 'concepts', 'coroutine', 'source_location', 'compare', 'version',
+  'new', 'typeinfo', 'typeindex', 'format', 'charconv', 'bit', 'numbers',
+  'stdio.h', 'stdlib.h', 'string.h', 'math.h', 'time.h', 'ctype.h', 'limits.h',
+  'float.h', 'assert.h', 'errno.h', 'locale.h', 'signal.h', 'setjmp.h', 'stdarg.h',
+  'stddef.h', 'stdint.h', 'inttypes.h', 'stdbool.h', 'stdnoreturn.h',
+]);
+
+interface DependencyCheckResult {
+  needsInstall: boolean;
+  language: 'python' | 'cpp' | 'node' | null;
+  packages: string[];
+  installedPackages?: string[];
+  command?: string;
+}
+
+async function detectDependencies(projectDir: string): Promise<DependencyCheckResult> {
+  const files = fs.readdirSync(projectDir);
+  
+  // Check for Python project
+  if (files.some(f => f.endsWith('.py')) || files.includes('requirements.txt')) {
+    return await detectPythonDeps(projectDir, files);
+  }
+  
+  // Check for C++ project
+  if (files.some(f => f.endsWith('.cpp') || f.endsWith('.c') || f.endsWith('.h') || f.endsWith('.hpp'))) {
+    return detectCppDeps(projectDir, files);
+  }
+  
+  // Check for Node.js project
+  if (files.includes('package.json')) {
+    return detectNodeDeps(projectDir);
+  }
+  
+  return { needsInstall: false, language: null, packages: [] };
+}
+
+async function detectPythonDeps(projectDir: string, files: string[]): Promise<DependencyCheckResult> {
+  const requiredPackages = new Set<string>();
+  
+  // Check requirements.txt first
+  const reqFile = path.join(projectDir, 'requirements.txt');
+  if (fs.existsSync(reqFile)) {
+    const content = fs.readFileSync(reqFile, 'utf-8');
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith('#') && !trimmed.startsWith('-')) {
+        // Extract package name (before ==, >=, <=, ~=, etc.)
+        const pkgName = trimmed.split(/[=<>~!]/)[0].trim().toLowerCase();
+        if (pkgName) requiredPackages.add(pkgName);
+      }
+    }
+  } else {
+    // Scan Python files for imports
+    for (const file of files) {
+      if (!file.endsWith('.py')) continue;
+      try {
+        const content = fs.readFileSync(path.join(projectDir, file), 'utf-8');
+        // Match: import X, from X import Y
+        const importRegex = /^(?:import|from)\s+([a-zA-Z_][a-zA-Z0-9_]*)/gm;
+        let match;
+        while ((match = importRegex.exec(content)) !== null) {
+          const module = match[1];
+          if (!PYTHON_STDLIB.has(module)) {
+            // Map to pip package name
+            const pipPkg = COMMON_PIP_MAPPINGS[module] || module.toLowerCase();
+            requiredPackages.add(pipPkg);
+          }
+        }
+      } catch (e) {
+        // Ignore read errors
+      }
+    }
+  }
+  
+  if (requiredPackages.size === 0) {
+    return { needsInstall: false, language: 'python', packages: [] };
+  }
+  
+  // Check which packages are already installed
+  const installedPackages: string[] = [];
+  const missingPackages: string[] = [];
+  
+  for (const pkg of requiredPackages) {
+    try {
+      execSync(`pip3 show ${shellEscape(pkg)} 2>/dev/null`, { encoding: 'utf-8' });
+      installedPackages.push(pkg);
+    } catch {
+      missingPackages.push(pkg);
+    }
+  }
+  
+  return {
+    needsInstall: missingPackages.length > 0,
+    language: 'python',
+    packages: missingPackages,
+    installedPackages,
+    command: missingPackages.length > 0 ? `pip3 install ${missingPackages.join(' ')}` : undefined,
+  };
+}
+
+function detectCppDeps(projectDir: string, files: string[]): DependencyCheckResult {
+  const requiredPackages = new Set<string>();
+  
+  // Check if g++ is installed
+  try {
+    execSync('which g++', { encoding: 'utf-8' });
+  } catch {
+    requiredPackages.add('g++');
+  }
+  
+  // Scan C++ files for includes
+  for (const file of files) {
+    if (!file.endsWith('.cpp') && !file.endsWith('.c') && !file.endsWith('.h') && !file.endsWith('.hpp')) continue;
+    try {
+      const content = fs.readFileSync(path.join(projectDir, file), 'utf-8');
+      // Match: #include <...> or #include "..."
+      const includeRegex = /#include\s*[<"]([^>"]+)[>"]/g;
+      let match;
+      while ((match = includeRegex.exec(content)) !== null) {
+        const header = match[1];
+        // Check if it's a standard header
+        const baseName = path.basename(header);
+        if (!CPP_STDLIB.has(header) && !CPP_STDLIB.has(baseName)) {
+          // Try to map to apt package
+          for (const [pattern, pkg] of Object.entries(COMMON_APT_MAPPINGS)) {
+            if (header.startsWith(pattern) || header === pattern) {
+              requiredPackages.add(pkg);
+              break;
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore read errors
+    }
+  }
+  
+  if (requiredPackages.size === 0) {
+    return { needsInstall: false, language: 'cpp', packages: [] };
+  }
+  
+  const packages = Array.from(requiredPackages);
+  return {
+    needsInstall: true,
+    language: 'cpp',
+    packages,
+    command: `sudo apt-get install -y ${packages.join(' ')}`,
+  };
+}
+
+function detectNodeDeps(projectDir: string): DependencyCheckResult {
+  const pkgJsonPath = path.join(projectDir, 'package.json');
+  if (!fs.existsSync(pkgJsonPath)) {
+    return { needsInstall: false, language: 'node', packages: [] };
+  }
+  
+  const nodeModulesPath = path.join(projectDir, 'node_modules');
+  const lockPath = path.join(projectDir, 'package-lock.json');
+  
+  // Check if node_modules exists
+  if (!fs.existsSync(nodeModulesPath)) {
+    return {
+      needsInstall: true,
+      language: 'node',
+      packages: ['(npm install)'],
+      command: 'npm install',
+    };
+  }
+  
+  // Check if package-lock.json is newer than node_modules
+  if (fs.existsSync(lockPath)) {
+    const lockStat = fs.statSync(lockPath);
+    const nmStat = fs.statSync(nodeModulesPath);
+    if (lockStat.mtimeMs > nmStat.mtimeMs) {
+      return {
+        needsInstall: true,
+        language: 'node',
+        packages: ['(npm install - lock file updated)'],
+        command: 'npm install',
+      };
+    }
+  }
+  
+  return { needsInstall: false, language: 'node', packages: [] };
+}
+
+// Hash dependencies for caching
+function hashDependencies(packages: string[]): string {
+  const sorted = [...packages].sort().join(',');
+  const crypto = require('crypto');
+  return crypto.createHash('md5').update(sorted).digest('hex');
+}
+
+// Check if dependencies are already installed (cached)
+function checkDepsCache(projectDir: string, packages: string[]): boolean {
+  const markerPath = path.join(projectDir, '.deps-installed');
+  if (!fs.existsSync(markerPath)) return false;
+  
+  try {
+    const cached = fs.readFileSync(markerPath, 'utf-8').trim();
+    const currentHash = hashDependencies(packages);
+    return cached === currentHash;
+  } catch {
+    return false;
+  }
+}
+
+// Write deps cache marker
+function writeDepsCache(projectDir: string, packages: string[]): void {
+  const markerPath = path.join(projectDir, '.deps-installed');
+  const hash = hashDependencies(packages);
+  fs.writeFileSync(markerPath, hash, 'utf-8');
+}
+
+// GET /api/projects/:name/check-deps - check dependencies without installing
+router.get('/:name/check-deps', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const ownerId = await getScopedOwnerId(req);
+    const projectDir = getProjectPath(ownerId, req.params.name);
+    if (!fs.existsSync(projectDir)) {
+      res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+    
+    const result = await detectDependencies(projectDir);
+    
+    // Check cache
+    if (result.needsInstall && result.packages.length > 0) {
+      if (checkDepsCache(projectDir, result.packages)) {
+        res.json({ ...result, needsInstall: false, cached: true });
+        return;
+      }
+    }
+    
+    res.json(result);
+  } catch (error: any) {
+    console.error('Check deps error:', error);
+    res.status(500).json({ error: 'Failed to check dependencies', detail: error.message });
+  }
+});
+
+// POST /api/projects/:name/install-deps - install dependencies with SSE streaming
+router.post('/:name/install-deps', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const ownerId = await getScopedOwnerId(req);
+    const projectDir = getProjectPath(ownerId, req.params.name);
+    if (!fs.existsSync(projectDir)) {
+      res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+    
+    const result = await detectDependencies(projectDir);
+    
+    if (!result.needsInstall || !result.command || result.packages.length === 0) {
+      res.json({ success: true, message: 'No dependencies to install', packages: [] });
+      return;
+    }
+    
+    // Check cache
+    if (checkDepsCache(projectDir, result.packages)) {
+      res.json({ success: true, message: 'Dependencies already installed (cached)', packages: result.packages, cached: true });
+      return;
+    }
+    
+    // Set up SSE
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    
+    const sendEvent = (event: string, data: any) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+    
+    sendEvent('start', { 
+      language: result.language, 
+      packages: result.packages,
+      command: result.command,
+    });
+    
+    // Run installation
+    let installProcess: ReturnType<typeof spawn>;
+    
+    if (result.language === 'python') {
+      // Install Python packages
+      installProcess = spawn('pip3', ['install', ...result.packages], {
+        cwd: projectDir,
+        env: { ...process.env },
+      });
+    } else if (result.language === 'cpp') {
+      // Install apt packages (requires sudo)
+      installProcess = spawn('sudo', ['apt-get', 'install', '-y', ...result.packages], {
+        cwd: projectDir,
+        env: { ...process.env, DEBIAN_FRONTEND: 'noninteractive' },
+      });
+    } else if (result.language === 'node') {
+      // Run npm install
+      installProcess = spawn('npm', ['install'], {
+        cwd: projectDir,
+        env: { ...process.env },
+      });
+    } else {
+      sendEvent('error', { message: 'Unknown language' });
+      res.end();
+      return;
+    }
+    
+    let outputBuffer = '';
+    const totalPackages = result.packages.length;
+    let installedCount = 0;
+    
+    installProcess.stdout?.on('data', (data: Buffer) => {
+      const text = data.toString();
+      outputBuffer += text;
+      
+      // Try to estimate progress for Python
+      if (result.language === 'python') {
+        const successMatches = outputBuffer.match(/Successfully installed/gi);
+        if (successMatches) {
+          installedCount = Math.min(successMatches.length, totalPackages);
+        }
+      }
+      
+      const progress = totalPackages > 0 ? Math.min(90, (installedCount / totalPackages) * 90) : 50;
+      sendEvent('progress', { 
+        text: text.trim(),
+        progress: Math.round(progress),
+        installed: installedCount,
+        total: totalPackages,
+      });
+    });
+    
+    installProcess.stderr?.on('data', (data: Buffer) => {
+      const text = data.toString();
+      // Some warnings come through stderr but aren't errors
+      sendEvent('log', { text: text.trim(), type: 'stderr' });
+    });
+    
+    installProcess.on('close', (code) => {
+      if (code === 0) {
+        // Write cache marker
+        writeDepsCache(projectDir, result.packages);
+        sendEvent('complete', { 
+          success: true, 
+          message: 'Dependencies installed successfully',
+          packages: result.packages,
+        });
+      } else {
+        sendEvent('error', { 
+          success: false, 
+          message: `Installation failed with code ${code}`,
+          output: outputBuffer,
+        });
+      }
+      res.end();
+    });
+    
+    installProcess.on('error', (err) => {
+      sendEvent('error', { 
+        success: false, 
+        message: err.message,
+      });
+      res.end();
+    });
+    
+    // Handle client disconnect
+    req.on('close', () => {
+      if (installProcess && !installProcess.killed) {
+        installProcess.kill('SIGTERM');
+      }
+    });
+    
+  } catch (error: any) {
+    console.error('Install deps error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to install dependencies', detail: error.message });
+    } else {
+      res.write(`event: error\ndata: ${JSON.stringify({ message: error.message })}\n\n`);
+      res.end();
+    }
+  }
+});
+
 // POST /api/projects/:name/deploy - deploy with build support (static + fullstack + runtime)
 router.post('/:name/deploy', authenticateToken, async (req: Request, res: Response) => {
   try {

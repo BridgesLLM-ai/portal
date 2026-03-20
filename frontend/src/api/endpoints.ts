@@ -172,6 +172,10 @@ export const projectsAPI = {
     const { data } = await client.post(`/projects/${name}/deploy`);
     return data;
   },
+  checkDeps: async (name: string) => {
+    const { data } = await client.get(`/projects/${name}/check-deps`);
+    return data;
+  },
   docUpdate: async (name: string, type: string, description: string, details?: string) => {
     const { data } = await client.post(`/projects/${name}/doc-update`, { type, description, details });
     return data;
