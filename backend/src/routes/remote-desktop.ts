@@ -504,6 +504,13 @@ WantedBy=multi-user.target
     // Disable old legacy service if present
     await runShell('systemctl disable --now bridges-rd-vnc.service 2>/dev/null || true');
 
+    // Disable stock TigerVNC template — it races with our service for display :1.
+    // On fresh installs, vncserver@1 can win the race and launch a bare VNC session
+    // with no XFCE theme, no PulseAudio, no desktop environment — wrong product.
+    await runShell('systemctl disable --now vncserver@1.service 2>/dev/null || true');
+    await runShell('systemctl mask vncserver@1.service 2>/dev/null || true');
+    await runShell('systemctl mask vncserver@.service 2>/dev/null || true');
+
     const enableSvc = await runShell('systemctl enable bridges-rd-xtigervnc.service bridges-rd-websockify.service');
     steps.push({ step: 'Enable services', ok: enableSvc.ok, message: enableSvc.ok ? 'Enabled' : enableSvc.stderr.slice(0, 200) });
 
