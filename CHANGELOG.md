@@ -2,6 +2,14 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.16.0] — 2026-03-19
+
+### Added
+- **Auto-Dependency Detection** — When you run a Python, C++, or Node.js project, the system automatically detects missing dependencies (scans `requirements.txt`, `import` statements, `#include` directives, `package.json`) and installs them with live progress feedback. Cached after first install — subsequent runs are instant.
+- **Unified Progress Notifications** — New polished notification card for deploy, dependency install, and build operations. SVG progress ring, live status text, collapsible log output, sound effects. Matches the Files page upload card quality.
+- **Dependency Check API** — `GET /check-deps` returns what's needed without installing. `POST /install-deps` streams install progress via Server-Sent Events.
+- **50+ Python module mappings** (cv2→opencv-python, PIL→Pillow, etc.) and **20+ C++ header mappings** (SDL2→libsdl2-dev, etc.) for smart auto-detection.
+
 ## [3.15.1] — 2026-03-19
 
 ### Fixed
