@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.17.3] — 2026-03-20
+
+### Added
+- **Full desktop config shipped in installer** — Complete XFCE4 configuration (Greybird theme, panel layout, keyboard shortcuts, session settings, wallpaper) snapshotted from production and deployed during install. Every new install gets an identical desktop experience.
+
+### Fixed
+- **PulseAudio boot race condition** — PulseAudio start now retries up to 5 times with 2-second delays. Previously failed silently on cold boot when XDG_RUNTIME_DIR wasn't ready, leaving audio permanently broken until manual restart.
+- **Caddyfile corruption on setup complete** — Regex to remove the IP-only server block only matched the inner brace of nested `reverse_proxy {}`, leaving an orphan `}`. Caddy treated `}` as a server name, crashed, and wouldn't start on reboot.
+- **XFCE session save disabled** — Prevents desktop death when user clicks logout. Session no longer saves state on exit, so the default config is always restored on VNC restart.
+
 ## [3.17.2] — 2026-03-20
 
 ### Added

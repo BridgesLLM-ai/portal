@@ -1239,8 +1239,10 @@ router.post('/complete', requireSetupToken, async (req: Request, res: Response, 
       if (fs.existsSync(caddyPath)) {
         let caddyContent = fs.readFileSync(caddyPath, 'utf-8');
         // Remove the "http://<IP>" server block that was kept for setup
+        // The block has nested braces (reverse_proxy { ... }), so [^}]*\} only
+        // matches the inner brace. Use [\s\S]*? to match across the full block.
         caddyContent = caddyContent.replace(
-          /\n*# Keep IP access alive during setup[^\n]*\nhttp:\/\/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s*\{[^}]*\}\n*/g,
+          /\n*# Keep IP access alive during setup[^\n]*\nhttp:\/\/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s*\{[\s\S]*?\n\}\n*/g,
           '\n'
         );
         fs.writeFileSync(caddyPath, caddyContent.trim() + '\n');

@@ -417,19 +417,22 @@ done
 # Start PulseAudio for audio support (virtual null sink → browser WebSocket)
 su - "$RD_USER" -c "
   export XDG_RUNTIME_DIR=$XDG_DIR
-  # Kill stale PulseAudio
   pulseaudio --kill 2>/dev/null || true
   sleep 0.5
-  # Start PulseAudio daemon with virtual null sink as default
-  pulseaudio --start --exit-idle-time=-1 2>>$LOG_DIR/pulseaudio.log
+  # Retry loop — PulseAudio can fail on cold boot if XDG_RUNTIME_DIR isn't ready
+  for attempt in 1 2 3 4 5; do
+    if pulseaudio --start --exit-idle-time=-1 2>>$LOG_DIR/pulseaudio.log; then
+      echo \\"PulseAudio started on attempt \\\$attempt\\"
+      break
+    fi
+    echo \\"PulseAudio start failed (attempt \\\$attempt), retrying...\\" >>$LOG_DIR/pulseaudio.log
+    sleep 2
+  done
   sleep 1
-  # Configure for audio streaming
   export PULSE_SERVER=unix:$XDG_DIR/pulse/native
   pactl set-default-sink auto_null 2>/dev/null || true
-  # CRITICAL: Unload suspend-on-idle so the monitor source always streams
-  # Without this, parec blocks when no audio is playing and the browser gets no data
   pactl unload-module module-suspend-on-idle 2>/dev/null || true
-  echo 'PulseAudio started (suspend-on-idle disabled)'
+  echo 'PulseAudio configured (suspend-on-idle disabled)'
 " &
 PA_PID=$!
 wait $PA_PID 2>/dev/null || true
