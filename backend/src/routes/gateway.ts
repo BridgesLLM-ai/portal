@@ -2017,7 +2017,7 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
   });
   ws.on('error', (err: Error) => console.error(`[gateway-ws] Error (${user.email}):`, err.message));
 
-  wsSend(ws, { type: 'connected', userId: user.userId });
+  wsSend(ws, { type: 'connected' });
 }
 
 /* ─── WS Server setup (called from server.ts) ─────────────────────────── */
@@ -2025,12 +2025,36 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
 let portalWss: WebSocketServer | null = null;
 let directWss: WebSocketServer | null = null;
 
+// Per-user connection tracking for direct proxy WebSocket
+const directUserConnections = new Map<string, number>();
+const MAX_DIRECT_WS_PER_USER = 5;
+
+// Allowlist of gateway methods that the direct proxy can forward
+const ALLOWED_GATEWAY_METHODS = new Set([
+  'connect',
+  'chat.send',
+  'chat.abort',
+  'session.history',
+  'session.subscribe',
+  'session.list',
+]);
+
 /**
  * Handle a direct WebSocket proxy connection.
  * This creates a transparent pipe between the browser and the OpenClaw gateway,
  * with one exception: 'connect' requests have the auth token injected server-side.
  */
 function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
+  const userId = user.userId;
+
+  // Enforce per-user connection limit
+  const currentCount = directUserConnections.get(userId) || 0;
+  if (currentCount >= MAX_DIRECT_WS_PER_USER) {
+    browserWs.close(4029, 'Too many connections');
+    return;
+  }
+  directUserConnections.set(userId, currentCount + 1);
+
   const gatewayUrl = getOpenClawWsUrl();
   let gatewayWs: WebSocket | null = null;
   let browserClosed = false;
@@ -2098,18 +2122,32 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       return;
     }
 
-    // Intercept 'connect' requests and inject the auth token
+    // Intercept 'connect' requests and inject the auth token with server-controlled role/scopes
     if (frame.type === 'req' && frame.method === 'connect') {
-      debugLog('[gateway-direct] Intercepting connect request to inject token');
+      debugLog('[gateway-direct] Intercepting connect request to inject token and enforce role/scopes');
       frame.params = frame.params || {};
       frame.params.auth = frame.params.auth || {};
       frame.params.auth.token = getGatewayToken();
+      // Server controls role/scopes — don't trust browser claims
+      frame.params.role = 'operator';
+      frame.params.scopes = ['operator.admin', 'operator.approvals'];
 
       try {
         gatewayWs.send(JSON.stringify(frame));
       } catch (err: any) {
         debugLog('[gateway-direct] Failed to send injected connect:', err.message);
       }
+      return;
+    }
+
+    // Enforce method allowlist — reject anything not explicitly allowed
+    if (frame.type === 'req' && frame.method && !ALLOWED_GATEWAY_METHODS.has(frame.method)) {
+      browserWs.send(JSON.stringify({
+        type: 'res',
+        id: frame.id,
+        ok: false,
+        error: { code: 'METHOD_NOT_ALLOWED', message: `Method '${frame.method}' is not allowed` }
+      }));
       return;
     }
 
@@ -2124,6 +2162,12 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
   browserWs.on('close', (code: number, reason: Buffer) => {
     browserClosed = true;
     debugLog(`[gateway-direct] Browser closed: ${code} ${reason?.toString()}`);
+
+    // Decrement per-user connection count
+    const count = directUserConnections.get(userId) || 0;
+    if (count <= 1) directUserConnections.delete(userId);
+    else directUserConnections.set(userId, count - 1);
+
     if (!gatewayClosed && gatewayWs) {
       try {
         gatewayWs.close(code, reason?.toString() || 'Browser disconnected');
@@ -2173,7 +2217,7 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
   });
 
   // Initialize the direct proxy WebSocket server
-  directWss = new WebSocketServer({ noServer: true });
+  directWss = new WebSocketServer({ noServer: true, maxPayload: 1 * 1024 * 1024 });
 
   directWss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     const user = (req as any).__portalUser as JwtPayload;

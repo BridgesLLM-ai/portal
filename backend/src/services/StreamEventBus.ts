@@ -40,13 +40,35 @@ class StreamEventBus {
   private globalListeners = new Set<GlobalCallback>();
 
   /** sessionKey → current stream status */
-  private activeStreams = new Map<string, StreamInfo>();
+  private streams = new Map<string, StreamInfo>();
 
   /** sessionKey → last accumulated text (for delta diffing from chat events) */
   private lastSeenText = new Map<string, string>();
 
   /** sessionKey → latest fully-assembled text snapshot for reconnect recovery */
   private latestText = new Map<string, string>();
+
+  /** Backwards-compatible alias for activeStreams */
+  private get activeStreams(): Map<string, StreamInfo> {
+    return this.streams;
+  }
+
+  constructor() {
+    // Prune dormant entries older than 1 hour every 15 minutes
+    const ONE_HOUR = 60 * 60 * 1000;
+    setInterval(() => {
+      const now = Date.now();
+      for (const [sessionKey, info] of this.streams) {
+        const subs = this.listeners.get(sessionKey);
+        const hasNoSubscribers = !subs || subs.size === 0;
+        if (info.lastDoneAt && (now - info.lastDoneAt) > ONE_HOUR && hasNoSubscribers) {
+          this.streams.delete(sessionKey);
+          this.lastSeenText.delete(sessionKey);
+          this.latestText.delete(sessionKey);
+        }
+      }
+    }, 15 * 60 * 1000);
+  }
 
 
   /**
