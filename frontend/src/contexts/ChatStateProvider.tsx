@@ -15,6 +15,7 @@ import React, {
 } from 'react';
 import client from '../api/client';
 import { gatewayAPI } from '../api/endpoints';
+import { authAPI } from '../api/auth';
 import {
   extractThinkingChunk,
   mergeAssistantStream,
@@ -140,14 +141,29 @@ function createWsManager(url: string): WsManager {
       ws = null;
 
       // Check for auth failure close codes (4001 = unauthorized, or HTTP-style 401/403 in reason)
-      // These indicate the token is invalid and we should not auto-reconnect (would cause auth cascade)
+      // These indicate the token may be expired — try refreshing before giving up
       const isAuthFailure = event.code === 4001 || event.code === 4003 ||
         event.reason?.toLowerCase().includes('unauthorized') ||
-        event.reason?.toLowerCase().includes('forbidden');
+        event.reason?.toLowerCase().includes('forbidden') ||
+        event.reason?.toLowerCase().includes('expired');
 
-      if (isAuthFailure) {
-        debugLog('[ws-manager] Auth failure detected, stopping reconnect attempts');
-        intentionallyClosed = true; // Prevent further reconnect attempts
+      if (isAuthFailure && !intentionallyClosed) {
+        debugLog('[ws-manager] Auth failure detected, attempting token refresh before reconnect');
+        // Attempt to refresh the token before reconnecting
+        authAPI.refresh()
+          .then(() => {
+            debugLog('[ws-manager] Token refresh succeeded, scheduling reconnect');
+            reconnectAttempts = 0; // Reset backoff after successful refresh
+            scheduleReconnect();
+          })
+          .catch((err) => {
+            console.warn('[ws-manager] Token refresh failed, stopping reconnect:', err);
+            intentionallyClosed = true; // Give up — user will need to re-login
+            for (const cb of disconnectCallbacks) {
+              try { cb(); } catch (e) { console.error('[ws-manager] disconnect callback error:', e); }
+            }
+          });
+        return;
       }
 
       if (!intentionallyClosed) {

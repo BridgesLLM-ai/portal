@@ -31,11 +31,21 @@ client.interceptors.response.use(
   async (error) => {
     const originalRequest = error.config;
     const status = error.response?.status;
+    const errorBody = error.response?.data;
 
-    // Handle both 401 (unauthorized) and 403 (forbidden/expired token)
-    // Skip setup endpoints — their 403s are setup-token failures, not auth failures
+    // Only trigger refresh on 401 (unauthorized).
+    // For 403, only refresh if it's specifically a token expiry issue (not a permission denied).
+    // This prevents users from being logged out when they simply lack permissions for an endpoint.
     const isSetupEndpoint = originalRequest?.url?.includes('/setup/');
-    if ((status === 401 || (status === 403 && !isSetupEndpoint)) && !originalRequest._retry) {
+    const is401 = status === 401;
+    const is403TokenExpiry = status === 403 && !isSetupEndpoint && (
+      errorBody?.error === 'jwt expired' ||
+      errorBody?.error === 'token expired' ||
+      errorBody?.message?.toLowerCase()?.includes('expired') ||
+      errorBody?.code === 'TOKEN_EXPIRED'
+    );
+    
+    if ((is401 || is403TokenExpiry) && !originalRequest._retry) {
       originalRequest._retry = true;
 
       // Prevent cascading auth failures (e.g., logout triggering more 401s)

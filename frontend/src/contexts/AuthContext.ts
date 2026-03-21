@@ -2,6 +2,13 @@ import { create } from 'zustand';
 import { User } from '../types';
 import { authAPI, isTwoFactorRequired, type RegistrationPendingResponse } from '../api/auth';
 
+// Proactive token refresh interval (6 hours in milliseconds)
+// This ensures tokens are refreshed well before the 24h expiry, even if the user
+// is only using WebSocket (no HTTP requests to trigger reactive refresh).
+const PROACTIVE_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+// Track the refresh timer globally so we can clear it on logout
+let proactiveRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
 interface AuthState {
   user: User | null;
@@ -23,6 +30,10 @@ interface AuthState {
   silentLogout: () => void;
   clearError: () => void;
   restoreSession: () => Promise<boolean>;
+  /** Start the proactive refresh timer (called after successful auth) */
+  startProactiveRefresh: () => void;
+  /** Stop the proactive refresh timer (called on logout) */
+  stopProactiveRefresh: () => void;
 }
 
 export const useAuthStore = create<AuthState>((set, get) => ({
@@ -33,6 +44,63 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   twoFactorPending: false,
   twoFactorPendingToken: null,
   twoFactorMethod: null,
+
+  startProactiveRefresh: () => {
+    // Clear any existing timer first
+    if (proactiveRefreshTimer) {
+      clearTimeout(proactiveRefreshTimer);
+      proactiveRefreshTimer = null;
+    }
+
+    const scheduleNextRefresh = () => {
+      proactiveRefreshTimer = setTimeout(async () => {
+        // Only refresh if still authenticated
+        if (!get().isAuthenticated) {
+          proactiveRefreshTimer = null;
+          return;
+        }
+
+        console.debug('[Auth] Proactive token refresh triggered');
+        try {
+          await authAPI.refresh();
+          console.debug('[Auth] Proactive token refresh succeeded');
+          // Schedule the next refresh
+          scheduleNextRefresh();
+        } catch (err) {
+          console.warn('[Auth] Proactive token refresh failed, retrying in 30s:', err);
+          // Retry once after 30 seconds before giving up
+          proactiveRefreshTimer = setTimeout(async () => {
+            if (!get().isAuthenticated) {
+              proactiveRefreshTimer = null;
+              return;
+            }
+            try {
+              await authAPI.refresh();
+              console.debug('[Auth] Proactive token refresh retry succeeded');
+              scheduleNextRefresh();
+            } catch (retryErr) {
+              console.error('[Auth] Proactive token refresh retry failed:', retryErr);
+              // Don't silently logout — the user will be logged out when their next
+              // API call fails. This prevents unexplained logouts while they're
+              // actively using the app.
+              proactiveRefreshTimer = null;
+            }
+          }, 30_000);
+        }
+      }, PROACTIVE_REFRESH_INTERVAL_MS);
+    };
+
+    scheduleNextRefresh();
+    console.debug('[Auth] Proactive refresh timer started (interval: 6h)');
+  },
+
+  stopProactiveRefresh: () => {
+    if (proactiveRefreshTimer) {
+      clearTimeout(proactiveRefreshTimer);
+      proactiveRefreshTimer = null;
+      console.debug('[Auth] Proactive refresh timer stopped');
+    }
+  },
 
   signup: async (email, username, password) => {
     set({ isLoading: true, error: null });
@@ -79,6 +147,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       // Normal login (no 2FA)
       const { user } = response;
       set({ user, isAuthenticated: true, isLoading: false });
+      get().startProactiveRefresh();
       return {};
     } catch (error: any) {
       const message = error.response?.data?.error || 'Login failed';
@@ -105,6 +174,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         twoFactorPendingToken: null,
         twoFactorMethod: null,
       });
+      get().startProactiveRefresh();
     } catch (error: any) {
       const message = error.response?.data?.error || 'Verification failed';
       set({ error: message, isLoading: false });
@@ -122,6 +192,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   logout: async () => {
+    get().stopProactiveRefresh();
     try {
       await authAPI.logout();
     } catch (error) {
@@ -137,6 +208,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   silentLogout: () => {
     // Clear auth state without calling the backend logout endpoint.
     // Used when the token is already invalid (e.g., refresh failed) to prevent cascading 401 errors.
+    get().stopProactiveRefresh();
     localStorage.removeItem('accessToken');
     localStorage.removeItem('refreshToken');
     localStorage.removeItem('token');
@@ -153,9 +225,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       // This handles both normal login (localStorage) and setup wizard (cookie-only).
       const user = await authAPI.me();
       set({ isAuthenticated: true, user, isLoading: false });
+      get().startProactiveRefresh();
       return true;
     } catch (error) {
       console.error('Session restore error:', error);
+      get().stopProactiveRefresh();
       localStorage.removeItem('accessToken');
       localStorage.removeItem('refreshToken');
       localStorage.removeItem('token');
