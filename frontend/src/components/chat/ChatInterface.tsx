@@ -1239,7 +1239,7 @@ const QUICK_START_PROMPTS = [
 
 /* ─── Message Timestamp ─────────────────────────────────────────────────── */
 
-function MessageTimestamp({ date }: { date: Date }) {
+const MessageTimestamp = React.memo(function MessageTimestamp({ date }: { date: Date }) {
   const formatted = new Intl.DateTimeFormat('en-US', {
     hour: 'numeric',
     minute: '2-digit',
@@ -1251,9 +1251,9 @@ function MessageTimestamp({ date }: { date: Date }) {
       {formatted}
     </span>
   );
-}
+});
 
-function DateSeparator({ date }: { date: Date }) {
+const DateSeparator = React.memo(function DateSeparator({ date }: { date: Date }) {
   const today = new Date();
   const yesterday = new Date(today);
   yesterday.setDate(yesterday.getDate() - 1);
@@ -1278,7 +1278,7 @@ function DateSeparator({ date }: { date: Date }) {
       <div className="flex-1 border-t border-white/[0.06]" />
     </div>
   );
-}
+});
 
 /* ─── Copy Button ───────────────────────────────────────────────────────── */
 
@@ -1530,7 +1530,7 @@ function AttachmentChip({
 
 /* ─── User Message Bubble ───────────────────────────────────────────────── */
 
-function UserBubble({ message, avatarUrl, username }: { message: ChatMessage; avatarUrl?: string | null; username?: string }) {
+const UserBubble = React.memo(function UserBubble({ message, avatarUrl, username }: { message: ChatMessage; avatarUrl?: string | null; username?: string }) {
   const [hovered, setHovered] = useState(false);
   const initial = (username || 'U')[0].toUpperCase();
 
@@ -1573,11 +1573,11 @@ function UserBubble({ message, avatarUrl, username }: { message: ChatMessage; av
       </div>
     </div>
   );
-}
+});
 
 /* ─── Assistant Message Bubble ──────────────────────────────────────────── */
 
-function AssistantBubble({
+const AssistantBubble = React.memo(function AssistantBubble({
   agent,
   message,
   avatarUrl,
@@ -1729,7 +1729,7 @@ function AssistantBubble({
       </div>
     </div>
   );
-}
+});
 
 /* ─── Main Component ────────────────────────────────────────────────────── */
 
@@ -2245,7 +2245,12 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     }
   }, [isRunning, scrollToBottom]);
 
-  const lastUserMessage = [...messages].reverse().find((m) => m.role === 'user');
+  const lastUserMessage = React.useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') return messages[i];
+    }
+    return undefined;
+  }, [messages]);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const agent = getAgent(provider);
   const providerSlashCommands = providerMeta.slashCommands || [];

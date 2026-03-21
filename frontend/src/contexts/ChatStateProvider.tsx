@@ -543,6 +543,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // switch or clearMessages. Any async history load that started in a previous
   // generation simply discards its result, eliminating race conditions.
   const historyGenRef = useRef(0);
+  // Throttle refs for streaming text updates — batch text deltas to reduce re-renders
+  const textThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingTextUpdateRef = useRef<string | null>(null);
+  const TEXT_THROTTLE_MS = 50; // 20fps is plenty smooth for text streaming
 
   // Sync refs immediately when state changes. Note: the refs are ALSO updated
   // synchronously in the event handlers (see case 'session' below) to avoid races.
@@ -988,11 +992,29 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setStatusText(null);
         setStreamingPhase('streaming');
         setActiveToolName(null);
-        upsertStreamingAssistant(nextText);
+        // Throttle UI updates to reduce re-renders during fast streaming.
+        // Text is accumulated synchronously in assembledRef, but React state
+        // updates are batched to TEXT_THROTTLE_MS intervals (default 50ms = 20fps).
+        pendingTextUpdateRef.current = nextText;
+        if (!textThrottleTimerRef.current) {
+          textThrottleTimerRef.current = setTimeout(() => {
+            textThrottleTimerRef.current = null;
+            if (pendingTextUpdateRef.current !== null) {
+              upsertStreamingAssistant(pendingTextUpdateRef.current);
+              pendingTextUpdateRef.current = null;
+            }
+          }, TEXT_THROTTLE_MS);
+        }
         break;
       }
       case 'done': {
         clearStreamWatchdog();
+        // Flush any pending throttled text update immediately
+        if (textThrottleTimerRef.current) {
+          clearTimeout(textThrottleTimerRef.current);
+          textThrottleTimerRef.current = null;
+        }
+        pendingTextUpdateRef.current = null;
         const hasFinal = typeof data.content === 'string' && data.content.length > 0;
         const finalContent = hasFinal ? sanitizeAssistantContent(data.content) : assembledRef.current;
         assembledRef.current = finalContent;
