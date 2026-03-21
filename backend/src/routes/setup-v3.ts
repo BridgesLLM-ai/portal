@@ -17,6 +17,7 @@ import { getGatewayToken, hasGatewayToken } from '../utils/gatewayToken';
 import dns from 'dns/promises';
 import { prisma } from '../config/database';
 import { hashPassword } from '../utils/password';
+import { PORTAL_VERSION } from '../version';
 import { generateAccessToken, generateRefreshToken } from '../utils/jwt';
 import { AppError } from '../middleware/errorHandler';
 import { config } from '../config/env';
@@ -317,10 +318,65 @@ router.get('/status', async (_req: Request, res: Response, next: NextFunction) =
   try {
     const ownerCount = await prisma.user.count({ where: { role: 'OWNER' as any } });
     const needsSetup = ownerCount === 0;
+
+    // Reinstall detection: OWNER exists but SETUP_TOKEN is present in env
+    // This means the installer ran fresh on a preserved database.
+    // The user needs to reset their password to regain access.
+    const isReinstall = ownerCount > 0 && !!process.env.SETUP_TOKEN;
+
+    let reinstallInfo: { email?: string; username?: string } | undefined;
+    if (isReinstall) {
+      const owner = await prisma.user.findFirst({ where: { role: 'OWNER' as any }, select: { email: true, username: true } });
+      if (owner) reinstallInfo = { email: (owner as any).email, username: (owner as any).username };
+    }
+
     res.json({
       needsSetup,
-      version: '3.0',
+      version: PORTAL_VERSION,
       incompleteSteps: needsSetup ? ['adminAccount', 'portalIdentity', 'security', 'domain', 'email', 'ai'] : [],
+      ...(isReinstall && { isReinstall: true, ownerEmail: reinstallInfo?.email, ownerUsername: reinstallInfo?.username }),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/setup/reinstall-reset
+ * Reset the OWNER's password during a reinstall (preserved database).
+ * Only available when SETUP_TOKEN is present (fresh install detected existing DB).
+ * After reset, clears the SETUP_TOKEN so the portal operates normally.
+ */
+router.post('/reinstall-reset', requireSetupToken, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    // Only allowed during reinstall — OWNER exists + SETUP_TOKEN present
+    const owner = await prisma.user.findFirst({ where: { role: 'OWNER' as any } });
+    if (!owner) {
+      throw new AppError(400, 'No owner account found. Use normal setup instead.');
+    }
+    if (!process.env.SETUP_TOKEN) {
+      throw new AppError(403, 'Not in reinstall mode.');
+    }
+
+    const { password } = req.body;
+    if (!password || typeof password !== 'string' || password.length < 8) {
+      throw new AppError(400, 'Password must be at least 8 characters.');
+    }
+
+    const passwordHash = await hashPassword(password);
+    await prisma.user.update({
+      where: { id: owner.id },
+      data: { passwordHash },
+    });
+
+    // Clear the setup token — reinstall recovery is complete
+    clearSetupToken();
+
+    res.json({
+      ok: true,
+      message: 'Password reset successfully. You can now log in.',
+      username: (owner as any).username,
+      email: (owner as any).email,
     });
   } catch (error) {
     next(error);

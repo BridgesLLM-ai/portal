@@ -462,9 +462,17 @@ export default function SetupWizardPage() {
     }
   }, [api]);
 
+  const [isReinstall, setIsReinstall] = useState(false);
+  const [ownerEmail, setOwnerEmail] = useState('');
+
   useEffect(() => {
     api.get('/setup/status').then(({ data }) => {
-      if (!data.needsSetup) navigate('/login', { replace: true });
+      if (data.isReinstall) {
+        setIsReinstall(true);
+        if (data.ownerEmail) setOwnerEmail(data.ownerEmail);
+      } else if (!data.needsSetup) {
+        navigate('/login', { replace: true });
+      }
     }).catch(() => undefined);
   }, [navigate]);
 
@@ -529,10 +537,10 @@ export default function SetupWizardPage() {
     setDomainConfigState('loading');
     setDomainMessage('');
     try {
-      const { data } = await api.post<{ success: boolean; url: string; message: string }>('/setup/configure-domain', { domain: domain.trim() });
+      const { data } = await api.post<{ success: boolean; url: string; message: string; httpsReady?: boolean }>('/setup/configure-domain', { domain: domain.trim() });
       setConfiguredDomainUrl(data.url);
       setDomainConfigState('success');
-      setDomainMessage(data.message);
+      setDomainMessage(data.httpsReady === false ? `${data.message} (HTTPS certificate is still being provisioned — it may take a moment)` : data.message);
       sounds.success();
 
       // Do NOT auto-redirect. The DNS/TLS handoff can race the first browser
@@ -770,68 +778,6 @@ export default function SetupWizardPage() {
           <PasswordInput value={confirmPassword} onChange={setConfirmPassword} placeholder="Repeat your password" />
           {confirmPassword.length > 0 && password !== confirmPassword && <p className="mt-2 text-xs text-amber-400">Passwords must match.</p>}
         </div>
-
-        <div className={`${cardClass} p-5`}>
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h3 className="text-lg font-semibold text-white">AI Coding Tools</h3>
-              <p className="mt-1 text-sm text-slate-400">
-                Optional CLI tools that enable AI-powered coding agents. Install any combination — each provides a different AI engine.
-              </p>
-            </div>
-            <button type="button" onClick={loadAiStatus} className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-slate-300 transition hover:bg-slate-800">
-              <RefreshCw className={`h-4 w-4 ${!codingToolsStatus ? 'animate-spin' : ''}`} />
-            </button>
-          </div>
-
-          {!codingToolsStatus ? (
-            <div className="mt-6 flex items-center justify-center py-6 text-slate-400">
-              <Loader2 className="mr-2 h-5 w-5 animate-spin" /> Checking coding tools...
-            </div>
-          ) : (
-            <div className="mt-5 space-y-3">
-              {codingToolsStatus.tools.map((tool) => (
-                <div key={tool.id} className="flex flex-col gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 md:flex-row md:items-center md:justify-between">
-                  <div className="flex-1">
-                    <p className="font-medium text-white">{tool.name}</p>
-                    <p className="text-sm text-slate-400">{tool.description}</p>
-                    {tool.installed && tool.version && (
-                      <p className="mt-1 text-xs text-emerald-400">v{tool.version}</p>
-                    )}
-                  </div>
-                  {tool.installed ? (
-                    <span className="inline-flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-sm text-emerald-300">
-                      <CheckCircle2 className="h-4 w-4" /> Installed
-                    </span>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        setInstallingTool(tool.id);
-                        try {
-                          await api.post('/setup/install-coding-tool', { toolId: tool.id });
-                          await loadAiStatus();
-                        } catch (err: any) {
-                          setError(friendlyError(err, `Failed to install ${tool.name}`));
-                        } finally {
-                          setInstallingTool('');
-                        }
-                      }}
-                      disabled={installingTool.length > 0}
-                      className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {installingTool === tool.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                      Install
-                    </button>
-                  )}
-                </div>
-              ))}
-              <p className="text-xs text-slate-500">
-                These are optional. You can install them later from Settings → System.
-              </p>
-            </div>
-          )}
-        </div>
       </div>
     </StepShell>
   );
@@ -942,11 +888,11 @@ export default function SetupWizardPage() {
           <button
             type="button"
             onClick={() => setSearchEngineVisibility((current) => current === 'visible' ? 'hidden' : 'visible')}
-            className={`relative h-7 w-12 rounded-full border transition ${searchEngineVisibility === 'visible' ? 'border-emerald-400/40 bg-emerald-500/20' : 'border-slate-700 bg-slate-800'}`}
+            className={`relative inline-flex h-7 w-12 flex-shrink-0 rounded-full border transition-colors duration-200 ${searchEngineVisibility === 'visible' ? 'border-emerald-400/40 bg-emerald-500' : 'border-slate-700 bg-slate-800'}`}
             aria-pressed={searchEngineVisibility === 'visible'}
           >
             <span
-              className={`absolute top-0.5 h-5 w-5 rounded-full transition ${searchEngineVisibility === 'visible' ? 'left-6 bg-emerald-400' : 'left-0.5 bg-slate-500'}`}
+              className={`pointer-events-none inline-block h-5 w-5 translate-y-0.5 rounded-full shadow-sm transition-transform duration-200 ${searchEngineVisibility === 'visible' ? 'translate-x-[22px] bg-white' : 'translate-x-0.5 bg-slate-400'}`}
             />
           </button>
         </div>
@@ -1381,6 +1327,68 @@ export default function SetupWizardPage() {
             <div className="mt-5 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm text-slate-300">OpenClaw status is unavailable right now. If it is not installed yet, you can add it later.</div>
           )}
         </div>
+
+        <div className={`${cardClass} p-5`}>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h3 className="text-lg font-semibold text-white">AI Coding Tools</h3>
+              <p className="mt-1 text-sm text-slate-400">
+                Optional CLI tools that enable AI-powered coding agents. Install any combination — each provides a different AI engine.
+              </p>
+            </div>
+            <button type="button" onClick={loadAiStatus} className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-slate-300 transition hover:bg-slate-800">
+              <RefreshCw className={`h-4 w-4 ${!codingToolsStatus ? 'animate-spin' : ''}`} />
+            </button>
+          </div>
+
+          {!codingToolsStatus ? (
+            <div className="mt-6 flex items-center justify-center py-6 text-slate-400">
+              <Loader2 className="mr-2 h-5 w-5 animate-spin" /> Checking coding tools...
+            </div>
+          ) : (
+            <div className="mt-5 space-y-3">
+              {codingToolsStatus.tools.map((tool) => (
+                <div key={tool.id} className="flex flex-col gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 md:flex-row md:items-center md:justify-between">
+                  <div className="flex-1">
+                    <p className="font-medium text-white">{tool.name}</p>
+                    <p className="text-sm text-slate-400">{tool.description}</p>
+                    {tool.installed && tool.version && (
+                      <p className="mt-1 text-xs text-emerald-400">v{tool.version}</p>
+                    )}
+                  </div>
+                  {tool.installed ? (
+                    <span className="inline-flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-sm text-emerald-300">
+                      <CheckCircle2 className="h-4 w-4" /> Installed
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setInstallingTool(tool.id);
+                        try {
+                          await api.post('/setup/install-coding-tool', { toolId: tool.id });
+                          await loadAiStatus();
+                        } catch (err: any) {
+                          setError(friendlyError(err, `Failed to install ${tool.name}`));
+                        } finally {
+                          setInstallingTool('');
+                        }
+                      }}
+                      disabled={installingTool.length > 0}
+                      className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {installingTool === tool.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                      Install
+                    </button>
+                  )}
+                </div>
+              ))}
+              <p className="text-xs text-slate-500">
+                These are optional. You can install them later from Settings → System.
+              </p>
+            </div>
+          )}
+        </div>
       </div>
     </StepShell>
   );
@@ -1520,11 +1528,11 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
           <button
             type="button"
             onClick={() => setAllowTelemetry((current) => !current)}
-            className={`relative h-7 w-12 rounded-full border transition ${allowTelemetry ? 'border-emerald-400/40 bg-emerald-500/20' : 'border-slate-700 bg-slate-800'}`}
+            className={`relative inline-flex h-7 w-12 flex-shrink-0 rounded-full border transition-colors duration-200 ${allowTelemetry ? 'border-emerald-400/40 bg-emerald-500' : 'border-slate-700 bg-slate-800'}`}
             aria-pressed={allowTelemetry}
           >
             <span
-              className={`absolute top-0.5 h-5 w-5 rounded-full transition ${allowTelemetry ? 'left-6 bg-emerald-400' : 'left-0.5 bg-slate-500'}`}
+              className={`pointer-events-none inline-block h-5 w-5 translate-y-0.5 rounded-full shadow-sm transition-transform duration-200 ${allowTelemetry ? 'translate-x-[22px] bg-white' : 'translate-x-0.5 bg-slate-400'}`}
             />
           </button>
         </div>
@@ -1573,6 +1581,67 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
           <div className="rounded-lg bg-slate-800/60 p-3 text-left">
             <p className="text-xs text-slate-500 mb-1">Your URL should look like:</p>
             <code className="text-xs text-emerald-400 break-all">http://your-ip/setup?token=abc123...</code>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Reinstall: password reset UI
+  if (isReinstall) {
+    return (
+      <div className="min-h-dvh bg-slate-950 px-4 py-8 text-slate-100">
+        <div className="mx-auto max-w-md">
+          <div className="rounded-[28px] border border-slate-800 bg-slate-900/80 p-8 shadow-2xl shadow-black/30 backdrop-blur">
+            <div className="mb-6 flex items-center gap-4">
+              <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-amber-500/20 bg-amber-500/10">
+                <Shield className="h-6 w-6 text-amber-300" />
+              </div>
+              <div>
+                <h1 className="text-2xl font-semibold text-white">Welcome Back</h1>
+                <p className="text-sm text-slate-400">Reinstall detected — reset your password</p>
+              </div>
+            </div>
+            <p className="mb-4 text-sm text-slate-400">
+              Your previous data (projects, settings, email) has been preserved.
+              Set a new password to regain access to your account.
+            </p>
+            {ownerEmail && (
+              <div className="mb-6 rounded-lg border border-slate-700 bg-slate-800/50 px-4 py-3">
+                <p className="text-xs text-slate-500">Your account</p>
+                <p className="text-sm font-medium text-white">{ownerEmail}</p>
+              </div>
+            )}
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              const form = e.target as HTMLFormElement;
+              const pw = (form.elements.namedItem('password') as HTMLInputElement).value;
+              const pw2 = (form.elements.namedItem('confirm') as HTMLInputElement).value;
+              if (pw !== pw2) { alert('Passwords do not match'); return; }
+              if (pw.length < 8) { alert('Password must be at least 8 characters'); return; }
+              try {
+                const { data } = await api.post('/setup/reinstall-reset', { password: pw });
+                alert(`Password reset! Log in with: ${data.email || data.username}`);
+                navigate('/login', { replace: true });
+              } catch (err: any) {
+                alert(err?.response?.data?.error || 'Reset failed');
+              }
+            }}>
+              <div className="mb-4">
+                <label className="mb-1 block text-sm font-medium text-slate-300">New Password</label>
+                <input name="password" type="password" required minLength={8}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-2.5 text-white focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500" />
+              </div>
+              <div className="mb-6">
+                <label className="mb-1 block text-sm font-medium text-slate-300">Confirm Password</label>
+                <input name="confirm" type="password" required minLength={8}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-2.5 text-white focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500" />
+              </div>
+              <button type="submit"
+                className="w-full rounded-lg bg-emerald-600 px-4 py-2.5 font-medium text-white hover:bg-emerald-500 transition-colors">
+                Reset Password & Continue
+              </button>
+            </form>
           </div>
         </div>
       </div>

@@ -1109,7 +1109,7 @@ router.get('/domain-status', requireOwner, async (_req: Request, res: Response, 
     let currentDomain = '';
     try {
       const caddyfile = fs.readFileSync('/etc/caddy/Caddyfile', 'utf8');
-      const domainMatch = caddyfile.match(/^([a-zA-Z0-9][-a-zA-Z0-9.]+\.[a-zA-Z]{2,})\s*\{/m);
+      const domainMatch = caddyfile.match(/^([a-zA-Z0-9][-a-zA-Z0-9.]+\.[a-zA-Z]{2,})[,\s]/m);
       if (domainMatch) currentDomain = domainMatch[1];
     } catch {}
 
@@ -1185,7 +1185,7 @@ router.post('/install-mail', requireOwner, async (req: Request, res: Response, n
     if (!domain) {
       try {
         const caddyfile = fs.readFileSync('/etc/caddy/Caddyfile', 'utf8');
-        const m = caddyfile.match(/^([a-zA-Z0-9][-a-zA-Z0-9.]+\.[a-zA-Z]{2,})\s*\{/m);
+        const m = caddyfile.match(/^([a-zA-Z0-9][-a-zA-Z0-9.]+\.[a-zA-Z]{2,})[,\s]/m);
         if (m) domain = m[1];
       } catch {}
     }

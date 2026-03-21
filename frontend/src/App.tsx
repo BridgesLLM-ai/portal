@@ -47,6 +47,7 @@ export default function App() {
   const heartbeatRef = useRef<ReturnType<typeof setInterval>>();
   const [setupChecked, setSetupChecked] = useState(false);
   const [needsSetup, setNeedsSetup] = useState<boolean>(false);
+  const [isReinstall, setIsReinstall] = useState<boolean>(false);
   const publicSettings = usePublicSettings();
 
   useEffect(() => {
@@ -57,9 +58,10 @@ export default function App() {
         if (res.ok) {
           const data = await res.json();
           setNeedsSetup(Boolean(data.needsSetup));
+          setIsReinstall(Boolean(data.isReinstall));
 
-          if (data.needsSetup && window.location.pathname !== '/setup') {
-            window.location.assign('/setup');
+          if ((data.needsSetup || data.isReinstall) && window.location.pathname !== '/setup') {
+            window.location.assign('/setup' + window.location.search);
             return;
           }
         }
@@ -193,7 +195,7 @@ export default function App() {
         </Route>
         <Route
           path="/setup"
-          element={needsSetup ? <SetupWizardPage /> : <Navigate to={isAuthenticated ? '/dashboard' : '/login'} replace />}
+          element={(needsSetup || isReinstall) ? <SetupWizardPage /> : <Navigate to={isAuthenticated ? '/dashboard' : '/login'} replace />}
         />
         <Route path="*" element={<Navigate to={isAuthenticated ? "/dashboard" : "/login"} replace />} />
       </Routes>

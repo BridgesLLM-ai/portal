@@ -299,6 +299,9 @@ function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
  * messages. During live streaming, tool_end events set .result on the call directly.
  * For history, we need to do this post-hoc so the tool pills have their results.
  * Also removes the standalone toolResult messages since they render as null.
+ *
+ * Fix: More resilient matching — if toolCallId doesn't match, try by toolName,
+ * then fall back to positional matching (the most recent running/unresolved tool call).
  */
 function mergeToolResultsIntoToolCalls(messages: ChatMessage[]): ChatMessage[] {
   const result: ChatMessage[] = [];
@@ -311,22 +314,48 @@ function mergeToolResultsIntoToolCalls(messages: ChatMessage[]): ChatMessage[] {
       lastAssistantIdx = result.length;
       result.push(msg);
     } else if (msg.role === 'toolResult' && lastAssistant && lastAssistant.toolCalls) {
-      // Try to match by toolCallId first, then by toolName
-      const calls = lastAssistant.toolCalls;
+      // Try to match by toolCallId first, then by toolName, then by position
+      const calls = [...lastAssistant.toolCalls];
       let matched = false;
-      for (let i = 0; i < calls.length; i++) {
-        if (
-          (msg.toolCallId && calls[i].id === msg.toolCallId) ||
-          (!msg.toolCallId && msg.toolName && calls[i].name === msg.toolName && !calls[i].result)
-        ) {
-          calls[i] = { ...calls[i], result: msg.content, status: 'done' as const };
-          matched = true;
-          break;
+      
+      // 1. Try exact toolCallId match
+      if (msg.toolCallId) {
+        for (let i = 0; i < calls.length; i++) {
+          if (calls[i].id === msg.toolCallId) {
+            calls[i] = { ...calls[i], result: msg.content, status: 'done' as const };
+            matched = true;
+            break;
+          }
         }
       }
+      
+      // 2. Try toolName match on an unresolved call
+      if (!matched && msg.toolName) {
+        for (let i = 0; i < calls.length; i++) {
+          if (calls[i].name === msg.toolName && !calls[i].result) {
+            calls[i] = { ...calls[i], result: msg.content, status: 'done' as const };
+            matched = true;
+            break;
+          }
+        }
+      }
+      
+      // 3. Fallback: positional match — assign to the first unresolved tool call
+      if (!matched) {
+        for (let i = 0; i < calls.length; i++) {
+          if (!calls[i].result && (calls[i].status === 'running' || calls[i].status === 'done')) {
+            calls[i] = { ...calls[i], result: msg.content, status: 'done' as const };
+            matched = true;
+            break;
+          }
+        }
+      }
+      
       // Update the assistant message in the result array
       if (matched && lastAssistantIdx >= 0) {
-        result[lastAssistantIdx] = { ...lastAssistant, toolCalls: [...calls] };
+        result[lastAssistantIdx] = { ...lastAssistant, toolCalls: calls };
+        // Update lastAssistant reference so subsequent toolResults use the updated calls
+        lastAssistant = result[lastAssistantIdx];
       }
       // Don't add toolResult to result — it renders as null anyway
     } else {
@@ -969,6 +998,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         assembledRef.current = finalContent;
         const prov = data.provenance || null;
         const cid = streamingAssistantIdRef.current;
+        
+        // Check if tools were used during this streaming session — we'll reload
+        // history to get the clean server-side formatted tool results.
+        const hadToolEvents = hasRealToolEventsRef.current;
+        
         setStatusText(null);
         setStreamingPhase('idle');
         setLastProvenance(prov);
@@ -987,6 +1021,21 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setMessages(prev => prev.map(m =>
           m.id === cid ? { ...m, content: finalContent, provenance: prov || undefined } : m
         ));
+        
+        // Pattern from OpenClaw web UI v2: reload history when tools were used
+        // so the persisted tool results replace the streaming artifacts.
+        // This ensures tool results are properly nested in their pills.
+        if (hadToolEvents) {
+          debugLog('[ChatState] Tools were used — scheduling history reload');
+          setTimeout(() => {
+            // Double-check we're still on the same session before reloading
+            const currentSession = sessionRef.current;
+            const currentProvider = providerRef.current;
+            if (currentSession) {
+              loadHistoryInternal(currentSession, currentProvider, { force: true });
+            }
+          }, 200); // Brief delay to let server commit the JSONL
+        }
         break;
       }
       case 'error': {

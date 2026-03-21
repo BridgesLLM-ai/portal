@@ -1,8 +1,33 @@
 import fs from "fs";
 import path from "path";
+import https from "https";
 import { execSync } from "child_process";
 import dns from "dns/promises";
 import { AppError } from "../middleware/errorHandler";
+
+/**
+ * Poll until HTTPS responds with a valid cert, or timeout.
+ * Returns true if HTTPS is ready, false if we timed out (setup can still continue).
+ */
+async function waitForHttps(domain: string, timeoutMs: number): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const req = https.get(`https://${domain}/api/setup/status`, { timeout: 3000 }, (res) => {
+          res.resume();
+          resolve();
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+      });
+      return true;
+    } catch {
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+  return false;
+}
 
 const PORTAL_ROOT = process.env.PORTAL_ROOT || '/opt/bridgesllm/portal';
 
@@ -94,7 +119,7 @@ export function updateEnvFile(updates: Record<string, string>): void {
   }
 }
 
-export async function configureDomainAndHttps(domain: string): Promise<{ success: true; domain: string; url: string; message: string }> {
+export async function configureDomainAndHttps(domain: string): Promise<{ success: true; domain: string; url: string; message: string; httpsReady: boolean }> {
   const publicIp = getPublicIp();
 
   let resolvedIps: string[] = [];
@@ -135,6 +160,9 @@ http://${publicIp} {
 
   execSync('systemctl reload caddy', { timeout: 10000 });
 
+  // Wait for HTTPS cert to be provisioned (Let's Encrypt ACME takes a few seconds)
+  const httpsReady = await waitForHttps(domain, 15000);
+
   updateEnvFile({
     CORS_ORIGIN: `https://${domain},https://www.${domain},http://${publicIp}`,
     MAIL_DOMAIN: domain,
@@ -144,6 +172,7 @@ http://${publicIp} {
     success: true,
     domain,
     url: `https://${domain}`,
+    httpsReady,
     message: `HTTPS configured! Your portal is now at https://${domain}`,
   };
 }

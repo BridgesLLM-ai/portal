@@ -2395,11 +2395,14 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       if (isRunning) {
         await chatState.cancelStream();
       }
+      // Fix: Clear messages FIRST to prevent stale history from showing.
+      // The sequence must be: clear → update state atomically → load new history.
+      // clearMessages() increments historyGenRef which invalidates any in-flight loads.
+      clearMessages();
       // Context setters handle localStorage persistence
       setProvider(selection.provider);
       setAgentId(selection.agentId);
       setSession('main');
-      clearMessages();
     },
     [provider, agentId, isRunning, chatState, clearMessages, setProvider, setAgentId, setSession],
   );

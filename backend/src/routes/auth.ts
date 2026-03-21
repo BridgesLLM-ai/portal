@@ -737,9 +737,11 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
     const mode = await getRegistrationMode();
 
     if (mode === 'closed') {
-      // Check if we should silently block the IP
+      // Log the attempt but do NOT auto-block the IP — legitimate users may try to register
+      // on a closed portal without malicious intent. IP blocking is reserved for honeypot
+      // endpoints (/signup) and repeated brute-force attempts.
       const blockOnClosed = await getSettingValue('security.blockClosedRegistration');
-      const shouldBlock = blockOnClosed === null ? true : blockOnClosed === 'true';
+      const shouldBlock = blockOnClosed === 'true'; // Only block if explicitly opted in (default: no block)
 
       if (shouldBlock) {
         const meta = extractTrackingMetadata(req);
