@@ -1817,8 +1817,13 @@ router.post('/:name/install-deps', authenticateToken, async (req: Request, res: 
     if (result.language === 'python') {
       // Install Python packages in a virtual environment
       const venvDir = path.join(projectDir, '.venv');
-      if (!fs.existsSync(venvDir)) {
-        // Create venv first
+      const pipPath = path.join(venvDir, 'bin', 'pip');
+      if (!fs.existsSync(pipPath)) {
+        // Create or recreate venv (handles missing dir AND broken venvs without pip)
+        if (fs.existsSync(venvDir)) {
+          sendEvent('log', { text: 'Broken virtual environment detected, recreating...', type: 'stdout' });
+          fs.rmSync(venvDir, { recursive: true, force: true });
+        }
         sendEvent('log', { text: 'Creating virtual environment...', type: 'stdout' });
         try {
           execSync(`python3 -m venv ${shellEscape(venvDir)}`, { timeout: 30000 });
@@ -1829,7 +1834,6 @@ router.post('/:name/install-deps', authenticateToken, async (req: Request, res: 
           execSync(`python3 -m venv ${shellEscape(venvDir)}`, { timeout: 30000 });
         }
       }
-      const pipPath = path.join(venvDir, 'bin', 'pip');
       installProcess = spawn(pipPath, ['install', ...result.packages], {
         cwd: projectDir,
         env: { ...process.env },
@@ -2006,11 +2010,24 @@ router.post('/:name/deploy', authenticateToken, async (req: Request, res: Respon
       let installCommand = '';
       
       if (files.includes('main.py') || files.includes('requirements.txt')) {
-        // Python project — use venv if it exists (created by install-deps), fall back to system python
-        const venvPython = path.join(projectDir, '.venv', 'bin', 'python');
-        const venvPip = path.join(projectDir, '.venv', 'bin', 'pip');
-        const usePython = fs.existsSync(venvPython) ? venvPython : 'python3';
-        const usePip = fs.existsSync(venvPip) ? venvPip : 'pip3';
+        // Python project — always use venv (PEP 668 on Ubuntu 24.04 blocks system pip)
+        const runtimeVenv = path.join(runtimeDir, '.venv');
+        const runtimeVenvPython = path.join(runtimeVenv, 'bin', 'python');
+        const runtimeVenvPip = path.join(runtimeVenv, 'bin', 'pip');
+        // Create venv in runtime dir if missing or broken (owned by bridgesrd)
+        if (!fs.existsSync(runtimeVenvPip)) {
+          if (fs.existsSync(runtimeVenv)) {
+            // Broken venv (no pip) — remove and recreate
+            try { execSync(`rm -rf ${shellEscape(runtimeVenv)}`, { timeout: 5000 }); } catch {}
+          }
+          try {
+            execSync(`su - bridgesrd -c ${shellEscape(`python3 -m venv '${runtimeVenv}'`)}`, { timeout: 30000 });
+          } catch (e: any) {
+            buildOutput += `\nWarning: failed to create venv: ${e.message}`;
+          }
+        }
+        const usePython = fs.existsSync(runtimeVenvPython) ? runtimeVenvPython : 'python3';
+        const usePip = fs.existsSync(runtimeVenvPip) ? runtimeVenvPip : 'pip3';
         if (files.includes('requirements.txt')) {
           installCommand = `${shellEscape(usePip)} install -r requirements.txt 2>&1`;
         }
@@ -2055,10 +2072,11 @@ router.post('/:name/deploy', authenticateToken, async (req: Request, res: Respon
         await new Promise(r => setTimeout(r, 500));
       } catch {}
       
-      // Launch in xterm on the VNC desktop
+      // Launch in xterm on the VNC desktop (fully detached via setsid so execSync returns immediately)
       if (runCommand) {
         try {
-          const xtermCmd = `su - bridgesrd -c ${shellEscape(`export DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/bridges-rd-runtime PULSE_SERVER=unix:/tmp/bridges-rd-runtime/pulse/native SDL_AUDIODRIVER=pulseaudio && cd '${runtimeDir}' && xterm -title '${safeAppName}' -fa 'Monospace' -fs 12 -e 'bash -c "${runCommand}; echo; echo Press Enter to close...; read"' &`)}`;
+          const innerCmd = `DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/bridges-rd-runtime PULSE_SERVER=unix:/tmp/bridges-rd-runtime/pulse/native SDL_AUDIODRIVER=pulseaudio xterm -title ${shellEscape(safeAppName)} -fa Monospace -fs 12 -e "bash -c ${shellEscape(`${runCommand}; echo; echo Press Enter to close...; read`)}"`;
+          const xtermCmd = `setsid su - bridgesrd -c ${shellEscape(innerCmd)} </dev/null >/dev/null 2>&1 &`;
           execSync(xtermCmd, { timeout: 5000 });
           buildOutput += `\nRunning on Remote Desktop`;
         } catch (e: any) {
