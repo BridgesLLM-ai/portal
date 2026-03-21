@@ -22,8 +22,17 @@ import {
   sanitizeAssistantContent,
   sanitizeAssistantChunk,
 } from '../utils/chatStream';
+import {
+  OpenClawGatewayClient,
+  createGatewayDirectUrl,
+  type GatewayEvent,
+  type GatewayChatMessage,
+} from '../utils/openclawGatewayClient';
 
 const DEBUG_CHAT_STATE = import.meta.env.DEV;
+// Feature flag: Use direct gateway connection for OPENCLAW provider
+// Set to true to bypass the portal WS middleman
+const USE_DIRECT_GATEWAY = import.meta.env.VITE_USE_DIRECT_GATEWAY === 'true';
 const debugLog = (...args: unknown[]) => {
   if (DEBUG_CHAT_STATE) console.debug('[ChatState]', ...args);
 };
@@ -275,6 +284,72 @@ function parseHistoryMessage(m: any): ChatMessage {
     msg.toolName = m.toolName;
   }
   return msg;
+}
+
+/**
+ * Extract text content from a gateway message.
+ * Gateway format: { role, content: [{type: "text", text: "..."}, ...] }
+ */
+function extractTextFromGatewayMessage(msg: GatewayChatMessage): string {
+  if (typeof msg.content === 'string') return msg.content;
+  if (!Array.isArray(msg.content)) return '';
+
+  return msg.content
+    .filter((block) => block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text!)
+    .join('\n');
+}
+
+/**
+ * Extract tool calls from a gateway message.
+ */
+function extractToolCallsFromGatewayMessage(msg: GatewayChatMessage): ToolCall[] | undefined {
+  if (!Array.isArray(msg.content)) return undefined;
+
+  const toolCalls = msg.content
+    .filter((block) => block.type === 'toolCall' && block.name)
+    .map((block) => ({
+      id: block.id || nextId(),
+      name: block.name as string,
+      arguments: block.arguments,
+      startedAt: Date.now(),
+      endedAt: Date.now(),
+      status: 'done' as const,
+    }));
+
+  return toolCalls.length > 0 ? toolCalls : undefined;
+}
+
+/**
+ * Extract thinking content from a gateway message.
+ */
+function extractThinkingFromGatewayMessage(msg: GatewayChatMessage): string | undefined {
+  if (!Array.isArray(msg.content)) return undefined;
+
+  const thinking = msg.content
+    .filter((block) => block.type === 'thinking' && typeof block.thinking === 'string')
+    .map((block) => block.thinking as string)
+    .join('\n');
+
+  return thinking || undefined;
+}
+
+/**
+ * Map a gateway message to our ChatMessage format.
+ */
+function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage {
+  const text = extractTextFromGatewayMessage(msg);
+  const toolCalls = extractToolCallsFromGatewayMessage(msg);
+  const thinking = extractThinkingFromGatewayMessage(msg);
+
+  return {
+    id: msg.id || msg.messageId || `gw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    role: msg.role as 'user' | 'assistant' | 'system' | 'toolResult',
+    content: msg.role === 'assistant' ? sanitizeAssistantContent(text) : text,
+    createdAt: new Date(msg.timestamp || Date.now()),
+    toolCalls,
+    thinkingContent: thinking,
+  };
 }
 
 function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
@@ -531,6 +606,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const toolCounterRef = useRef(0);
   const hasRealToolEventsRef = useRef(false);
   const wsManagerRef = useRef<WsManager | null>(null);
+  // Direct gateway client for OPENCLAW provider (bypasses portal WS middleman)
+  const directClientRef = useRef<OpenClawGatewayClient | null>(null);
+  const directClientConnectedRef = useRef(false);
+  const currentRunIdRef = useRef<string | null>(null);
   const streamingAssistantIdRef = useRef<string | null>(null);
   const assembledRef = useRef('');
   const lastSegmentStartRef = useRef(0);
@@ -644,42 +723,66 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       return data.messages ? data.messages.map(parseHistoryMessage) : [];
     };
 
+    // Load via direct gateway client for OPENCLAW
+    const loadViaDirect = async (): Promise<ChatMessage[]> => {
+      const directClient = directClientRef.current;
+      if (!directClient?.isConnected) {
+        throw new Error('Direct gateway not connected');
+      }
+      const result = await directClient.loadHistory(sessionKey);
+      return result.messages.map(mapGatewayMessage);
+    };
+
     try {
       let loaded: ChatMessage[];
-      const manager = wsManagerRef.current;
-      if (manager && manager.isConnected()) {
+
+      // Try direct gateway for OPENCLAW when enabled
+      const directClient = directClientRef.current;
+      if (USE_DIRECT_GATEWAY && prov === 'OPENCLAW' && directClient?.isConnected) {
         try {
-          loaded = await new Promise<ChatMessage[]>((resolve, reject) => {
-            const requestId = 'hist-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-            const handler = (data: any) => {
-              if (data.type === 'history' && data.requestId === requestId) {
-                clearTimeout(timeout);
-                manager.removeHandler(handler);
-                resolve((data.messages || []).map(parseHistoryMessage));
-              } else if (data.type === 'error' && data.requestId === requestId) {
-                clearTimeout(timeout);
-                manager.removeHandler(handler);
-                reject(new Error(data.content || 'History request failed'));
-              }
-            };
-            const timeout = setTimeout(() => {
-              manager.removeHandler(handler);
-              reject(new Error('History timeout'));
-            }, 5000);
-            manager.addHandler(handler);
-            const sent = manager.send({ type: 'history', session: sessionKey, provider: prov, requestId });
-            if (!sent) {
-              clearTimeout(timeout);
-              manager.removeHandler(handler);
-              reject(new Error('History send failed'));
-            }
-          });
+          debugLog('[ChatState] Loading history via direct gateway');
+          loaded = await loadViaDirect();
         } catch (err) {
-          console.warn('[ChatState] WS history failed; falling back to HTTP', err);
+          console.warn('[ChatState] Direct gateway history failed; falling back to HTTP', err);
           loaded = await loadViaHttp();
         }
       } else {
-        loaded = await loadViaHttp();
+        // Use existing portal WS or HTTP path
+        const manager = wsManagerRef.current;
+        if (manager && manager.isConnected()) {
+          try {
+            loaded = await new Promise<ChatMessage[]>((resolve, reject) => {
+              const requestId = 'hist-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+              const handler = (data: any) => {
+                if (data.type === 'history' && data.requestId === requestId) {
+                  clearTimeout(timeout);
+                  manager.removeHandler(handler);
+                  resolve((data.messages || []).map(parseHistoryMessage));
+                } else if (data.type === 'error' && data.requestId === requestId) {
+                  clearTimeout(timeout);
+                  manager.removeHandler(handler);
+                  reject(new Error(data.content || 'History request failed'));
+                }
+              };
+              const timeout = setTimeout(() => {
+                manager.removeHandler(handler);
+                reject(new Error('History timeout'));
+              }, 5000);
+              manager.addHandler(handler);
+              const sent = manager.send({ type: 'history', session: sessionKey, provider: prov, requestId });
+              if (!sent) {
+                clearTimeout(timeout);
+                manager.removeHandler(handler);
+                reject(new Error('History send failed'));
+              }
+            });
+          } catch (err) {
+            console.warn('[ChatState] WS history failed; falling back to HTTP', err);
+            loaded = await loadViaHttp();
+          }
+        } else {
+          loaded = await loadViaHttp();
+        }
       }
 
       // Only apply if still the current generation
@@ -1131,6 +1234,248 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const handleWsEventRef = useRef(handleWsEvent);
   useEffect(() => { handleWsEventRef.current = handleWsEvent; }, [handleWsEvent]);
 
+  /**
+   * Handle events from the direct gateway client.
+   * Maps native gateway events to our internal event format.
+   */
+  const handleDirectGatewayEvent = useCallback((evt: GatewayEvent) => {
+    debugLog('[ChatState] Direct gateway event:', evt.event, evt.payload);
+
+    if (evt.event === 'chat') {
+      const payload = evt.payload;
+      const state = payload.state;
+
+      // Track current run for abort functionality
+      if (payload.runId) {
+        currentRunIdRef.current = payload.runId;
+      }
+
+      switch (state) {
+        case 'delta': {
+          // Extract text from the delta message
+          const text = payload.message?.text ||
+            (Array.isArray(payload.message?.content)
+              ? payload.message.content
+                  .filter((b: any) => b.type === 'text')
+                  .map((b: any) => b.text || '')
+                  .join('')
+              : '');
+
+          if (text) {
+            const safeChunk = sanitizeAssistantChunk(text);
+            const nextText = mergeStreamText(safeChunk);
+            setStatusText(null);
+            setStreamingPhase('streaming');
+            setActiveToolName(null);
+
+            // Throttle UI updates
+            pendingTextUpdateRef.current = nextText;
+            if (!textThrottleTimerRef.current) {
+              textThrottleTimerRef.current = setTimeout(() => {
+                textThrottleTimerRef.current = null;
+                if (pendingTextUpdateRef.current !== null) {
+                  upsertStreamingAssistant(pendingTextUpdateRef.current);
+                  pendingTextUpdateRef.current = null;
+                }
+              }, TEXT_THROTTLE_MS);
+            }
+          }
+          resetStreamWatchdog();
+          break;
+        }
+        case 'final': {
+          clearStreamWatchdog();
+          // Flush any pending throttled text update
+          if (textThrottleTimerRef.current) {
+            clearTimeout(textThrottleTimerRef.current);
+            textThrottleTimerRef.current = null;
+          }
+          pendingTextUpdateRef.current = null;
+
+          const finalText = payload.message?.text ||
+            (Array.isArray(payload.message?.content)
+              ? payload.message.content
+                  .filter((b: any) => b.type === 'text')
+                  .map((b: any) => b.text || '')
+                  .join('')
+              : assembledRef.current);
+
+          const finalContent = sanitizeAssistantContent(finalText);
+          assembledRef.current = finalContent;
+
+          const cid = streamingAssistantIdRef.current;
+          const hadToolEvents = hasRealToolEventsRef.current;
+
+          setStatusText(null);
+          setStreamingPhase('idle');
+          setIsRunning(false);
+          setIsCompacting(false);
+          if (compactionTimerRef.current) {
+            clearTimeout(compactionTimerRef.current);
+            compactionTimerRef.current = null;
+          }
+
+          isStreamActiveRef.current = false;
+          streamingAssistantIdRef.current = null;
+          currentRunIdRef.current = null;
+          assembledRef.current = '';
+          lastSegmentStartRef.current = 0;
+
+          if (cid) {
+            setMessages(prev => prev.map(m =>
+              m.id === cid ? { ...m, content: finalContent } : m
+            ));
+          }
+
+          // Reload history when tools were used to get proper tool results
+          if (hadToolEvents) {
+            debugLog('[ChatState] Direct: Tools were used — scheduling history reload');
+            setTimeout(() => {
+              const currentSession = sessionRef.current;
+              const currentProvider = providerRef.current;
+              if (currentSession) {
+                loadHistoryInternal(currentSession, currentProvider, { force: true });
+              }
+            }, 200);
+          }
+          break;
+        }
+        case 'aborted': {
+          clearStreamWatchdog();
+          if (textThrottleTimerRef.current) {
+            clearTimeout(textThrottleTimerRef.current);
+            textThrottleTimerRef.current = null;
+          }
+          pendingTextUpdateRef.current = null;
+
+          const cid = streamingAssistantIdRef.current;
+          const currentText = assembledRef.current;
+
+          setStatusText(null);
+          setStreamingPhase('idle');
+          setIsRunning(false);
+          isStreamActiveRef.current = false;
+          streamingAssistantIdRef.current = null;
+          currentRunIdRef.current = null;
+
+          if (cid && currentText) {
+            setMessages(prev => prev.map(m =>
+              m.id === cid ? { ...m, content: currentText + '\n\n*(cancelled)*' } : m
+            ));
+          }
+          break;
+        }
+        case 'error': {
+          clearStreamWatchdog();
+          const errorMsg = payload.errorMessage || 'Unknown error';
+          const cid = streamingAssistantIdRef.current;
+
+          setStatusText(null);
+          setStreamingPhase('idle');
+          setIsRunning(false);
+          isStreamActiveRef.current = false;
+          streamingAssistantIdRef.current = null;
+          currentRunIdRef.current = null;
+
+          if (cid) {
+            setMessages(prev => prev.map(m =>
+              m.id === cid ? { ...m, content: '\u26a0\ufe0f ' + errorMsg } : m
+            ));
+          }
+          break;
+        }
+      }
+    } else if (evt.event === 'agent') {
+      const payload = evt.payload;
+
+      if (payload.stream === 'tool' && payload.data) {
+        const data = payload.data;
+        const assistantId = streamingAssistantIdRef.current;
+
+        switch (data.phase) {
+          case 'start': {
+            hasRealToolEventsRef.current = true;
+            const toolName = data.name || 'tool';
+            setStatusText(`Using ${toolName}…`);
+            setStreamingPhase('tool');
+            setActiveToolName(toolName);
+
+            const toolId = data.toolCallId || 'tool-' + (++toolCounterRef.current);
+            if (assistantId) {
+              setMessages(prev => prev.map(m =>
+                m.id === assistantId
+                  ? {
+                      ...m,
+                      toolCalls: [
+                        ...(m.toolCalls || []),
+                        {
+                          id: toolId,
+                          name: toolName,
+                          arguments: data.args,
+                          startedAt: Date.now(),
+                          status: 'running' as const,
+                        },
+                      ],
+                    }
+                  : m
+              ));
+            }
+            break;
+          }
+          case 'update': {
+            // Partial result update — could update the tool call if needed
+            break;
+          }
+          case 'result': {
+            setStatusText(null);
+            setActiveToolName(null);
+            setStreamingPhase(assembledRef.current ? 'streaming' : 'thinking');
+
+            const toolResult = typeof data.result === 'string'
+              ? data.result
+              : JSON.stringify(data.result);
+
+            if (assistantId) {
+              setMessages(prev => prev.map(m => {
+                if (m.id !== assistantId) return m;
+                const calls = [...(m.toolCalls || [])];
+                // Find the matching tool call by ID or most recent running
+                const idx = data.toolCallId
+                  ? calls.findIndex(c => c.id === data.toolCallId)
+                  : calls.findIndex(c => c.status === 'running');
+                if (idx >= 0) {
+                  calls[idx] = {
+                    ...calls[idx],
+                    endedAt: Date.now(),
+                    result: toolResult,
+                    status: 'done',
+                  };
+                }
+                return { ...m, toolCalls: calls };
+              }));
+            }
+            break;
+          }
+        }
+      } else if (payload.stream === 'compaction') {
+        // Handle compaction events
+        const data = payload.data as any;
+        if (data?.status === 'started') {
+          setIsCompacting(true);
+          setThinkingContent('');
+          setStatusText('Compacting context… stream may pause briefly');
+        } else if (data?.status === 'completed') {
+          if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
+          compactionTimerRef.current = setTimeout(() => {
+            setIsCompacting(false);
+            compactionTimerRef.current = null;
+          }, 3000);
+          setStatusText('Context compacted. Reconnecting stream…');
+        }
+      }
+    }
+  }, [resetStreamWatchdog, clearStreamWatchdog, loadHistoryInternal, mergeStreamText, upsertStreamingAssistant]);
+
   // WS setup — runs once on mount, survives entire app lifetime
   // Handler registration MUST happen in the same effect that creates the manager,
   // otherwise wsManagerRef.current is null when the handler effect runs.
@@ -1202,6 +1547,70 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       releaseWsManager();
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Direct gateway client setup for OPENCLAW provider
+  // When USE_DIRECT_GATEWAY is enabled and provider is OPENCLAW, use the direct
+  // gateway connection instead of the portal WS middleman.
+  useEffect(() => {
+    // Only create direct client when:
+    // 1. Feature flag is enabled
+    // 2. Provider is OPENCLAW
+    if (!USE_DIRECT_GATEWAY || provider !== 'OPENCLAW') {
+      // Disconnect existing direct client if switching away from OPENCLAW
+      if (directClientRef.current) {
+        debugLog('[ChatState] Disconnecting direct gateway client (provider changed)');
+        directClientRef.current.disconnect();
+        directClientRef.current = null;
+        directClientConnectedRef.current = false;
+      }
+      return;
+    }
+
+    // Already have a connected client
+    if (directClientRef.current) {
+      return;
+    }
+
+    debugLog('[ChatState] Creating direct gateway client');
+    const directClient = new OpenClawGatewayClient({
+      url: createGatewayDirectUrl(),
+      onEvent: handleDirectGatewayEvent,
+      onConnected: () => {
+        debugLog('[ChatState] Direct gateway connected');
+        directClientConnectedRef.current = true;
+        setWsConnected(true);
+        // Subscribe to current session if any
+        const currentSession = sessionRef.current;
+        if (currentSession && currentSession.startsWith('agent:')) {
+          directClient.subscribeSession(currentSession).catch((err) => {
+            console.warn('[ChatState] Failed to subscribe to session:', err);
+          });
+        }
+      },
+      onDisconnected: () => {
+        debugLog('[ChatState] Direct gateway disconnected');
+        directClientConnectedRef.current = false;
+        setWsConnected(false);
+        if (isStreamActiveRef.current) {
+          console.warn('[ChatState] Direct gateway disconnected during active stream');
+          setStatusText('Reconnecting to stream…');
+        }
+      },
+      onError: (err) => {
+        console.error('[ChatState] Direct gateway error:', err);
+      },
+    });
+
+    directClientRef.current = directClient;
+    directClient.connect();
+
+    return () => {
+      debugLog('[ChatState] Cleaning up direct gateway client');
+      directClient.disconnect();
+      directClientRef.current = null;
+      directClientConnectedRef.current = false;
+    };
+  }, [provider, handleDirectGatewayEvent]);
 
   // Visibility change handler: when tab becomes visible again, check stream status
   // and resubscribe if needed. Mobile browsers are aggressive about backgrounding
@@ -1342,7 +1751,30 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     isStreamActiveRef.current = true;
     resetStreamWatchdog();
 
-    // Send via WS
+    // For OPENCLAW with direct gateway enabled, use the direct client
+    const directClient = directClientRef.current;
+    if (USE_DIRECT_GATEWAY && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
+      try {
+        const currentSession = sessionRef.current || 'main';
+        debugLog('[ChatState] Sending via direct gateway to session:', currentSession);
+        const runId = await directClient.sendMessage(currentSession, text);
+        currentRunIdRef.current = runId;
+        debugLog('[ChatState] Direct send initiated, runId:', runId);
+        // Events will come through handleDirectGatewayEvent
+      } catch (err: any) {
+        console.error('[ChatState] Direct gateway send failed:', err);
+        setMessages(prev => prev.map(m =>
+          m.id === assistantId ? { ...m, content: '\u26a0\ufe0f ' + (err.message || 'Send failed') } : m
+        ));
+        setIsRunning(false);
+        setStreamingPhase('idle');
+        isStreamActiveRef.current = false;
+        streamingAssistantIdRef.current = null;
+      }
+      return;
+    }
+
+    // Send via WS (portal middleman path for non-OPENCLAW or when direct gateway unavailable)
     const manager = wsManagerRef.current;
     if (manager && manager.isConnected()) {
       const payload: Record<string, unknown> = {
@@ -1500,11 +1932,20 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // Cancel stream
   const cancelStream = useCallback(async () => {
     try {
-      const manager = wsManagerRef.current;
-      if (manager && manager.isConnected()) {
-        manager.send({ type: 'abort', session: sessionRef.current });
+      // For OPENCLAW with direct gateway, use the direct client for abort
+      const directClient = directClientRef.current;
+      if (USE_DIRECT_GATEWAY && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
+        const currentSession = sessionRef.current;
+        const runId = currentRunIdRef.current;
+        debugLog('[ChatState] Aborting via direct gateway, session:', currentSession, 'runId:', runId);
+        await directClient.abortRun(currentSession, runId || undefined);
       } else {
-        await client.post('/gateway/chat/abort', { session: sessionRef.current });
+        const manager = wsManagerRef.current;
+        if (manager && manager.isConnected()) {
+          manager.send({ type: 'abort', session: sessionRef.current });
+        } else {
+          await client.post('/gateway/chat/abort', { session: sessionRef.current });
+        }
       }
     } catch (err) {
       console.error('[ChatState] Failed to cancel stream:', err);
@@ -1515,6 +1956,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       setStreamingPhase('idle');
       setStatusText(null);
       setIsCompacting(false);
+      currentRunIdRef.current = null;
       if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
       const cid = streamingAssistantIdRef.current;
       if (cid) {

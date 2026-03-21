@@ -27,7 +27,8 @@ import { getOpenClawApiUrl } from '../config/openclaw';
 import { shouldIsolateUser } from '../utils/workspaceScope';
 import { extractTextFromContent as extractSanitizedText } from '../utils/chatText';
 import { canAccessPortal, canUseInteractivePortal, isElevatedRole, isOwnerRole } from '../utils/authz';
-import { hasGatewayToken } from '../utils/gatewayToken';
+import { hasGatewayToken, getGatewayToken } from '../utils/gatewayToken';
+import { getOpenClawWsUrl } from '../config/openclaw';
 import { isAllowedWebSocketOrigin } from '../utils/websocketOrigin';
 // @ts-ignore - ws doesn't have type declarations in this project
 import { WebSocketServer, WebSocket } from 'ws';
@@ -2022,11 +2023,140 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
 /* ─── WS Server setup (called from server.ts) ─────────────────────────── */
 
 let portalWss: WebSocketServer | null = null;
+let directWss: WebSocketServer | null = null;
+
+/**
+ * Handle a direct WebSocket proxy connection.
+ * This creates a transparent pipe between the browser and the OpenClaw gateway,
+ * with one exception: 'connect' requests have the auth token injected server-side.
+ */
+function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
+  const gatewayUrl = getOpenClawWsUrl();
+  let gatewayWs: WebSocket | null = null;
+  let browserClosed = false;
+  let gatewayClosed = false;
+
+  debugLog(`[gateway-direct] Creating proxy for user ${user.email} to ${gatewayUrl}`);
+
+  try {
+    gatewayWs = new WebSocket(gatewayUrl);
+  } catch (err: any) {
+    console.error('[gateway-direct] Failed to connect to gateway:', err.message);
+    browserWs.close(1011, 'Gateway connection failed');
+    return;
+  }
+
+  gatewayWs.on('open', () => {
+    debugLog('[gateway-direct] Connected to gateway');
+    // Send a connected event to the browser
+    try {
+      browserWs.send(JSON.stringify({ type: 'connected', userId: user.userId }));
+    } catch {}
+  });
+
+  gatewayWs.on('message', (data: Buffer | string) => {
+    if (browserClosed) return;
+    // Forward gateway messages to browser unchanged
+    try {
+      browserWs.send(data);
+    } catch (err: any) {
+      debugLog('[gateway-direct] Failed to forward to browser:', err.message);
+    }
+  });
+
+  gatewayWs.on('close', (code: number, reason: Buffer) => {
+    gatewayClosed = true;
+    debugLog(`[gateway-direct] Gateway closed: ${code} ${reason?.toString()}`);
+    if (!browserClosed) {
+      try {
+        browserWs.close(code, reason?.toString() || 'Gateway disconnected');
+      } catch {}
+    }
+  });
+
+  gatewayWs.on('error', (err: Error) => {
+    console.error('[gateway-direct] Gateway error:', err.message);
+    if (!browserClosed) {
+      try {
+        browserWs.close(1011, 'Gateway error');
+      } catch {}
+    }
+  });
+
+  browserWs.on('message', (data: Buffer | string) => {
+    if (gatewayClosed || !gatewayWs) return;
+
+    // Parse the message to check if it's a 'connect' request
+    let frame: any;
+    try {
+      frame = JSON.parse(data.toString());
+    } catch {
+      // Not JSON — pass through unchanged (shouldn't happen with JSON-RPC)
+      try {
+        gatewayWs.send(data);
+      } catch {}
+      return;
+    }
+
+    // Intercept 'connect' requests and inject the auth token
+    if (frame.type === 'req' && frame.method === 'connect') {
+      debugLog('[gateway-direct] Intercepting connect request to inject token');
+      frame.params = frame.params || {};
+      frame.params.auth = frame.params.auth || {};
+      frame.params.auth.token = getGatewayToken();
+
+      try {
+        gatewayWs.send(JSON.stringify(frame));
+      } catch (err: any) {
+        debugLog('[gateway-direct] Failed to send injected connect:', err.message);
+      }
+      return;
+    }
+
+    // Pass through all other frames unchanged
+    try {
+      gatewayWs.send(data);
+    } catch (err: any) {
+      debugLog('[gateway-direct] Failed to forward to gateway:', err.message);
+    }
+  });
+
+  browserWs.on('close', (code: number, reason: Buffer) => {
+    browserClosed = true;
+    debugLog(`[gateway-direct] Browser closed: ${code} ${reason?.toString()}`);
+    if (!gatewayClosed && gatewayWs) {
+      try {
+        gatewayWs.close(code, reason?.toString() || 'Browser disconnected');
+      } catch {}
+    }
+  });
+
+  browserWs.on('error', (err: Error) => {
+    console.error('[gateway-direct] Browser error:', err.message);
+    if (!gatewayClosed && gatewayWs) {
+      try {
+        gatewayWs.close(1011, 'Browser error');
+      } catch {}
+    }
+  });
+
+  // Ping/pong keepalive
+  const pingTimer = setInterval(() => {
+    if (!browserClosed && browserWs.readyState === WebSocket.OPEN) {
+      try { browserWs.ping(); } catch {}
+    }
+    if (!gatewayClosed && gatewayWs?.readyState === WebSocket.OPEN) {
+      try { gatewayWs.ping(); } catch {}
+    }
+  }, 30000);
+
+  browserWs.on('close', () => clearInterval(pingTimer));
+}
 
 /**
  * Attach the portal WebSocket server to the HTTP server.
  * Call this from server.ts after creating httpServer.
- * Handles upgrade requests on /api/gateway/ws.
+ * Handles upgrade requests on /api/gateway/ws and /api/gateway/direct.
  */
 export function attachPortalWebSocket(httpServer: HttpServer) {
   portalWss = new WebSocketServer({ noServer: true });
@@ -2042,10 +2172,25 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
     handlePortalWsConnection(ws, user);
   });
 
-  // Register upgrade handler
+  // Initialize the direct proxy WebSocket server
+  directWss = new WebSocketServer({ noServer: true });
+
+  directWss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+    const user = (req as any).__portalUser as JwtPayload;
+    if (!user) {
+      ws.close(4001, 'Unauthorized');
+      return;
+    }
+    handleDirectProxyConnection(ws, user);
+  });
+
+  // Register upgrade handler for both /api/gateway/ws and /api/gateway/direct
   httpServer.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const url = req.url || '';
-    if (!url.startsWith('/api/gateway/ws')) return; // Let other upgrade handlers proceed
+    const isPortalWs = url.startsWith('/api/gateway/ws');
+    const isDirectProxy = url.startsWith('/api/gateway/direct');
+
+    if (!isPortalWs && !isDirectProxy) return; // Let other upgrade handlers proceed
 
     const origin = req.headers.origin;
     if (!isAllowedWebSocketOrigin(origin)) {
@@ -2087,16 +2232,23 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
         sandboxEnabled: !!(dbUser as any).sandboxEnabled,
       };
 
-      portalWss!.handleUpgrade(req, socket, head, (ws: any) => {
-        portalWss!.emit('connection', ws, req);
-      });
+      // Route to the appropriate WebSocket server
+      if (isDirectProxy) {
+        directWss!.handleUpgrade(req, socket, head, (ws: any) => {
+          directWss!.emit('connection', ws, req);
+        });
+      } else {
+        portalWss!.handleUpgrade(req, socket, head, (ws: any) => {
+          portalWss!.emit('connection', ws, req);
+        });
+      }
     }).catch(() => {
       socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
       socket.destroy();
     });
   });
 
-  debugLog('[gateway-ws] Portal WebSocket server attached on /api/gateway/ws');
+  debugLog('[gateway-ws] Portal WebSocket server attached on /api/gateway/ws and /api/gateway/direct');
 }
 
 export default router;
