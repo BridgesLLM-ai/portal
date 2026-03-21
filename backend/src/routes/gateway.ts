@@ -1745,6 +1745,15 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
           // Stop keepalive during idle gap, but do NOT unsub — agent may resume
           if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
         }
+        if (evt.type === 'run_resumed') {
+          // Agent resumed after sub-agent — restart keepalive
+          if (!streamKeepalive) {
+            streamKeepalive = setInterval(() => {
+              wsSend(ws, { type: 'keepalive', ts: Date.now() });
+            }, 10000);
+          }
+          debugLog(`[handleWsSend] run_resumed detected for ${sessionId} — keepalive restarted`);
+        }
         if (evt.type === 'error') {
           // Hard error — clean up fully
           if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }

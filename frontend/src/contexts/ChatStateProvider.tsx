@@ -515,6 +515,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // generation simply discards its result, eliminating race conditions.
   const historyGenRef = useRef(0);
 
+  // Sync refs immediately when state changes. Note: the refs are ALSO updated
+  // synchronously in the event handlers (see case 'session' below) to avoid races.
   useEffect(() => { sessionRef.current = session; }, [session]);
   useEffect(() => { providerRef.current = provider; }, [provider]);
   useEffect(() => { agentIdRef.current = agentId; }, [agentId]);
@@ -742,6 +744,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   // WS event handler — processes events even when chat page is unmounted
   const handleWsEvent = useCallback((data: any) => {
+    // Session events with a new sessionId should update our ref IMMEDIATELY,
+    // before the React state update queues. This prevents subsequent events
+    // (that arrive before the useEffect fires) from being dropped.
+    if (data?.type === 'session' && data.sessionId) {
+      sessionRef.current = data.sessionId;
+    }
+
+    // Filter events by session key. Allow events that match our current session,
+    // OR events that don't have a sessionKey (global events like connected/keepalive).
     if (data?.sessionKey && data.sessionKey !== sessionRef.current) {
       return;
     }
@@ -959,8 +970,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setIsRunning(false);
         setIsCompacting(false);
         if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
+        // Mark stream as inactive but DON'T null out streamingAssistantIdRef yet.
+        // The agent may resume after a sub-agent completes (sessions_yield flow).
+        // The guard at the top of handleWsEvent will create a new bubble when
+        // stream events arrive without an active assistantId.
         isStreamActiveRef.current = false;
         streamingAssistantIdRef.current = null;
+        // Reset text accumulator so the next run segment starts fresh
+        assembledRef.current = '';
+        lastSegmentStartRef.current = 0;
         setMessages(prev => prev.map(m =>
           m.id === cid ? { ...m, content: finalContent, provenance: prov || undefined } : m
         ));
@@ -1108,6 +1126,57 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       releaseWsManager();
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Visibility change handler: when tab becomes visible again, check stream status
+  // and resubscribe if needed. Mobile browsers are aggressive about backgrounding
+  // WebSockets, so this helps recover lost streams.
+  useEffect(() => {
+    const handleVisibilityChange = async () => {
+      if (document.visibilityState !== 'visible') return;
+
+      const manager = wsManagerRef.current;
+      const currentSession = sessionRef.current;
+      const currentProvider = providerRef.current;
+
+      if (!currentSession) return;
+
+      debugLog('[ChatState] Tab became visible — checking stream status');
+
+      // 1. Check if WS is still connected
+      if (!manager || !manager.isConnected()) {
+        debugLog('[ChatState] WS disconnected on visibility — waiting for auto-reconnect');
+        return; // WsManager's built-in reconnect will handle this
+      }
+
+      // 2. If we think we have an active stream, verify it's still running
+      if (isStreamActiveRef.current) {
+        // Stream was active — send a reconnect message to resubscribe
+        manager.send({ type: 'reconnect', session: currentSession });
+        resetStreamWatchdog();
+        return;
+      }
+
+      // 3. No active stream — check if one started while we were backgrounded
+      try {
+        const params: Record<string, string> = { session: currentSession };
+        if (currentProvider) params.provider = currentProvider;
+        const { data } = await client.get('/gateway/stream-status', { params });
+
+        if (data.active) {
+          debugLog('[ChatState] Discovered active stream on visibility — subscribing');
+          // A stream started while we were backgrounded — subscribe to it
+          manager.send({ type: 'reconnect', session: currentSession });
+        }
+      } catch (err) {
+        console.warn('[ChatState] Visibility check failed:', err);
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [resetStreamWatchdog]);
 
   // Clear messages helper — also invalidates any in-flight history load and
   // resets transient stream UI so switching sessions always starts clean.

@@ -173,6 +173,10 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   if (!expectedRunId && runId) {
     activeRunIds.set(sessionKey, runId);
     debugLog(`Adopted new runId=${runId} for session ${sessionKey} (resumed after yield)`);
+    // Reset text accumulators for the new run
+    assistantLastSeenTextMap.delete(sessionKey);
+    streamEventBus.setLastSeenText(sessionKey, '');
+    streamEventBus.setLatestText(sessionKey, '');
     // Signal the frontend that a new run segment has started
     streamEventBus.publish(sessionKey, { type: 'run_resumed', content: '' });
   }
@@ -318,7 +322,17 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
 
   // If no active runId is set but the event has one, adopt it (new run segment)
   if (!expectedRunId && runId) {
+    const wasRecent = streamEventBus.wasRecentlyDone(sessionKey);
     activeRunIds.set(sessionKey, runId);
+    debugLog(`Adopted new runId=${runId} for session ${sessionKey} via chat event (wasRecentlyDone=${wasRecent})`);
+    // Reset text accumulators for the new run
+    assistantLastSeenTextMap.delete(sessionKey);
+    streamEventBus.setLastSeenText(sessionKey, '');
+    streamEventBus.setLatestText(sessionKey, '');
+    // If the session was recently done, signal resumption
+    if (wasRecent) {
+      streamEventBus.publish(sessionKey, { type: 'run_resumed', content: '' });
+    }
   }
 
   // Ensure the stream is tracked
@@ -507,6 +521,21 @@ function connect(): void {
           stateVersion = msg.payload.stateVersion;
         }
         debugLog('Authenticated and listening for events');
+
+        // On reconnect, restore active session tracking and notify StreamEventBus
+        // that sessions may need to be re-subscribed.
+        const snapshot = (globalThis as any).__persistentWsActiveSessionsSnapshot as Map<string, string> | undefined;
+        if (snapshot && snapshot.size > 0) {
+          debugLog(`Reconnected with ${snapshot.size} previously active sessions`);
+          // Re-register the active runs so events are accepted
+          for (const [sessionKey, runId] of snapshot) {
+            activeRunIds.set(sessionKey, runId);
+            // Mark the session as potentially resuming in StreamEventBus
+            streamEventBus.startStream(sessionKey, runId);
+          }
+          // Clear the snapshot
+          delete (globalThis as any).__persistentWsActiveSessionsSnapshot;
+        }
         return;
       }
 
@@ -610,6 +639,11 @@ function connect(): void {
   ws.on('close', (code: number, reason: Buffer) => {
     const reasonStr = reason?.toString() || '';
     debugLog(`WebSocket closed: code=${code} ${reasonStr}`);
+
+    // Preserve activeRunIds before clearing state — we'll use these on reconnect
+    // to re-seed StreamEventBus if the gateway still has active sessions.
+    const activeSessionsSnapshot = new Map(activeRunIds);
+
     singletonWs = null;
     isConnecting = false;
     isAuthenticated = false;
@@ -619,6 +653,9 @@ function connect(): void {
       pending.reject(new Error('WebSocket connection closed'));
       pendingResponses.delete(id);
     }
+
+    // Store the snapshot for use on reconnect
+    (globalThis as any).__persistentWsActiveSessionsSnapshot = activeSessionsSnapshot;
 
     scheduleReconnect();
   });

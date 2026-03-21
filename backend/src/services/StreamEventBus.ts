@@ -24,6 +24,8 @@ export interface StreamInfo {
   runId?: string;
   latestText: string;
   lastEventAt: number;
+  /** Timestamp of last 'done' event — helps detect run resumption */
+  lastDoneAt?: number;
 }
 
 type StreamCallback = (event: StreamEvent) => void;
@@ -210,13 +212,32 @@ class StreamEventBus {
   /**
    * Soft-clear stream state for a session (run segment completed, but new run may follow).
    * Preserves subscribers and listener registration. Resets text tracking so the next
-   * run segment starts with a fresh accumulator.
+   * run segment starts with a fresh accumulator. Records lastDoneAt for resumption detection.
    */
   softClearStream(sessionKey: string): void {
-    this.activeStreams.delete(sessionKey);
+    const info = this.activeStreams.get(sessionKey);
+    const lastDoneAt = Date.now();
+    // Preserve lastDoneAt in a minimal "dormant" entry so we can detect resumption
+    this.activeStreams.set(sessionKey, {
+      active: false,
+      phase: 'thinking',
+      startedAt: info?.startedAt || lastDoneAt,
+      latestText: '',
+      lastEventAt: lastDoneAt,
+      lastDoneAt,
+    });
     this.lastSeenText.delete(sessionKey);
     this.latestText.delete(sessionKey);
     // NOTE: listeners are NOT removed — they stay alive for the next run segment
+  }
+
+  /**
+   * Check if a session had a recent 'done' and is now potentially resuming.
+   */
+  wasRecentlyDone(sessionKey: string, withinMs: number = 300000): boolean {
+    const info = this.activeStreams.get(sessionKey);
+    if (!info || !info.lastDoneAt) return false;
+    return Date.now() - info.lastDoneAt < withinMs;
   }
 
   /**
