@@ -9,6 +9,7 @@ import {
   MessageSquare,
   Octagon,
   PlayCircle,
+  RefreshCw,
   Send,
   Sparkles,
   X,
@@ -16,6 +17,45 @@ import {
 } from 'lucide-react';
 import { agentJobsAPI, AgentJob, TranscriptEntry } from '../api/agentJobs';
 import { agentRuntimeAPI, AgentRuntimeStatus } from '../api/agentRuntime';
+
+/* ─── Transcript Cache ──────────────────────────────────────────────────── */
+
+const MAX_CACHE_SIZE = 20;
+
+class TranscriptCache {
+  private cache = new Map<string, TranscriptEntry[]>();
+  private accessOrder: string[] = [];
+
+  get(jobId: string): TranscriptEntry[] | undefined {
+    return this.cache.get(jobId);
+  }
+
+  set(jobId: string, entries: TranscriptEntry[]): void {
+    // Update access order
+    const idx = this.accessOrder.indexOf(jobId);
+    if (idx !== -1) this.accessOrder.splice(idx, 1);
+    this.accessOrder.push(jobId);
+
+    // Evict oldest if over limit
+    while (this.accessOrder.length > MAX_CACHE_SIZE) {
+      const evict = this.accessOrder.shift();
+      if (evict) this.cache.delete(evict);
+    }
+
+    this.cache.set(jobId, entries);
+  }
+
+  append(jobId: string, entry: TranscriptEntry): void {
+    const existing = this.cache.get(jobId) || [];
+    this.set(jobId, [...existing, entry]);
+  }
+
+  clear(jobId: string): void {
+    this.cache.delete(jobId);
+    const idx = this.accessOrder.indexOf(jobId);
+    if (idx !== -1) this.accessOrder.splice(idx, 1);
+  }
+}
 
 /* ─── Constants ─────────────────────────────────────────────────────────── */
 
@@ -326,10 +366,15 @@ export default function AgentChatsPage() {
   const [isStartingJob, setIsStartingJob] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
   const [socketState, setSocketState] = useState<'connecting' | 'connected' | 'error'>('connecting');
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   const startJobLock = useRef<string | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const transcriptCacheRef = useRef(new TranscriptCache());
+  const socketRef = useRef<Socket | null>(null);
+  const currentSubscriptionRef = useRef<string | null>(null);
+  const reconnectAttemptRef = useRef(0);
 
   const selectedJob = useMemo(() => jobs.find((j) => j.id === selectedJobId) || null, [jobs, selectedJobId]);
   const adapterSupportsModel = !!ADAPTER_MODEL_FLAGS[toolId];
@@ -360,11 +405,29 @@ export default function AgentChatsPage() {
     return () => { cancelled = true; clearInterval(interval); };
   }, [selectedJobId]);
 
-  // Load transcript
+  // Load transcript (with caching)
   useEffect(() => {
     if (!selectedJobId) return;
     setIsThinking(false);
-    agentJobsAPI.get(selectedJobId).then((job) => setTranscript(job.transcript || [])).catch(() => setTranscript([]));
+
+    const cache = transcriptCacheRef.current;
+    
+    // Show cached version immediately if available
+    const cached = cache.get(selectedJobId);
+    if (cached) {
+      setTranscript(cached);
+    }
+
+    // Fetch fresh data in background
+    agentJobsAPI.get(selectedJobId)
+      .then((job) => {
+        const entries = job.transcript || [];
+        cache.set(selectedJobId, entries);
+        setTranscript(entries);
+      })
+      .catch(() => {
+        if (!cached) setTranscript([]);
+      });
   }, [selectedJobId]);
 
   // Runtime status
@@ -384,16 +447,27 @@ export default function AgentChatsPage() {
   }, []);
 
   // Auto-start from Agent Tools (deduped)
+  // This only fires when navigating FROM another page with startJob in state
+  // Clicking sidebar jobs just sets selectedJobId - does NOT trigger this
   useEffect(() => {
     const state = location.state as any;
     const startJobState = state?.startJob;
+    
+    // Exit early if no start job state
     if (!startJobState?.toolId || !startJobState?.command) return;
+    
+    // Create a unique signature for this job request
     const sig = JSON.stringify(startJobState);
+    
+    // Already processed this exact request? Clear state and skip
     if (startJobLock.current === sig) {
-      navigate('/agent-chats', { replace: true });
+      navigate('/agent-chats', { replace: true, state: {} });
       return;
     }
+    
+    // Lock to prevent re-processing
     startJobLock.current = sig;
+    
     let cancelled = false;
     (async () => {
       try {
@@ -406,31 +480,86 @@ export default function AgentChatsPage() {
         setJobs((prev) => [job, ...prev]);
         setSelectedJobId(job.id);
       } catch { /* no-op */ } finally {
-        navigate('/agent-chats', { replace: true });
+        // Always clear state to prevent re-triggering on re-render
+        navigate('/agent-chats', { replace: true, state: {} });
       }
     })();
     return () => { cancelled = true; };
   }, [location.state, navigate]);
 
-  // WebSocket (cookie auth fallback supported server-side)
+  // Persistent WebSocket (connect once, subscribe/unsubscribe to jobs)
   useEffect(() => {
-    setSocketState('connecting');
     const wsUrl = import.meta.env.VITE_WS_URL || window.location.origin;
-    const socket: Socket = io(`${wsUrl}/ws/agent-jobs`, {
-      transports: ['websocket'],
-      withCredentials: true,
-    });
-    socket.on('connect', () => {
-      setSocketState('connected');
-      if (selectedJobId) socket.emit('subscribe', { jobId: selectedJobId });
-    });
-    socket.on('connect_error', () => setSocketState('error'));
-    socket.on('output', ({ jobId, entry }: { jobId: string; entry: TranscriptEntry }) => {
-      if (jobId !== selectedJobId) return;
-      setIsThinking(false);
-      setTranscript((prev) => [...prev, entry]);
-    });
-    return () => { socket.disconnect(); };
+    
+    const createSocket = () => {
+      setSocketState('connecting');
+      
+      const socket: Socket = io(`${wsUrl}/ws/agent-jobs`, {
+        transports: ['websocket'],
+        withCredentials: true,
+        reconnection: true,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 30000,
+        reconnectionAttempts: Infinity,
+      });
+
+      socket.on('connect', () => {
+        setSocketState('connected');
+        reconnectAttemptRef.current = 0;
+        // Re-subscribe to current job on reconnect
+        if (currentSubscriptionRef.current) {
+          socket.emit('subscribe', { jobId: currentSubscriptionRef.current });
+        }
+      });
+
+      socket.on('disconnect', () => {
+        setSocketState('connecting');
+      });
+
+      socket.on('connect_error', () => {
+        reconnectAttemptRef.current++;
+        setSocketState('error');
+      });
+
+      socket.on('output', ({ jobId, entry }: { jobId: string; entry: TranscriptEntry }) => {
+        // Update cache regardless of current selection
+        transcriptCacheRef.current.append(jobId, entry);
+        
+        // Only update UI state if this is the selected job
+        if (jobId === currentSubscriptionRef.current) {
+          setIsThinking(false);
+          setTranscript((prev) => [...prev, entry]);
+        }
+      });
+
+      socketRef.current = socket;
+    };
+
+    createSocket();
+
+    return () => {
+      socketRef.current?.disconnect();
+      socketRef.current = null;
+    };
+  }, []);
+
+  // Subscribe/unsubscribe when selected job changes
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket) return;
+
+    // Unsubscribe from previous job
+    if (currentSubscriptionRef.current && currentSubscriptionRef.current !== selectedJobId) {
+      socket.emit('unsubscribe', { jobId: currentSubscriptionRef.current });
+    }
+
+    // Subscribe to new job
+    if (selectedJobId) {
+      socket.emit('subscribe', { jobId: selectedJobId });
+      currentSubscriptionRef.current = selectedJobId;
+    } else {
+      currentSubscriptionRef.current = null;
+    }
   }, [selectedJobId]);
 
   // Poll transcript/status when job is running (fallback if websocket drops)
@@ -468,6 +597,41 @@ export default function AgentChatsPage() {
   }, []);
 
   /* ── Actions ───────────────────────────────────────────────────────── */
+
+  const refreshTranscript = useCallback(async () => {
+    if (!selectedJobId || isRefreshing) return;
+    setIsRefreshing(true);
+    try {
+      // Clear cache for this job to force fresh data
+      transcriptCacheRef.current.clear(selectedJobId);
+      
+      // Fetch fresh transcript
+      const job = await agentJobsAPI.get(selectedJobId);
+      const entries = job.transcript || [];
+      transcriptCacheRef.current.set(selectedJobId, entries);
+      setTranscript(entries);
+      
+      // Update job status
+      setJobs((prev) => prev.map((j) => 
+        j.id === selectedJobId 
+          ? { ...j, status: job.status, updatedAt: job.updatedAt, finishedAt: job.finishedAt, exitCode: job.exitCode }
+          : j
+      ));
+
+      // Reconnect socket if disconnected
+      const socket = socketRef.current;
+      if (socket && !socket.connected) {
+        socket.connect();
+      } else if (socket && selectedJobId) {
+        // Re-subscribe to ensure we're receiving updates
+        socket.emit('subscribe', { jobId: selectedJobId });
+      }
+    } catch {
+      // no-op
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [selectedJobId, isRefreshing]);
 
   const sendInput = async (e: FormEvent) => {
     e.preventDefault();
@@ -626,8 +790,28 @@ export default function AgentChatsPage() {
                 </div>
               </div>
               <div className="flex items-center gap-2 shrink-0">
-                <span className={`px-2 py-0.5 rounded-full text-[10px] border ${socketState === 'connected' ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20' : socketState === 'connecting' ? 'bg-amber-500/10 text-amber-300 border-amber-500/20' : 'bg-red-500/10 text-red-300 border-red-500/20'}`}>{socketState === 'connected' ? 'Live' : socketState === 'connecting' ? 'Connecting' : 'Polling'}</span>
+                <span 
+                  className={`px-2 py-0.5 rounded-full text-[10px] border flex items-center gap-1 ${
+                    socketState === 'connected' 
+                      ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20' 
+                      : socketState === 'connecting' 
+                        ? 'bg-amber-500/10 text-amber-300 border-amber-500/20' 
+                        : 'bg-red-500/10 text-red-300 border-red-500/20'
+                  }`}
+                  title={socketState === 'error' ? 'Click refresh to reconnect' : undefined}
+                >
+                  {socketState === 'connecting' && <Loader2 size={10} className="animate-spin" />}
+                  {socketState === 'connected' ? 'Live' : socketState === 'connecting' ? 'Reconnecting' : 'Disconnected'}
+                </span>
                 <RuntimeTimer startedAt={selectedJob.startedAt} finishedAt={selectedJob.finishedAt} status={selectedJob.status} />
+                <button
+                  onClick={refreshTranscript}
+                  disabled={isRefreshing}
+                  className={`p-1.5 rounded-lg transition-colors ${isRefreshing ? 'text-violet-400' : 'text-slate-500 hover:text-slate-300 hover:bg-white/[0.05]'}`}
+                  title="Refresh transcript"
+                >
+                  <RefreshCw size={14} className={isRefreshing ? 'animate-spin' : ''} />
+                </button>
                 <button
                   onClick={() => exportTranscript(selectedJob, transcript, 'md')}
                   className="p-1.5 rounded-lg text-slate-500 hover:text-slate-300 hover:bg-white/[0.05] transition-colors"
