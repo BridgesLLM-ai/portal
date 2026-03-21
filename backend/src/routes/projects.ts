@@ -2075,7 +2075,7 @@ router.post('/:name/deploy', authenticateToken, async (req: Request, res: Respon
       // Launch in xterm on the VNC desktop (fully detached via setsid so execSync returns immediately)
       if (runCommand) {
         try {
-          const innerCmd = `DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/bridges-rd-runtime PULSE_SERVER=unix:/tmp/bridges-rd-runtime/pulse/native SDL_AUDIODRIVER=pulseaudio xterm -title ${shellEscape(safeAppName)} -fa Monospace -fs 12 -e "bash -c ${shellEscape(`${runCommand}; echo; echo Press Enter to close...; read`)}"`;
+          const innerCmd = `DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/bridges-rd-runtime PULSE_SERVER=unix:/tmp/bridges-rd-runtime/pulse/native SDL_AUDIODRIVER=pulseaudio xterm -title ${shellEscape(safeAppName)} -fa Monospace -fs 12 -e "bash -c ${shellEscape(`cd ${shellEscape(runtimeDir)} && ${runCommand}; echo; echo Press Enter to close...; read`)}"`;
           const xtermCmd = `setsid su - bridgesrd -c ${shellEscape(innerCmd)} </dev/null >/dev/null 2>&1 &`;
           execSync(xtermCmd, { timeout: 5000 });
           buildOutput += `\nRunning on Remote Desktop`;
