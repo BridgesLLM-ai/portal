@@ -860,6 +860,9 @@ function ThinkingBlock({ content, isActive, activeLabel }: { content?: string; i
 
   if (!isActive && !content) return null;
 
+  // Allow expansion when there's content (even during streaming)
+  const canExpand = !!content;
+
   return (
     <motion.div
       initial={{ opacity: 0, height: 0 }}
@@ -869,8 +872,8 @@ function ThinkingBlock({ content, isActive, activeLabel }: { content?: string; i
       className="mb-3"
     >
       <button
-        onClick={() => content && !isActive && setExpanded(!expanded)}
-        className="flex items-center gap-2.5 px-4 py-2 rounded-xl bg-violet-500/[0.08] border border-violet-500/[0.15] hover:bg-violet-500/[0.12] transition-colors w-full text-left"
+        onClick={() => canExpand && setExpanded(!expanded)}
+        className={`flex items-center gap-2.5 px-4 py-2 rounded-xl bg-violet-500/[0.08] border border-violet-500/[0.15] transition-colors w-full text-left ${canExpand ? 'hover:bg-violet-500/[0.12] cursor-pointer' : 'cursor-default'}`}
       >
         <div className={isActive ? 'animate-thinking-pulse' : ''}>
           <Sparkles size={14} className="text-violet-400" />
@@ -883,14 +886,16 @@ function ThinkingBlock({ content, isActive, activeLabel }: { content?: string; i
             <span className="text-[11px] text-violet-400/60 font-mono tabular-nums">
               {elapsedSeconds}s
             </span>
-            <span className="flex gap-0.5 ml-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '0ms' }} />
-              <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '150ms' }} />
-              <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '300ms' }} />
-            </span>
+            {!expanded && (
+              <span className="flex gap-0.5 ml-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '0ms' }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '150ms' }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+              </span>
+            )}
           </>
         )}
-        {content && !isActive && (
+        {canExpand && (
           <ChevronRight size={12} className={`text-violet-400 transition-transform ${expanded ? 'rotate-90' : ''}`} />
         )}
       </button>
@@ -1578,6 +1583,7 @@ function AssistantBubble({
   avatarUrl,
   isLast,
   isStreaming,
+  liveThinkingContent,
   onRetry,
 }: {
   agent: AgentIdentity;
@@ -1585,13 +1591,20 @@ function AssistantBubble({
   avatarUrl?: string;
   isLast: boolean;
   isStreaming: boolean;
+  /** Live thinking content from context state — used for the streaming message */
+  liveThinkingContent?: string;
   onRetry?: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
+  const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const provenance = message.provenance || agent.provenance;
   const toolCalls = message.toolCalls || [];
-  const thinkingContent = message.thinkingContent;
+  // For the streaming message, prefer live thinking content from context;
+  // otherwise fall back to persisted content on the message object
   const isCurrentlyStreaming = isLast && isStreaming;
+  const thinkingContent = isCurrentlyStreaming && liveThinkingContent
+    ? liveThinkingContent
+    : message.thinkingContent;
   const hasContent = !!message.content;
 
   return (
@@ -1608,14 +1621,16 @@ function AssistantBubble({
         )}
       </div>
       <div className="flex-1 min-w-0 max-w-[80%]">
-        {/* Thinking block — only for historical thought content (collapsed, expandable).
-            Live "Thinking…" indicator is handled by the pinned status bar above the composer.
-            Do NOT render during active streaming — it's redundant with the status bar. */}
+        {/* Thinking block — shows both during streaming (collapsible disclosure) and
+            after streaming completes (expandable historical content).
+            During streaming: shows as a collapsible block so user can peek at thoughts.
+            After streaming: shows as expandable historical content. */}
         <AnimatePresence>
-          {thinkingContent && !isCurrentlyStreaming && (
+          {thinkingContent && (
             <ThinkingBlock
               content={thinkingContent}
-              isActive={false}
+              isActive={isCurrentlyStreaming}
+              activeLabel={isCurrentlyStreaming ? 'Internal monologue' : undefined}
             />
           )}
         </AnimatePresence>
@@ -2191,6 +2206,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     resolveApproval: streamResolveApproval,
     dismissApproval: streamDismissApproval,
     isCompacting,
+    thinkingContent,
   } = useAgentRuntime({
     provider,
     session,
@@ -2626,6 +2642,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                             avatarUrl={agentAvatars[agent.providerName]}
                             isLast={idx === messages.length - 1}
                             isStreaming={isRunning}
+                            liveThinkingContent={idx === messages.length - 1 ? thinkingContent : undefined}
                             onRetry={
                               idx === messages.length - 1 && lastUserMessage
                                 ? () => {

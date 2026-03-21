@@ -753,7 +753,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
     // Filter events by session key. Allow events that match our current session,
     // OR events that don't have a sessionKey (global events like connected/keepalive).
-    if (data?.sessionKey && data.sessionKey !== sessionRef.current) {
+    // Also allow compaction events through regardless of session key — they're important
+    // system notifications that should display even if the sessionKey hasn't resolved yet.
+    const alwaysPassthroughTypes = ['compaction_start', 'compaction_end', 'connected', 'keepalive'];
+    if (data?.sessionKey && data.sessionKey !== sessionRef.current && !alwaysPassthroughTypes.includes(data.type)) {
       return;
     }
     // Temp debug: log tool-related events to diagnose missing tool cards
@@ -829,17 +832,19 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'compaction_start': {
         if (providerRef.current !== 'OPENCLAW') break;
         setIsCompacting(true);
+        // Clear thinking content — old thoughts are being compacted away anyway
+        setThinkingContent('');
         setStatusText('Compacting context… stream may pause briefly');
+        // Use 'system' role so it renders as a centered notification pill, not an assistant bubble
         setMessages(prev => {
-          const last = prev[prev.length - 1];
           const marker = '⚙️ Context compaction in progress. Stream may pause briefly while the session is compressed.';
-          if (last?.role === 'assistant' && last.content === marker) return prev;
+          const last = prev[prev.length - 1];
+          if (last?.role === 'system' && last.content === marker) return prev;
           return [...prev, {
             id: 'compaction-start-' + Date.now(),
-            role: 'assistant' as const,
+            role: 'system' as const,
             content: marker,
             createdAt: new Date(),
-            toolCalls: [],
           }];
         });
         if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
@@ -849,16 +854,16 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (providerRef.current !== 'OPENCLAW') break;
         compactionTimerRef.current = setTimeout(() => { setIsCompacting(false); compactionTimerRef.current = null; }, 3000);
         setStatusText('Context compacted. Reconnecting stream…');
+        // Use 'system' role so it renders as a centered notification pill, not an assistant bubble
         setMessages(prev => {
-          const last = prev[prev.length - 1];
           const marker = '✅ Context compaction finished. Reconnecting to the live stream now.';
-          if (last?.role === 'assistant' && last.content === marker) return prev;
+          const last = prev[prev.length - 1];
+          if (last?.role === 'system' && last.content === marker) return prev;
           return [...prev, {
             id: 'compaction-end-' + Date.now(),
-            role: 'assistant' as const,
+            role: 'system' as const,
             content: marker,
             createdAt: new Date(),
-            toolCalls: [],
           }];
         });
         window.setTimeout(() => {
