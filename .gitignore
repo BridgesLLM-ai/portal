@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build output
+frontend/dist/
+backend/dist/
+*.tar.gz
+*.map
+coverage/
+
+# Environment & secrets
+.env
+.env.*
+frontend/.env*
+backend/.env*
+backend/.ssh/
+*.pem
+*.key
+
+# Runtime data
+.data/
+projects/
+uploads/
+assets/avatars/
+assets/branding/
+*.log
+.DS_Store

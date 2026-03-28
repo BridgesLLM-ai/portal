@@ -1,0 +1,388 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             String    @id @default(uuid())
+  email          String    @unique
+  username       String    @unique
+  passwordHash   String
+  firstName      String?
+  lastName       String?
+  role           UserRole  @default(USER)
+  accountStatus  AccountStatus @default(ACTIVE)
+  isActive       Boolean   @default(true)
+  sandboxEnabled Boolean   @default(false)
+  lastLoginAt    DateTime?
+  approvedAt     DateTime?
+  approvedBy     String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  metadata       Json?     @default("{}")
+  avatarPath     String?
+  mailPassword   String?   // Legacy generated password for Stalwart account, null if no mailbox provisioned
+
+  // Two-Factor Authentication
+  twoFactorSecret      String?
+  twoFactorEnabled     Boolean   @default(false)
+  twoFactorBackupCodes String?   @db.Text
+  twoFactorMethod      String?   // 'totp' | 'email' | null
+
+  // Relations
+  sessions              Session[]
+  emailVerificationCodes EmailVerificationCode[]
+  files                 File[]
+  apps                  App[]
+  appShareLinks         AppShareLink[]
+  activityLogs          ActivityLog[]
+  chatMessages          ProjectChatMessage[]
+  chatSessions          ProjectChatSession[]
+  agentSessions         AgentSession[]
+  agentJobs             AgentJob[]
+  passwordResetTokens   PasswordResetToken[]
+  mailboxAccounts       MailboxAccount[]
+  reviewedRegistrations RegistrationRequest[] @relation("ReviewedBy")
+  approvedByUser        User?                 @relation("ApprovedByUser", fields: [approvedBy], references: [id], onDelete: SetNull)
+  approvedUsers         User[]                @relation("ApprovedByUser")
+
+  @@index([email])
+  @@index([username])
+  @@index([isActive])
+}
+
+model MailboxAccount {
+  id            String   @id @default(uuid())
+  userId        String
+  username      String   @unique
+  mailPassword  String
+  isPrimary     Boolean  @default(false)
+  signature     String?  @db.Text  // Plain text signature
+  signatureHtml String?  @db.Text  // HTML signature (rendered in emails)
+  autoForwardTo String?             // Email address to auto-forward incoming mail to
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, isPrimary])
+}
+
+model Session {
+  id                String   @id @default(uuid())
+  userId            String
+  refreshTokenHash  String   @unique
+  deviceFingerprint String?
+  ipAddress         String?
+  userAgent         String?
+  expiresAt         DateTime
+  createdAt         DateTime @default(now())
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model File {
+  id           String         @id @default(uuid())
+  userId       String
+  path         String
+  originalName String?
+  size         BigInt
+  mimeType     String?
+  visibility   FileVisibility @default(PRIVATE)
+  cloudinaryId String?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, path])
+  @@index([userId])
+  @@index([path])
+  @@index([visibility])
+}
+
+model App {
+  id          String   @id @default(uuid())
+  userId      String
+  name        String
+  description String?
+  zipPath     String
+  isPublic       Boolean  @default(false)
+  isActive       Boolean  @default(true)
+  deployType     String   @default("static")
+  port           Int?
+  processStatus  String   @default("stopped")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  // Relations
+  user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shareLinks AppShareLink[]
+
+  @@index([userId])
+  @@index([isPublic, isActive])
+}
+
+model AppShareLink {
+  id           String    @id @default(uuid())
+  appId        String
+  userId       String
+  token        String    @unique
+  expiresAt    DateTime?
+  maxUses      Int?
+  currentUses  Int       @default(0)
+  isActive     Boolean   @default(true)
+  isPublic     Boolean   @default(true)
+  passwordHash String?
+  progressData Json?
+  createdAt    DateTime  @default(now())
+
+  // Relations
+  app  App  @relation(fields: [appId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([appId])
+  @@index([isActive, expiresAt])
+}
+
+model ActivityLog {
+  id                String      @id @default(uuid())
+  userId            String?
+  action            String
+  resource          String
+  resourceId        String?
+  metadata          Json?
+  ipAddress         String?
+  userAgent         String?
+  translatedMessage String?
+  severity          LogSeverity @default(INFO)
+  createdAt         DateTime    @default(now())
+
+  // Relations
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([action])
+  @@index([resource])
+  @@index([severity])
+  @@index([createdAt])
+}
+
+model Metrics {
+  id           String   @id @default(uuid())
+  timestamp    DateTime @default(now())
+  cpuUsage     Float
+  memoryUsage  Float
+  memoryTotal  BigInt
+  diskUsage    Float
+  diskTotal    BigInt
+  networkIn    BigInt
+  networkOut   BigInt
+  processCount Int
+  loadAverage  Float[]
+  temperature  Float?
+  metadata     Json?
+
+  @@index([timestamp])
+}
+
+// ── Multi-User: Registration Requests ───────────────────────────────────────
+
+model RegistrationRequest {
+  id          String                    @id @default(uuid())
+  email       String
+  name        String
+  message     String?                   @db.Text
+  status      RegistrationRequestStatus @default(PENDING)
+  requestedAt DateTime                  @default(now())
+  reviewedAt  DateTime?
+  reviewedBy  String?
+
+  // Relations
+  reviewer User? @relation("ReviewedBy", fields: [reviewedBy], references: [id], onDelete: SetNull)
+
+  @@index([email])
+  @@index([status])
+  @@index([requestedAt])
+}
+
+// ── Agent Sessions (cross-provider) ─────────────────────────────────────────
+
+model AgentSession {
+  id             String            @id @default(uuid())
+  userId         String
+  provider       AgentProviderType
+  externalId     String // session id on the provider side
+  status         String            @default("active")
+  createdAt      DateTime          @default(now())
+  lastActivityAt DateTime          @default(now())
+  metadata       Json?             @default("{}")
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([provider])
+  @@index([status])
+  @@index([lastActivityAt])
+}
+
+
+model AgentJob {
+  id             String         @id @default(uuid())
+  userId         String
+  toolId         String
+  title          String?
+  status         AgentJobStatus @default(running)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  exitCode       Int?
+  transcriptPath String?
+  metadata       Json?          @default("{}")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+
+// ── System Settings (key-value) ─────────────────────────────────────────────
+model SystemSetting {
+  key       String   @id
+  value     String   @db.Text
+  updatedAt DateTime @updatedAt
+}
+
+// ── Password Reset Tokens ───────────────────────────────────────────────────
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  token     String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+  @@index([expiresAt])
+}
+
+// ── Enums ───────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  OWNER
+  SUB_ADMIN
+  USER
+  VIEWER
+}
+
+enum AccountStatus {
+  ACTIVE
+  PENDING
+  DISABLED
+  BANNED
+}
+
+enum FileVisibility {
+  PRIVATE
+  SHARED
+  PUBLIC
+}
+
+enum LogSeverity {
+  DEBUG
+  INFO
+  WARNING
+  ERROR
+  CRITICAL
+}
+
+enum RegistrationRequestStatus {
+  PENDING
+  APPROVED
+  DENIED
+}
+
+
+enum AgentJobStatus {
+  running
+  completed
+  error
+  killed
+}
+
+enum AgentProviderType {
+  OPENCLAW
+  CLAUDE_CODE
+  CODEX
+  AGENT_ZERO
+}
+
+model EmailVerificationCode {
+  id        String    @id @default(uuid())
+  userId    String
+  code      String    // 6-digit code, stored as bcrypt hash
+  expiresAt DateTime  // 10 minutes from creation
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model ProjectChatMessage {
+  id         String   @id @default(cuid())
+  projectId  String
+  userId     String
+  sessionKey String
+  role       String
+  content    String   @db.Text
+  timestamp  DateTime @default(now())
+  messageId  String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, projectId])
+  @@index([sessionKey])
+  @@index([timestamp])
+}
+
+model ProjectChatSession {
+  id           String   @id @default(cuid())
+  userId       String
+  projectId    String
+  sessionKey   String   @unique
+  status       String   @default("active")
+  model        String?
+  lastActivity DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, projectId])
+  @@index([sessionKey])
+}
