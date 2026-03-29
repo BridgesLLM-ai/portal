@@ -10,7 +10,9 @@ import { Children, isValidElement, useState, useCallback, useEffect, useMemo, me
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import rehypeRaw from 'rehype-raw';
+// rehype-raw removed: allowing raw HTML in markdown is dangerous — agent responses
+// with unfenced HTML (e.g. raw <!DOCTYPE html>) would inject into the portal DOM,
+// breaking layout and creating XSS vectors. Code blocks handle HTML rendering safely.
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import { Copy, Check, Eye, EyeOff, Maximize2, Minimize2 } from 'lucide-react';
@@ -413,7 +415,7 @@ const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, is
     <div className={`text-sm text-slate-200 leading-relaxed ${className || ''}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight, rehypeRaw]}
+        rehypePlugins={[rehypeHighlight]}
         components={markdownComponents}
       >
         {renderContent}
