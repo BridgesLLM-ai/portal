@@ -391,9 +391,26 @@ function closeUnclosedBacktickFence(content: string, isStreaming: boolean): stri
 }
 
 /** Memoized markdown renderer - prevents re-parsing identical content */
+/**
+ * Detect if content is a raw HTML document without markdown code fences.
+ * Agents sometimes respond with bare HTML — wrap it in fences so the
+ * PreviewableCodeBlock can render it with a sandboxed preview.
+ */
+function wrapBareHtmlInFences(text: string): string {
+  const trimmed = text.trim();
+  // Already has code fences — leave it alone
+  if (trimmed.includes('```')) return text;
+  // Check if it looks like a complete HTML document
+  const looksLikeHtml = /^\s*<!doctype\s+html/i.test(trimmed) || /^\s*<html[\s>]/i.test(trimmed);
+  if (looksLikeHtml) {
+    return '```html\n' + trimmed + '\n```';
+  }
+  return text;
+}
+
 const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, isStreaming = false }: MarkdownRendererProps) {
   const renderContent = useMemo(
-    () => closeUnclosedBacktickFence(content, isStreaming),
+    () => closeUnclosedBacktickFence(wrapBareHtmlInFences(content), isStreaming),
     [content, isStreaming]
   );
 
