@@ -103,7 +103,13 @@ function atomicWriteJson(targetPath: string, data: unknown) {
 }
 
 function runOpenClaw(args: string[], timeout = 30000) {
-  return execFileSync(OPENCLAW_BIN, args, { timeout, encoding: 'utf8' });
+  const raw = execFileSync(OPENCLAW_BIN, args, { timeout, encoding: 'utf8' });
+  // OpenClaw sometimes prints diagnostic messages to stdout before JSON output.
+  // Strip any non-JSON prefix lines (e.g. "[agents/model-providers] ...")
+  if (args.includes('--json') && raw.includes('{')) {
+    return raw.slice(raw.indexOf('{'));
+  }
+  return raw;
 }
 
 /**
