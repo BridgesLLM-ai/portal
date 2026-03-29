@@ -474,24 +474,15 @@ export async function startClaudeSetupTokenFlow() {
       console.log(`[Claude] Last 500 chars: ${session.cleanOutput.slice(-500)}`);
 
       if (exitCode === 0 && !setupToken) {
-        // Try to extract the token from the output — Claude CLI prints in multiple formats
+        // Extract token by matching the sk-ant-oat01- prefix directly.
+        // The PTY output has \r padding and collapsed spaces that break line-based regexes.
         const text = session.cleanOutput;
-        const patterns = [
-          /(?:Setup token[^:]*:\s*)([A-Za-z0-9_\-/.+=]{20,})/i,
-          /(?:Token:\s*)([A-Za-z0-9_\-/.+=]{20,})/i,
-          /CLAUDE_CODE_OAUTH_TOKEN=([A-Za-z0-9_\-/.+=]{20,})/,
-          /(?:Store this token|won't be able to see it)[\s\S]*?\n\s*([A-Za-z0-9_\-/.+=]{50,})/i,
-          /\n([A-Za-z0-9_\-/.+=]{50,})\s*\n/,
-        ];
-        for (const pat of patterns) {
-          const m = text.match(pat);
-          if (m?.[1]) {
-            setupToken = m[1].trim();
-            console.log(`[Claude] Token captured from output (${setupToken.length} chars)`);
-            // Save immediately — don't wait for frontend to ask
-            saveClaudeToken(setupToken);
-            break;
-          }
+        const m = text.match(/(sk-ant-oat01-[A-Za-z0-9_\-/.+=]{20,})/);
+        if (m?.[1]) {
+          setupToken = m[1].trim();
+          console.log(`[Claude] Token captured on exit: ${setupToken.slice(0, 20)}... (${setupToken.length} chars)`);
+          // Save immediately — don't wait for frontend to ask
+          saveClaudeToken(setupToken);
         }
       }
 
@@ -590,27 +581,22 @@ export async function pasteCodeToClaudeSession(sessionId: string, code: string):
       // - "export CLAUDE_CODE_OAUTH_TOKEN=<token>"
       // - "Store this token securely..." followed by a long token string
       const text = session.cleanOutput;
-      const tokenPatterns = [
-        /(?:setup[- ]token[^:]*:\s*)([A-Za-z0-9_\-/.+=]{20,})/i,
-        /CLAUDE_CODE_OAUTH_TOKEN=([A-Za-z0-9_\-/.+=]{20,})/,
-        /(?:Store this token|won't be able to see it)[\s\S]*?\n\s*([A-Za-z0-9_\-/.+=]{50,})/i,
-        /\n([A-Za-z0-9_\-/.+=]{50,})\s*\n/,
-      ];
-      for (const pattern of tokenPatterns) {
-        const tokenMatch = text.match(pattern);
-        if (tokenMatch?.[1]) {
-          clearInterval(timer);
-          const token = tokenMatch[1].trim();
-          console.log(`[Claude] Token captured from output (${token.length} chars), saving...`);
-          saveClaudeToken(token).then((saveResult) => {
-            if (saveResult.success) {
-              session.status = 'complete';
-              session.completedAt = Date.now();
-            }
-            resolve(saveResult);
-          });
-          return;
-        }
+      // Bulletproof token extraction: match the sk-ant-oat01- prefix directly.
+      // PTY output has \r characters and space-padding that break line-based regexes,
+      // but the token itself is always a contiguous string starting with sk-ant-oat01-.
+      const tokenMatch = text.match(/(sk-ant-oat01-[A-Za-z0-9_\-/.+=]{20,})/);
+      if (tokenMatch?.[1]) {
+        clearInterval(timer);
+        const token = tokenMatch[1].trim();
+        console.log(`[Claude] Token captured: ${token.slice(0, 20)}... (${token.length} chars), saving...`);
+        saveClaudeToken(token).then((saveResult) => {
+          if (saveResult.success) {
+            session.status = 'complete';
+            session.completedAt = Date.now();
+          }
+          resolve(saveResult);
+        });
+        return;
       }
 
       if (Date.now() - started > 60000) {

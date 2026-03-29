@@ -1655,12 +1655,23 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
     // StreamEventBus has no active stream — but the gateway might still be running
     // (e.g., after backend restart when PersistentGatewayWs hasn't forwarded events yet).
     // Query the gateway's session state as a fallback.
+    // GUARD: only trust the gateway's chatState if there's been recent activity.
+    // Stale chatState (from interrupted turns) causes the UI to show "thinking..." forever.
     try {
       const sessResult = await getSessionInfo(sessionKey);
       if (sessResult.ok && sessResult.data) {
         const sess = sessResult.data;
         const chatState = typeof sess.chatState === 'string' ? sess.chatState : '';
         if (chatState === 'streaming' || chatState === 'thinking' || chatState === 'tool') {
+          // Check if the run is genuinely active — if lastActivity is older than 60s
+          // and we have no stream events, this is almost certainly a stale state.
+          const lastActivity = typeof sess.lastActivity === 'number' ? sess.lastActivity : 0;
+          const staleCutoff = Date.now() - 60_000; // 60 seconds
+          if (lastActivity && lastActivity < staleCutoff) {
+            debugLog(`[stream-status] Gateway reports chatState=${chatState} but lastActivity=${new Date(lastActivity).toISOString()} is stale — reporting inactive`);
+            res.json({ active: false });
+            return;
+          }
           debugLog(`[stream-status] StreamEventBus empty but gateway reports chatState=${chatState} — reporting active`);
           res.json({
             active: true,
