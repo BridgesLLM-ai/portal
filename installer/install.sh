@@ -478,13 +478,10 @@ run_migrations_safe() {
 
   # ── Post-flight: verify tables were actually created ──
   local table_count=0
-  table_count=$(DATABASE_URL="${db_url}" node -e "
-    const { PrismaClient } = require('@prisma/client');
-    const p = new PrismaClient();
-    p.\$queryRaw\`SELECT count(*) as c FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'\`
-      .then(r => { console.log(Number(r[0].c)); p.\$disconnect(); })
-      .catch(() => { console.log('0'); p.\$disconnect(); });
-  " 2>/dev/null || echo "0")
+  table_count=$(sudo -u postgres psql -d bridgesllm_portal -tAc \
+    "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'" \
+    2>/dev/null | tr -d '[:space:]' || echo "0")
+  table_count="${table_count:-0}"
 
   # _prisma_migrations table always exists; we need at least a few more
   if (( table_count < 3 )); then
