@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.18.2"
+readonly VERSION="3.20.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
