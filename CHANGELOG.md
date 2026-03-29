@@ -7,6 +7,9 @@ All notable changes to BridgesLLM Portal are documented here.
 ### 🔐 Security
 - **Remove rehype-raw from markdown renderer** — Agent responses with unfenced HTML were rendered directly into the portal DOM via rehype-raw, enabling XSS and breaking page layout. Raw HTML in chat is now safely escaped; code blocks with preview still work via sandboxed iframe.
 
+### 🚨 Critical
+- **Fix installer destroying portal on update** — The installer hardcoded `bridgesllm_portal` on port 5432 for the database URL and migration check. Installs using different database names or ports (common on established servers) would fail the check with "0 tables created" and abort — without restarting the portal service. Result: dead portal after clicking "Update". Fixed: preserve existing DATABASE_URL on updates, parse it for migration checks, and always restart the service if the update fails mid-way.
+
 ### 🐛 Bug Fixes
 
 #### Provider Authentication
