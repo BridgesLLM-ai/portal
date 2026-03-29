@@ -13,6 +13,25 @@ interface OAuthSetupFlowProps {
 
 type Step = 'prereqs' | 'start' | 'waiting' | 'paste' | 'model' | 'done' | 'error';
 
+function nativeCliBridgeNote(providerId: string): { title: string; body: string; command?: string } | null {
+  switch (providerId) {
+    case 'openai-codex':
+      return {
+        title: 'Native Codex login is separate',
+        body: 'This portal flow links OpenClaw only. The native Codex adapter used by Agent Chat still needs its own server-side auth; those tokens are not copied into the Codex CLI automatically.',
+        command: 'codex auth',
+      };
+    case 'google-gemini-cli':
+      return {
+        title: 'Native Gemini login is separate',
+        body: 'This flow links OpenClaw only. The native Gemini adapter still needs its own login or API-key environment on the server; OpenClaw credentials are not copied into the Gemini CLI automatically.',
+        command: 'gemini',
+      };
+    default:
+      return null;
+  }
+}
+
 export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel }: OAuthSetupFlowProps) {
   const [step, setStep] = useState<Step>('prereqs');
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -45,6 +64,7 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
   const isGoogle = provider.id === 'google-gemini-cli';
   const providerLabel = isOpenAI ? 'OpenAI' : 'Google';
   const callbackPort = isOpenAI ? '1455' : '8085';
+  const nativeCliNote = nativeCliBridgeNote(provider.id);
 
   // Poll for auto-completion (local callback server may catch the redirect directly on VPS)
   const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
@@ -260,6 +280,16 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                     <strong>Note:</strong> This uses an unofficial Google integration. Use a non-critical Google account if you're concerned about account restrictions.
                   </div>
                 </>
+              ) : null}
+
+              {nativeCliNote ? (
+                <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                  <div className="font-medium text-amber-50">{nativeCliNote.title}</div>
+                  <div className="mt-1 text-amber-100/90">{nativeCliNote.body}</div>
+                  {nativeCliNote.command ? (
+                    <div className="mt-2 text-xs text-amber-100/80">Server command: <code className="rounded bg-slate-950 px-1.5 py-0.5 text-amber-100">{nativeCliNote.command}</code></div>
+                  ) : null}
+                </div>
               ) : null}
 
               {error ? (

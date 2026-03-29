@@ -207,6 +207,12 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
                 </ul>
               </div>
 
+              <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                <div className="font-medium text-amber-50">Native Claude Code login is separate</div>
+                <div className="mt-1 text-amber-100/90">This setup-token links OpenClaw only. If you want the portal's native Claude Code adapter, the `claude` CLI on the server still needs its own login. The setup-token is not copied into Claude Code automatically.</div>
+                <div className="mt-2 text-xs text-amber-100/80">Server command: <code className="rounded bg-slate-950 px-1.5 py-0.5 text-amber-100">claude</code> then run <code className="rounded bg-slate-950 px-1.5 py-0.5 text-amber-100">/login</code></div>
+              </div>
+
               {error ? (
                 <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">{error}</div>
               ) : null}

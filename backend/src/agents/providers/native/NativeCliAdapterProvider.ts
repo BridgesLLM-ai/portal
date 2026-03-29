@@ -12,6 +12,7 @@ import type {
   SenderIdentity,
   AgentSendResult,
 } from '../../AgentProvider.interface';
+import { AgentAbortError } from '../../AgentProvider.interface';
 import {
   appendNativeMessage,
   createNativeSession,
@@ -23,6 +24,7 @@ import {
   type NativeSessionData,
 } from '../NativeSessionStore';
 import type { NativeCliProviderAdapter, NativeCliTurnContext } from './types';
+import { getProviderAvailability } from '../../providerAvailability';
 
 function stripAnsi(text: string): string {
   // eslint-disable-next-line no-control-regex
@@ -35,6 +37,7 @@ function stripAnsi(text: string): string {
 export abstract class NativeCliAdapterProvider implements AgentProvider {
   readonly displayName: string;
   readonly providerName: AgentProviderName;
+  private readonly activeRuns = new Map<AgentSessionId, { child: ReturnType<typeof spawn>; aborted: boolean; killTimer: ReturnType<typeof setTimeout> | null }>();
 
   protected constructor(protected readonly adapter: NativeCliProviderAdapter) {
     this.displayName = adapter.displayName;
@@ -68,6 +71,11 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
     _onExecApproval?: OnExecApprovalCallback,
     _sender?: SenderIdentity,
   ) {
+    const providerAvailability = getProviderAvailability(this.adapter.providerName);
+    if (!providerAvailability.usable) {
+      throw new Error(providerAvailability.reason || `${this.adapter.displayName} is not ready on this server.`);
+    }
+
     const session = this.requireSession(sessionId);
     appendNativeMessage(session, {
       id: this.nextId(),
@@ -126,6 +134,17 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
         ...(invocation.options || {}),
       });
 
+      const activeRun = { child, aborted: false, killTimer: null as ReturnType<typeof setTimeout> | null };
+      this.activeRuns.set(session.sessionId, activeRun);
+
+      const clearActiveRun = () => {
+        const current = this.activeRuns.get(session.sessionId);
+        if (current?.killTimer) clearTimeout(current.killTimer);
+        if (current === activeRun) {
+          this.activeRuns.delete(session.sessionId);
+        }
+      };
+
       const flushLine = (line: string) => {
         const normalized = line.replace(/\r$/, '');
         if (!normalized.trim()) return;
@@ -149,6 +168,8 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
       });
 
       child.on('close', async (code) => {
+        const wasAborted = activeRun.aborted;
+        clearActiveRun();
         try {
           if (stdoutBuffer.trim()) {
             if (this.adapter.handleStdoutRemainder) {
@@ -156,6 +177,12 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
             } else {
               flushLine(stdoutBuffer);
             }
+          }
+
+          if (wasAborted) {
+            ctx.emitStatus('');
+            reject(new AgentAbortError());
+            return;
           }
 
           ctx.exitCode = code ?? 0;
@@ -199,9 +226,28 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
       });
 
       child.on('error', (err) => {
+        clearActiveRun();
         reject(new Error(`${this.adapter.spawnErrorPrefix || `Failed to spawn ${this.adapter.cliCommand} CLI`}: ${err.message}`));
       });
     });
+  }
+
+  async abortActiveRun(sessionId: AgentSessionId): Promise<boolean> {
+    const activeRun = this.activeRuns.get(sessionId);
+    if (!activeRun) return false;
+
+    activeRun.aborted = true;
+    try {
+      activeRun.child.kill('SIGTERM');
+    } catch {}
+
+    activeRun.killTimer = setTimeout(() => {
+      try {
+        activeRun.child.kill('SIGKILL');
+      } catch {}
+    }, 3000);
+
+    return true;
   }
 
   async getHistory(sessionId: AgentSessionId): Promise<AgentMessage[]> {

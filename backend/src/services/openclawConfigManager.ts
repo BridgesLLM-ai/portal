@@ -1,5 +1,11 @@
 import fs from 'fs';
 import path from 'path';
+import type { AgentProviderName } from '../agents/AgentProvider.interface';
+import {
+  getNativeCliAuthStatus,
+  getNativeProviderLinkedToOpenClawProvider,
+  type NativeCliAuthState,
+} from '../agents/nativeCliAuth';
 import { AI_PROVIDERS } from '../config/aiProviders';
 
 const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(process.env.HOME || '/root', '.openclaw');
@@ -36,6 +42,12 @@ export interface ProviderStatus {
   cooldownUntil: number | null;
   lastUsed: number | null;
   expiresAt: number | null;
+  warning: string | null;
+  nativeProvider: AgentProviderName | null;
+  nativeCliAuthStatus: NativeCliAuthState | null;
+  nativeCliAuthMessage: string | null;
+  nativeCliLoginCommand: string | null;
+  requiresSeparateNativeLogin: boolean;
 }
 
 function safeReadJson<T>(targetPath: string, fallback: T): T {
@@ -154,8 +166,11 @@ export function getProviderStatuses(): ProviderStatus[] {
 
     let status: ProviderStatus['status'] = 'unconfigured';
     let error: string | null = null;
+    let warning: string | null = null;
     let effectiveProfileId: string | null = null;
     let effectiveAuthType: string | null = null;
+    const nativeProvider = getNativeProviderLinkedToOpenClawProvider(provider.id);
+    const nativeAuth = nativeProvider ? getNativeCliAuthStatus(nativeProvider) : null;
 
     if (isConfigured) {
       status = 'configured';
@@ -170,6 +185,10 @@ export function getProviderStatuses(): ProviderStatus[] {
       } else if (errorCount > 0) {
         status = 'error';
         error = `Provider has recorded ${errorCount} recent error${errorCount === 1 ? '' : 's'}.`;
+      }
+
+      if (nativeAuth?.status === 'needs_login') {
+        warning = `${nativeAuth.message} OpenClaw can use this provider, but the portal's native ${nativeProvider} adapter still needs its own server-side auth.`;
       }
     } else if (hasConfigProfile || hasStoredProfile) {
       status = 'error';
@@ -189,6 +208,12 @@ export function getProviderStatuses(): ProviderStatus[] {
       cooldownUntil,
       lastUsed,
       expiresAt,
+      warning,
+      nativeProvider,
+      nativeCliAuthStatus: nativeAuth?.status || null,
+      nativeCliAuthMessage: nativeAuth?.message || null,
+      nativeCliLoginCommand: nativeAuth?.loginCommand || null,
+      requiresSeparateNativeLogin: Boolean(nativeAuth?.requiresSeparateLogin),
     };
   });
 }

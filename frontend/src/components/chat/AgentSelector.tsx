@@ -100,6 +100,9 @@ interface ProviderInfo {
   version?: string;
   native?: boolean;
   reason?: string;
+  nativeAuthStatus?: 'not_applicable' | 'authenticated' | 'needs_login' | 'unknown';
+  nativeAuthMessage?: string;
+  nativeAuthLoginCommand?: string;
   capabilities?: {
     implemented?: boolean;
     requiresGateway?: boolean;
@@ -639,8 +642,16 @@ export default function AgentSelector({
               const isSelectedProvider = p.name === value;
               const providerAvatarUrl = agentAvatars[p.name] || undefined;
               const isUsable = p.usable !== false;
-              const statusLabel = !p.implemented ? 'Not implemented' : !p.installed ? 'Not installed' : p.native ? 'Native' : 'Gateway';
-              const detailLabel = p.reason || (p.version ? `Detected ${p.version}` : undefined);
+              const statusLabel = !p.implemented
+                ? 'Not implemented'
+                : !p.installed
+                  ? 'Not installed'
+                  : p.native && p.nativeAuthStatus === 'needs_login'
+                    ? 'Needs login'
+                    : p.native
+                      ? 'Native'
+                      : 'Gateway';
+              const detailLabel = p.nativeAuthMessage || p.reason || (p.version ? `Detected ${p.version}` : undefined);
 
               return (
                 <div key={p.name}>

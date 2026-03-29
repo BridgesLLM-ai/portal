@@ -1,5 +1,12 @@
 import { execFileSync } from 'child_process';
+import { getProviderStatuses } from '../services/openclawConfigManager';
 import type { AgentProviderName } from './AgentProvider.interface';
+import {
+  getLinkedOpenClawProviderIds,
+  getNativeCliAuthStatus,
+  nativeCliAuthBlocksUsage,
+  type NativeCliAuthState,
+} from './nativeCliAuth';
 
 export type ProviderModelSelectionMode = 'none' | 'session' | 'launch';
 export type ProviderModelCatalogKind = 'none' | 'dynamic' | 'declared';
@@ -33,6 +40,15 @@ export interface ProviderAvailability {
   command?: string;
   version?: string;
   reason?: string;
+  nativeAuthStatus?: NativeCliAuthState;
+  nativeAuthMessage?: string;
+  nativeAuthLoginCommand?: string;
+  requiresSeparateNativeLogin?: boolean;
+  linkedOpenClawProviders?: Array<{
+    id: string;
+    configured: boolean;
+    status: string;
+  }>;
   capabilities: ProviderCapabilitySummary;
 }
 
@@ -213,6 +229,16 @@ export function getProviderAvailability(name: AgentProviderName): ProviderAvaila
   const command = resolveCommand(def.commands);
   const installed = Boolean(command);
   const version = command ? detectVersion(command, def.versionArgs) : undefined;
+  const linkedProviderStatuses = def.native
+    ? getProviderStatuses()
+        .filter((status) => getLinkedOpenClawProviderIds(name).includes(status.id))
+        .map((status) => ({
+          id: status.id,
+          configured: status.status === 'configured' || status.status === 'cooldown' || status.status === 'error' || status.status === 'expired',
+          status: status.status,
+        }))
+    : [];
+  const nativeAuth = def.native ? getNativeCliAuthStatus(name) : null;
 
   if (!def.implemented) {
     return {
@@ -224,6 +250,11 @@ export function getProviderAvailability(name: AgentProviderName): ProviderAvaila
       command,
       version,
       reason: 'Provider adapter is not implemented yet',
+      nativeAuthStatus: nativeAuth?.status,
+      nativeAuthMessage: nativeAuth?.message,
+      nativeAuthLoginCommand: nativeAuth?.loginCommand,
+      requiresSeparateNativeLogin: nativeAuth?.requiresSeparateLogin,
+      linkedOpenClawProviders: linkedProviderStatuses,
       capabilities: def.capabilities,
     };
   }
@@ -236,19 +267,38 @@ export function getProviderAvailability(name: AgentProviderName): ProviderAvaila
       usable: false,
       native: def.native,
       reason: `Missing CLI: ${def.commands.join(', ')}`,
+      nativeAuthStatus: nativeAuth?.status,
+      nativeAuthMessage: nativeAuth?.message,
+      nativeAuthLoginCommand: nativeAuth?.loginCommand,
+      requiresSeparateNativeLogin: nativeAuth?.requiresSeparateLogin,
+      linkedOpenClawProviders: linkedProviderStatuses,
       capabilities: def.capabilities,
     };
   }
+
+  const linkedConfigured = linkedProviderStatuses.filter((entry) => entry.configured).map((entry) => entry.id);
+  const reason = nativeCliAuthBlocksUsage(nativeAuth)
+    ? linkedConfigured.length
+      ? `${nativeAuth?.message} OpenClaw is configured for ${linkedConfigured.join(', ')}, but those credentials are not copied into this CLI.`
+      : nativeAuth?.message
+    : def.capabilities.requiresGateway
+      ? 'Uses OpenClaw gateway transport'
+      : (nativeAuth?.message || 'Runs natively via local provider CLI');
 
   return {
     name,
     installed: true,
     implemented: true,
-    usable: true,
+    usable: !nativeCliAuthBlocksUsage(nativeAuth),
     native: def.native,
     command,
     version,
-    reason: def.capabilities.requiresGateway ? 'Uses OpenClaw gateway transport' : 'Runs natively via local provider CLI',
+    reason,
+    nativeAuthStatus: nativeAuth?.status,
+    nativeAuthMessage: nativeAuth?.message,
+    nativeAuthLoginCommand: nativeAuth?.loginCommand,
+    requiresSeparateNativeLogin: nativeAuth?.requiresSeparateLogin,
+    linkedOpenClawProviders: linkedProviderStatuses,
     capabilities: def.capabilities,
   };
 }

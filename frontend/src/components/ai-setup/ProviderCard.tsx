@@ -12,6 +12,12 @@ export interface ProviderStatus {
   cooldownUntil: number | null;
   lastUsed: number | null;
   expiresAt: number | null;
+  warning?: string | null;
+  nativeProvider?: string | null;
+  nativeCliAuthStatus?: 'not_applicable' | 'authenticated' | 'needs_login' | 'unknown' | null;
+  nativeCliAuthMessage?: string | null;
+  nativeCliLoginCommand?: string | null;
+  requiresSeparateNativeLogin?: boolean;
 }
 
 interface ProviderCardProps {
@@ -76,6 +82,21 @@ function authLabel(provider: ProviderUIConfig) {
   }
 }
 
+function nativeCliLabel(status: ProviderStatus | null | undefined) {
+  switch (status?.nativeCliAuthStatus) {
+    case 'authenticated':
+      return 'Ready';
+    case 'needs_login':
+      return 'Needs CLI login';
+    case 'unknown':
+      return 'Unknown';
+    case 'not_applicable':
+      return 'Not needed';
+    default:
+      return status?.nativeProvider ? 'Separate auth' : 'Not used';
+  }
+}
+
 export default function ProviderCard({ provider, status, onConfigure, onRemove, compact = false }: ProviderCardProps) {
   const Icon = iconMap[provider.icon as keyof typeof iconMap] || Cpu;
   const tone = statusStyles(status?.status);
@@ -102,6 +123,10 @@ export default function ProviderCard({ provider, status, onConfigure, onRemove, 
 
         {status?.error ? (
           <div className="mt-1.5 text-[10px] text-red-300 truncate">{status.error}</div>
+        ) : null}
+
+        {status?.warning ? (
+          <div className="mt-1.5 text-[10px] text-amber-300 truncate">{status.warning}</div>
         ) : null}
 
         <div className="mt-2 flex items-center gap-1.5">
@@ -164,6 +189,26 @@ export default function ProviderCard({ provider, status, onConfigure, onRemove, 
         </div>
       </div>
 
+      {status?.nativeProvider ? (
+        <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="text-[11px] uppercase tracking-wide text-slate-500">Portal native CLI</div>
+              <div className="mt-1 text-sm text-slate-200">{status.nativeProvider}</div>
+            </div>
+            <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${status.nativeCliAuthStatus === 'authenticated' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : status.nativeCliAuthStatus === 'needs_login' ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-slate-700 bg-slate-800/70 text-slate-300'}`}>
+              {nativeCliLabel(status)}
+            </span>
+          </div>
+          {status.nativeCliAuthMessage ? (
+            <div className="mt-2 text-sm text-slate-300">{status.nativeCliAuthMessage}</div>
+          ) : null}
+          {status.nativeCliLoginCommand ? (
+            <div className="mt-2 text-xs text-slate-500">Server command: <code className="rounded bg-slate-900 px-1.5 py-0.5 text-slate-300">{status.nativeCliLoginCommand}</code></div>
+          ) : null}
+        </div>
+      ) : null}
+
       <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2">
         <div className="text-[11px] uppercase tracking-wide text-slate-500">Pricing</div>
         <div className="mt-1 text-sm text-slate-300">{provider.pricingNote}</div>
@@ -172,6 +217,12 @@ export default function ProviderCard({ provider, status, onConfigure, onRemove, 
       {status?.error ? (
         <div className="mt-3 rounded-xl border border-red-500/20 bg-red-500/5 px-3 py-2 text-sm text-red-200">
           {status.error}
+        </div>
+      ) : null}
+
+      {status?.warning ? (
+        <div className="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-sm text-amber-100">
+          {status.warning}
         </div>
       ) : null}
 
