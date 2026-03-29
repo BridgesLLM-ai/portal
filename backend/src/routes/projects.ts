@@ -16,6 +16,7 @@ import { getWorkspaceOwnerId } from '../utils/workspaceScope';
 import extract from 'extract-zip';
 import { getGatewayToken } from '../utils/gatewayToken';
 import { desktopExec, desktopExecDetached } from '../utils/desktopEnv';
+import { getDefaultModel } from '../services/openclawConfigManager';
 
 /** Shell-escape a filename for safe use in execSync commands */
 function shellEscape(s: string): string {
@@ -3206,8 +3207,8 @@ Hello! I'm ready to help with this project. What would you like to work on?`;
       fs.writeFileSync(sessionStatePath, JSON.stringify({ initialized: true, lastActivity: new Date().toISOString() }, null, 2), 'utf-8');
     }
 
-    // Determine default model
-    const selectedModel = req.body?.model || 'anthropic/claude-opus-4-6';
+    // Determine default model — use gateway's configured default, never hardcode a provider
+    const selectedModel = req.body?.model || getDefaultModel() || 'openai-codex/gpt-5.4';
 
     // Patch model if provided
     if (req.body?.model) {
@@ -3623,7 +3624,7 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
     const projectDir = getProjectPath(ownerId, name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
 
-    const selectedModel = model || 'anthropic/claude-opus-4-6';
+    const selectedModel = model || getDefaultModel() || 'openai-codex/gpt-5.4';
     // FIX BUG-5: Normalize project name for case-insensitive session keys
     const normalizedName = name.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
     
