@@ -435,6 +435,21 @@ export class OpenClawGatewayClient {
     return idempotencyKey;
   }
 
+
+  /**
+   * Inject an FYI / steer note into an active run without starting a new turn.
+   */
+  async injectMessage(sessionKey: string, text: string): Promise<void> {
+    this.currentSessionKey = sessionKey;
+    await this.request('chat.inject', {
+      sessionKey,
+      message: {
+        role: 'assistant',
+        content: [{ type: 'input_text', text }],
+      },
+    });
+  }
+
   /**
    * Load message history for a session.
    */

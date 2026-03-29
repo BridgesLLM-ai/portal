@@ -328,7 +328,7 @@ export const gatewayAPI = {
     const { data } = await client.get('/gateway/sessions');
     return data;
   },
-  models: async (provider = 'OPENCLAW'): Promise<{ provider: string; capabilities?: { supportsModelSelection?: boolean; modelSelectionMode?: string; supportsCustomModelInput?: boolean; canEnumerateModels?: boolean; modelCatalogKind?: string }; models: Array<{ id: string; alias: string | null; displayName: string; provider: string; source?: string }> }> => {
+  models: async (provider = 'OPENCLAW'): Promise<{ provider: string; capabilities?: { supportsModelSelection?: boolean; modelSelectionMode?: string; supportsCustomModelInput?: boolean; canEnumerateModels?: boolean; modelCatalogKind?: string; supportsInTurnSteering?: boolean; supportsQueuedFollowUps?: boolean; followUpMode?: string; adapterFamily?: string; adapterKey?: string }; models: Array<{ id: string; alias: string | null; displayName: string; provider: string; source?: string }> }> => {
     const { data } = await client.get('/gateway/models', { params: { provider } });
     return data;
   },

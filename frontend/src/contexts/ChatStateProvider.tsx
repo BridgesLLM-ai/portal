@@ -2225,6 +2225,42 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const normalized = String(text || '').trim();
     if (!normalized) return;
 
+    const shouldInjectIntoActiveTurn = providerRef.current === 'OPENCLAW' && isStreamActiveRef.current;
+    if (shouldInjectIntoActiveTurn) {
+      try {
+        const targetSession = resolveOpenClawSessionKey(sessionRef.current || 'main');
+        const directClient = directClientRef.current;
+        if (USE_DIRECT_GATEWAY && directClient?.isConnected) {
+          await directClient.injectMessage(targetSession, normalized);
+        } else {
+          const manager = wsManagerRef.current;
+          if (manager && manager.isConnected()) {
+            const sent = manager.send({ type: 'inject', session: targetSession, text: normalized });
+            if (!sent) {
+              await client.post('/gateway/chat/inject', { session: targetSession, text: normalized });
+            }
+          } else {
+            await client.post('/gateway/chat/inject', { session: targetSession, text: normalized });
+          }
+        }
+
+        setMessages(prev => [...prev, {
+          id: nextId(),
+          role: 'system',
+          content: `Steer sent to running OpenClaw turn: ${normalized}`,
+          createdAt: new Date(),
+          provenance: 'live-steer',
+        }]);
+        setStatusText('Steer sent to running OpenClaw turn');
+        setTimeout(() => setStatusText((curr) => curr === 'Steer sent to running OpenClaw turn' ? null : curr), 2200);
+      } catch (err: any) {
+        console.error('[ChatState] Failed to inject note into active OpenClaw turn:', err);
+        setStatusText(`⚠️ Live steer failed${err?.message ? `: ${err.message}` : ''}`);
+        setTimeout(() => setStatusText(null), 4000);
+      }
+      return;
+    }
+
     const shouldQueue = isStreamActiveRef.current || (!isQueueDrainActiveRef.current && messageQueueRef.current.length > 0);
     if (shouldQueue) {
       const queuedId = nextId();
@@ -2481,6 +2517,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (!note) return;
 
     const targetSession = sessionKey || sessionRef.current;
+    const directClient = directClientRef.current;
+    if (USE_DIRECT_GATEWAY && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
+      await directClient.injectMessage(targetSession, note);
+      return;
+    }
+
     const manager = wsManagerRef.current;
     if (manager && manager.isConnected()) {
       const sent = manager.send({ type: 'inject', session: targetSession, text: note });

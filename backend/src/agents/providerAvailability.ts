@@ -3,10 +3,14 @@ import type { AgentProviderName } from './AgentProvider.interface';
 
 export type ProviderModelSelectionMode = 'none' | 'session' | 'launch';
 export type ProviderModelCatalogKind = 'none' | 'dynamic' | 'declared';
+export type ProviderFollowUpMode = 'in_turn_inject' | 'queued_follow_up';
+export type ProviderAdapterFamily = 'openclaw-gateway' | 'native-cli';
 
 export interface ProviderCapabilitySummary {
   implemented: boolean;
   requiresGateway: boolean;
+  adapterFamily: ProviderAdapterFamily;
+  adapterKey: string;
   supportsHistory: boolean;
   supportsModelSelection: boolean;
   modelSelectionMode: ProviderModelSelectionMode;
@@ -15,6 +19,9 @@ export interface ProviderCapabilitySummary {
   modelCatalogKind: ProviderModelCatalogKind;
   supportsSessionList: boolean;
   supportsExecApproval: boolean;
+  supportsInTurnSteering: boolean;
+  supportsQueuedFollowUps: boolean;
+  followUpMode: ProviderFollowUpMode;
 }
 
 export interface ProviderAvailability {
@@ -46,6 +53,8 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
     capabilities: {
       implemented: true,
       requiresGateway: true,
+      adapterFamily: 'openclaw-gateway',
+      adapterKey: 'openclaw',
       supportsHistory: true,
       supportsModelSelection: true,
       modelSelectionMode: 'session',
@@ -54,7 +63,9 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
       modelCatalogKind: 'dynamic',
       supportsSessionList: true,
       supportsExecApproval: true,
-    },
+      supportsInTurnSteering: true,
+      supportsQueuedFollowUps: false,
+      followUpMode: 'in_turn_inject',    },
   },
   CLAUDE_CODE: {
     native: true,
@@ -64,6 +75,8 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
     capabilities: {
       implemented: true,
       requiresGateway: false,
+      adapterFamily: 'native-cli',
+      adapterKey: 'claude-code',
       supportsHistory: true,
       supportsModelSelection: true,
       modelSelectionMode: 'session',
@@ -72,7 +85,9 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
       modelCatalogKind: 'none',
       supportsSessionList: true,
       supportsExecApproval: false,
-    },
+      supportsInTurnSteering: false,
+      supportsQueuedFollowUps: true,
+      followUpMode: 'queued_follow_up',    },
   },
   CODEX: {
     native: true,
@@ -82,6 +97,8 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
     capabilities: {
       implemented: true,
       requiresGateway: false,
+      adapterFamily: 'native-cli',
+      adapterKey: 'codex',
       supportsHistory: true,
       supportsModelSelection: true,
       modelSelectionMode: 'session',
@@ -90,7 +107,9 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
       modelCatalogKind: 'none',
       supportsSessionList: true,
       supportsExecApproval: false,
-    },
+      supportsInTurnSteering: false,
+      supportsQueuedFollowUps: true,
+      followUpMode: 'queued_follow_up',    },
   },
   AGENT_ZERO: {
     native: true,
@@ -100,6 +119,8 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
     capabilities: {
       implemented: false,
       requiresGateway: false,
+      adapterFamily: 'native-cli',
+      adapterKey: 'agent-zero',
       supportsHistory: false,
       supportsModelSelection: false,
       modelSelectionMode: 'none',
@@ -108,7 +129,9 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
       modelCatalogKind: 'none',
       supportsSessionList: false,
       supportsExecApproval: false,
-    },
+      supportsInTurnSteering: false,
+      supportsQueuedFollowUps: true,
+      followUpMode: 'queued_follow_up',    },
   },
   GEMINI: {
     native: true,
@@ -118,6 +141,8 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
     capabilities: {
       implemented: true,
       requiresGateway: false,
+      adapterFamily: 'native-cli',
+      adapterKey: 'gemini',
       supportsHistory: true,
       supportsModelSelection: true,
       modelSelectionMode: 'launch',
@@ -126,7 +151,9 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
       modelCatalogKind: 'declared',
       supportsSessionList: true,
       supportsExecApproval: false,
-    },
+      supportsInTurnSteering: false,
+      supportsQueuedFollowUps: true,
+      followUpMode: 'queued_follow_up',    },
   },
   OLLAMA: {
     native: true,
@@ -136,6 +163,8 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
     capabilities: {
       implemented: true,
       requiresGateway: false,
+      adapterFamily: 'native-cli',
+      adapterKey: 'ollama',
       supportsHistory: true,
       supportsModelSelection: true,
       modelSelectionMode: 'launch',
@@ -144,7 +173,9 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
       modelCatalogKind: 'dynamic',
       supportsSessionList: true,
       supportsExecApproval: false,
-    },
+      supportsInTurnSteering: false,
+      supportsQueuedFollowUps: true,
+      followUpMode: 'queued_follow_up',    },
   },
 };
 

@@ -1231,7 +1231,9 @@ function formatProviderCapabilitySummary(params: {
     `- session history: ${capabilities.supportsHistory ? 'yes' : 'no'}`,
     `- session list: ${capabilities.supportsSessionList ? 'yes' : 'no'}`,
     `- exec approvals: ${capabilities.supportsExecApproval ? 'yes' : 'no'}`,
+    `- follow-ups while running: ${capabilities.supportsInTurnSteering ? 'live FYI / steer' : capabilities.supportsQueuedFollowUps === false ? 'not supported' : 'queued for next turn'}`,
     `- transport: ${capabilities.requiresGateway ? 'gateway' : 'native CLI'}`,
+    `- adapter: ${capabilities.adapterFamily || 'unknown'}${capabilities.adapterKey ? ` (${capabilities.adapterKey})` : ''}`,
     `- installed: ${providerInfo?.installed ? 'yes' : 'no'}`,
     `- version: ${providerInfo?.version || 'unknown'}`,
   ].filter(Boolean);

@@ -192,19 +192,26 @@ const providerModelsCache = new Map<string, {
 
 const providerCommandsCache = new Map<string, {
   slashCommands: SlashCommandInfo[];
-  capabilities?: {
-    implemented?: boolean;
-    requiresGateway?: boolean;
-    supportsHistory?: boolean;
-    supportsModelSelection?: boolean;
-    modelSelectionMode?: string;
-    supportsCustomModelInput?: boolean;
-    canEnumerateModels?: boolean;
-    supportsSessionList?: boolean;
-    supportsExecApproval?: boolean;
-    modelCatalogKind?: string;
-  };
+  capabilities?: ProviderCapabilities;
 }>();
+
+interface ProviderCapabilities {
+  implemented?: boolean;
+  requiresGateway?: boolean;
+  adapterFamily?: string;
+  adapterKey?: string;
+  supportsHistory?: boolean;
+  supportsModelSelection?: boolean;
+  modelSelectionMode?: string;
+  supportsCustomModelInput?: boolean;
+  canEnumerateModels?: boolean;
+  supportsSessionList?: boolean;
+  supportsExecApproval?: boolean;
+  modelCatalogKind?: string;
+  supportsInTurnSteering?: boolean;
+  supportsQueuedFollowUps?: boolean;
+  followUpMode?: 'in_turn_inject' | 'queued_follow_up' | string;
+}
 
 /* ─── Model Picker Dropdown ─────────────────────────────────────────────── */
 
@@ -281,17 +288,7 @@ function capabilityPillTone(tone: 'violet' | 'sky' | 'emerald' | 'amber' | 'slat
 
 function buildProviderCapabilityPills(params: {
   commandCount: number;
-  capabilities?: {
-    requiresGateway?: boolean;
-    supportsHistory?: boolean;
-    supportsModelSelection?: boolean;
-    modelSelectionMode?: string;
-    supportsCustomModelInput?: boolean;
-    canEnumerateModels?: boolean;
-    supportsSessionList?: boolean;
-    supportsExecApproval?: boolean;
-    modelCatalogKind?: string;
-  };
+  capabilities?: ProviderCapabilities;
   availableModels: string[];
 }) {
   const { commandCount, capabilities, availableModels } = params;
@@ -312,6 +309,12 @@ function buildProviderCapabilityPills(params: {
   }
 
   pills.push({ icon: <ListChecks size={11} />, label: capabilities?.supportsSessionList ? 'Session list available' : 'No session list', tone: capabilities?.supportsSessionList ? 'sky' : 'slate' });
+
+  if (capabilities?.supportsInTurnSteering) {
+    pills.push({ icon: <MessageSquare size={11} />, label: 'Live FYI / steer while running', tone: 'emerald' });
+  } else if (capabilities?.supportsQueuedFollowUps !== false) {
+    pills.push({ icon: <Clock size={11} />, label: 'Queued follow-ups while running', tone: 'amber' });
+  }
 
   if (capabilities?.supportsExecApproval) {
     pills.push({ icon: <ShieldAlert size={11} />, label: 'Exec approvals supported', tone: 'amber' });
@@ -2227,18 +2230,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const [compactionModelOptionsLoading, setCompactionModelOptionsLoading] = useState(false);
   const [providerCatalog, setProviderCatalog] = useState<Record<string, {
     usable?: boolean;
-    capabilities?: {
-      implemented?: boolean;
-      requiresGateway?: boolean;
-      supportsHistory?: boolean;
-      supportsModelSelection?: boolean;
-      modelSelectionMode?: string;
-      supportsCustomModelInput?: boolean;
-      canEnumerateModels?: boolean;
-      supportsSessionList?: boolean;
-      supportsExecApproval?: boolean;
-      modelCatalogKind?: string;
-    };
+    capabilities?: ProviderCapabilities;
     slashCommands?: SlashCommandInfo[];
     slashCommandsLoaded?: boolean;
     slashCommandsLoading?: boolean;
@@ -2434,6 +2426,10 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     : (availableModels.length > 0 ? 'dynamic' : 'none');
   const sessionListProvider = provider === 'OPENCLAW' ? undefined : provider;
   const providerLabel = getAgent(provider).name;
+  const liveSteerEnabled = providerMeta.capabilities?.supportsInTurnSteering === true;
+  const runningComposerPlaceholder = liveSteerEnabled
+    ? 'OpenClaw is working — send FYI / steer for this turn…'
+    : 'Agent is working — queue a follow-up message…';
   const providerCommandCount = providerMeta.slashCommands?.length || 0;
   const providerCommandStatus = providerMeta.slashCommandsLoaded
     ? `${providerCommandCount} provider command${providerCommandCount === 1 ? '' : 's'}`
@@ -2657,6 +2653,10 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     agentId,
     onSessionResolved: handleSessionResolved,
   });
+
+  const sendButtonTitle = isRunning
+    ? (liveSteerEnabled ? 'Send live steer to running turn' : 'Queue follow-up after current turn')
+    : `Send message to ${providerLabel}`;
 
   // Global exec approval listener (works even when no chat stream is active)
   const {
@@ -3381,7 +3381,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   <ComposerPrimitive.Input
                     ref={composerInputRef}
                     autoFocus
-                    placeholder={isRunning ? 'Agent is working — send a follow-up message…' : `Message ${agent.name}…`}
+                    placeholder={isRunning ? runningComposerPlaceholder : `Message ${agent.name}…`}
                     className={`flex-1 resize-none rounded-2xl px-3 sm:px-4 py-2.5 sm:py-3 text-sm placeholder-slate-500 focus:outline-none transition-all duration-300 min-h-[44px] max-h-[200px] overflow-y-auto ${
                       isRunning
                         ? 'bg-violet-500/[0.04] border border-violet-500/15 text-white'
@@ -3484,7 +3484,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                     </button>
                   )}
 
-                  {/* Send button — remains active so users can queue follow-up messages during a running turn. This is not true in-turn agent interruption. */}
+                  {/* Send button stays active during runs. OpenClaw uses live inject/steer; native CLIs queue the follow-up for the next turn. */}
                   <ComposerPrimitive.Send asChild>
                     <button
                       onClick={async (e) => {
@@ -3495,6 +3495,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                         }
                       }}
                       className={`flex-shrink-0 p-2.5 sm:p-3 rounded-xl ${agent.sendBg} ${agent.sendHover} text-white transition-all duration-200 shadow-lg ${agent.sendShadow} hover:scale-105 active:scale-95 touch-target`}
+                      title={sendButtonTitle}
                     >
                       <Send size={16} className="sm:w-4 sm:h-4 w-3.5 h-3.5" />
                     </button>
