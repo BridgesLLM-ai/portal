@@ -569,7 +569,8 @@ function resolveSessionFileId(sessionKey: string, sessionsDir = SESSIONS_DIR): s
   if (existsSync(sessionsFile)) {
     try {
       const data = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
-      const sessions = data.sessions || data;
+      // data.sessions may be an empty array (truthy), so fall back to top-level dict only when absent
+      const sessions = (Array.isArray(data.sessions) && data.sessions.length === 0) ? data : (data.sessions || data);
       if (typeof sessions === 'object' && !Array.isArray(sessions)) {
         const entry = sessions[sessionKey];
         if (entry?.sessionId || entry?.id) return entry.sessionId || entry.id;
