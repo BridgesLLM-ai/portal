@@ -186,7 +186,11 @@ class StreamEventBus {
    * Get the current stream status for a session.
    */
   getStreamStatus(sessionKey: string): StreamInfo | null {
-    return this.activeStreams.get(sessionKey) || null;
+    const info = this.activeStreams.get(sessionKey);
+    // Only return if actively streaming — softClearStream sets active=false
+    // when a run segment completes but a new run might follow.
+    if (info && info.active === false) return null;
+    return info || null;
   }
 
   /**

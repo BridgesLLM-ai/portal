@@ -1642,6 +1642,15 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
   }
   const info = streamEventBus.getStreamStatus(sessionKey);
   if (info) {
+    // Double-check: if last event was >90s ago, the stream is probably stale
+    // (e.g., done event was missed). Report inactive to avoid stuck UI.
+    const lastEvent = (info as any).lastEventAt || info.startedAt;
+    if (lastEvent && (Date.now() - lastEvent) > 90_000) {
+      debugLog(`[stream-status] StreamEventBus has entry but lastEvent=${new Date(lastEvent).toISOString()} is stale — reporting inactive`);
+      streamEventBus.clearStream(sessionKey);
+      res.json({ active: false });
+      return;
+    }
     const content = streamEventBus.getLatestText(sessionKey);
     res.json({
       active: true,
@@ -1650,6 +1659,7 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
       startedAt: info.startedAt,
       runId: info.runId || null,
       content: content || undefined,
+      lastEventAt: lastEvent,
     });
   } else {
     // StreamEventBus has no active stream — but the gateway might still be running

@@ -2129,7 +2129,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      // 3. No active stream — check if one started while we were backgrounded
+      // 3. No active stream — check if one started (or completed) while we were backgrounded
       try {
         const params: Record<string, string> = { session: currentSession };
         if (currentProvider) params.provider = currentProvider;
@@ -2139,6 +2139,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           debugLog('[ChatState] Discovered active stream on visibility — subscribing');
           // A stream started while we were backgrounded — subscribe to it
           manager.send({ type: 'reconnect', session: currentSession });
+        } else {
+          // Stream is not active — a response may have completed while backgrounded.
+          // Reload history to pick up any new messages we missed.
+          debugLog('[ChatState] No active stream on visibility — reloading history for missed messages');
+          loadHistoryInternal(currentSession, currentProvider);
         }
       } catch (err) {
         console.warn('[ChatState] Visibility check failed:', err);
