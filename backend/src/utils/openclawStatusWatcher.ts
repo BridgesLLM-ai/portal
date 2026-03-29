@@ -1,7 +1,7 @@
 import path from 'path';
 import { spawn, ChildProcess } from 'child_process';
 import { createInterface } from 'readline';
-import { existsSync } from 'fs';
+import { existsSync, watch, FSWatcher } from 'fs';
 
 const LOG_FILE = path.join(process.env.OPENCLAW_ROOT || '/root/.openclaw', 'logs/openclaw.log');
 
@@ -121,13 +121,46 @@ function processLine(line: string) {
 }
 
 let watcher: ChildProcess | null = null;
+let logFileWaiter: FSWatcher | null = null;
+let stopRequested = false;
+let missingLogAnnounced = false;
+
+function waitForLogFile() {
+  if (logFileWaiter || watcher) return;
+
+  let watchDir = path.dirname(LOG_FILE);
+  while (!existsSync(watchDir)) {
+    const parent = path.dirname(watchDir);
+    if (parent === watchDir) return;
+    watchDir = parent;
+  }
+
+  if (!missingLogAnnounced) {
+    console.log(`ℹ️ OpenClaw status watcher is waiting for ${LOG_FILE} to appear.`);
+    missingLogAnnounced = true;
+  }
+
+  logFileWaiter = watch(watchDir, () => {
+    if (!existsSync(LOG_FILE)) return;
+    try { logFileWaiter?.close(); } catch {}
+    logFileWaiter = null;
+    missingLogAnnounced = false;
+    if (!stopRequested) startStatusWatcher();
+  });
+}
 
 export function startStatusWatcher() {
+  stopRequested = false;
   if (!existsSync(LOG_FILE)) {
-    console.log(`⚠️ OpenClaw log not found: ${LOG_FILE}, retrying in 30s`);
-    setTimeout(startStatusWatcher, 30000);
+    waitForLogFile();
     return;
   }
+
+  if (logFileWaiter) {
+    try { logFileWaiter.close(); } catch {}
+    logFileWaiter = null;
+  }
+  if (watcher) return;
 
   console.log(`📊 Starting OpenClaw status watcher on ${LOG_FILE}`);
   watcher = spawn('tail', ['-F', '-n', '0', LOG_FILE], { stdio: ['ignore', 'pipe', 'ignore'] });
@@ -136,12 +169,21 @@ export function startStatusWatcher() {
   rl.on('line', processLine);
 
   watcher.on('exit', (code) => {
+    watcher = null;
+    if (stopRequested) return;
     console.log(`Status watcher exited (code ${code}), restarting in 5s...`);
-    setTimeout(startStatusWatcher, 5000);
+    setTimeout(() => {
+      if (!stopRequested) startStatusWatcher();
+    }, 5000);
   });
 }
 
 export function stopStatusWatcher() {
+  stopRequested = true;
+  if (logFileWaiter) {
+    try { logFileWaiter.close(); } catch {}
+    logFileWaiter = null;
+  }
   if (watcher) {
     watcher.kill();
     watcher = null;

@@ -301,8 +301,9 @@ export class OpenClawProvider implements AgentProvider {
       // Try one reconnect before giving up
       const { reconnectNow } = await import('./PersistentGatewayWs');
       reconnectNow();
-      // Wait up to 5s for connection
-      for (let i = 0; i < 10; i++) {
+      // Wait up to 15s for connection because OpenClaw reloads can briefly
+      // drop the gateway websocket before it comes back.
+      for (let i = 0; i < 30; i++) {
         await new Promise(r => setTimeout(r, 500));
         if (isPersistentWsConnected()) break;
       }

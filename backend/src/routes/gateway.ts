@@ -5,6 +5,7 @@ import { requireApproved } from '../middleware/requireApproved';
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'fs';
 import path from 'path';
 import { AgentRegistry, AgentProviderName } from '../agents';
+import { AgentAbortError } from '../agents/AgentProvider.interface';
 import { listProviderModels } from '../agents/providerModels';
 import { getProviderCommandCatalog } from '../agents/providerCommandCatalog';
 import { resolveExecApproval, ExecApprovalRequest } from '../agents/providers/OpenClawProvider';
@@ -125,6 +126,38 @@ function assertGatewaySessionAccess(sessionKey: string, user: JwtPayload, option
 
   if (isSandboxProjectSessionKeyForUser(sessionKey, user)) return;
   throw new Error('Admin access required');
+}
+
+function normalizeProviderName(input: unknown): AgentProviderName {
+  const normalized = String(input || 'OPENCLAW').trim().toUpperCase();
+  return (normalized || 'OPENCLAW') as AgentProviderName;
+}
+
+function humanizeProviderError(providerName: AgentProviderName, rawMessage: string): string {
+  const message = String(rawMessage || '').trim();
+  if (!message) return 'The agent failed to respond.';
+
+  if (/not logged in|please run \/login/i.test(message)) {
+    return providerName === 'CLAUDE_CODE'
+      ? 'Claude Code is installed on the server but not logged in yet. Run /login in Claude Code, then try again.'
+      : 'This provider is installed on the server but not logged in yet. Complete CLI login, then try again.';
+  }
+
+  if (/GEMINI_API_KEY|GOOGLE_GENAI_USE_VERTEXAI|GOOGLE_GENAI_USE_GCA|Auth method/i.test(message)) {
+    return 'Gemini CLI is installed but not authenticated on the server. Configure Gemini auth (for example GEMINI_API_KEY) and try again.';
+  }
+
+  if (/failed to connect to websocket: HTTP error: 500 Internal Server Error, url: wss:\/\/api\.openai\.com\/v1\/responses/i.test(message)) {
+    return 'Codex could not reach the OpenAI Responses service from this server. Check Codex authentication/networking and try again.';
+  }
+
+  if (/ECONNREFUSED|connect ECONNREFUSED|gateway.*not connected|Cannot connect to OpenClaw gateway/i.test(message)) {
+    return providerName === 'OPENCLAW'
+      ? 'OpenClaw is reconnecting right now. Give it a few seconds, then try again.'
+      : 'The agent backend is temporarily unavailable. Give it a few seconds, then try again.';
+  }
+
+  return message;
 }
 
 function readConfigPath(source: any, pathStr: string): any {
@@ -1558,8 +1591,9 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         }
       } catch (err: any) {
         clearTimeout(fallbackTimer); clearInterval(keepaliveTimer);
+        const friendlyError = humanizeProviderError(provider.providerName, err?.message || String(err));
         if (sseAlive) {
-          sseWrite(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`);
+          sseWrite(`data: ${JSON.stringify({ type: 'error', content: friendlyError })}\n\n`);
           sseWrite('data: [DONE]\n\n');
         }
       }
@@ -1576,7 +1610,10 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     res.json({ response: result.fullText, model: result.metadata?.model, provider: provider.providerName, provenance, sessionId: resolvedSessionId });
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 503;
-    res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Agent unavailable', detail: err.message });
+    const friendlyError = status === 403
+      ? 'Admin access required'
+      : humanizeProviderError(normalizeProviderName(req.body?.provider), err?.message || String(err));
+    res.status(status).json({ error: friendlyError, detail: err?.message || String(err) });
   }
 });
 
@@ -1647,7 +1684,7 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
     // Double-check: if last event was >90s ago, the stream is probably stale
     // (e.g., done event was missed). Report inactive to avoid stuck UI.
     const lastEvent = (info as any).lastEventAt || info.startedAt;
-    if (lastEvent && (Date.now() - lastEvent) > 90_000) {
+    if (lastEvent && (Date.now() - lastEvent) > 180_000) {
       debugLog(`[stream-status] StreamEventBus has entry but lastEvent=${new Date(lastEvent).toISOString()} is stale — reporting inactive`);
       streamEventBus.clearStream(sessionKey);
       res.json({ active: false });
@@ -1678,7 +1715,7 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
           // Check if the run is genuinely active — if lastActivity is older than 60s
           // and we have no stream events, this is almost certainly a stale state.
           const lastActivity = typeof sess.lastActivity === 'number' ? sess.lastActivity : 0;
-          const staleCutoff = Date.now() - 60_000; // 60 seconds
+          const staleCutoff = Date.now() - 180_000; // 3 minutes
           if (lastActivity && lastActivity < staleCutoff) {
             debugLog(`[stream-status] Gateway reports chatState=${chatState} but lastActivity=${new Date(lastActivity).toISOString()} is stale — reporting inactive`);
             res.json({ active: false });
@@ -1704,16 +1741,27 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
 
 router.post('/chat/abort', authenticateToken, requireApproved, async (req: Request, res: Response): Promise<void> => {
   const { session, runId } = req.body;
-  const sessionKey = resolveOpenClawSessionKey(session, req.user);
-  console.log(`[gateway] HTTP ABORT REQUEST: session=${sessionKey} runId=${runId || 'none'}`);
+  const providerName = normalizeProviderName(req.body?.provider);
+  const sessionKey = providerName === 'OPENCLAW'
+    ? resolveOpenClawSessionKey(session, req.user)
+    : String(session || '').trim();
+  console.log(`[gateway] HTTP ABORT REQUEST: provider=${providerName} session=${sessionKey} runId=${runId || 'none'}`);
   try {
-    assertGatewaySessionAccess(sessionKey, req.user!);
+    assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
+
+    if (providerName !== 'OPENCLAW') {
+      const provider = AgentRegistry.get(providerName);
+      const aborted = await provider.abortActiveRun?.(sessionKey);
+      res.json({ ok: aborted !== false, sessionKey, provider: providerName });
+      return;
+    }
+
     const payload: Record<string, string> = { sessionKey };
     if (runId) payload.runId = runId;
     const result = await gatewayRpcCall('chat.abort', payload);
     console.log(`[gateway] HTTP ABORT RESULT: ok=${result.ok} error=${result.error || 'none'}`);
     if (!result.ok) { res.status(500).json({ error: 'Abort failed', detail: result.error }); return; }
-    res.json({ ok: true, sessionKey });
+    res.json({ ok: true, sessionKey, provider: providerName });
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 500;
     res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to abort', detail: err.message });
@@ -1919,11 +1967,13 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
 
   let streamKeepalive: ReturnType<typeof setInterval> | null = null;
   let resolvedSessionId: string | null = null;
+  let providerNameForError: AgentProviderName = normalizeProviderName(providerName);
 
   try {
     const provider = providerName
       ? AgentRegistry.get(providerName as AgentProviderName)
       : AgentRegistry.getDefault();
+    providerNameForError = provider.providerName;
     const provenance = PROVENANCE[provider.providerName] || `via ${provider.displayName}`;
     const isOpenClawProvider = provider.providerName === 'OPENCLAW';
 
@@ -2142,16 +2192,31 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
   } catch (err: unknown) {
     if (streamKeepalive) clearInterval(streamKeepalive);
     if (resolvedSessionId) streamEventBus.clearStream(resolvedSessionId);
+    if (err instanceof AgentAbortError) {
+      wsSend(ws, { type: 'abort_result', ok: true, sessionKey: resolvedSessionId || String(session || 'main') });
+      return;
+    }
     const errMsg = err instanceof Error ? err.message : String(err);
-    wsSend(ws, { type: 'error', content: errMsg });
+    wsSend(ws, { type: 'error', content: humanizeProviderError(providerNameForError, errMsg) });
   }
 }
 
 async function handleWsAbort(ws: WebSocket, msg: any, user?: JwtPayload) {
-  const sessionKey = resolveOpenClawSessionKey(msg.session, user);
-  console.log(`[gateway] ABORT REQUEST: session=${sessionKey} runId=${msg.runId || 'none'}`);
+  const providerName = normalizeProviderName(msg.provider);
+  const sessionKey = providerName === 'OPENCLAW'
+    ? resolveOpenClawSessionKey(msg.session, user)
+    : String(msg.session || '').trim();
+  console.log(`[gateway] ABORT REQUEST: provider=${providerName} session=${sessionKey} runId=${msg.runId || 'none'}`);
   try {
-    if (user) assertGatewaySessionAccess(sessionKey, user);
+    if (user) assertGatewaySessionAccess(sessionKey, user, { providerName });
+
+    if (providerName !== 'OPENCLAW') {
+      const provider = AgentRegistry.get(providerName);
+      const aborted = await provider.abortActiveRun?.(sessionKey);
+      wsSend(ws, { type: 'abort_result', ok: aborted !== false, sessionKey, provider: providerName });
+      return;
+    }
+
     const payload: Record<string, string> = { sessionKey };
     if (msg.runId) payload.runId = msg.runId;
     const result = await gatewayRpcCall('chat.abort', payload);
@@ -2164,7 +2229,7 @@ async function handleWsAbort(ws: WebSocket, msg: any, user?: JwtPayload) {
     runWsStreamCleanup(ws, sessionKey);
     streamEventBus.clearStream(sessionKey);
 
-    wsSend(ws, { type: 'abort_result', ok: result.ok, sessionKey });
+    wsSend(ws, { type: 'abort_result', ok: result.ok, sessionKey, provider: providerName });
   } catch (err: any) {
     wsSend(ws, { type: 'abort_result', ok: false, error: err.message });
   }

@@ -54,6 +54,13 @@ export interface AgentSendResult {
   metadata?: Record<string, unknown>;
 }
 
+export class AgentAbortError extends Error {
+  constructor(message = 'Request cancelled') {
+    super(message);
+    this.name = 'AgentAbortError';
+  }
+}
+
 /** Summary of one agent session, returned by listSessions. */
 export interface AgentSessionSummary {
   sessionId: AgentSessionId;
@@ -109,4 +116,9 @@ export interface AgentProvider {
    * Tear down a session and release resources.
    */
   terminateSession(sessionId: AgentSessionId): Promise<void>;
+
+  /**
+   * Abort an in-flight run if the provider supports it.
+   */
+  abortActiveRun?(sessionId: AgentSessionId): Promise<boolean>;
 }

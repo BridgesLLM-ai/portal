@@ -332,6 +332,7 @@ function ModelPicker({
   models,
   supportsCustomModelInput = true,
   modelCatalogKind = 'dynamic',
+  disabled = false,
 }: {
   provider: string;
   value: string;
@@ -339,11 +340,16 @@ function ModelPicker({
   models: string[];
   supportsCustomModelInput?: boolean;
   modelCatalogKind?: 'none' | 'declared' | 'dynamic';
+  disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [custom, setCustom] = useState(false);
   const isCustomOnlyCatalog = modelCatalogKind === 'none' && models.length === 0;
   const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
 
   useEffect(() => {
     const isMobile = window.matchMedia('(max-width: 639px)').matches;
@@ -362,9 +368,10 @@ function ModelPicker({
   return (
     <div ref={ref} className="relative">
       <button
-        onClick={() => setOpen(!open)}
-        className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.10] border border-white/[0.08] text-[11px] text-slate-400 hover:text-slate-200 transition-colors"
-        title={value || 'Default model'}
+        onClick={() => { if (!disabled) setOpen(!open); }}
+        disabled={disabled}
+        className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg border text-[11px] transition-colors ${disabled ? 'bg-white/[0.03] border-white/[0.05] text-slate-500 cursor-not-allowed opacity-60' : 'bg-white/[0.06] hover:bg-white/[0.10] border-white/[0.08] text-slate-400 hover:text-slate-200'}`}
+        title={disabled ? 'Finish or abort the current response before switching models' : (value || 'Default model')}
       >
         {/* Icon-only on mobile, text on desktop */}
         <Code2 size={13} className="sm:hidden flex-shrink-0" />
@@ -2972,7 +2979,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
 
             <div className="flex items-center gap-1 sm:gap-2 ml-auto">
               {canSelectModel && (
-                <ModelPicker provider={provider} value={selectedModel} onChange={handleModelChange} models={availableModels} supportsCustomModelInput={supportsCustomModelInput} modelCatalogKind={modelCatalogKind} />
+                <ModelPicker provider={provider} value={selectedModel} onChange={handleModelChange} models={availableModels} supportsCustomModelInput={supportsCustomModelInput} modelCatalogKind={modelCatalogKind} disabled={isRunning} />
               )}
               <SessionControls
                 thinkingLevel={thinkingLevel}

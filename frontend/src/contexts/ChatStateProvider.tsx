@@ -694,7 +694,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   // Refs
   const streamWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const STREAM_TIMEOUT_MS = 60_000;
+  const STREAM_TIMEOUT_MS = 90_000;
   const compactionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectCatchUpTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const toolCounterRef = useRef(0);
@@ -775,13 +775,54 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     return () => { cancelled = true; };
   }, [provider, session, deriveSessionModel]);
 
+  const normalizeAgentError = useCallback((err: unknown, fallback = 'Agent request failed') => {
+    const raw = err instanceof Error ? err.message : String(err || '').trim();
+    if (!raw) return fallback;
+    if (/not logged in|please run \/login/i.test(raw)) return 'This provider is installed but not logged in on the server yet.';
+    if (/GEMINI_API_KEY|GOOGLE_GENAI_USE_VERTEXAI|GOOGLE_GENAI_USE_GCA|Auth method/i.test(raw)) return 'Gemini is installed but not authenticated on the server yet.';
+    if (/ECONNREFUSED|Cannot connect to OpenClaw gateway|gateway.*not connected/i.test(raw)) return 'OpenClaw is reconnecting right now. Give it a few seconds and retry.';
+    return raw;
+  }, []);
+
   // Stream watchdog
   const resetStreamWatchdog = useCallback(() => {
     if (streamWatchdogRef.current) clearTimeout(streamWatchdogRef.current);
     if (!isStreamActiveRef.current) return;
-    streamWatchdogRef.current = setTimeout(() => {
+    streamWatchdogRef.current = setTimeout(async () => {
       if (!isStreamActiveRef.current) return;
-      console.warn('[ChatState] Stream watchdog: no activity for 60s');
+      console.warn('[ChatState] Stream watchdog: no activity for 90s — verifying stream status');
+
+      try {
+        const currentSession = sessionRef.current || 'main';
+        const currentProvider = providerRef.current;
+        const params: Record<string, string> = { session: currentSession };
+        if (currentProvider) params.provider = currentProvider;
+        const { data } = await client.get('/gateway/stream-status', { params, _silent: true } as any);
+        if (data?.active) {
+          setIsRunning(true);
+          setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
+          setActiveToolName(data.toolName || null);
+          setStatusText(data.toolName ? `Using ${data.toolName}…` : 'Still working…');
+          if (typeof data.content === 'string' && data.content.length > 0) {
+            const safeText = sanitizeAssistantContent(data.content);
+            assembledRef.current = safeText;
+            const assistantId = streamingAssistantIdRef.current;
+            if (assistantId) {
+              setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, content: safeText } : m));
+            }
+          }
+          if (USE_DIRECT_GATEWAY && currentProvider === 'OPENCLAW') {
+            directClientRef.current?.connect();
+          } else if (wsManagerRef.current && !wsManagerRef.current.isConnected()) {
+            wsManagerRef.current.reconnect();
+          }
+          resetStreamWatchdog();
+          return;
+        }
+      } catch (err) {
+        console.warn('[ChatState] Stream watchdog verification failed:', err);
+      }
+
       isStreamActiveRef.current = false;
       setIsRunning(false);
       setStreamingPhase('idle');
@@ -1398,7 +1439,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
         if (assistantId) {
           setMessages(prev => prev.map(m =>
-            m.id === assistantId ? { ...m, content: '\u26a0\ufe0f ' + (data.content || 'Unknown error') } : m
+            m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(data.content, 'Unknown error') } : m
           ));
         }
         setStatusText(null);
@@ -1466,7 +1507,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'keepalive':
         break;
     }
-  }, [resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyCompactionState, mergeStreamText, upsertStreamingAssistant]);
+  }, [normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyCompactionState, mergeStreamText, upsertStreamingAssistant]);
 
   // Keep handleWsEvent in a ref so the WS handler always calls the latest version
   const handleWsEventRef = useRef(handleWsEvent);
@@ -1719,7 +1760,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             clearTimeout(compactionTimerRef.current);
             compactionTimerRef.current = null;
           }
-          const errorMsg = payload.errorMessage || 'Unknown error';
+          const errorMsg = normalizeAgentError(payload.errorMessage, 'Unknown error');
           const cid = streamingAssistantIdRef.current;
 
           setStatusText(null);
@@ -1735,7 +1776,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
           if (cid) {
             setMessages(prev => prev.map(m =>
-              m.id === cid ? { ...m, content: '\u26a0\ufe0f ' + errorMsg } : m
+              m.id === cid ? { ...m, content: '⚠️ ' + errorMsg } : m
             ));
           }
           break;
@@ -1847,7 +1888,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
       }
     }
-  }, [resetStreamWatchdog, clearStreamWatchdog, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState]);
+  }, [normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState]);
 
   // WS setup — runs once on mount, survives entire app lifetime
   // Handler registration MUST happen in the same effect that creates the manager,
@@ -2108,6 +2149,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       if (document.visibilityState !== 'visible') return;
 
       const manager = wsManagerRef.current;
+      const directClient = directClientRef.current;
       const currentSession = resolveOpenClawSessionKey(sessionRef.current);
       const currentProvider = providerRef.current;
 
@@ -2115,33 +2157,52 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
       debugLog('[ChatState] Tab became visible — checking stream status');
 
-      // 1. Check if WS is still connected
-      if (!manager || !manager.isConnected()) {
-        debugLog('[ChatState] WS disconnected on visibility — waiting for auto-reconnect');
-        return; // WsManager's built-in reconnect will handle this
+      const usingDirectGateway = USE_DIRECT_GATEWAY && currentProvider === 'OPENCLAW';
+      const transportConnected = usingDirectGateway
+        ? Boolean(directClient?.isConnected)
+        : Boolean(manager && manager.isConnected());
+
+      if (!transportConnected) {
+        debugLog('[ChatState] Transport disconnected on visibility — nudging reconnect');
+        if (usingDirectGateway) {
+          directClient?.connect();
+        } else {
+          manager?.reconnect();
+        }
       }
 
-      // 2. If we think we have an active stream, verify it's still running
       if (isStreamActiveRef.current) {
-        // Stream was active — send a reconnect message to resubscribe
-        manager.send({ type: 'reconnect', session: currentSession });
-        resetStreamWatchdog();
+        if (usingDirectGateway) {
+          resetStreamWatchdog();
+        } else {
+          manager?.send({ type: 'reconnect', session: currentSession, provider: currentProvider });
+          resetStreamWatchdog();
+        }
         return;
       }
 
-      // 3. No active stream — check if one started (or completed) while we were backgrounded
       try {
         const params: Record<string, string> = { session: currentSession };
         if (currentProvider) params.provider = currentProvider;
-        const { data } = await client.get('/gateway/stream-status', { params });
+        const { data } = await client.get('/gateway/stream-status', { params, _silent: true } as any);
 
         if (data.active) {
-          debugLog('[ChatState] Discovered active stream on visibility — subscribing');
-          // A stream started while we were backgrounded — subscribe to it
-          manager.send({ type: 'reconnect', session: currentSession });
+          debugLog('[ChatState] Discovered active stream on visibility — reconnecting');
+          if (usingDirectGateway) {
+            setIsRunning(true);
+            setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
+            setActiveToolName(data.toolName || null);
+            setStatusText(data.toolName ? `Using ${data.toolName}…` : 'Reconnecting to stream…');
+            if (typeof data.content === 'string' && data.content.length > 0) {
+              const safeText = sanitizeAssistantContent(data.content);
+              assembledRef.current = safeText;
+              upsertStreamingAssistant(safeText);
+            }
+            resetStreamWatchdog();
+          } else {
+            manager?.send({ type: 'reconnect', session: currentSession, provider: currentProvider });
+          }
         } else {
-          // Stream is not active — a response may have completed while backgrounded.
-          // Reload history to pick up any new messages we missed.
           debugLog('[ChatState] No active stream on visibility — reloading history for missed messages');
           loadHistoryInternal(currentSession, currentProvider);
         }
@@ -2154,7 +2215,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [resetStreamWatchdog, resolveOpenClawSessionKey]);
+  }, [loadHistoryInternal, resetStreamWatchdog, resolveOpenClawSessionKey, upsertStreamingAssistant]);
 
   // Clear messages helper — also invalidates any in-flight history load and
   // resets transient stream UI so switching sessions always starts clean.
@@ -2255,7 +2316,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setTimeout(() => setStatusText((curr) => curr === 'Steer sent to running OpenClaw turn' ? null : curr), 2200);
       } catch (err: any) {
         console.error('[ChatState] Failed to inject note into active OpenClaw turn:', err);
-        setStatusText(`⚠️ Live steer failed${err?.message ? `: ${err.message}` : ''}`);
+        setStatusText(`⚠️ ${normalizeAgentError(err, 'Live steer failed')}`);
         setTimeout(() => setStatusText(null), 4000);
       }
       return;
@@ -2329,7 +2390,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       } catch (err: any) {
         console.error('[ChatState] Direct gateway send failed:', err);
         setMessages(prev => prev.map(m =>
-          m.id === assistantId ? { ...m, content: '\u26a0\ufe0f ' + (err.message || 'Send failed') } : m
+          m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(err, 'Send failed') } : m
         ));
         setIsRunning(false);
         setStreamingPhase('idle');
@@ -2356,7 +2417,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           await sendViaSSE(normalized, assistantId);
         } catch (err: any) {
           setMessages(prev => prev.map(m =>
-            m.id === assistantId ? { ...m, content: '\u26a0\ufe0f ' + (err.message || 'Send failed') } : m
+            m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(err, 'Send failed') } : m
           ));
           setIsRunning(false);
           setStreamingPhase('idle');
@@ -2370,7 +2431,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         await sendViaSSE(normalized, assistantId);
       } catch (err: any) {
         setMessages(prev => prev.map(m =>
-          m.id === assistantId ? { ...m, content: '\u26a0\ufe0f ' + (err.message || 'Send failed') } : m
+          m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(err, 'Send failed') } : m
         ));
         setIsRunning(false);
         setStreamingPhase('idle');
@@ -2378,7 +2439,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         streamingAssistantIdRef.current = null;
       }
     }
-  }, [resetStreamWatchdog, resolveOpenClawSessionKey]);
+  }, [normalizeAgentError, resetStreamWatchdog, resolveOpenClawSessionKey]);
 
   const drainNextQueuedMessage = useCallback(() => {
     if (isStreamActiveRef.current || isQueueDrainActiveRef.current) return;
@@ -2415,7 +2476,17 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       credentials: 'include',
       body: JSON.stringify(body),
     });
-    if (!response.ok) throw new Error('Gateway error: ' + response.status);
+    if (!response.ok) {
+      let errorMessage = `Gateway error: ${response.status}`;
+      try {
+        const text = await response.text();
+        if (text) {
+          const parsed = JSON.parse(text);
+          errorMessage = parsed?.error || parsed?.detail || errorMessage;
+        }
+      } catch {}
+      throw new Error(errorMessage);
+    }
     const reader = response.body?.getReader();
     if (!reader) throw new Error('No stream body');
 
@@ -2483,7 +2554,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               compactionTimerRef.current = null;
             }
             setMessages(prev => prev.map(m =>
-              m.id === assistantId ? { ...m, content: '\u26a0\ufe0f ' + (evt.content || 'Error') } : m
+              m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(evt.content, 'Error') } : m
             ));
             setStatusText(null);
             setStreamingPhase('idle');
@@ -2501,7 +2572,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       if (done) break;
     }
-  }, [appendThinkingChunk, clearStreamWatchdog, resolveOpenClawSessionKey]);
+  }, [appendThinkingChunk, clearStreamWatchdog, normalizeAgentError, resolveOpenClawSessionKey]);
 
   // Drain queued FYI messages after the current stream ends.
   // isRunning is in the dep array so this re-evaluates when the stream completes
@@ -2545,9 +2616,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       } else {
         const manager = wsManagerRef.current;
         if (manager && manager.isConnected()) {
-          manager.send({ type: 'abort', session: sessionRef.current });
+          manager.send({ type: 'abort', session: sessionRef.current, provider: providerRef.current });
         } else {
-          await client.post('/gateway/chat/abort', { session: sessionRef.current });
+          await client.post('/gateway/chat/abort', { session: sessionRef.current, provider: providerRef.current });
         }
       }
     } catch (err) {
