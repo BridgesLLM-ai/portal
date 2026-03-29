@@ -78,20 +78,21 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
   };
 
   const saveKey = async () => {
-    if (!selectedModel) return;
     setStep('saving');
     setSaveError(null);
     try {
       setSavingMessage('Saving API key...');
       await new Promise((resolve) => setTimeout(resolve, 250));
-      setSavingMessage('Setting model preference...');
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      if (selectedModel && setDefault) {
+        setSavingMessage('Setting model preference...');
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
       setSavingMessage('Restarting AI engine...');
       await client.post(`${apiBase}/save-key`, {
         provider: provider.id,
         apiKey,
-        setDefault,
-        model: selectedModel,
+        setDefault: selectedModel ? setDefault : false,
+        model: selectedModel || undefined,
       });
       setStep('done');
       onComplete();
@@ -230,8 +231,8 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
           {step === 'model' ? (
             <div className="space-y-4">
               <div>
-                <h3 className="text-lg font-semibold text-white">Choose your default model</h3>
-                <p className="mt-1 text-sm text-slate-400">Pick the model this provider should use by default after setup.</p>
+                <h3 className="text-lg font-semibold text-white">Choose a default model (optional)</h3>
+                <p className="mt-1 text-sm text-slate-400">Optionally pick a model to set as your default. You can skip this if you already have one configured.</p>
               </div>
 
               <ModelSelector
@@ -256,10 +257,9 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
                 <button
                   type="button"
                   onClick={saveKey}
-                  disabled={!selectedModel}
-                  className="rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+                  className="rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-emerald-400"
                 >
-                  Save & Activate
+                  {selectedModel ? 'Save & Activate' : 'Save Key'}
                 </button>
               </div>
             </div>
