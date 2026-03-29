@@ -36,7 +36,28 @@ function buildPreviewDocument(code: string, language: string): string | null {
   if (!code.trim()) return null;
 
   if (language === 'html') {
-    return code;
+    // If the code already has a full document structure, use it as-is.
+    // Otherwise, wrap it in a minimal document with a clean reset.
+    const hasDoctype = /<!doctype\s+html/i.test(code);
+    const hasHtmlTag = /<html[\s>]/i.test(code);
+    if (hasDoctype || hasHtmlTag) {
+      return code;
+    }
+    // Wrap partial HTML in a clean document — no inherited portal styles
+    return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; min-height: 100%; }
+  </style>
+</head>
+<body>
+${code}
+</body>
+</html>`;
   }
 
   if (language === 'svg') {
@@ -234,7 +255,8 @@ function PreviewableCodeBlock({ className, children, isStreaming = false, ...pro
                 title={`${language || 'code'} preview`}
                 sandbox="allow-scripts"
                 srcDoc={previewDoc}
-                className={`w-full bg-white transition-[height] duration-200 ${expanded ? 'h-[75vh] min-h-[36rem]' : 'h-[24rem]'}`}
+                className={`w-full transition-[height] duration-200 ${expanded ? 'h-[75vh] min-h-[36rem]' : 'h-[24rem]'}`}
+                style={{ background: 'transparent' }}
               />
             )}
           </div>
