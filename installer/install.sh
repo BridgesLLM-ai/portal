@@ -433,6 +433,91 @@ NODE
   ok "Runtime dependencies verified"
 }
 
+run_migrations_safe() {
+  local db_url="$1"
+  local backend_dir="${PORTAL_DIR}/backend"
+  local migration_dir="${backend_dir}/prisma/migrations"
+
+  # ── Pre-flight: ensure migration files exist ──
+  local migration_count=0
+  if [[ -d "${migration_dir}" ]]; then
+    migration_count=$(find "${migration_dir}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+  fi
+
+  if (( migration_count == 0 )); then
+    echo ""
+    echo -e "  ${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${RED}${BOLD}  DATABASE SETUP ERROR${NC}"
+    echo ""
+    echo -e "  ${WHITE}  No migration files found in:${NC}"
+    echo -e "  ${DIM}  ${migration_dir}${NC}"
+    echo ""
+    echo -e "  ${WHITE}  This usually means the release tarball is incomplete.${NC}"
+    echo -e "  ${WHITE}  The portal cannot start without database tables.${NC}"
+    echo ""
+    echo -e "  ${CYAN}  How to fix:${NC}"
+    echo -e "  ${WHITE}  1. Re-download the installer and run again:${NC}"
+    echo -e "  ${DIM}     curl -fsSL https://bridgesllm.ai/install.sh | sudo bash${NC}"
+    echo ""
+    echo -e "  ${WHITE}  2. Or manually re-download the portal tarball:${NC}"
+    echo -e "  ${DIM}     curl -fsSL https://bridgesllm.ai/portal.tar.gz -o /tmp/portal.tar.gz${NC}"
+    echo -e "  ${DIM}     tar xzf /tmp/portal.tar.gz -C /tmp${NC}"
+    echo -e "  ${DIM}     cp -r /tmp/portal/backend/prisma/migrations ${migration_dir}${NC}"
+    echo -e "  ${DIM}     cd ${backend_dir} && npx prisma migrate deploy${NC}"
+    echo -e "  ${DIM}     systemctl restart bridgesllm-product${NC}"
+    echo ""
+    echo -e "  ${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    fail "No database migrations found — release package may be corrupt"
+  fi
+
+  info "Found ${migration_count} migration(s)"
+
+  # ── Run migrations ──
+  spin "Running database migrations" "cd '${backend_dir}' && DATABASE_URL='${db_url}' npx prisma migrate deploy"
+
+  # ── Post-flight: verify tables were actually created ──
+  local table_count=0
+  table_count=$(DATABASE_URL="${db_url}" node -e "
+    const { PrismaClient } = require('@prisma/client');
+    const p = new PrismaClient();
+    p.\$queryRaw\`SELECT count(*) as c FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'\`
+      .then(r => { console.log(Number(r[0].c)); p.\$disconnect(); })
+      .catch(() => { console.log('0'); p.\$disconnect(); });
+  " 2>/dev/null || echo "0")
+
+  # _prisma_migrations table always exists; we need at least a few more
+  if (( table_count < 3 )); then
+    echo ""
+    echo -e "  ${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${RED}${BOLD}  DATABASE MIGRATION FAILED${NC}"
+    echo ""
+    echo -e "  ${WHITE}  Migrations ran but only ${table_count} table(s) were created.${NC}"
+    echo -e "  ${WHITE}  Expected 10+. The database is incomplete.${NC}"
+    echo ""
+    echo -e "  ${CYAN}  How to fix:${NC}"
+    echo -e "  ${WHITE}  1. Check the install log for errors:${NC}"
+    echo -e "  ${DIM}     tail -50 ${LOG_FILE}${NC}"
+    echo ""
+    echo -e "  ${WHITE}  2. Try running migrations manually:${NC}"
+    echo -e "  ${DIM}     cd ${backend_dir}${NC}"
+    echo -e "  ${DIM}     DATABASE_URL='${db_url}' npx prisma migrate deploy${NC}"
+    echo ""
+    echo -e "  ${WHITE}  3. If that fails, reset the database and retry:${NC}"
+    echo -e "  ${DIM}     sudo -u postgres psql -c 'DROP DATABASE bridgesllm_portal;'${NC}"
+    echo -e "  ${DIM}     sudo -u postgres psql -c 'CREATE DATABASE bridgesllm_portal OWNER blp;'${NC}"
+    echo -e "  ${DIM}     cd ${backend_dir} && DATABASE_URL='${db_url}' npx prisma migrate deploy${NC}"
+    echo -e "  ${DIM}     systemctl restart bridgesllm-product${NC}"
+    echo ""
+    echo -e "  ${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    fail "Database migration incomplete — only ${table_count} tables created (expected 10+)"
+  fi
+
+  spin "Generating database client" "cd '${backend_dir}' && DATABASE_URL='${db_url}' npx prisma generate"
+  ok "Database ready ${DIM}(${table_count} tables, ${migration_count} migrations)${NC}"
+}
+
 verify_portal_service_health() {
   local service_name="${1:-bridgesllm-product}"
   local health_url="${2:-http://127.0.0.1:4001/health}"
@@ -1380,9 +1465,7 @@ ENVEOF
 
   # Run migrations
   local db_url="postgresql://blp:${DB_PASSWORD}@127.0.0.1:5432/bridgesllm_portal"
-  spin "Running database migrations" "cd '${PORTAL_DIR}/backend' && DATABASE_URL='${db_url}' npx prisma migrate deploy"
-  spin "Generating database client" "cd '${PORTAL_DIR}/backend' && DATABASE_URL='${db_url}' npx prisma generate"
-  ok "Database tables created"
+  run_migrations_safe "${db_url}"
 
   # Build
   if [[ -f "${PORTAL_DIR}/frontend/dist/index.html" ]] && [[ -f "${PORTAL_DIR}/backend/dist/server.js" ]]; then
@@ -1896,8 +1979,7 @@ do_update() {
 
   # Use the existing DATABASE_URL if available, otherwise construct a default
   local db_url="${existing_db_url:-postgresql://blp:${DB_PASSWORD}@127.0.0.1:5432/bridgesllm_portal}"
-  spin "Running database migrations" "cd '${PORTAL_DIR}/backend' && DATABASE_URL='${db_url}' npx prisma migrate deploy"
-  spin "Generating database client" "cd '${PORTAL_DIR}/backend' && DATABASE_URL='${db_url}' npx prisma generate"
+  run_migrations_safe "${db_url}"
 
   update_dependencies
   telemetry_event "deps_updated" ",\"installId\":\"${TELEMETRY_INSTALL_ID}\""
