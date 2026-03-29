@@ -17,6 +17,10 @@ export interface RegisteredProviderInfo {
   version?: string;
   native: boolean;
   reason?: string;
+  nativeAuthStatus?: string;
+  nativeAuthMessage?: string;
+  nativeAuthLoginCommand?: string;
+  requiresSeparateNativeLogin?: boolean;
   capabilities: ProviderCapabilitySummary;
 }
 
@@ -90,6 +94,10 @@ export class AgentRegistry {
         version: availability.version,
         native: availability.native,
         reason: availability.reason,
+        nativeAuthStatus: availability.nativeAuthStatus,
+        nativeAuthMessage: availability.nativeAuthMessage,
+        nativeAuthLoginCommand: availability.nativeAuthLoginCommand,
+        requiresSeparateNativeLogin: availability.requiresSeparateNativeLogin,
         capabilities: availability.capabilities,
       };
     });
