@@ -477,8 +477,17 @@ run_migrations_safe() {
   spin "Running database migrations" "cd '${backend_dir}' && DATABASE_URL='${db_url}' npx prisma migrate deploy"
 
   # ── Post-flight: verify tables were actually created ──
+  # Parse the DATABASE_URL to connect with psql (handles custom ports/db names).
   local table_count=0
-  table_count=$(sudo -u postgres psql -d bridgesllm_portal -tAc \
+  local _db_host _db_port _db_name _db_user _db_pass
+  _db_host=$(echo "${db_url}" | sed -n 's#.*@\([^:/]*\).*#\1#p')
+  _db_port=$(echo "${db_url}" | sed -n 's#.*:\([0-9]*\)/.*#\1#p')
+  _db_name=$(echo "${db_url}" | sed -n 's#.*/\([^?]*\).*#\1#p')
+  _db_user=$(echo "${db_url}" | sed -n 's#.*://\([^:]*\):.*#\1#p')
+  _db_pass=$(echo "${db_url}" | sed -n 's#.*://[^:]*:\([^@]*\)@.*#\1#p')
+  _db_port="${_db_port:-5432}"
+
+  table_count=$(PGPASSWORD="${_db_pass}" psql -h "${_db_host}" -p "${_db_port}" -U "${_db_user}" -d "${_db_name}" -tAc \
     "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'" \
     2>/dev/null | tr -d '[:space:]' || echo "0")
   table_count="${table_count:-0}"
@@ -500,11 +509,9 @@ run_migrations_safe() {
     echo -e "  ${DIM}     cd ${backend_dir}${NC}"
     echo -e "  ${DIM}     DATABASE_URL='${db_url}' npx prisma migrate deploy${NC}"
     echo ""
-    echo -e "  ${WHITE}  3. If that fails, reset the database and retry:${NC}"
-    echo -e "  ${DIM}     sudo -u postgres psql -c 'DROP DATABASE bridgesllm_portal;'${NC}"
-    echo -e "  ${DIM}     sudo -u postgres psql -c 'CREATE DATABASE bridgesllm_portal OWNER blp;'${NC}"
-    echo -e "  ${DIM}     cd ${backend_dir} && DATABASE_URL='${db_url}' npx prisma migrate deploy${NC}"
-    echo -e "  ${DIM}     systemctl restart bridgesllm-product${NC}"
+    echo -e "  ${WHITE}  3. If that fails, check your database and retry:${NC}"
+    echo -e "  ${DIM}     Verify database exists: psql '${db_url}' -c '\\dt'${NC}"
+    echo -e "  ${DIM}     Then restart: systemctl restart bridgesllm-product${NC}"
     echo ""
     echo -e "  ${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
@@ -1419,6 +1426,17 @@ build_portal() {
     DB_PASSWORD=$(printf '%s' "${existing_database_url}" | sed -n 's#.*://[^:]*:\([^@]*\)@.*#\1#p')
   fi
 
+  # Build the DATABASE_URL — PRESERVE existing URL on updates to respect
+  # custom port/database name. Only construct a new one for fresh installs.
+  local final_database_url=""
+  if [[ -n "${existing_database_url}" ]]; then
+    final_database_url="${existing_database_url}"
+    info "Preserving existing DATABASE_URL ($(echo "${existing_database_url}" | sed 's#://[^:]*:[^@]*@#://***:***@#'))"
+  else
+    [[ -n "${DB_PASSWORD}" ]] || DB_PASSWORD="$(rand_pass 24)"
+    final_database_url="postgresql://blp:${DB_PASSWORD}@127.0.0.1:5432/bridgesllm_portal"
+  fi
+
   # Write .env.production
   local cors_origin="http://${PUBLIC_IP}"
   [[ -n "$DOMAIN" ]] && cors_origin="https://${DOMAIN},https://www.${DOMAIN}"
@@ -1428,7 +1446,7 @@ build_portal() {
 NODE_ENV=production
 PORT=4001
 
-DATABASE_URL="postgresql://blp:${DB_PASSWORD}@127.0.0.1:5432/bridgesllm_portal"
+DATABASE_URL="${final_database_url}"
 JWT_SECRET=${JWT_SECRET}
 JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET}
 
@@ -1898,6 +1916,10 @@ do_update() {
   info "Stopping portal..."
   systemctl stop bridgesllm-product 2>/dev/null || true
 
+  # Safety net: if the update fails for ANY reason after stopping the service,
+  # always try to restart it so the user doesn't lose their portal.
+  trap 'echo ""; echo -e "  ${YELLOW}⚠ Update failed — restarting portal with previous version...${NC}"; systemctl start bridgesllm-product 2>/dev/null || true' ERR
+
   # Read existing DATABASE_URL directly — do NOT reconstruct it (port may differ)
   local existing_db_url=""
   if [[ -f "${PORTAL_DIR}/backend/.env.production" ]]; then
@@ -1991,6 +2013,9 @@ do_update() {
   # Ensure Remote Desktop is properly set up (packages + services + VNC race fix)
   info "Checking Remote Desktop..."
   setup_remote_desktop
+
+  # Clear the safety-net trap — we're about to start the service ourselves
+  trap - ERR
 
   info "Starting portal..."
   systemctl start bridgesllm-product
