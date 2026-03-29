@@ -3,6 +3,7 @@ import { AlertTriangle, ChevronRight, Cpu, Loader2, RefreshCw } from 'lucide-rea
 import client from '../../api/client';
 import ApiKeySetupFlow from './ApiKeySetupFlow';
 import DeviceCodeFlow from './DeviceCodeFlow';
+import NativeCliSetupFlow from './NativeCliSetupFlow';
 import OAuthSetupFlow from './OAuthSetupFlow';
 import OpenClawProviderPicker from './OpenClawProviderPicker';
 import type { ProviderStatus } from './ProviderCard';
@@ -36,6 +37,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
   const [status, setStatus] = useState<AiSetupStatusResponse | null>(null);
   const [activeSetup, setActiveSetup] = useState<ProviderUIConfig | null>(null);
   const [activeDeviceFlow, setActiveDeviceFlow] = useState(false);
+  const [activeNativeCliFlow, setActiveNativeCliFlow] = useState<'claude-code' | 'codex' | 'gemini' | null>(null);
   const [showProviderPicker, setShowProviderPicker] = useState(false);
 
   const loadStatus = async (silent = false) => {
@@ -90,6 +92,21 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
     // Don't auto-advance the wizard — let user add more providers first
   };
 
+  const handleNativeCliLogin = (nativeProvider: string) => {
+    const providerMap: Record<string, 'claude-code' | 'codex' | 'gemini'> = {
+      'CLAUDE_CODE': 'claude-code',
+      'CODEX': 'codex',
+      'GEMINI': 'gemini',
+      'claude-code': 'claude-code',
+      'codex': 'codex',
+      'gemini': 'gemini',
+    };
+    const mapped = providerMap[nativeProvider];
+    if (mapped) {
+      setActiveNativeCliFlow(mapped);
+    }
+  };
+
   // ── Compact layout (sidebar drawer) ──────────────────────────────
   if (compact) {
     return (
@@ -131,7 +148,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
 
         {/* Provider buttons */}
         {!loading ? (
-          <QuickStartBanner onChoose={handleCardChoose} statusMap={statusMap} compact />
+          <QuickStartBanner onChoose={handleCardChoose} onNativeCliLogin={handleNativeCliLogin} statusMap={statusMap} compact />
         ) : null}
 
         {/* Modals */}
@@ -154,6 +171,9 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
         ) : null}
         {activeDeviceFlow ? (
           <DeviceCodeFlow apiBase={apiBase} onComplete={async () => { await handleComplete(); setActiveDeviceFlow(false); }} onCancel={() => setActiveDeviceFlow(false)} />
+        ) : null}
+        {activeNativeCliFlow ? (
+          <NativeCliSetupFlow provider={activeNativeCliFlow} apiBase={apiBase} onComplete={async () => { await handleComplete(); setActiveNativeCliFlow(null); }} onCancel={() => setActiveNativeCliFlow(null)} />
         ) : null}
       </div>
     );
@@ -226,7 +246,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
 
       {/* ── Four cards ── */}
       {!loading ? (
-        <QuickStartBanner onChoose={handleCardChoose} statusMap={statusMap} />
+        <QuickStartBanner onChoose={handleCardChoose} onNativeCliLogin={handleNativeCliLogin} statusMap={statusMap} />
       ) : null}
 
       {/* ── Modals ── */}
@@ -259,6 +279,14 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
           apiBase={apiBase}
           onComplete={async () => { await handleComplete(); setActiveDeviceFlow(false); }}
           onCancel={() => setActiveDeviceFlow(false)}
+        />
+      ) : null}
+      {activeNativeCliFlow ? (
+        <NativeCliSetupFlow
+          provider={activeNativeCliFlow}
+          apiBase={apiBase}
+          onComplete={async () => { await handleComplete(); setActiveNativeCliFlow(null); }}
+          onCancel={() => setActiveNativeCliFlow(null)}
         />
       ) : null}
 

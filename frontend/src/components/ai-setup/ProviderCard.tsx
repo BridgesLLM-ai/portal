@@ -25,6 +25,7 @@ interface ProviderCardProps {
   status?: ProviderStatus | null;
   onConfigure: (providerId: string) => void;
   onRemove?: (providerId: string) => void;
+  onNativeCliLogin?: (nativeProvider: string) => void;
   /** Compact layout for narrow containers */
   compact?: boolean;
 }
@@ -97,7 +98,7 @@ function nativeCliLabel(status: ProviderStatus | null | undefined) {
   }
 }
 
-export default function ProviderCard({ provider, status, onConfigure, onRemove, compact = false }: ProviderCardProps) {
+export default function ProviderCard({ provider, status, onConfigure, onRemove, onNativeCliLogin, compact = false }: ProviderCardProps) {
   const Icon = iconMap[provider.icon as keyof typeof iconMap] || Cpu;
   const tone = statusStyles(status?.status);
   const isConfigured = status?.status === 'configured';
@@ -203,8 +204,15 @@ export default function ProviderCard({ provider, status, onConfigure, onRemove, 
           {status.nativeCliAuthMessage ? (
             <div className="mt-2 text-sm text-slate-300">{status.nativeCliAuthMessage}</div>
           ) : null}
-          {status.nativeCliLoginCommand ? (
-            <div className="mt-2 text-xs text-slate-500">Server command: <code className="rounded bg-slate-900 px-1.5 py-0.5 text-slate-300">{status.nativeCliLoginCommand}</code></div>
+          {status.nativeCliAuthStatus === 'needs_login' && onNativeCliLogin ? (
+            <button
+              type="button"
+              onClick={() => onNativeCliLogin(status.nativeProvider!)}
+              className="mt-2 inline-flex items-center gap-1 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 transition hover:bg-emerald-500/15"
+            >
+              <ChevronRight className="h-3.5 w-3.5" />
+              Login to {status.nativeProvider} CLI
+            </button>
           ) : null}
         </div>
       ) : null}

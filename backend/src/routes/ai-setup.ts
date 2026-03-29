@@ -5,7 +5,7 @@ import { execFileSync, execSync } from 'child_process';
 import { z } from 'zod';
 import { getAiProviderMeta } from '../config/aiProviders';
 import { validateApiKey } from '../services/aiProviderValidator';
-import { completeOAuthFlow, getClaudeSetupToken, getOAuthFlowStatus, pasteCodeToClaudeSession, saveClaudeToken, startClaudeSetupTokenFlow, startDeviceCodeFlow, startOAuthFlow } from '../services/oauthFlowManager';
+import { completeNativeCliFlow, completeOAuthFlow, getClaudeSetupToken, getOAuthFlowStatus, pasteCodeToClaudeSession, saveClaudeToken, startClaudeSetupTokenFlow, startDeviceCodeFlow, startNativeCliFlow, startOAuthFlow } from '../services/oauthFlowManager';
 import {
   AUTH_PROFILES_PATH,
   CONFIG_PATH,
@@ -595,6 +595,48 @@ export function createAiSetupRouter(): Router {
       res.json({ success: gatewayRunning, message: gatewayRunning ? 'Gateway restarted' : 'Gateway may still be starting' });
     } catch (error: any) {
       res.status(500).json({ success: false, error: error?.message || 'Failed to restart gateway' });
+    }
+  });
+
+  // ── Native CLI OAuth flows ──────────────────────────────────────────
+  router.post('/native-cli/start', async (req: Request, res: Response) => {
+    const { provider } = req.body;
+    if (!['claude-code', 'codex', 'gemini'].includes(provider)) {
+      res.status(400).json({ error: 'Invalid native CLI provider' });
+      return;
+    }
+
+    try {
+      const result = await startNativeCliFlow(provider);
+      res.json({ success: true, ...result });
+    } catch (error: any) {
+      console.error(`[NativeCLI] start error for ${provider}:`, error.message);
+      res.status(500).json({ success: false, error: error?.message || 'Failed to start native CLI flow' });
+    }
+  });
+
+  router.get('/native-cli/status/:sessionId', async (req: Request, res: Response) => {
+    const status = getOAuthFlowStatus(req.params.sessionId);
+    if (!status) {
+      res.status(404).json({ error: 'Native CLI session not found' });
+      return;
+    }
+    res.json(status);
+  });
+
+  router.post('/native-cli/callback', async (req: Request, res: Response) => {
+    const { sessionId, callbackUrl } = req.body;
+    if (!sessionId || !callbackUrl) {
+      res.status(400).json({ error: 'sessionId and callbackUrl required' });
+      return;
+    }
+
+    try {
+      const result = await completeNativeCliFlow(sessionId, callbackUrl);
+      res.json(result);
+    } catch (error: any) {
+      console.error('[NativeCLI] callback error:', error.message);
+      res.status(500).json({ success: false, error: error?.message || 'Failed to complete native CLI flow' });
     }
   });
 

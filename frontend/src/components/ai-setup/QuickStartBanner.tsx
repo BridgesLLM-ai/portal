@@ -3,6 +3,7 @@ import type { ProviderStatus } from './ProviderCard';
 
 interface QuickStartBannerProps {
   onChoose: (providerId: string) => void;
+  onNativeCliLogin?: (nativeProvider: 'claude-code' | 'codex' | 'gemini') => void;
   statusMap?: Map<string, ProviderStatus>;
   compact?: boolean;
 }
@@ -38,6 +39,18 @@ const cards = [
   },
 ];
 
+const NATIVE_CLI_MAP: Record<string, 'claude-code' | 'codex' | 'gemini'> = {
+  'anthropic': 'claude-code',
+  'openai-codex': 'codex',
+  'google-gemini-cli': 'gemini',
+};
+
+function getNativeCliStatus(statusMap: Map<string, ProviderStatus> | undefined, id: string): ProviderStatus['nativeCliAuthStatus'] | null {
+  if (!statusMap || !NATIVE_CLI_MAP[id]) return null;
+  const status = statusMap.get(id);
+  return status?.nativeCliAuthStatus || null;
+}
+
 function isConfigured(statusMap: Map<string, ProviderStatus> | undefined, id: string): boolean {
   if (!statusMap) return false;
   if (id === 'openclaw') return false;
@@ -60,7 +73,7 @@ function getExpiryInfo(statusMap: Map<string, ProviderStatus> | undefined, id: s
   return { label: `Expires ${new Date(status.expiresAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`, urgency: 'ok' };
 }
 
-export default function QuickStartBanner({ onChoose, statusMap, compact = false }: QuickStartBannerProps) {
+export default function QuickStartBanner({ onChoose, onNativeCliLogin, statusMap, compact = false }: QuickStartBannerProps) {
   if (compact) {
     return (
       <div className="space-y-1.5">
@@ -150,6 +163,16 @@ export default function QuickStartBanner({ onChoose, statusMap, compact = false 
               ) : null}
 
               <p className="mt-2 text-sm leading-relaxed text-slate-400">{card.description}</p>
+              {getNativeCliStatus(statusMap, card.id) === 'needs_login' && onNativeCliLogin && NATIVE_CLI_MAP[card.id] ? (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onNativeCliLogin(NATIVE_CLI_MAP[card.id]); }}
+                  className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-300 transition hover:bg-amber-500/15"
+                >
+                  <AlertTriangle className="h-3 w-3" />
+                  Login to {NATIVE_CLI_MAP[card.id] === 'claude-code' ? 'Claude Code' : NATIVE_CLI_MAP[card.id] === 'codex' ? 'Codex' : 'Gemini'} CLI
+                </button>
+              ) : null}
               <div className="mt-3 flex items-center gap-1 text-sm font-medium text-slate-300 group-hover:text-white transition-colors">
                 <span>{expiry?.urgency === 'expired' ? 'Re-authenticate' : configured ? 'Reconfigure' : 'Set up'}</span>
                 <ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />

@@ -664,6 +664,337 @@ export async function saveClaudeToken(token: string) {
   }
 }
 
+// ── Native CLI OAuth flows ──────────────────────────────────────────
+// Spawn native CLI binaries (claude, codex, gemini) in PTY to authenticate
+// their own credential stores separate from OpenClaw auth profiles.
+
+const fs = require('fs');
+const path = require('path');
+
+const HOME_DIR = process.env.HOME || '/root';
+const CLAUDE_CREDENTIALS_PATH = path.join(HOME_DIR, '.claude', '.credentials.json');
+const CODEX_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
+const GEMINI_CONFIG_DIR = path.join(HOME_DIR, '.config', 'gemini');
+
+function findCliBin(command: string): string {
+  const { execSync } = require('child_process');
+  try {
+    return execSync(`which ${command}`, { encoding: 'utf-8' }).trim() || command;
+  } catch {
+    return command;
+  }
+}
+
+function checkCredentialFile(filePath: string, requiredKeys: string[]): boolean {
+  try {
+    if (!fs.existsSync(filePath)) return false;
+    const content = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return requiredKeys.every((key) => {
+      const parts = key.split('.');
+      let current = content;
+      for (const part of parts) {
+        if (!current || typeof current !== 'object' || !(part in current)) return false;
+        current = current[part];
+      }
+      return Boolean(current);
+    });
+  } catch {
+    return false;
+  }
+}
+
+function checkCredentialDir(dirPath: string): boolean {
+  try {
+    return fs.readdirSync(dirPath).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'gemini') {
+  const id = createSessionId();
+  let session: OAuthSession;
+
+  switch (provider) {
+    case 'claude-code': {
+      const claudeBin = findCliBin('claude');
+      console.log(`[NativeCLI] Starting Claude Code login, binary=${claudeBin}`);
+      
+      const proc = pty.spawn(claudeBin, [], {
+        name: 'xterm-256color',
+        cols: 500,
+        rows: 40,
+        cwd: process.cwd(),
+        env: { ...process.env } as Record<string, string>,
+      });
+
+      session = {
+        id,
+        provider: 'claude-code',
+        mode: 'oauth',
+        process: proc,
+        authUrl: null,
+        callbackHintUrl: null,
+        deviceCode: null,
+        verificationUrl: null,
+        status: 'starting',
+        error: null,
+        output: '',
+        cleanOutput: '',
+        createdAt: Date.now(),
+        completedAt: null,
+        profileKeyBefore: [],
+        sentInitialConfirm: false,
+      };
+
+      sessions.set(id, session);
+
+      proc.onData((chunk: string) => {
+        session.output += chunk;
+        session.cleanOutput += stripAnsi(chunk);
+
+        const text = session.cleanOutput;
+        // Claude outputs auth URL — match claude.ai or claude.com
+        const unwrapped = text.replace(/([A-Za-z0-9%&=_\-.+/])[\r\n]+([A-Za-z0-9%&=_\-.+/])/g, '$1$2');
+        const urls = unwrapped.match(/https:\/\/claude\.(ai|com)\/[^\s)">]*oauth\/authorize[^\s)">]*/g);
+        const firstUrl = urls?.[0] ?? null;
+        if (firstUrl && !session.authUrl) {
+          session.authUrl = firstUrl;
+          session.status = 'awaiting_callback';
+          console.log(`[NativeCLI] Claude auth URL captured: ${firstUrl.slice(0, 100)}...`);
+        }
+      });
+
+      proc.onExit(({ exitCode }) => {
+        console.log(`[NativeCLI] Claude PTY exited: code=${exitCode} status=${session.status}`);
+        if (checkCredentialFile(CLAUDE_CREDENTIALS_PATH, ['claudeAiOauth.accessToken'])) {
+          session.status = 'complete';
+          session.completedAt = Date.now();
+          console.log('[NativeCLI] Claude credentials verified');
+        } else if (session.status !== 'complete' && !session.error) {
+          session.status = 'error';
+          session.error = `Claude CLI exited with code ${exitCode}`;
+        }
+      });
+
+      await waitForInitialOutput(session, 30000);
+      break;
+    }
+
+    case 'codex': {
+      const codexBin = findCliBin('codex');
+      console.log(`[NativeCLI] Starting Codex login, binary=${codexBin}`);
+      
+      const proc = pty.spawn(codexBin, ['login'], {
+        name: 'xterm-256color',
+        cols: 120,
+        rows: 40,
+        cwd: process.cwd(),
+        env: { ...process.env } as Record<string, string>,
+      });
+
+      session = {
+        id,
+        provider: 'codex',
+        mode: 'device_code',
+        process: proc,
+        authUrl: null,
+        callbackHintUrl: null,
+        deviceCode: null,
+        verificationUrl: null,
+        status: 'starting',
+        error: null,
+        output: '',
+        cleanOutput: '',
+        createdAt: Date.now(),
+        completedAt: null,
+        profileKeyBefore: [],
+        sentInitialConfirm: false,
+      };
+
+      sessions.set(id, session);
+
+      proc.onData((chunk: string) => {
+        session.output += chunk;
+        session.cleanOutput += stripAnsi(chunk);
+        updateSessionFromOutput(session);
+      });
+
+      proc.onExit(({ exitCode }) => {
+        console.log(`[NativeCLI] Codex PTY exited: code=${exitCode} status=${session.status}`);
+        if (checkCredentialFile(CODEX_AUTH_PATH, ['tokens.access_token'])) {
+          session.status = 'complete';
+          session.completedAt = Date.now();
+          console.log('[NativeCLI] Codex credentials verified');
+        } else if (session.status !== 'complete' && !session.error) {
+          session.status = 'error';
+          session.error = `Codex CLI exited with code ${exitCode}`;
+        }
+      });
+
+      await waitForInitialOutput(session, 20000);
+      break;
+    }
+
+    case 'gemini': {
+      const geminiBin = findCliBin('gemini');
+      console.log(`[NativeCLI] Starting Gemini login, binary=${geminiBin}`);
+      
+      const proc = pty.spawn(geminiBin, [], {
+        name: 'xterm-256color',
+        cols: 120,
+        rows: 40,
+        cwd: process.cwd(),
+        env: { ...process.env } as Record<string, string>,
+      });
+
+      session = {
+        id,
+        provider: 'gemini',
+        mode: 'oauth',
+        process: proc,
+        authUrl: null,
+        callbackHintUrl: null,
+        deviceCode: null,
+        verificationUrl: null,
+        status: 'starting',
+        error: null,
+        output: '',
+        cleanOutput: '',
+        createdAt: Date.now(),
+        completedAt: null,
+        profileKeyBefore: [],
+        sentInitialConfirm: false,
+      };
+
+      sessions.set(id, session);
+
+      proc.onData((chunk: string) => {
+        session.output += chunk;
+        session.cleanOutput += stripAnsi(chunk);
+        updateSessionFromOutput(session);
+      });
+
+      proc.onExit(({ exitCode }) => {
+        console.log(`[NativeCLI] Gemini PTY exited: code=${exitCode} status=${session.status}`);
+        if (checkCredentialDir(GEMINI_CONFIG_DIR)) {
+          session.status = 'complete';
+          session.completedAt = Date.now();
+          console.log('[NativeCLI] Gemini credentials verified');
+        } else if (session.status !== 'complete' && !session.error) {
+          session.status = 'error';
+          session.error = `Gemini CLI exited with code ${exitCode}`;
+        }
+      });
+
+      await waitForInitialOutput(session, 20000);
+      break;
+    }
+  }
+
+  return {
+    sessionId: session.id,
+    authUrl: session.authUrl,
+    callbackHintUrl: session.callbackHintUrl,
+    deviceCode: session.deviceCode,
+    verificationUrl: session.verificationUrl,
+  };
+}
+
+export async function completeNativeCliFlow(sessionId: string, callbackUrl: string) {
+  const session = sessions.get(sessionId);
+  if (!session) throw new Error('Native CLI session not found');
+  if (!['claude-code', 'gemini'].includes(session.provider)) {
+    throw new Error('Session is not a callback-based native CLI flow');
+  }
+
+  session.status = 'processing';
+  session.error = null;
+
+  // Check if PTY is still alive
+  let ptyAlive = false;
+  try {
+    session.process.write('');
+    ptyAlive = true;
+  } catch {
+    ptyAlive = false;
+  }
+
+  if (!ptyAlive) {
+    console.log(`[NativeCLI] PTY dead for ${session.provider}, spawning fresh process...`);
+    const bin = findCliBin(session.provider === 'claude-code' ? 'claude' : 'gemini');
+    const freshProcess = pty.spawn(bin, [], {
+      name: 'xterm-256color',
+      cols: 120,
+      rows: 40,
+      cwd: process.cwd(),
+      env: { ...process.env } as Record<string, string>,
+    });
+    session.process = freshProcess;
+    session.output = '';
+    session.cleanOutput = '';
+
+    freshProcess.onData((chunk: string) => {
+      session.output += chunk;
+      session.cleanOutput += stripAnsi(chunk);
+      updateSessionFromOutput(session);
+    });
+
+    freshProcess.onExit(({ exitCode }) => {
+      console.log(`[NativeCLI] Fresh PTY exited: provider=${session.provider} code=${exitCode}`);
+      const credCheck = session.provider === 'claude-code'
+        ? checkCredentialFile(CLAUDE_CREDENTIALS_PATH, ['claudeAiOauth.accessToken'])
+        : checkCredentialDir(GEMINI_CONFIG_DIR);
+      if (credCheck) {
+        session.status = 'complete';
+        session.completedAt = Date.now();
+      } else if (!session.error) {
+        session.status = 'error';
+        session.error = `Native CLI exited with code ${exitCode}`;
+      }
+    });
+
+    try {
+      await waitForInitialOutput(session, 20000);
+    } catch (err: any) {
+      return { success: false, error: `Failed to restart native CLI: ${err.message}` };
+    }
+  }
+
+  // Write the callback URL
+  session.process.write(`${callbackUrl}\r`);
+
+  const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      const credCheck = session.provider === 'claude-code'
+        ? checkCredentialFile(CLAUDE_CREDENTIALS_PATH, ['claudeAiOauth.accessToken'])
+        : checkCredentialDir(GEMINI_CONFIG_DIR);
+
+      if (credCheck || session.status === 'complete') {
+        clearInterval(timer);
+        session.status = 'complete';
+        session.completedAt = Date.now();
+        resolve({ success: true });
+        return;
+      }
+
+      if (session.error || session.status === 'error') {
+        clearInterval(timer);
+        resolve({ success: false, error: session.error || 'Native CLI login failed' });
+        return;
+      }
+
+      if (Date.now() - started > 45000) {
+        clearInterval(timer);
+        resolve({ success: false, error: 'Timed out waiting for native CLI login to finish.' });
+      }
+    }, 250);
+  });
+
+  return result;
+}
+
 setInterval(() => {
   for (const [id, session] of sessions.entries()) {
     if (Date.now() - session.createdAt > 10 * 60 * 1000) {
