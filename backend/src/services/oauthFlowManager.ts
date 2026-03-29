@@ -1,5 +1,5 @@
 import * as pty from 'node-pty';
-import { readAuthProfiles } from './openclawConfigManager';
+import { readAuthProfiles, saveProviderApiKey } from './openclawConfigManager';
 
 export type OAuthFlowStatus = 'starting' | 'awaiting_callback' | 'polling_device' | 'processing' | 'complete' | 'error';
 
@@ -474,15 +474,24 @@ export async function startClaudeSetupTokenFlow() {
       console.log(`[Claude] Last 500 chars: ${session.cleanOutput.slice(-500)}`);
 
       if (exitCode === 0 && !setupToken) {
-        // Try to extract the token from the output
-        // claude setup-token prints lines like: "Setup token (expires ...): <token>"
-        // or just a bare long token string after "Setup token:"
+        // Try to extract the token from the output — Claude CLI prints in multiple formats
         const text = session.cleanOutput;
-        const tokenMatch = text.match(/(?:Setup token[^:]*:\s*)([A-Za-z0-9_\-/.+=]{20,})/i)
-          || text.match(/(?:Token:\s*)([A-Za-z0-9_\-/.+=]{20,})/i);
-        if (tokenMatch?.[1]) {
-          setupToken = tokenMatch[1].trim();
-          console.log(`[Claude] Token captured from output (${setupToken.length} chars)`);
+        const patterns = [
+          /(?:Setup token[^:]*:\s*)([A-Za-z0-9_\-/.+=]{20,})/i,
+          /(?:Token:\s*)([A-Za-z0-9_\-/.+=]{20,})/i,
+          /CLAUDE_CODE_OAUTH_TOKEN=([A-Za-z0-9_\-/.+=]{20,})/,
+          /(?:Store this token|won't be able to see it)[\s\S]*?\n\s*([A-Za-z0-9_\-/.+=]{50,})/i,
+          /\n([A-Za-z0-9_\-/.+=]{50,})\s*\n/,
+        ];
+        for (const pat of patterns) {
+          const m = text.match(pat);
+          if (m?.[1]) {
+            setupToken = m[1].trim();
+            console.log(`[Claude] Token captured from output (${setupToken.length} chars)`);
+            // Save immediately — don't wait for frontend to ask
+            saveClaudeToken(setupToken);
+            break;
+          }
         }
       }
 
@@ -545,18 +554,7 @@ export async function pasteCodeToClaudeSession(sessionId: string, code: string):
   const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
     const started = Date.now();
     const timer = setInterval(() => {
-      if (session.status === 'complete') {
-        clearInterval(timer);
-        resolve({ success: true });
-        return;
-      }
-      if (session.status === 'error') {
-        clearInterval(timer);
-        resolve({ success: false, error: session.error || 'Claude setup failed' });
-        return;
-      }
-
-      // Check if new auth profile appeared
+      // Check if new auth profile appeared (saved by onExit handler or earlier iteration)
       const currentProfiles = readProviderProfileIds('anthropic');
       const newProfile = currentProfiles.find((id) => !session.profileKeyBefore.includes(id));
       if (newProfile) {
@@ -568,12 +566,38 @@ export async function pasteCodeToClaudeSession(sessionId: string, code: string):
         return;
       }
 
-      // Check output for setup token pattern
+      if (session.status === 'error') {
+        clearInterval(timer);
+        resolve({ success: false, error: session.error || 'Claude setup failed' });
+        return;
+      }
+
+      // If session completed (exit 0) but no profile saved yet, try to extract and save token
+      if (session.status === 'complete') {
+        // Give a brief window for the onExit handler to save — then check
+        const profilesNow = readProviderProfileIds('anthropic');
+        const savedProfile = profilesNow.find((id) => !session.profileKeyBefore.includes(id));
+        if (savedProfile) {
+          clearInterval(timer);
+          resolve({ success: true });
+          return;
+        }
+        // onExit may not have matched the token — fall through to our extraction below
+      }
+
+      // Check output for token patterns — Claude CLI prints tokens in various formats:
+      // - "Setup token (expires ...): <token>"
+      // - "export CLAUDE_CODE_OAUTH_TOKEN=<token>"
+      // - "Store this token securely..." followed by a long token string
       const text = session.cleanOutput;
-      if (/setup[- ]token/i.test(text) && text.match(/[A-Za-z0-9_\-/.+=]{50,}/)) {
-        // Looks like the token was printed — try to save it
-        const tokenMatch = text.match(/(?:setup[- ]token[^:]*:\s*)([A-Za-z0-9_\-/.+=]{20,})/i)
-          || text.match(/\n([A-Za-z0-9_\-/.+=]{50,})\s*$/);
+      const tokenPatterns = [
+        /(?:setup[- ]token[^:]*:\s*)([A-Za-z0-9_\-/.+=]{20,})/i,
+        /CLAUDE_CODE_OAUTH_TOKEN=([A-Za-z0-9_\-/.+=]{20,})/,
+        /(?:Store this token|won't be able to see it)[\s\S]*?\n\s*([A-Za-z0-9_\-/.+=]{50,})/i,
+        /\n([A-Za-z0-9_\-/.+=]{50,})\s*\n/,
+      ];
+      for (const pattern of tokenPatterns) {
+        const tokenMatch = text.match(pattern);
         if (tokenMatch?.[1]) {
           clearInterval(timer);
           const token = tokenMatch[1].trim();
@@ -591,7 +615,18 @@ export async function pasteCodeToClaudeSession(sessionId: string, code: string):
 
       if (Date.now() - started > 60000) {
         clearInterval(timer);
-        resolve({ success: false, error: 'Timed out waiting for Claude to process the code' });
+        // Final check: did the token get saved by onExit while we were waiting?
+        const finalProfiles = readProviderProfileIds('anthropic');
+        const finalProfile = finalProfiles.find((id) => !session.profileKeyBefore.includes(id));
+        if (finalProfile) {
+          session.status = 'complete';
+          session.completedAt = Date.now();
+          resolve({ success: true });
+        } else if (session.status === 'complete') {
+          resolve({ success: false, error: 'Claude completed but the token could not be extracted from the output. Try using an API key instead.' });
+        } else {
+          resolve({ success: false, error: 'Timed out waiting for Claude to process the code.' });
+        }
       }
     }, 500);
   });
@@ -631,16 +666,11 @@ export async function getClaudeSetupToken(sessionId: string): Promise<{ success:
 }
 
 export async function saveClaudeToken(token: string) {
-  // Use openclaw models auth paste-token to save it
-  const { execSync } = require('child_process');
   try {
-    execSync(`${OPENCLAW_BIN} models auth paste-token --provider anthropic --expires-in 365d`, {
-      input: token,
-      encoding: 'utf-8',
-      timeout: 15000,
-      env: process.env,
-    });
-    console.log('[Claude] Token saved via paste-token');
+    // Write directly to auth-profiles.json, openclaw.json, and models.json.
+    // The 'openclaw models auth paste-token' CLI is unreliable on fresh installs.
+    saveProviderApiKey('anthropic', token);
+    console.log(`[Claude] Token saved directly to auth files (${token.length} chars)`);
     return { success: true };
   } catch (err: any) {
     console.error('[Claude] Failed to save token:', err.message);
