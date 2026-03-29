@@ -57,8 +57,8 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     description: 'Most capable AI for complex reasoning, coding, and analysis. Industry-leading safety.',
     validationEndpoint: 'https://api.anthropic.com/v1/models',
     validationMethod: 'x-api-key',
-    onboardAuthChoice: 'token',
-    onboardKeyFlag: 'token',
+    onboardAuthChoice: 'anthropic-api-key',
+    onboardKeyFlag: 'anthropic-api-key',
     defaultModels: [
       { id: 'claude-opus-4-6', name: 'Claude Opus 4.6', tier: 'frontier', description: 'Most capable. Best for complex reasoning and difficult tasks.' },
       { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', tier: 'balanced', description: 'Balanced. Great all-rounder for most tasks.' },

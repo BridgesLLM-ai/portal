@@ -216,10 +216,6 @@ function buildSaveCommand(provider: string, apiKey: string): string[] {
 
   const commonArgs = ['onboard', '--non-interactive', '--accept-risk', '--skip-channels', '--skip-skills', '--skip-health', '--skip-daemon', '--skip-search', '--skip-ui'];
 
-  if (provider === 'anthropic') {
-    return [...commonArgs, '--auth-choice', 'token', '--token-provider', 'anthropic', '--token', apiKey];
-  }
-
   if (provider === 'groq') {
     return [...commonArgs, '--auth-choice', 'token', '--token-provider', 'groq', '--token', apiKey];
   }
