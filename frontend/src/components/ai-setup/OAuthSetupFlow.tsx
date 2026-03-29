@@ -22,10 +22,24 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
   const [popupBlocked, setPopupBlocked] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fatalError, setFatalError] = useState<string | null>(null);
-  const [selectedModel, setSelectedModel] = useState<string | null>(
-    provider.defaultModels.find((m) => m.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null,
-  );
+  const [existingDefault, setExistingDefault] = useState<string | null>(null);
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [googleProjectId, setGoogleProjectId] = useState('');
+
+  // Check if a default model is already configured; only auto-select if not
+  React.useEffect(() => {
+    client.get(`${apiBase}/status`).then(({ data }) => {
+      const current = data?.defaultModel || null;
+      setExistingDefault(current);
+      if (!current) {
+        // No default set yet — auto-select balanced tier for convenience
+        setSelectedModel(
+          provider.defaultModels.find((m) => m.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null,
+        );
+      }
+      // Otherwise leave selectedModel as null so the user has to explicitly choose
+    }).catch(() => {});
+  }, [apiBase, provider]);
 
   const isOpenAI = provider.id === 'openai-codex';
   const isGoogle = provider.id === 'google-gemini-cli';

@@ -22,9 +22,19 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
   const [error, setError] = useState<string | null>(null);
   const [pasteCode, setPasteCode] = useState('');
   const [manualToken, setManualToken] = useState('');
-  const [selectedModel, setSelectedModel] = useState<string | null>(
-    provider.defaultModels.find((m) => m.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null,
-  );
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+
+  // Only auto-select a default model if no default is already configured
+  React.useEffect(() => {
+    client.get(`${apiBase}/status`).then(({ data }: { data: any }) => {
+      const current = data?.defaultModel || null;
+      if (!current) {
+        setSelectedModel(
+          provider.defaultModels.find((m) => m.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null,
+        );
+      }
+    }).catch(() => {});
+  }, [apiBase, provider]);
 
   // Poll for auto-completion
   const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null);

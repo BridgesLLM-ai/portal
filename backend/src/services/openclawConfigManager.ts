@@ -67,6 +67,64 @@ export function getFallbackModels(): string[] {
   return Array.isArray(fallbacks) ? fallbacks.filter((item: unknown): item is string => typeof item === 'string') : [];
 }
 
+const MODELS_JSON_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'models.json');
+
+/**
+ * Provider API endpoint configurations used by OpenClaw gateway.
+ * When a user saves an API key, we write provider config to models.json
+ * so the gateway can actually reach the provider's API.
+ */
+const PROVIDER_API_CONFIG: Record<string, { baseUrl: string; api: string }> = {
+  'anthropic': { baseUrl: 'https://api.anthropic.com', api: 'anthropic-messages' },
+  'openrouter': { baseUrl: 'https://openrouter.ai/api/v1', api: 'openai-compatible' },
+  'deepseek': { baseUrl: 'https://api.deepseek.com', api: 'openai-compatible' },
+  'mistral': { baseUrl: 'https://api.mistral.ai/v1', api: 'openai-compatible' },
+  'groq': { baseUrl: 'https://api.groq.com/openai/v1', api: 'openai-compatible' },
+  'together': { baseUrl: 'https://api.together.xyz/v1', api: 'openai-compatible' },
+  'xai': { baseUrl: 'https://api.x.ai/v1', api: 'openai-compatible' },
+};
+
+/**
+ * Save an API key directly to both auth-profiles.json and models.json.
+ * This bypasses the 'openclaw onboard' CLI which doesn't reliably persist
+ * API keys for non-OAuth providers.
+ */
+export function saveProviderApiKey(provider: string, apiKey: string): { profileId: string } {
+  // 1. Write to auth-profiles.json
+  const authData = readAuthProfiles();
+  const profileId = `${provider}:manual`;
+  authData.profiles[profileId] = {
+    type: 'token',
+    provider,
+    token: apiKey,
+  };
+  fs.writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(authData, null, 2), 'utf8');
+
+  // 2. Write to openclaw.json auth.profiles
+  const config = readOpenClawConfig();
+  if (!config.auth) config.auth = {};
+  if (!config.auth.profiles) config.auth.profiles = {};
+  config.auth.profiles[profileId] = { provider, mode: 'token' };
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+
+  // 3. Write to models.json (provider API config) if we know this provider
+  const apiConfig = PROVIDER_API_CONFIG[provider];
+  if (apiConfig) {
+    const modelsData = safeReadJson<any>(MODELS_JSON_PATH, { providers: {} });
+    if (!modelsData.providers) modelsData.providers = {};
+    if (!modelsData.providers[provider]) {
+      modelsData.providers[provider] = { ...apiConfig, apiKey, models: [] };
+    } else {
+      modelsData.providers[provider].apiKey = apiKey;
+      modelsData.providers[provider].baseUrl = apiConfig.baseUrl;
+      modelsData.providers[provider].api = apiConfig.api;
+    }
+    fs.writeFileSync(MODELS_JSON_PATH, JSON.stringify(modelsData, null, 2), 'utf8');
+  }
+
+  return { profileId };
+}
+
 export function getProviderStatuses(): ProviderStatus[] {
   const config = readOpenClawConfig();
   const authProfiles = readAuthProfiles();

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, CheckCircle2, ExternalLink, Loader2, ShieldCheck, X } from 'lucide-react';
 import client from '../../api/client';
 import ModelSelector, { SelectableModel } from './ModelSelector';
@@ -26,10 +26,21 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
   const [showKey, setShowKey] = useState(false);
   const [validating, setValidating] = useState(false);
   const [validation, setValidation] = useState<ValidationResponse | null>(null);
-  const [selectedModel, setSelectedModel] = useState<string | null>(provider.defaultModels.find((model) => model.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null);
-  const [setDefault, setSetDefault] = useState(true);
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [setDefault, setSetDefault] = useState(false);
   const [savingMessage, setSavingMessage] = useState('Saving API key...');
   const [saveError, setSaveError] = useState<string | null>(null);
+
+  // Only auto-select a default model if no default is already configured
+  useEffect(() => {
+    client.get(`${apiBase}/status`).then(({ data }) => {
+      const current = data?.defaultModel || null;
+      if (!current) {
+        setSelectedModel(provider.defaultModels.find((m) => m.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null);
+        setSetDefault(true);
+      }
+    }).catch(() => {});
+  }, [apiBase, provider]);
 
   const selectableModels = useMemo<SelectableModel[]>(() => {
     if (validation?.models?.length) {

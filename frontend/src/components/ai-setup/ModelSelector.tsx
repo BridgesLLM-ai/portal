@@ -46,7 +46,7 @@ export default function ModelSelector({
             <button
               type="button"
               key={model.id}
-              onClick={() => onSelect(model.id)}
+              onClick={() => onSelect(active ? '' : model.id)}
               className={`w-full rounded-2xl border p-4 text-left transition ${
                 active
                   ? 'border-emerald-500/60 bg-emerald-500/10 shadow-[0_0_0_1px_rgba(16,185,129,0.25)]'

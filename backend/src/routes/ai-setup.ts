@@ -14,6 +14,7 @@ import {
   getProviderStatuses,
   readAuthProfiles,
   readOpenClawConfig,
+  saveProviderApiKey,
 } from '../services/openclawConfigManager';
 import { listGatewayModels } from '../utils/openclawGatewayRpc';
 
@@ -362,26 +363,26 @@ export function createAiSetupRouter(): Router {
     }
 
     try {
-      const beforeAuthProfiles = readAuthProfiles();
-      const beforeProfileIds = new Set(Object.keys(beforeAuthProfiles.profiles || {}).filter((profileId) => beforeAuthProfiles.profiles?.[profileId]?.provider === provider));
-
-      // shell-escape helper kept per roadmap; execFileSync is used for actual execution.
-      shellEscapeSingleQuotes(apiKey);
-      runOpenClaw(buildSaveCommand(provider, apiKey), 30000);
+      // Write API key directly to auth-profiles.json, openclaw.json, and models.json.
+      // The 'openclaw onboard' CLI doesn't reliably persist API keys for non-OAuth providers,
+      // so we bypass it entirely and write to the same files OpenClaw reads at runtime.
+      const { profileId: savedProfileId } = saveProviderApiKey(provider, apiKey);
 
       if (setDefault && model) {
-        runOpenClaw(['models', 'set', model], 10000);
+        try { runOpenClaw(['models', 'set', model], 10000); } catch {
+          // Fall back to direct config write if CLI fails
+          const config = readOpenClawConfig();
+          if (!config.agents) config.agents = {};
+          if (!config.agents.defaults) config.agents.defaults = {};
+          if (!config.agents.defaults.model) config.agents.defaults.model = {};
+          config.agents.defaults.model.primary = model;
+          const fs = require('fs');
+          fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+        }
       }
 
       await restartGateway();
       registerProviderModels(provider);
-
-      const authProfiles = readAuthProfiles();
-      const providerProfileIds = Object.keys(authProfiles.profiles || {}).filter((profileId) => authProfiles.profiles[profileId]?.provider === provider);
-      const savedProfileId = providerProfileIds.find((profileId) => !beforeProfileIds.has(profileId))
-        || providerProfileIds.find((profileId) => profileId.endsWith(':manual'))
-        || providerProfileIds[0];
-      if (!savedProfileId) throw new Error('Provider profile was not found after saving credentials');
 
       res.json({ success: true, profileId: savedProfileId, model: model || null });
     } catch (error: any) {
