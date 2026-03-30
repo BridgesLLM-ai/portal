@@ -16,9 +16,6 @@ const RD_DEFAULT_URL = '/novnc/vnc_portal.html?reconnect=1&resize=smart&path=nov
 const PORTAL_VISIBLE_AGENT_ID = 'main';
 const PORTAL_VISIBLE_AGENT_NAME = 'Assistant';
 const PORTAL_VISIBLE_AGENT_EMOJI = '🖥️';
-const PORTAL_AUX_VISIBLE_AGENT_ID = 'desktop';
-const PORTAL_AUX_VISIBLE_AGENT_NAME = 'Desktop';
-const PORTAL_AUX_VISIBLE_AGENT_EMOJI = '🖥️';
 const OPENCLAW_WORKSPACE = process.env.OPENCLAW_WORKSPACE || '/root/.openclaw/workspace-main';
 const OPENCLAW_CONFIG_PATH = process.env.OPENCLAW_CONFIG_PATH || path.join(process.env.HOME || '/root', '.openclaw/openclaw.json');
 const PORTAL_STATIC_NOVNC_DIR = path.resolve(process.cwd(), '../static/novnc');
@@ -178,13 +175,6 @@ function ensurePortalVisibleBrowserAgentConfig(): { changed: boolean; created: b
         identity: { emoji: PORTAL_VISIBLE_AGENT_EMOJI },
         tools: desiredTools,
       },
-      {
-        id: PORTAL_AUX_VISIBLE_AGENT_ID,
-        name: PORTAL_AUX_VISIBLE_AGENT_NAME,
-        workspace: OPENCLAW_WORKSPACE,
-        identity: { emoji: PORTAL_AUX_VISIBLE_AGENT_EMOJI },
-        tools: desiredTools,
-      },
     ];
 
     let created = false;
@@ -235,7 +225,7 @@ function ensurePortalVisibleBrowserAgentConfig(): { changed: boolean; created: b
     }
 
     if (!changed) {
-      return { changed: false, created: false, note: `${PORTAL_VISIBLE_AGENT_ID} and ${PORTAL_AUX_VISIBLE_AGENT_ID} agents already configured` };
+      return { changed: false, created: false, note: `${PORTAL_VISIBLE_AGENT_ID} agent already configured` };
     }
 
     fs.writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2) + '\n', 'utf8');
@@ -257,7 +247,7 @@ async function ensurePortalVisibleBrowserDefaults(): Promise<{ changed: boolean;
   if (agentResult.note) notes.push(agentResult.note);
   let dbChanged = false;
   try {
-    const keys = ['agent.defaultOpenClawAgentId', 'agent.visibleBrowserOpenClawAgentId', `appearance.subAgentAvatar.${PORTAL_AUX_VISIBLE_AGENT_ID}`];
+    const keys = ['agent.defaultOpenClawAgentId', 'agent.visibleBrowserOpenClawAgentId'];
     const existing = await prisma.systemSetting.findMany({ where: { key: { in: keys } } });
     const map = new Map(existing.map((row) => [row.key, row.value] as const));
 
@@ -274,14 +264,6 @@ async function ensurePortalVisibleBrowserDefaults(): Promise<{ changed: boolean;
         where: { key: 'agent.visibleBrowserOpenClawAgentId' },
         update: { value: 'main' },
         create: { key: 'agent.visibleBrowserOpenClawAgentId', value: 'main' },
-      });
-      dbChanged = true;
-    }
-    if (!map.has(`appearance.subAgentAvatar.${PORTAL_AUX_VISIBLE_AGENT_ID}`)) {
-      await prisma.systemSetting.upsert({
-        where: { key: `appearance.subAgentAvatar.${PORTAL_AUX_VISIBLE_AGENT_ID}` },
-        update: { value: '' },
-        create: { key: `appearance.subAgentAvatar.${PORTAL_AUX_VISIBLE_AGENT_ID}`, value: '' },
       });
       dbChanged = true;
     }
