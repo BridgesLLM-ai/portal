@@ -998,13 +998,40 @@ export async function completeNativeCliFlow(sessionId: string, callbackValue: st
 
   if (session.provider === 'claude-code') {
     // Claude Code: relay the auth code to Claude's local OAuth callback server
+    if (!session.oauthState && session.authUrl) {
+      try {
+        const parsed = new URL(session.authUrl);
+        session.oauthState = parsed.searchParams.get('state');
+      } catch { /* ignore */ }
+    }
+
     if (!session.localPort) {
       try {
-        const ssOutput = execSync("ss -tlnp 2>/dev/null | grep claude || true").toString().trim();
-        const portMatch = ssOutput.match(/:(\d+)\s/);
-        if (portMatch) {
-          session.localPort = parseInt(portMatch[1], 10);
-          console.log(`[NativeCLI] Fallback-discovered Claude local callback port: ${session.localPort}`);
+        const rootPid = (session.process as any).pid;
+        const pids = new Set<number>();
+        const queue: number[] = [];
+        if (typeof rootPid === 'number' && rootPid > 0) queue.push(rootPid);
+
+        while (queue.length) {
+          const pid = queue.shift()!;
+          if (pids.has(pid)) continue;
+          pids.add(pid);
+          try {
+            const children = execSync(`pgrep -P ${pid} || true`).toString().trim().split(/\s+/).filter(Boolean).map((v) => parseInt(v, 10)).filter((n) => Number.isFinite(n));
+            for (const child of children) queue.push(child);
+          } catch { /* ignore */ }
+        }
+
+        for (const pid of pids) {
+          try {
+            const ssOutput = execSync(`ss -tlnp 2>/dev/null | grep "pid=${pid}," || true`).toString().trim();
+            const portMatch = ssOutput.match(/:(\d+)\s/);
+            if (portMatch) {
+              session.localPort = parseInt(portMatch[1], 10);
+              console.log(`[NativeCLI] Fallback-discovered Claude callback port ${session.localPort} via pid ${pid}`);
+              break;
+            }
+          } catch { /* ignore */ }
         }
       } catch { /* ignore */ }
     }
