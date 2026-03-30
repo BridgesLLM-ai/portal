@@ -2,6 +2,19 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.20.1] — 2026-03-29
+
+### 🐛 Bug Fixes
+
+#### Native CLI Agent Login
+- **Fix Claude Code native login on headless servers** — Replaced the broken localhost callback relay approach with Claude's correct manual PKCE OAuth flow. The portal now generates the auth URL, accepts Anthropic's pasted authorization code, exchanges it directly for tokens, and writes the Claude credentials file itself.
+- **Fix Codex read-only sessions** — Codex agent chats now launch with `--full-auto`, giving the session `workspace-write` sandboxing with `on-request` approvals instead of the unusable default read-only sandbox.
+- **Fix Gemini native auth detection** — Gemini availability now recognizes the real OAuth credentials path (`~/.gemini/oauth_creds.json`), so successful logins become selectable in agent chat.
+
+#### Agent Chat / Project Chat
+- **Refresh provider availability when opening the agent selector** — Newly authenticated native CLI providers no longer require a hard refresh before they appear as usable.
+- **Align project sandbox chat defaults with gateway config** — Project assistant chats now report and inherit the configured gateway default model instead of stale hardcoded Anthropic fallbacks.
+
 ## [3.20.0] — 2026-03-29
 
 ### 🔐 Security
