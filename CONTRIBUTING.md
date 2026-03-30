@@ -85,7 +85,7 @@ Check the [Roadmap](README.md#-roadmap) for areas where help is welcome. Issues 
 
 ## Questions?
 
-Open a [discussion](https://github.com/BridgesLLM-ai/portal/discussions) or email support@bridgesllm.com.
+Open an [issue](https://github.com/BridgesLLM-ai/portal/issues) or email support@bridgesllm.com.
 
 ## License
 

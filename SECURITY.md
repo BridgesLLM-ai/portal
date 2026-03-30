@@ -21,12 +21,12 @@ If you discover a security vulnerability, please report it responsibly:
 
 ## Architecture Overview
 
-BridgesLLM Portal runs as a Node.js backend behind Nginx on a single server. The portal manages user authentication, routes requests to OpenClaw (the AI agent framework), and provides the browser-based UI. All communication happens over HTTPS.
+BridgesLLM Portal runs as a Node.js backend behind Caddy (automatic HTTPS reverse proxy) on a single server. The portal manages user authentication, routes requests to OpenClaw (the AI agent framework), and provides the browser-based UI. All communication happens over HTTPS.
 
 ```
-Browser ──HTTPS──▶ Nginx ──▶ Portal Backend ──▶ OpenClaw Gateway
+Browser ──HTTPS──▶ Caddy ──▶ Portal Backend ──▶ OpenClaw Gateway
                                     │
-                                    ├──▶ Database (SQLite via Prisma)
+                                    ├──▶ Database (PostgreSQL via Prisma)
                                     ├──▶ File System (sandboxed paths)
                                     └──▶ Docker (project sandboxes)
 ```
@@ -35,9 +35,10 @@ Browser ──HTTPS──▶ Nginx ──▶ Portal Backend ──▶ OpenClaw G
 
 ### Network & Transport
 
-- **HTTPS only** — automatic TLS certificates via Let's Encrypt, managed by Caddy (installer) or Nginx (runtime). HSTS enabled with `max-age=15552000; includeSubDomains`.
+- **HTTPS only** — automatic TLS certificates via Let's Encrypt, managed by Caddy. HSTS enabled with `max-age=15552000; includeSubDomains`.
 - **Firewall** — UFW configured during installation. Only ports 22 (SSH), 80 (HTTP redirect), and 443 (HTTPS) are exposed externally. Internal Docker bridge ports are restricted to container subnets.
-- **Security headers** — Content-Security-Policy, X-Content-Type-Options (`nosniff`), X-Frame-Options (`SAMEORIGIN`), Referrer-Policy (`strict-origin-when-cross-origin`) set via Nginx.
+- **Security headers** — Content-Security-Policy, X-Content-Type-Options (`nosniff`), X-Frame-Options (`SAMEORIGIN`), Referrer-Policy (`strict-origin-when-cross-origin`) set via Caddy and Express middleware.
+- **Shell-escape enforcement** — all user-influenced parameters (commit messages, branch names, file paths, URLs) are properly escaped before reaching any shell command. Input validated against strict allowlist regexes.
 
 ### Authentication & Authorization
 
@@ -75,7 +76,7 @@ Browser ──HTTPS──▶ Nginx ──▶ Portal Backend ──▶ OpenClaw G
 
 - **Parameterized queries** — all database access goes through Prisma ORM, which uses parameterized queries. No raw SQL string concatenation.
 - **Schema validation** — API inputs are validated using Zod schemas before processing.
-- **SQLite database** — stored locally on the server. No external database connections.
+- **PostgreSQL database** — stored locally on the server. No external database connections.
 
 ### Malware Scanning
 
