@@ -342,10 +342,10 @@ router.get('/models/available', authenticateToken, async (_req: Request, res: Re
     } else {
       res.json({ 
         models: [
-          { id: 'anthropic/claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', provider: 'anthropic' },
+          { id: 'openai-codex/gpt-5.4', name: 'Codex (5.4)', provider: 'openai-codex' },
           { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6', provider: 'anthropic' },
-          { id: 'anthropic/claude-sonnet-4-5', name: 'Claude Sonnet 4.5 (legacy)', provider: 'anthropic' },
-          { id: 'anthropic/claude-opus-4-5-20251101', name: 'Claude Opus 4.5', provider: 'anthropic' },
+          { id: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', provider: 'anthropic' },
+          { id: 'google/gemini-2.5-flash', name: 'Gemini 2.5 Flash', provider: 'google' },
         ],
         fallback: true,
       });
@@ -3281,13 +3281,17 @@ router.get('/:name/assistant/active-model', authenticateToken, async (req: Reque
       result = await getSessionInfo(sessionKey);
     }
     
+    const configuredDefault = getDefaultModel() || 'openai-codex/gpt-5.4';
+    const [defaultProvider, ...defaultModelParts] = configuredDefault.split('/');
+    const defaultModel = defaultModelParts.join('/') || 'gpt-5.4';
+
     if (result.ok && result.data) {
       const session = result.data;
       // sessions.list returns the resolved model (already merged with override)
-      const provider = session.modelProvider || 'anthropic';
-      const model = session.model || 'claude-sonnet-4-5';
+      const provider = session.modelProvider || defaultProvider || 'openai-codex';
+      const model = session.model || defaultModel;
       const activeModel = `${provider}/${model}`;
-      const isDefault = model === 'claude-sonnet-4-5'; // default model for portal agent
+      const isDefault = activeModel === configuredDefault;
       
       res.json({ 
         activeModel,
@@ -3297,14 +3301,14 @@ router.get('/:name/assistant/active-model', authenticateToken, async (req: Reque
         sessionKey,
       });
     } else {
-      // Session might not exist yet - return default
+      // Session might not exist yet - return configured gateway default
       res.json({ 
-        activeModel: 'anthropic/claude-sonnet-4-5',
-        modelProvider: 'anthropic',
-        model: 'claude-sonnet-4-5',
+        activeModel: configuredDefault,
+        modelProvider: defaultProvider || 'openai-codex',
+        model: defaultModel,
         isOverridden: false,
         sessionKey,
-        note: 'Session not yet created - showing default model',
+        note: 'Session not yet created - showing configured default model',
       });
     }
   } catch (error: any) {
