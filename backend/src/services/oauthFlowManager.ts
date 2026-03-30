@@ -101,10 +101,9 @@ function updateSessionFromOutput(session: OAuthSession) {
   }
 
   const deviceCodePatterns = [
-    /Code:\s*([A-Z0-9-]{4,})/i,
-    /device code[:\s]+([A-Z0-9-]{4,})/i,
-    /enter (?:the )?code[:\s]+([A-Z0-9-]{4,})/i,
     /one-time code[^]*?\n\s+([A-Z0-9-]{6,})/i,  // Codex: "Enter this one-time code\n   OW1I-ARN5H"
+    /Code:\s*([A-Z0-9-]{6,})/i,
+    /enter (?:the )?code[:\s]+([A-Z0-9-]{6,})/i,
   ];
   for (const pattern of deviceCodePatterns) {
     const match = text.match(pattern);
