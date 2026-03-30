@@ -16,6 +16,7 @@ const HOME_DIR = process.env.HOME || '/root';
 const CLAUDE_CREDENTIALS_PATH = path.join(HOME_DIR, '.claude', '.credentials.json');
 const CODEX_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
 const GEMINI_CONFIG_DIR = path.join(HOME_DIR, '.config', 'gemini');
+const GEMINI_OAUTH_CREDS_PATH = path.join(HOME_DIR, '.gemini', 'oauth_creds.json');
 
 const NATIVE_TO_OPENCLAW_PROVIDER_IDS: Record<AgentProviderName, string[]> = {
   OPENCLAW: [],
@@ -48,6 +49,16 @@ function directoryHasEntries(targetPath: string): boolean {
   } catch {
     return false;
   }
+}
+
+function fileHasJsonKey(targetPath: string, keys: string[]): boolean {
+  const parsed = safeReadJson(targetPath);
+  if (!parsed) return false;
+  for (const key of keys) {
+    const value = key.split('.').reduce<any>((acc, part) => (acc && typeof acc === 'object' ? acc[part] : undefined), parsed);
+    if (typeof value === 'string' && value.trim()) return true;
+  }
+  return false;
 }
 
 function hasEnvValue(name: string): boolean {
@@ -126,7 +137,7 @@ function detectGeminiAuth(): NativeCliAuthStatus {
     };
   }
 
-  if (directoryHasEntries(GEMINI_CONFIG_DIR)) {
+  if (fileHasJsonKey(GEMINI_OAUTH_CREDS_PATH, ['access_token', 'refresh_token']) || directoryHasEntries(GEMINI_CONFIG_DIR)) {
     return {
       provider: 'GEMINI',
       status: 'authenticated',

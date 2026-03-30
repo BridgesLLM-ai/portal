@@ -998,6 +998,16 @@ export async function completeNativeCliFlow(sessionId: string, callbackValue: st
 
   if (session.provider === 'claude-code') {
     // Claude Code: relay the auth code to Claude's local OAuth callback server
+    if (!session.localPort) {
+      try {
+        const ssOutput = execSync("ss -tlnp 2>/dev/null | grep claude || true").toString().trim();
+        const portMatch = ssOutput.match(/:(\d+)\s/);
+        if (portMatch) {
+          session.localPort = parseInt(portMatch[1], 10);
+          console.log(`[NativeCLI] Fallback-discovered Claude local callback port: ${session.localPort}`);
+        }
+      } catch { /* ignore */ }
+    }
     if (!session.localPort || !session.oauthState) {
       return { success: false, error: 'Claude CLI local callback server not available. Try restarting the flow.' };
     }
