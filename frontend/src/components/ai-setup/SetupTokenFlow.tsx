@@ -9,11 +9,12 @@ interface SetupTokenFlowProps {
   apiBase: string;
   onComplete: () => void;
   onCancel: () => void;
+  onNativeCliLogin?: () => void;
 }
 
 type Step = 'prereqs' | 'starting' | 'waiting' | 'paste-code' | 'completing' | 'model' | 'manual-paste' | 'done' | 'error';
 
-export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel }: SetupTokenFlowProps) {
+export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel, onNativeCliLogin }: SetupTokenFlowProps) {
   const [step, setStep] = useState<Step>('prereqs');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [authUrl, setAuthUrl] = useState<string | null>(null);
@@ -208,9 +209,18 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
               </div>
 
               <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
-                <div className="font-medium text-amber-50">Native Claude Code login is separate</div>
-                <div className="mt-1 text-amber-100/90">This setup-token links OpenClaw only. If you want the portal's native Claude Code adapter, the `claude` CLI on the server still needs its own login. The setup-token is not copied into Claude Code automatically.</div>
-                <div className="mt-2 text-xs text-amber-100/80">Server command: <code className="rounded bg-slate-950 px-1.5 py-0.5 text-amber-100">claude</code> then run <code className="rounded bg-slate-950 px-1.5 py-0.5 text-amber-100">/login</code></div>
+                <div className="font-medium text-amber-50">This sets up OpenClaw's Claude access</div>
+                <div className="mt-1 text-amber-100/90">If you also want to use the native Claude Code adapter in Agent Chat, you'll need to log in the Claude CLI separately.</div>
+                {onNativeCliLogin ? (
+                  <button
+                    type="button"
+                    onClick={onNativeCliLogin}
+                    className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 transition hover:bg-emerald-500/15"
+                  >
+                    <Terminal className="h-3.5 w-3.5" />
+                    Login to Claude Code CLI
+                  </button>
+                ) : null}
               </div>
 
               {error ? (

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { AlertTriangle, CheckCircle2, ChevronRight, ClipboardPaste, ExternalLink, Loader2, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronRight, ClipboardPaste, ExternalLink, Loader2, Terminal, X } from 'lucide-react';
 import client from '../../api/client';
 import ModelSelector from './ModelSelector';
 import type { ProviderUIConfig } from './providerConfig';
@@ -9,6 +9,7 @@ interface OAuthSetupFlowProps {
   apiBase: string;
   onComplete: () => void;
   onCancel: () => void;
+  onNativeCliLogin?: () => void;
 }
 
 type Step = 'prereqs' | 'start' | 'waiting' | 'paste' | 'model' | 'done' | 'error';
@@ -32,7 +33,7 @@ function nativeCliBridgeNote(providerId: string): { title: string; body: string;
   }
 }
 
-export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel }: OAuthSetupFlowProps) {
+export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel, onNativeCliLogin }: OAuthSetupFlowProps) {
   const [step, setStep] = useState<Step>('prereqs');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [authUrl, setAuthUrl] = useState<string | null>(null);
@@ -284,10 +285,17 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
 
               {nativeCliNote ? (
                 <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
-                  <div className="font-medium text-amber-50">{nativeCliNote.title}</div>
-                  <div className="mt-1 text-amber-100/90">{nativeCliNote.body}</div>
-                  {nativeCliNote.command ? (
-                    <div className="mt-2 text-xs text-amber-100/80">Server command: <code className="rounded bg-slate-950 px-1.5 py-0.5 text-amber-100">{nativeCliNote.command}</code></div>
+                  <div className="font-medium text-amber-50">This sets up OpenClaw's {provider.id === 'openai-codex' ? 'Codex' : 'Gemini'} access</div>
+                  <div className="mt-1 text-amber-100/90">If you also want to use the native {provider.id === 'openai-codex' ? 'Codex' : 'Gemini'} adapter in Agent Chat, you'll need to log in the CLI separately.</div>
+                  {onNativeCliLogin ? (
+                    <button
+                      type="button"
+                      onClick={onNativeCliLogin}
+                      className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 transition hover:bg-emerald-500/15"
+                    >
+                      <Terminal className="h-3.5 w-3.5" />
+                      Login to {provider.id === 'openai-codex' ? 'Codex' : 'Gemini'} CLI
+                    </button>
                   ) : null}
                 </div>
               ) : null}
