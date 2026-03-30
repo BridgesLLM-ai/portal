@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as http from 'http';
+import { createHash, randomBytes } from 'crypto';
 import { execSync } from 'child_process';
 import { readAuthProfiles, saveProviderApiKey } from './openclawConfigManager';
 
@@ -36,6 +37,22 @@ const ANSI_REGEX = /\x1B\[[0-9;?]*[ -\/]*[@-~]|\x1B[@-_]/g;
 
 function createSessionId() {
   return `oauth_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function base64Url(input: Buffer): string {
+  return input.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function buildPkceChallenge(verifier: string): string {
+  return base64Url(createHash('sha256').update(verifier).digest());
+}
+
+function safeReadJson(filePath: string): any | null {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+  } catch {
+    return null;
+  }
 }
 
 function stripAnsi(value: string) {
@@ -754,29 +771,41 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
 
   switch (provider) {
     case 'claude-code': {
-      const claudeBin = findCliBin('claude');
-      console.log(`[NativeCLI] Starting Claude Code login, binary=${claudeBin}`);
-      
-      const proc = pty.spawn(claudeBin, ['auth', 'login'], {
-        name: 'xterm-256color',
-        cols: 500,
-        rows: 40,
-        cwd: process.cwd(),
-        env: { ...process.env, BROWSER: '/bin/false' } as Record<string, string>,
-      });
+      // Claude headless login uses a manual PKCE flow. Do it directly instead of
+      // trying to puppet the CLI's internal auth UI.
+      const codeVerifier = base64Url(randomBytes(32));
+      const codeChallenge = buildPkceChallenge(codeVerifier);
+      const state = base64Url(randomBytes(32));
+      const scopes = [
+        'org:create_api_key',
+        'user:profile',
+        'user:inference',
+        'user:sessions:claude_code',
+        'user:mcp_servers',
+        'user:file_upload',
+      ];
+      const authUrl = new URL('https://claude.com/cai/oauth/authorize');
+      authUrl.searchParams.append('code', 'true');
+      authUrl.searchParams.append('client_id', '9d1c250a-e61b-44d9-88ed-5944d1962f5e');
+      authUrl.searchParams.append('response_type', 'code');
+      authUrl.searchParams.append('redirect_uri', 'https://platform.claude.com/oauth/code/callback');
+      authUrl.searchParams.append('scope', scopes.join(' '));
+      authUrl.searchParams.append('code_challenge', codeChallenge);
+      authUrl.searchParams.append('code_challenge_method', 'S256');
+      authUrl.searchParams.append('state', state);
 
       session = {
         id,
         provider: 'claude-code',
         mode: 'oauth',
-        process: proc,
-        authUrl: null,
+        process: null as any,
+        authUrl: authUrl.toString(),
         callbackHintUrl: null,
         deviceCode: null,
         verificationUrl: null,
         localPort: null,
-        oauthState: null,
-        status: 'starting',
+        oauthState: state,
+        status: 'awaiting_callback',
         error: null,
         output: '',
         cleanOutput: '',
@@ -784,57 +813,11 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
         completedAt: null,
         profileKeyBefore: [],
         sentInitialConfirm: false,
+        extraEnv: { codeVerifier },
       };
 
       sessions.set(id, session);
-
-      proc.onData((chunk: string) => {
-        session.output += chunk;
-        session.cleanOutput += stripAnsi(chunk);
-
-        const text = session.cleanOutput;
-        // Claude outputs auth URL — match claude.ai or claude.com
-        const unwrapped = text.replace(/([A-Za-z0-9%&=_\-.+/])[\r\n]+([A-Za-z0-9%&=_\-.+/])/g, '$1$2');
-        const urls = unwrapped.match(/https:\/\/claude\.(ai|com)\/[^\s)">]*oauth\/authorize[^\s)">]*/g);
-        const firstUrl = urls?.[0] ?? null;
-        if (firstUrl && !session.authUrl) {
-          session.authUrl = firstUrl;
-          session.status = 'awaiting_callback';
-          console.log(`[NativeCLI] Claude auth URL captured: ${firstUrl.slice(0, 100)}...`);
-        }
-      });
-
-      proc.onExit(({ exitCode }) => {
-        console.log(`[NativeCLI] Claude PTY exited: code=${exitCode} status=${session.status}`);
-        if (checkCredentialFile(CLAUDE_CREDENTIALS_PATH, ['claudeAiOauth.accessToken'])) {
-          session.status = 'complete';
-          session.completedAt = Date.now();
-          console.log('[NativeCLI] Claude credentials verified');
-        } else if (session.status !== 'complete' && !session.error) {
-          session.status = 'error';
-          session.error = `Claude CLI exited with code ${exitCode}`;
-        }
-      });
-
-      await waitForInitialOutput(session, 30000);
-
-      // Discover Claude's local OAuth callback port
-      if (!session.localPort) {
-        try {
-          
-          const pid = (session.process as any).pid;
-          if (pid) {
-            const ssOutput = execSync(`ss -tlnp 2>/dev/null | grep "pid=${pid}," || true`).toString().trim();
-            const portMatch = ssOutput.match(/:(\d+)\s/);
-            if (portMatch) {
-              session.localPort = parseInt(portMatch[1], 10);
-              console.log(`[NativeCLI] Discovered Claude local callback port: ${session.localPort}`);
-            }
-          }
-        } catch (err: any) {
-          console.log(`[NativeCLI] Failed to discover Claude port: ${err.message}`);
-        }
-      }
+      console.log(`[NativeCLI] Claude manual auth URL prepared: ${authUrl.toString().slice(0, 100)}...`);
       break;
     }
 
@@ -997,86 +980,56 @@ export async function completeNativeCliFlow(sessionId: string, callbackValue: st
   session.error = null;
 
   if (session.provider === 'claude-code') {
-    // Claude Code: relay the auth code to Claude's local OAuth callback server
-    if (!session.oauthState && session.authUrl) {
-      try {
-        const parsed = new URL(session.authUrl);
-        session.oauthState = parsed.searchParams.get('state');
-      } catch { /* ignore */ }
+    // Claude headless flow returns a manual auth code in the form code#fragment.
+    // The actual token exchange only uses the code plus the PKCE verifier + state we stored.
+    if (!session.oauthState || !session.extraEnv?.codeVerifier) {
+      return { success: false, error: 'Claude login session is missing OAuth state. Try restarting the flow.' };
     }
 
-    if (!session.localPort) {
-      try {
-        const rootPid = (session.process as any).pid;
-        const pids = new Set<number>();
-        const queue: number[] = [];
-        if (typeof rootPid === 'number' && rootPid > 0) queue.push(rootPid);
-
-        while (queue.length) {
-          const pid = queue.shift()!;
-          if (pids.has(pid)) continue;
-          pids.add(pid);
-          try {
-            const children = execSync(`pgrep -P ${pid} || true`).toString().trim().split(/\s+/).filter(Boolean).map((v) => parseInt(v, 10)).filter((n) => Number.isFinite(n));
-            for (const child of children) queue.push(child);
-          } catch { /* ignore */ }
-        }
-
-        for (const pid of pids) {
-          try {
-            const ssOutput = execSync(`ss -tlnp 2>/dev/null | grep "pid=${pid}," || true`).toString().trim();
-            const portMatch = ssOutput.match(/:(\d+)\s/);
-            if (portMatch) {
-              session.localPort = parseInt(portMatch[1], 10);
-              console.log(`[NativeCLI] Fallback-discovered Claude callback port ${session.localPort} via pid ${pid}`);
-              break;
-            }
-          } catch { /* ignore */ }
-        }
-      } catch { /* ignore */ }
+    const pasted = callbackValue.trim();
+    const code = pasted.split('#')[0]?.trim();
+    if (!code) {
+      return { success: false, error: 'Invalid authorization code.' };
     }
-    if (!session.localPort || !session.oauthState) {
-      return { success: false, error: 'Claude CLI local callback server not available. Try restarting the flow.' };
-    }
-
-    const code = callbackValue.trim();
-    const path = `/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(session.oauthState)}`;
-
-    console.log(`[NativeCLI] Relaying auth code to Claude local server on port ${session.localPort}`);
 
     try {
-      await new Promise<void>((resolve, reject) => {
-        const req = http.get(
-          { hostname: '::1', port: session.localPort, path, family: 6 },
-          (res: any) => {
-            let body = '';
-            res.on('data', (d: string) => (body += d));
-            res.on('end', () => {
-              console.log(`[NativeCLI] Claude callback response: status=${res.statusCode}`);
-              resolve();
-            });
-          },
-        );
-        req.on('error', (e: Error) => reject(e));
-        req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
+      const resp = await fetch('https://platform.claude.com/v1/oauth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: 'https://platform.claude.com/oauth/code/callback',
+          client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+          code_verifier: session.extraEnv.codeVerifier,
+          state: session.oauthState,
+        }),
       });
-    } catch (err: any) {
-      // Also try IPv4 in case IPv6 fails
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const req = http.get(
-            { hostname: '127.0.0.1', port: session.localPort, path },
-            (res: any) => {
-              res.on('data', () => {});
-              res.on('end', () => resolve());
-            },
-          );
-          req.on('error', (e: Error) => reject(e));
-          req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
-        });
-      } catch (err2: any) {
-        return { success: false, error: `Failed to relay auth code to Claude: ${err.message}` };
+
+      const data: any = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const detail = data?.error_description || data?.error || data?.message || `HTTP ${resp.status}`;
+        session.status = 'error';
+        session.error = `Claude token exchange failed: ${detail}`;
+        return { success: false, error: session.error };
       }
+
+      const existing = safeReadJson(CLAUDE_CREDENTIALS_PATH) || {};
+      existing.claudeAiOauth = {
+        accessToken: data.access_token,
+        refreshToken: data.refresh_token,
+        expiresAt: Date.now() + ((data.expires_in || 0) * 1000),
+        scopes: typeof data.scope === 'string' ? data.scope.split(/\s+/).filter(Boolean) : [],
+        subscriptionType: existing.claudeAiOauth?.subscriptionType ?? null,
+        rateLimitTier: existing.claudeAiOauth?.rateLimitTier ?? null,
+      };
+      fs.mkdirSync(path.dirname(CLAUDE_CREDENTIALS_PATH), { recursive: true });
+      fs.writeFileSync(CLAUDE_CREDENTIALS_PATH, JSON.stringify(existing, null, 2));
+      console.log('[NativeCLI] Claude OAuth tokens written to credentials file');
+    } catch (err: any) {
+      session.status = 'error';
+      session.error = `Claude token exchange failed: ${err.message}`;
+      return { success: false, error: session.error };
     }
   } else if (session.provider === 'gemini' || session.provider === 'google-gemini-cli') {
     // Gemini: write the auth code to PTY stdin (readline is waiting for it)
