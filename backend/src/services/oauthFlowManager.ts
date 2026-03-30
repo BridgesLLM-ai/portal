@@ -53,23 +53,27 @@ function spawnOpenClawPty(args: string[], extraEnv?: Record<string, string>) {
 function updateSessionFromOutput(session: OAuthSession) {
   const text = session.cleanOutput;
 
-  if (
-    session.provider === 'google-gemini-cli'
-    && !session.sentInitialConfirm
-    && /Continue with Google Gemini CLI OAuth\?/i.test(text)
-  ) {
-    session.sentInitialConfirm = true;
-    console.log('[OAuth] Google caution prompt detected, auto-confirming in 500ms...');
-    // Default selection is "No"; send left-arrow to move to "Yes", then Enter after a delay.
-    // Use setTimeout to avoid race with the prompt rendering.
-    setTimeout(() => {
-      console.log('[OAuth] Sending left-arrow...');
-      session.process.write('\u001b[D');
+  if (session.provider === 'google-gemini-cli') {
+    // Auto-confirm trust folder prompt (option 1 = "Trust folder")
+    if (!session.sentInitialConfirm && /Do you trust the files in this folder\?/i.test(text)) {
+      session.sentInitialConfirm = true;
+      console.log('[NativeCLI] Gemini trust-folder prompt detected, auto-confirming...');
       setTimeout(() => {
-        console.log('[OAuth] Sending enter...');
-        session.process.write('\r');
-      }, 300);
-    }, 500);
+        session.process.write('\r');  // Press enter to select default (option 1)
+      }, 500);
+    }
+
+    // Auto-confirm the Google OAuth caution prompt
+    if (session.sentInitialConfirm && /Continue with Google Gemini CLI OAuth\?/i.test(text) && !(session as any).__oauthConfirmed) {
+      (session as any).__oauthConfirmed = true;
+      console.log('[NativeCLI] Google OAuth caution prompt detected, auto-confirming...');
+      setTimeout(() => {
+        session.process.write('\u001b[D');  // left-arrow to select "Yes"
+        setTimeout(() => {
+          session.process.write('\r');
+        }, 300);
+      }, 500);
+    }
   }
 
   const urls = text.match(/https?:\/\/[^\s)"'>]+/g) || [];
@@ -83,11 +87,12 @@ function updateSessionFromOutput(session: OAuthSession) {
 
     const isLocalCallbackUrl = hostname === '127.0.0.1' || hostname === 'localhost';
     const isGithubDeviceUrl = /github\.com\/login\/device/i.test(url);
+    const isOpenAIDeviceUrl = /auth\.openai\.com\/codex\/device/i.test(url);
 
-    if (!session.verificationUrl && isGithubDeviceUrl) {
+    if (!session.verificationUrl && (isGithubDeviceUrl || isOpenAIDeviceUrl)) {
       session.verificationUrl = url;
     }
-    if (!session.authUrl && !isLocalCallbackUrl && !isGithubDeviceUrl) {
+    if (!session.authUrl && !isLocalCallbackUrl && !isGithubDeviceUrl && !isOpenAIDeviceUrl) {
       session.authUrl = url;
     }
     if (!session.callbackHintUrl && isLocalCallbackUrl) {
@@ -99,6 +104,7 @@ function updateSessionFromOutput(session: OAuthSession) {
     /Code:\s*([A-Z0-9-]{4,})/i,
     /device code[:\s]+([A-Z0-9-]{4,})/i,
     /enter (?:the )?code[:\s]+([A-Z0-9-]{4,})/i,
+    /one-time code[^]*?\n\s+([A-Z0-9-]{6,})/i,  // Codex: "Enter this one-time code\n   OW1I-ARN5H"
   ];
   for (const pattern of deviceCodePatterns) {
     const match = text.match(pattern);
@@ -152,12 +158,14 @@ function waitForInitialOutput(session: OAuthSession, timeoutMs: number) {
         || /Paste the authorization code/i.test(text)
         || /Paste the redirect URL here/i.test(text)
         || /Waiting for you to paste the callback URL/i.test(text)
+        || /browser didn't open, visit:/i.test(text)
       );
 
       const deviceReady = session.mode === 'device_code' && (
         Boolean(session.deviceCode)
         || Boolean(session.verificationUrl)
         || /github\.com\/login\/device/i.test(text)
+        || /auth\.openai\.com\/codex\/device/i.test(text)
       );
 
       if (oauthReady || deviceReady) {
@@ -720,12 +728,12 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
       const claudeBin = findCliBin('claude');
       console.log(`[NativeCLI] Starting Claude Code login, binary=${claudeBin}`);
       
-      const proc = pty.spawn(claudeBin, [], {
+      const proc = pty.spawn(claudeBin, ['auth', 'login'], {
         name: 'xterm-256color',
         cols: 500,
         rows: 40,
         cwd: process.cwd(),
-        env: { ...process.env } as Record<string, string>,
+        env: { ...process.env, BROWSER: '/bin/false' } as Record<string, string>,
       });
 
       session = {
@@ -785,12 +793,12 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
       const codexBin = findCliBin('codex');
       console.log(`[NativeCLI] Starting Codex login, binary=${codexBin}`);
       
-      const proc = pty.spawn(codexBin, ['login'], {
+      const proc = pty.spawn(codexBin, ['login', '--device-auth'], {
         name: 'xterm-256color',
         cols: 120,
         rows: 40,
         cwd: process.cwd(),
-        env: { ...process.env } as Record<string, string>,
+        env: { ...process.env, BROWSER: '/bin/false' } as Record<string, string>,
       });
 
       session = {
@@ -844,8 +852,8 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
         name: 'xterm-256color',
         cols: 120,
         rows: 40,
-        cwd: process.cwd(),
-        env: { ...process.env } as Record<string, string>,
+        cwd: '/tmp',
+        env: { ...process.env, BROWSER: '/bin/false' } as Record<string, string>,
       });
 
       session = {
