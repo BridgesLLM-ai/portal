@@ -398,7 +398,7 @@ export default function AgentSelector({
   const [agentsLoading, setAgentsLoading] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
-  // Fetch providers
+  // Fetch providers on mount and whenever dropdown opens
   useEffect(() => {
     let cancelled = false;
     async function fetchProviders() {
@@ -429,7 +429,7 @@ export default function AgentSelector({
     }
     fetchProviders();
     return () => { cancelled = true; };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (value !== 'OPENCLAW' || !defaultOpenClawAgentId || !agents.length) return;

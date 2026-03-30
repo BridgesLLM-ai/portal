@@ -13,8 +13,8 @@ export const codexAdapter: NativeCliProviderAdapter = {
       : null;
     ctx.state.nativeSessionId = nativeSessionId;
     const args = nativeSessionId
-      ? ['exec', 'resume', nativeSessionId, '--skip-git-repo-check', '--json']
-      : ['exec', '--skip-git-repo-check', '--color', 'never', '--json'];
+      ? ['exec', 'resume', nativeSessionId, '--skip-git-repo-check', '--json', '--full-auto']
+      : ['exec', '--skip-git-repo-check', '--color', 'never', '--json', '--full-auto'];
     if (ctx.session.model) args.push('--model', ctx.session.model);
     args.push(ctx.message);
     return { command: 'codex', args };
