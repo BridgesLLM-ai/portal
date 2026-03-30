@@ -12,54 +12,69 @@ const cards = [
   {
     id: 'openclaw',
     title: 'OpenClaw',
-    subtitle: 'All providers',
-    description: 'Browse and connect any supported AI provider.',
+    subtitle: 'All providers via OpenClaw',
+    description: 'Configure API keys and OAuth for providers through OpenClaw (Claude, Codex, Gemini, and more).',
     color: 'bg-emerald-500',
+    isNativeCli: false,
   },
   {
-    id: 'openai-codex',
-    title: 'ChatGPT / Codex',
-    subtitle: 'Use your ChatGPT subscription',
-    description: 'Sign in with your ChatGPT Plus, Pro, or Team account.',
-    color: 'bg-sky-500',
-  },
-  {
-    id: 'google-gemini-cli',
-    title: 'Google Gemini',
-    subtitle: 'Use your Google account',
-    description: 'Sign in with your Google account for Gemini access.',
-    color: 'bg-violet-500',
-  },
-  {
-    id: 'anthropic',
-    title: 'Claude',
-    subtitle: 'Use your Claude subscription',
-    description: 'Connect your Claude subscription with a setup-token.',
+    id: 'native-claude-code',
+    title: 'Claude Code',
+    subtitle: 'Native CLI agent',
+    description: 'Log in the Claude Code CLI directly for use as a native agent in Agent Chat.',
     color: 'bg-amber-500',
+    isNativeCli: true,
+    nativeCliProvider: 'claude-code' as const,
+  },
+  {
+    id: 'native-codex',
+    title: 'Codex',
+    subtitle: 'Native CLI agent',
+    description: 'Log in the Codex CLI directly for use as a native agent in Agent Chat.',
+    color: 'bg-sky-500',
+    isNativeCli: true,
+    nativeCliProvider: 'codex' as const,
+  },
+  {
+    id: 'native-gemini',
+    title: 'Gemini',
+    subtitle: 'Native CLI agent',
+    description: 'Log in the Gemini CLI directly for use as a native agent in Agent Chat.',
+    color: 'bg-violet-500',
+    isNativeCli: true,
+    nativeCliProvider: 'gemini' as const,
   },
 ];
 
-const NATIVE_CLI_MAP: Record<string, 'claude-code' | 'codex' | 'gemini'> = {
-  'anthropic': 'claude-code',
-  'openai-codex': 'codex',
-  'google-gemini-cli': 'gemini',
+// Map native CLI card IDs to the OpenClaw provider that tracks their auth status
+const NATIVE_CLI_PROVIDER_MAP: Record<string, string> = {
+  'native-claude-code': 'anthropic',
+  'native-codex': 'openai-codex',
+  'native-gemini': 'google-gemini-cli',
 };
 
-function getNativeCliStatus(statusMap: Map<string, ProviderStatus> | undefined, id: string): ProviderStatus['nativeCliAuthStatus'] | null {
-  if (!statusMap || !NATIVE_CLI_MAP[id]) return null;
-  const status = statusMap.get(id);
+function getNativeCliStatus(statusMap: Map<string, ProviderStatus> | undefined, cardId: string): ProviderStatus['nativeCliAuthStatus'] | null {
+  const providerId = NATIVE_CLI_PROVIDER_MAP[cardId];
+  if (!statusMap || !providerId) return null;
+  const status = statusMap.get(providerId);
   return status?.nativeCliAuthStatus || null;
 }
 
 function isConfigured(statusMap: Map<string, ProviderStatus> | undefined, id: string): boolean {
   if (!statusMap) return false;
   if (id === 'openclaw') return false;
+  // For native CLI cards, check the underlying provider's native auth status
+  const providerId = NATIVE_CLI_PROVIDER_MAP[id];
+  if (providerId) {
+    return statusMap.get(providerId)?.nativeCliAuthStatus === 'authenticated';
+  }
   return statusMap.get(id)?.status === 'configured';
 }
 
 function getExpiryInfo(statusMap: Map<string, ProviderStatus> | undefined, id: string): { label: string; urgency: 'ok' | 'warning' | 'danger' | 'expired' } | null {
   if (!statusMap || id === 'openclaw') return null;
-  const status = statusMap.get(id);
+  const providerId = NATIVE_CLI_PROVIDER_MAP[id] || id;
+  const status = statusMap.get(providerId);
   if (!status?.expiresAt) return null;
 
   const now = Date.now();
@@ -84,7 +99,7 @@ export default function QuickStartBanner({ onChoose, onNativeCliLogin, statusMap
             <button
               key={card.id}
               type="button"
-              onClick={() => onChoose(card.id)}
+              onClick={() => card.isNativeCli && card.nativeCliProvider && onNativeCliLogin ? onNativeCliLogin(card.nativeCliProvider) : onChoose(card.id)}
               className="group flex w-full items-center gap-3 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2.5 text-left transition hover:border-slate-600 hover:bg-slate-800/60 active:bg-slate-800"
             >
               <div className={`h-2 w-2 shrink-0 rounded-full ${configured ? 'bg-emerald-400' : card.color + '/40'}`} />
@@ -130,7 +145,7 @@ export default function QuickStartBanner({ onChoose, onNativeCliLogin, statusMap
             <button
               key={card.id}
               type="button"
-              onClick={() => onChoose(card.id)}
+              onClick={() => card.isNativeCli && card.nativeCliProvider && onNativeCliLogin ? onNativeCliLogin(card.nativeCliProvider) : onChoose(card.id)}
               className={`group relative flex flex-col rounded-xl border bg-slate-950/60 p-5 text-left transition hover:bg-slate-900/80 active:bg-slate-900 ${
                 expiry?.urgency === 'expired' || expiry?.urgency === 'danger'
                   ? 'border-red-500/30 hover:border-red-500/50'
@@ -163,16 +178,6 @@ export default function QuickStartBanner({ onChoose, onNativeCliLogin, statusMap
               ) : null}
 
               <p className="mt-2 text-sm leading-relaxed text-slate-400">{card.description}</p>
-              {getNativeCliStatus(statusMap, card.id) === 'needs_login' && onNativeCliLogin && NATIVE_CLI_MAP[card.id] ? (
-                <button
-                  type="button"
-                  onClick={(e) => { e.stopPropagation(); onNativeCliLogin(NATIVE_CLI_MAP[card.id]); }}
-                  className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-300 transition hover:bg-amber-500/15"
-                >
-                  <AlertTriangle className="h-3 w-3" />
-                  Login to {NATIVE_CLI_MAP[card.id] === 'claude-code' ? 'Claude Code' : NATIVE_CLI_MAP[card.id] === 'codex' ? 'Codex' : 'Gemini'} CLI
-                </button>
-              ) : null}
               <div className="mt-3 flex items-center gap-1 text-sm font-medium text-slate-300 group-hover:text-white transition-colors">
                 <span>{expiry?.urgency === 'expired' ? 'Re-authenticate' : configured ? 'Reconfigure' : 'Set up'}</span>
                 <ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />

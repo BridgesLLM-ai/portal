@@ -164,10 +164,10 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
           <ApiKeySetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
         ) : null}
         {activeSetup?.primaryAuthType === 'oauth' ? (
-          <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} onNativeCliLogin={() => { const mapped = activeSetup.id === 'openai-codex' ? 'codex' : activeSetup.id === 'google-gemini-cli' ? 'gemini' : null; if (mapped) { setActiveSetup(null); handleNativeCliLogin(mapped); } }} />
+          <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
         ) : null}
         {activeSetup?.primaryAuthType === 'setup_token' ? (
-          <SetupTokenFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} onNativeCliLogin={() => { setActiveSetup(null); handleNativeCliLogin('claude-code'); }} />
+          <SetupTokenFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
         ) : null}
         {activeDeviceFlow ? (
           <DeviceCodeFlow apiBase={apiBase} onComplete={async () => { await handleComplete(); setActiveDeviceFlow(false); }} onCancel={() => setActiveDeviceFlow(false)} />
@@ -269,10 +269,10 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
         <ApiKeySetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
       ) : null}
       {activeSetup?.primaryAuthType === 'oauth' ? (
-        <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} onNativeCliLogin={() => { const mapped = activeSetup.id === 'openai-codex' ? 'codex' : activeSetup.id === 'google-gemini-cli' ? 'gemini' : null; if (mapped) { setActiveSetup(null); handleNativeCliLogin(mapped); } }} />
+        <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
       ) : null}
       {activeSetup?.primaryAuthType === 'setup_token' ? (
-        <SetupTokenFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} onNativeCliLogin={() => { setActiveSetup(null); handleNativeCliLogin('claude-code'); }} />
+        <SetupTokenFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
       ) : null}
       {activeDeviceFlow ? (
         <DeviceCodeFlow
