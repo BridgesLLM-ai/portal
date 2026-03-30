@@ -1637,7 +1637,7 @@ router.get('/agents', authenticateToken, requireAdmin, async (_req: Request, res
     } catch {}
 
     // Filter out hidden/confusing OpenClaw agents from the portal selector.
-    const hiddenAgentIds = new Set(['portal', 'opus', 'codex', 'claude']);
+    const hiddenAgentIds = new Set(['portal', 'opus', 'codex', 'claude', 'desktop']);
     const agents = raw
       .filter((a: any) => {
         const id = String(a.id || a.name || '');
