@@ -24,6 +24,7 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
   const [deviceCode, setDeviceCode] = useState<string | null>(null);
   const [verificationUrl, setVerificationUrl] = useState<string | null>(null);
   const [callbackUrl, setCallbackUrl] = useState('');
+
   const [loading, setLoading] = useState(false);
   const [popupBlocked, setPopupBlocked] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -75,7 +76,7 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
         setVerificationUrl(data.verificationUrl || 'https://auth.openai.com/codex/device');
         setStep('device');
       } else {
-        // Claude/Gemini OAuth flow
+        // Claude OAuth flow
         setAuthUrl(data.authUrl || null);
         if (data.authUrl) {
           try {
@@ -152,7 +153,7 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
             {authUrl ? (
               <>
                 <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Authorization URL</div>
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Step 1 — Authorize</div>
                   <a
                     href={authUrl}
                     target="_blank"
@@ -168,16 +169,43 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
                     </div>
                   ) : null}
                 </div>
-                <p className="text-sm text-slate-300">
-                  After authorizing in your browser, the portal will detect completion automatically. Or paste the callback URL below if needed.
-                </p>
-                <button
-                  type="button"
-                  onClick={() => setStep('paste')}
-                  className="text-sm text-slate-400 underline hover:text-slate-300"
-                >
-                  Paste callback URL manually
-                </button>
+                {(provider === 'claude-code' || provider === 'gemini') ? (
+                  <>
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                      <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Step 2 — Paste Authorization Code</div>
+                      <p className="mt-2 text-sm text-slate-300">
+                        After authorizing, {provider === 'claude-code' ? 'Anthropic' : 'Google'} will show you an <strong>authorization code</strong>. Copy and paste it below.
+                      </p>
+                      <textarea
+                        value={callbackUrl}
+                        onChange={(e) => setCallbackUrl(e.target.value)}
+                        placeholder="Paste the authorization code here..."
+                        rows={2}
+                        className="mt-3 w-full rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 text-sm text-white font-mono placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+                      />
+                    </div>
+                    {error ? (
+                      <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-100">
+                        {error}
+                      </div>
+                    ) : null}
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={submitCallback}
+                        disabled={loading || !callbackUrl.trim()}
+                        className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+                      >
+                        {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ClipboardPaste className="h-4 w-4" />}
+                        Submit Code
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-sm text-slate-300">
+                    After authorizing in your browser, the portal will detect completion automatically.
+                  </p>
+                )}
               </>
             ) : (
               <div className="flex items-center gap-3 text-sm text-slate-400">
@@ -185,48 +213,6 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
                 Waiting for {meta.name} to provide auth URL...
               </div>
             )}
-          </div>
-        );
-
-      case 'paste':
-        return (
-          <div className="space-y-4">
-            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Callback URL</div>
-              <p className="mt-2 text-sm text-slate-300">
-                After authorizing, paste the full <code className="rounded bg-slate-900 px-1.5 py-0.5">http://localhost:...</code> or <code className="rounded bg-slate-900 px-1.5 py-0.5">http://127.0.0.1:...</code> URL from your browser's address bar.
-              </p>
-              <textarea
-                value={callbackUrl}
-                onChange={(e) => setCallbackUrl(e.target.value)}
-                placeholder="http://localhost:8085/?code=..."
-                rows={3}
-                className="mt-3 w-full rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 text-sm text-white placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
-              />
-            </div>
-            {error ? (
-              <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-100">
-                {error}
-              </div>
-            ) : null}
-            <div className="flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setStep('waiting')}
-                className="rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm font-medium text-slate-300 transition hover:bg-slate-700"
-              >
-                Back
-              </button>
-              <button
-                type="button"
-                onClick={submitCallback}
-                disabled={loading || !callbackUrl.trim()}
-                className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
-              >
-                {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ClipboardPaste className="h-4 w-4" />}
-                Submit
-              </button>
-            </div>
           </div>
         );
 

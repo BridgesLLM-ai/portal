@@ -1,4 +1,9 @@
 import * as pty from 'node-pty';
+import * as os from 'os';
+import * as path from 'path';
+import * as fs from 'fs';
+import * as http from 'http';
+import { execSync } from 'child_process';
 import { readAuthProfiles, saveProviderApiKey } from './openclawConfigManager';
 
 export type OAuthFlowStatus = 'starting' | 'awaiting_callback' | 'polling_device' | 'processing' | 'complete' | 'error';
@@ -12,6 +17,8 @@ export interface OAuthSession {
   callbackHintUrl: string | null;
   deviceCode: string | null;
   verificationUrl: string | null;
+  localPort: number | null;
+  oauthState: string | null;
   status: OAuthFlowStatus;
   error: string | null;
   output: string;
@@ -92,8 +99,21 @@ function updateSessionFromOutput(session: OAuthSession) {
     if (!session.verificationUrl && (isGithubDeviceUrl || isOpenAIDeviceUrl)) {
       session.verificationUrl = url;
     }
+    // For Claude native CLI, extract local callback port from the local server URL
+    if (isLocalCallbackUrl && !session.localPort) {
+      try {
+        const localUrl = new URL(url);
+        session.localPort = parseInt(localUrl.port, 10) || null;
+      } catch { /* ignore */ }
+    }
     if (!session.authUrl && !isLocalCallbackUrl && !isGithubDeviceUrl && !isOpenAIDeviceUrl) {
       session.authUrl = url;
+      // Extract OAuth state parameter for local callback relay
+      try {
+        const parsed = new URL(url);
+        const state = parsed.searchParams.get('state');
+        if (state) session.oauthState = state;
+      } catch { /* ignore */ }
     }
     if (!session.callbackHintUrl && isLocalCallbackUrl) {
       session.callbackHintUrl = url;
@@ -158,6 +178,7 @@ function waitForInitialOutput(session: OAuthSession, timeoutMs: number) {
         || /Paste the redirect URL here/i.test(text)
         || /Waiting for you to paste the callback URL/i.test(text)
         || /browser didn't open, visit:/i.test(text)
+        || /Enter the authorization code:/i.test(text)  // Gemini headless OAuth
       );
 
       const deviceReady = session.mode === 'device_code' && (
@@ -227,6 +248,8 @@ export async function startOAuthFlow(provider: string, options?: { googleProject
     callbackHintUrl: null,
     deviceCode: null,
     verificationUrl: null,
+    localPort: null,
+    oauthState: null,
     status: 'starting',
     error: null,
     output: '',
@@ -261,6 +284,8 @@ export async function startDeviceCodeFlow(provider: 'github-copilot') {
     callbackHintUrl: null,
     deviceCode: null,
     verificationUrl: null,
+    localPort: null,
+    oauthState: null,
     status: 'starting',
     error: null,
     output: '',
@@ -413,7 +438,7 @@ export function getOAuthFlowStatus(sessionId: string) {
 // for the token to be printed after the user completes browser sign-in.
 
 function findClaudeBin(): string {
-  const { execSync } = require('child_process');
+  
   try {
     return execSync('which claude', { encoding: 'utf-8' }).trim() || 'claude';
   } catch {
@@ -443,6 +468,8 @@ export async function startClaudeSetupTokenFlow() {
     callbackHintUrl: null,
     deviceCode: null,
     verificationUrl: null,
+    localPort: null,
+    oauthState: null,
     status: 'starting',
     error: null,
     output: '',
@@ -675,16 +702,14 @@ export async function saveClaudeToken(token: string) {
 // Spawn native CLI binaries (claude, codex, gemini) in PTY to authenticate
 // their own credential stores separate from OpenClaw auth profiles.
 
-const fs = require('fs');
-const path = require('path');
-
 const HOME_DIR = process.env.HOME || '/root';
 const CLAUDE_CREDENTIALS_PATH = path.join(HOME_DIR, '.claude', '.credentials.json');
 const CODEX_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
 const GEMINI_CONFIG_DIR = path.join(HOME_DIR, '.config', 'gemini');
+const GEMINI_OAUTH_CREDS_PATH = path.join(HOME_DIR, '.gemini', 'oauth_creds.json');
 
 function findCliBin(command: string): string {
-  const { execSync } = require('child_process');
+  
   try {
     return execSync(`which ${command}`, { encoding: 'utf-8' }).trim() || command;
   } catch {
@@ -718,6 +743,11 @@ function checkCredentialDir(dirPath: string): boolean {
   }
 }
 
+function checkGeminiCredentials(): boolean {
+  // Check both the new ~/.gemini/oauth_creds.json and the legacy ~/.config/gemini/ directory
+  return checkCredentialFile(GEMINI_OAUTH_CREDS_PATH, ['access_token']) || checkCredentialDir(GEMINI_CONFIG_DIR);
+}
+
 export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'gemini') {
   const id = createSessionId();
   let session: OAuthSession;
@@ -744,6 +774,8 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
         callbackHintUrl: null,
         deviceCode: null,
         verificationUrl: null,
+        localPort: null,
+        oauthState: null,
         status: 'starting',
         error: null,
         output: '',
@@ -785,6 +817,24 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
       });
 
       await waitForInitialOutput(session, 30000);
+
+      // Discover Claude's local OAuth callback port
+      if (!session.localPort) {
+        try {
+          
+          const pid = (session.process as any).pid;
+          if (pid) {
+            const ssOutput = execSync(`ss -tlnp 2>/dev/null | grep "pid=${pid}," || true`).toString().trim();
+            const portMatch = ssOutput.match(/:(\d+)\s/);
+            if (portMatch) {
+              session.localPort = parseInt(portMatch[1], 10);
+              console.log(`[NativeCLI] Discovered Claude local callback port: ${session.localPort}`);
+            }
+          }
+        } catch (err: any) {
+          console.log(`[NativeCLI] Failed to discover Claude port: ${err.message}`);
+        }
+      }
       break;
     }
 
@@ -809,6 +859,8 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
         callbackHintUrl: null,
         deviceCode: null,
         verificationUrl: null,
+        localPort: null,
+        oauthState: null,
         status: 'starting',
         error: null,
         output: '',
@@ -846,13 +898,33 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
     case 'gemini': {
       const geminiBin = findCliBin('gemini');
       console.log(`[NativeCLI] Starting Gemini login, binary=${geminiBin}`);
-      
+
+      // Pre-configure Gemini to use Google OAuth (oauth-personal) so it skips the auth selector
+      const geminiDir = path.join(os.homedir(), '.gemini');
+      const geminiSettingsPath = path.join(geminiDir, 'settings.json');
+      try {
+        fs.mkdirSync(geminiDir, { recursive: true });
+        let existingSettings: any = {};
+        try {
+          existingSettings = JSON.parse(fs.readFileSync(geminiSettingsPath, 'utf-8'));
+        } catch { /* file doesn't exist yet */ }
+        if (!existingSettings.security?.auth?.selectedType) {
+          existingSettings.security = existingSettings.security || {};
+          existingSettings.security.auth = existingSettings.security.auth || {};
+          existingSettings.security.auth.selectedType = 'oauth-personal';
+          fs.writeFileSync(geminiSettingsPath, JSON.stringify(existingSettings, null, 2));
+          console.log('[NativeCLI] Pre-configured Gemini auth type to oauth-personal');
+        }
+      } catch (err: any) {
+        console.log(`[NativeCLI] Warning: could not pre-configure Gemini settings: ${err.message}`);
+      }
+
       const proc = pty.spawn(geminiBin, [], {
         name: 'xterm-256color',
         cols: 120,
         rows: 40,
         cwd: '/tmp',
-        env: { ...process.env, BROWSER: '/bin/false' } as Record<string, string>,
+        env: { ...process.env, NO_BROWSER: 'true' } as Record<string, string>,
       });
 
       session = {
@@ -864,6 +936,8 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
         callbackHintUrl: null,
         deviceCode: null,
         verificationUrl: null,
+        localPort: null,
+        oauthState: null,
         status: 'starting',
         error: null,
         output: '',
@@ -884,17 +958,21 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
 
       proc.onExit(({ exitCode }) => {
         console.log(`[NativeCLI] Gemini PTY exited: code=${exitCode} status=${session.status}`);
-        if (checkCredentialDir(GEMINI_CONFIG_DIR)) {
+        if (checkGeminiCredentials()) {
           session.status = 'complete';
           session.completedAt = Date.now();
           console.log('[NativeCLI] Gemini credentials verified');
+        } else if (exitCode === 199) {
+          // Gemini relaunch code — the wrapper should respawn, not an error
+          console.log('[NativeCLI] Gemini exited with relaunch code 199, waiting for respawn...');
         } else if (session.status !== 'complete' && !session.error) {
           session.status = 'error';
           session.error = `Gemini CLI exited with code ${exitCode}`;
         }
       });
 
-      await waitForInitialOutput(session, 20000);
+      // Gemini needs extra time: it relaunches itself after saving auth config
+      await waitForInitialOutput(session, 45000);
       break;
     }
   }
@@ -908,75 +986,87 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
   };
 }
 
-export async function completeNativeCliFlow(sessionId: string, callbackUrl: string) {
+export async function completeNativeCliFlow(sessionId: string, callbackValue: string) {
   const session = sessions.get(sessionId);
   if (!session) throw new Error('Native CLI session not found');
-  if (!['claude-code', 'gemini'].includes(session.provider)) {
+  if (!['claude-code', 'gemini', 'google-gemini-cli'].includes(session.provider)) {
     throw new Error('Session is not a callback-based native CLI flow');
   }
 
   session.status = 'processing';
   session.error = null;
 
-  // Check if PTY is still alive
-  let ptyAlive = false;
-  try {
-    session.process.write('');
-    ptyAlive = true;
-  } catch {
-    ptyAlive = false;
-  }
+  if (session.provider === 'claude-code') {
+    // Claude Code: relay the auth code to Claude's local OAuth callback server
+    if (!session.localPort || !session.oauthState) {
+      return { success: false, error: 'Claude CLI local callback server not available. Try restarting the flow.' };
+    }
 
-  if (!ptyAlive) {
-    console.log(`[NativeCLI] PTY dead for ${session.provider}, spawning fresh process...`);
-    const bin = findCliBin(session.provider === 'claude-code' ? 'claude' : 'gemini');
-    const freshProcess = pty.spawn(bin, [], {
-      name: 'xterm-256color',
-      cols: 120,
-      rows: 40,
-      cwd: process.cwd(),
-      env: { ...process.env } as Record<string, string>,
-    });
-    session.process = freshProcess;
-    session.output = '';
-    session.cleanOutput = '';
+    const code = callbackValue.trim();
+    const path = `/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(session.oauthState)}`;
 
-    freshProcess.onData((chunk: string) => {
-      session.output += chunk;
-      session.cleanOutput += stripAnsi(chunk);
-      updateSessionFromOutput(session);
-    });
-
-    freshProcess.onExit(({ exitCode }) => {
-      console.log(`[NativeCLI] Fresh PTY exited: provider=${session.provider} code=${exitCode}`);
-      const credCheck = session.provider === 'claude-code'
-        ? checkCredentialFile(CLAUDE_CREDENTIALS_PATH, ['claudeAiOauth.accessToken'])
-        : checkCredentialDir(GEMINI_CONFIG_DIR);
-      if (credCheck) {
-        session.status = 'complete';
-        session.completedAt = Date.now();
-      } else if (!session.error) {
-        session.status = 'error';
-        session.error = `Native CLI exited with code ${exitCode}`;
-      }
-    });
+    console.log(`[NativeCLI] Relaying auth code to Claude local server on port ${session.localPort}`);
 
     try {
-      await waitForInitialOutput(session, 20000);
+      await new Promise<void>((resolve, reject) => {
+        const req = http.get(
+          { hostname: '::1', port: session.localPort, path, family: 6 },
+          (res: any) => {
+            let body = '';
+            res.on('data', (d: string) => (body += d));
+            res.on('end', () => {
+              console.log(`[NativeCLI] Claude callback response: status=${res.statusCode}`);
+              resolve();
+            });
+          },
+        );
+        req.on('error', (e: Error) => reject(e));
+        req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
+      });
     } catch (err: any) {
-      return { success: false, error: `Failed to restart native CLI: ${err.message}` };
+      // Also try IPv4 in case IPv6 fails
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const req = http.get(
+            { hostname: '127.0.0.1', port: session.localPort, path },
+            (res: any) => {
+              res.on('data', () => {});
+              res.on('end', () => resolve());
+            },
+          );
+          req.on('error', (e: Error) => reject(e));
+          req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
+        });
+      } catch (err2: any) {
+        return { success: false, error: `Failed to relay auth code to Claude: ${err.message}` };
+      }
     }
+  } else if (session.provider === 'gemini' || session.provider === 'google-gemini-cli') {
+    // Gemini: write the auth code to PTY stdin (readline is waiting for it)
+    let ptyAlive = false;
+    try {
+      session.process.write('');
+      ptyAlive = true;
+    } catch {
+      ptyAlive = false;
+    }
+
+    if (!ptyAlive) {
+      return { success: false, error: 'Gemini CLI process is no longer running. Try restarting the flow.' };
+    }
+
+    const code = callbackValue.trim();
+    console.log(`[NativeCLI] Writing auth code to Gemini stdin (${code.length} chars)`);
+    session.process.write(`${code}\r`);
   }
 
-  // Write the callback URL
-  session.process.write(`${callbackUrl}\r`);
-
+  // Poll for credential files
   const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
     const started = Date.now();
     const timer = setInterval(() => {
       const credCheck = session.provider === 'claude-code'
         ? checkCredentialFile(CLAUDE_CREDENTIALS_PATH, ['claudeAiOauth.accessToken'])
-        : checkCredentialDir(GEMINI_CONFIG_DIR);
+        : checkGeminiCredentials();
 
       if (credCheck || session.status === 'complete') {
         clearInterval(timer);
@@ -989,6 +1079,15 @@ export async function completeNativeCliFlow(sessionId: string, callbackUrl: stri
       if (session.error || session.status === 'error') {
         clearInterval(timer);
         resolve({ success: false, error: session.error || 'Native CLI login failed' });
+        return;
+      }
+
+      // Check for failure messages in output
+      if (/Login failed/i.test(session.cleanOutput) && Date.now() - started > 3000) {
+        clearInterval(timer);
+        session.status = 'error';
+        session.error = 'Login failed — the authorization code may be invalid or expired.';
+        resolve({ success: false, error: session.error });
         return;
       }
 

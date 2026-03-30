@@ -39,7 +39,7 @@ const cards = [
     id: 'native-gemini',
     title: 'Gemini',
     subtitle: 'Native CLI agent',
-    description: 'Log in the Gemini CLI directly for use as a native agent in Agent Chat.',
+    description: 'Sign in with Google to use the Gemini CLI as a native agent in Agent Chat.',
     color: 'bg-violet-500',
     isNativeCli: true,
     nativeCliProvider: 'gemini' as const,
