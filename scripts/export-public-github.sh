@@ -69,6 +69,8 @@ rsync -a \
   --exclude='assets/avatars' \
   --exclude='assets/branding' \
   --exclude='*.log' \
+  --exclude='*.db' \
+  --exclude='*.sqlite' \
   --exclude='.DS_Store' \
   --exclude='tmp' \
   --exclude='backend/server.log' \

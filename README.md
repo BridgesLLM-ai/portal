@@ -13,7 +13,6 @@
   <a href="https://github.com/BridgesLLM-ai/portal/releases"><img src="https://img.shields.io/github/v/release/BridgesLLM-ai/portal?style=flat-square&color=green" alt="Release"></a>
   <a href="https://github.com/BridgesLLM-ai/portal/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
   <a href="https://github.com/BridgesLLM-ai/portal/stargazers"><img src="https://img.shields.io/github/stars/BridgesLLM-ai/portal?style=flat-square" alt="Stars"></a>
-  <a href="https://www.youtube.com/@BridgesLLM"><img src="https://img.shields.io/badge/YouTube-@BridgesLLM-red?style=flat-square&logo=youtube" alt="YouTube"></a>
 </p>
 
 ---
@@ -37,13 +36,7 @@ curl -fsSL https://bridgesllm.ai/install.sh | sudo bash
 
 ## 📺 See It in Action
 
-<p align="center">
-  <a href="https://youtu.be/t-iscyH7SZA">
-    <img src="https://img.youtube.com/vi/t-iscyH7SZA/maxresdefault.jpg" alt="BridgesLLM Portal Demo" width="600">
-  </a>
-  <br>
-  <em>▶ Watch the full walkthrough on YouTube</em>
-</p>
+Visit [bridgesllm.ai](https://bridgesllm.ai) for live video demos of every feature.
 
 ## 🎯 What You Get
 
@@ -178,12 +171,14 @@ For the full security policy, see [SECURITY.md](SECURITY.md).
 
 ## 📋 Roadmap
 
+- [ ] **Chat reliability hardening** — survive hard refresh, tab close, and reconnect without losing streamed content or showing stale state
+- [ ] **Clean chat output** — strip internal tool noise, approval artifacts, and system metadata from agent responses so conversations read like conversations
+- [ ] **Full OpenClaw feature parity** — surface all OpenClaw capabilities (FYI mode, tool approval workflows, new agent features) as they ship upstream
+- [ ] **Agent management UI** — create, edit, configure, and delete agents directly from the Agent Tools page
 - [ ] **GitHub integration** — push/pull from the project panel
 - [ ] **Team collaboration** — multi-user project sharing and permissions
 - [ ] **Email polish** — forwarding rules, HTML signatures, folder management
-- [ ] **Template marketplace** — starter projects and boilerplate generators
 - [ ] **Mobile-optimized UI** — responsive layouts for phone and tablet
-- [ ] **Plugin system** — extend the portal with community-built modules
 
 ## 🤝 Contributing
 
@@ -215,7 +210,6 @@ MIT License — see [LICENSE](LICENSE).
   <strong>Built by <a href="https://github.com/Robertmonkey">Robert Bridges</a></strong>
   <br>
   <a href="https://bridgesllm.ai">Website</a> ·
-  <a href="https://www.youtube.com/@BridgesLLM">YouTube</a> ·
   <a href="https://github.com/BridgesLLM-ai/portal/issues">Issues</a> ·
   <a href="https://github.com/BridgesLLM-ai/portal/releases">Releases</a>
 </p>
