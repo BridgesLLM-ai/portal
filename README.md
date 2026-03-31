@@ -76,6 +76,10 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.21.0 (March 31, 2026)
+- **Remote Desktop clipboard & mobile keyboard** — floating toolbar with clipboard paste (Read/Paste/Type modes) and mobile soft keyboard support. Copy-paste and type into your VNC session from any device.
+- **Fix Google indexing** — corrected cache-control, www redirect, and soft 404s preventing proper crawling
+
 ### v3.20.1 (March 29, 2026)
 - Fix Claude Code native login on headless servers (direct PKCE OAuth flow)
 - Fix Codex read-only sessions — now launches with full `workspace-write` sandbox
@@ -87,11 +91,6 @@ One-click updates from the browser. Admin dashboard with user management, storag
 - **Critical:** Fix installer destroying portal on update when using non-default database config
 - Fix Anthropic API key persistence, stale "Agent is thinking" indicator, missed messages after phone lock
 - Fix code preview dark mode, auto-detect bare HTML responses
-
-### v3.19.0 (March 26, 2026)
-- **AI Provider Setup Wizard** — one-click OAuth for Claude, Codex, and Gemini with automated PTY auth flows
-- **OAuth expiration tracking** — color-coded badges showing token health
-- **Remote Desktop resize** — browser window resizing works correctly
 
 See the full [CHANGELOG](CHANGELOG.md) for all releases.
 

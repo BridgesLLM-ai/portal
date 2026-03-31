@@ -2,6 +2,27 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.21.0] — 2026-03-31
+
+### ✨ New Features
+
+#### Remote Desktop Clipboard & Mobile Keyboard
+- **Clipboard paste into Remote Desktop** — New floating toolbar (bottom-right) with a clipboard panel. Paste text from your phone or desktop clipboard directly into the VNC session. Three modes:
+  - **Read** — reads your device clipboard into the text area
+  - **Paste** — sends text to the VNC clipboard and simulates Ctrl+V
+  - **Type** — sends text character-by-character as keystrokes (for password fields, terminals, and apps that don't support clipboard paste)
+- **Mobile keyboard support** — Keyboard button opens a hidden input that captures your phone's soft keyboard and forwards all keystrokes to the VNC session. Handles printable characters, Enter, Backspace, Tab, arrow keys, Delete, Home, and End.
+- **Works on all devices** — Desktop browsers, iOS Safari, Android Chrome. No additional setup or plugins required.
+
+### 🔧 Improvements
+
+#### SEO & Indexing
+- **Fix Google indexing failures** — Three critical issues prevented Google from properly indexing bridgesllm.ai:
+  - Fixed `cache-control: no-store` on the homepage (now cacheable with `public, max-age=3600`)
+  - Added 301 redirect from `www.bridgesllm.ai` to `bridgesllm.ai` (was serving duplicate content)
+  - Eliminated soft 404s from SPA catch-all (unknown URLs now return proper 404 status)
+- **Updated sitemap, structured data, and llms.txt** to version 3.21.0
+
 ## [3.20.1] — 2026-03-29
 
 ### 🐛 Bug Fixes

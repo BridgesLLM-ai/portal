@@ -18,6 +18,62 @@
         }
         #status.connected { opacity: 0; pointer-events: none; }
         #status.error { color: #f87171; opacity: 1; }
+
+        /* ── Clipboard / Mobile Keyboard Toolbar ── */
+        #toolbar {
+            position: fixed; bottom: 12px; right: 12px; z-index: 100;
+            display: flex; gap: 6px; align-items: center;
+        }
+        .tb-btn {
+            width: 40px; height: 40px; border: none; border-radius: 10px;
+            background: rgba(30,45,71,0.9); color: #94a3b8; cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            backdrop-filter: blur(8px); transition: all 0.15s;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+            -webkit-tap-highlight-color: transparent;
+        }
+        .tb-btn:hover, .tb-btn:active { background: rgba(59,130,246,0.25); color: #e2e8f0; }
+        .tb-btn.active { background: rgba(59,130,246,0.35); color: #3b82f6; }
+        .tb-btn svg { width: 18px; height: 18px; }
+
+        #clipPanel {
+            position: fixed; bottom: 60px; right: 12px; z-index: 100;
+            width: min(340px, calc(100vw - 24px));
+            background: rgba(18,24,41,0.95); border: 1px solid rgba(30,45,71,0.8);
+            border-radius: 12px; padding: 12px;
+            backdrop-filter: blur(12px); box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+            display: none; flex-direction: column; gap: 8px;
+            font: 13px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+        #clipPanel.open { display: flex; }
+        #clipPanel label { color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+        #clipText {
+            width: 100%; min-height: 72px; max-height: 200px; resize: vertical;
+            background: rgba(10,14,39,0.8); border: 1px solid rgba(30,45,71,0.8); border-radius: 8px;
+            color: #e2e8f0; padding: 8px 10px; font: 13px/1.5 'SF Mono', 'JetBrains Mono', monospace;
+            outline: none;
+        }
+        #clipText:focus { border-color: rgba(59,130,246,0.5); }
+        #clipText::placeholder { color: #4a5872; }
+        .clip-actions { display: flex; gap: 6px; }
+        .clip-btn {
+            flex: 1; padding: 7px 0; border: none; border-radius: 8px;
+            font: 600 12px/1 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            cursor: pointer; transition: all 0.15s; text-transform: uppercase; letter-spacing: 0.03em;
+        }
+        .clip-btn.send { background: #3b82f6; color: #fff; }
+        .clip-btn.send:hover { background: #2563eb; }
+        .clip-btn.type { background: rgba(139,92,246,0.2); color: #a78bfa; border: 1px solid rgba(139,92,246,0.3); }
+        .clip-btn.type:hover { background: rgba(139,92,246,0.3); }
+        .clip-btn.read { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
+        .clip-btn.read:hover { background: rgba(16,185,129,0.25); }
+        .clip-hint { font-size: 10px; color: #4a5872; text-align: center; }
+
+        /* Mobile keyboard input (hidden offscreen, captures keystrokes) */
+        #mobileInput {
+            position: fixed; left: -9999px; top: 50%; width: 1px; height: 1px;
+            opacity: 0.01; font-size: 16px; /* prevent iOS zoom */
+        }
     </style>
     <script type="module" crossorigin="anonymous">
         import RFB from './core/rfb.js';
@@ -149,6 +205,8 @@
                     credentials: {},
                     wsProtocols: ['binary'],
                 });
+                // Expose for clipboard/keyboard toolbar
+                window._rfb = rfb;
 
                 rfb.scaleViewport = resize !== 'off';
                 rfb.resizeSession = resize === 'remote';
@@ -168,6 +226,7 @@
 
                 rfb.addEventListener('disconnect', (e) => {
                     rfb = undefined;
+                    window._rfb = undefined;
                     clearTimeout(resizeTimer);
                     if (e.detail.clean) {
                         status('Disconnected');
@@ -199,5 +258,188 @@
 <body>
     <div id="status">Connecting…</div>
     <div id="screen"></div>
+
+    <!-- Hidden input for mobile keyboard -->
+    <input id="mobileInput" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+
+    <!-- Clipboard panel -->
+    <div id="clipPanel">
+        <label>Clipboard / Text Input</label>
+        <textarea id="clipText" placeholder="Paste or type text here, then send to desktop…" rows="3"></textarea>
+        <div class="clip-actions">
+            <button class="clip-btn read" id="clipReadBtn" title="Read clipboard from your device">📋 Read</button>
+            <button class="clip-btn send" id="clipSendBtn" title="Paste text into the remote desktop clipboard">⬆ Paste</button>
+            <button class="clip-btn type" id="clipTypeBtn" title="Type text character-by-character (like a keyboard)">⌨ Type</button>
+        </div>
+        <div class="clip-hint">Paste → sets clipboard · Type → sends keystrokes</div>
+    </div>
+
+    <!-- Floating toolbar -->
+    <div id="toolbar">
+        <button class="tb-btn" id="tbKeyboard" title="Show mobile keyboard">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="4" width="20" height="16" rx="2" ry="2"/><line x1="6" y1="8" x2="6" y2="8"/><line x1="10" y1="8" x2="10" y2="8"/><line x1="14" y1="8" x2="14" y2="8"/><line x1="18" y1="8" x2="18" y2="8"/><line x1="6" y1="12" x2="6" y2="12"/><line x1="10" y1="12" x2="10" y2="12"/><line x1="14" y1="12" x2="14" y2="12"/><line x1="18" y1="12" x2="18" y2="12"/><line x1="8" y1="16" x2="16" y2="16"/>
+            </svg>
+        </button>
+        <button class="tb-btn" id="tbClipboard" title="Clipboard / text input panel">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
+            </svg>
+        </button>
+    </div>
+
+    <script type="module">
+        // ── Clipboard & Mobile Keyboard Logic ──
+        // Waits for the RFB instance to be available via window._rfb (set in main script)
+
+        const clipPanel = document.getElementById('clipPanel');
+        const clipText = document.getElementById('clipText');
+        const clipReadBtn = document.getElementById('clipReadBtn');
+        const clipSendBtn = document.getElementById('clipSendBtn');
+        const clipTypeBtn = document.getElementById('clipTypeBtn');
+        const tbClipboard = document.getElementById('tbClipboard');
+        const tbKeyboard = document.getElementById('tbKeyboard');
+        const mobileInput = document.getElementById('mobileInput');
+
+        let keyboardActive = false;
+
+        // Toggle clipboard panel
+        tbClipboard.addEventListener('click', () => {
+            clipPanel.classList.toggle('open');
+            tbClipboard.classList.toggle('active', clipPanel.classList.contains('open'));
+        });
+
+        // Read device clipboard into textarea
+        clipReadBtn.addEventListener('click', async () => {
+            try {
+                const text = await navigator.clipboard.readText();
+                clipText.value = text;
+                clipText.focus();
+            } catch (err) {
+                // Fallback: just focus the textarea so user can manually paste
+                clipText.focus();
+                clipText.placeholder = 'Tap here and use Ctrl+V / long-press paste';
+            }
+        });
+
+        // Paste: send text to VNC clipboard
+        clipSendBtn.addEventListener('click', () => {
+            const rfb = window._rfb;
+            const text = clipText.value;
+            if (!rfb || !text) return;
+
+            // Send to VNC clipboard
+            rfb.clipboardPasteFrom(text);
+
+            // Then simulate Ctrl+V to paste it in the active app
+            rfb.sendKey(0xffe3, 'ControlLeft', true);  // Ctrl down
+            rfb.sendKey(0x0076, 'KeyV', true);          // v down
+            rfb.sendKey(0x0076, 'KeyV', false);          // v up
+            rfb.sendKey(0xffe3, 'ControlLeft', false);  // Ctrl up
+
+            // Visual feedback
+            clipSendBtn.textContent = '✓ Sent';
+            setTimeout(() => { clipSendBtn.textContent = '⬆ Paste'; }, 1500);
+        });
+
+        // Type: send text as individual keystrokes
+        clipTypeBtn.addEventListener('click', () => {
+            const rfb = window._rfb;
+            const text = clipText.value;
+            if (!rfb || !text) return;
+
+            let i = 0;
+            const typeNext = () => {
+                if (i >= text.length) {
+                    clipTypeBtn.textContent = '✓ Done';
+                    setTimeout(() => { clipTypeBtn.textContent = '⌨ Type'; }, 1500);
+                    return;
+                }
+                const char = text[i];
+                const code = char.charCodeAt(0);
+                // For basic ASCII, use the charCode as keysym
+                if (code === 10 || code === 13) {
+                    rfb.sendKey(0xff0d, 'Enter', true);
+                    rfb.sendKey(0xff0d, 'Enter', false);
+                } else if (code === 9) {
+                    rfb.sendKey(0xff09, 'Tab', true);
+                    rfb.sendKey(0xff09, 'Tab', false);
+                } else if (code >= 32 && code <= 126) {
+                    rfb.sendKey(code, '', true);
+                    rfb.sendKey(code, '', false);
+                } else {
+                    // Unicode: try X11 keysym encoding (0x01000000 + unicode codepoint)
+                    const keysym = 0x01000000 | code;
+                    rfb.sendKey(keysym, '', true);
+                    rfb.sendKey(keysym, '', false);
+                }
+                i++;
+                // Small delay between keystrokes to not overwhelm the VNC server
+                setTimeout(typeNext, 12);
+            };
+
+            clipTypeBtn.textContent = '⌨ Typing…';
+            typeNext();
+        });
+
+        // Mobile keyboard toggle
+        tbKeyboard.addEventListener('click', () => {
+            keyboardActive = !keyboardActive;
+            tbKeyboard.classList.toggle('active', keyboardActive);
+            if (keyboardActive) {
+                mobileInput.focus();
+                mobileInput.click(); // Force keyboard on iOS
+            } else {
+                mobileInput.blur();
+            }
+        });
+
+        // Capture keystrokes from hidden mobile input and forward to VNC
+        mobileInput.addEventListener('input', (e) => {
+            const rfb = window._rfb;
+            if (!rfb) return;
+            const data = e.data || '';
+            for (let i = 0; i < data.length; i++) {
+                const code = data.charCodeAt(i);
+                if (code >= 32 && code <= 126) {
+                    rfb.sendKey(code, '', true);
+                    rfb.sendKey(code, '', false);
+                } else {
+                    const keysym = 0x01000000 | code;
+                    rfb.sendKey(keysym, '', true);
+                    rfb.sendKey(keysym, '', false);
+                }
+            }
+            // Clear the input after processing
+            mobileInput.value = '';
+        });
+
+        // Handle special keys from mobile keyboard
+        mobileInput.addEventListener('keydown', (e) => {
+            const rfb = window._rfb;
+            if (!rfb) return;
+            const keyMap = {
+                'Enter': 0xff0d, 'Backspace': 0xff08, 'Tab': 0xff09,
+                'Escape': 0xff1b, 'ArrowLeft': 0xff51, 'ArrowUp': 0xff52,
+                'ArrowRight': 0xff53, 'ArrowDown': 0xff54, 'Delete': 0xffff,
+                'Home': 0xff50, 'End': 0xff57,
+            };
+            const keysym = keyMap[e.key];
+            if (keysym) {
+                e.preventDefault();
+                rfb.sendKey(keysym, e.code || e.key, true);
+                rfb.sendKey(keysym, e.code || e.key, false);
+            }
+        });
+
+        // Keep mobile input focused while keyboard is active
+        mobileInput.addEventListener('blur', () => {
+            if (keyboardActive) {
+                setTimeout(() => {
+                    if (keyboardActive) mobileInput.focus();
+                }, 100);
+            }
+        });
+    </script>
 </body>
 </html>
