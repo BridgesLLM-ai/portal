@@ -13,6 +13,7 @@
   <a href="https://github.com/BridgesLLM-ai/portal/releases"><img src="https://img.shields.io/github/v/release/BridgesLLM-ai/portal?style=flat-square&color=green" alt="Release"></a>
   <a href="https://github.com/BridgesLLM-ai/portal/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
   <a href="https://github.com/BridgesLLM-ai/portal/stargazers"><img src="https://img.shields.io/github/stars/BridgesLLM-ai/portal?style=flat-square" alt="Stars"></a>
+  <a href="https://x.com/BridgesLlm90984"><img src="https://img.shields.io/badge/X-@BridgesLLM-000?style=flat-square&logo=x" alt="X (Twitter)"></a>
 </p>
 
 ---
@@ -210,6 +211,7 @@ MIT License — see [LICENSE](LICENSE).
   <strong>Built by <a href="https://github.com/Robertmonkey">Robert Bridges</a></strong>
   <br>
   <a href="https://bridgesllm.ai">Website</a> ·
+  <a href="https://x.com/BridgesLlm90984">X (Twitter)</a> ·
   <a href="https://github.com/BridgesLLM-ai/portal/issues">Issues</a> ·
   <a href="https://github.com/BridgesLLM-ai/portal/releases">Releases</a>
 </p>
