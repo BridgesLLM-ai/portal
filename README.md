@@ -78,7 +78,6 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ### v3.21.0 (March 31, 2026)
 - **Remote Desktop clipboard & mobile keyboard** — floating toolbar with clipboard paste (Read/Paste/Type modes) and mobile soft keyboard support. Copy-paste and type into your VNC session from any device.
-- **Fix Google indexing** — corrected cache-control, www redirect, and soft 404s preventing proper crawling
 
 ### v3.20.1 (March 29, 2026)
 - Fix Claude Code native login on headless servers (direct PKCE OAuth flow)
