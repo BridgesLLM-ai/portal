@@ -76,6 +76,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.22.0 (April 1, 2026)
+- **OpenClaw gateway compatibility update** (2026.3.31) — improved exec approvals, provider error recovery, background task flows
+- Remove unused analytics/installer subdomain routes (dead config causing TLS cert errors)
+- Close public analytics dashboard exposure — now portal-auth only
+
 ### v3.21.0 (March 31, 2026)
 - **Remote Desktop clipboard & mobile keyboard** — floating toolbar with clipboard paste (Read/Paste/Type modes) and mobile soft keyboard support. Copy-paste and type into your VNC session from any device.
 
