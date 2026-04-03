@@ -22,6 +22,7 @@ const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const AdminPage = lazy(() => import('./pages/AdminPage'));
 const MailPage = lazy(() => import('./pages/MailPage'));
 const AgentToolsPage = lazy(() => import('./pages/AgentToolsPage'));
+const TasksPage = lazy(() => import('./pages/TasksPage'));
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuthStore();
@@ -198,6 +199,7 @@ export default function App() {
           <Route path="projects" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><AppsPage /></Suspense></InteractiveRoute>} />
           <Route path="agent-chats" element={<AdminRoute><AgentChatPage /></AdminRoute>} />
           <Route path="agent-tools" element={<AdminRoute><Suspense fallback={<RouteFallback />}><AgentToolsPage /></Suspense></AdminRoute>} />
+          <Route path="tasks" element={<AdminRoute><Suspense fallback={<RouteFallback />}><TasksPage /></Suspense></AdminRoute>} />
           {/* Backward compatibility redirects */}
           <Route path="automations" element={<LegacyAgentToolsRedirect tab="automations" />} />
           <Route path="usage" element={<LegacyAgentToolsRedirect tab="usage" />} />

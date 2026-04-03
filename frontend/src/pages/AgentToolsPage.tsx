@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, lazy, Suspense } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { Timer, BarChart3, Puzzle, ChevronDown, Check, Loader2, Layers } from 'lucide-react';
+import { Timer, BarChart3, Puzzle, ChevronDown, Check, Loader2, Layers, ListTodo } from 'lucide-react';
 import client from '../api/client';
 
 /* ─── Lazy-loaded tab content components ────────────────── */
@@ -9,12 +9,13 @@ import client from '../api/client';
 const AutomationsContent = lazy(() => import('./AutomationsPage').then(m => ({ default: m.AutomationsContent })));
 const UsageContent = lazy(() => import('./UsagePage').then(m => ({ default: m.UsageContent })));
 const SkillsContent = lazy(() => import('./SkillsPage').then(m => ({ default: m.SkillsContent })));
+const TasksContent = lazy(() => import('./TasksPage').then(m => ({ default: m.TasksContent })));
 
 /* ─── Types ─────────────────────────────────────────────── */
 
-type TabKey = 'automations' | 'usage' | 'skills';
+type TabKey = 'automations' | 'usage' | 'skills' | 'tasks';
 
-const VALID_TABS: TabKey[] = ['automations', 'usage', 'skills'];
+const VALID_TABS: TabKey[] = ['automations', 'usage', 'skills', 'tasks'];
 
 interface OpenClawAgent {
   id: string;
@@ -50,6 +51,7 @@ const TABS: TabDef[] = [
   { key: 'automations', label: 'Automations', icon: Timer },
   { key: 'usage', label: 'Usage', icon: BarChart3 },
   { key: 'skills', label: 'Skills', icon: Puzzle },
+  { key: 'tasks', label: 'Tasks', icon: ListTodo },
 ];
 
 const AGENT_IDENTITY_FALLBACK: Record<string, string> = {
@@ -415,6 +417,7 @@ export default function AgentToolsPage() {
             {activeTab === 'automations' && <AutomationsContent agentId={selectedAgentId} />}
             {activeTab === 'usage' && <UsageContent agentId={selectedAgentId} />}
             {activeTab === 'skills' && <SkillsContent agentId={selectedAgentId} />}
+            {activeTab === 'tasks' && <TasksContent agentId={selectedAgentId} />}
           </Suspense>
         )}
       </div>

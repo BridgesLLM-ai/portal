@@ -2,6 +2,23 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.23.0] — 2026-04-02
+
+### ✨ New Features
+
+#### Background Tasks Visibility
+- **Add Background Tasks page and Agent Tools tab** — Admins can now view running and recent subagents/cron-backed jobs in a dedicated Tasks view, with status, model, duration, parent session, summaries, and failures.
+- **Add `/api/gateway/tasks` backend endpoint** — The portal now queries OpenClaw session state directly to surface detached task activity in the UI.
+
+### 🐛 Bug Fixes
+
+#### Agent Chat / Project Chat
+- **Fix stale assistant text after reconnect** — Stream resume now only rehydrates accumulated text while the assistant is actively streaming. Tool/thinking reconnects no longer replay stale content from a prior phase.
+- **Suppress phantom live-bubble content during reconnect/tool phases** — Project chat now clears resume-seeded content when real tool/thinking events arrive, preventing duplicated or misleading partial assistant output after tab sleep, disconnects, or tool transitions.
+
+#### Tasks UI
+- **Fix Tasks page double-`/api` request bug** — Corrected the Tasks page client path so it requests `/api/gateway/tasks` instead of the broken `/api/api/gateway/tasks`.
+
 ## [3.22.0] — 2026-04-01
 
 ### 🔧 Maintenance

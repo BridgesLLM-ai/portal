@@ -55,7 +55,10 @@ interface LocalWsManager {
   send: (data: any) => boolean;
   addHandler: (handler: WsEventHandler) => void;
   removeHandler: (handler: WsEventHandler) => void;
+  onDisconnect: (cb: () => void) => (() => void);
+  onReconnect: (cb: () => void) => (() => void);
   isConnected: () => boolean;
+  reconnect: () => void;
   close: () => void;
 }
 
@@ -64,16 +67,30 @@ function createLocalWsManager(url: string): LocalWsManager {
   let intentionallyClosed = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectAttempts = 0;
+  let wasConnectedBefore = false;
   const handlers = new Set<WsEventHandler>();
+  const disconnectCallbacks = new Set<() => void>();
+  const reconnectCallbacks = new Set<() => void>();
 
   function connect() {
     if (intentionallyClosed) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     try {
       ws = new WebSocket(url);
-    } catch { return; }
+    } catch {
+      scheduleReconnect();
+      return;
+    }
 
     ws.onopen = () => {
+      const isReconnect = wasConnectedBefore;
+      wasConnectedBefore = true;
       reconnectAttempts = 0;
+      if (isReconnect) {
+        for (const cb of reconnectCallbacks) {
+          try { cb(); } catch (err) { console.error('[project-ws] reconnect callback error:', err); }
+        }
+      }
     };
 
     ws.onmessage = (event) => {
@@ -86,7 +103,12 @@ function createLocalWsManager(url: string): LocalWsManager {
 
     ws.onclose = () => {
       ws = null;
-      if (!intentionallyClosed) scheduleReconnect();
+      if (!intentionallyClosed) {
+        for (const cb of disconnectCallbacks) {
+          try { cb(); } catch (err) { console.error('[project-ws] disconnect callback error:', err); }
+        }
+        scheduleReconnect();
+      }
     };
 
     ws.onerror = () => {};
@@ -111,12 +133,31 @@ function createLocalWsManager(url: string): LocalWsManager {
     },
     addHandler(handler: WsEventHandler) { handlers.add(handler); },
     removeHandler(handler: WsEventHandler) { handlers.delete(handler); },
+    onDisconnect(cb: () => void) {
+      disconnectCallbacks.add(cb);
+      return () => { disconnectCallbacks.delete(cb); };
+    },
+    onReconnect(cb: () => void) {
+      reconnectCallbacks.add(cb);
+      return () => { reconnectCallbacks.delete(cb); };
+    },
     isConnected() { return ws !== null && ws.readyState === WebSocket.OPEN; },
+    reconnect() {
+      intentionallyClosed = false;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (ws) {
+        try { ws.close(); } catch {}
+        ws = null;
+      }
+      connect();
+    },
     close() {
       intentionallyClosed = true;
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       if (ws) { try { ws.close(); } catch {} ws = null; }
       handlers.clear();
+      disconnectCallbacks.clear();
+      reconnectCallbacks.clear();
     },
   };
 }
@@ -507,6 +548,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [sessionReady, setSessionReady] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
+  const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
 
   // Chat state
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -532,6 +574,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const assembledRef = useRef('');
   const lastSegmentStartRef = useRef(0);
   const lastRawTextLenRef = useRef(0); // Track raw gateway text length for accurate graduation
+  const resumeSeededContentRef = useRef(false);
+  const suppressLiveBubbleContentRef = useRef(false);
   const isStreamActiveRef = useRef(false);
   const toolCounterRef = useRef(0);
   const hasRealToolEventsRef = useRef(false);
@@ -637,6 +681,134 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     if (watchdogRef.current) { clearTimeout(watchdogRef.current); watchdogRef.current = null; }
   }, []);
 
+  const ensureStreamingAssistant = useCallback((content?: string) => {
+    const currentId = streamingAssistantIdRef.current ?? ('stream-resume-' + Date.now());
+    streamingAssistantIdRef.current = currentId;
+    setMessages(prev => {
+      const exists = prev.some(m => m.id === currentId);
+      if (!exists) {
+        return [...prev, {
+          id: currentId,
+          role: 'assistant' as const,
+          content: typeof content === 'string' ? content : '',
+          createdAt: new Date(),
+          toolCalls: [],
+        }];
+      }
+      if (typeof content !== 'string') return prev;
+      return prev.map(m => m.id === currentId ? { ...m, content } : m);
+    });
+    return currentId;
+  }, []);
+
+  const loadHistoryViaWs = useCallback(async (manager: LocalWsManager, session: string) => {
+    const loaded = await new Promise<ChatMessage[]>((resolve, reject) => {
+      const requestId = 'phist-' + Date.now();
+      const histHandler = (d: any) => {
+        if (d.type === 'history' && d.requestId === requestId) {
+          clearTimeout(timeout);
+          manager.removeHandler(histHandler);
+          resolve((d.messages || []).map(parseHistoryMessage));
+        } else if (d.type === 'error' && d.requestId === requestId) {
+          clearTimeout(timeout);
+          manager.removeHandler(histHandler);
+          reject(new Error(d.content));
+        }
+      };
+      const timeout = setTimeout(() => {
+        manager.removeHandler(histHandler);
+        reject(new Error('History timeout'));
+      }, 10000);
+      manager.addHandler(histHandler);
+      const sent = manager.send({ type: 'history', session, provider: 'OPENCLAW', requestId });
+      if (!sent) {
+        clearTimeout(timeout);
+        manager.removeHandler(histHandler);
+        reject(new Error('Live chat socket is disconnected'));
+      }
+    });
+    setMessages(loaded);
+    setSessionError(null);
+    return loaded;
+  }, []);
+
+  const clearResumeSeededContent = useCallback((assistantId?: string | null) => {
+    if (!resumeSeededContentRef.current) return;
+    resumeSeededContentRef.current = false;
+    assembledRef.current = '';
+    lastSegmentStartRef.current = 0;
+    lastRawTextLenRef.current = 0;
+    const cid = assistantId || streamingAssistantIdRef.current;
+    if (cid) {
+      setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: '' } : m));
+    }
+  }, []);
+
+  const syncStreamState = useCallback(async (
+    manager: LocalWsManager | null,
+    options: { reloadHistoryIfIdle?: boolean } = {}
+  ) => {
+    const currentSession = sessionKeyRef.current;
+    if (!currentSession) return false;
+
+    const { data } = await client.get('/gateway/stream-status', {
+      params: { session: currentSession, provider: 'OPENCLAW' },
+      _silent: true,
+    } as any);
+
+    if (data.active) {
+      isStreamActiveRef.current = true;
+      suppressLiveBubbleContentRef.current = true;
+      setIsRunning(true);
+      const resumePhase = data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking';
+      setStreamingPhase(resumePhase);
+      setActiveToolName(data.toolName || null);
+      setStatusText(data.toolName ? `Using ${data.toolName}…` : 'Reconnecting to stream…');
+      setConnectionNotice(null);
+
+      if (resumePhase === 'streaming' && typeof data.content === 'string' && data.content.length > 0) {
+        const safeText = sanitizeAssistantContent(data.content);
+        resumeSeededContentRef.current = true;
+        assembledRef.current = safeText;
+        lastSegmentStartRef.current = 0;
+        lastRawTextLenRef.current = safeText.length;
+        ensureStreamingAssistant(safeText);
+      } else {
+        resumeSeededContentRef.current = false;
+        assembledRef.current = '';
+        lastSegmentStartRef.current = 0;
+        lastRawTextLenRef.current = 0;
+        ensureStreamingAssistant();
+      }
+
+      manager?.send({ type: 'reconnect', session: currentSession, provider: 'OPENCLAW' });
+      resetWatchdog();
+      return true;
+    }
+
+    clearWatchdog();
+    if (isStreamActiveRef.current) {
+      isStreamActiveRef.current = false;
+      suppressLiveBubbleContentRef.current = false;
+      setIsRunning(false);
+      setStreamingPhase('idle');
+      setStatusText(null);
+      setActiveToolName(null);
+      streamingAssistantIdRef.current = null;
+    }
+
+    if (options.reloadHistoryIfIdle && manager) {
+      setIsLoadingHistory(true);
+      try {
+        await loadHistoryViaWs(manager, currentSession);
+      } finally {
+        setIsLoadingHistory(false);
+      }
+    }
+
+    return false;
+  }, [clearWatchdog, ensureStreamingAssistant, loadHistoryViaWs, resetWatchdog]);
+
   const appendThinkingChunk = useCallback((assistantId: string | null, chunk: string) => {
     if (!chunk) return;
     setThinkingContent(prev => mergeThinkingStream(prev, chunk));
@@ -662,12 +834,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         break;
       }
       case 'status': {
+        clearResumeSeededContent(assistantId);
         setStatusText(data.content || null);
         // OpenClaw streams thinking separately; keep status out of thought text.
         if (!assembledRef.current) setStreamingPhase('thinking');
         break;
       }
       case 'thinking': {
+        clearResumeSeededContent(assistantId);
         appendThinkingChunk(
           assistantId,
           extractThinkingChunk('thinking', data.content, assembledRef.current.length > 0),
@@ -691,6 +865,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         break;
       }
       case 'tool_start': {
+        clearResumeSeededContent(assistantId);
         hasRealToolEventsRef.current = true;
         const toolName = (data.toolName || data.content || 'tool').replace(/^Using tool:\s*/i, '').replace(/^[^\s]+\s+Using tool:\s*/i, '').trim();
         if (assembledRef.current && assembledRef.current.trim().length > 0) {
@@ -752,6 +927,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         break;
       }
       case 'toolCall': {
+        clearResumeSeededContent(assistantId);
         const tid = 'tool-' + (++toolCounterRef.current);
         setStreamingPhase('tool');
         setActiveToolName(data.name);
@@ -814,6 +990,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           });
         }
 
+        resumeSeededContentRef.current = false;
+        suppressLiveBubbleContentRef.current = false;
         assembledRef.current = fullText;
         setStatusText(null);
         setStreamingPhase('streaming');
@@ -840,6 +1018,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         }
         isStreamActiveRef.current = false;
         streamingAssistantIdRef.current = null;
+        resumeSeededContentRef.current = false;
+        suppressLiveBubbleContentRef.current = false;
         setMessages(prev => prev.map(m =>
           m.id === cid ? { ...m, content: fc, provenance: prov || undefined } : m
         ));
@@ -856,20 +1036,26 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setIsRunning(false);
         isStreamActiveRef.current = false;
         streamingAssistantIdRef.current = null;
+        resumeSeededContentRef.current = false;
+        suppressLiveBubbleContentRef.current = false;
         break;
       }
       case 'stream_resume': {
+        suppressLiveBubbleContentRef.current = true;
+        const resumePhase = data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking';
         if (!streamingAssistantIdRef.current) {
           const resumeId = 'stream-resume-' + Date.now();
           streamingAssistantIdRef.current = resumeId;
           assembledRef.current = '';
           isStreamActiveRef.current = true;
           setIsRunning(true);
-          setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
+          setStreamingPhase(resumePhase);
+          setActiveToolName(data.toolName || null);
           if (data.toolName) setStatusText(`Using ${data.toolName}…`);
           setMessages(prev => [...prev, { id: resumeId, role: 'assistant' as const, content: '', createdAt: new Date(), toolCalls: [] }]);
         }
-        if (typeof data.content === 'string') {
+        if (resumePhase === 'streaming' && typeof data.content === 'string') {
+          resumeSeededContentRef.current = true;
           const safeChunk = sanitizeAssistantContent(data.content);
           const fullText = mergeAssistantStream(assembledRef.current, safeChunk, { replace: true });
           lastRawTextLenRef.current = fullText.length;
@@ -887,17 +1073,20 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           assembledRef.current = fullText;
           const cid = streamingAssistantIdRef.current;
           setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: st } : m));
+        } else {
+          resumeSeededContentRef.current = false;
         }
         break;
       }
       case 'connected':
         setWsConnected(true);
+        setConnectionNotice(null);
         break;
       case 'stream_ended':
       case 'keepalive':
         break;
     }
-  }, [resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent]);
+  }, [clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent]);
 
   const handleWsEventRef = useRef(handleWsEvent);
   useEffect(() => { handleWsEventRef.current = handleWsEvent; }, [handleWsEvent]);
@@ -905,11 +1094,13 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   // ── Ensure session + WS setup on mount ──
   useEffect(() => {
     let cancelled = false;
+    let cleanupTransport: (() => void) | null = null;
 
     async function init() {
       try {
         setIsLoadingHistory(true);
-        // Ensure session exists
+        setConnectionNotice('Connecting to project agent…');
+
         const { data } = await client.post(`/projects/${projectName}/assistant/ensure-session`, {
           model: modelRef.current,
         });
@@ -920,53 +1111,81 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setAgentId(aid);
         if (m) setSelectedModel(m);
 
-        // Create WS connection
         const manager = createLocalWsManager(getWsUrl());
         wsRef.current = manager;
 
         const stableHandler = (d: any) => handleWsEventRef.current(d);
         manager.addHandler(stableHandler);
 
-        // Wait for WS to be connected before loading history
+        const unsubDisconnect = manager.onDisconnect(() => {
+          setWsConnected(false);
+          setConnectionNotice(
+            isStreamActiveRef.current
+              ? 'Connection lost — reconnecting to the live stream…'
+              : 'Connection lost — reconnecting…'
+          );
+          if (isStreamActiveRef.current) {
+            setIsRunning(true);
+            setStreamingPhase(prev => prev === 'idle' ? 'thinking' : prev);
+            setStatusText('Reconnecting to stream…');
+          }
+        });
+
+        const unsubReconnect = manager.onReconnect(async () => {
+          setWsConnected(true);
+          setConnectionNotice(null);
+          try {
+            await syncStreamState(manager, { reloadHistoryIfIdle: true });
+          } catch (err) {
+            console.warn('[ProjectChat] Reconnect sync failed:', err);
+          }
+        });
+
+        cleanupTransport = () => {
+          manager.removeHandler(stableHandler);
+          unsubDisconnect();
+          unsubReconnect();
+        };
+
+        if (manager.isConnected()) {
+          setWsConnected(true);
+          setConnectionNotice(null);
+        }
+
         await new Promise<void>((resolve) => {
           if (manager.isConnected()) { resolve(); return; }
           const check = setInterval(() => {
             if (manager.isConnected() || cancelled) { clearInterval(check); resolve(); }
           }, 100);
-          setTimeout(() => { clearInterval(check); resolve(); }, 3000); // timeout safety
+          setTimeout(() => { clearInterval(check); resolve(); }, 3000);
         });
 
-        if (cancelled) { manager.close(); return; }
-        setWsConnected(true);
+        if (cancelled) {
+          cleanupTransport?.();
+          manager.close();
+          return;
+        }
+
+        setWsConnected(manager.isConnected());
         setSessionReady(true);
+        if (manager.isConnected()) setConnectionNotice(null);
         sessionKeyRef.current = sk;
 
-        // Load history via WS
-        const loaded = await new Promise<ChatMessage[]>((resolve, reject) => {
-          const timeout = setTimeout(() => { manager.removeHandler(histHandler); reject(new Error('History timeout')); }, 10000);
-          const requestId = 'phist-' + Date.now();
-          const histHandler = (d: any) => {
-            if (d.type === 'history' && d.requestId === requestId) {
-              clearTimeout(timeout);
-              manager.removeHandler(histHandler);
-              resolve((d.messages || []).map(parseHistoryMessage));
-            } else if (d.type === 'error' && d.requestId === requestId) {
-              clearTimeout(timeout);
-              manager.removeHandler(histHandler);
-              reject(new Error(d.content));
-            }
-          };
-          manager.addHandler(histHandler);
-          manager.send({ type: 'history', session: sk, provider: 'OPENCLAW', requestId });
-        });
+        await loadHistoryViaWs(manager, sk);
+        await syncStreamState(manager);
 
         if (!cancelled) {
-          setMessages(loaded);
           setIsLoadingHistory(false);
         }
       } catch (err: any) {
         if (!cancelled) {
-          setSessionError(err.message || 'Failed to initialize session');
+          const message = err?.message || 'Failed to initialize session';
+          if (message === 'History timeout' || message === 'Live chat socket is disconnected') {
+            setSessionError(null);
+            setConnectionNotice('Live chat socket is still reconnecting…');
+          } else {
+            setSessionError(message);
+          }
           setIsLoadingHistory(false);
         }
       }
@@ -976,6 +1195,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
     return () => {
       cancelled = true;
+      cleanupTransport?.();
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
@@ -983,12 +1203,36 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       if (watchdogRef.current) clearTimeout(watchdogRef.current);
       if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
     };
-  }, [projectName]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [projectName, loadHistoryViaWs, syncStreamState]);
 
   // ── Send message ──
   const sendMessage = useCallback((text: string) => {
     const sk = sessionKeyRef.current;
-    if (!sk || isStreamActiveRef.current) return;
+    if (!sk || isStreamActiveRef.current) return false;
+
+    const manager = wsRef.current;
+    if (!manager || !manager.isConnected()) {
+      setWsConnected(false);
+      setConnectionNotice('Connection lost — reconnecting. Your draft is still in the composer.');
+      manager?.reconnect();
+      return false;
+    }
+
+    const sent = manager.send({
+      type: 'send',
+      message: text,
+      session: sk,
+      provider: 'OPENCLAW',
+      agentId: agentId,
+      model: modelRef.current,
+    });
+
+    if (!sent) {
+      setWsConnected(false);
+      setConnectionNotice('Couldn’t reach the live chat socket. Reconnecting now — your draft is still in the composer.');
+      manager.reconnect();
+      return false;
+    }
 
     const userMsg: ChatMessage = { id: nextId(), role: 'user', content: text, createdAt: new Date() };
     setMessages(prev => [...prev, userMsg]);
@@ -998,6 +1242,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     lastRawTextLenRef.current = 0;
     toolCounterRef.current = 0;
     hasRealToolEventsRef.current = false;
+    resumeSeededContentRef.current = false;
+    suppressLiveBubbleContentRef.current = false;
     setThinkingContent('');
     setStatusText(null);
     setStreamingPhase('thinking');
@@ -1009,18 +1255,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     setIsRunning(true);
     isStreamActiveRef.current = true;
     resetWatchdog();
-
-    const manager = wsRef.current;
-    if (manager && manager.isConnected()) {
-      manager.send({
-        type: 'send',
-        message: text,
-        session: sk,
-        provider: 'OPENCLAW',
-        agentId: agentId,
-        model: modelRef.current,
-      });
-    }
+    setConnectionNotice(null);
+    return true;
   }, [agentId, resetWatchdog]);
 
   // ── Cancel stream ──
@@ -1137,9 +1373,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     if (stillUploading) return;
     const attachText = buildAttachmentText();
     const fullMessage = attachText + input.trim();
-    setInput('');
-    setPendingAttachments([]);
-    sendMessage(fullMessage);
+    const sent = sendMessage(fullMessage);
+    if (sent) {
+      setInput('');
+      setPendingAttachments([]);
+    }
   }, [input, isRunning, sessionReady, pendingAttachments, buildAttachmentText, sendMessage]);
 
   // ── Model change ──
@@ -1259,6 +1497,21 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         </div>
       )}
 
+      {connectionNotice && !sessionError && (
+        <div className="px-3 py-2 bg-amber-500/10 border-b border-amber-500/20 text-[11px] text-amber-300 flex items-center gap-2">
+          <RotateCcw size={12} className={!wsConnected ? 'animate-spin' : ''} />
+          <span className="flex-1 min-w-0">{connectionNotice}</span>
+          {!wsConnected && (
+            <button
+              onClick={() => wsRef.current?.reconnect()}
+              className="px-2 py-0.5 rounded-md border border-amber-500/20 hover:bg-amber-500/10 transition-colors text-[10px] font-medium"
+            >
+              Retry now
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Compaction indicator */}
       <AnimatePresence>
         {compactionPhase !== 'idle' && (
@@ -1325,7 +1578,16 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
               if (msg.role === 'assistant') {
                 const toolCalls = msg.toolCalls || [];
-                const hasContent = !!msg.content;
+                const hasRunningTool = toolCalls.some(tc => tc.status === 'running');
+                const suppressCurrentBubbleText = isCurrentlyStreaming && (
+                  streamingPhase !== 'streaming'
+                  || suppressLiveBubbleContentRef.current
+                  || hasRunningTool
+                  || !!activeToolName
+                  || !!statusText
+                );
+                const visibleContent = suppressCurrentBubbleText ? '' : msg.content;
+                const hasContent = !!visibleContent;
                 const thinkingContent = msg.thinkingContent;
 
                 return (
@@ -1353,21 +1615,21 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                         <div className="flex-1 min-w-0 max-w-[90%]">
                           <div
                             className={`rounded-2xl rounded-bl-sm px-3 py-2 transition-all duration-500 ${
-                              hasContent && msg.content.startsWith('⚠️')
+                              hasContent && visibleContent.startsWith('⚠️')
                                 ? 'bg-red-500/10 border border-red-500/20'
                                 : isCurrentlyStreaming
                                   ? 'border border-dashed bg-[var(--accent-bg-subtle)]'
                                   : 'bg-white/[0.06] border border-solid border-white/[0.08]'
                             }`}
-                            style={isCurrentlyStreaming && !(hasContent && msg.content.startsWith('⚠️'))
+                            style={isCurrentlyStreaming && !(hasContent && visibleContent.startsWith('⚠️'))
                               ? { borderColor: 'var(--accent-border-hover)', boxShadow: '0 0 12px var(--accent-shadow), inset 0 0 0 1px var(--accent-bg)' }
                               : undefined
                             }
                           >
-                            {hasContent && msg.content.startsWith('⚠️') ? (
+                            {hasContent && visibleContent.startsWith('⚠️') ? (
                               <div className="flex items-start gap-1.5">
                                 <XCircle size={12} className="text-red-400 flex-shrink-0 mt-0.5" />
-                                <div className="text-[11px] text-red-300">{msg.content.replace(/^⚠️\s*/, '')}</div>
+                                <div className="text-[11px] text-red-300">{visibleContent.replace(/^⚠️\s*/, '')}</div>
                               </div>
                             ) : (
                               <>
@@ -1381,7 +1643,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                                   <span className="w-1 h-1 rounded-full animate-pulse" style={{ backgroundColor: 'var(--accent-light)', opacity: 0.5 }} />
                                 </div>
                                 <div className={`text-[11px] leading-relaxed ${isCurrentlyStreaming ? 'streaming-cursor' : ''}`}>
-                                  <MarkdownRenderer content={msg.content} isStreaming={isCurrentlyStreaming} />
+                                  <MarkdownRenderer content={visibleContent} isStreaming={isCurrentlyStreaming} />
                                 </div>
                               </>
                             )}

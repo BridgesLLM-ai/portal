@@ -77,6 +77,7 @@ const oauthCallbackSchema = z.object({
 
 const OPENCLAW_BIN = 'openclaw';
 const GATEWAY_HEALTH_URL = process.env.OPENCLAW_API_URL || 'http://127.0.0.1:18789';
+const handledNativeCliDeviceCompletions = new Set<string>();
 
 function shellEscapeSingleQuotes(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -621,6 +622,23 @@ export function createAiSetupRouter(): Router {
       res.status(404).json({ error: 'Native CLI session not found' });
       return;
     }
+
+    if (status.mode === 'device_code' && status.status === 'complete' && !handledNativeCliDeviceCompletions.has(status.id)) {
+      handledNativeCliDeviceCompletions.add(status.id);
+      try {
+        await restartGateway();
+      } catch (error: any) {
+        handledNativeCliDeviceCompletions.delete(status.id);
+        console.error(`[NativeCLI] gateway restart failed after ${status.provider} login:`, error?.message || error);
+        res.status(500).json({
+          ...status,
+          success: false,
+          error: `Native CLI auth completed, but gateway restart failed: ${error?.message || 'unknown error'}`,
+        });
+        return;
+      }
+    }
+
     res.json(status);
   });
 
@@ -633,6 +651,19 @@ export function createAiSetupRouter(): Router {
 
     try {
       const result = await completeNativeCliFlow(sessionId, callbackUrl);
+      if (result?.success) {
+        try {
+          await restartGateway();
+        } catch (error: any) {
+          console.error('[NativeCLI] gateway restart failed after callback login:', error?.message || error);
+          res.status(500).json({
+            ...result,
+            success: false,
+            error: `Native CLI auth completed, but gateway restart failed: ${error?.message || 'unknown error'}`,
+          });
+          return;
+        }
+      }
       res.json(result);
     } catch (error: any) {
       console.error('[NativeCLI] callback error:', error.message);

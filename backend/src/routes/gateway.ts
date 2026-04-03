@@ -967,6 +967,43 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
   }
 });
 
+// GET /api/gateway/tasks — Query OpenClaw gateway for task/subagent state
+router.get('/tasks', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const result = await gatewayRpcCall('sessions.list', {});
+    if (!result.ok || !result.data?.sessions) {
+      res.status(502).json({ ok: false, error: result.error || 'Gateway unavailable' });
+      return;
+    }
+
+    const sessions = Array.isArray(result.data.sessions) ? result.data.sessions : [];
+
+    const taskSessions = sessions.filter((s: any) => {
+      const key = s.key || s.sessionKey || '';
+      return key.includes(':subagent:') || key.includes(':cron:');
+    });
+
+    const tasks = taskSessions.map((s: any) => ({
+      id: s.key || s.sessionKey || s.id || 'unknown',
+      name: s.displayName || s.origin?.label || s.key?.split(':').pop() || 'Task',
+      status: s.status === 'done' ? 'done' : s.status === 'error' ? 'failed' : s.endedAt ? 'done' : 'running',
+      model: s.model || s.modelProvider || 'unknown',
+      createdAt: s.startedAt,
+      updatedAt: s.endedAt || s.updatedAt,
+      duration: s.runtimeMs,
+      summary: s.origin?.label || s.displayName || null,
+      parentSession: s.origin?.from || null,
+      error: s.status === 'error' ? (s.error || 'Task failed') : null,
+    }));
+
+    res.json({ ok: true, tasks });
+  } catch (err: any) {
+    console.error('[gateway] tasks error:', err);
+    const status = err.message?.includes('ECONNREFUSED') ? 502 : 500;
+    res.status(status).json({ ok: false, error: err.message || 'Failed to get tasks' });
+  }
+});
+
 router.get('/session-info', authenticateToken, async (req: Request, res: Response) => {
   try {
     const sessionKey = resolveOpenClawSessionKey(req.query.session as string, req.user);
@@ -1691,7 +1728,9 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
       res.json({ active: false });
       return;
     }
-    const content = streamEventBus.getLatestText(sessionKey);
+    const content = info.phase === 'streaming'
+      ? streamEventBus.getLatestText(sessionKey)
+      : '';
     res.json({
       active: true,
       phase: info.phase,
@@ -2302,8 +2341,11 @@ function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtP
   const streamInfo = streamEventBus.getStreamStatus(sessionKey);
   if (streamInfo && streamInfo.active) {
     // Stream is active — subscribe and forward events.
-    // Include the latest accumulated text so the browser can recover mid-stream.
-    const latestText = streamEventBus.getLatestText(sessionKey);
+    // Only replay accumulated assistant text while the assistant is actively streaming.
+    // Tool/thinking resumes should show current status, not stale text from a prior run.
+    const latestText = streamInfo.phase === 'streaming'
+      ? streamEventBus.getLatestText(sessionKey)
+      : '';
     wsSend(ws, {
       type: 'stream_resume',
       sessionKey,

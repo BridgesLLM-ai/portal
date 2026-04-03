@@ -76,6 +76,12 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.23.0 (April 2, 2026)
+- **Background Tasks page + Agent Tools tab** — view running and recent subagents/cron jobs with status, duration, summaries, and failures.
+- **Project chat reconnect hardening** — fixes stale assistant text and phantom partial bubbles after reconnects, tab sleep, and tool/thinking transitions.
+- Fix Tasks API path regression (`/api/api/gateway/tasks` → `/api/gateway/tasks`).
+
+
 ### v3.22.0 (April 1, 2026)
 - **OpenClaw gateway compatibility update** (2026.3.31) — improved exec approvals, provider error recovery, background task flows
 - Remove unused analytics/installer subdomain routes (dead config causing TLS cert errors)
