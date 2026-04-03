@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Timer, BarChart3, Puzzle, ChevronDown, Check, Loader2, Layers, ListTodo } from 'lucide-react';
 import client from '../api/client';
+import { getShortModelLabel } from '../utils/modelId';
 
 /* ─── Lazy-loaded tab content components ────────────────── */
 
@@ -207,7 +208,7 @@ function AgentSelectorDropdown({ agents, providers, selected, onSelect, loading,
                         </div>
                         {agent.model && (
                           <span className="text-[10px] text-slate-600 font-mono truncate max-w-[60px]">
-                            {agent.model.split('/').pop()}
+                            {getShortModelLabel(agent.model)}
                           </span>
                         )}
                         {isSelected && <Check size={14} className="text-emerald-400 flex-shrink-0" />}

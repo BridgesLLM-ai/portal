@@ -9,6 +9,7 @@ import { createPortal } from 'react-dom';
 import { ChevronDown, Check, Users, Radio, Loader2, History, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import client from '../../api/client';
+import { getShortModelLabel } from '../../utils/modelId';
 
 /* ─── Mobile Bottom Sheet wrapper ───────────────────────────────────────── */
 /** Renders children in a portal as a bottom-sheet on mobile, inline absolute on desktop */
@@ -746,7 +747,7 @@ export default function AgentSelector({
                             <span className="flex-1 text-left">{getAgentLabel(agent, assistantName)}</span>
                             {agent.model && (
                               <span className="text-[10px] text-slate-600 font-mono truncate max-w-[80px]">
-                                {agent.model.split('/').pop()}
+                                {getShortModelLabel(agent.model)}
                               </span>
                             )}
                             {isSelected && (

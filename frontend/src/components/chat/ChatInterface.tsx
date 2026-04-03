@@ -41,6 +41,7 @@ import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../
 import { executeSlashCommand } from '../../utils/slashCommandExecutor';
 import client from '../../api/client';
 import sounds from '../../utils/sounds';
+import { getShortModelLabel } from '../../utils/modelId';
 
 /* ─── Per-agent identity ────────────────────────────────────────────────── */
 
@@ -704,7 +705,7 @@ function SessionControls({
   }, [isOpen]);
 
   // Extract short model name for display
-  const shortModel = currentModel?.split('/').pop() || 'default';
+  const shortModel = getShortModelLabel(currentModel, 'default');
 
   return (
     <div ref={containerRef} className="relative">

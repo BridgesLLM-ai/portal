@@ -2,6 +2,15 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.23.1] — 2026-04-02
+
+### 🐛 Hotfixes
+
+#### Agent Chat / Gateway Model Compatibility
+- **Fix React crash in Agent Chat selector** — The portal no longer assumes agent `model` fields are always plain strings. This fixes `model.split is not a function` crashes on `/agent-chats` when OpenClaw returns structured model configs.
+- **Normalize gateway model values at the backend boundary** — Structured OpenClaw model configs (for example `{ primary, fallbacks }`) are now converted into stable string model IDs before the portal API returns them.
+- **Harden model rendering across the UI** — Agent Chat, Agent Tools, Usage, and Terminal status views now safely render model labels even if a non-string value slips through.
+
 ## [3.23.0] — 2026-04-02
 
 ### ✨ New Features

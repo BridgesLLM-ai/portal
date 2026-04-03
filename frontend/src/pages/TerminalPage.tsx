@@ -12,6 +12,7 @@ import { io, Socket } from 'socket.io-client';
 import { aiAPI, terminalAPI, gatewayAPI } from '../api/endpoints';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { captureError } from '../utils/errorHandler';
+import { getShortModelLabel } from '../utils/modelId';
 import sounds from '../utils/sounds';
 import { clientRandomId } from '../utils/clientId';
 import 'xterm/css/xterm.css';
@@ -1432,7 +1433,8 @@ function OpenClawTUITab({ tabId, isActive, onConnectionChange }: {
     statusSocket.on('status', (data: any) => {
       if (data.session !== 'main') return;
       if (data.type === 'thinking') {
-        setStatusText(`🧠 Thinking${data.model ? ` (${data.model.split('/').pop()})` : ''}...`);
+        const shortModel = getShortModelLabel(data.model);
+        setStatusText(`🧠 Thinking${shortModel ? ` (${shortModel})` : ''}...`);
       } else if (data.type === 'tool_start') {
         setStatusText(`🔧 Running ${data.tool}...`);
       } else if (data.type === 'tool_end') {

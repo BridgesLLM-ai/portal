@@ -98,6 +98,49 @@ function normalizeOpenClawAgentList(rawAgents: unknown): any[] {
   return [];
 }
 
+function normalizeGatewayModelId(rawModel: unknown): string | undefined {
+  if (typeof rawModel === 'string') {
+    const trimmed = rawModel.trim();
+    return trimmed || undefined;
+  }
+
+  if (!rawModel) return undefined;
+
+  if (Array.isArray(rawModel)) {
+    for (const entry of rawModel) {
+      const normalized = normalizeGatewayModelId(entry);
+      if (normalized) return normalized;
+    }
+    return undefined;
+  }
+
+  if (typeof rawModel !== 'object') return undefined;
+
+  const record = rawModel as Record<string, any>;
+  const provider = typeof record.provider === 'string' ? record.provider.trim() : '';
+  const directModel = normalizeGatewayModelId(record.model);
+  if (provider && directModel && !directModel.includes('/')) {
+    return `${provider}/${directModel}`;
+  }
+
+  const candidates = [
+    record.primary,
+    record.currentModel,
+    record.defaultModel,
+    record.id,
+    record.name,
+    record.fallbacks,
+    directModel,
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeGatewayModelId(candidate);
+    if (normalized) return normalized;
+  }
+
+  return undefined;
+}
+
 function isSandboxProjectAgentIdForUser(agentId: string, user: JwtPayload): boolean {
   const normalized = String(agentId || '').trim();
   if (!normalized) return false;
@@ -248,7 +291,12 @@ async function listOpenClawAgentsForSelector(): Promise<any[]> {
     merged.set('main', { id: 'main' });
   }
 
-  return Array.from(merged.values());
+  return Array.from(merged.values()).map((agent) => ({
+    ...agent,
+    model: normalizeGatewayModelId(agent?.model ?? agent?.defaultModel ?? agent?.currentModel),
+    defaultModel: normalizeGatewayModelId(agent?.defaultModel),
+    currentModel: normalizeGatewayModelId(agent?.currentModel),
+  }));
 }
 
 /* ─── Helpers ──────────────────────────────────────────────────────────── */
@@ -934,7 +982,7 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
     // Model breakdown
     const modelCounts: Record<string, number> = {};
     agentFilteredSessions.forEach((s: any) => {
-      const model = s.model || s.defaultModel || 'unknown';
+      const model = normalizeGatewayModelId(s.model ?? s.defaultModel) || 'unknown';
       modelCounts[model] = (modelCounts[model] || 0) + 1;
     });
     const modelBreakdown = Object.entries(modelCounts)
@@ -948,7 +996,7 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
       .map((s: any) => ({
         key: s.sessionKey || s.key || s.id,
         agent: s.agentId || 'main',
-        model: s.model || s.defaultModel || 'unknown',
+        model: normalizeGatewayModelId(s.model ?? s.defaultModel) || 'unknown',
         lastActivity: s.lastActivityMs || s.updatedAt || s.updatedAtMs,
         turns: s.turns || 0,
       }));
@@ -987,7 +1035,7 @@ router.get('/tasks', authenticateToken, requireApproved, async (req: Request, re
       id: s.key || s.sessionKey || s.id || 'unknown',
       name: s.displayName || s.origin?.label || s.key?.split(':').pop() || 'Task',
       status: s.status === 'done' ? 'done' : s.status === 'error' ? 'failed' : s.endedAt ? 'done' : 'running',
-      model: s.model || s.modelProvider || 'unknown',
+      model: normalizeGatewayModelId(s.model) || s.modelProvider || 'unknown',
       createdAt: s.startedAt,
       updatedAt: s.endedAt || s.updatedAt,
       duration: s.runtimeMs,
@@ -1575,7 +1623,9 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
       if (slashResult.handled) {
         res.json({
           response: slashResult.content || '',
-          model: slashResult.metadata?.model || loadNativeSession(provider.providerName, slashResult.sessionId)?.model || null,
+          model: normalizeGatewayModelId(slashResult.metadata?.model)
+            || normalizeGatewayModelId(loadNativeSession(provider.providerName, slashResult.sessionId)?.model)
+            || null,
           provider: provider.providerName,
           provenance,
           sessionId: slashResult.sessionId,
@@ -1645,7 +1695,13 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     const resolvedSessionId = typeof result?.metadata?.resolvedSessionId === 'string' && result.metadata.resolvedSessionId.trim()
       ? result.metadata.resolvedSessionId.trim()
       : sessionId;
-    res.json({ response: result.fullText, model: result.metadata?.model, provider: provider.providerName, provenance, sessionId: resolvedSessionId });
+    res.json({
+      response: result.fullText,
+      model: normalizeGatewayModelId(result.metadata?.model) || null,
+      provider: provider.providerName,
+      provenance,
+      sessionId: resolvedSessionId,
+    });
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 503;
     const friendlyError = status === 403
@@ -1693,7 +1749,7 @@ router.get('/agents', authenticateToken, requireAdmin, async (_req: Request, res
           id,
           name: a.name || undefined,
           identity,
-          model: a.model || a.defaultModel || undefined,
+          model: normalizeGatewayModelId(a.model ?? a.defaultModel ?? a.currentModel),
           workspace: a.workspace || undefined,
           avatarUrl: subAgentAvatarMap[id] || undefined,
         };
