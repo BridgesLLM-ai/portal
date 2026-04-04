@@ -5,7 +5,6 @@ import { requireApproved } from '../middleware/requireApproved';
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'fs';
 import path from 'path';
 import { AgentRegistry, AgentProviderName } from '../agents';
-import { invalidateProviderAvailabilityCache } from '../agents/providerAvailability';
 import { AgentAbortError } from '../agents/AgentProvider.interface';
 import { listProviderModels } from '../agents/providerModels';
 import { getProviderCommandCatalog } from '../agents/providerCommandCatalog';
@@ -82,7 +81,7 @@ function resolveOpenClawSessionKey(rawSession: unknown, user?: Pick<JwtPayload, 
   if (session.startsWith('agent:')) return session;
 
   const isOwnerMainAlias = isOwnerRole(user?.role)
-    && (!session || session === 'main');
+    && (!session || session === 'main' || session.startsWith('new-'));
   if (isOwnerMainAlias) return 'agent:main:main';
 
   return session;
@@ -97,6 +96,49 @@ function normalizeOpenClawAgentList(rawAgents: unknown): any[] {
     }));
   }
   return [];
+}
+
+function normalizeGatewayModelId(rawModel: unknown): string | undefined {
+  if (typeof rawModel === 'string') {
+    const trimmed = rawModel.trim();
+    return trimmed || undefined;
+  }
+
+  if (!rawModel) return undefined;
+
+  if (Array.isArray(rawModel)) {
+    for (const entry of rawModel) {
+      const normalized = normalizeGatewayModelId(entry);
+      if (normalized) return normalized;
+    }
+    return undefined;
+  }
+
+  if (typeof rawModel !== 'object') return undefined;
+
+  const record = rawModel as Record<string, any>;
+  const provider = typeof record.provider === 'string' ? record.provider.trim() : '';
+  const directModel = normalizeGatewayModelId(record.model);
+  if (provider && directModel && !directModel.includes('/')) {
+    return `${provider}/${directModel}`;
+  }
+
+  const candidates = [
+    record.primary,
+    record.currentModel,
+    record.defaultModel,
+    record.id,
+    record.name,
+    record.fallbacks,
+    directModel,
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeGatewayModelId(candidate);
+    if (normalized) return normalized;
+  }
+
+  return undefined;
 }
 
 function isSandboxProjectAgentIdForUser(agentId: string, user: JwtPayload): boolean {
@@ -132,6 +174,20 @@ function assertGatewaySessionAccess(sessionKey: string, user: JwtPayload, option
 function normalizeProviderName(input: unknown): AgentProviderName {
   const normalized = String(input || 'OPENCLAW').trim().toUpperCase();
   return (normalized || 'OPENCLAW') as AgentProviderName;
+}
+
+function isNativeSessionPlaceholder(rawSession: unknown): boolean {
+  const session = typeof rawSession === 'string' ? rawSession.trim() : '';
+  return !session || session === 'main' || session.startsWith('new-') || session.startsWith('agent:');
+}
+
+function getOwnedNativeSession(providerName: AgentProviderName, userId: string, rawSession: unknown) {
+  if (isNativeSessionPlaceholder(rawSession)) return null;
+  const sessionId = typeof rawSession === 'string' ? rawSession.trim() : '';
+  if (!sessionId) return null;
+  const session = loadNativeSession(providerName, sessionId);
+  if (!session || session.userId !== userId) return null;
+  return session;
 }
 
 function humanizeProviderError(providerName: AgentProviderName, rawMessage: string): string {
@@ -249,7 +305,12 @@ async function listOpenClawAgentsForSelector(): Promise<any[]> {
     merged.set('main', { id: 'main' });
   }
 
-  return Array.from(merged.values());
+  return Array.from(merged.values()).map((agent) => ({
+    ...agent,
+    model: normalizeGatewayModelId(agent?.model ?? agent?.defaultModel ?? agent?.currentModel),
+    defaultModel: normalizeGatewayModelId(agent?.defaultModel),
+    currentModel: normalizeGatewayModelId(agent?.currentModel),
+  }));
 }
 
 /* ─── Helpers ──────────────────────────────────────────────────────────── */
@@ -563,248 +624,6 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
   });
 }
 
-
-function parseCliJsonPayload(rawOutput: string): any {
-  const cleaned = String(rawOutput || '')
-    .replace(/\u001b\[[0-9;]*m/g, '')
-    .trim();
-  if (!cleaned) throw new Error('No JSON output from command');
-
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    // fall through
-  }
-
-  const firstObject = cleaned.indexOf('{');
-  const firstArray = cleaned.indexOf('[');
-  const starts = [firstObject, firstArray].filter((idx) => idx >= 0);
-  if (!starts.length) {
-    throw new Error('No JSON payload found in command output');
-  }
-
-  const start = Math.min(...starts);
-  const candidate = cleaned.slice(start).trim();
-  return JSON.parse(candidate);
-}
-
-
-function runOpenClawJsonCommandAsync(args: string[], timeoutMs = 15_000): Promise<any> {
-  const { spawn } = require('child_process');
-  const cleanEnv = { ...process.env };
-  delete cleanEnv.OPENCLAW_GATEWAY_TOKEN;
-  delete cleanEnv.OPENCLAW_API_URL;
-  cleanEnv.FORCE_COLOR = '0';
-  cleanEnv.NO_COLOR = '1';
-  return new Promise((resolve, reject) => {
-    const proc = spawn('openclaw', args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: cleanEnv,
-    });
-    let stdout = '';
-    let stderr = '';
-    proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
-    proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
-    const timer = setTimeout(() => { proc.kill('SIGKILL'); reject(new Error('Command timeout')); }, timeoutMs);
-    proc.on('close', (code: number) => {
-      clearTimeout(timer);
-      const combined = `${stdout}\n${stderr}`.trim();
-      if (code !== 0 && !combined) { reject(new Error(`openclaw ${args.join(' ')} failed with exit code ${code}`)); return; }
-      try { resolve(parseCliJsonPayload(combined)); }
-      catch (e) { reject(e); }
-    });
-    proc.on('error', (err: Error) => { clearTimeout(timer); reject(err); });
-  });
-}
-
-function normalizeNativeTaskStatus(status: string | null | undefined): 'queued' | 'running' | 'succeeded' | 'failed' | 'timed_out' | 'cancelled' | 'lost' | 'unknown' {
-  const s = String(status || '').trim().toLowerCase();
-  if (!s) return 'unknown';
-  if (s === 'queued') return 'queued';
-  if (s === 'running') return 'running';
-  if (s === 'succeeded') return 'succeeded';
-  if (s === 'failed') return 'failed';
-  if (s === 'timed_out') return 'timed_out';
-  if (s === 'cancelled') return 'cancelled';
-  if (s === 'lost') return 'lost';
-  return 'unknown';
-}
-
-function cleanNativeTaskPrompt(rawTask: string): string {
-  let text = String(rawTask || '');
-  if (!text) return '';
-
-  text = text.replace(/<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>[\s\S]*?<<<END_OPENCLAW_INTERNAL_CONTEXT>>>/g, '');
-  text = text.replace(/\[Subagent Context\][\s\S]*?\[Subagent Task\]:\s*/g, '');
-  text = text.replace(/^\[[^\]]+\]\s*/g, '');
-  return text.trim();
-}
-
-function deriveNativeTaskName(task: any): string {
-  const label = String(task?.label || '').trim();
-  if (label) return label;
-
-  const cleaned = cleanNativeTaskPrompt(String(task?.task || ''));
-  if (!cleaned) {
-    const runtime = String(task?.runtime || 'task');
-    return `${runtime} task`;
-  }
-
-  const firstLine = cleaned.split(/\r?\n/)[0].trim();
-  if (firstLine.length <= 96) return firstLine;
-  return `${firstLine.slice(0, 93)}...`;
-}
-
-function readSessionModelHistory(sessionKey: string | null | undefined, sessionId: string | null | undefined): string[] {
-  const key = String(sessionKey || '').trim();
-  const id = String(sessionId || '').trim();
-  if (!id && !key) return [];
-
-  try {
-    const sessionsDir = resolveSessionsDir(key || undefined);
-    const fileId = id || resolveSessionFileId(key, sessionsDir);
-    if (!fileId) return [];
-
-    const file = path.join(sessionsDir, `${fileId}.jsonl`);
-    if (!existsSync(file)) return [];
-
-    const seen = new Set<string>();
-    const data = readFileSync(file, 'utf-8');
-    for (const line of data.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line);
-
-        if (entry?.type === 'model_change' && entry?.modelId) {
-          const provider = String(entry.provider || '').trim();
-          const model = String(entry.modelId || '').trim();
-          if (model) seen.add(provider ? `${provider}/${model}` : model);
-          continue;
-        }
-
-        if (entry?.type === 'message' && entry?.message?.role === 'assistant') {
-          const provider = String(entry.message?.provider || '').trim();
-          const model = String(entry.message?.model || '').trim();
-          if (model) seen.add(provider ? `${provider}/${model}` : model);
-        }
-      } catch {
-        // ignore malformed line
-      }
-    }
-
-    return [...seen];
-  } catch {
-    return [];
-  }
-}
-
-
-function parseDurationTextToMs(raw?: string | null): number | null {
-  const input = String(raw || '').trim();
-  if (!input) return null;
-  const m = input.match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h)$/i);
-  if (!m) return null;
-  const value = Number(m[1]);
-  const unit = m[2].toLowerCase();
-  if (!Number.isFinite(value)) return null;
-  if (unit === 'ms') return Math.round(value);
-  if (unit === 's') return Math.round(value * 1000);
-  if (unit === 'm') return Math.round(value * 60_000);
-  if (unit === 'h') return Math.round(value * 3_600_000);
-  return null;
-}
-
-function mapArchivedTaskStatus(raw?: string | null): 'done' | 'failed' | 'cancelled' | 'running' | 'unknown' {
-  const s = String(raw || '').trim().toLowerCase();
-  if (!s) return 'unknown';
-  if (s.includes('completed')) return 'done';
-  if (s.includes('timed out') || s.includes('failed') || s.includes('error')) return 'failed';
-  if (s.includes('cancelled') || s.includes('aborted')) return 'cancelled';
-  if (s.includes('running') || s.includes('active')) return 'running';
-  return 'unknown';
-}
-
-function parseInternalTaskCompletionMessage(message: any, parentSessionKey: string, parentName?: string | null): any | null {
-  const content = String(message?.content || '');
-  if (!content.includes('<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>') || !content.includes('[Internal task completion event]')) {
-    return null;
-  }
-
-  const pick = (re: RegExp): string | null => {
-    const match = content.match(re);
-    return match?.[1]?.trim() || null;
-  };
-
-  const sessionKey = pick(/session_key:\s*(.+)/);
-  if (!sessionKey || (!sessionKey.includes(':subagent:') && !sessionKey.includes(':cron:'))) return null;
-
-  const taskName = pick(/task:\s*(.+)/) || 'Background task';
-  const rawStatus = pick(/status:\s*(.+)/);
-  const resultText = pick(/<<<BEGIN_UNTRUSTED_CHILD_RESULT>>>\s*([\s\S]*?)\s*<<<END_UNTRUSTED_CHILD_RESULT>>>/);
-  const runtimeText = pick(/Stats:\s*runtime\s*([^•\n]+)/);
-  const endedAt = message?.timestamp || new Date().toISOString();
-  const duration = parseDurationTextToMs(runtimeText);
-  const endedMs = Date.parse(String(endedAt));
-  const createdAt = Number.isFinite(endedMs) && duration ? new Date(endedMs - duration).toISOString() : endedAt;
-  const status = mapArchivedTaskStatus(rawStatus);
-  const summary = resultText ? resultText.trim().slice(0, 500) : null;
-  const error = status === 'failed' ? (summary || rawStatus || 'Task failed') : null;
-  const kind = sessionKey.includes(':cron:') ? 'cron' : 'subagent';
-  const agent = sessionKey.split(':')[1] || null;
-
-  return {
-    id: sessionKey,
-    name: taskName.length > 80 ? `${taskName.slice(0, 77)}...` : taskName,
-    status,
-    model: 'unknown',
-    createdAt,
-    updatedAt: endedAt,
-    endedAt,
-    duration,
-    summary,
-    parentSession: parentSessionKey,
-    parentName: parentName || null,
-    error,
-    kind,
-    agent,
-    turns: 0,
-    childCount: 0,
-    source: 'history',
-  };
-}
-
-function collectArchivedTaskCompletions(sessions: any[]): any[] {
-  const recentParentSessions = [...sessions]
-    .filter((s: any) => {
-      const key = String(s.key || s.sessionKey || '');
-      const resolvedId = String(s.id || resolveSessionFileId(key) || '');
-      return Boolean(resolvedId) && key && !key.includes(':subagent:') && !key.includes(':cron:');
-    })
-    .sort((a: any, b: any) => Number(b.lastActivityMs || 0) - Number(a.lastActivityMs || 0))
-    .slice(0, 12);
-
-  const seen = new Set<string>();
-  const archived: any[] = [];
-
-  for (const session of recentParentSessions) {
-    const parentSessionKey = String(session.key || session.sessionKey || '');
-    const sessionId = String(session.id || resolveSessionFileId(parentSessionKey) || '');
-    const parentName = session.displayName || session.origin?.label || null;
-    if (!sessionId || !parentSessionKey) continue;
-
-    const messages = readSessionMessagesEnhanced(sessionId, 120);
-    for (const message of messages) {
-      if (message?.role !== 'user' || !message?.content) continue;
-      const parsed = parseInternalTaskCompletionMessage(message, parentSessionKey, parentName);
-      if (!parsed || seen.has(parsed.id)) continue;
-      seen.add(parsed.id);
-      archived.push(parsed);
-    }
-  }
-
-  return archived;
-}
-
 /** Resolve a session key to its JSONL file id */
 function resolveSessionFileId(sessionKey: string, sessionsDir = SESSIONS_DIR): string | null {
   // Try sessions.json index first
@@ -937,46 +756,9 @@ router.post('/reconnect', authenticateToken, requireAdmin, async (_req: Request,
   }
 });
 
-
-// ── Enabled-provider enforcement ──────────────────────────────────────
-async function isProviderEnabled(providerName: string): Promise<boolean> {
+router.get('/providers', authenticateToken, async (_req: Request, res: Response) => {
   try {
-    const row = await prisma.systemSetting.findUnique({ where: { key: 'agents.enabledProviders' } });
-    if (!row?.value) return true; // No setting = all enabled
-    const enabled: string[] = JSON.parse(row.value);
-    if (!enabled.length) return true; // Empty array = all enabled
-    return enabled.includes(providerName);
-  } catch {
-    return true; // Parse error = fail open (same as /providers endpoint)
-  }
-}
-
-router.get('/providers', authenticateToken, async (req: Request, res: Response) => {
-  try {
-    const allProviders = AgentRegistry.listProviders();
-
-    // Admin pages (Agent Tools) can request unfiltered list
-    const showAll = req.query.all === 'true' && isElevatedRole(req.user!.role);
-
-    let providers = allProviders;
-    if (!showAll) {
-      // Read admin-configured enabled providers list
-      const enabledRow = await prisma.systemSetting.findUnique({ where: { key: 'agents.enabledProviders' } });
-      let enabledNames: string[] | null = null;
-      if (enabledRow?.value) {
-        try { enabledNames = JSON.parse(enabledRow.value); } catch { /* ignore parse errors, show all */ }
-      }
-      // Filter: if enabledProviders is set, only include those providers
-      if (enabledNames && enabledNames.length > 0) {
-        providers = allProviders.filter(p => enabledNames!.includes(p.name));
-      }
-    }
-
-    // Read admin-configured default provider
-    const defaultRow = await prisma.systemSetting.findUnique({ where: { key: 'agents.defaultProvider' } });
-    const defaultProvider = defaultRow?.value || 'OPENCLAW';
-
-    res.json({ providers, defaultProvider });
+    res.json({ providers: AgentRegistry.listProviders() });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to list providers', detail: err.message });
   }
@@ -1125,7 +907,9 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
     }
 
     try {
-      const parsed = await runOpenClawJsonCommandAsync(args, 10_000);
+      const { execFileSync } = require('child_process');
+      const output = execFileSync('openclaw', args, { timeout: 10000, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }) as string;
+      const parsed = JSON.parse(output.trim());
       // --all-agents returns { agents: { id: { sessions: [...] } } } — flatten
       if (parsed.agents && !parsed.sessions) {
         const allSessions: any[] = [];
@@ -1160,42 +944,39 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
 // GET /api/gateway/usage-stats — aggregates session and cron data for usage dashboard
 router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
+    const { execSync } = require('child_process');
     const selectedAgent =
       (typeof req.query.agent === 'string' && req.query.agent.trim())
       || (typeof req.query.agentId === 'string' && req.query.agentId.trim())
       || '';
-    const days = Math.max(1, Math.min(parseInt(String(req.query.days || '30'), 10) || 30, 365));
 
-    // Native OpenClaw sources
+    // Get session list
     let sessions: any[] = [];
-    let cronJobs: any[] = [];
-    let usageCost: any = null;
-
     try {
-      const parsed = await runOpenClawJsonCommandAsync(['sessions', '--json']);
-      if (Array.isArray(parsed?.sessions)) {
+      const sessionsRaw = execSync('openclaw sessions --json 2>/dev/null', { timeout: 10000, encoding: 'utf-8' });
+      const parsed = JSON.parse(sessionsRaw.trim());
+      // Handle both { sessions: [...] } and { agents: { id: { sessions: [...] } } } formats
+      if (parsed.sessions && Array.isArray(parsed.sessions)) {
         sessions = parsed.sessions;
-      } else if (parsed?.agents && typeof parsed.agents === 'object') {
+      } else if (parsed.agents) {
         for (const agent of Object.values(parsed.agents) as any[]) {
-          if (Array.isArray(agent?.sessions)) sessions.push(...agent.sessions);
+          if (agent.sessions && Array.isArray(agent.sessions)) {
+            sessions.push(...agent.sessions);
+          }
         }
       }
     } catch {
-      // keep fallback empty
+      // Sessions list failed — continue with empty array
     }
 
+    // Get cron job count
+    let cronJobs: any[] = [];
     try {
-      const parsed = await runOpenClawJsonCommandAsync(['cron', 'list', '--json']);
-      cronJobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
+      const cronsRaw = execSync('openclaw cron list --json 2>/dev/null', { timeout: 10000, encoding: 'utf-8' });
+      const parsed = JSON.parse(cronsRaw.trim());
+      cronJobs = parsed.jobs || [];
     } catch {
-      // keep fallback empty
-    }
-
-    try {
-      usageCost = await runOpenClawJsonCommandAsync(['gateway', 'usage-cost', '--json', '--days', String(days)]);
-    } catch (ucErr: any) {
-      console.warn('[gateway] usage-cost command failed:', ucErr?.message || ucErr);
-      usageCost = null;
+      // Cron list failed — continue with empty array
     }
 
     const agentFilteredSessions = selectedAgent
@@ -1205,44 +986,31 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
       ? cronJobs.filter((j: any) => (j?.agentId || j?.agent || 'main') === selectedAgent)
       : cronJobs;
 
-    const now = Date.now();
     const totalSessions = agentFilteredSessions.length;
+    const now = Date.now();
     const activeSessions = agentFilteredSessions.filter((s: any) => {
       const lastMs = s.lastActivityMs || s.updatedAt || s.updatedAtMs || 0;
-      return now - lastMs < 3_600_000; // active in last hour
+      return now - lastMs < 3600000; // active in last hour
     }).length;
 
-    // Model breakdown (native + historical model changes per session).
+    // Model breakdown
     const modelCounts: Record<string, number> = {};
-    for (const s of agentFilteredSessions) {
-      const key = String(s.sessionKey || s.key || s.id || '').trim();
-      const sessionId = String(s.sessionId || s.id || '').trim();
-      const currentModel = String(s.model || s.defaultModel || '').trim();
-      const currentProvider = String(s.modelProvider || s.providerOverride || '').trim();
-
-      const models = new Set<string>();
-      if (currentModel) models.add(currentProvider ? `${currentProvider}/${currentModel}` : currentModel);
-      for (const historical of readSessionModelHistory(key, sessionId)) {
-        if (historical) models.add(historical);
-      }
-
-      if (!models.size) models.add('unknown');
-      for (const model of models) {
-        modelCounts[model] = (modelCounts[model] || 0) + 1;
-      }
-    }
-
+    agentFilteredSessions.forEach((s: any) => {
+      const model = normalizeGatewayModelId(s.model ?? s.defaultModel) || 'unknown';
+      modelCounts[model] = (modelCounts[model] || 0) + 1;
+    });
     const modelBreakdown = Object.entries(modelCounts)
       .map(([model, count]) => ({ model, sessions: count }))
       .sort((a, b) => b.sessions - a.sessions);
 
-    const recentSessions = [...agentFilteredSessions]
+    // Recent sessions (last 20)
+    const recentSessions = agentFilteredSessions
       .sort((a: any, b: any) => (b.lastActivityMs || b.updatedAt || 0) - (a.lastActivityMs || a.updatedAt || 0))
       .slice(0, 20)
       .map((s: any) => ({
         key: s.sessionKey || s.key || s.id,
         agent: s.agentId || 'main',
-        model: s.model || s.defaultModel || 'unknown',
+        model: normalizeGatewayModelId(s.model ?? s.defaultModel) || 'unknown',
         lastActivity: s.lastActivityMs || s.updatedAt || s.updatedAtMs,
         turns: s.turns || 0,
       }));
@@ -1254,8 +1022,6 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
       activeCrons: agentFilteredCrons.filter((j: any) => j.enabled !== false).length,
       modelBreakdown,
       recentSessions,
-      usageWindowDays: days,
-      usageCost,
     });
   } catch (err: any) {
     console.error('[gateway] usage-stats error:', err);
@@ -1263,115 +1029,58 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
   }
 });
 
-// GET /api/gateway/tasks — Native OpenClaw task ledger passthrough (openclaw tasks list --json)
+// GET /api/gateway/tasks — Query OpenClaw gateway for task/subagent state
 router.get('/tasks', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    const requestedRuntime = String(req.query.runtime || '').trim().toLowerCase();
-    const requestedStatus = String(req.query.status || '').trim().toLowerCase();
-
-    const tasksPayload = await runOpenClawJsonCommandAsync(['tasks', 'list', '--json'], 30_000);
-    const rawTasks = Array.isArray(tasksPayload?.tasks) ? tasksPayload.tasks : [];
-
-    // Optional enrichment: resolve requester display names from sessions index.
-    let sessionsByKey: Record<string, any> = {};
-    try {
-      const sessionsPayload = await runOpenClawJsonCommandAsync(['sessions', '--json']);
-      const sessions: any[] = Array.isArray(sessionsPayload?.sessions)
-        ? sessionsPayload.sessions
-        : (sessionsPayload?.agents && typeof sessionsPayload.agents === 'object'
-          ? Object.values(sessionsPayload.agents).flatMap((a: any) => Array.isArray(a?.sessions) ? a.sessions : [])
-          : []);
-      sessionsByKey = Object.fromEntries(
-        sessions
-          .map((s: any) => [String(s?.key || s?.sessionKey || ''), s])
-          .filter(([k]) => Boolean(k))
-      );
-    } catch {
-      sessionsByKey = {};
+    const result = await gatewayRpcCall('sessions.list', {});
+    if (!result.ok || !result.data?.sessions) {
+      res.status(502).json({ ok: false, error: result.error || 'Gateway unavailable' });
+      return;
     }
 
-    const mapped = rawTasks
-      .map((task: any) => {
-        const runtime = String(task?.runtime || 'unknown').trim().toLowerCase();
-        const status = normalizeNativeTaskStatus(task?.status);
+    const sessions = Array.isArray(result.data.sessions) ? result.data.sessions : [];
 
-        const createdAt = Number(task?.createdAt || 0) || undefined;
-        const startedAt = Number(task?.startedAt || 0) || undefined;
-        const endedAt = Number(task?.endedAt || 0) || Number(task?.lastEventAt || 0) || undefined;
-        const duration = Number(task?.durationMs || 0)
-          || ((startedAt && endedAt && endedAt >= startedAt) ? (endedAt - startedAt) : undefined);
-
-        const requesterSessionKey = String(task?.requesterSessionKey || task?.ownerKey || '').trim();
-        const requesterSession = sessionsByKey[requesterSessionKey];
-
-        const rawPrompt = String(task?.task || '');
-        const cleanedPrompt = cleanNativeTaskPrompt(rawPrompt);
-
-        const summary = String(task?.progressSummary || '').trim() || (cleanedPrompt ? cleanedPrompt.slice(0, 500) : null);
-        const name = deriveNativeTaskName(task);
-
-        const kind = runtime === 'cron'
-          ? 'cron'
-          : runtime === 'subagent'
-            ? 'subagent'
-            : 'unknown';
-
-        return {
-          id: String(task?.taskId || task?.runId || task?.sourceId || `${runtime}:${task?.createdAt || Math.random()}`),
-          taskId: task?.taskId || null,
-          runId: task?.runId || null,
-          sourceId: task?.sourceId || null,
-          name,
-          status,
-          runtime,
-          kind,
-          model: String(task?.model || 'unknown'),
-          createdAt,
-          startedAt,
-          updatedAt: endedAt || startedAt || createdAt,
-          endedAt,
-          duration,
-          summary,
-          progressSummary: String(task?.progressSummary || '').trim() || null,
-          parentSession: requesterSessionKey || null,
-          parentName: requesterSession?.displayName || requesterSession?.origin?.label || null,
-          childSessionKey: String(task?.childSessionKey || '').trim() || null,
-          requesterSessionKey: requesterSessionKey || null,
-          ownerKey: String(task?.ownerKey || '').trim() || null,
-          deliveryStatus: String(task?.deliveryStatus || '').trim() || null,
-          notifyPolicy: String(task?.notifyPolicy || '').trim() || null,
-          scopeKind: String(task?.scopeKind || '').trim() || null,
-          cleanupAfter: Number(task?.cleanupAfter || 0) || null,
-          agent: String((task?.childSessionKey || '').split(':')[1] || (task?.requesterSessionKey || '').split(':')[1] || 'main'),
-          error: (status === 'failed' || status === 'timed_out' || status === 'lost')
-            ? (String(task?.error || task?.progressSummary || '').trim() || null)
-            : null,
-          turns: 0,
-          childCount: 0,
-          source: 'openclaw-task-registry',
-        };
-      })
-      .filter((task: any) => {
-        if (requestedRuntime && requestedRuntime !== 'all' && task.runtime !== requestedRuntime) return false;
-        if (requestedStatus && requestedStatus !== 'all' && task.status !== requestedStatus) return false;
-        return true;
-      })
-      .sort((a: any, b: any) => {
-        const aTs = Number(a.endedAt || a.updatedAt || a.createdAt || 0);
-        const bTs = Number(b.endedAt || b.updatedAt || b.createdAt || 0);
-        return bTs - aTs;
-      });
-
-    res.json({
-      ok: true,
-      count: mapped.length,
-      runtime: tasksPayload?.runtime || requestedRuntime || 'all',
-      status: tasksPayload?.status || requestedStatus || 'all',
-      tasks: mapped,
+    const taskSessions = sessions.filter((s: any) => {
+      const key = s.key || s.sessionKey || '';
+      return key.includes(':subagent:') || key.includes(':cron:');
     });
+
+    const tasks = taskSessions.map((s: any) => ({
+      id: s.key || s.sessionKey || s.id || 'unknown',
+      name: s.displayName || s.origin?.label || s.key?.split(':').pop() || 'Task',
+      status: s.status === 'done' ? 'done' : s.status === 'error' ? 'failed' : s.endedAt ? 'done' : 'running',
+      model: normalizeGatewayModelId(s.model) || s.modelProvider || 'unknown',
+      createdAt: s.startedAt,
+      updatedAt: s.endedAt || s.updatedAt,
+      duration: s.runtimeMs,
+      summary: s.origin?.label || s.displayName || null,
+      parentSession: s.origin?.from || null,
+      error: s.status === 'error' ? (s.error || 'Task failed') : null,
+    }));
+
+    res.json({ ok: true, tasks });
   } catch (err: any) {
     console.error('[gateway] tasks error:', err);
-    res.status(500).json({ ok: false, error: err?.message || 'Failed to fetch task ledger' });
+    const status = err.message?.includes('ECONNREFUSED') ? 502 : 500;
+    res.status(status).json({ ok: false, error: err.message || 'Failed to get tasks' });
+  }
+});
+
+router.get('/session-info', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const sessionKey = resolveOpenClawSessionKey(req.query.session as string, req.user);
+    assertGatewaySessionAccess(sessionKey, req.user!);
+    const result = await getSessionInfo(sessionKey);
+    if (!result.ok) {
+      // Distinguish gateway transport failures (timeout, WS error) from "session not found"
+      const status = isGatewayTransportError(result.error) ? 502 : 404;
+      res.status(status).json({ error: result.error || 'Session not found' });
+      return;
+    }
+    res.json({ session: result.data });
+  } catch (err: any) {
+    const status = err?.message === 'Admin access required' ? 403 : 500;
+    res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to get session info', detail: err.message });
   }
 });
 
@@ -1524,17 +1233,12 @@ router.get('/config-path', authenticateToken, requireApproved, async (req: Reque
       return;
     }
     const pathStr = typeof req.query?.path === 'string' ? req.query.path.trim() : '';
-    const soft = String(req.query?.soft || '').trim() === '1';
     if (!pathStr) {
       res.status(400).json({ error: 'path required' });
       return;
     }
     const cfgResult = await gatewayRpcCall('config.get', {});
     if (!cfgResult.ok) {
-      if (soft) {
-        res.json({ ok: false, path: pathStr, value: null, error: cfgResult.error || 'config.get failed' });
-        return;
-      }
       res.status(502).json({ error: cfgResult.error || 'config.get failed' });
       return;
     }
@@ -1818,9 +1522,14 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
     // For non-OPENCLAW providers use the provider abstraction
     if (providerName && providerName !== 'OPENCLAW') {
       try {
+        const nativeSession = getOwnedNativeSession(providerName, req.user!.userId, req.query.session);
+        if (!nativeSession) {
+          res.json({ messages: [], sessionId: typeof req.query.session === 'string' ? req.query.session : '' });
+          return;
+        }
         const provider = AgentRegistry.get(providerName);
-        const messages = await provider.getHistory(sessionKey);
-        res.json({ messages, sessionId: sessionKey });
+        const messages = await provider.getHistory(nativeSession.sessionId);
+        res.json({ messages, sessionId: nativeSession.sessionId });
         return;
       } catch (err: any) {
         console.warn(`[gateway] Provider ${providerName} getHistory failed: ${err.message}`);
@@ -1862,12 +1571,6 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     const provider = providerName
       ? AgentRegistry.get(providerName as AgentProviderName)
       : AgentRegistry.getDefault();
-    // Enforce admin-configured enabled providers (non-admin only)
-    if (!isElevatedRole(req.user!.role) && !(await isProviderEnabled(provider.providerName))) {
-      res.status(403).json({ error: `Provider ${provider.displayName} is not enabled by the administrator` });
-      return;
-    }
-
     const provenance = PROVENANCE[provider.providerName] || `via ${provider.displayName}`;
 
     const clientSession = typeof session === 'string' && session.trim().length > 0 ? session.trim() : '';
@@ -1875,7 +1578,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     if (provider.providerName === 'OPENCLAW') {
       const useCanonicalMainSession = isOwnerRole(req.user!.role)
         && (!agentId || agentId === 'main')
-        && (!clientSession || clientSession === 'main');
+        && (!clientSession || clientSession === 'main' || clientSession.startsWith('new-'));
       if (agentId && agentId !== 'main') {
         // Same sub-agent session resolution as the WS path
         const agentPrefix = `agent:${agentId}:`;
@@ -1903,13 +1606,14 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         });
       }
     } else {
-      if (!clientSession || clientSession === 'main' || clientSession.startsWith('new-')) {
+      const reusableNativeSession = getOwnedNativeSession(provider.providerName, req.user!.userId, clientSession);
+      if (!reusableNativeSession) {
         sessionId = await provider.startSession(req.user!.userId, {
           model: typeof requestedModel === 'string' && requestedModel.trim() ? normalizeRequestedModel(provider.providerName, requestedModel.trim()) : undefined,
           metadata: { requestedBy: req.user!.email },
         });
       } else {
-        sessionId = clientSession;
+        sessionId = reusableNativeSession.sessionId;
         if (typeof requestedModel === 'string' && requestedModel.trim()) {
           updateNativeSessionModel(provider.providerName, sessionId, normalizeRequestedModel(provider.providerName, requestedModel.trim()));
         }
@@ -1939,7 +1643,9 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
       if (slashResult.handled) {
         res.json({
           response: slashResult.content || '',
-          model: slashResult.metadata?.model || loadNativeSession(provider.providerName, slashResult.sessionId)?.model || null,
+          model: normalizeGatewayModelId(slashResult.metadata?.model)
+            || normalizeGatewayModelId(loadNativeSession(provider.providerName, slashResult.sessionId)?.model)
+            || null,
           provider: provider.providerName,
           provenance,
           sessionId: slashResult.sessionId,
@@ -1988,7 +1694,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         }, onStatus, onExecApproval, senderIdentity);
         clearTimeout(fallbackTimer); clearInterval(keepaliveTimer);
         if (sseAlive) {
-          sseWrite(`data: ${JSON.stringify({ type: 'done', content: result.fullText, provenance, metadata: result.metadata })}\n\n`);
+          sseWrite(`data: ${JSON.stringify({ type: 'done', content: result.fullText, provenance })}\n\n`);
           sseWrite('data: [DONE]\n\n');
         }
       } catch (err: any) {
@@ -2009,66 +1715,19 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     const resolvedSessionId = typeof result?.metadata?.resolvedSessionId === 'string' && result.metadata.resolvedSessionId.trim()
       ? result.metadata.resolvedSessionId.trim()
       : sessionId;
-    res.json({ response: result.fullText, model: result.metadata?.model, provider: provider.providerName, provenance, sessionId: resolvedSessionId });
+    res.json({
+      response: result.fullText,
+      model: normalizeGatewayModelId(result.metadata?.model) || null,
+      provider: provider.providerName,
+      provenance,
+      sessionId: resolvedSessionId,
+    });
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 503;
     const friendlyError = status === 403
       ? 'Admin access required'
       : humanizeProviderError(normalizeProviderName(req.body?.provider), err?.message || String(err));
     res.status(status).json({ error: friendlyError, detail: err?.message || String(err) });
-  }
-});
-
-
-
-/* GET /api/gateway/native-permissions — get permission levels for all native CLI providers */
-router.get('/native-permissions', authenticateToken, requireAdmin, async (_req: Request, res: Response) => {
-  try {
-    const rows = await prisma.systemSetting.findMany({
-      where: { key: { startsWith: 'agents.nativePermission.' } },
-    });
-    const permissions: Record<string, string> = {};
-    for (const row of rows) {
-      const provider = row.key.replace('agents.nativePermission.', '');
-      permissions[provider] = row.value;
-    }
-    // Default everything to 'sandboxed' if not set
-    for (const p of ['CLAUDE_CODE', 'CODEX', 'GEMINI']) {
-      if (!permissions[p]) permissions[p] = 'sandboxed';
-    }
-    res.json({ permissions });
-  } catch (err: any) {
-    res.status(500).json({ error: 'Failed to read native permissions', detail: err?.message });
-  }
-});
-
-/* PUT /api/gateway/native-permissions — set permission level for a native CLI provider */
-router.put('/native-permissions', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    // Only the owner can elevate CLI permissions (security-critical)
-    if (!isOwnerRole(req.user?.role)) {
-      res.status(403).json({ error: 'Only the owner can change native CLI permission levels' });
-      return;
-    }
-    const { provider, level } = req.body;
-    if (!['CLAUDE_CODE', 'CODEX', 'GEMINI'].includes(provider)) {
-      res.status(400).json({ error: 'Invalid provider' });
-      return;
-    }
-    if (!['sandboxed', 'elevated'].includes(level)) {
-      res.status(400).json({ error: 'Invalid permission level. Must be sandboxed or elevated.' });
-      return;
-    }
-    await prisma.systemSetting.upsert({
-      where: { key: `agents.nativePermission.${provider}` },
-      create: { key: `agents.nativePermission.${provider}`, value: level },
-      update: { value: level },
-    });
-    console.log(`[gateway] Native permission for ${provider} set to ${level} by ${req.user?.email}`);
-    invalidateProviderAvailabilityCache(provider as AgentProviderName);
-    res.json({ ok: true, provider, level });
-  } catch (err: any) {
-    res.status(500).json({ error: 'Failed to set native permission', detail: err?.message });
   }
 });
 
@@ -2110,7 +1769,7 @@ router.get('/agents', authenticateToken, requireAdmin, async (_req: Request, res
           id,
           name: a.name || undefined,
           identity,
-          model: a.model || a.defaultModel || undefined,
+          model: normalizeGatewayModelId(a.model ?? a.defaultModel ?? a.currentModel),
           workspace: a.workspace || undefined,
           avatarUrl: subAgentAvatarMap[id] || undefined,
         };
@@ -2136,20 +1795,18 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
   }
   const info = streamEventBus.getStreamStatus(sessionKey);
   if (info) {
-    const lastEvent = (info as any).lastEventAt || info.startedAt;
-    if ((info as any).active === false) {
-      res.json({ active: false, lastEventAt: lastEvent, runId: info.runId || null });
-      return;
-    }
     // Double-check: if last event was >90s ago, the stream is probably stale
     // (e.g., done event was missed). Report inactive to avoid stuck UI.
+    const lastEvent = (info as any).lastEventAt || info.startedAt;
     if (lastEvent && (Date.now() - lastEvent) > 180_000) {
       debugLog(`[stream-status] StreamEventBus has entry but lastEvent=${new Date(lastEvent).toISOString()} is stale — reporting inactive`);
       streamEventBus.clearStream(sessionKey);
       res.json({ active: false });
       return;
     }
-    const content = streamEventBus.getLatestText(sessionKey);
+    const content = info.phase === 'streaming'
+      ? streamEventBus.getLatestText(sessionKey)
+      : '';
     res.json({
       active: true,
       phase: info.phase,
@@ -2157,8 +1814,6 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
       startedAt: info.startedAt,
       runId: info.runId || null,
       content: content || undefined,
-      thinkingContent: info.thinkingContent || undefined,
-      statusText: info.statusText || undefined,
       lastEventAt: lastEvent,
     });
   } else {
@@ -2189,8 +1844,6 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
             toolName: null,
             startedAt: Date.now(),
             runId: typeof sess.runId === 'string' ? sess.runId : null,
-            thinkingContent: undefined,
-            statusText: chatState === 'tool' ? 'Using tool…' : chatState === 'streaming' ? 'Responding…' : 'Thinking…',
           });
           return;
         }
@@ -2364,7 +2017,7 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
       try {
         const provider = AgentRegistry.get(providerName);
         const messages = await provider.getHistory(sessionKey);
-        wsSend(ws, { type: 'history', messages, sessionId: sessionKey, sessionKey, requestId });
+        wsSend(ws, { type: 'history', messages, sessionId: sessionKey, requestId });
         return;
       } catch {}
     }
@@ -2374,7 +2027,7 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
     const fileId = resolveSessionFileId(sessionKey, sessionsDir);
     const sessionId = fileId || sessionKey;
     const messages = readSessionMessagesEnhanced(sessionId, msg.limit || 200, sessionsDir);
-    wsSend(ws, { type: 'history', messages, sessionId, sessionKey, requestId });
+    wsSend(ws, { type: 'history', messages, sessionId, requestId });
 
     // After sending history, check if there's an active stream on this session.
     // If so, send a stream_resume event and subscribe to StreamEventBus.
@@ -2386,9 +2039,6 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
         phase: streamInfo.phase,
         toolName: streamInfo.toolName || null,
         runId: streamInfo.runId || null,
-        content: streamInfo.latestText || undefined,
-        thinkingContent: streamInfo.thinkingContent || undefined,
-        statusText: streamInfo.statusText || undefined,
       });
 
       // Subscribe to StreamEventBus and forward events to this browser WS.
@@ -2403,7 +2053,7 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
       registerWsStreamCleanup(ws, sessionKey, unsub);
     }
   } catch (err: any) {
-    wsSend(ws, { type: 'error', content: err?.message === 'Admin access required' ? 'Admin access required' : `History failed: ${err.message}`, sessionKey, requestId });
+    wsSend(ws, { type: 'error', content: err?.message === 'Admin access required' ? 'Admin access required' : `History failed: ${err.message}`, requestId });
   }
 }
 
@@ -2440,13 +2090,6 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       ? AgentRegistry.get(providerName as AgentProviderName)
       : AgentRegistry.getDefault();
     providerNameForError = provider.providerName;
-
-    // Enforce admin-configured enabled providers (non-admin only)
-    if (!isElevatedRole(user.role) && !(await isProviderEnabled(provider.providerName))) {
-      wsSend(ws, { type: 'error', content: `Provider ${provider.displayName} is not enabled by the administrator` });
-      return;
-    }
-
     const provenance = PROVENANCE[provider.providerName] || `via ${provider.displayName}`;
     const isOpenClawProvider = provider.providerName === 'OPENCLAW';
 
@@ -2455,7 +2098,7 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
     if (isOpenClawProvider) {
       const useCanonicalMainSession = isOwnerRole(user.role)
         && (!agentId || agentId === 'main')
-        && (!clientSession || clientSession === 'main');
+        && (!clientSession || clientSession === 'main' || clientSession.startsWith('new-'));
       if (agentId && agentId !== 'main') {
         // If clientSession is already a fully-qualified agent: key for this agent, reuse it directly.
         // This prevents the cascading session bug where e.g. 'agent:parity:main' gets wrapped
@@ -2487,13 +2130,14 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
         });
       }
     } else {
-      if (!clientSession || clientSession === 'main' || clientSession.startsWith('new-')) {
+      const reusableNativeSession = getOwnedNativeSession(provider.providerName, user.userId, clientSession);
+      if (!reusableNativeSession) {
         sessionId = await provider.startSession(user.userId, {
           model: typeof requestedModel === 'string' && requestedModel.trim() ? normalizeRequestedModel(provider.providerName, requestedModel.trim()) : undefined,
           metadata: { requestedBy: user.email },
         });
       } else {
-        sessionId = clientSession;
+        sessionId = reusableNativeSession.sessionId;
         if (typeof requestedModel === 'string' && requestedModel.trim()) {
           updateNativeSessionModel(provider.providerName, sessionId, normalizeRequestedModel(provider.providerName, requestedModel.trim()));
         }
@@ -2774,8 +2418,11 @@ function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtP
   const streamInfo = streamEventBus.getStreamStatus(sessionKey);
   if (streamInfo && streamInfo.active) {
     // Stream is active — subscribe and forward events.
-    // Include the latest accumulated text so the browser can recover mid-stream.
-    const latestText = streamEventBus.getLatestText(sessionKey);
+    // Only replay accumulated assistant text while the assistant is actively streaming.
+    // Tool/thinking resumes should show current status, not stale text from a prior run.
+    const latestText = streamInfo.phase === 'streaming'
+      ? streamEventBus.getLatestText(sessionKey)
+      : '';
     wsSend(ws, {
       type: 'stream_resume',
       sessionKey,
@@ -2783,8 +2430,6 @@ function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtP
       toolName: streamInfo.toolName || null,
       runId: streamInfo.runId || null,
       content: latestText || undefined,
-      thinkingContent: streamInfo.thinkingContent || undefined,
-      statusText: streamInfo.statusText || undefined,
     });
 
     const unsub = streamEventBus.subscribe(sessionKey, (evt: StreamEvent) => {
@@ -2845,19 +2490,7 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
 
   ws.on('message', async (raw: Buffer | string) => {
     let msg: any;
-    try {
-      let rawStr = raw.toString();
-      try { msg = JSON.parse(rawStr); } catch {
-        // Sanitize control characters and retry
-        rawStr = rawStr.replace(/[\x00-\x1f\x7f]/g, (ch: string) => {
-          if (ch === '\n') return '\\n';
-          if (ch === '\r') return '\\r';
-          if (ch === '\t') return '\\t';
-          return '';
-        });
-        msg = JSON.parse(rawStr);
-      }
-    } catch { wsSend(ws, { type: 'error', content: 'Invalid JSON' }); return; }
+    try { msg = JSON.parse(raw.toString()); } catch { wsSend(ws, { type: 'error', content: 'Invalid JSON' }); return; }
 
     switch (msg.type) {
       case 'history': await handleWsHistory(ws, msg, user); break;
@@ -2994,20 +2627,8 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
     if (browserClosed) return;
     // Convert response string IDs back to the numeric IDs the browser expects
     try {
-      let str = data.toString();
-      let msg: any;
-      try {
-        msg = JSON.parse(str);
-      } catch {
-        // Sanitize control characters that may appear in raw gateway content
-        str = str.replace(/[\x00-\x1f\x7f]/g, (ch: string) => {
-          if (ch === '\n') return '\\n';
-          if (ch === '\r') return '\\r';
-          if (ch === '\t') return '\\t';
-          return '';
-        });
-        msg = JSON.parse(str);
-      }
+      const str = data.toString();
+      const msg = JSON.parse(str);
 
       // VERBOSE DIAGNOSTIC LOGGING
       if (msg.type === 'event') {

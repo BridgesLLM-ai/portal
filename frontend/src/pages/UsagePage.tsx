@@ -7,6 +7,7 @@ import { usageAPI } from '../api/endpoints';
 import {
   Users, Activity, Timer, Zap, RefreshCw, Loader2, AlertTriangle, Copy, Check,
 } from 'lucide-react';
+import { getShortModelLabel, normalizeModelId } from '../utils/modelId';
 
 /* ─── types ─────────────────────────────────────────────── */
 
@@ -128,9 +129,7 @@ function ModelBreakdown({ data, loading }: ModelBreakdownProps) {
     return data.slice(0, 8).map((item) => ({
       ...item,
       // Shorten model name for display
-      displayName: (typeof item.model === 'string' && item.model.includes('/'))
-        ? item.model.split('/').slice(-1)[0]
-        : String(item.model || ''),
+      displayName: getShortModelLabel(item.model, 'unknown'),
     }));
   }, [data]);
 
@@ -273,9 +272,7 @@ function RecentSessions({ sessions, loading }: RecentSessionsProps) {
                   </td>
                   <td className="py-3 pr-4">
                     <span className="text-slate-300 font-mono text-xs">
-                      {(typeof session.model === 'string' && session.model.includes('/'))
-                        ? session.model.split('/').slice(-1)[0]
-                        : String(session.model || '')}
+                      {getShortModelLabel(session.model, normalizeModelId(session.model) || 'unknown')}
                     </span>
                   </td>
                   <td className="py-3 pr-4 text-right">

@@ -24,7 +24,7 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Send, StopCircle, Pencil, Settings, X, ChevronDown,
-  Check, RefreshCw, Wrench, Loader2, CheckCircle2, XCircle, Shield, ShieldAlert, Radio,
+  Check, RefreshCw, Wrench, Loader2, CheckCircle2, XCircle, ShieldAlert, Radio,
   Sparkles, Copy, RotateCcw, MessageSquare, Code2, Bug, ChevronRight, Clock,
   Paperclip, Mic, PenSquare, ListChecks, Layers3, TerminalSquare, Slash, Settings2,
 } from 'lucide-react';
@@ -41,6 +41,7 @@ import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../
 import { executeSlashCommand } from '../../utils/slashCommandExecutor';
 import client from '../../api/client';
 import sounds from '../../utils/sounds';
+import { getShortModelLabel } from '../../utils/modelId';
 
 /* ─── Per-agent identity ────────────────────────────────────────────────── */
 
@@ -704,7 +705,7 @@ function SessionControls({
   }, [isOpen]);
 
   // Extract short model name for display
-  const shortModel = currentModel?.split('/').pop() || 'default';
+  const shortModel = getShortModelLabel(currentModel, 'default');
 
   return (
     <div ref={containerRef} className="relative">
@@ -1187,13 +1188,6 @@ function getToolSummary(tool: ToolCall): string {
       return `Run \`${short}\``;
     }
   }
-  if (name === 'process') {
-    const action = String(args.action || '').toLowerCase();
-    if (action === 'poll') return 'Wait for command';
-    if (action === 'log') return 'Read command output';
-    if (action === 'kill') return 'Stop command';
-    if (action === 'list') return 'List commands';
-  }
 
   // Search
   if (name === 'web_search' || name === 'search') {
@@ -1250,46 +1244,11 @@ function getToolSummary(tool: ToolCall): string {
   return tool.name;
 }
 
-function formatToolDuration(ms: number): string {
-  if (!Number.isFinite(ms) || ms < 1000) return '<1s';
-  if (ms < 10_000) return `${(ms / 1000).toFixed(1)}s`;
-  const totalSeconds = Math.round(ms / 1000);
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes < 60) return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const remMinutes = minutes % 60;
-  return remMinutes ? `${hours}h ${remMinutes}m` : `${hours}h`;
-}
-
-function filterVisibleToolCalls(toolCalls?: ToolCall[]): ToolCall[] {
-  return (toolCalls || []).filter((tool) => {
-    const action = typeof tool.arguments?.action === 'string' ? tool.arguments.action.toLowerCase() : '';
-    return !(tool.name.toLowerCase() === 'process' && action === 'poll' && tool.status !== 'running');
-  });
-}
-
 function ToolCallBlock({ tool }: { tool: ToolCall }) {
   const [expanded, setExpanded] = useState(false);
-  const [now, setNow] = useState(() => Date.now());
+  const duration = tool.endedAt ? ((tool.endedAt - tool.startedAt) / 1000).toFixed(1) : null;
   const hasDetails = !!(tool.result || tool.arguments);
   const summary = getToolSummary(tool);
-  const durationMs = tool.timingKnown === false
-    ? null
-    : tool.endedAt
-      ? Math.max(0, tool.endedAt - tool.startedAt)
-      : tool.status === 'running'
-        ? Math.max(0, now - tool.startedAt)
-        : null;
-  const duration = durationMs !== null ? formatToolDuration(durationMs) : null;
-
-  useEffect(() => {
-    if (tool.status !== 'running' || tool.timingKnown === false) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [tool.status, tool.startedAt, tool.timingKnown]);
 
   return (
     <motion.div
@@ -1312,7 +1271,7 @@ function ToolCallBlock({ tool }: { tool: ToolCall }) {
             {summary}
           </span>
           {duration && (
-            <span className="text-slate-600">· {duration}</span>
+            <span className="text-slate-600">· {duration}s</span>
           )}
           {hasDetails && (
             <ChevronRight size={10} className={`text-slate-600 transition-transform ${expanded ? 'rotate-90' : ''}`} />
@@ -1902,19 +1861,11 @@ const UserBubble = React.memo(function UserBubble({ message, avatarUrl, username
     >
       <div className="flex-1 min-w-0" />
       <div className="max-w-[78%]">
-        <div className={`rounded-2xl rounded-br-sm px-4 py-2.5 shadow-lg transition-opacity ${message.steer ? 'bg-emerald-600/80 shadow-emerald-600/15' : message.queued ? 'bg-blue-600/65 shadow-blue-600/15 opacity-85' : 'bg-blue-600/90 shadow-blue-600/15'}`}>
+        <div className={`rounded-2xl rounded-br-sm px-4 py-2.5 shadow-lg shadow-blue-600/15 transition-opacity ${message.queued ? 'bg-blue-600/65 opacity-85' : 'bg-blue-600/90'}`}>
           <p className="text-sm text-white leading-relaxed whitespace-pre-wrap break-words">
             {message.content}
           </p>
         </div>
-        {message.steer && (
-          <div className="mt-1 mr-1 flex justify-end">
-            <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-300">
-              <Radio size={9} />
-              Live steer
-            </span>
-          </div>
-        )}
         {message.queued && (
           <div className="mt-1 mr-1 flex justify-end gap-2">
             <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/25 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-300">
@@ -1986,14 +1937,15 @@ const AssistantBubble = React.memo(function AssistantBubble({
 }) {
   const [hovered, setHovered] = useState(false);
   const provenance = message.provenance || agent.provenance;
-  const toolCalls = filterVisibleToolCalls(message.toolCalls);
+  const toolCalls = message.toolCalls || [];
   // For the streaming message, prefer live thinking content from context;
   // otherwise fall back to persisted content on the message object
   const isCurrentlyStreaming = isLast && isStreaming;
-  // During streaming, keep showing the latest thinking snapshot even after the
-  // phase moves to tool/streaming. Users use this block as the main "it's alive" surface.
+  // During streaming: show thinking ONLY during the 'thinking' phase.
+  // Once streamingPhase moves to 'streaming' or 'tool', the thinking is done.
+  // After streaming completes, show persisted thinking for history (expandable).
   const thinkingContent = isCurrentlyStreaming
-    ? (liveThinkingContent || '')
+    ? (streamingPhase === 'thinking' ? (liveThinkingContent || '') : '')
     : message.thinkingContent;
   const hasContent = !!message.content;
 
@@ -2076,11 +2028,6 @@ const AssistantBubble = React.memo(function AssistantBubble({
         {/* Footer: provenance + actions + timestamp */}
         <div className="flex items-center gap-2 mt-1 ml-1">
           <span className="text-[10px] text-slate-500 italic">{provenance}</span>
-          {message.turnMetadata?.totalCostUsd != null && message.turnMetadata.totalCostUsd > 0 && (
-            <span className="text-[10px] text-emerald-500/70 font-mono" title={`Input: ${message.turnMetadata.usage?.input_tokens?.toLocaleString() ?? '?'} / Output: ${message.turnMetadata.usage?.output_tokens?.toLocaleString() ?? '?'} tokens${message.turnMetadata.model ? ` \u2022 ${message.turnMetadata.model}` : ''}`}>
-              ${message.turnMetadata.totalCostUsd < 0.01 ? '<0.01' : message.turnMetadata.totalCostUsd.toFixed(2)}
-            </span>
-          )}
 
           <AnimatePresence>
             {hovered && hasContent && (
@@ -2296,9 +2243,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     slashCommandsLoaded?: boolean;
     slashCommandsLoading?: boolean;
   }>>({});
-  const [nativePermission, setNativePermission] = useState<'sandboxed' | 'elevated' | null>(null);
 
-  // Apply defaultProvider on first mount if provided (prop or from API)
+  // Apply defaultProvider on first mount if provided
   useEffect(() => {
     if (defaultProvider && defaultProvider !== provider) {
       setProvider(defaultProvider);
@@ -2314,11 +2260,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         if (cancelled) return;
         const catalog = Object.fromEntries(((data?.providers || []) as Array<any>).map((p) => [p.name, p]));
         setProviderCatalog(catalog);
-        // Apply admin-configured default provider if no explicit prop and no user selection yet
-        if (!defaultProvider && data?.defaultProvider && data.defaultProvider !== provider) {
-          const usable = (data.providers || []).find((p: any) => p.name === data.defaultProvider && p.usable !== false);
-          if (usable) setProvider(data.defaultProvider);
-        }
       })
       .catch(() => {
         if (!cancelled) setProviderCatalog({});
@@ -2328,7 +2269,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     };
   }, []);
 
-  const loadProviderCommands = useCallback(async (targetProvider: string, options?: { force?: boolean; silent?: boolean }) => {
+  const loadProviderCommands = useCallback(async (targetProvider: string, options?: { force?: boolean }) => {
     const cached = !options?.force ? providerCommandsCache.get(targetProvider) : undefined;
     if (cached) {
       setProviderCatalog((prev) => ({
@@ -2347,15 +2288,13 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       return cached.slashCommands;
     }
 
-    if (!options?.silent) {
-      setProviderCatalog((prev) => ({
-        ...prev,
-        [targetProvider]: {
-          ...(prev[targetProvider] || {}),
-          slashCommandsLoading: true,
-        },
-      }));
-    }
+    setProviderCatalog((prev) => ({
+      ...prev,
+      [targetProvider]: {
+        ...(prev[targetProvider] || {}),
+        slashCommandsLoading: true,
+      },
+    }));
 
     try {
       const { data } = await client.get('/gateway/commands', { params: { provider: targetProvider } });
@@ -2390,31 +2329,9 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    const idleCallback = (window as any).requestIdleCallback as undefined | ((cb: () => void, opts?: { timeout?: number }) => number);
-    const cancelIdleCallback = (window as any).cancelIdleCallback as undefined | ((id: number) => void);
-    let idleHandle: number | null = null;
-    const timeoutHandle = window.setTimeout(() => {
-      if (cancelled) return;
-      if (idleCallback) {
-        idleHandle = idleCallback(() => {
-          if (cancelled) return;
-          void loadProviderCommands(provider, { silent: true }).catch(() => {
-            // Keep existing provider metadata if command discovery fails.
-          });
-        }, { timeout: 1500 });
-      } else {
-        void loadProviderCommands(provider, { silent: true }).catch(() => {
-          // Keep existing provider metadata if command discovery fails.
-        });
-      }
-    }, 1200);
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timeoutHandle);
-      if (idleHandle !== null && cancelIdleCallback) cancelIdleCallback(idleHandle);
-    };
+    loadProviderCommands(provider).catch(() => {
+      // Keep existing provider metadata if command discovery fails.
+    });
   }, [provider, loadProviderCommands]);
 
   useEffect(() => {
@@ -2477,22 +2394,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     };
   }, [provider]);
 
-  // Fetch native permission level for native-cli providers
-  useEffect(() => {
-    const caps = (providerCatalog[provider] || {}).capabilities;
-    const isNative = caps?.adapterFamily === 'native-cli';
-    if (!isNative) { setNativePermission(null); return; }
-    let cancelled = false;
-    client.get('/gateway/native-permissions')
-      .then(({ data }) => {
-        if (cancelled) return;
-        const level = data?.permissions?.[provider];
-        setNativePermission(level === 'elevated' ? 'elevated' : 'sandboxed');
-      })
-      .catch(() => { if (!cancelled) setNativePermission(null); });
-    return () => { cancelled = true; };
-  }, [provider, providerCatalog]);
-
   useEffect(() => {
     let cancelled = false;
     const cached = providerModelsCache.get('OPENCLAW');
@@ -2543,9 +2444,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     : providerMeta.slashCommandsLoading
       ? 'Loading provider commands…'
       : 'Provider commands on demand';
-  const composerProviderCommandHint = providerMeta.slashCommandsLoaded
-    ? `${providerCommandCount} provider command${providerCommandCount === 1 ? '' : 's'}`
-    : 'Provider commands on demand';
 
   const [agentAvatars, setAgentAvatars] = useState<Record<string, string>>({});
   const [subAgentAvatars, setSubAgentAvatars] = useState<Record<string, string>>({});
@@ -2810,53 +2708,12 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     return undefined;
   }, [messages]);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
-  const draftCacheRef = useRef<Map<string, string>>(new Map());
-  const lastDraftScopeRef = useRef<string>('');
   const agent = getAgent(provider);
   const providerSlashCommands = providerMeta.slashCommands || [];
   const streamIsStale = isRunning && !wsConnected;
   // B20: Only show connection-lost UI when stream is active and WS dropped,
   // not during idle disconnects (which auto-reconnect silently)
   const showConnectionLost = streamIsStale;
-  const draftScopeKey = `${provider}::${agentId || 'default'}::${session || 'main'}`;
-
-  const cacheComposerDraft = useCallback((scopeKey: string, value: string) => {
-    draftCacheRef.current.set(scopeKey, value);
-  }, []);
-
-  const setComposerValue = useCallback((value: string) => {
-    const textarea = composerInputRef.current;
-    if (!textarea) return;
-    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-    nativeInputValueSetter?.call(textarea, value);
-    textarea.dispatchEvent(new Event('input', { bubbles: true }));
-  }, []);
-
-  useEffect(() => {
-    const previousScope = lastDraftScopeRef.current;
-    if (!previousScope) {
-      lastDraftScopeRef.current = draftScopeKey;
-      requestAnimationFrame(() => {
-        const initialDraft = draftCacheRef.current.get(draftScopeKey);
-        if (typeof initialDraft === 'string' && composerInputRef.current && composerInputRef.current.value !== initialDraft) {
-          setComposerValue(initialDraft);
-        }
-      });
-      return;
-    }
-    if (previousScope === draftScopeKey) return;
-
-    const previousValue = composerInputRef.current?.value || '';
-    draftCacheRef.current.set(previousScope, previousValue);
-    lastDraftScopeRef.current = draftScopeKey;
-
-    requestAnimationFrame(() => {
-      const nextDraft = draftCacheRef.current.get(draftScopeKey) || '';
-      if (composerInputRef.current && composerInputRef.current.value !== nextDraft) {
-        setComposerValue(nextDraft);
-      }
-    });
-  }, [draftScopeKey, setComposerValue]);
 
   // Mobile detection for keyboard behavior (Return key on mobile should insert newline, not submit)
   const [isMobileDevice, setIsMobileDevice] = useState(false);
@@ -3023,9 +2880,14 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     }
     clearMessages();
     resolvedSessionRef.current = null;
-    setSession('new-' + Date.now());
+
+    const shouldReuseCanonicalMain = provider === 'OPENCLAW'
+      && (!agentId || agentId === 'main')
+      && isOwner(user);
+
+    setSession(shouldReuseCanonicalMain ? 'main' : 'new-' + Date.now());
     setPendingAttachments([]);
-  }, [isRunning, chatState, clearMessages, setSession]);
+  }, [isRunning, chatState, clearMessages, setSession, provider, agentId, user]);
 
   const handleSelectSession = useCallback(
     (sessionId: string) => {
@@ -3117,15 +2979,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
             </div>
 
             <div className="flex items-center gap-1 sm:gap-2 ml-auto">
-              {nativePermission && (
-                <span
-                  className={`hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] border cursor-default transition-colors ${nativePermission === 'elevated' ? 'bg-rose-500/10 text-rose-300 border-rose-500/20' : 'bg-slate-500/10 text-slate-400 border-white/10'}`}
-                  title={nativePermission === 'elevated' ? 'Elevated: auto permission mode, broader access' : 'Sandboxed: accept-edits mode, restricted access'}
-                >
-                  {nativePermission === 'elevated' ? <ShieldAlert size={10} /> : <Shield size={10} />}
-                  {nativePermission}
-                </span>
-              )}
               {canSelectModel && (
                 <ModelPicker provider={provider} value={selectedModel} onChange={handleModelChange} models={availableModels} supportsCustomModelInput={supportsCustomModelInput} modelCatalogKind={modelCatalogKind} disabled={isRunning} />
               )}
@@ -3315,7 +3168,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                 For streaming: use live streamSegments with timestamps.
                                 For history: use msg.segments with position info to reconstruct the timeline. */}
                             {(() => {
-                              const toolCalls = filterVisibleToolCalls(msg.toolCalls);
+                              const toolCalls = msg.toolCalls || [];
                               const isLiveTimeline = idx === messages.length - 1 && streamSegments.length > 0;
                               const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0 && toolCalls.length > 0;
                               
@@ -3502,7 +3355,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
 
                 {/* Composer row: [paperclip] [textarea] [mic] [send] */}
                 <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500">
-                  <span className="inline-flex items-center gap-1"><kbd className="px-1 py-0.5 rounded bg-white/[0.05] text-[10px] font-mono text-slate-400">/</kbd> {composerProviderCommandHint}</span>
+                  <span className="inline-flex items-center gap-1"><kbd className="px-1 py-0.5 rounded bg-white/[0.05] text-[10px] font-mono text-slate-400">/</kbd> {providerCommandStatus}</span>
                   <span>{canSelectModel ? 'Model switching available' : 'Fixed provider defaults'}</span>
                   <span>{modelCatalogKind === 'none' ? 'Manual model ids may be required' : `Model catalog: ${availableModels.length || 'live'}`}</span>
                   <span className="text-slate-600">Try <span className="font-mono text-slate-400">/help</span> or <span className="font-mono text-slate-400">/status</span></span>
@@ -3551,7 +3404,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                       // Auto-resize: reset height, then set to scrollHeight
                       textarea.style.height = 'auto';
                       textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
-                      cacheComposerDraft(draftScopeKey, textarea.value);
                       refreshSlashAutocomplete(textarea.value);
                     }}
                     onClick={(e: React.MouseEvent<HTMLTextAreaElement>) => {

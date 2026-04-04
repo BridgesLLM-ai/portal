@@ -9,6 +9,7 @@ import { createPortal } from 'react-dom';
 import { ChevronDown, Check, Users, Radio, Loader2, History, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import client from '../../api/client';
+import { getShortModelLabel } from '../../utils/modelId';
 
 /* ─── Mobile Bottom Sheet wrapper ───────────────────────────────────────── */
 /** Renders children in a portal as a bottom-sheet on mobile, inline absolute on desktop */
@@ -415,10 +416,7 @@ export default function AgentSelector({
           if (saved && usableProviders.some((p: ProviderInfo) => p.name === saved)) {
             onChange({ provider: saved, agentId: saved === 'OPENCLAW' ? preferredOpenClawAgent : undefined });
           } else if (usableProviders.length > 0) {
-            // Use admin-configured default provider if available and usable, else first usable
-            const adminDefault = data.defaultProvider;
-            const defaultUsable = adminDefault && usableProviders.some((p: ProviderInfo) => p.name === adminDefault);
-            const fallback = defaultUsable ? adminDefault : usableProviders[0].name;
+            const fallback = usableProviders[0].name;
             if (!value || !usableProviders.some((p: ProviderInfo) => p.name === value)) {
               onChange({ provider: fallback, agentId: fallback === 'OPENCLAW' ? preferredOpenClawAgent : undefined });
             }
@@ -747,9 +745,9 @@ export default function AgentSelector({
                               textClass="text-slate-300"
                             />
                             <span className="flex-1 text-left">{getAgentLabel(agent, assistantName)}</span>
-                            {typeof agent.model === 'string' && agent.model && (
+                            {agent.model && (
                               <span className="text-[10px] text-slate-600 font-mono truncate max-w-[80px]">
-                                {agent.model.split('/').pop()}
+                                {getShortModelLabel(agent.model)}
                               </span>
                             )}
                             {isSelected && (

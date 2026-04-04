@@ -12,14 +12,9 @@ export const codexAdapter: NativeCliProviderAdapter = {
       ? String(ctx.session.metadata.nativeSessionId).trim()
       : null;
     ctx.state.nativeSessionId = nativeSessionId;
-    const permissionLevel = ctx.state.permissionLevel || 'sandboxed';
-    const permFlag = permissionLevel === 'elevated'
-      ? '--dangerously-bypass-approvals-and-sandbox'
-      : '--full-auto';
-
     const args = nativeSessionId
-      ? ['exec', 'resume', '--skip-git-repo-check', '--json', permFlag, nativeSessionId]
-      : ['exec', '--skip-git-repo-check', '--color', 'never', '--json', permFlag];
+      ? ['exec', 'resume', nativeSessionId, '--skip-git-repo-check', '--json', '--full-auto']
+      : ['exec', '--skip-git-repo-check', '--color', 'never', '--json', '--full-auto'];
     if (ctx.session.model) args.push('--model', ctx.session.model);
     args.push(ctx.message);
     return { command: 'codex', args };
@@ -31,8 +26,10 @@ export const codexAdapter: NativeCliProviderAdapter = {
     } catch {
       const plain = ctx.stripAnsi(line.trim());
       if (plain) {
-        ctx.setFullText(ctx.fullText ? `${ctx.fullText}\n${plain}` : plain);
-        ctx.emitChunk(`${plain}\n`);
+        ctx.setFullText(ctx.fullText ? `${ctx.fullText}
+${plain}` : plain);
+        ctx.emitChunk(`${plain}
+`);
       }
       return;
     }
@@ -47,29 +44,6 @@ export const codexAdapter: NativeCliProviderAdapter = {
       return;
     }
 
-    if (type === 'turn.started') {
-      ctx.emitStatus('Codex is working\u2026');
-      return;
-    }
-
-    // Command execution started — surface as tool_start for the UI
-    if (type === 'item.started' && parsed?.item?.type === 'command_execution') {
-      const cmd = parsed.item.command || 'Running command';
-      ctx.onStatus?.({ type: 'tool_start', content: cmd, toolName: 'shell', toolArgs: { command: cmd } });
-      return;
-    }
-
-    // Command execution completed — surface as tool_end with output
-    if (type === 'item.completed' && parsed?.item?.type === 'command_execution') {
-      const cmd = parsed.item.command || 'command';
-      const exitCode = parsed.item.exit_code;
-      const output = parsed.item.aggregated_output || '';
-      // Truncate very long output for status display
-      const truncated = output.length > 500 ? output.slice(0, 500) + '\n... (truncated)' : output;
-      ctx.onStatus?.({ type: 'tool_end', content: `Exit ${exitCode}`, toolName: 'shell', toolResult: { command: cmd, exitCode, output: truncated } });
-      return;
-    }
-
     if (type === 'item.completed' && parsed?.item?.type === 'agent_message' && parsed?.item?.text) {
       const text = String(parsed.item.text).trim();
       ctx.setLastAssistantMessage(text);
@@ -81,13 +55,7 @@ export const codexAdapter: NativeCliProviderAdapter = {
     }
 
     if (type === 'item.completed' && parsed?.item?.type === 'reasoning' && parsed?.item?.text) {
-      ctx.onStatus?.({ type: 'thinking', content: String(parsed.item.text) });
-      return;
-    }
-
-    // Turn completed — extract usage metadata
-    if (type === 'turn.completed' && parsed?.usage) {
-      ctx.state.usage = parsed.usage;
+      ctx.emitStatus(String(parsed.item.text));
       return;
     }
   },
@@ -98,6 +66,5 @@ export const codexAdapter: NativeCliProviderAdapter = {
     model: ctx.session.model || null,
     resolvedSessionId: ctx.session.sessionId,
     nativeSessionId: ctx.state.nativeSessionId || ctx.session.metadata?.nativeSessionId || null,
-    usage: ctx.state.usage || null,
   }),
 };

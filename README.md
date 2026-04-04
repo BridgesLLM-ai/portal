@@ -76,13 +76,23 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
-### v3.24.0 (April 4, 2026)
-- **Tasks tab overhaul** — Expandable card layout with status colors, duration tracking, and native OpenClaw task registry integration
-- **Native CLI provider panel** — Agent Tools page shows Claude Code, Codex, and Gemini status with auth state and model catalogs
-- **Security hardening** — enabledProviders enforcement on HTTP and WebSocket, tiered native CLI permissions, .env file lockdown
-- **Chat system fixes** — Steering message rendering, NO_REPLY suppression, inactivity-based turn timeout (600s), control character sanitization, internal context leak prevention
-- **Performance** — Async CLI commands, non-blocking provider cache with TTL, lazy-loaded routes, turn-level cost display
-- **Settings cleanup** — Removed dead panels, wired up enabled providers and default provider selection
+### v3.23.2 (April 4, 2026)
+- **Claude Code OAuth fix** — Agent Chat now strips conflicting inherited Anthropic API keys when Claude Code is already logged in on the server, fixing the bogus `Invalid API key · Fix external API key` failure after successful OAuth setup.
+- **Native provider session hardening** — switching from OpenClaw into Claude/Codex/Gemini no longer reuses foreign session IDs, so native provider history loads and first messages start cleanly instead of failing against stale `main`, `new-*`, or `agent:*` session keys.
+
+### v3.23.1 (April 2, 2026)
+- **Agent Chat crash hotfix** — fixes `model.split is not a function` crashes caused by structured OpenClaw model configs leaking into the portal UI.
+- **Backend model normalization** — portal gateway responses now normalize structured model objects into stable string IDs before returning them to the frontend.
+- **UI hardening** — Agent Chat, Agent Tools, Usage, and Terminal status views now safely render model labels even when upstream model data is not a plain string.
+
+### v3.23.0 (April 2, 2026)
+- **Background Tasks page + Agent Tools tab** — view running and recent subagents/cron jobs with status, duration, summaries, and failures.
+- **Project chat reconnect hardening** — fixes stale assistant text and phantom partial bubbles after reconnects, tab sleep, and tool/thinking transitions.
+- Fix Tasks API path regression (`/api/api/gateway/tasks` → `/api/gateway/tasks`).
+
+
+### v3.22.0 (April 1, 2026)
+- **OpenClaw gateway compatibility update** (2026.3.31) — improved exec approvals, provider error recovery, background task flows
 - Remove unused analytics/installer subdomain routes (dead config causing TLS cert errors)
 - Close public analytics dashboard exposure — now portal-auth only
 

@@ -604,9 +604,6 @@ function TruncatableContent({ content, maxHeight = 300 }: { content: string; max
 }
 
 // --- Main Component ---
-const PROJECT_SELECTION_STORAGE_KEY = 'projects:selected-project';
-const PROJECT_CHAT_OPEN_STORAGE_KEY = 'projects:agent-chat-open';
-
 export default function AppsPage() {
   // Core state
   const navigate = useNavigate();
@@ -1651,53 +1648,18 @@ export default function AppsPage() {
 
   const openAgentChat = useCallback(() => {
     if (!selectedProject) return;
-    try { sessionStorage.setItem(PROJECT_CHAT_OPEN_STORAGE_KEY, selectedProject); } catch {}
     setAgentChatOpen(true);
   }, [selectedProject]);
 
   const closeAgentChat = useCallback(() => {
     if (selectedProject) {
       localStorage.removeItem(`agent-active-${selectedProject}`);
-      try {
-        if (sessionStorage.getItem(PROJECT_CHAT_OPEN_STORAGE_KEY) === selectedProject) {
-          sessionStorage.removeItem(PROJECT_CHAT_OPEN_STORAGE_KEY);
-        }
-      } catch {}
     }
     agentAutoRestoreAttempted.current = null;
     setAgentChatOpen(false);
   }, [selectedProject]);
 
-  useEffect(() => {
-    try {
-      if (selectedProject) sessionStorage.setItem(PROJECT_SELECTION_STORAGE_KEY, selectedProject);
-      else sessionStorage.removeItem(PROJECT_SELECTION_STORAGE_KEY);
-    } catch {}
-  }, [selectedProject]);
-
-  useEffect(() => {
-    try {
-      if (agentChatOpen && selectedProject) sessionStorage.setItem(PROJECT_CHAT_OPEN_STORAGE_KEY, selectedProject);
-    } catch {}
-  }, [agentChatOpen, selectedProject]);
-
-  // Restore selected project after a hard reload so project-chat reconnect can resume cleanly.
-  useEffect(() => {
-    if (loading || selectedProject || projects.length === 0) return;
-    let rememberedProject: string | null = null;
-    try {
-      rememberedProject = sessionStorage.getItem(PROJECT_CHAT_OPEN_STORAGE_KEY) || sessionStorage.getItem(PROJECT_SELECTION_STORAGE_KEY);
-    } catch {
-      rememberedProject = null;
-    }
-    if (!rememberedProject) return;
-    if (!projects.some((p) => p.name === rememberedProject)) return;
-    void selectProject(rememberedProject);
-    agentAutoRestoreAttempted.current = null;
-  }, [loading, projects, selectedProject]);
-
-  // Auto-restore Agent chat on project selection if there was an active session or if the
-  // current tab had the project chat panel open before a hard reload.
+  // Auto-restore Agent chat on project selection if there was an active session
   useEffect(() => {
     if (!selectedProject || agentAutoRestoreAttempted.current === selectedProject) return;
     if (agentChatOpen) {
@@ -1705,15 +1667,11 @@ export default function AppsPage() {
       return;
     }
     const wasActive = localStorage.getItem(`agent-active-${selectedProject}`) === 'true';
-    let shouldRestoreOpenPanel = false;
-    try {
-      shouldRestoreOpenPanel = sessionStorage.getItem(PROJECT_CHAT_OPEN_STORAGE_KEY) === selectedProject;
-    } catch {}
     agentAutoRestoreAttempted.current = selectedProject;
-    if (wasActive || shouldRestoreOpenPanel) {
+    if (wasActive) {
       setTimeout(() => openAgentChat(), 300);
     }
-  }, [selectedProject, agentChatOpen, openAgentChat, loading, projects]);
+  }, [selectedProject, agentChatOpen, openAgentChat]);
 
   const analyzeFile = async () => {
     if (!openFile || !editorContent) return;
@@ -1919,7 +1877,7 @@ export default function AppsPage() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [saveFile, editorFullscreen, showFileSearch, openFile]);
+  });
 
   const currentProject = projects.find(p => p.name === selectedProject);
 

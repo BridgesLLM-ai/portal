@@ -7,15 +7,15 @@ import { activityAPI } from './api/endpoints';
 import { preloadPublicSettings, usePublicSettings } from './hooks/usePublicSettings';
 import Layout from './components/Layout';
 import LoginPage from './pages/LoginPage';
+import DashboardPage from './pages/DashboardPage';
+import FilesPage from './pages/FilesPage';
+import AgentChatPage from './pages/AgentChatPage';
 import SetupWizardPage from './pages/SetupWizardPage';
 import LandingPage from './pages/LandingPage';
 import DocsPage from './pages/DocsPage';
 import ForgotPasswordPage from './pages/ForgotPasswordPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
 
-const DashboardPage = lazy(() => import('./pages/DashboardPage'));
-const FilesPage = lazy(() => import('./pages/FilesPage'));
-const AgentChatPage = lazy(() => import('./pages/AgentChatPage'));
 const DesktopPage = lazy(() => import('./pages/DesktopPage'));
 const AppsPage = lazy(() => import('./pages/AppsPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
@@ -51,31 +51,6 @@ function LegacyAgentToolsRedirect({ tab }: { tab: 'automations' | 'usage' | 'ski
   return <Navigate to={`/agent-tools${search ? `?${search}` : ''}`} replace />;
 }
 
-function hasPersistedAuthHint(): boolean {
-  try {
-    const raw = localStorage.getItem('bridgesllm-auth');
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      const state = parsed?.state || parsed;
-      if (state?.isAuthenticated || state?.user) return true;
-    }
-  } catch {
-    // ignore malformed persisted auth state and treat as logged out
-  }
-
-  return Boolean(
-    localStorage.getItem('accessToken') ||
-    localStorage.getItem('refreshToken') ||
-    localStorage.getItem('token')
-  );
-}
-
-function shouldAttemptSessionRestore(pathname: string): boolean {
-  const publicRoutes = new Set(['/login', '/landing', '/docs', '/forgot-password', '/reset-password', '/']);
-  if (!publicRoutes.has(pathname)) return true;
-  return hasPersistedAuthHint();
-}
-
 export default function App() {
   const { restoreSession, isAuthenticated } = useAuthStore();
   const heartbeatRef = useRef<ReturnType<typeof setInterval>>();
@@ -103,9 +78,7 @@ export default function App() {
         // ignore setup-check failure and continue normal restore flow
       }
 
-      if (shouldAttemptSessionRestore(window.location.pathname)) {
-        await restoreSession();
-      }
+      await restoreSession();
       setSetupChecked(true);
     };
 
@@ -217,14 +190,14 @@ export default function App() {
             </ProtectedRoute>
           }
         >
-          <Route path="dashboard" element={<Suspense fallback={<RouteFallback />}><DashboardPage /></Suspense>} />
-          <Route path="files" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><FilesPage /></Suspense></InteractiveRoute>} />
+          <Route path="dashboard" element={<DashboardPage />} />
+          <Route path="files" element={<InteractiveRoute><FilesPage /></InteractiveRoute>} />
           {/* Terminal is rendered persistently in Layout.tsx — this route just prevents fallback */}
           <Route path="terminal" element={<AdminRoute><div /></AdminRoute>} />
           <Route path="desktop" element={<AdminRoute><Suspense fallback={<RouteFallback />}><DesktopPage /></Suspense></AdminRoute>} />
           <Route path="apps" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><AppsPage /></Suspense></InteractiveRoute>} />
           <Route path="projects" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><AppsPage /></Suspense></InteractiveRoute>} />
-          <Route path="agent-chats" element={<AdminRoute><Suspense fallback={<RouteFallback />}><AgentChatPage /></Suspense></AdminRoute>} />
+          <Route path="agent-chats" element={<AdminRoute><AgentChatPage /></AdminRoute>} />
           <Route path="agent-tools" element={<AdminRoute><Suspense fallback={<RouteFallback />}><AgentToolsPage /></Suspense></AdminRoute>} />
           <Route path="tasks" element={<AdminRoute><Suspense fallback={<RouteFallback />}><TasksPage /></Suspense></AdminRoute>} />
           {/* Backward compatibility redirects */}

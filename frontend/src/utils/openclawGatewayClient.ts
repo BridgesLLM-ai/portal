@@ -207,20 +207,9 @@ export class OpenClawGatewayClient {
     let msg: any;
     try {
       msg = JSON.parse(data);
-    } catch (e1) {
-      // Retry with control characters sanitized (raw \n, \t, \r inside JSON strings)
-      try {
-        const sanitized = data.replace(/[\x00-\x1f\x7f]/g, (ch: string) => {
-          if (ch === '\n') return '\\n';
-          if (ch === '\r') return '\\r';
-          if (ch === '\t') return '\\t';
-          return '';
-        });
-        msg = JSON.parse(sanitized);
-      } catch {
-        console.warn('[OpenClawGatewayClient] Failed to parse message:', data.slice(0, 200), e1);
-        return;
-      }
+    } catch {
+      console.warn('[OpenClawGatewayClient] Failed to parse message:', data);
+      return;
     }
 
     // Handle JSON-RPC responses

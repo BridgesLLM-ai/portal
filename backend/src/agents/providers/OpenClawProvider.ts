@@ -185,20 +185,12 @@ function sendMessageViaPersistentWs(
   onChunk?: OnChunkCallback,
   onStatus?: (statusEvent: { type: string; content: string; [key: string]: any }) => void,
   onExecApproval?: OnExecApprovalCallback,
-  inactivityTimeoutMs = 600000,
+  timeoutMs = 600000,
 ): Promise<AgentSendResult> {
   return new Promise((resolve, reject) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let unsubBus: (() => void) | null = null;
-
-    const resetTimer = () => {
-      if (timer) clearTimeout(timer);
-      if (settled) return;
-      timer = setTimeout(() => {
-        fail(new Error(`OpenClaw streaming timed out after ${inactivityTimeoutMs / 1000}s of inactivity`));
-      }, inactivityTimeoutMs);
-    };
 
     const done = (result: AgentSendResult) => {
       if (settled) return;
@@ -219,8 +211,10 @@ function sendMessageViaPersistentWs(
       reject(err);
     };
 
-    // Inactivity timeout — resets on every stream event
-    resetTimer();
+    // Overall timeout
+    timer = setTimeout(() => {
+      fail(new Error(`OpenClaw streaming timed out after ${timeoutMs / 1000}s`));
+    }, timeoutMs);
 
     // Subscribe to StreamEventBus BEFORE sending the message.
     // This ensures we don't miss any events if the response is very fast.
@@ -229,8 +223,6 @@ function sendMessageViaPersistentWs(
     // subscriber is in place before events can arrive.
     unsubBus = streamEventBus.subscribe(sessionId, (evt: StreamEvent) => {
       if (settled) return;
-      // Reset inactivity timer on any stream activity
-      resetTimer();
 
       switch (evt.type) {
         case 'text':

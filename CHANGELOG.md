@@ -2,70 +2,39 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
-## [3.24.0] — 2026-04-04
-
-### ✨ New Features
-
-#### Tasks Tab Overhaul
-- **Complete Tasks page redesign** — New expandable card layout with status-specific colors, duration tracking, and inline output preview. Replaces the old minimal list view.
-- **Native OpenClaw task integration** — Tasks now pull from OpenClaw's native task registry (`openclaw tasks list`), showing all background task runs including sub-agents, cron jobs, and isolated sessions.
-- **Status indicators** — Color-coded badges and animated dots for queued (indigo), running (blue), succeeded (emerald), failed (red), cancelled (amber), and timed-out (orange) states.
-- **Archived task visibility** — Tasks include source metadata showing whether they originated from cron, sub-agent spawn, or direct CLI.
-
-#### Agent Tools Page
-- **Native CLI provider panel** — New card-based layout showing Claude Code, Codex, and Gemini CLI status with auth state, version, and model catalogs.
-- **Declared model catalogs** — Each native provider displays its available models (Claude: 6 models including sonnet/opus/haiku aliases; Codex: 3 models; Gemini: 6 models).
-- **Fail-soft loading** — Provider panels load independently using `Promise.allSettled`, so one slow/failing provider doesn't block the others.
-
-#### Usage Statistics
-- **Model breakdown** — Usage stats now show per-model token/cost breakdown alongside session counts.
-- **Turn-level cost display** — Individual chat turns show estimated cost when available from the streaming metadata.
-
-### 🔒 Security
-
-- **enabledProviders enforcement** — Provider enable/disable settings now enforced on both HTTP and WebSocket chat endpoints. Disabled providers return 403 instead of silently falling back.
-- **Tiered native CLI permissions** — New `/api/gateway/native-permissions` endpoint returns per-provider permission levels (elevated/standard/ask). Permission badge shown in chat interface header.
-- **.env file permissions** — Installer and runtime now enforce 600 permissions on backend environment files.
+## [3.23.2] — 2026-04-04
 
 ### 🐛 Bug Fixes
 
-#### Chat System
-- **Fix steering messages** — Messages sent via `sessions_send` or `subagents steer` now render with green bubbles and "Live steer" badge instead of appearing as normal assistant messages.
-- **Fix JSON parse errors from control characters** — Sanitizer now strips control characters (0x00-0x1F except newline/tab) before JSON parsing, preventing "Bad control character" crashes.
-- **Fix NO_REPLY / HEARTBEAT_OK appearing in chat** — These internal sentinel values are now suppressed before rendering.
-- **Fix turn timeout killing active streams** — Timeout changed from wall-clock (120s total) to inactivity-based (600s of no output). Active streams with continuous output no longer timeout.
-- **Fix internal context leaking to chat** — `inbound_meta` JSON blocks and other internal envelope metadata stripped before display.
+#### Claude Code / Native Agent Chat
+- **Fix Claude Code OAuth sessions being overridden by bad Anthropic API keys** — Native Claude chats now prefer the server's local Claude OAuth login over inherited `ANTHROPIC_API_KEY` values, fixing the false `Invalid API key · Fix external API key` failure in Agent Chat after successful OAuth setup.
+- **Harden native-provider session routing when switching providers** — Agent Chat no longer tries to reuse OpenClaw session IDs (`main`, `new-*`, or `agent:*`) as Claude/Codex/Gemini native session IDs. When you switch into a native provider, the portal now opens a fresh native session instead of failing history loads or sends against a foreign session key.
 
-#### Native CLI Providers
-- **Fix Codex resume argument order** — Session resume now correctly uses `exec resume --flags sessionId` instead of broken flag placement.
-- **Fix Claude elevated mode** — Claude Code sessions now launch with `--add-dir /` for full filesystem access in elevated permission mode.
-- **Fix portal API key injection** — Portal-configured API keys now properly injected into native CLI environment via `getPortalApiKeysForEnv`.
-- **Fix auth detection** — Improved refresh token detection and auto-renewal for OAuth-based providers.
+## [3.23.1] — 2026-04-02
 
-#### Settings
-- **Remove dead settings panels** — Removed non-functional "Gateway Connection", "Runner Configuration", and "Feature Readiness" sections that had no backend implementation.
-- **Wire up Enabled Providers** — Provider enable/disable toggles now persist to gateway config and take effect immediately.
-- **Wire up Default Provider** — Default provider selection now persists correctly.
-- **Rename "System Status" to "System Health"** — Clearer labeling for the diagnostics panel.
+### 🐛 Hotfixes
 
-### ⚡ Performance
+#### Agent Chat / Gateway Model Compatibility
+- **Fix React crash in Agent Chat selector** — The portal no longer assumes agent `model` fields are always plain strings. This fixes `model.split is not a function` crashes on `/agent-chats` when OpenClaw returns structured model configs.
+- **Normalize gateway model values at the backend boundary** — Structured OpenClaw model configs (for example `{ primary, fallbacks }`) are now converted into stable string model IDs before the portal API returns them.
+- **Harden model rendering across the UI** — Agent Chat, Agent Tools, Usage, and Terminal status views now safely render model labels even if a non-string value slips through.
 
-- **Non-blocking provider availability** — Provider status checks now use async spawn with TTL cache instead of blocking `spawnSync`. Initial page loads no longer wait for slow CLI commands.
-- **Async OpenClaw CLI commands** — Tasks, sessions, usage stats, and skills endpoints converted from `spawnSync` to async `spawn` with Promise wrappers.
-- **Cache invalidation on config change** — Provider availability cache invalidates when settings change, ensuring fresh status after enable/disable toggles.
-- **Lazy-loaded routes** — All major page components now use `React.lazy()` with Suspense fallbacks, reducing initial bundle parse time.
+## [3.23.0] — 2026-04-02
 
-### 🧹 Cleanup
+### ✨ New Features
 
-- **Remove dead BackupsTab props** — Removed unused `backupPath`/`onBackupPathChange`/`onSaveBackupPath` props and dead "Backup Path Configuration" UI block.
-- **Remove sync CLI helpers** — Removed dead `runOpenClawJsonCommand` (sync version) from gateway routes; only async version remains.
-- **Files sync endpoint** — `/api/files/sync` now properly syncs filesystem state with database.
+#### Background Tasks Visibility
+- **Add Background Tasks page and Agent Tools tab** — Admins can now view running and recent subagents/cron-backed jobs in a dedicated Tasks view, with status, model, duration, parent session, summaries, and failures.
+- **Add `/api/gateway/tasks` backend endpoint** — The portal now queries OpenClaw session state directly to surface detached task activity in the UI.
 
-### 🔧 Infrastructure
+### 🐛 Bug Fixes
 
-- **Fix OpenClaw provider showing as unusable** — OpenClaw provider now correctly reports `usable: true` when gateway is configured, regardless of whether models endpoint responds.
-- **Fix export script source path** — `export-public-github.sh` now uses correct source directory `/opt/bridgesllm/portal`.
+#### Agent Chat / Project Chat
+- **Fix stale assistant text after reconnect** — Stream resume now only rehydrates accumulated text while the assistant is actively streaming. Tool/thinking reconnects no longer replay stale content from a prior phase.
+- **Suppress phantom live-bubble content during reconnect/tool phases** — Project chat now clears resume-seeded content when real tool/thinking events arrive, preventing duplicated or misleading partial assistant output after tab sleep, disconnects, or tool transitions.
 
+#### Tasks UI
+- **Fix Tasks page double-`/api` request bug** — Corrected the Tasks page client path so it requests `/api/gateway/tasks` instead of the broken `/api/api/gateway/tasks`.
 
 ## [3.22.0] — 2026-04-01
 
@@ -74,6 +43,10 @@ All notable changes to BridgesLLM Portal are documented here.
 #### OpenClaw Gateway Compatibility
 - **Updated OpenClaw gateway compatibility to 2026.3.31** — Picks up improved exec approval handling, better provider error recovery (Anthropic transient errors now retry instead of failing), hardened config SecretRef round-trips, and background task flow improvements.
 - **Installer version bump** — Installer now targets v3.22.0 and is compatible with the latest OpenClaw gateway release.
+
+### 🛡️ Infrastructure
+- **Remove unused analytics and installer subdomain routes** — Removed dead Caddy proxy routes (`analytics.bridgesllm.ai`, `install.bridgesllm.ai`) that had no DNS records configured and were generating continuous TLS certificate errors. Analytics dashboard remains accessible through the portal project behind authentication. Installer continues to work at `bridgesllm.ai/install.sh`.
+- **Remove public analytics dashboard exposure** — Closed two unauthenticated routes (`/analytics` on the marketing site, `/api/dashboard` on the portal domain) that exposed the analytics dashboard publicly. Data is now only accessible through the authenticated portal.
 
 ## [3.21.0] — 2026-03-31
 

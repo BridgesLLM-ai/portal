@@ -31,7 +31,6 @@ import {
   type GatewayEvent,
   type GatewayChatMessage,
 } from '../utils/openclawGatewayClient';
-import { streamManager } from '../services/StreamManager';
 
 const DEBUG_CHAT_STATE = import.meta.env.DEV;
 // Feature flag: Use direct gateway connection for OPENCLAW provider
@@ -51,7 +50,6 @@ export interface ToolCall {
   result?: string;
   status: 'running' | 'done' | 'error';
   arguments?: any;
-  timingKnown?: boolean;
 }
 
 export interface ExecApprovalRequest {
@@ -81,7 +79,6 @@ export interface ChatMessage {
   content: string;
   createdAt: Date;
   queued?: boolean;
-  steer?: boolean;
   provenance?: string;
   toolCalls?: ToolCall[];
   thinkingContent?: string;
@@ -89,14 +86,6 @@ export interface ChatMessage {
   toolName?: string;
   /** Text segments with their position relative to tool calls (for history reconstruction) */
   segments?: TextSegment[];
-  /** Per-turn metadata from native provider (cost, usage, model, session ID) */
-  turnMetadata?: {
-    totalCostUsd?: number | null;
-    usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | null;
-    model?: string | null;
-    modelUsage?: Record<string, { input_tokens?: number; output_tokens?: number; cost_usd?: number }> | null;
-    nativeSessionId?: string | null;
-  };
 }
 
 export interface MessageQueueItem {
@@ -107,14 +96,15 @@ export interface MessageQueueItem {
 
 export type StreamingPhase = 'idle' | 'thinking' | 'tool' | 'streaming';
 
-/* ═══ WS Manager Types (kept for export compatibility) ═══ */
+/* ═══ WS Manager (singleton — identical to original) ═══ */
 
-/** @deprecated Use streamManager from StreamManager.ts instead */
+type WsEventHandler = (data: any) => void;
+
 export interface WsManager {
   ws: WebSocket | null;
   send: (data: any) => boolean;
-  addHandler: (handler: (data: any) => void) => void;
-  removeHandler: (handler: (data: any) => void) => void;
+  addHandler: (handler: WsEventHandler) => void;
+  removeHandler: (handler: WsEventHandler) => void;
   onDisconnect: (cb: () => void) => (() => void);
   onReconnect: (cb: () => void) => (() => void);
   isConnected: () => boolean;
@@ -122,8 +112,170 @@ export interface WsManager {
   close: () => void;
 }
 
-// NOTE: WS connection is now managed by StreamManager singleton.
-// ChatStateProvider uses streamManager.addGlobalHandler() to receive all events.
+function createWsManager(url: string): WsManager {
+  let ws: WebSocket | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectAttempts = 0;
+  let intentionallyClosed = false;
+  let wasConnectedBefore = false;
+  const handlers = new Set<WsEventHandler>();
+  const disconnectCallbacks = new Set<() => void>();
+  const reconnectCallbacks = new Set<() => void>();
+
+  function connect() {
+    if (intentionallyClosed) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      scheduleReconnect();
+      return;
+    }
+
+    ws.onopen = () => {
+      debugLog('[ws-manager] Connected');
+      const isReconnect = wasConnectedBefore;
+      wasConnectedBefore = true;
+      reconnectAttempts = 0;
+      if (isReconnect) {
+        for (const cb of reconnectCallbacks) {
+          try { cb(); } catch (e) { console.error('[ws-manager] reconnect callback error:', e); }
+        }
+      }
+    };
+
+    ws.onmessage = (event) => {
+      let data: any;
+      try { data = JSON.parse(event.data); } catch { return; }
+      for (const handler of handlers) {
+        try { handler(data); } catch (err) { console.error('[ws-manager] Handler error:', err); }
+      }
+    };
+
+    ws.onclose = (event) => {
+      debugLog('[ws-manager] Closed: code=' + event.code + ' reason=' + event.reason + ' intentionallyClosed=' + intentionallyClosed);
+      ws = null;
+
+      // Check for auth failure close codes (4001 = unauthorized, or HTTP-style 401/403 in reason)
+      // These indicate the token may be expired — try refreshing before giving up
+      const isAuthFailure = event.code === 4001 || event.code === 4003 ||
+        event.reason?.toLowerCase().includes('unauthorized') ||
+        event.reason?.toLowerCase().includes('forbidden') ||
+        event.reason?.toLowerCase().includes('expired');
+
+      if (isAuthFailure && !intentionallyClosed) {
+        debugLog('[ws-manager] Auth failure detected, attempting token refresh before reconnect');
+        // Attempt to refresh the token before reconnecting
+        authAPI.refresh()
+          .then(() => {
+            debugLog('[ws-manager] Token refresh succeeded, scheduling reconnect');
+            reconnectAttempts = 0; // Reset backoff after successful refresh
+            scheduleReconnect();
+          })
+          .catch((err) => {
+            console.warn('[ws-manager] Token refresh failed, stopping reconnect:', err);
+            intentionallyClosed = true; // Give up — user will need to re-login
+            for (const cb of disconnectCallbacks) {
+              try { cb(); } catch (e) { console.error('[ws-manager] disconnect callback error:', e); }
+            }
+          });
+        return;
+      }
+
+      if (!intentionallyClosed) {
+        for (const cb of disconnectCallbacks) {
+          try { cb(); } catch (e) { console.error('[ws-manager] disconnect callback error:', e); }
+        }
+        scheduleReconnect();
+      }
+    };
+
+    ws.onerror = () => {};
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer || intentionallyClosed) return;
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+    reconnectAttempts++;
+    debugLog('[ws-manager] Reconnecting in ' + delay + 'ms (attempt ' + reconnectAttempts + ')');
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, delay);
+  }
+
+  connect();
+
+  return {
+    get ws() { return ws; },
+    send(data: any): boolean {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      try { ws.send(JSON.stringify(data)); return true; } catch { return false; }
+    },
+    addHandler(handler: WsEventHandler) { handlers.add(handler); },
+    removeHandler(handler: WsEventHandler) { handlers.delete(handler); },
+    onDisconnect(cb: () => void) {
+      disconnectCallbacks.add(cb);
+      return () => { disconnectCallbacks.delete(cb); };
+    },
+    onReconnect(cb: () => void) {
+      reconnectCallbacks.add(cb);
+      return () => { reconnectCallbacks.delete(cb); };
+    },
+    isConnected() { return ws !== null && ws.readyState === WebSocket.OPEN; },
+    reconnect() {
+      intentionallyClosed = false;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (ws) {
+        try { ws.close(); } catch {}
+        ws = null;
+      }
+      connect();
+    },
+    close() {
+      intentionallyClosed = true;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (ws) { try { ws.close(); } catch {} ws = null; }
+      handlers.clear();
+      disconnectCallbacks.clear();
+      reconnectCallbacks.clear();
+    },
+  };
+}
+
+// Singleton WS manager — shared across the app lifetime
+let sharedWsManager: WsManager | null = null;
+let wsManagerRefCount = 0;
+
+function getWsManager(): WsManager {
+  if (!sharedWsManager) {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const apiUrl = import.meta.env.VITE_API_URL || '';
+    let wsUrl: string;
+    if (apiUrl) {
+      if (apiUrl.startsWith('http')) {
+        wsUrl = apiUrl.replace(/^http/, 'ws') + '/gateway/ws';
+      } else {
+        wsUrl = protocol + '//' + window.location.host + apiUrl + '/gateway/ws';
+      }
+    } else {
+      wsUrl = protocol + '//' + window.location.host + '/api/gateway/ws';
+    }
+    sharedWsManager = createWsManager(wsUrl);
+  }
+  wsManagerRefCount++;
+  return sharedWsManager;
+}
+
+function releaseWsManager() {
+  wsManagerRefCount--;
+  if (wsManagerRefCount <= 0 && sharedWsManager) {
+    sharedWsManager.close();
+    sharedWsManager = null;
+    wsManagerRefCount = 0;
+  }
+}
 
 /* ═══ Helpers ═══ */
 
@@ -132,30 +284,12 @@ function nextId() {
   return 'msg-' + Date.now() + '-' + (++msgCounter);
 }
 
-function normalizeHistoricalToolCall(tc: any, fallbackTs: number): ToolCall {
-  const startedAt = typeof tc?.startedAt === 'number' ? tc.startedAt : fallbackTs;
-  const endedAt = typeof tc?.endedAt === 'number' ? tc.endedAt : undefined;
-  const status = tc?.status === 'running' || tc?.status === 'error' ? tc.status : 'done';
-  const timingKnown = typeof tc?.startedAt === 'number' && (typeof tc?.endedAt === 'number' || status === 'running');
-
-  return {
-    id: tc?.id || nextId(),
-    name: tc?.name || 'tool',
-    arguments: tc?.arguments,
-    startedAt,
-    endedAt,
-    status,
-    timingKnown,
-  };
-}
-
 const MODEL_STORAGE_PREFIX = 'agentChats.lastModel.';
 const CHAT_HISTORY_OMITTED_PLACEHOLDER = '[chat.history omitted: message too large]';
 
 function normalizeProviderModel(provider: string, rawModel: string): string {
   const model = String(rawModel || '').trim();
   if (!model) return '';
-  if (!model || typeof model !== 'string') return model || '';
   if (provider === 'OPENCLAW' || provider === 'OLLAMA' || provider === 'GEMINI') return model;
 
   const lower = model.toLowerCase();
@@ -168,43 +302,28 @@ function normalizeProviderModel(provider: string, rawModel: string): string {
   return model;
 }
 
-function stripInternalOpenClawContext(raw: string): string {
-  if (!raw) return raw;
-  if (raw.includes('<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>')) return '';
-  if (/Sender \(untrusted metadata\):/.test(raw) && /```json/.test(raw)) return '';
-  if (/Conversation info \(untrusted metadata\):/.test(raw) && /```json/.test(raw)) return '';
-  return raw
-    .replace(/^\[[^\]]+\]\s*$/gm, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-
-function sanitizeRenderableContent(role: string, raw: string): string {
-  const stripped = stripInternalOpenClawContext(raw || '');
-  return role === 'assistant' ? sanitizeAssistantContent(stripped) : stripped;
-}
-
-function parseHistoryMessage(m: any): ChatMessage | null {
+function parseHistoryMessage(m: any): ChatMessage {
   const rawContent = m.content || '';
   const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
-  const createdAt = new Date(m.timestamp || Date.now());
-  const content = isTruncationPlaceholder
-    ? 'Earlier assistant output was omitted from history because the message was too large.'
-    : sanitizeRenderableContent(m.role, rawContent);
-
-  // Drop empty/internal-only messages from history so portal users don't see raw OpenClaw internal context.
-  if (!content && !m.toolCalls?.length && !m.segments?.length) return null;
 
   const msg: ChatMessage = {
     id: m.id || nextId(),
     role: isTruncationPlaceholder ? 'system' : m.role,
-    content,
-    createdAt,
+    content: isTruncationPlaceholder
+      ? 'Earlier assistant output was omitted from history because the message was too large.'
+      : (m.role === 'assistant' ? sanitizeAssistantContent(rawContent) : rawContent),
+    createdAt: new Date(m.timestamp || Date.now()),
     provenance: m.provenance,
   };
   if (m.toolCalls) {
-    msg.toolCalls = m.toolCalls.map((tc: any) => normalizeHistoricalToolCall(tc, createdAt.getTime()));
+    msg.toolCalls = m.toolCalls.map((tc: any) => ({
+      id: tc.id || nextId(),
+      name: tc.name,
+      arguments: tc.arguments,
+      startedAt: Date.now(),
+      endedAt: Date.now(),
+      status: 'done' as const,
+    }));
   }
   // Preserve segments for graduated timeline reconstruction
   if (m.segments && Array.isArray(m.segments)) {
@@ -234,12 +353,19 @@ function extractTextFromGatewayMessage(msg: GatewayChatMessage): string {
 /**
  * Extract tool calls from a gateway message.
  */
-function extractToolCallsFromGatewayMessage(msg: GatewayChatMessage, fallbackTs: number): ToolCall[] | undefined {
+function extractToolCallsFromGatewayMessage(msg: GatewayChatMessage): ToolCall[] | undefined {
   if (!Array.isArray(msg.content)) return undefined;
 
   const toolCalls = msg.content
     .filter((block) => block.type === 'toolCall' && block.name)
-    .map((block) => normalizeHistoricalToolCall(block, fallbackTs));
+    .map((block) => ({
+      id: block.id || nextId(),
+      name: block.name as string,
+      arguments: block.arguments,
+      startedAt: Date.now(),
+      endedAt: Date.now(),
+      status: 'done' as const,
+    }));
 
   return toolCalls.length > 0 ? toolCalls : undefined;
 }
@@ -261,23 +387,19 @@ function extractThinkingFromGatewayMessage(msg: GatewayChatMessage): string | un
 /**
  * Map a gateway message to our ChatMessage format.
  */
-function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage | null {
+function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage {
   const text = extractTextFromGatewayMessage(msg);
-  const createdAt = new Date(msg.timestamp || Date.now());
-  const toolCalls = extractToolCallsFromGatewayMessage(msg, createdAt.getTime()) || [];
+  const toolCalls = extractToolCallsFromGatewayMessage(msg);
   const thinking = extractThinkingFromGatewayMessage(msg);
   const isTruncationPlaceholder = msg.role === 'assistant' && text === CHAT_HISTORY_OMITTED_PLACEHOLDER;
-  const content = isTruncationPlaceholder
-    ? 'Earlier assistant output was omitted from history because the message was too large.'
-    : sanitizeRenderableContent(msg.role, text);
-
-  if (!content && !toolCalls.length && !thinking) return null;
 
   return {
     id: msg.id || msg.messageId || `gw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     role: isTruncationPlaceholder ? 'system' : (msg.role as 'user' | 'assistant' | 'system' | 'toolResult'),
-    content,
-    createdAt,
+    content: isTruncationPlaceholder
+      ? 'Earlier assistant output was omitted from history because the message was too large.'
+      : (msg.role === 'assistant' ? sanitizeAssistantContent(text) : text),
+    createdAt: new Date(msg.timestamp || Date.now()),
     toolCalls,
     thinkingContent: thinking,
   };
@@ -577,7 +699,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const reconnectCatchUpTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const toolCounterRef = useRef(0);
   const hasRealToolEventsRef = useRef(false);
-  // NOTE: WS connection now managed by streamManager singleton (StreamManager.ts)
+  const wsManagerRef = useRef<WsManager | null>(null);
   // Direct gateway client for OPENCLAW provider (bypasses portal WS middleman)
   const directClientRef = useRef<OpenClawGatewayClient | null>(null);
   const currentRunIdRef = useRef<string | null>(null);
@@ -617,7 +739,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       try {
         // Use silent mode — 404 is expected for expired/stale sessions and
         // should not trigger error sounds or the ErrorPanel.
-        const data = await gatewayAPI.sessionInfo(session, { silent: true, soft: true });
+        const data = await gatewayAPI.sessionInfo(session, { silent: true });
         const actualModel = deriveSessionModel(data?.session);
         if (!cancelled && actualModel) {
           setSelectedModelRaw((prev) => (prev === actualModel ? prev : actualModel));
@@ -691,8 +813,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           }
           if (USE_DIRECT_GATEWAY && currentProvider === 'OPENCLAW') {
             directClientRef.current?.connect();
-          } else if (!streamManager.isConnected()) {
-            streamManager.reconnect();
+          } else if (wsManagerRef.current && !wsManagerRef.current.isConnected()) {
+            wsManagerRef.current.reconnect();
           }
           resetStreamWatchdog();
           return;
@@ -727,7 +849,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const sessionKey = typeof rawSession === 'string' ? rawSession.trim() : '';
     if (providerRef.current !== 'OPENCLAW') return sessionKey;
     if (sessionKey.startsWith('agent:')) return sessionKey;
-    if (isOwner(user) && (!sessionKey || sessionKey === 'main')) {
+    if (isOwner(user) && (!sessionKey || sessionKey === 'main' || sessionKey.startsWith('new-'))) {
       return 'agent:main:main';
     }
     return sessionKey;
@@ -787,9 +909,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       const params: Record<string, string> = { session: sessionKey, enhanced: '1' };
       if (prov) params.provider = prov;
       const { data } = await client.get('/gateway/history', { params });
-      return data.messages
-        ? data.messages.map(parseHistoryMessage).filter(Boolean) as ChatMessage[]
-        : [];
+      return data.messages ? data.messages.map(parseHistoryMessage) : [];
     };
 
     // Load via direct gateway client for OPENCLAW
@@ -805,7 +925,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         localStorage.setItem('agent-chat-session', resolvedSessionKey);
       }
       const result = await directClient.loadHistory(resolvedSessionKey || sessionKey);
-      return result.messages.map(mapGatewayMessage).filter(Boolean) as ChatMessage[];
+      return result.messages.map(mapGatewayMessage);
     };
 
     try {
@@ -823,8 +943,42 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           loaded = await loadViaHttp();
         }
       } else {
-        // Use HTTP path (StreamManager doesn't support one-shot handlers for history)
-        loaded = await loadViaHttp();
+        // Use existing portal WS or HTTP path
+        const manager = wsManagerRef.current;
+        if (manager && manager.isConnected()) {
+          try {
+            loaded = await new Promise<ChatMessage[]>((resolve, reject) => {
+              const requestId = 'hist-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+              const handler = (data: any) => {
+                if (data.type === 'history' && data.requestId === requestId) {
+                  clearTimeout(timeout);
+                  manager.removeHandler(handler);
+                  resolve((data.messages || []).map(parseHistoryMessage));
+                } else if (data.type === 'error' && data.requestId === requestId) {
+                  clearTimeout(timeout);
+                  manager.removeHandler(handler);
+                  reject(new Error(data.content || 'History request failed'));
+                }
+              };
+              const timeout = setTimeout(() => {
+                manager.removeHandler(handler);
+                reject(new Error('History timeout'));
+              }, 5000);
+              manager.addHandler(handler);
+              const sent = manager.send({ type: 'history', session: sessionKey, provider: prov, requestId });
+              if (!sent) {
+                clearTimeout(timeout);
+                manager.removeHandler(handler);
+                reject(new Error('History send failed'));
+              }
+            });
+          } catch (err) {
+            console.warn('[ChatState] WS history failed; falling back to HTTP', err);
+            loaded = await loadViaHttp();
+          }
+        } else {
+          loaded = await loadViaHttp();
+        }
       }
 
       // Only apply if still the current generation
@@ -886,33 +1040,16 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       const { data } = await client.get('/gateway/stream-status', { params });
       if (data.active) {
         debugLog('[ChatState] Active stream found on refresh — resubscribing');
-        if (!streamingAssistantIdRef.current) {
-          const resumeId = 'stream-resume-' + Date.now();
-          streamingAssistantIdRef.current = resumeId;
-          setMessages(prev => [...prev, {
-            id: resumeId,
-            role: 'assistant' as const,
-            content: '',
-            createdAt: new Date(),
-            toolCalls: [],
-          }]);
-        }
         isStreamActiveRef.current = true;
         setIsRunning(true);
         setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
         if (data.toolName) setActiveToolName(data.toolName);
-        setStatusText(data.statusText || (data.toolName ? `Using ${data.toolName}…` : data.phase === 'streaming' ? 'Responding…' : 'Thinking…'));
-        if (typeof data.thinkingContent === 'string') {
-          setThinkingContent(data.thinkingContent);
-          const aid = streamingAssistantIdRef.current;
-          if (aid) setMessages(prev => prev.map(m => m.id === aid ? { ...m, thinkingContent: data.thinkingContent } : m));
-        }
         if (typeof data.content === 'string' && data.content.length > 0) {
           const safeText = sanitizeAssistantContent(data.content);
           mergeStreamText(safeText, { replace: true });
           upsertStreamingAssistant(safeText);
         }
-        streamManager.send({ type: 'reconnect', session: currentSession });
+        wsManagerRef.current?.send({ type: 'reconnect', session: currentSession });
 
         // B19 fix: Stale stream watchdog — if no stream events arrive within 8s,
         // re-check stream-status and reset if the stream has ended. Prevents
@@ -954,41 +1091,31 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // handleSelectAgent, etc.) already clears before setting the new session, so the
   // messages array is already empty by the time this effect fires.
   useEffect(() => {
-    let cancelled = false;
-    const expectedSession = session;
-    const expectedProvider = provider;
-
     if (session && !isStreamActiveRef.current) {
       setIsLoadingHistory(true); // show spinner immediately, before async fetch
       loadHistoryInternal(session, provider).then(() => {
-        if (cancelled) return;
-        if (sessionRef.current !== expectedSession || providerRef.current !== expectedProvider) return;
-
         // After loading history, check if there's an active stream to reconnect to.
         // This covers page refresh mid-stream — without this, there's a gap between
         // history load and the first WS event where the UI shows no streaming indicator.
-        if (!isStreamActiveRef.current && expectedSession?.startsWith('agent:')) {
-          const params: Record<string, string> = { session: expectedSession };
-          if (expectedProvider) params.provider = expectedProvider;
+        if (!isStreamActiveRef.current && session.startsWith('agent:')) {
+          const params: Record<string, string> = { session };
+          if (provider) params.provider = provider;
           client.get('/gateway/stream-status', { params, _silent: true } as any).then(({ data }) => {
-            if (cancelled) return;
-            if (sessionRef.current !== expectedSession || providerRef.current !== expectedProvider) return;
             if (data.active && !isStreamActiveRef.current) {
               debugLog('[ChatState] Active stream detected on initial load — showing streaming UI');
               isStreamActiveRef.current = true;
               setIsRunning(true);
               setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
               if (data.toolName) setActiveToolName(data.toolName);
-              setStatusText(data.statusText || (data.toolName ? `Using ${data.toolName}…` : data.phase === 'streaming' ? 'Responding…' : 'Thinking…'));
-              const resumeId = streamingAssistantIdRef.current || ('stream-resume-' + Date.now());
-              streamingAssistantIdRef.current = resumeId;
               if (typeof data.content === 'string' && data.content.length > 0) {
                 const safeText = sanitizeAssistantContent(data.content);
                 assembledRef.current = safeText;
                 upsertStreamingAssistant(safeText);
               } else {
                 // Create empty streaming bubble so events have somewhere to land
-                setMessages(prev => prev.some(m => m.id === resumeId) ? prev : [...prev, {
+                const resumeId = 'stream-resume-' + Date.now();
+                streamingAssistantIdRef.current = resumeId;
+                setMessages(prev => [...prev, {
                   id: resumeId,
                   role: 'assistant' as const,
                   content: '',
@@ -996,19 +1123,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                   toolCalls: [],
                 }]);
               }
-              if (typeof data.thinkingContent === 'string') {
-                setThinkingContent(data.thinkingContent);
-                setMessages(prev => prev.map(m => m.id === resumeId ? { ...m, thinkingContent: data.thinkingContent } : m));
-              }
             }
           }).catch(() => { /* stream-status check is best-effort */ });
         }
       });
     }
-
-    return () => {
-      cancelled = true;
-    };
   }, [session, provider, loadHistoryInternal]);
 
   // WS event handler — processes events even when chat page is unmounted
@@ -1050,9 +1169,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const passthrough = ['session', 'exec_approval', 'exec_approval_resolved', 'connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended', 'run_resumed'];
     const streamTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'done'];
     if (!streamingAssistantIdRef.current && !passthrough.includes(data.type)) {
-      if (streamTypes.includes(data.type)) {
-        // Agent resumed after a sub-agent, reconnect, or reload race — create a new assistant bubble
-        // even for a final `done` so the completion text has somewhere to land.
+      if (streamTypes.includes(data.type) && data.type !== 'done') {
+        // Agent resumed after a sub-agent or multi-run — create a new assistant bubble
         console.log(`[ChatState] Agent resumed (${data.type}) — creating new assistant bubble`);
         const resumeId = 'resume-' + Date.now();
         streamingAssistantIdRef.current = resumeId;
@@ -1069,14 +1187,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           createdAt: new Date(),
           toolCalls: [],
         }]);
-        if (data.type !== 'done') {
-          isStreamActiveRef.current = true;
-          setIsRunning(true);
-          resetStreamWatchdog();
-        }
+        isStreamActiveRef.current = true;
+        setIsRunning(true);
+        resetStreamWatchdog();
         // Don't return — fall through to process this event with the new assistantId
       } else {
-        console.warn(`[ChatState] DROPPED event: type=${data.type} (no assistantId)`);
+        if (data.type !== 'done') {
+          console.warn(`[ChatState] DROPPED event: type=${data.type} (no assistantId)`);
+        }
         return;
       }
     }
@@ -1142,7 +1260,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         const toolArgs = data.toolArgs || undefined;
         setMessages(prev => prev.map(m =>
           m.id === assistantId
-            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: toolId, name: toolName, arguments: toolArgs, startedAt: Date.now(), timingKnown: true, status: 'running' as const }] }
+            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: toolId, name: toolName, arguments: toolArgs, startedAt: Date.now(), status: 'running' as const }] }
             : m
         ));
         break;
@@ -1177,7 +1295,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           const tid = 'tool-' + (++toolCounterRef.current);
           const now = Date.now();
           return prev.map(m => m.id === assistantId
-            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: tid, name: tn, startedAt: now - 1000, endedAt: now, timingKnown: true, status: 'done' as const }] }
+            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: tid, name: tn, startedAt: now - 1000, endedAt: now, status: 'done' as const }] }
             : m
           );
         });
@@ -1190,7 +1308,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setStatusText('Using tool: ' + data.name);
         setMessages(prev => prev.map(m =>
           m.id === assistantId
-            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: data.id || tid, name: data.name, arguments: data.arguments, startedAt: Date.now(), timingKnown: true, status: 'running' as const }] }
+            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: data.id || tid, name: data.name, arguments: data.arguments, startedAt: Date.now(), status: 'running' as const }] }
             : m
         ));
         break;
@@ -1256,8 +1374,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         
         setStatusText(null);
         setStreamingPhase('idle');
-        setActiveToolName(null);
-        setThinkingContent('');
         setLastProvenance(prov);
         setIsRunning(false);
         if (compactionPhaseRef.current === 'compacting') {
@@ -1273,7 +1389,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         // stream events arrive without an active assistantId.
         isStreamActiveRef.current = false;
         streamingAssistantIdRef.current = null;
-        currentRunIdRef.current = null;
         // Reset text accumulator so the next run segment starts fresh
         assembledRef.current = '';
         lastSegmentStartRef.current = 0;
@@ -1294,27 +1409,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           }
         }
 
-        setMessages(prev => prev.flatMap(m => {
-          if (m.id !== cid) return [m];
-          const turnMeta = data.metadata && (data.metadata.totalCostUsd || data.metadata.usage) ? {
-            totalCostUsd: data.metadata.totalCostUsd ?? null,
-            usage: data.metadata.usage ?? null,
-            model: data.metadata.model ?? null,
-            modelUsage: data.metadata.modelUsage ?? null,
-            nativeSessionId: data.metadata.nativeSessionId ?? null,
-          } : undefined;
-          const update: Partial<ChatMessage> = { content: finalContent, provenance: prov || undefined, turnMetadata: turnMeta };
+        setMessages(prev => prev.map(m => {
+          if (m.id !== cid) return m;
+          const update: Partial<ChatMessage> = { content: finalContent, provenance: prov || undefined };
           if (graduatedSegments.length > 0) {
             update.segments = graduatedSegments;
           }
-          const merged = { ...m, ...update };
-          const keep = Boolean(
-            (finalContent || '').trim() ||
-            graduatedSegments.length > 0 ||
-            (merged.toolCalls && merged.toolCalls.length > 0) ||
-            (merged.thinkingContent && merged.thinkingContent.trim())
-          );
-          return keep ? [merged] : [];
+          return { ...m, ...update };
         }));
         
         // The streaming state is already accurate at this point — the graduated segments
@@ -1380,12 +1481,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setIsRunning(true);
         setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
         setActiveToolName(data.toolName || null);
-        setStatusText(data.statusText || (data.toolName ? `Using ${data.toolName}…` : data.phase === 'streaming' ? 'Responding…' : 'Reconnecting to stream…'));
-        if (typeof data.thinkingContent === 'string') {
-          setThinkingContent(data.thinkingContent);
-          const aid = streamingAssistantIdRef.current;
-          if (aid) setMessages(prev => prev.map(m => m.id === aid ? { ...m, thinkingContent: data.thinkingContent } : m));
-        }
+        setStatusText(data.toolName ? `Using ${data.toolName}…` : 'Reconnecting to stream…');
         if (typeof data.content === 'string') {
           const nextText = mergeStreamText(sanitizeAssistantContent(data.content), { replace: true });
           upsertStreamingAssistant(nextText);
@@ -1405,18 +1501,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         break;
       }
       case 'stream_ended':
-        // Backend says no active stream — clear any stale local running state.
-        clearStreamWatchdog();
-        if (isStreamActiveRef.current || isRunning) {
-          isStreamActiveRef.current = false;
-          streamingAssistantIdRef.current = null;
-          currentRunIdRef.current = null;
-          setIsRunning(false);
-          setStreamingPhase('idle');
-          setStatusText(null);
-          setActiveToolName(null);
-          setThinkingContent('');
-        }
+        // Backend says no active stream — nothing to do
         break;
       case 'connected':
       case 'keepalive':
@@ -1593,8 +1678,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
           setStatusText(null);
           setStreamingPhase('idle');
-          setActiveToolName(null);
-          setThinkingContent('');
           setIsRunning(false);
           if (compactionPhaseRef.current === 'compacting') {
             compactionPhaseRef.current = 'idle';
@@ -1807,25 +1890,29 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
   }, [normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState]);
 
-  // WS setup — uses shared StreamManager singleton instead of per-provider WS.
-  // This eliminates duplicate WebSocket connections when both Agent Chat and
-  // Project Chat are active simultaneously.
+  // WS setup — runs once on mount, survives entire app lifetime
+  // Handler registration MUST happen in the same effect that creates the manager,
+  // otherwise wsManagerRef.current is null when the handler effect runs.
   useEffect(() => {
-    streamManager.init(); // Idempotent — safe to call multiple times
+    const manager = getWsManager();
+    wsManagerRef.current = manager;
 
-    // Register global handler to receive ALL events (ChatStateProvider handles its own session filtering)
-    const removeGlobalHandler = streamManager.addGlobalHandler((data: any) => {
-      handleWsEventRef.current(data);
-      // Also handle connected event for wsConnected state
+    // Register the main event handler via ref indirection so it always calls latest
+    const stableHandler = (data: any) => handleWsEventRef.current(data);
+    manager.addHandler(stableHandler);
+
+    const statusHandler = (data: any) => {
       if (data.type === 'connected') setWsConnected(true);
-    });
+    };
+    manager.addHandler(statusHandler);
 
-    // Seed connection state immediately
-    if (streamManager.isConnected()) {
+    // Seed connection state immediately in case the singleton WS connected
+    // before this component attached its handlers (fast-connect race).
+    if (manager.isConnected()) {
       setWsConnected(true);
     }
 
-    const unsubDisconnect = streamManager.onDisconnect(() => {
+    const unsubDisconnect = manager.onDisconnect(() => {
       setWsConnected(false);
       if (isStreamActiveRef.current) {
         console.warn('[ChatState] WS disconnected during active stream');
@@ -1836,9 +1923,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     });
 
     // On reconnect: check stream status & reload history delta
-    const unsubReconnect = streamManager.onReconnect(async () => {
+    const unsubReconnect = manager.onReconnect(async () => {
       setWsConnected(true);
-      debugLog('[ChatState] WS reconnected — checking stream status');
+      debugLog('[ChatState] WS reconnected \u2014 checking stream status');
       try {
         const params: Record<string, string> = { session: sessionRef.current };
         if (providerRef.current) params.provider = providerRef.current;
@@ -1854,29 +1941,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             upsertStreamingAssistant(nextText);
           }
           // Send reconnect message to subscribe to StreamEventBus via WS
-          streamManager.send({ type: 'reconnect', session: sessionRef.current });
-          const reconnectSession = sessionRef.current;
-          const reconnectProvider = providerRef.current;
-          setTimeout(async () => {
-            if (!isStreamActiveRef.current) return;
-            try {
-              const staleParams: Record<string, string> = { session: reconnectSession };
-              if (reconnectProvider) staleParams.provider = reconnectProvider;
-              const { data: recheck } = await client.get('/gateway/stream-status', { params: staleParams, _silent: true } as any);
-              if (!recheck.active && isStreamActiveRef.current) {
-                console.log('[ChatState] Reconnect stream-status was stale — resetting to idle');
-                isStreamActiveRef.current = false;
-                streamingAssistantIdRef.current = null;
-                currentRunIdRef.current = null;
-                setIsRunning(false);
-                setStreamingPhase('idle');
-                setStatusText(null);
-                setActiveToolName(null);
-                setThinkingContent('');
-                loadHistoryInternal(reconnectSession, reconnectProvider, { force: true }).catch(() => {});
-              }
-            } catch {}
-          }, 8000);
+          wsManagerRef.current?.send({ type: 'reconnect', session: sessionRef.current });
           resetStreamWatchdog();
           return;
         } else if (isStreamActiveRef.current) {
@@ -1894,9 +1959,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     });
 
     return () => {
-      removeGlobalHandler();
+      manager.removeHandler(stableHandler);
+      manager.removeHandler(statusHandler);
       unsubDisconnect();
       unsubReconnect();
+      wsManagerRef.current = null;
+      releaseWsManager();
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1980,7 +2048,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                     id: resumeId,
                     role: 'assistant' as const,
                     content: '',
-                    thinkingContent: typeof data.thinkingContent === 'string' ? data.thinkingContent : undefined,
                     createdAt: new Date(),
                     toolCalls: [],
                   }]);
@@ -1989,39 +2056,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                 setIsRunning(true);
                 setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
                 setActiveToolName(data.toolName || null);
-                setStatusText(data.statusText || (data.toolName ? `Using ${data.toolName}…` : data.phase === 'streaming' ? 'Responding…' : 'Reconnecting to stream…'));
-                if (typeof data.thinkingContent === 'string') {
-                  setThinkingContent(data.thinkingContent);
-                  const aid = streamingAssistantIdRef.current;
-                  if (aid) setMessages(prev => prev.map(m => m.id === aid ? { ...m, thinkingContent: data.thinkingContent } : m));
-                }
+                setStatusText(data.toolName ? `Using ${data.toolName}…` : 'Reconnecting to stream…');
                 if (typeof data.content === 'string' && data.content.length > 0) {
                   const safeText = sanitizeAssistantContent(data.content);
                   assembledRef.current = safeText;
                   upsertStreamingAssistant(safeText);
                 }
-                const reconnectSession = currentSession;
-                const reconnectProvider = currentProvider;
-                setTimeout(async () => {
-                  if (!isStreamActiveRef.current) return;
-                  try {
-                    const staleParams: Record<string, string> = { session: reconnectSession };
-                    if (reconnectProvider) staleParams.provider = reconnectProvider;
-                    const { data: recheck } = await client.get('/gateway/stream-status', { params: staleParams, _silent: true } as any);
-                    if (!recheck.active && isStreamActiveRef.current) {
-                      console.log('[ChatState] Direct reconnect stream-status was stale — resetting to idle');
-                      isStreamActiveRef.current = false;
-                      streamingAssistantIdRef.current = null;
-                      currentRunIdRef.current = null;
-                      setIsRunning(false);
-                      setStreamingPhase('idle');
-                      setStatusText(null);
-                      setActiveToolName(null);
-                      setThinkingContent('');
-                      loadHistoryInternal(reconnectSession, reconnectProvider, { force: true }).catch(() => {});
-                    }
-                  } catch {}
-                }, 8000);
                 resetStreamWatchdog();
               } else {
                 // Stream finished during disconnect — reload history to pick up
@@ -2108,6 +2148,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const handleVisibilityChange = async () => {
       if (document.visibilityState !== 'visible') return;
 
+      const manager = wsManagerRef.current;
       const directClient = directClientRef.current;
       const currentSession = resolveOpenClawSessionKey(sessionRef.current);
       const currentProvider = providerRef.current;
@@ -2119,14 +2160,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       const usingDirectGateway = USE_DIRECT_GATEWAY && currentProvider === 'OPENCLAW';
       const transportConnected = usingDirectGateway
         ? Boolean(directClient?.isConnected)
-        : streamManager.isConnected();
+        : Boolean(manager && manager.isConnected());
 
       if (!transportConnected) {
         debugLog('[ChatState] Transport disconnected on visibility — nudging reconnect');
         if (usingDirectGateway) {
           directClient?.connect();
         } else {
-          streamManager.reconnect();
+          manager?.reconnect();
         }
       }
 
@@ -2134,7 +2175,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (usingDirectGateway) {
           resetStreamWatchdog();
         } else {
-          streamManager.send({ type: 'reconnect', session: currentSession, provider: currentProvider });
+          manager?.send({ type: 'reconnect', session: currentSession, provider: currentProvider });
           resetStreamWatchdog();
         }
         return;
@@ -2159,7 +2200,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             }
             resetStreamWatchdog();
           } else {
-            streamManager.send({ type: 'reconnect', session: currentSession, provider: currentProvider });
+            manager?.send({ type: 'reconnect', session: currentSession, provider: currentProvider });
           }
         } else {
           debugLog('[ChatState] No active stream on visibility — reloading history for missed messages');
@@ -2245,49 +2286,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const normalized = String(text || '').trim();
     if (!normalized) return;
 
-    let authoritativeBusy = false;
-    if (providerRef.current === 'OPENCLAW' && !isStreamActiveRef.current) {
-      try {
-        const targetSession = resolveOpenClawSessionKey(sessionRef.current || 'main');
-        const { data } = await client.get('/gateway/stream-status', { params: { session: targetSession, provider: 'OPENCLAW' }, _silent: true } as any);
-        if (data?.active) {
-          authoritativeBusy = true;
-          if (!streamingAssistantIdRef.current) {
-            const resumeId = 'stream-resume-' + Date.now();
-            streamingAssistantIdRef.current = resumeId;
-            setMessages(prev => [...prev, {
-              id: resumeId,
-              role: 'assistant' as const,
-              content: typeof data.content === 'string' ? sanitizeAssistantContent(data.content) : '',
-              thinkingContent: typeof data.thinkingContent === 'string' ? data.thinkingContent : undefined,
-              createdAt: new Date(),
-              toolCalls: [],
-            }]);
-          }
-          isStreamActiveRef.current = true;
-          setIsRunning(true);
-          setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
-          setActiveToolName(data.toolName || null);
-          setStatusText(data.statusText || (data.toolName ? `Using ${data.toolName}…` : data.phase === 'streaming' ? 'Responding…' : 'Thinking…'));
-          if (typeof data.thinkingContent === 'string') {
-            setThinkingContent(data.thinkingContent);
-            const aid = streamingAssistantIdRef.current;
-            if (aid) setMessages(prev => prev.map(m => m.id === aid ? { ...m, thinkingContent: data.thinkingContent } : m));
-          }
-          if (typeof data.content === 'string' && data.content.length > 0) {
-            const safeText = sanitizeAssistantContent(data.content);
-            assembledRef.current = safeText;
-            mergeStreamText(safeText, { replace: true });
-            upsertStreamingAssistant(safeText);
-          }
-          resetStreamWatchdog();
-        }
-      } catch {
-        // best-effort authoritative busy check
-      }
-    }
-
-    const shouldInjectIntoActiveTurn = providerRef.current === 'OPENCLAW' && isStreamActiveRef.current && !authoritativeBusy;
+    const shouldInjectIntoActiveTurn = providerRef.current === 'OPENCLAW' && isStreamActiveRef.current;
     if (shouldInjectIntoActiveTurn) {
       try {
         const targetSession = resolveOpenClawSessionKey(sessionRef.current || 'main');
@@ -2295,8 +2294,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (USE_DIRECT_GATEWAY && directClient?.isConnected) {
           await directClient.injectMessage(targetSession, normalized);
         } else {
-          if (streamManager.isConnected()) {
-            const sent = streamManager.send({ type: 'inject', session: targetSession, text: normalized });
+          const manager = wsManagerRef.current;
+          if (manager && manager.isConnected()) {
+            const sent = manager.send({ type: 'inject', session: targetSession, text: normalized });
             if (!sent) {
               await client.post('/gateway/chat/inject', { session: targetSession, text: normalized });
             }
@@ -2307,14 +2307,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
         setMessages(prev => [...prev, {
           id: nextId(),
-          role: 'user',
-          content: normalized,
+          role: 'system',
+          content: `Steer sent to running OpenClaw turn: ${normalized}`,
           createdAt: new Date(),
-          steer: true,
           provenance: 'live-steer',
         }]);
-        setStatusText('Steer sent');
-        setTimeout(() => setStatusText((curr) => curr === 'Steer sent' ? null : curr), 1500);
+        setStatusText('Steer sent to running OpenClaw turn');
+        setTimeout(() => setStatusText((curr) => curr === 'Steer sent to running OpenClaw turn' ? null : curr), 2200);
       } catch (err: any) {
         console.error('[ChatState] Failed to inject note into active OpenClaw turn:', err);
         setStatusText(`⚠️ ${normalizeAgentError(err, 'Live steer failed')}`);
@@ -2323,7 +2322,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    const shouldQueue = authoritativeBusy || isStreamActiveRef.current || (!isQueueDrainActiveRef.current && messageQueueRef.current.length > 0);
+    const shouldQueue = isStreamActiveRef.current || (!isQueueDrainActiveRef.current && messageQueueRef.current.length > 0);
     if (shouldQueue) {
       const queuedId = nextId();
       const queuedAt = Date.now();
@@ -2402,7 +2401,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
 
     // Send via WS (portal middleman path for non-OPENCLAW or when direct gateway unavailable)
-    if (streamManager.isConnected()) {
+    const manager = wsManagerRef.current;
+    if (manager && manager.isConnected()) {
       const payload: Record<string, unknown> = {
         type: 'send',
         message: normalized,
@@ -2411,7 +2411,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       if (providerRef.current) payload.provider = providerRef.current;
       if (modelRef.current) payload.model = modelRef.current;
       if (agentIdRef.current) payload.agentId = agentIdRef.current;
-      const sent = streamManager.send(payload);
+      const sent = manager.send(payload);
       if (!sent) {
         try {
           await sendViaSSE(normalized, assistantId);
@@ -2538,17 +2538,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             const finalContent = hasFinal ? sanitizeAssistantContent(evt.content) : (assembled || '');
             assembled = finalContent;
             const prov = evt.provenance || null;
-            setMessages(prev => prev.flatMap(m => {
-              if (m.id !== assistantId) return [m];
-              const merged = { ...m, content: finalContent, provenance: prov || undefined };
-              const keep = Boolean(
-                (finalContent || '').trim() ||
-                (merged.toolCalls && merged.toolCalls.length > 0) ||
-                (merged.segments && merged.segments.length > 0) ||
-                (merged.thinkingContent && merged.thinkingContent.trim())
-              );
-              return keep ? [merged] : [];
-            }));
+            setMessages(prev => prev.map(m =>
+              m.id === assistantId ? { ...m, content: finalContent, provenance: prov || undefined } : m
+            ));
             setStreamingPhase('idle');
             setIsRunning(false);
             setLastProvenance(prov);
@@ -2602,8 +2594,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    if (streamManager.isConnected()) {
-      const sent = streamManager.send({ type: 'inject', session: targetSession, text: note });
+    const manager = wsManagerRef.current;
+    if (manager && manager.isConnected()) {
+      const sent = manager.send({ type: 'inject', session: targetSession, text: note });
       if (sent) return;
     }
 
@@ -2621,8 +2614,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         debugLog('[ChatState] Aborting via direct gateway, session:', currentSession, 'runId:', runId);
         await directClient.abortRun(currentSession, runId || undefined);
       } else {
-        if (streamManager.isConnected()) {
-          streamManager.send({ type: 'abort', session: sessionRef.current, provider: providerRef.current });
+        const manager = wsManagerRef.current;
+        if (manager && manager.isConnected()) {
+          manager.send({ type: 'abort', session: sessionRef.current, provider: providerRef.current });
         } else {
           await client.post('/gateway/chat/abort', { session: sessionRef.current, provider: providerRef.current });
         }
@@ -2667,7 +2661,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       directClientRef.current.connect();
       return;
     }
-    streamManager.reconnect();
+    wsManagerRef.current?.reconnect();
   }, []);
 
   const setFastModeModel = useCallback(async (nextModel: string) => {
@@ -2714,7 +2708,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       const patchResult = await gatewayAPI.patchConfigPath('agents.defaults.compaction.model', normalized || null);
       const patchedValue = typeof patchResult?.value === 'string' ? patchResult.value.trim() : '';
       setCompactionModelOverrideState(patchedValue);
-      const fresh = await gatewayAPI.getConfigPath('agents.defaults.compaction.model', { silent: true, soft: true });
+      const fresh = await gatewayAPI.getConfigPath('agents.defaults.compaction.model');
       const freshValue = typeof fresh?.value === 'string' ? fresh.value.trim() : '';
       setCompactionModelOverrideState(freshValue);
     } catch (err) {
@@ -2726,7 +2720,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
-    gatewayAPI.getConfigPath('agents.defaults.compaction.model', { silent: true, soft: true })
+    gatewayAPI.getConfigPath('agents.defaults.compaction.model')
       .then((data) => {
         if (cancelled) return;
         const value = typeof data?.value === 'string' ? data.value.trim() : '';
@@ -2778,7 +2772,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     loadHistory,
     selectSession,
     refreshChat,
-    wsManager: null, // Deprecated: use streamManager from StreamManager.ts
+    wsManager: wsManagerRef.current,
     reconnectSocket,
     // Session controls
     thinkingLevel,

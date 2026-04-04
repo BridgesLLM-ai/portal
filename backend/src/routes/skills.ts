@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
-import { spawn } from 'child_process';
+import { spawnSync } from 'child_process';
 
 const router = Router();
 
@@ -9,38 +9,27 @@ router.use(authenticateToken, requireAdmin);
 
 /* ─── Helpers ────────────────────────────────────────────── */
 
-function runCli(command: string, args: string[], timeout = 15000): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    const errChunks: Buffer[] = [];
-    const child = spawn(command, args, {
-      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    child.stdout.on('data', (d: Buffer) => chunks.push(d));
-    child.stderr.on('data', (d: Buffer) => errChunks.push(d));
-    const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error(`${command} timed out after ${timeout}ms`)); }, timeout);
-    child.on('error', (err: Error) => { clearTimeout(timer); reject(err); });
-    child.on('close', (code: number | null) => {
-      clearTimeout(timer);
-      const stdout = Buffer.concat(chunks).toString('utf-8');
-      const stderr = Buffer.concat(errChunks).toString('utf-8');
-      if (code && code !== 0) {
-        reject(new Error(stderr || stdout || `${command} ${args.join(' ')} failed with code ${code}`));
-      } else {
-        resolve({ stdout, stderr });
-      }
-    });
+function runCli(command: string, args: string[], timeout = 15000) {
+  const result = spawnSync(command, args, {
+    timeout,
+    encoding: 'utf-8',
+    maxBuffer: 10 * 1024 * 1024,
+    env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
   });
+  if (result.error) throw result.error;
+  if (result.status && result.status !== 0) {
+    throw new Error(result.stderr || result.stdout || `${command} ${args.join(' ')} failed`);
+  }
+  return { stdout: result.stdout || '', stderr: result.stderr || '' };
 }
 
-async function runOpenClaw(args: string[], timeout = 15000): Promise<string> {
-  const { stdout, stderr } = await runCli('openclaw', args, timeout);
+function runOpenClaw(args: string[], timeout = 15000): string {
+  const { stdout, stderr } = runCli('openclaw', args, timeout);
   return stdout || stderr;
 }
 
-async function runClawHub(args: string[], timeout = 30000): Promise<string> {
-  const { stdout, stderr } = await runCli('clawhub', args, timeout);
+function runClawHub(args: string[], timeout = 30000): string {
+  const { stdout, stderr } = runCli('clawhub', args, timeout);
   return stdout || stderr;
 }
 
@@ -102,53 +91,25 @@ function normalizeMarketplaceItem(item: any) {
   };
 }
 
-async function enrichMarketplaceResults(results: any[], inspectLimit = 8): Promise<any[]> {
-  const enriched = await Promise.all(results.map(async (item, index) => {
+function enrichMarketplaceResults(results: any[], inspectLimit = 8) {
+  return results.map((item, index) => {
     const normalized = normalizeMarketplaceItem(item);
     if ((normalized.description && normalized.author) || !normalized.slug || index >= inspectLimit) {
       return normalized;
     }
     try {
-      const raw = await runClawHub(['inspect', normalized.slug, '--json'], 15000);
+      const raw = runClawHub(['inspect', normalized.slug, '--json'], 15000);
       const parsed = parseJson(raw);
-      const enrichedItem = normalizeMarketplaceItem(parsed);
+      const enriched = normalizeMarketplaceItem(parsed);
       return {
         ...normalized,
-        ...enrichedItem,
-        score: normalized.score ?? enrichedItem.score,
+        ...enriched,
+        score: normalized.score ?? enriched.score,
       };
     } catch {
       return normalized;
     }
-  }));
-  return enriched.filter(item => item.name);
-}
-
-function getExploreFallbackQueries(sort: string): string[] {
-  const key = String(sort || 'trending').toLowerCase();
-  if (key === 'downloads' || key === 'installs' || key === 'installsalltime') {
-    return ['popular', 'trending', 'automation', 'github', 'productivity', 'weather'];
-  }
-  if (key === 'newest') {
-    return ['latest', 'new', 'recent', 'automation', 'ai'];
-  }
-  return ['trending', 'automation', 'weather', 'github', 'docker', 'ai'];
-}
-
-function sortMarketplaceFallback(results: any[], sort: string): any[] {
-  const key = String(sort || 'trending').toLowerCase();
-  const copy = [...results];
-  if (key === 'downloads' || key === 'installs' || key === 'installsalltime') {
-    return copy.sort((a: any, b: any) => Number(b?.downloads || 0) - Number(a?.downloads || 0));
-  }
-  if (key === 'newest') {
-    return copy.sort((a: any, b: any) => {
-      const aTs = Date.parse(String(a?.updatedAt || '')) || 0;
-      const bTs = Date.parse(String(b?.updatedAt || '')) || 0;
-      return bTs - aTs;
-    });
-  }
-  return copy.sort((a: any, b: any) => Number(b?.score || 0) - Number(a?.score || 0));
+  }).filter(item => item.name);
 }
 
 /* ─── Routes ─────────────────────────────────────────────── */
@@ -156,7 +117,7 @@ function sortMarketplaceFallback(results: any[], sort: string): any[] {
 /** GET /api/skills — list all locally available skills (openclaw skills list --json) */
 router.get('/', async (_req: Request, res: Response) => {
   try {
-    const raw = await runOpenClaw(['skills', 'list', '--json']);
+    const raw = runOpenClaw(['skills', 'list', '--json']);
     const parsed = parseJson(raw);
     const skills = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.skills) ? parsed.skills : []);
     res.json({ skills });
@@ -176,8 +137,8 @@ router.get('/search', async (req: Request, res: Response) => {
     }
 
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '20'), 10) || 20, 1), 50);
-    const raw = await runClawHub(['search', query, '--limit', String(limit)]);
-    const results = await enrichMarketplaceResults(parseSearchOutput(raw), Math.min(limit, 10));
+    const raw = runClawHub(['search', query, '--limit', String(limit)]);
+    const results = enrichMarketplaceResults(parseSearchOutput(raw), Math.min(limit, 10));
     res.json({ available: true, results });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Marketplace search failed';
@@ -194,11 +155,10 @@ router.get('/explore', async (req: Request, res: Response) => {
     const safeSort = allowedSorts.includes(sort) ? sort : 'trending';
 
     let results: unknown[] = [];
-    let source: 'explore' | 'search-fallback' = 'explore';
 
     // Try explore first (needs clawhub auth)
     try {
-      const raw = await runClawHub(['explore', '--json', '--limit', String(limit), '--sort', safeSort]);
+      const raw = runClawHub(['explore', '--json', '--limit', String(limit), '--sort', safeSort]);
       const parsed = parseJson(raw);
       const items = Array.isArray(parsed) ? parsed : (parsed?.items ?? parsed?.skills ?? []);
       if (Array.isArray(items) && items.length > 0) {
@@ -208,16 +168,14 @@ router.get('/explore', async (req: Request, res: Response) => {
       // explore failed (not logged in, etc.) — fall through to search fallback
     }
 
-    // Fallback: clawhub explore may be unavailable depending on server auth/state.
-    // Use search-derived browsing but keep sort semantics deterministic.
+    // Fallback: run popular search queries to simulate browsing
     if (results.length === 0) {
-      source = 'search-fallback';
-      const fallbackQueries = getExploreFallbackQueries(safeSort);
+      const fallbackQueries = ['automation', 'weather', 'github', 'docker', 'ai'];
       const seen = new Set<string>();
       for (const q of fallbackQueries) {
         if (results.length >= limit) break;
         try {
-          const raw = await runClawHub(['search', q, '--limit', '10']);
+          const raw = runClawHub(['search', q, '--limit', '10']);
           for (const item of parseSearchOutput(raw)) {
             if (!seen.has(item.name)) {
               seen.add(item.name);
@@ -231,15 +189,7 @@ router.get('/explore', async (req: Request, res: Response) => {
       results = results.slice(0, limit);
     }
 
-    const enriched = await enrichMarketplaceResults(results, Math.min(limit, 10));
-    const sorted = source === 'search-fallback' ? sortMarketplaceFallback(enriched, safeSort) : enriched;
-
-    res.json({
-      results: sorted.slice(0, limit),
-      source,
-      sort: safeSort,
-      fallback: source === 'search-fallback',
-    });
+    res.json({ results: enrichMarketplaceResults(results, Math.min(limit, 10)) });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Marketplace explore failed';
     res.status(500).json({ error: message });
@@ -255,7 +205,7 @@ router.get('/inspect/:slug', async (req: Request, res: Response) => {
       return;
     }
 
-    const raw = await runClawHub(['inspect', slug, '--json']);
+    const raw = runClawHub(['inspect', slug, '--json']);
     const parsed = parseJson(raw);
     res.json(parsed);
   } catch (err) {
@@ -279,7 +229,7 @@ router.post('/install', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await runClawHub(['install', name], 60000);
+    const result = runClawHub(['install', name], 60000);
     res.json({ ok: true, output: result });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Install failed';
@@ -301,7 +251,7 @@ router.post('/uninstall', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await runClawHub(['uninstall', name], 30000);
+    const result = runClawHub(['uninstall', name], 30000);
     res.json({ ok: true, output: result });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Uninstall failed';
@@ -312,7 +262,7 @@ router.post('/uninstall', async (req: Request, res: Response) => {
 /** GET /api/skills/plugins — list installed plugins (openclaw plugins list --json) */
 router.get('/plugins', async (_req: Request, res: Response) => {
   try {
-    const raw = await runOpenClaw(['plugins', 'list', '--json']);
+    const raw = runOpenClaw(['plugins', 'list', '--json']);
     const parsed = parseJson(raw);
     const plugins = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.plugins) ? parsed.plugins : []);
     res.json({ plugins });
@@ -331,7 +281,7 @@ router.post('/plugins/install', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await runOpenClaw(['plugins', 'install', spec], 120000);
+    const result = runOpenClaw(['plugins', 'install', spec], 120000);
     res.json({ ok: true, output: result });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Plugin install failed';

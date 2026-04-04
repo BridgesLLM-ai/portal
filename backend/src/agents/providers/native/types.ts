@@ -1,7 +1,4 @@
 import type { SpawnOptionsWithoutStdio } from 'child_process';
-
-// Defined here to avoid circular import with NativeCliAdapterProvider
-export type NativeCliPermissionLevel = 'sandboxed' | 'elevated';
 import type {
   AgentProviderName,
   AgentSessionConfig,

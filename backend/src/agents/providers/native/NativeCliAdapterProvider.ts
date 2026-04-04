@@ -1,4 +1,6 @@
 import { spawn } from 'child_process';
+import { existsSync, readFileSync } from 'fs';
+import path from 'path';
 import type {
   AgentMessage,
   AgentProvider,
@@ -25,21 +27,9 @@ import {
 } from '../NativeSessionStore';
 import type { NativeCliProviderAdapter, NativeCliTurnContext } from './types';
 import { getProviderAvailability } from '../../providerAvailability';
-import { getPortalApiKeysForEnv } from '../../../services/openclawConfigManager';
-import { prisma } from '../../../config/database';
-import type { NativeCliPermissionLevel } from './types';
 
-export async function getNativeCliPermissionLevel(providerName: string): Promise<NativeCliPermissionLevel> {
-  try {
-    const row = await prisma.systemSetting.findUnique({
-      where: { key: `agents.nativePermission.${providerName}` },
-    });
-    if (row?.value === 'elevated') return 'elevated';
-    return 'sandboxed';
-  } catch {
-    return 'sandboxed';
-  }
-}
+const HOME_DIR = process.env.HOME || '/root';
+const CLAUDE_CREDENTIALS_PATH = path.join(HOME_DIR, '.claude', '.credentials.json');
 
 function stripAnsi(text: string): string {
   // eslint-disable-next-line no-control-regex
@@ -47,6 +37,31 @@ function stripAnsi(text: string): string {
     .replace(/\u001B\][^\u0007]*(\u0007|\u001B\\)/g, '')
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
+}
+
+function hasLocalClaudeOauthCredentials(): boolean {
+  try {
+    if (!existsSync(CLAUDE_CREDENTIALS_PATH)) return false;
+    const parsed = JSON.parse(readFileSync(CLAUDE_CREDENTIALS_PATH, 'utf8'));
+    const oauth = parsed?.claudeAiOauth;
+    return Boolean(oauth?.accessToken || oauth?.refreshToken);
+  } catch {
+    return false;
+  }
+}
+
+function buildNativeCliEnv(providerName: AgentProviderName): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: '1' };
+
+  // Claude Code OAuth subscriptions should win over any inherited Anthropic API key.
+  // A stale portal/server key can override the local CLI login and produce false
+  // "Invalid API key" failures even though Claude is authenticated on the box.
+  if (providerName === 'CLAUDE_CODE' && hasLocalClaudeOauthCredentials()) {
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+  }
+
+  return env;
 }
 
 export abstract class NativeCliAdapterProvider implements AgentProvider {
@@ -142,12 +157,10 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
     return new Promise<AgentSendResult>((resolve, reject) => {
       let stdoutBuffer = '';
 
-      // Inject portal-configured API keys so native CLIs can use them as fallback auth
-      const portalApiKeys = getPortalApiKeysForEnv(this.adapter.providerName);
       const child = spawn(invocation.command, invocation.args, {
         cwd: session.cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, NO_COLOR: '1', ...portalApiKeys },
+        env: buildNativeCliEnv(this.adapter.providerName),
         ...(invocation.options || {}),
       });
 

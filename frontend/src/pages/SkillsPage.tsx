@@ -236,7 +236,6 @@ export function SkillsContent({ agentId, showHeader = false }: SkillsContentProp
   const [marketLoading, setMarketLoading] = useState(false);
   const [marketSort, setMarketSort] = useState<MarketSort>('trending');
   const [marketMode, setMarketMode] = useState<'explore' | 'search'>('explore');
-  const [marketSource, setMarketSource] = useState<'explore' | 'search-fallback'>('explore');
   const [installingSkill, setInstallingSkill] = useState<string | null>(null);
   const [pluginSpec, setPluginSpec] = useState('');
   const [installingPlugin, setInstallingPlugin] = useState(false);
@@ -269,7 +268,6 @@ export function SkillsContent({ agentId, showHeader = false }: SkillsContentProp
     try {
       const data = await skillsAPI.explore(sort, 25);
       setMarketResults(Array.isArray(data.results) ? data.results : []);
-      setMarketSource(data.source === 'search-fallback' ? 'search-fallback' : 'explore');
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to load marketplace';
       setActivityMessage(message);
@@ -488,11 +486,6 @@ export function SkillsContent({ agentId, showHeader = false }: SkillsContentProp
                 <p className="text-sm text-slate-400">
                   {marketMode === 'search' ? 'Search results from ClawHub' : 'Browse trending skills from ClawHub'}
                 </p>
-                {marketMode === 'explore' && marketSource === 'search-fallback' && (
-                  <p className="text-[11px] text-amber-300/90 mt-0.5">
-                    Using search fallback mode (native explore unavailable right now)
-                  </p>
-                )}
               </div>
             </div>
 

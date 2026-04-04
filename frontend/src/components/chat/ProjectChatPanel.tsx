@@ -1,11 +1,11 @@
 /**
  * ProjectChatPanel — Self-contained chat panel for project agents.
  * 
- * Uses shared StreamManager singleton for WebSocket — no per-panel WS connections.
+ * Has its OWN WebSocket connection (not shared with ChatStateProvider singleton).
  * Manages its own message state, streaming, tool calls, compaction.
  * Replicates the quality of ChatInterface: markdown, tool pills, status bar, file upload.
  */
-import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -26,7 +26,6 @@ import {
 } from '../../utils/chatStream';
 
 import type { ToolCall, ChatMessage, StreamingPhase } from '../../contexts/ChatStateProvider';
-import { streamManager } from '../../services/StreamManager';
 
 /* ═══ Types ═══ */
 
@@ -48,6 +47,133 @@ interface PendingAttachment {
   uploadError?: string;
 }
 
+/* ═══ WS Manager (local, not shared) ═══ */
+
+type WsEventHandler = (data: any) => void;
+
+interface LocalWsManager {
+  send: (data: any) => boolean;
+  addHandler: (handler: WsEventHandler) => void;
+  removeHandler: (handler: WsEventHandler) => void;
+  onDisconnect: (cb: () => void) => (() => void);
+  onReconnect: (cb: () => void) => (() => void);
+  isConnected: () => boolean;
+  reconnect: () => void;
+  close: () => void;
+}
+
+function createLocalWsManager(url: string): LocalWsManager {
+  let ws: WebSocket | null = null;
+  let intentionallyClosed = false;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectAttempts = 0;
+  let wasConnectedBefore = false;
+  const handlers = new Set<WsEventHandler>();
+  const disconnectCallbacks = new Set<() => void>();
+  const reconnectCallbacks = new Set<() => void>();
+
+  function connect() {
+    if (intentionallyClosed) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      scheduleReconnect();
+      return;
+    }
+
+    ws.onopen = () => {
+      const isReconnect = wasConnectedBefore;
+      wasConnectedBefore = true;
+      reconnectAttempts = 0;
+      if (isReconnect) {
+        for (const cb of reconnectCallbacks) {
+          try { cb(); } catch (err) { console.error('[project-ws] reconnect callback error:', err); }
+        }
+      }
+    };
+
+    ws.onmessage = (event) => {
+      let data: any;
+      try { data = JSON.parse(event.data); } catch { return; }
+      for (const handler of handlers) {
+        try { handler(data); } catch (err) { console.error('[project-ws] Handler error:', err); }
+      }
+    };
+
+    ws.onclose = () => {
+      ws = null;
+      if (!intentionallyClosed) {
+        for (const cb of disconnectCallbacks) {
+          try { cb(); } catch (err) { console.error('[project-ws] disconnect callback error:', err); }
+        }
+        scheduleReconnect();
+      }
+    };
+
+    ws.onerror = () => {};
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer || intentionallyClosed) return;
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+    reconnectAttempts++;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, delay);
+  }
+
+  connect();
+
+  return {
+    send(data: any): boolean {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      try { ws.send(JSON.stringify(data)); return true; } catch { return false; }
+    },
+    addHandler(handler: WsEventHandler) { handlers.add(handler); },
+    removeHandler(handler: WsEventHandler) { handlers.delete(handler); },
+    onDisconnect(cb: () => void) {
+      disconnectCallbacks.add(cb);
+      return () => { disconnectCallbacks.delete(cb); };
+    },
+    onReconnect(cb: () => void) {
+      reconnectCallbacks.add(cb);
+      return () => { reconnectCallbacks.delete(cb); };
+    },
+    isConnected() { return ws !== null && ws.readyState === WebSocket.OPEN; },
+    reconnect() {
+      intentionallyClosed = false;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (ws) {
+        try { ws.close(); } catch {}
+        ws = null;
+      }
+      connect();
+    },
+    close() {
+      intentionallyClosed = true;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (ws) { try { ws.close(); } catch {} ws = null; }
+      handlers.clear();
+      disconnectCallbacks.clear();
+      reconnectCallbacks.clear();
+    },
+  };
+}
+
+function getWsUrl(): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const apiUrl = import.meta.env.VITE_API_URL || '';
+  if (apiUrl) {
+    if (apiUrl.startsWith('http')) {
+      return apiUrl.replace(/^http/, 'ws') + '/gateway/ws';
+    }
+    return protocol + '//' + window.location.host + apiUrl + '/gateway/ws';
+  }
+  return protocol + '//' + window.location.host + '/api/gateway/ws';
+}
+
 /* ═══ Helpers ═══ */
 
 let msgCounter = 0;
@@ -55,74 +181,31 @@ function nextId() {
   return 'pmsg-' + Date.now() + '-' + (++msgCounter);
 }
 
-function normalizeHistoricalToolCall(tc: any, fallbackTs: number): ToolCall {
-  const startedAt = typeof tc?.startedAt === 'number' ? tc.startedAt : fallbackTs;
-  const endedAt = typeof tc?.endedAt === 'number' ? tc.endedAt : undefined;
-  const status = tc?.status === 'running' || tc?.status === 'error' ? tc.status : 'done';
-  const timingKnown = typeof tc?.startedAt === 'number' && (typeof tc?.endedAt === 'number' || status === 'running');
-
-  return {
-    id: tc?.id || nextId(),
-    name: tc?.name || 'tool',
-    arguments: tc?.arguments,
-    startedAt,
-    endedAt,
-    status,
-    timingKnown,
-  };
-}
-
 function parseHistoryMessage(m: any): ChatMessage {
-  const createdAt = new Date(m.timestamp || Date.now());
   const msg: ChatMessage = {
     id: m.id || nextId(),
     role: m.role,
     content: m.role === 'assistant'
       ? sanitizeAssistantContent(m.content || '')
       : (m.content || ''),
-    createdAt,
+    createdAt: new Date(m.timestamp || Date.now()),
     provenance: m.provenance,
   };
   if (m.toolCalls) {
-    msg.toolCalls = m.toolCalls.map((tc: any) => normalizeHistoricalToolCall(tc, createdAt.getTime()));
+    msg.toolCalls = m.toolCalls.map((tc: any) => ({
+      id: tc.id || nextId(),
+      name: tc.name,
+      arguments: tc.arguments,
+      startedAt: Date.now(),
+      endedAt: Date.now(),
+      status: 'done' as const,
+    }));
   }
   if (m.role === 'toolResult') {
     msg.toolCallId = m.toolCallId;
     msg.toolName = m.toolName;
   }
   return msg;
-}
-
-function cleanProjectHistory(messages: ChatMessage[]): ChatMessage[] {
-  const seenIds = new Set<string>();
-  const cleaned: ChatMessage[] = [];
-
-  for (const msg of messages) {
-    if (msg.id && seenIds.has(msg.id)) continue;
-    if (msg.id) seenIds.add(msg.id);
-
-    const content = typeof msg.content === 'string' ? msg.content.trim() : '';
-    const hasToolCalls = Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0;
-    const hasThinking = typeof msg.thinkingContent === 'string' && msg.thinkingContent.trim().length > 0;
-
-    // Drop pure empty assistant placeholders from history — they add noise but no value.
-    if (msg.role === 'assistant' && !content && !hasToolCalls && !hasThinking) {
-      continue;
-    }
-
-    const prev = cleaned[cleaned.length - 1];
-    if (prev && prev.role === 'user' && msg.role === 'user') {
-      const prevContent = typeof prev.content === 'string' ? prev.content.trim() : '';
-      const samePrompt = prevContent.length > 0 && prevContent === content;
-      if (samePrompt) {
-        continue;
-      }
-    }
-
-    cleaned.push(msg);
-  }
-
-  return cleaned;
 }
 
 /* ═══ Tool Summary ═══ */
@@ -151,13 +234,6 @@ function getToolSummary(tool: ToolCall): string {
       return `Run \`${short}\``;
     }
   }
-  if (name === 'process') {
-    const action = String(args.action || '').toLowerCase();
-    if (action === 'poll') return 'Wait for command';
-    if (action === 'log') return 'Read command output';
-    if (action === 'kill') return 'Stop command';
-    if (action === 'list') return 'List commands';
-  }
   if (name === 'web_search' || name === 'search') {
     const q = args.query;
     if (q) return `Search "${String(q).substring(0, 40)}"`;
@@ -170,48 +246,13 @@ function getToolSummary(tool: ToolCall): string {
   return tool.name;
 }
 
-function formatToolDuration(ms: number): string {
-  if (!Number.isFinite(ms) || ms < 1000) return '<1s';
-  if (ms < 10_000) return `${(ms / 1000).toFixed(1)}s`;
-  const totalSeconds = Math.round(ms / 1000);
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes < 60) return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const remMinutes = minutes % 60;
-  return remMinutes ? `${hours}h ${remMinutes}m` : `${hours}h`;
-}
-
-function filterVisibleToolCalls(toolCalls?: ToolCall[]): ToolCall[] {
-  return (toolCalls || []).filter((tool) => {
-    const action = typeof tool.arguments?.action === 'string' ? tool.arguments.action.toLowerCase() : '';
-    return !(tool.name.toLowerCase() === 'process' && action === 'poll' && tool.status !== 'running');
-  });
-}
-
 /* ═══ Sub-components ═══ */
 
 function ToolCallPill({ tool }: { tool: ToolCall }) {
   const [expanded, setExpanded] = useState(false);
-  const [now, setNow] = useState(() => Date.now());
+  const duration = tool.endedAt ? ((tool.endedAt - tool.startedAt) / 1000).toFixed(1) : null;
   const hasDetails = !!(tool.result || tool.arguments);
   const summary = getToolSummary(tool);
-  const durationMs = tool.timingKnown === false
-    ? null
-    : tool.endedAt
-      ? Math.max(0, tool.endedAt - tool.startedAt)
-      : tool.status === 'running'
-        ? Math.max(0, now - tool.startedAt)
-        : null;
-  const duration = durationMs !== null ? formatToolDuration(durationMs) : null;
-
-  useEffect(() => {
-    if (tool.status !== 'running' || tool.timingKnown === false) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [tool.status, tool.startedAt, tool.timingKnown]);
 
   return (
     <motion.div
@@ -231,7 +272,7 @@ function ToolCallPill({ tool }: { tool: ToolCall }) {
             <Wrench size={10} className="text-emerald-400" />
           )}
           <span className="text-slate-300">{summary}</span>
-          {duration && <span className="text-slate-600">· {duration}</span>}
+          {duration && <span className="text-slate-600">· {duration}s</span>}
           {hasDetails && (
             <ChevronRight size={9} className={`text-slate-600 transition-transform ${expanded ? 'rotate-90' : ''}`} />
           )}
@@ -246,14 +287,14 @@ function ToolCallPill({ tool }: { tool: ToolCall }) {
               className="overflow-hidden w-full"
             >
               {tool.arguments && (
-                <div className="mt-1 px-2.5 py-2 rounded-xl bg-slate-800/40 border border-white/[0.04] text-[10px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap max-h-[100px] overflow-y-auto text-left">
-                  <span className="text-slate-500 text-[9px] block mb-1">Arguments:</span>
+                <div className="mt-1 px-2.5 py-1.5 rounded-lg bg-slate-800/40 border border-white/[0.04] text-[10px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap max-h-[100px] overflow-y-auto text-left">
+                  <span className="text-slate-500 text-[9px] block mb-0.5">Args:</span>
                   {typeof tool.arguments === 'string' ? tool.arguments : JSON.stringify(tool.arguments, null, 2)}
                 </div>
               )}
               {tool.result && (
-                <div className="mt-1 px-2.5 py-2 rounded-xl bg-black/20 border border-white/[0.04] text-[10px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap max-h-[100px] overflow-y-auto text-left">
-                  <span className="text-slate-500 text-[9px] block mb-1">Result:</span>
+                <div className="mt-1 px-2.5 py-1.5 rounded-lg bg-black/20 border border-white/[0.04] text-[10px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap max-h-[100px] overflow-y-auto text-left">
+                  <span className="text-slate-500 text-[9px] block mb-0.5">Result:</span>
                   {tool.result}
                 </div>
               )}
@@ -501,10 +542,13 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   // Session state
   const [sessionKey, setSessionKey] = useState<string | null>(null);
   const [agentId, setAgentId] = useState<string | null>(null);
-  const [selectedModel, setSelectedModel] = useState<string>('');
+  const [selectedModel, setSelectedModel] = useState<string>(() =>
+    localStorage.getItem(`agent-model-${projectName}`) || ''
+  );
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [sessionReady, setSessionReady] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
+  const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
 
   // Chat state
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -523,27 +567,22 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const draftCacheRef = useRef<Map<string, string>>(new Map());
-  const attachmentCacheRef = useRef<Map<string, PendingAttachment[]>>(new Map());
-  const lastDraftScopeRef = useRef(projectName);
 
   // Refs
-  const unsubscribeRef = useRef<(() => void) | null>(null);
-  const connectionUnsubscribeRef = useRef<(() => void) | null>(null);
-  const reconnectUnsubscribeRef = useRef<(() => void) | null>(null);
+  const wsRef = useRef<LocalWsManager | null>(null);
   const streamingAssistantIdRef = useRef<string | null>(null);
   const assembledRef = useRef('');
   const lastSegmentStartRef = useRef(0);
   const lastRawTextLenRef = useRef(0); // Track raw gateway text length for accurate graduation
+  const resumeSeededContentRef = useRef(false);
+  const suppressLiveBubbleContentRef = useRef(false);
   const isStreamActiveRef = useRef(false);
   const toolCounterRef = useRef(0);
   const hasRealToolEventsRef = useRef(false);
   const compactionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionKeyRef = useRef<string | null>(null);
-  const initGenerationRef = useRef(0);
   const modelRef = useRef(selectedModel);
-  const [hydratedModelProject, setHydratedModelProject] = useState(projectName);
 
   // Scroll
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -553,53 +592,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   useEffect(() => { sessionKeyRef.current = sessionKey; }, [sessionKey]);
   useEffect(() => { modelRef.current = selectedModel; }, [selectedModel]);
 
-  const resizeComposer = useCallback(() => {
-    requestAnimationFrame(() => {
-      const t = inputRef.current;
-      if (!t) return;
-      t.style.height = 'auto';
-      t.style.height = `${Math.min(t.scrollHeight, 120)}px`;
-    });
-  }, []);
-
-  const setProjectDraft = useCallback((value: string, scopeKey: string = projectName) => {
-    draftCacheRef.current.set(scopeKey, value);
-    setInput(value);
-    if (scopeKey === projectName) resizeComposer();
-  }, [projectName, resizeComposer]);
-
-  const setProjectAttachments = useCallback((next: PendingAttachment[] | ((prev: PendingAttachment[]) => PendingAttachment[]), scopeKey: string = projectName) => {
-    const base = scopeKey === projectName
-      ? pendingAttachments
-      : (attachmentCacheRef.current.get(scopeKey) || []);
-    const resolved = typeof next === 'function'
-      ? (next as (prev: PendingAttachment[]) => PendingAttachment[])(base)
-      : next;
-    attachmentCacheRef.current.set(scopeKey, resolved);
-    if (scopeKey === projectName) setPendingAttachments(resolved);
-  }, [pendingAttachments, projectName]);
-
+  // Persist model selection
   useEffect(() => {
-    const prevScope = lastDraftScopeRef.current;
-    if (prevScope === projectName) return;
-    draftCacheRef.current.set(prevScope, input);
-    attachmentCacheRef.current.set(prevScope, pendingAttachments);
-    lastDraftScopeRef.current = projectName;
-    setInput(draftCacheRef.current.get(projectName) || '');
-    setPendingAttachments(attachmentCacheRef.current.get(projectName) || []);
-    resizeComposer();
-  }, [input, pendingAttachments, projectName, resizeComposer]);
-
-  // Hydrate per-project model selection before passive init effects run.
-  useLayoutEffect(() => {
-    setSelectedModel(localStorage.getItem(`agent-model-${projectName}`) || '');
-    setHydratedModelProject(projectName);
-  }, [projectName]);
-
-  useEffect(() => {
-    if (hydratedModelProject !== projectName) return;
     localStorage.setItem(`agent-model-${projectName}`, selectedModel);
-  }, [hydratedModelProject, projectName, selectedModel]);
+  }, [selectedModel, projectName]);
 
   const loadAvailableModels = useCallback(async () => {
     const data = await gatewayAPI.models();
@@ -621,15 +617,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     });
   }, [loadAvailableModels]);
 
-  // Only mark the project chat as active when a stream is actually running.
-  // This keeps idle chats from auto-reopening and prevents stale "active" state.
+  // Mark session as active for auto-restore
   useEffect(() => {
-    if (isRunning) {
-      localStorage.setItem(`agent-active-${projectName}`, 'true');
-    } else {
-      localStorage.removeItem(`agent-active-${projectName}`);
-    }
-  }, [isRunning, projectName]);
+    localStorage.setItem(`agent-active-${projectName}`, 'true');
+    return () => {}; // Don't clear on unmount — closeAgentChat handles that
+  }, [projectName]);
 
   // ── Scroll helpers ──
   const handleScroll = useCallback(() => {
@@ -689,143 +681,133 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     if (watchdogRef.current) { clearTimeout(watchdogRef.current); watchdogRef.current = null; }
   }, []);
 
-  const resetChatRuntimeState = useCallback((options?: { clearMessages?: boolean; clearComposer?: boolean }) => {
-    clearWatchdog();
-    if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
-    streamingAssistantIdRef.current = null;
+  const ensureStreamingAssistant = useCallback((content?: string) => {
+    const currentId = streamingAssistantIdRef.current ?? ('stream-resume-' + Date.now());
+    streamingAssistantIdRef.current = currentId;
+    setMessages(prev => {
+      const exists = prev.some(m => m.id === currentId);
+      if (!exists) {
+        return [...prev, {
+          id: currentId,
+          role: 'assistant' as const,
+          content: typeof content === 'string' ? content : '',
+          createdAt: new Date(),
+          toolCalls: [],
+        }];
+      }
+      if (typeof content !== 'string') return prev;
+      return prev.map(m => m.id === currentId ? { ...m, content } : m);
+    });
+    return currentId;
+  }, []);
+
+  const loadHistoryViaWs = useCallback(async (manager: LocalWsManager, session: string) => {
+    const loaded = await new Promise<ChatMessage[]>((resolve, reject) => {
+      const requestId = 'phist-' + Date.now();
+      const histHandler = (d: any) => {
+        if (d.type === 'history' && d.requestId === requestId) {
+          clearTimeout(timeout);
+          manager.removeHandler(histHandler);
+          resolve((d.messages || []).map(parseHistoryMessage));
+        } else if (d.type === 'error' && d.requestId === requestId) {
+          clearTimeout(timeout);
+          manager.removeHandler(histHandler);
+          reject(new Error(d.content));
+        }
+      };
+      const timeout = setTimeout(() => {
+        manager.removeHandler(histHandler);
+        reject(new Error('History timeout'));
+      }, 10000);
+      manager.addHandler(histHandler);
+      const sent = manager.send({ type: 'history', session, provider: 'OPENCLAW', requestId });
+      if (!sent) {
+        clearTimeout(timeout);
+        manager.removeHandler(histHandler);
+        reject(new Error('Live chat socket is disconnected'));
+      }
+    });
+    setMessages(loaded);
+    setSessionError(null);
+    return loaded;
+  }, []);
+
+  const clearResumeSeededContent = useCallback((assistantId?: string | null) => {
+    if (!resumeSeededContentRef.current) return;
+    resumeSeededContentRef.current = false;
     assembledRef.current = '';
     lastSegmentStartRef.current = 0;
     lastRawTextLenRef.current = 0;
-    isStreamActiveRef.current = false;
-    toolCounterRef.current = 0;
-    hasRealToolEventsRef.current = false;
-    compactionPhaseRef.current = 'idle';
-    setIsRunning(false);
-    setStreamingPhase('idle');
-    setActiveToolName(null);
-    setStatusText(null);
-    setThinkingContent('');
-    setCompactionPhase('idle');
-    if (options?.clearMessages !== false) {
-      setMessages([]);
-    }
-    if (options?.clearComposer !== false) {
-      draftCacheRef.current.set(projectName, '');
-      attachmentCacheRef.current.set(projectName, []);
-      setInput('');
-      setPendingAttachments([]);
-    }
-  }, [clearWatchdog, projectName]);
-
-  const applySessionStreamState = useCallback((state: { phase?: string; toolName?: string | null; statusText?: string | null; thinkingContent?: string } | null) => {
-    const phase = state?.phase;
-    const active = phase === 'thinking' || phase === 'streaming' || phase === 'tool';
-
-    isStreamActiveRef.current = active;
-    setIsRunning(active);
-
-    if (!active) {
-      setStreamingPhase('idle');
-      setActiveToolName(null);
-      setStatusText(null);
-      return;
-    }
-
-    setStreamingPhase(phase === 'tool' ? 'tool' : phase === 'streaming' ? 'streaming' : 'thinking');
-    setActiveToolName(state?.toolName || null);
-    setStatusText(state?.statusText || (phase === 'tool' && state?.toolName ? `Using ${state.toolName}…` : phase === 'streaming' ? 'Responding…' : 'Thinking…'));
-    if (typeof state?.thinkingContent === 'string') {
-      setThinkingContent(state.thinkingContent);
+    const cid = assistantId || streamingAssistantIdRef.current;
+    if (cid) {
+      setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: '' } : m));
     }
   }, []);
 
-  const syncAuthoritativeStreamState = useCallback(async (session: string, options?: { reconnect?: boolean }) => {
-    try {
-      const { data } = await client.get('/gateway/stream-status', {
-        params: { session },
-        _silent: true,
-      } as any);
+  const syncStreamState = useCallback(async (
+    manager: LocalWsManager | null,
+    options: { reloadHistoryIfIdle?: boolean } = {}
+  ) => {
+    const currentSession = sessionKeyRef.current;
+    if (!currentSession) return false;
 
-      if (!data?.active) {
-        resetChatRuntimeState({ clearMessages: false, clearComposer: false });
-        return;
-      }
+    const { data } = await client.get('/gateway/stream-status', {
+      params: { session: currentSession, provider: 'OPENCLAW' },
+      _silent: true,
+    } as any);
 
+    if (data.active) {
       isStreamActiveRef.current = true;
+      suppressLiveBubbleContentRef.current = true;
       setIsRunning(true);
-      setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
+      const resumePhase = data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking';
+      setStreamingPhase(resumePhase);
       setActiveToolName(data.toolName || null);
-      setStatusText(data.statusText || (data.toolName && data.phase === 'tool' ? `Using ${data.toolName}…` : data.phase === 'streaming' ? 'Responding…' : 'Thinking…'));
+      setStatusText(data.toolName ? `Using ${data.toolName}…` : 'Reconnecting to stream…');
+      setConnectionNotice(null);
 
-      if (typeof data.thinkingContent === 'string') {
-        setThinkingContent(data.thinkingContent);
-        const thinkingId = streamingAssistantIdRef.current || nextId();
-        streamingAssistantIdRef.current = thinkingId;
-        setMessages(prev => {
-          const idx = prev.findIndex(msg => msg.id === thinkingId);
-          if (idx === -1) {
-            return [...prev, {
-              id: thinkingId,
-              role: 'assistant' as const,
-              content: '',
-              thinkingContent: data.thinkingContent,
-              createdAt: new Date(),
-              toolCalls: [],
-            }];
-          }
-          const next = [...prev];
-          next[idx] = { ...next[idx], thinkingContent: data.thinkingContent };
-          return next;
-        });
-      }
-
-      if (typeof data.content === 'string' && data.content.length > 0) {
+      if (resumePhase === 'streaming' && typeof data.content === 'string' && data.content.length > 0) {
         const safeText = sanitizeAssistantContent(data.content);
+        resumeSeededContentRef.current = true;
         assembledRef.current = safeText;
+        lastSegmentStartRef.current = 0;
         lastRawTextLenRef.current = safeText.length;
-
-        const assistantId = streamingAssistantIdRef.current || nextId();
-        streamingAssistantIdRef.current = assistantId;
-        setMessages(prev => {
-          const idx = prev.findIndex(msg => msg.id === assistantId);
-          if (idx === -1) {
-            return [...prev, {
-              id: assistantId,
-              role: 'assistant' as const,
-              content: safeText,
-              createdAt: new Date(),
-              toolCalls: [],
-            }];
-          }
-          const next = [...prev];
-          next[idx] = { ...next[idx], content: safeText };
-          return next;
-        });
+        ensureStreamingAssistant(safeText);
+      } else {
+        resumeSeededContentRef.current = false;
+        assembledRef.current = '';
+        lastSegmentStartRef.current = 0;
+        lastRawTextLenRef.current = 0;
+        ensureStreamingAssistant();
       }
 
-      if (options?.reconnect !== false) {
-        streamManager.send({ type: 'reconnect', session, provider: 'OPENCLAW' });
-      }
-
-      const staleSession = session;
-      setTimeout(async () => {
-        if (sessionKeyRef.current !== staleSession || !isStreamActiveRef.current) return;
-        try {
-          const { data: recheck } = await client.get('/gateway/stream-status', {
-            params: { session: staleSession },
-            _silent: true,
-          } as any);
-          if (!recheck?.active && sessionKeyRef.current === staleSession) {
-            resetChatRuntimeState({ clearMessages: false, clearComposer: false });
-          }
-        } catch {
-          // Best-effort stale stream cleanup
-        }
-      }, 8000);
-    } catch {
-      // Best-effort authoritative check
+      manager?.send({ type: 'reconnect', session: currentSession, provider: 'OPENCLAW' });
+      resetWatchdog();
+      return true;
     }
-  }, [resetChatRuntimeState]);
+
+    clearWatchdog();
+    if (isStreamActiveRef.current) {
+      isStreamActiveRef.current = false;
+      suppressLiveBubbleContentRef.current = false;
+      setIsRunning(false);
+      setStreamingPhase('idle');
+      setStatusText(null);
+      setActiveToolName(null);
+      streamingAssistantIdRef.current = null;
+    }
+
+    if (options.reloadHistoryIfIdle && manager) {
+      setIsLoadingHistory(true);
+      try {
+        await loadHistoryViaWs(manager, currentSession);
+      } finally {
+        setIsLoadingHistory(false);
+      }
+    }
+
+    return false;
+  }, [clearWatchdog, ensureStreamingAssistant, loadHistoryViaWs, resetWatchdog]);
 
   const appendThinkingChunk = useCallback((assistantId: string | null, chunk: string) => {
     if (!chunk) return;
@@ -852,12 +834,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         break;
       }
       case 'status': {
+        clearResumeSeededContent(assistantId);
         setStatusText(data.content || null);
         // OpenClaw streams thinking separately; keep status out of thought text.
         if (!assembledRef.current) setStreamingPhase('thinking');
         break;
       }
       case 'thinking': {
+        clearResumeSeededContent(assistantId);
         appendThinkingChunk(
           assistantId,
           extractThinkingChunk('thinking', data.content, assembledRef.current.length > 0),
@@ -881,6 +865,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         break;
       }
       case 'tool_start': {
+        clearResumeSeededContent(assistantId);
         hasRealToolEventsRef.current = true;
         const toolName = (data.toolName || data.content || 'tool').replace(/^Using tool:\s*/i, '').replace(/^[^\s]+\s+Using tool:\s*/i, '').trim();
         if (assembledRef.current && assembledRef.current.trim().length > 0) {
@@ -899,7 +884,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         const toolArgs = data.toolArgs || undefined;
         setMessages(prev => prev.map(m =>
           m.id === assistantId
-            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: toolId, name: toolName, arguments: toolArgs, startedAt: Date.now(), timingKnown: true, status: 'running' as const }] }
+            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: toolId, name: toolName, arguments: toolArgs, startedAt: Date.now(), status: 'running' as const }] }
             : m
         ));
         break;
@@ -935,20 +920,21 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           const tid = 'tool-' + (++toolCounterRef.current);
           const now = Date.now();
           return prev.map(m => m.id === assistantId
-            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: tid, name: tn, startedAt: now - 1000, endedAt: now, timingKnown: true, status: 'done' as const }] }
+            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: tid, name: tn, startedAt: now - 1000, endedAt: now, status: 'done' as const }] }
             : m
           );
         });
         break;
       }
       case 'toolCall': {
+        clearResumeSeededContent(assistantId);
         const tid = 'tool-' + (++toolCounterRef.current);
         setStreamingPhase('tool');
         setActiveToolName(data.name);
         setStatusText('Using tool: ' + data.name);
         setMessages(prev => prev.map(m =>
           m.id === assistantId
-            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: data.id || tid, name: data.name, arguments: data.arguments, startedAt: Date.now(), timingKnown: true, status: 'running' as const }] }
+            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: data.id || tid, name: data.name, arguments: data.arguments, startedAt: Date.now(), status: 'running' as const }] }
             : m
         ));
         break;
@@ -1004,6 +990,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           });
         }
 
+        resumeSeededContentRef.current = false;
+        suppressLiveBubbleContentRef.current = false;
         assembledRef.current = fullText;
         setStatusText(null);
         setStreamingPhase('streaming');
@@ -1030,6 +1018,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         }
         isStreamActiveRef.current = false;
         streamingAssistantIdRef.current = null;
+        resumeSeededContentRef.current = false;
+        suppressLiveBubbleContentRef.current = false;
         setMessages(prev => prev.map(m =>
           m.id === cid ? { ...m, content: fc, provenance: prov || undefined } : m
         ));
@@ -1046,25 +1036,26 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setIsRunning(false);
         isStreamActiveRef.current = false;
         streamingAssistantIdRef.current = null;
+        resumeSeededContentRef.current = false;
+        suppressLiveBubbleContentRef.current = false;
         break;
       }
       case 'stream_resume': {
+        suppressLiveBubbleContentRef.current = true;
+        const resumePhase = data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking';
         if (!streamingAssistantIdRef.current) {
           const resumeId = 'stream-resume-' + Date.now();
           streamingAssistantIdRef.current = resumeId;
           assembledRef.current = '';
           isStreamActiveRef.current = true;
           setIsRunning(true);
-          setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
-          setStatusText(data.statusText || (data.toolName && data.phase === 'tool' ? `Using ${data.toolName}…` : data.phase === 'streaming' ? 'Responding…' : 'Thinking…'));
-          setMessages(prev => [...prev, { id: resumeId, role: 'assistant' as const, content: '', thinkingContent: typeof data.thinkingContent === 'string' ? data.thinkingContent : undefined, createdAt: new Date(), toolCalls: [] }]);
+          setStreamingPhase(resumePhase);
+          setActiveToolName(data.toolName || null);
+          if (data.toolName) setStatusText(`Using ${data.toolName}…`);
+          setMessages(prev => [...prev, { id: resumeId, role: 'assistant' as const, content: '', createdAt: new Date(), toolCalls: [] }]);
         }
-        if (typeof data.thinkingContent === 'string') {
-          setThinkingContent(data.thinkingContent);
-          const cid = streamingAssistantIdRef.current;
-          setMessages(prev => prev.map(m => m.id === cid ? { ...m, thinkingContent: data.thinkingContent } : m));
-        }
-        if (typeof data.content === 'string') {
+        if (resumePhase === 'streaming' && typeof data.content === 'string') {
+          resumeSeededContentRef.current = true;
           const safeChunk = sanitizeAssistantContent(data.content);
           const fullText = mergeAssistantStream(assembledRef.current, safeChunk, { replace: true });
           lastRawTextLenRef.current = fullText.length;
@@ -1082,29 +1073,20 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           assembledRef.current = fullText;
           const cid = streamingAssistantIdRef.current;
           setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: st } : m));
+        } else {
+          resumeSeededContentRef.current = false;
         }
         break;
       }
       case 'connected':
         setWsConnected(true);
+        setConnectionNotice(null);
         break;
-      case 'stream_ended': {
-        clearWatchdog();
-        isStreamActiveRef.current = false;
-        setIsRunning(false);
-        setStreamingPhase('idle');
-        setStatusText(null);
-        setActiveToolName(null);
-        compactionPhaseRef.current = 'idle';
-        setCompactionPhase('idle');
-        if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
-        streamingAssistantIdRef.current = null;
-        break;
-      }
+      case 'stream_ended':
       case 'keepalive':
         break;
     }
-  }, [resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent]);
+  }, [clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent]);
 
   const handleWsEventRef = useRef(handleWsEvent);
   useEffect(() => { handleWsEventRef.current = handleWsEvent; }, [handleWsEvent]);
@@ -1112,140 +1094,98 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   // ── Ensure session + WS setup on mount ──
   useEffect(() => {
     let cancelled = false;
-    const initGeneration = ++initGenerationRef.current;
+    let cleanupTransport: (() => void) | null = null;
 
     async function init() {
       try {
-        if (hydratedModelProject !== projectName) return;
-        resetChatRuntimeState({ clearMessages: false, clearComposer: false });
-        setSessionReady(false);
-        setSessionError(null);
-        setSessionKey(null);
-        setAgentId(null);
-        sessionKeyRef.current = null;
         setIsLoadingHistory(true);
+        setConnectionNotice('Connecting to project agent…');
 
-        // Initialize shared StreamManager and connection tracking before session work
-        streamManager.init();
-        connectionUnsubscribeRef.current?.();
-        connectionUnsubscribeRef.current = streamManager.onConnectionChange((connected) => {
-          if (initGenerationRef.current !== initGeneration) return;
-          setWsConnected(connected);
-        });
-        setWsConnected(streamManager.isConnected());
-
-        reconnectUnsubscribeRef.current?.();
-        reconnectUnsubscribeRef.current = streamManager.onReconnect(() => {
-          if (initGenerationRef.current !== initGeneration) return;
-          const liveSession = sessionKeyRef.current;
-          if (!liveSession) return;
-          void syncAuthoritativeStreamState(liveSession);
-        });
-
-        // Ensure session exists
         const { data } = await client.post(`/projects/${projectName}/assistant/ensure-session`, {
-          model: selectedModel || undefined,
+          model: modelRef.current,
         });
-        if (cancelled || initGenerationRef.current !== initGeneration) return;
+        if (cancelled) return;
 
-        const { sessionKey: sk, agentId: aid, model: m, initialized } = data;
+        const { sessionKey: sk, agentId: aid, model: m } = data;
         setSessionKey(sk);
         setAgentId(aid);
         if (m) setSelectedModel(m);
 
-        if (initialized === false) {
-          sessionKeyRef.current = sk;
-          setSessionReady(true);
-          setWsConnected(streamManager.isConnected());
+        const manager = createLocalWsManager(getWsUrl());
+        wsRef.current = manager;
 
-          unsubscribeRef.current?.();
-          const { unsubscribe } = streamManager.subscribe(
-            sk,
-            (event) => handleWsEventRef.current(event),
-            (state) => applySessionStreamState(state)
+        const stableHandler = (d: any) => handleWsEventRef.current(d);
+        manager.addHandler(stableHandler);
+
+        const unsubDisconnect = manager.onDisconnect(() => {
+          setWsConnected(false);
+          setConnectionNotice(
+            isStreamActiveRef.current
+              ? 'Connection lost — reconnecting to the live stream…'
+              : 'Connection lost — reconnecting…'
           );
-          unsubscribeRef.current = unsubscribe;
-
-          if (cancelled || initGenerationRef.current !== initGeneration) return;
-          resetChatRuntimeState({ clearMessages: true, clearComposer: false });
-          setSessionError(null);
-          setIsLoadingHistory(false);
-          return;
-        }
-
-        let connected = streamManager.isConnected();
-        if (!connected) {
-          connected = await new Promise<boolean>((resolve) => {
-            const unsub = streamManager.onConnectionChange((nextConnected) => {
-              if (nextConnected) {
-                unsub();
-                resolve(true);
-              }
-            });
-            // Timeout safety — don't wait forever
-            setTimeout(() => {
-              unsub();
-              resolve(streamManager.isConnected());
-            }, 5000);
-          });
-        }
-
-        if (cancelled || initGenerationRef.current !== initGeneration) return;
-        setWsConnected(connected);
-        if (!connected) {
-          throw new Error('Chat connection unavailable');
-        }
-
-        setSessionReady(true);
-        sessionKeyRef.current = sk;
-
-        unsubscribeRef.current?.();
-        const { unsubscribe } = streamManager.subscribe(
-          sk,
-          (event) => handleWsEventRef.current(event),
-          (state) => applySessionStreamState(state)
-        );
-        unsubscribeRef.current = unsubscribe;
-
-        // Load history via WS after the long-lived subscriber is attached.
-        // Empty/new sessions skip this entirely so first-open lands immediately.
-        const loaded = await new Promise<ChatMessage[]>((resolve, reject) => {
-          const timeout = setTimeout(() => { unsubHist(); reject(new Error('History timeout')); }, 10000);
-          const requestId = 'phist-' + Date.now();
-
-          const { unsubscribe: unsubHist } = streamManager.subscribe(
-            sk,
-            (d) => {
-              if (d.type === 'history' && d.requestId === requestId) {
-                clearTimeout(timeout);
-                unsubHist();
-                resolve(((d.messages as any[]) || []).map(parseHistoryMessage));
-              } else if (d.type === 'error' && d.requestId === requestId) {
-                clearTimeout(timeout);
-                unsubHist();
-                reject(new Error(d.content as string));
-              }
-            }
-          );
-
-          const sent = streamManager.send({ type: 'history', session: sk, provider: 'OPENCLAW', requestId });
-          if (!sent) {
-            clearTimeout(timeout);
-            unsubHist();
-            reject(new Error('Chat connection unavailable'));
+          if (isStreamActiveRef.current) {
+            setIsRunning(true);
+            setStreamingPhase(prev => prev === 'idle' ? 'thinking' : prev);
+            setStatusText('Reconnecting to stream…');
           }
         });
 
-        if (cancelled || initGenerationRef.current !== initGeneration) return;
-        setMessages(cleanProjectHistory(loaded));
+        const unsubReconnect = manager.onReconnect(async () => {
+          setWsConnected(true);
+          setConnectionNotice(null);
+          try {
+            await syncStreamState(manager, { reloadHistoryIfIdle: true });
+          } catch (err) {
+            console.warn('[ProjectChat] Reconnect sync failed:', err);
+          }
+        });
 
-        await syncAuthoritativeStreamState(sk);
-        if (cancelled || initGenerationRef.current !== initGeneration) return;
-        setSessionError(null);
-        setIsLoadingHistory(false);
+        cleanupTransport = () => {
+          manager.removeHandler(stableHandler);
+          unsubDisconnect();
+          unsubReconnect();
+        };
+
+        if (manager.isConnected()) {
+          setWsConnected(true);
+          setConnectionNotice(null);
+        }
+
+        await new Promise<void>((resolve) => {
+          if (manager.isConnected()) { resolve(); return; }
+          const check = setInterval(() => {
+            if (manager.isConnected() || cancelled) { clearInterval(check); resolve(); }
+          }, 100);
+          setTimeout(() => { clearInterval(check); resolve(); }, 3000);
+        });
+
+        if (cancelled) {
+          cleanupTransport?.();
+          manager.close();
+          return;
+        }
+
+        setWsConnected(manager.isConnected());
+        setSessionReady(true);
+        if (manager.isConnected()) setConnectionNotice(null);
+        sessionKeyRef.current = sk;
+
+        await loadHistoryViaWs(manager, sk);
+        await syncStreamState(manager);
+
+        if (!cancelled) {
+          setIsLoadingHistory(false);
+        }
       } catch (err: any) {
-        if (!cancelled && initGenerationRef.current === initGeneration) {
-          setSessionError(err.message || 'Failed to initialize session');
+        if (!cancelled) {
+          const message = err?.message || 'Failed to initialize session';
+          if (message === 'History timeout' || message === 'Live chat socket is disconnected') {
+            setSessionError(null);
+            setConnectionNotice('Live chat socket is still reconnecting…');
+          } else {
+            setSessionError(message);
+          }
           setIsLoadingHistory(false);
         }
       }
@@ -1255,73 +1195,30 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
     return () => {
       cancelled = true;
-      connectionUnsubscribeRef.current?.();
-      connectionUnsubscribeRef.current = null;
-      reconnectUnsubscribeRef.current?.();
-      reconnectUnsubscribeRef.current = null;
-      if (unsubscribeRef.current) {
-        unsubscribeRef.current();
-        unsubscribeRef.current = null;
+      cleanupTransport?.();
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
       }
       if (watchdogRef.current) clearTimeout(watchdogRef.current);
       if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
     };
-  }, [hydratedModelProject, projectName, applySessionStreamState, resetChatRuntimeState, syncAuthoritativeStreamState]);
+  }, [projectName, loadHistoryViaWs, syncStreamState]);
 
   // ── Send message ──
-  const sendMessage = useCallback(async (text: string): Promise<boolean> => {
+  const sendMessage = useCallback((text: string) => {
     const sk = sessionKeyRef.current;
-    if (!sk) return false;
+    if (!sk || isStreamActiveRef.current) return false;
 
-    if (!isStreamActiveRef.current) {
-      try {
-        const { data } = await client.get('/gateway/stream-status', { params: { session: sk }, _silent: true } as any);
-        if (data?.active) {
-          isStreamActiveRef.current = true;
-          setIsRunning(true);
-          setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
-          setActiveToolName(data.toolName || null);
-          setStatusText(data.statusText || (data.toolName && data.phase === 'tool' ? `Using ${data.toolName}…` : data.phase === 'streaming' ? 'Responding…' : 'Thinking…'));
-          if (typeof data.thinkingContent === 'string') setThinkingContent(data.thinkingContent);
-          return false;
-        }
-      } catch {
-        // best effort authoritative busy check
-      }
-    }
-
-    if (isStreamActiveRef.current) return false;
-
-    if (!streamManager.isConnected()) {
+    const manager = wsRef.current;
+    if (!manager || !manager.isConnected()) {
       setWsConnected(false);
-      setSessionError('Chat connection unavailable. Reconnecting…');
-      streamManager.reconnect();
+      setConnectionNotice('Connection lost — reconnecting. Your draft is still in the composer.');
+      manager?.reconnect();
       return false;
     }
 
-    setSessionError(null);
-
-    const userMsg: ChatMessage = { id: nextId(), role: 'user', content: text, createdAt: new Date() };
-    const assistantMsgId = nextId();
-    const assistantMsg: ChatMessage = { id: assistantMsgId, role: 'assistant' as const, content: '', createdAt: new Date() };
-    setMessages(prev => [...prev, userMsg, assistantMsg]);
-
-    assembledRef.current = '';
-    lastSegmentStartRef.current = 0;
-    lastRawTextLenRef.current = 0;
-    toolCounterRef.current = 0;
-    hasRealToolEventsRef.current = false;
-    setThinkingContent('');
-    setStatusText(null);
-    setStreamingPhase('thinking');
-    setActiveToolName(null);
-
-    streamingAssistantIdRef.current = assistantMsgId;
-    setIsRunning(true);
-    isStreamActiveRef.current = true;
-    resetWatchdog();
-
-    const sent = streamManager.send({
+    const sent = manager.send({
       type: 'send',
       message: text,
       session: sk,
@@ -1331,28 +1228,43 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     });
 
     if (!sent) {
-      clearWatchdog();
-      isStreamActiveRef.current = false;
-      streamingAssistantIdRef.current = null;
-      setIsRunning(false);
-      setStreamingPhase('idle');
-      setActiveToolName(null);
-      setStatusText(null);
       setWsConnected(false);
-      setSessionError('Chat connection unavailable. Reconnecting…');
-      setMessages(prev => prev.filter(m => m.id !== userMsg.id && m.id !== assistantMsgId));
-      streamManager.reconnect();
+      setConnectionNotice('Couldn’t reach the live chat socket. Reconnecting now — your draft is still in the composer.');
+      manager.reconnect();
       return false;
     }
 
+    const userMsg: ChatMessage = { id: nextId(), role: 'user', content: text, createdAt: new Date() };
+    setMessages(prev => [...prev, userMsg]);
+
+    assembledRef.current = '';
+    lastSegmentStartRef.current = 0;
+    lastRawTextLenRef.current = 0;
+    toolCounterRef.current = 0;
+    hasRealToolEventsRef.current = false;
+    resumeSeededContentRef.current = false;
+    suppressLiveBubbleContentRef.current = false;
+    setThinkingContent('');
+    setStatusText(null);
+    setStreamingPhase('thinking');
+    setActiveToolName(null);
+
+    const assistantMsgId = nextId();
+    streamingAssistantIdRef.current = assistantMsgId;
+    setMessages(prev => [...prev, { id: assistantMsgId, role: 'assistant' as const, content: '', createdAt: new Date() }]);
+    setIsRunning(true);
+    isStreamActiveRef.current = true;
+    resetWatchdog();
+    setConnectionNotice(null);
     return true;
-  }, [agentId, clearWatchdog, resetWatchdog]);
+  }, [agentId, resetWatchdog]);
 
   // ── Cancel stream ──
   const cancelStream = useCallback(() => {
+    const manager = wsRef.current;
     const sk = sessionKeyRef.current;
-    if (streamManager.isConnected() && sk) {
-      streamManager.abort(sk);
+    if (manager && manager.isConnected() && sk) {
+      manager.send({ type: 'abort', session: sk });
     }
     clearWatchdog();
     isStreamActiveRef.current = false;
@@ -1399,7 +1311,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   }, [projectName, cancelStream]);
 
   // ── File upload ──
-  const uploadFile = useCallback(async (file: File, attachId: string, scopeKey: string) => {
+  const uploadFile = useCallback(async (file: File, attachId: string) => {
     const formData = new FormData();
     formData.append('file', file);
     try {
@@ -1407,15 +1319,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       if (!resp.ok) throw new Error(`Upload failed: ${resp.status}`);
       const data = await resp.json();
       const serverPath = data.diskPath || `/var/portal-files/uploads/${data.path}`;
-      setProjectAttachments(prev => prev.map(a => a.id === attachId ? { ...a, serverPath, uploadStatus: 'done' as const } : a), scopeKey);
+      setPendingAttachments(prev => prev.map(a => a.id === attachId ? { ...a, serverPath, uploadStatus: 'done' as const } : a));
     } catch (err: any) {
-      setProjectAttachments(prev => prev.map(a => a.id === attachId ? { ...a, uploadStatus: 'error' as const, uploadError: err.message } : a), scopeKey);
+      setPendingAttachments(prev => prev.map(a => a.id === attachId ? { ...a, uploadStatus: 'error' as const, uploadError: err.message } : a));
     }
-  }, [setProjectAttachments]);
+  }, []);
 
   const handleFileSelect = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    const scopeKey = projectName;
     const newAttachments: PendingAttachment[] = [];
     for (const file of Array.from(files)) {
       const id = `pattach-${Date.now()}-${Math.random()}`;
@@ -1427,19 +1338,19 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       else if (!isText) { att.uploadStatus = 'uploading'; }
       newAttachments.push(att);
     }
-    setProjectAttachments(prev => [...prev, ...newAttachments], scopeKey);
+    setPendingAttachments(prev => [...prev, ...newAttachments]);
     for (const att of newAttachments) {
-      if (att.uploadStatus === 'uploading') uploadFile(att.file, att.id, scopeKey);
+      if (att.uploadStatus === 'uploading') uploadFile(att.file, att.id);
     }
-  }, [projectName, setProjectAttachments, uploadFile]);
+  }, [uploadFile]);
 
   const removeAttachment = useCallback((id: string) => {
-    setProjectAttachments(prev => {
+    setPendingAttachments(prev => {
       const removed = prev.find(a => a.id === id);
       if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
       return prev.filter(a => a.id !== id);
     });
-  }, [setProjectAttachments]);
+  }, []);
 
   // Build attachment text
   const buildAttachmentText = useCallback(() => {
@@ -1455,19 +1366,19 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   }, [pendingAttachments]);
 
   // ── Form submit ──
-  const handleSubmit = useCallback(async (e: React.FormEvent) => {
+  const handleSubmit = useCallback((e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim() || isRunning || !sessionReady) return;
     const stillUploading = pendingAttachments.some(a => a.uploadStatus === 'uploading');
     if (stillUploading) return;
     const attachText = buildAttachmentText();
     const fullMessage = attachText + input.trim();
-    const sent = await sendMessage(fullMessage);
+    const sent = sendMessage(fullMessage);
     if (sent) {
-      setProjectDraft('');
-      setProjectAttachments([]);
+      setInput('');
+      setPendingAttachments([]);
     }
-  }, [input, isRunning, sessionReady, pendingAttachments, buildAttachmentText, sendMessage, setProjectAttachments, setProjectDraft]);
+  }, [input, isRunning, sessionReady, pendingAttachments, buildAttachmentText, sendMessage]);
 
   // ── Model change ──
   const handleModelChange = useCallback(async (newModel: string) => {
@@ -1497,7 +1408,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       recognition.interimResults = true;
       recognition.onresult = (event: any) => {
         const transcript = Array.from(event.results).map((r: any) => r[0].transcript).join('');
-        setProjectDraft(transcript);
+        setInput(transcript);
       };
       recognition.onerror = () => setIsListening(false);
       recognition.onend = () => setIsListening(false);
@@ -1505,7 +1416,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       recognitionRef.current = recognition;
       setIsListening(true);
     }
-  }, [SpeechRecognition, isListening, setProjectDraft]);
+  }, [SpeechRecognition, isListening]);
 
   // Cleanup recognition on unmount
   useEffect(() => {
@@ -1586,6 +1497,21 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         </div>
       )}
 
+      {connectionNotice && !sessionError && (
+        <div className="px-3 py-2 bg-amber-500/10 border-b border-amber-500/20 text-[11px] text-amber-300 flex items-center gap-2">
+          <RotateCcw size={12} className={!wsConnected ? 'animate-spin' : ''} />
+          <span className="flex-1 min-w-0">{connectionNotice}</span>
+          {!wsConnected && (
+            <button
+              onClick={() => wsRef.current?.reconnect()}
+              className="px-2 py-0.5 rounded-md border border-amber-500/20 hover:bg-amber-500/10 transition-colors text-[10px] font-medium"
+            >
+              Retry now
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Compaction indicator */}
       <AnimatePresence>
         {compactionPhase !== 'idle' && (
@@ -1616,16 +1542,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       </AnimatePresence>
 
       {/* Messages */}
-      <div ref={scrollRef} className="flex-1 overflow-auto relative" onScroll={handleScroll}>
-        {isLoadingHistory && messages.length > 0 && (
-          <div className="absolute top-3 inset-x-0 z-10 flex justify-center pointer-events-none px-3">
-            <div className="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-slate-950/85 backdrop-blur px-3 py-1 text-[10px] text-slate-300 shadow-lg shadow-black/20">
-              <Loader2 size={10} className="animate-spin text-emerald-400" />
-              <span>Loading <span className="font-medium text-slate-200">{projectName}</span> chat… keeping previous context visible</span>
-            </div>
-          </div>
-        )}
-        {isLoadingHistory && messages.length === 0 ? (
+      <div ref={scrollRef} className="flex-1 overflow-auto" onScroll={handleScroll}>
+        {isLoadingHistory ? (
           <div className="flex items-center justify-center py-12">
             <Loader2 size={18} className="animate-spin text-slate-500" />
             <span className="ml-2 text-xs text-slate-500">Loading history…</span>
@@ -1659,16 +1577,25 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
               }
 
               if (msg.role === 'assistant') {
-                const toolCalls = filterVisibleToolCalls(msg.toolCalls);
-                const hasContent = !!msg.content;
+                const toolCalls = msg.toolCalls || [];
+                const hasRunningTool = toolCalls.some(tc => tc.status === 'running');
+                const suppressCurrentBubbleText = isCurrentlyStreaming && (
+                  streamingPhase !== 'streaming'
+                  || suppressLiveBubbleContentRef.current
+                  || hasRunningTool
+                  || !!activeToolName
+                  || !!statusText
+                );
+                const visibleContent = suppressCurrentBubbleText ? '' : msg.content;
+                const hasContent = !!visibleContent;
                 const thinkingContent = msg.thinkingContent;
 
                 return (
                   <div key={msg.id} className="px-3 py-1.5">
-                    {/* Thinking block — keep visible during active runs so reconnects/device switches still feel alive. */}
+                    {/* Thinking block — hidden during active streaming (status bar shows it) */}
                     <AnimatePresence>
-                      {thinkingContent && (
-                        <ThinkingBlock content={thinkingContent} isActive={isCurrentlyStreaming} />
+                      {thinkingContent && !isCurrentlyStreaming && (
+                        <ThinkingBlock content={thinkingContent} isActive={false} />
                       )}
                     </AnimatePresence>
 
@@ -1688,21 +1615,21 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                         <div className="flex-1 min-w-0 max-w-[90%]">
                           <div
                             className={`rounded-2xl rounded-bl-sm px-3 py-2 transition-all duration-500 ${
-                              hasContent && msg.content.startsWith('⚠️')
+                              hasContent && visibleContent.startsWith('⚠️')
                                 ? 'bg-red-500/10 border border-red-500/20'
                                 : isCurrentlyStreaming
                                   ? 'border border-dashed bg-[var(--accent-bg-subtle)]'
                                   : 'bg-white/[0.06] border border-solid border-white/[0.08]'
                             }`}
-                            style={isCurrentlyStreaming && !(hasContent && msg.content.startsWith('⚠️'))
+                            style={isCurrentlyStreaming && !(hasContent && visibleContent.startsWith('⚠️'))
                               ? { borderColor: 'var(--accent-border-hover)', boxShadow: '0 0 12px var(--accent-shadow), inset 0 0 0 1px var(--accent-bg)' }
                               : undefined
                             }
                           >
-                            {hasContent && msg.content.startsWith('⚠️') ? (
+                            {hasContent && visibleContent.startsWith('⚠️') ? (
                               <div className="flex items-start gap-1.5">
                                 <XCircle size={12} className="text-red-400 flex-shrink-0 mt-0.5" />
-                                <div className="text-[11px] text-red-300">{msg.content.replace(/^⚠️\s*/, '')}</div>
+                                <div className="text-[11px] text-red-300">{visibleContent.replace(/^⚠️\s*/, '')}</div>
                               </div>
                             ) : (
                               <>
@@ -1716,7 +1643,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                                   <span className="w-1 h-1 rounded-full animate-pulse" style={{ backgroundColor: 'var(--accent-light)', opacity: 0.5 }} />
                                 </div>
                                 <div className={`text-[11px] leading-relaxed ${isCurrentlyStreaming ? 'streaming-cursor' : ''}`}>
-                                  <MarkdownRenderer content={msg.content} isStreaming={isCurrentlyStreaming} />
+                                  <MarkdownRenderer content={visibleContent} isStreaming={isCurrentlyStreaming} />
                                 </div>
                               </>
                             )}
@@ -1829,7 +1756,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             <textarea
               ref={inputRef}
               value={input}
-              onChange={e => setProjectDraft(e.target.value)}
+              onChange={e => setInput(e.target.value)}
               onKeyDown={e => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();

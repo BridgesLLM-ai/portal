@@ -12,8 +12,6 @@ export interface NativeCliAuthStatus {
   requiresSeparateLogin: boolean;
 }
 
-import { getPortalApiKeysForEnv } from '../services/openclawConfigManager';
-
 const HOME_DIR = process.env.HOME || '/root';
 const CLAUDE_CREDENTIALS_PATH = path.join(HOME_DIR, '.claude', '.credentials.json');
 const CODEX_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
@@ -84,18 +82,6 @@ function detectClaudeAuth(): NativeCliAuthStatus {
     };
   }
 
-  // If access token expired but refresh token exists, Claude Code will auto-refresh on next invocation.
-  // Treat this as authenticated — the CLI handles token refresh transparently.
-  if (expiresAt && expiresAt <= Date.now() && oauth?.refreshToken) {
-    return {
-      provider: 'CLAUDE_CODE',
-      status: 'authenticated',
-      message: 'Claude Code CLI has a refresh token and will auto-renew on next use.',
-      loginCommand: 'claude',
-      requiresSeparateLogin: true,
-    };
-  }
-
   if (expiresAt && expiresAt <= Date.now()) {
     return {
       provider: 'CLAUDE_CODE',
@@ -103,18 +89,6 @@ function detectClaudeAuth(): NativeCliAuthStatus {
       message: 'Claude Code CLI credentials on this server have expired. OpenClaw auth is separate.',
       loginCommand: 'claude',
       requiresSeparateLogin: true,
-    };
-  }
-
-  // Check if portal has an Anthropic API key that the CLI can use as fallback
-  const portalKeys = getPortalApiKeysForEnv('CLAUDE_CODE');
-  if (portalKeys.ANTHROPIC_API_KEY) {
-    return {
-      provider: 'CLAUDE_CODE',
-      status: 'authenticated',
-      message: 'Claude Code CLI will use the portal-configured Anthropic API key.',
-      loginCommand: 'claude',
-      requiresSeparateLogin: false,
     };
   }
 
@@ -140,18 +114,6 @@ function detectCodexAuth(): NativeCliAuthStatus {
       message: 'Codex CLI is authenticated on this server.',
       loginCommand: 'codex auth',
       requiresSeparateLogin: true,
-    };
-  }
-
-  // Check if portal has an OpenAI API key that the CLI can use as fallback
-  const codexPortalKeys = getPortalApiKeysForEnv('CODEX');
-  if (codexPortalKeys.OPENAI_API_KEY) {
-    return {
-      provider: 'CODEX',
-      status: 'authenticated',
-      message: 'Codex CLI will use the portal-configured OpenAI API key.',
-      loginCommand: 'codex auth',
-      requiresSeparateLogin: false,
     };
   }
 
@@ -182,18 +144,6 @@ function detectGeminiAuth(): NativeCliAuthStatus {
       message: 'Gemini CLI has local auth/config files on this server.',
       loginCommand: 'gemini',
       requiresSeparateLogin: true,
-    };
-  }
-
-  // Check if portal has a Google/Gemini API key that the CLI can use as fallback
-  const geminiPortalKeys = getPortalApiKeysForEnv('GEMINI');
-  if (geminiPortalKeys.GEMINI_API_KEY || geminiPortalKeys.GOOGLE_API_KEY) {
-    return {
-      provider: 'GEMINI',
-      status: 'authenticated',
-      message: 'Gemini CLI will use the portal-configured Google API key.',
-      loginCommand: 'gemini',
-      requiresSeparateLogin: false,
     };
   }
 
