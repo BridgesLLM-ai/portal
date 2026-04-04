@@ -75,10 +75,6 @@ All notable changes to BridgesLLM Portal are documented here.
 - **Updated OpenClaw gateway compatibility to 2026.3.31** — Picks up improved exec approval handling, better provider error recovery (Anthropic transient errors now retry instead of failing), hardened config SecretRef round-trips, and background task flow improvements.
 - **Installer version bump** — Installer now targets v3.22.0 and is compatible with the latest OpenClaw gateway release.
 
-### 🛡️ Infrastructure
-- **Remove unused analytics and installer subdomain routes** — Removed dead Caddy proxy routes (`analytics.bridgesllm.ai`, `install.bridgesllm.ai`) that had no DNS records configured and were generating continuous TLS certificate errors. Analytics dashboard remains accessible through the portal project behind authentication. Installer continues to work at `bridgesllm.ai/install.sh`.
-- **Remove public analytics dashboard exposure** — Closed two unauthenticated routes (`/analytics` on the marketing site, `/api/dashboard` on the portal domain) that exposed the analytics dashboard publicly. Data is now only accessible through the authenticated portal.
-
 ## [3.21.0] — 2026-03-31
 
 ### ✨ New Features
