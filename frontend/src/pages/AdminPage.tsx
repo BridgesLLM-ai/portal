@@ -237,7 +237,7 @@ function UsersTab({ currentUserId, isOwner: ownerAccess }: { currentUserId: stri
                       <div className="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-xs font-bold text-white overflow-hidden flex-shrink-0">
                         {u.avatarPath
                           ? <img src={`/static-assets/avatars/${u.avatarPath}`} alt="" className="w-full h-full object-cover" />
-                          : (u.username?.[0] || u.email[0]).toUpperCase()
+                          : (u.username?.[0] || u.email?.[0] || '?').toUpperCase()
                         }
                       </div>
                       <div className="min-w-0">

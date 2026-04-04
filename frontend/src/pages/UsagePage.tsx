@@ -128,9 +128,9 @@ function ModelBreakdown({ data, loading }: ModelBreakdownProps) {
     return data.slice(0, 8).map((item) => ({
       ...item,
       // Shorten model name for display
-      displayName: item.model.includes('/') 
-        ? (typeof item.model === 'string' ? item.model.split('/').slice(-1)[0] : String(item.model || '')) 
-        : item.model,
+      displayName: (typeof item.model === 'string' && item.model.includes('/'))
+        ? item.model.split('/').slice(-1)[0]
+        : String(item.model || ''),
     }));
   }, [data]);
 
@@ -273,9 +273,9 @@ function RecentSessions({ sessions, loading }: RecentSessionsProps) {
                   </td>
                   <td className="py-3 pr-4">
                     <span className="text-slate-300 font-mono text-xs">
-                      {session.model.includes('/') 
-                        ? (typeof session.model === 'string' ? session.model.split('/').slice(-1)[0] : String(session.model || '')) 
-                        : session.model}
+                      {(typeof session.model === 'string' && session.model.includes('/'))
+                        ? session.model.split('/').slice(-1)[0]
+                        : String(session.model || '')}
                     </span>
                   </td>
                   <td className="py-3 pr-4 text-right">

@@ -1518,7 +1518,7 @@ function FeatureReadinessTab() {
       <SectionCard title="Overall Status">
         <div className="flex items-center justify-between gap-3">
           <div className={`px-3 py-1 rounded-lg border text-xs font-semibold ${statusBadge(data.overall)}`}>
-            {data.overall.toUpperCase()}
+            {(data.overall || 'unknown').toUpperCase()}
           </div>
           <button onClick={load} className="text-xs px-3 py-1 rounded border border-white/10 text-slate-300 hover:text-white hover:bg-white/5">Refresh</button>
         </div>
