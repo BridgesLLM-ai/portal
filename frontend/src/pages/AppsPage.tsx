@@ -1919,7 +1919,7 @@ export default function AppsPage() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  });
+  }, [saveFile, editorFullscreen, showFileSearch, openFile]);
 
   const currentProject = projects.find(p => p.name === selectedProject);
 

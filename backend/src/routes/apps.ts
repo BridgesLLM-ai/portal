@@ -214,6 +214,14 @@ export const shareRouter = Router();
 // Rate limiter for password attempts
 const passwordAttempts = new Map<string, { count: number; resetAt: number }>();
 
+// Clean up stale rate-limit entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, record] of passwordAttempts) {
+    if (now > record.resetAt) passwordAttempts.delete(key);
+  }
+}, 5 * 60 * 1000);
+
 function checkRateLimit(ip: string, token: string): { allowed: boolean; retryAfter?: number } {
   const key = `${ip}:${token}`;
   const now = Date.now();

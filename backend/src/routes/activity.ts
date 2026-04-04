@@ -7,8 +7,21 @@ import { logError } from '../utils/errorLogger';
 
 const router = Router();
 
-// In-memory translation cache
+// In-memory translation cache with size limit
+const TRANSLATION_CACHE_MAX = 5000;
 const translationCache = new Map<string, string>();
+
+function pruneTranslationCache() {
+  if (translationCache.size > TRANSLATION_CACHE_MAX) {
+    // Delete oldest half of entries (Map preserves insertion order)
+    const deleteCount = Math.floor(TRANSLATION_CACHE_MAX / 2);
+    let i = 0;
+    for (const key of translationCache.keys()) {
+      if (i++ >= deleteCount) break;
+      translationCache.delete(key);
+    }
+  }
+}
 
 async function translateMessage(action: string, resource: string, resourceId?: string | null): Promise<string> {
   const cacheKey = `${action}:${resource}:${resourceId || ''}`;
@@ -27,6 +40,7 @@ async function translateMessage(action: string, resource: string, resourceId?: s
     const data = await response.json() as { response: string };
     const translated = data.response?.trim() || fallbackTranslation(action, resource);
     translationCache.set(cacheKey, translated);
+    pruneTranslationCache();
     if (resourceId) {
       await prisma.activityLog.updateMany({ where: { action, resource, resourceId }, data: { translatedMessage: translated } }).catch(() => {});
     }

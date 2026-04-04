@@ -32,8 +32,18 @@ router.post('/analyze', authenticateToken, async (req: Request, res: Response) =
 
     if (projectName && filePath) {
       resolvedPath = path.join(PROJECTS_DIR, req.user!.userId, projectName, filePath);
+      const baseDir = path.resolve(path.join(PROJECTS_DIR, req.user!.userId, projectName));
+      if (!path.resolve(resolvedPath).startsWith(baseDir + path.sep) && path.resolve(resolvedPath) !== baseDir) {
+        res.status(403).json({ error: 'Invalid file path' });
+        return;
+      }
     } else if (filePath) {
       resolvedPath = path.join(UPLOAD_DIR, req.user!.userId, filePath);
+      const baseDir = path.resolve(path.join(UPLOAD_DIR, req.user!.userId));
+      if (!path.resolve(resolvedPath).startsWith(baseDir + path.sep) && path.resolve(resolvedPath) !== baseDir) {
+        res.status(403).json({ error: 'Invalid file path' });
+        return;
+      }
     }
 
     if (!resolvedPath || !fs.existsSync(resolvedPath)) {
@@ -138,8 +148,18 @@ router.get('/file-content', authenticateToken, async (req: Request, res: Respons
     let resolved = '';
     if (projectName && filePath) {
       resolved = path.join(PROJECTS_DIR, req.user!.userId, projectName, filePath);
+      const baseDir = path.resolve(path.join(PROJECTS_DIR, req.user!.userId, projectName));
+      if (!path.resolve(resolved).startsWith(baseDir + path.sep) && path.resolve(resolved) !== baseDir) {
+        res.status(403).json({ error: 'Invalid file path' });
+        return;
+      }
     } else if (filePath) {
       resolved = path.join(UPLOAD_DIR, req.user!.userId, filePath);
+      const baseDir = path.resolve(path.join(UPLOAD_DIR, req.user!.userId));
+      if (!path.resolve(resolved).startsWith(baseDir + path.sep) && path.resolve(resolved) !== baseDir) {
+        res.status(403).json({ error: 'Invalid file path' });
+        return;
+      }
     }
 
     if (!resolved || !fs.existsSync(resolved)) {

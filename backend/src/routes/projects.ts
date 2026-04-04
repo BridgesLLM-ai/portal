@@ -319,7 +319,8 @@ router.post('/clone', authenticateToken, async (req: Request, res: Response) => 
     res.status(201).json({ name: safeName, clonedFrom: url });
   } catch (error: any) {
     console.error('Clone error:', error);
-    res.status(500).json({ error: 'Failed to clone repository', detail: error.message });
+    console.error('Clone error:', error);
+      res.status(500).json({ error: 'Failed to clone repository' });
   }
 });
 
@@ -2239,7 +2240,8 @@ router.post('/:name/app-process', authenticateToken, async (req: Request, res: R
     res.status(400).json({ error: 'Invalid action. Use: start, stop, status, logs' });
   } catch (error: any) {
     console.error('App process error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('Project operation error:', error);
+      res.status(500).json({ error: 'Internal server error' });
   }
 });
 // POST /api/projects/:name/doc-update - auto-update documentation

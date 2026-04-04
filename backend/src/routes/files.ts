@@ -446,6 +446,14 @@ router.post('/:id/copy-to-project', authenticateToken, async (req: Request, res:
       ? path.join(projectDir, destinationPath, fileName)
       : path.join(projectDir, fileName);
 
+    // Prevent path traversal
+    const resolvedDest = path.resolve(destPath);
+    const resolvedProject = path.resolve(projectDir);
+    if (!resolvedDest.startsWith(resolvedProject + path.sep) && resolvedDest !== resolvedProject) {
+      res.status(403).json({ error: 'Invalid destination path' });
+      return;
+    }
+
     // Ensure destination directory exists
     const destDir = path.dirname(destPath);
     fs.mkdirSync(destDir, { recursive: true });
