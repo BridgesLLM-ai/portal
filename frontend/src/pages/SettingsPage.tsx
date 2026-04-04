@@ -71,7 +71,7 @@ const allTabs: TabDef[] = [
   { id: 'agents', label: 'Agents', icon: Bot, adminOnly: true },
   { id: 'system', label: 'System', icon: Server, adminOnly: true },
   { id: 'ai-providers', label: 'AI Providers', icon: Cpu, adminOnly: true },
-  { id: 'readiness', label: 'Feature Readiness', icon: Wrench, adminOnly: true },
+  { id: 'readiness', label: 'System Health', icon: Wrench, adminOnly: true },
   { id: 'backups', label: 'Backups', icon: Database, adminOnly: true },
   { id: 'profile', label: 'Profile', icon: User, adminOnly: false },
 ];
@@ -507,6 +507,97 @@ function GeneralTab({ settings, updateSetting, setSettingValue, onSave, isDirty,
   );
 }
 
+
+// ── Mailbox Management (used in Email tab) ────────────────────────────
+
+function MailboxManagement({ addToast }: { addToast: (type: 'success' | 'error', msg: string) => void }) {
+  const [mailboxes, setMailboxes] = useState<{ userId: string; username: string; email: string; createdAt: string; lastLoginAt: string | null }[]>([]);
+  const [mailboxLoading, setMailboxLoading] = useState(false);
+  const [deletingMailbox, setDeletingMailbox] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
+  const loadMailboxes = useCallback(() => {
+    setMailboxLoading(true);
+    client.get('/admin/mailboxes')
+      .then(res => setMailboxes(res.data?.mailboxes || []))
+      .catch(() => setMailboxes([]))
+      .finally(() => setMailboxLoading(false));
+  }, []);
+
+  useEffect(() => { loadMailboxes(); }, [loadMailboxes]);
+
+  const handleDeleteMailbox = async (username: string) => {
+    setDeletingMailbox(username);
+    try {
+      await client.delete(`/admin/mailboxes/${username}`);
+      setConfirmDelete(null);
+      loadMailboxes();
+      addToast('success', `Mailbox ${username} deleted`);
+    } catch (err) {
+      console.error('Failed to delete mailbox:', err);
+      addToast('error', 'Failed to delete mailbox');
+    } finally {
+      setDeletingMailbox(null);
+    }
+  };
+
+  return (
+    <div>
+      <p className="text-xs text-slate-500 mb-3">User email accounts provisioned on Stalwart. Deleting a mailbox removes the Stalwart account but keeps the portal user.</p>
+      {mailboxLoading ? (
+        <div className="flex items-center gap-2 text-slate-500 text-sm py-4">
+          <Loader2 size={16} className="animate-spin" /> Loading mailboxes...
+        </div>
+      ) : mailboxes.length === 0 ? (
+        <div className="text-sm text-slate-500 py-4">No mailboxes provisioned yet.</div>
+      ) : (
+        <div className="space-y-2">
+          {mailboxes.map(mb => (
+            <div key={mb.username} className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+              <div className="min-w-0 flex-1">
+                <div className="text-sm text-white font-medium truncate">{mb.username}</div>
+                <div className="text-xs text-slate-500 truncate">{mb.email}</div>
+              </div>
+              <div className="text-xs text-slate-500 shrink-0 hidden sm:block">
+                {mb.lastLoginAt ? `Last login: ${new Date(mb.lastLoginAt).toLocaleDateString()}` : 'Never logged in'}
+              </div>
+              {confirmDelete === mb.username ? (
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    onClick={() => handleDeleteMailbox(mb.username)}
+                    disabled={deletingMailbox === mb.username}
+                    className="px-2.5 py-1 rounded text-xs font-medium bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30 disabled:opacity-50"
+                  >
+                    {deletingMailbox === mb.username ? <Loader2 size={12} className="animate-spin" /> : 'Confirm'}
+                  </button>
+                  <button
+                    onClick={() => setConfirmDelete(null)}
+                    className="px-2 py-1 rounded text-xs text-slate-400 hover:text-white"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setConfirmDelete(mb.username)}
+                  className="px-2.5 py-1 rounded text-xs font-medium text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 shrink-0"
+                >
+                  Delete
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="mt-3 flex justify-end">
+        <button onClick={loadMailboxes} className="text-xs text-slate-400 hover:text-white flex items-center gap-1">
+          <RefreshCw size={12} /> Refresh
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Email & Notifications Tab ─────────────────────────────────────────
 
 interface EmailStatus {
@@ -699,6 +790,11 @@ function EmailTab({ settings, updateSetting, onSave, isDirty, addToast }: {
         )}
       </SectionCard>
 
+
+      <SectionCard title="Mailbox Management">
+        <MailboxManagement addToast={addToast} />
+      </SectionCard>
+
       <SectionCard title="Notification Events">
         <div className="space-y-3">
           <Toggle
@@ -841,6 +937,8 @@ function AgentsTab({ settings, updateSetting, onSave, isDirty }: {
   isDirty: boolean;
 }) {
   const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
+  const [nativePermissions, setNativePermissions] = useState<Record<string, string>>({});
+  const [permLoading, setPermLoading] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -857,6 +955,29 @@ function AgentsTab({ settings, updateSetting, onSave, isDirty }: {
     return () => { cancelled = true; clearInterval(interval); };
   }, []);
 
+  // Load native CLI permission levels
+  useEffect(() => {
+    let cancelled = false;
+    client.get('/gateway/native-permissions').then(({ data }) => {
+      if (!cancelled) setNativePermissions(data.permissions || {});
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  const togglePermission = async (provider: string) => {
+    const current = nativePermissions[provider] || 'sandboxed';
+    const next = current === 'elevated' ? 'sandboxed' : 'elevated';
+    setPermLoading(true);
+    try {
+      await client.put('/gateway/native-permissions', { provider, level: next });
+      setNativePermissions(prev => ({ ...prev, [provider]: next }));
+    } catch (err: any) {
+      console.error('Failed to update permission:', err);
+    } finally {
+      setPermLoading(false);
+    }
+  };
+
   const enabledStr = settings['agents.enabledProviders'] || '["OPENCLAW"]';
   let enabledProviders: string[] = [];
   try { enabledProviders = JSON.parse(enabledStr); } catch { enabledProviders = ['OPENCLAW']; }
@@ -867,13 +988,6 @@ function AgentsTab({ settings, updateSetting, onSave, isDirty }: {
       : [...enabledProviders, provider];
     updateSetting('agents.enabledProviders', JSON.stringify(newList));
   };
-
-  const adapters = [
-    { key: 'openclaw', label: 'OpenClaw' },
-    { key: 'claudeCode', label: 'Claude Code' },
-    { key: 'codex', label: 'Codex' },
-    { key: 'shell', label: 'Shell' },
-  ];
 
   return (
     <div>
@@ -889,16 +1003,8 @@ function AgentsTab({ settings, updateSetting, onSave, isDirty }: {
         </span>
       </div>
 
-      <SectionCard title="AI Provider Setup">
-        <div className="space-y-4">
-          <p className="text-sm text-slate-400">
-            Connect cloud providers, complete remote sign-in flows, and choose which models are available to your agents.
-          </p>
-          <AiProviderSetup mode="settings" apiBase="/ai-setup" />
-        </div>
-      </SectionCard>
-
       <SectionCard title="Enabled Providers">
+        <p className="text-xs text-slate-500 mb-3">Control which AI providers appear in the chat provider dropdown. Disabled providers won't be available to users even if installed.</p>
         <div className="space-y-3">
           {PROVIDER_OPTIONS.map(provider => (
             <Toggle
@@ -911,7 +1017,50 @@ function AgentsTab({ settings, updateSetting, onSave, isDirty }: {
         </div>
       </SectionCard>
 
-      <SectionCard title="Agent Configuration">
+      <SectionCard title="Native CLI Permissions">
+        <p className="text-xs text-slate-500 mb-3">
+          Control the permission level for native CLI agents. <strong>Sandboxed</strong> restricts tool execution
+          to safe operations (reads, file edits within workspace). <strong>Elevated</strong> grants full system access.
+        </p>
+        <div className="space-y-3">
+          {(['CLAUDE_CODE', 'CODEX', 'GEMINI'] as const).map(provider => {
+            const level = nativePermissions[provider] || 'sandboxed';
+            const isElevated = level === 'elevated';
+            const labels: Record<string, { sandboxed: string; elevated: string }> = {
+              CLAUDE_CODE: { sandboxed: 'Accept Edits (reads + file edits in workspace)', elevated: 'Auto (full access in print mode)' },
+              CODEX: { sandboxed: 'Full Auto (sandboxed workspace-write)', elevated: 'Bypass Sandbox (full root access)' },
+              GEMINI: { sandboxed: 'Auto Edit (file edits auto-approved)', elevated: 'YOLO (all tools auto-approved)' },
+            };
+            return (
+              <div key={provider} className="flex items-center justify-between rounded-lg border border-white/[0.08] bg-white/[0.02] px-4 py-3">
+                <div>
+                  <span className="text-sm font-medium text-slate-200">{provider.replace(/_/g, ' ')}</span>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    {isElevated ? labels[provider].elevated : labels[provider].sandboxed}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => togglePermission(provider)}
+                  disabled={permLoading}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${
+                    isElevated
+                      ? 'bg-red-500/20 text-red-300 hover:bg-red-500/30 border border-red-500/30'
+                      : 'bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 border border-emerald-500/30'
+                  }`}
+                >
+                  {isElevated ? '⚡ Elevated' : '🛡️ Sandboxed'}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+        <p className="text-xs text-amber-400/70 mt-3">
+          ⚠️ Elevated mode gives AI agents unrestricted system access. Only enable for trusted use.
+        </p>
+      </SectionCard>
+
+            <SectionCard title="Agent Configuration">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
             <FieldLabel label="Default Provider" />
@@ -937,62 +1086,6 @@ function AgentsTab({ settings, updateSetting, onSave, isDirty }: {
         </div>
       </SectionCard>
 
-      <SectionCard title="Gateway Connection">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <FieldLabel label="OpenClaw Gateway Host" />
-            <TextInput
-              value={settings['agents.openclaw.gatewayHost'] || 'localhost'}
-              onChange={v => updateSetting('agents.openclaw.gatewayHost', v)}
-              placeholder="localhost"
-            />
-          </div>
-          <div>
-            <FieldLabel label="OpenClaw Gateway Port" />
-            <TextInput
-              value={settings['agents.openclaw.gatewayPort'] || '18789'}
-              onChange={v => updateSetting('agents.openclaw.gatewayPort', v)}
-              placeholder="18789"
-              type="number"
-            />
-          </div>
-        </div>
-      </SectionCard>
-
-      <SectionCard title="Runner Configuration">
-        <div className="space-y-4">
-          {adapters.map((adapter) => (
-            <div key={adapter.key} className="rounded-lg border border-white/[0.08] bg-white/[0.02] p-4">
-              <div className="mb-3">
-                <Toggle
-                  checked={settings[`runners.${adapter.key}.enabled`] !== 'false'}
-                  onChange={(v) => updateSetting(`runners.${adapter.key}.enabled`, v ? 'true' : 'false')}
-                  label={`${adapter.label} enabled`}
-                />
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <FieldLabel label="Binary Path Override" description="Optional absolute path to executable" />
-                  <TextInput
-                    value={settings[`runners.${adapter.key}.binaryPath`] || ''}
-                    onChange={(v) => updateSetting(`runners.${adapter.key}.binaryPath`, v)}
-                    placeholder="/usr/local/bin/..."
-                  />
-                </div>
-                <div>
-                  <FieldLabel label="Default Working Directory" description="Runner starts here unless overridden" />
-                  <TextInput
-                    value={settings[`runners.${adapter.key}.workingDirectory`] || ''}
-                    onChange={(v) => updateSetting(`runners.${adapter.key}.workingDirectory`, v)}
-                    placeholder="/portal/projects"
-                  />
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </SectionCard>
-
       <div className="flex items-center justify-between">
         <a href="/agent-tools" className="text-sm text-blue-400 hover:text-blue-300 underline">
           Manage installs and updates on Agent Tools →
@@ -1012,121 +1105,8 @@ function SystemTab({ settings, updateSetting, onSave, isDirty, addToast }: {
   isDirty: boolean;
   addToast: (type: 'success' | 'error', msg: string) => void;
 }) {
-  // Mailbox management state
-  const [mailboxes, setMailboxes] = useState<{ userId: string; username: string; email: string; createdAt: string; lastLoginAt: string | null }[]>([]);
-  const [mailboxLoading, setMailboxLoading] = useState(false);
-  const [deletingMailbox, setDeletingMailbox] = useState<string | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-  const [codingTools, setCodingTools] = useState<Array<{ id: string; name: string; description: string; installed: boolean; version: string }>>([]);
-  const [codingToolsLoading, setCodingToolsLoading] = useState(false);
-  const [installingToolId, setInstallingToolId] = useState('');
-
-  const loadMailboxes = useCallback(() => {
-    setMailboxLoading(true);
-    client.get('/admin/mailboxes')
-      .then(res => setMailboxes(res.data?.mailboxes || []))
-      .catch(() => setMailboxes([]))
-      .finally(() => setMailboxLoading(false));
-  }, []);
-
-  useEffect(() => { loadMailboxes(); }, [loadMailboxes]);
-
-  const loadCodingTools = useCallback(async () => {
-    setCodingToolsLoading(true);
-    try {
-      const res = await client.get('/admin/coding-tools-status');
-      setCodingTools(res.data.tools || []);
-    } catch {
-      setCodingTools([]);
-    } finally {
-      setCodingToolsLoading(false);
-    }
-  }, []);
-
-  useEffect(() => { loadCodingTools(); }, [loadCodingTools]);
-
-  const handleInstallTool = async (toolId: string) => {
-    setInstallingToolId(toolId);
-    try {
-      await client.post('/admin/install-coding-tool', { toolId });
-      addToast('success', 'Tool installed successfully');
-      await loadCodingTools();
-    } catch (err: any) {
-      addToast('error', err?.response?.data?.error || 'Installation failed');
-    } finally {
-      setInstallingToolId('');
-    }
-  };
-
-  const handleDeleteMailbox = async (username: string) => {
-    setDeletingMailbox(username);
-    try {
-      await client.delete(`/admin/mailboxes/${username}`);
-      setConfirmDelete(null);
-      loadMailboxes();
-    } catch (err) {
-      console.error('Failed to delete mailbox:', err);
-    } finally {
-      setDeletingMailbox(null);
-    }
-  };
-
   return (
     <div>
-      <SectionCard title="Mailbox Management">
-        <p className="text-xs text-slate-500 mb-3">User email accounts provisioned on Stalwart. Deleting a mailbox removes the Stalwart account but keeps the portal user.</p>
-        {mailboxLoading ? (
-          <div className="flex items-center gap-2 text-slate-500 text-sm py-4">
-            <Loader2 size={16} className="animate-spin" /> Loading mailboxes...
-          </div>
-        ) : mailboxes.length === 0 ? (
-          <div className="text-sm text-slate-500 py-4">No mailboxes provisioned yet.</div>
-        ) : (
-          <div className="space-y-2">
-            {mailboxes.map(mb => (
-              <div key={mb.username} className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/[0.04]">
-                <div className="min-w-0 flex-1">
-                  <div className="text-sm text-white font-medium truncate">{mb.username}</div>
-                  <div className="text-xs text-slate-500 truncate">{mb.email}</div>
-                </div>
-                <div className="text-xs text-slate-500 shrink-0 hidden sm:block">
-                  {mb.lastLoginAt ? `Last login: ${new Date(mb.lastLoginAt).toLocaleDateString()}` : 'Never logged in'}
-                </div>
-                {confirmDelete === mb.username ? (
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <button
-                      onClick={() => handleDeleteMailbox(mb.username)}
-                      disabled={deletingMailbox === mb.username}
-                      className="px-2.5 py-1 rounded text-xs font-medium bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30 disabled:opacity-50"
-                    >
-                      {deletingMailbox === mb.username ? <Loader2 size={12} className="animate-spin" /> : 'Confirm'}
-                    </button>
-                    <button
-                      onClick={() => setConfirmDelete(null)}
-                      className="px-2 py-1 rounded text-xs text-slate-400 hover:text-white"
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                ) : (
-                  <button
-                    onClick={() => setConfirmDelete(mb.username)}
-                    className="px-2.5 py-1 rounded text-xs font-medium text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 shrink-0"
-                  >
-                    Delete
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-        <div className="mt-3 flex justify-end">
-          <button onClick={loadMailboxes} className="text-xs text-slate-400 hover:text-white flex items-center gap-1">
-            <RefreshCw size={12} /> Refresh
-          </button>
-        </div>
-      </SectionCard>
-
       <SectionCard title="Telemetry">
         <div className="space-y-3">
           <Toggle
@@ -1162,34 +1142,6 @@ function SystemTab({ settings, updateSetting, onSave, isDirty, addToast }: {
             />
           </div>
         </div>
-      </SectionCard>
-
-      <SectionCard title="AI Coding Tools">
-        <p className="text-sm text-slate-400 mb-4">Optional CLI tools for AI-powered coding agents.</p>
-        {codingToolsLoading ? (
-          <div className="flex items-center gap-2 text-slate-400"><Loader2 size={16} className="animate-spin" /> Checking...</div>
-        ) : codingTools.length === 0 ? (
-          <p className="text-sm text-slate-500">Could not check coding tools status.</p>
-        ) : (
-          <div className="space-y-3">
-            {codingTools.map(tool => (
-              <div key={tool.id} className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-950/70 p-4">
-                <div>
-                  <p className="font-medium text-slate-200">{tool.name}</p>
-                  <p className="text-xs text-slate-500">{tool.description}</p>
-                  {tool.installed && tool.version && <p className="text-xs text-emerald-400 mt-1">v{tool.version}</p>}
-                </div>
-                {tool.installed ? (
-                  <span className="text-xs text-emerald-400 flex items-center gap-1"><CheckCircle2 size={14} /> Installed</span>
-                ) : (
-                  <button onClick={() => handleInstallTool(tool.id)} disabled={!!installingToolId} className="rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-50">
-                    {installingToolId === tool.id ? 'Installing...' : 'Install'}
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
       </SectionCard>
 
       <div className="flex justify-end">
@@ -1471,7 +1423,7 @@ function OllamaTab({ settings, updateSetting, onSave, isDirty, addToast }: {
   );
 }
 
-// ── Feature Readiness Tab ─────────────────────────────────────────────
+// ── System Health Tab ─────────────────────────────────────────────
 
 type ReadinessStatus = 'ready' | 'partial' | 'missing';
 
@@ -2633,11 +2585,7 @@ export default function SettingsPage() {
                   updateSetting={(k, v) => updateSetting(k, v, 'agents')}
                   onSave={() => saveSettings([
                     'agents.enabledProviders', 'agents.defaultProvider',
-                    'agents.maxSessionsPerUser', 'agents.openclaw.gatewayHost', 'agents.openclaw.gatewayPort',
-                    'runners.openclaw.enabled', 'runners.openclaw.binaryPath', 'runners.openclaw.workingDirectory',
-                    'runners.claudeCode.enabled', 'runners.claudeCode.binaryPath', 'runners.claudeCode.workingDirectory',
-                    'runners.codex.enabled', 'runners.codex.binaryPath', 'runners.codex.workingDirectory',
-                    'runners.shell.enabled', 'runners.shell.binaryPath', 'runners.shell.workingDirectory'
+                    'agents.maxSessionsPerUser'
                   ], 'agents')}
                   isDirty={dirtyTabs.has('agents')}
                 />
@@ -2672,14 +2620,7 @@ export default function SettingsPage() {
                 </div>
               )}
               {activeTab === 'readiness' && <FeatureReadinessTab />}
-              {activeTab === 'backups' && (
-                <BackupsTab
-                  backupPath={settings['system.backupPath'] || '/opt/bridgesllm/backups'}
-                  onBackupPathChange={(v) => updateSetting('system.backupPath', v, 'backups')}
-                  onSaveBackupPath={() => saveSettings(['system.backupPath'], 'backups')}
-                  backupPathDirty={dirtyTabs.has('backups')}
-                />
-              )}
+              {activeTab === 'backups' && <BackupsTab />}
               {activeTab === 'profile' && <ProfileTab addToast={addToast} />}
             </>
           )}

@@ -23,7 +23,11 @@ export const geminiAdapter: NativeCliProviderAdapter = {
   buildInvocation: (ctx) => {
     const prompt = buildTranscriptPrompt(ctx.session.messages.slice(0, -1), ctx.message);
     ctx.state.prompt = prompt;
-    const args = ['-p', prompt, '--output-format', 'stream-json'];
+    const permissionLevel = ctx.state.permissionLevel || 'sandboxed';
+    const approvalFlag = permissionLevel === 'elevated' ? '--yolo' : '--approval-mode';
+    const args = permissionLevel === 'elevated'
+      ? ['-p', prompt, '--output-format', 'stream-json', '--yolo']
+      : ['-p', prompt, '--output-format', 'stream-json', '--approval-mode', 'auto_edit'];
     if (ctx.session.model) args.push('--model', ctx.session.model);
     return { command: 'gemini', args };
   },
@@ -35,7 +39,17 @@ export const geminiAdapter: NativeCliProviderAdapter = {
       return;
     }
 
-    if (parsed?.type === 'message' && parsed?.role === 'assistant' && typeof parsed?.content === 'string') {
+    const type = parsed?.type;
+
+    // Init event — extract session/model info
+    if (type === 'init') {
+      if (parsed.model) ctx.state.geminiModel = parsed.model;
+      if (parsed.session_id) ctx.state.geminiSessionId = parsed.session_id;
+      return;
+    }
+
+    // Assistant message (streaming delta or full)
+    if (type === 'message' && parsed?.role === 'assistant' && typeof parsed?.content === 'string') {
       if (parsed?.delta) {
         ctx.appendFullText(parsed.content);
         ctx.emitChunk(parsed.content);
@@ -46,12 +60,32 @@ export const geminiAdapter: NativeCliProviderAdapter = {
       return;
     }
 
-    if (parsed?.type === 'thought' && typeof parsed?.subject === 'string') {
-      ctx.emitStatus(parsed.subject);
+    // Tool call events
+    if (type === 'tool_call') {
+      const toolName = parsed.name || parsed.tool || 'tool';
+      ctx.onStatus?.({ type: 'tool_start', content: toolName, toolName, toolArgs: parsed.args || parsed.input });
       return;
     }
 
-    if (parsed?.type === 'error') {
+    if (type === 'tool_result') {
+      const toolName = parsed.name || parsed.tool || 'tool';
+      ctx.onStatus?.({ type: 'tool_end', content: '', toolName, toolResult: parsed.output || parsed.result });
+      return;
+    }
+
+    // Thinking events
+    if (type === 'thought' && typeof parsed?.subject === 'string') {
+      ctx.onStatus?.({ type: 'thinking', content: parsed.subject });
+      return;
+    }
+
+    // Result event — extract stats
+    if (type === 'result') {
+      ctx.state.geminiStats = parsed.stats || null;
+      return;
+    }
+
+    if (type === 'error') {
       ctx.appendStderr(`${parsed?.message || 'Gemini error'}\n`);
     }
   },
@@ -64,8 +98,9 @@ export const geminiAdapter: NativeCliProviderAdapter = {
   getResultMetadata: (ctx) => ({
     provider: 'gemini-cli',
     exitCode: ctx.exitCode,
-    model: ctx.session.model || null,
+    model: ctx.state.geminiModel || ctx.session.model || null,
     resolvedSessionId: ctx.session.sessionId,
+    stats: ctx.state.geminiStats || null,
   }),
   getErrorMessage: (ctx) => ctx.stripAnsi(ctx.stderr).trim() || `Gemini CLI exited with code ${ctx.exitCode}`,
 };

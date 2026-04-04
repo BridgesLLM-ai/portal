@@ -27,7 +27,12 @@ export function stripOpenClawReplyTags(text: string): string {
 }
 
 export function sanitizeAssistantText(text: string): string {
-  return stripOpenClawReplyTags(stripEnvelope(text || ''));
+  const cleaned = stripOpenClawReplyTags(stripEnvelope(text || ''));
+  // Strip NO_REPLY / HEARTBEAT_OK silent tokens
+  const trimmed = cleaned.trim();
+  if (trimmed === 'NO_REPLY' || trimmed === 'HEARTBEAT_OK') return '';
+  // Strip NO_REPLY prefix (agent sometimes adds it before real content)
+  return cleaned.replace(/^\s*NO_REPLY\s*\n?/, '').replace(/^\s*HEARTBEAT_OK\s*\n?/, '');
 }
 
 export function extractTextFromContent(content: unknown): string {

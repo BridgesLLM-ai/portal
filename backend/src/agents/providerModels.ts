@@ -21,6 +21,21 @@ const GEMINI_DECLARED_FALLBACK = [
   'gemini-3-flash-preview',
 ];
 
+const CLAUDE_DECLARED_FALLBACK: Array<{ id: string; alias?: string | null; displayName?: string }> = [
+  { id: 'sonnet', alias: 'Latest Sonnet', displayName: 'Claude Sonnet (alias)' },
+  { id: 'opus', alias: 'Latest Opus', displayName: 'Claude Opus (alias)' },
+  { id: 'haiku', alias: 'Latest Haiku', displayName: 'Claude Haiku (alias)' },
+  { id: 'claude-sonnet-4-6', alias: 'Sonnet 4.6', displayName: 'Claude Sonnet 4.6' },
+  { id: 'claude-opus-4-6', alias: 'Opus 4.6', displayName: 'Claude Opus 4.6' },
+  { id: 'claude-haiku-4-5', alias: 'Haiku 4.5', displayName: 'Claude Haiku 4.5' },
+];
+
+const CODEX_DECLARED_FALLBACK: Array<{ id: string; alias?: string | null; displayName?: string }> = [
+  { id: 'gpt-5.4', alias: 'GPT-5.4', displayName: 'GPT-5.4' },
+  { id: 'gpt-5.3-codex', alias: 'GPT-5.3 Codex', displayName: 'GPT-5.3 Codex' },
+  { id: 'gpt-5.1', alias: 'GPT-5.1', displayName: 'GPT-5.1' },
+];
+
 function toTitleCase(value: string): string {
   return value
     .split(/[-_/]+/)
@@ -45,8 +60,31 @@ function declaredModels(ids: string[], provider: string): ProviderModelDescripto
   }));
 }
 
+function declaredModelEntries(provider: string, entries: Array<string | { id: string; alias?: string | null; displayName?: string }>): ProviderModelDescriptor[] {
+  return entries.map((entry) => {
+    if (typeof entry === 'string') {
+      return {
+        id: entry,
+        alias: null,
+        provider,
+        displayName: displayNameFromId(entry),
+        source: 'declared' as const,
+      };
+    }
+    return {
+      id: entry.id,
+      alias: entry.alias || null,
+      provider,
+      displayName: entry.displayName || displayNameFromId(entry.id),
+      source: 'declared' as const,
+    };
+  });
+}
+
 const DECLARED_MODELS: Partial<Record<AgentProviderName, ProviderModelDescriptor[]>> = {
   GEMINI: declaredModels(GEMINI_DECLARED_FALLBACK, 'gemini'),
+  CLAUDE_CODE: declaredModelEntries('claude', CLAUDE_DECLARED_FALLBACK),
+  CODEX: declaredModelEntries('openai', CODEX_DECLARED_FALLBACK),
 };
 
 function safeExecFile(command: string, args: string[]): string | null {

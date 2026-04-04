@@ -217,3 +217,43 @@ export function getProviderStatuses(): ProviderStatus[] {
     };
   });
 }
+
+
+/**
+ * Return environment variables that inject portal-configured API keys
+ * for native CLI providers. This allows native CLIs to use portal-managed
+ * credentials as a fallback when their own auth is not set up.
+ *
+ * Only injects keys that are NOT already in process.env to avoid overriding
+ * explicit server-level configuration.
+ */
+export function getPortalApiKeysForEnv(providerName: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  try {
+    const modelsData = safeReadJson<any>(MODELS_JSON_PATH, { providers: {} });
+    const providers = modelsData?.providers || {};
+
+    // Map: native provider name -> { env var name, portal provider id }
+    const mapping: Record<string, Array<{ envVar: string; portalProvider: string }>> = {
+      CLAUDE_CODE: [{ envVar: 'ANTHROPIC_API_KEY', portalProvider: 'anthropic' }],
+      CODEX: [{ envVar: 'OPENAI_API_KEY', portalProvider: 'openai-codex' }],
+      GEMINI: [
+        { envVar: 'GEMINI_API_KEY', portalProvider: 'google-gemini-cli' },
+        { envVar: 'GOOGLE_API_KEY', portalProvider: 'google' },
+      ],
+    };
+
+    const entries = mapping[providerName] || [];
+    for (const { envVar, portalProvider } of entries) {
+      // Don't override existing env vars
+      if (process.env[envVar]) continue;
+      const key = providers[portalProvider]?.apiKey;
+      if (typeof key === 'string' && key.trim() && key !== 'None') {
+        env[envVar] = key.trim();
+      }
+    }
+  } catch {
+    // Fail silently — if config can't be read, native CLIs use their own auth
+  }
+  return env;
+}

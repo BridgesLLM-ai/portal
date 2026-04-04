@@ -25,6 +25,21 @@ import {
 } from '../NativeSessionStore';
 import type { NativeCliProviderAdapter, NativeCliTurnContext } from './types';
 import { getProviderAvailability } from '../../providerAvailability';
+import { getPortalApiKeysForEnv } from '../../../services/openclawConfigManager';
+import { prisma } from '../../../config/database';
+import type { NativeCliPermissionLevel } from './types';
+
+export async function getNativeCliPermissionLevel(providerName: string): Promise<NativeCliPermissionLevel> {
+  try {
+    const row = await prisma.systemSetting.findUnique({
+      where: { key: `agents.nativePermission.${providerName}` },
+    });
+    if (row?.value === 'elevated') return 'elevated';
+    return 'sandboxed';
+  } catch {
+    return 'sandboxed';
+  }
+}
 
 function stripAnsi(text: string): string {
   // eslint-disable-next-line no-control-regex
@@ -127,10 +142,12 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
     return new Promise<AgentSendResult>((resolve, reject) => {
       let stdoutBuffer = '';
 
+      // Inject portal-configured API keys so native CLIs can use them as fallback auth
+      const portalApiKeys = getPortalApiKeysForEnv(this.adapter.providerName);
       const child = spawn(invocation.command, invocation.args, {
         cwd: session.cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, NO_COLOR: '1' },
+        env: { ...process.env, NO_COLOR: '1', ...portalApiKeys },
         ...(invocation.options || {}),
       });
 

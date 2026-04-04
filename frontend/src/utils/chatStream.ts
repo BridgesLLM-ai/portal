@@ -11,7 +11,11 @@ export function stripOpenClawReplyTags(text: string): string {
 }
 
 export function sanitizeAssistantContent(text: string): string {
-  return stripOpenClawReplyTags(text || '');
+  const cleaned = stripOpenClawReplyTags(text || '');
+  // Strip NO_REPLY / HEARTBEAT_OK silent tokens
+  const trimmed = cleaned.trim();
+  if (trimmed === 'NO_REPLY' || trimmed === 'HEARTBEAT_OK') return '';
+  return cleaned.replace(/^\s*NO_REPLY\s*\n?/, '').replace(/^\s*HEARTBEAT_OK\s*\n?/, '');
 }
 
 // Streaming-safe sanitization for live OpenClaw chunks.

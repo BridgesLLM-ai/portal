@@ -20,6 +20,11 @@ export const filesAPI = {
     const base = import.meta.env.VITE_API_URL || '';
     return `${base}/files/${id}/download`;
   },
+  /** Sync filesystem with database — registers untracked files, removes orphaned DB entries */
+  sync: async (): Promise<{ added: number; removed: number; skipped: number }> => {
+    const { data } = await client.post('/files/sync');
+    return data;
+  },
 };
 
 export const appsAPI = {
@@ -336,9 +341,9 @@ export const gatewayAPI = {
     const { data } = await client.get('/gateway/history', { params: { session, after: afterId } });
     return data;
   },
-  sessionInfo: async (session = 'agent:main:main', options?: { silent?: boolean }) => {
+  sessionInfo: async (session = 'agent:main:main', options?: { silent?: boolean; soft?: boolean }) => {
     const { data } = await client.get('/gateway/session-info', {
-      params: { session },
+      params: { session, ...(options?.soft ? { soft: '1' } : {}) },
       ...(options?.silent ? { _silent: true } as any : {}),
     });
     return data;
@@ -351,8 +356,11 @@ export const gatewayAPI = {
     const { data } = await client.post('/gateway/session-patch', { session, provider, settings });
     return data;
   },
-  getConfigPath: async (path: string) => {
-    const { data } = await client.get('/gateway/config-path', { params: { path } });
+  getConfigPath: async (path: string, options?: { silent?: boolean; soft?: boolean }) => {
+    const { data } = await client.get('/gateway/config-path', {
+      params: { path, ...(options?.soft ? { soft: '1' } : {}) },
+      ...(options?.silent ? { _silent: true } as any : {}),
+    });
     return data;
   },
   patchConfigPath: async (path: string, value: any) => {

@@ -82,14 +82,7 @@ function formatDate(iso: string): string {
   });
 }
 
-interface BackupsTabProps {
-  backupPath?: string;
-  onBackupPathChange?: (v: string) => void;
-  onSaveBackupPath?: () => void;
-  backupPathDirty?: boolean;
-}
-
-export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBackupPath, backupPathDirty }: BackupsTabProps = {}) {
+export default function BackupsTab() {
   const [backups, setBackups] = useState<Backup[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [loading, setLoading] = useState(true);
@@ -285,46 +278,6 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
 
   return (
     <div className="space-y-6">
-      {/* Backup Path Configuration */}
-      {onBackupPathChange && (
-        <div className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-5">
-          <h3 className="text-sm font-semibold text-white mb-4">Backup Storage</h3>
-          <div className="space-y-3">
-            <div>
-              <label className="text-sm font-medium text-slate-200 block mb-1.5">Backup Path</label>
-              <p className="text-xs text-slate-500 mb-1.5">Directory for automated and manual backups</p>
-              <input
-                type="text"
-                value={backupPath || '/opt/bridgesllm/backups'}
-                onChange={e => onBackupPathChange(e.target.value)}
-                placeholder="/opt/bridgesllm/backups"
-                className="w-full px-3 py-2 rounded-lg bg-white/[0.05] border border-white/[0.08] text-sm text-slate-200 placeholder-slate-600 focus:outline-none accent-focus transition-all"
-              />
-            </div>
-            {onSaveBackupPath && (
-              <div className="flex justify-end">
-                <button
-                  onClick={onSaveBackupPath}
-                  disabled={!backupPathDirty}
-                  className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all border ${
-                    backupPathDirty
-                      ? 'accent-btn'
-                      : 'bg-white/[0.04] text-slate-500 border-white/[0.06] cursor-not-allowed'
-                  }`}
-                  style={backupPathDirty ? {
-                    background: 'var(--accent-bg)',
-                    color: 'var(--accent)',
-                    borderColor: 'var(--accent-border)',
-                  } : undefined}
-                >
-                  Save Path
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* Create Backup + Status */}
       <div className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-5">
         <div className="flex flex-col gap-4">

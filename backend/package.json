@@ -1,6 +1,6 @@
 {
   "name": "bridgesllm-backend",
-  "version": "3.23.1",
+  "version": "3.20.1",
   "description": "BridgesLLM Portal Backend",
   "main": "dist/server.js",
   "scripts": {

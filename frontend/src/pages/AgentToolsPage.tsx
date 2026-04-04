@@ -1,9 +1,31 @@
 import { useState, useEffect, useCallback, lazy, Suspense } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { Timer, BarChart3, Puzzle, ChevronDown, Check, Loader2, Layers, ListTodo } from 'lucide-react';
+import {
+  Timer,
+  BarChart3,
+  Puzzle,
+  ChevronDown,
+  Check,
+  Loader2,
+  Layers,
+  ListTodo,
+  Shield,
+  ShieldAlert,
+  Link2,
+  Brain,
+  Sparkles,
+  Terminal,
+  ArrowUpRight,
+  CheckCircle2,
+  CircleOff,
+  Clock3,
+  Bot,
+  Copy,
+  RefreshCw,
+} from 'lucide-react';
 import client from '../api/client';
-import { getShortModelLabel } from '../utils/modelId';
+import { gatewayAPI } from '../api/endpoints';
 
 /* ─── Lazy-loaded tab content components ────────────────── */
 
@@ -15,6 +37,7 @@ const TasksContent = lazy(() => import('./TasksPage').then(m => ({ default: m.Ta
 /* ─── Types ─────────────────────────────────────────────── */
 
 type TabKey = 'automations' | 'usage' | 'skills' | 'tasks';
+type NativePermissionLevel = 'sandboxed' | 'elevated';
 
 const VALID_TABS: TabKey[] = ['automations', 'usage', 'skills', 'tasks'];
 
@@ -30,6 +53,24 @@ interface OpenClawAgent {
   disabledReason?: string;
 }
 
+interface ProviderCapabilitySummary {
+  implemented?: boolean;
+  requiresGateway?: boolean;
+  adapterFamily?: string;
+  adapterKey?: string;
+  supportsHistory?: boolean;
+  supportsModelSelection?: boolean;
+  modelSelectionMode?: string;
+  supportsCustomModelInput?: boolean;
+  canEnumerateModels?: boolean;
+  modelCatalogKind?: string;
+  supportsSessionList?: boolean;
+  supportsExecApproval?: boolean;
+  supportsInTurnSteering?: boolean;
+  supportsQueuedFollowUps?: boolean;
+  followUpMode?: string;
+}
+
 interface ProviderInfo {
   name: string;
   displayName: string;
@@ -37,7 +78,22 @@ interface ProviderInfo {
   implemented?: boolean;
   usable?: boolean;
   native?: boolean;
+  version?: string;
+  command?: string;
   reason?: string;
+  nativeAuthStatus?: string;
+  nativeAuthMessage?: string;
+  nativeAuthLoginCommand?: string;
+  requiresSeparateNativeLogin?: boolean;
+  capabilities?: ProviderCapabilitySummary;
+}
+
+interface ProviderModelDescriptor {
+  id: string;
+  alias?: string | null;
+  provider: string;
+  displayName: string;
+  source?: string;
 }
 
 interface TabDef {
@@ -62,10 +118,25 @@ const AGENT_IDENTITY_FALLBACK: Record<string, string> = {
   isotype: '🧬',
 };
 
+const PROVIDER_IDENTITY: Record<string, string> = {
+  CLAUDE_CODE: '🧠',
+  CODEX: '⚡',
+  GEMINI: '✨',
+  OLLAMA: '🦙',
+  AGENT_ZERO: '🤖',
+};
+
+const PORTAL_ROOT_PATHS = [
+  '/opt/bridgesllm/portal',
+  '/opt/bridgesllm/portal/backend',
+  '/opt/bridgesllm/portal/frontend',
+];
+
 /* ─── Helpers ───────────────────────────────────────────── */
 
 function getAgentEmoji(agent: OpenClawAgent): string {
   if (agent.identity) return agent.identity;
+  if (agent.provider && PROVIDER_IDENTITY[agent.provider]) return PROVIDER_IDENTITY[agent.provider];
   return AGENT_IDENTITY_FALLBACK[agent.id] || '🤖';
 }
 
@@ -97,12 +168,316 @@ function parseAgent(agent: string | null): string {
   return agent || 'main';
 }
 
+function capabilityLabel(value?: boolean, positive = 'Yes', negative = 'No') {
+  return value ? positive : negative;
+}
+
+function statusTone(provider: ProviderInfo): 'good' | 'warn' | 'bad' {
+  if (provider.usable) return 'good';
+  if (provider.installed) return 'warn';
+  return 'bad';
+}
+
+function toneClasses(tone: 'good' | 'warn' | 'bad') {
+  if (tone === 'good') return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200';
+  if (tone === 'warn') return 'border-amber-500/30 bg-amber-500/10 text-amber-100';
+  return 'border-rose-500/30 bg-rose-500/10 text-rose-100';
+}
+
+function prettifyCapability(value?: string | null) {
+  if (!value) return '—';
+  return value
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+async function copyText(text: string) {
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // Ignore clipboard failures
+  }
+}
+
 /* ─── Tab Fallback ──────────────────────────────────────── */
 
 function TabFallback() {
   return (
     <div className="flex items-center justify-center h-64">
       <Loader2 size={32} className="text-slate-400 animate-spin" />
+    </div>
+  );
+}
+
+/* ─── Reusable Native Provider UI ───────────────────────── */
+
+function SectionCard({ title, icon: Icon, children, right }: { title: string; icon: typeof Brain; children: React.ReactNode; right?: React.ReactNode }) {
+  return (
+    <div className="rounded-3xl border border-white/[0.08] bg-white/[0.04] p-5 md:p-6 shadow-[0_20px_60px_-35px_rgba(0,0,0,0.65)]">
+      <div className="flex items-start justify-between gap-3 mb-4">
+        <div className="flex items-center gap-2.5">
+          <div className="w-9 h-9 rounded-2xl bg-white/[0.06] border border-white/[0.08] flex items-center justify-center text-slate-200">
+            <Icon size={17} />
+          </div>
+          <div>
+            <div className="text-white font-semibold">{title}</div>
+          </div>
+        </div>
+        {right}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function DetailPill({ label, value, mono = false }: { label: string; value: React.ReactNode; mono?: boolean }) {
+  return (
+    <div className="rounded-2xl border border-white/[0.06] bg-black/20 px-3 py-2.5">
+      <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">{label}</div>
+      <div className={`text-sm text-slate-200 ${mono ? 'font-mono break-all' : ''}`}>{value}</div>
+    </div>
+  );
+}
+
+function ModelChip({ model }: { model: ProviderModelDescriptor }) {
+  return (
+    <div className="rounded-2xl border border-white/[0.08] bg-white/[0.03] px-3 py-2.5 min-w-0">
+      <div className="text-sm text-white truncate">{model.alias || model.displayName}</div>
+      <div className="text-[11px] text-slate-400 font-mono truncate mt-0.5">{model.id}</div>
+      <div className="text-[10px] uppercase tracking-wider text-slate-600 mt-1">{model.source || 'declared'}</div>
+    </div>
+  );
+}
+
+function NativeProviderToolsPanel({ provider, activeTab }: { provider: ProviderInfo; activeTab: TabKey }) {
+  const [models, setModels] = useState<ProviderModelDescriptor[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [permission, setPermission] = useState<NativePermissionLevel>('sandboxed');
+  const [permissionLoading, setPermissionLoading] = useState(false);
+  const [permissionError, setPermissionError] = useState<string>('');
+  const [refreshTick, setRefreshTick] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      setModelsLoading(true);
+      try {
+        const requests: Promise<any>[] = [gatewayAPI.models(provider.name)];
+        if (provider.native) requests.push(client.get('/gateway/native-permissions'));
+        const [modelsResp, permissionsResp] = await Promise.all(requests);
+        if (cancelled) return;
+        setModels(Array.isArray(modelsResp?.models) ? modelsResp.models : []);
+        if (provider.native && permissionsResp?.data?.permissions) {
+          const next = permissionsResp.data.permissions?.[provider.name];
+          if (next === 'sandboxed' || next === 'elevated') setPermission(next);
+        }
+      } catch (err: any) {
+        if (!cancelled) {
+          setModels([]);
+          setPermissionError(err?.response?.data?.error || err?.message || 'Failed to load provider tooling');
+        }
+      } finally {
+        if (!cancelled) setModelsLoading(false);
+      }
+    }
+
+    load();
+    return () => { cancelled = true; };
+  }, [provider.name, provider.native, refreshTick]);
+
+  const togglePermission = useCallback(async () => {
+    const next: NativePermissionLevel = permission === 'elevated' ? 'sandboxed' : 'elevated';
+    setPermissionError('');
+    setPermissionLoading(true);
+    try {
+      await client.put('/gateway/native-permissions', { provider: provider.name, level: next });
+      setPermission(next);
+    } catch (err: any) {
+      setPermissionError(err?.response?.data?.error || err?.message || 'Failed to update permission level');
+    } finally {
+      setPermissionLoading(false);
+    }
+  }, [permission, provider.name]);
+
+  const tone = statusTone(provider);
+  const capability = provider.capabilities || {};
+  const activeTabLabel = TABS.find((tab) => tab.key === activeTab)?.label || 'Tools';
+  const supportsPermissionToggle = provider.native && ['CLAUDE_CODE', 'CODEX', 'GEMINI'].includes(provider.name);
+
+  return (
+    <div className="h-full overflow-auto p-6 md:p-8">
+      <div className="max-w-7xl mx-auto space-y-6">
+        <div className={`rounded-3xl border p-6 md:p-7 ${toneClasses(tone)}`}>
+          <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-5">
+            <div>
+              <div className="flex items-center gap-3">
+                <div className="w-12 h-12 rounded-2xl bg-black/20 border border-white/10 flex items-center justify-center text-2xl">
+                  {PROVIDER_IDENTITY[provider.name] || '🧩'}
+                </div>
+                <div>
+                  <h2 className="text-2xl font-bold text-white">{provider.displayName}</h2>
+                  <p className="text-sm text-slate-200/80 mt-0.5">
+                    Native-provider tools panel for {activeTabLabel.toLowerCase()} workflows.
+                  </p>
+                </div>
+              </div>
+              <p className="mt-4 text-sm text-slate-200/80 max-w-3xl">
+                This provider doesn’t use OpenClaw’s automations/skills/task ledger the same way the gateway does. Instead of blocking the selector,
+                this panel surfaces the runtime, auth, model catalog, permissions, and portal-specific guidance you actually need.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              <a
+                href={`/agent-chats?provider=${encodeURIComponent(provider.name)}`}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-white text-sm border border-white/10 transition-colors"
+              >
+                <ArrowUpRight size={14} />
+                Open Agent Chats
+              </a>
+              <button
+                onClick={() => setRefreshTick((v) => v + 1)}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-black/20 hover:bg-black/30 text-white text-sm border border-white/10 transition-colors"
+              >
+                <RefreshCw size={14} />
+                Refresh
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {(provider.reason || provider.nativeAuthMessage || permissionError) && (
+          <div className="rounded-3xl border border-amber-500/20 bg-amber-500/10 p-5 text-amber-100">
+            {provider.reason && <div className="text-sm"><strong className="font-semibold">Runtime:</strong> {provider.reason}</div>}
+            {provider.nativeAuthMessage && <div className="text-sm mt-2"><strong className="font-semibold">Auth:</strong> {provider.nativeAuthMessage}</div>}
+            {permissionError && <div className="text-sm mt-2"><strong className="font-semibold">Permissions:</strong> {permissionError}</div>}
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+          <SectionCard title="Runtime Status" icon={Bot}>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <DetailPill label="Installed" value={capabilityLabel(provider.installed, 'Yes', 'No')} />
+              <DetailPill label="Usable" value={capabilityLabel(provider.usable, 'Ready', 'Needs attention')} />
+              <DetailPill label="Version" value={provider.version || 'Unknown'} mono />
+              <DetailPill label="Command" value={provider.command || 'Not detected'} mono />
+              <DetailPill label="Adapter family" value={prettifyCapability(capability.adapterFamily)} />
+              <DetailPill label="Adapter key" value={capability.adapterKey || '—'} mono />
+            </div>
+          </SectionCard>
+
+          <SectionCard title="Capabilities" icon={Sparkles}>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <DetailPill label="History" value={capabilityLabel(capability.supportsHistory)} />
+              <DetailPill label="Session list" value={capabilityLabel(capability.supportsSessionList)} />
+              <DetailPill label="Model selection" value={capabilityLabel(capability.supportsModelSelection)} />
+              <DetailPill label="Custom model input" value={capabilityLabel(capability.supportsCustomModelInput)} />
+              <DetailPill label="Steering" value={capabilityLabel(capability.supportsInTurnSteering, 'In-turn', 'Not supported')} />
+              <DetailPill label="Follow-up mode" value={prettifyCapability(capability.followUpMode)} />
+            </div>
+          </SectionCard>
+
+          <SectionCard
+            title="Native Permissions"
+            icon={permission === 'elevated' ? ShieldAlert : Shield}
+            right={supportsPermissionToggle ? (
+              <button
+                onClick={togglePermission}
+                disabled={permissionLoading}
+                className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-sm border transition-colors ${permission === 'elevated' ? 'bg-rose-500/15 border-rose-500/30 text-rose-100 hover:bg-rose-500/20' : 'bg-emerald-500/15 border-emerald-500/30 text-emerald-100 hover:bg-emerald-500/20'} ${permissionLoading ? 'opacity-60 cursor-not-allowed' : ''}`}
+              >
+                {permissionLoading ? <Loader2 size={14} className="animate-spin" /> : permission === 'elevated' ? <ShieldAlert size={14} /> : <Shield size={14} />}
+                {permission === 'elevated' ? 'Switch to sandboxed' : 'Allow elevated mode'}
+              </button>
+            ) : undefined}
+          >
+            <div className="space-y-3">
+              <div className={`rounded-2xl border px-4 py-3 ${permission === 'elevated' ? 'border-rose-500/25 bg-rose-500/10 text-rose-100' : 'border-emerald-500/25 bg-emerald-500/10 text-emerald-100'}`}>
+                <div className="font-semibold text-sm">Current level: {permission}</div>
+                <div className="text-xs mt-1 opacity-90">
+                  {permission === 'elevated'
+                    ? 'Claude Code can run with broader filesystem reach and auto mode. Use this for trusted coding sessions only.'
+                    : 'Sandboxed keeps Claude Code in accept-edits mode with a tighter permission posture.'}
+                </div>
+              </div>
+              <div className="text-xs text-slate-400">
+                Stored in portal settings as <span className="font-mono text-slate-300">agents.nativePermission.{provider.name}</span>.
+              </div>
+            </div>
+          </SectionCard>
+        </div>
+
+        <div className="grid grid-cols-1 xl:grid-cols-[1.4fr_1fr] gap-6">
+          <SectionCard title="Model Catalog" icon={Brain} right={modelsLoading ? <Loader2 size={16} className="animate-spin text-slate-400" /> : <div className="text-xs text-slate-500">{models.length} models</div>}>
+            {modelsLoading && models.length === 0 ? (
+              <div className="flex items-center gap-2 text-sm text-slate-400">
+                <Loader2 size={14} className="animate-spin" />
+                Loading provider model catalog…
+              </div>
+            ) : models.length ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {models.map((model) => <ModelChip key={model.id} model={model} />)}
+              </div>
+            ) : (
+              <div className="text-sm text-slate-400">No model catalog returned for this provider yet.</div>
+            )}
+          </SectionCard>
+
+          <SectionCard title="Quick Commands" icon={Terminal}>
+            <div className="space-y-3">
+              <div className="rounded-2xl border border-white/[0.06] bg-black/20 p-3">
+                <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Launch</div>
+                <div className="font-mono text-sm text-slate-200 break-all">{provider.name === 'CLAUDE_CODE' ? 'claude --model sonnet' : provider.name === 'CODEX' ? 'codex --model gpt-5.4' : `${(provider.command || provider.displayName).toLowerCase()} --help`}</div>
+                <button onClick={() => copyText(provider.name === 'CLAUDE_CODE' ? 'claude --model sonnet' : provider.name === 'CODEX' ? 'codex --model gpt-5.4' : `${(provider.command || provider.displayName).toLowerCase()} --help`)} className="mt-2 inline-flex items-center gap-1.5 text-xs text-slate-400 hover:text-white">
+                  <Copy size={12} /> Copy
+                </button>
+              </div>
+              {provider.nativeAuthLoginCommand && (
+                <div className="rounded-2xl border border-white/[0.06] bg-black/20 p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Login / refresh auth</div>
+                  <div className="font-mono text-sm text-slate-200 break-all">{provider.nativeAuthLoginCommand}</div>
+                  <button onClick={() => copyText(provider.nativeAuthLoginCommand || '')} className="mt-2 inline-flex items-center gap-1.5 text-xs text-slate-400 hover:text-white">
+                    <Copy size={12} /> Copy
+                  </button>
+                </div>
+              )}
+              <div className="text-xs text-slate-400">
+                Native providers keep their own CLI auth and session state. The portal is orchestrating them; it is not proxying the actual Anthropic account.
+              </div>
+            </div>
+          </SectionCard>
+        </div>
+
+        <div className="grid grid-cols-1 xl:grid-cols-[1.3fr_1fr] gap-6">
+          <SectionCard title="Portal Context for Coding" icon={Link2}>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {PORTAL_ROOT_PATHS.map((entry) => (
+                <DetailPill key={entry} label="Path" value={entry} mono />
+              ))}
+              <DetailPill label="Service" value="bridgesllm-product.service" mono />
+              <DetailPill label="Portal API" value="http://127.0.0.1:4001" mono />
+              <DetailPill label="OpenClaw Gateway" value="http://127.0.0.1:18789" mono />
+            </div>
+            <div className="mt-4 text-sm text-slate-300/90 space-y-2">
+              <div>Use Claude Code sessions from <span className="font-mono text-slate-200">/opt/bridgesllm/portal</span> when you want it to understand the repo layout and existing scripts.</div>
+              <div>For portal work, the most common loop is: edit source → <span className="font-mono text-slate-200">backend: npx tsc</span> → <span className="font-mono text-slate-200">frontend: npx tsc --noEmit && npx vite build</span> → restart service.</div>
+            </div>
+          </SectionCard>
+
+          <SectionCard title="What Works Today" icon={CheckCircle2}>
+            <div className="space-y-3 text-sm">
+              <div className="flex items-start gap-2 text-emerald-200"><CheckCircle2 size={16} className="mt-0.5 flex-shrink-0" /> Session history and resume support</div>
+              <div className="flex items-start gap-2 text-emerald-200"><CheckCircle2 size={16} className="mt-0.5 flex-shrink-0" /> Model selection via the provider model picker</div>
+              <div className="flex items-start gap-2 text-emerald-200"><CheckCircle2 size={16} className="mt-0.5 flex-shrink-0" /> Native auth + version visibility in the portal</div>
+              <div className="flex items-start gap-2 text-emerald-200"><CheckCircle2 size={16} className="mt-0.5 flex-shrink-0" /> Permission level management for trusted coding sessions</div>
+              <div className="flex items-start gap-2 text-slate-400"><Clock3 size={16} className="mt-0.5 flex-shrink-0" /> OpenClaw automations / skills tabs remain gateway-native, not Claude-native</div>
+              <div className="flex items-start gap-2 text-slate-400"><CircleOff size={16} className="mt-0.5 flex-shrink-0" /> In-turn steering is not available here; follow-ups are queued instead</div>
+            </div>
+          </SectionCard>
+        </div>
+      </div>
     </div>
   );
 }
@@ -161,7 +536,7 @@ function AgentSelectorDropdown({ agents, providers, selected, onSelect, loading,
           initial={{ opacity: 0, y: -6, scale: 0.97 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}
           transition={{ duration: 0.15 }}
-          className="absolute top-full left-0 mt-1.5 w-56 rounded-xl bg-[#1A1F3A] border border-white/[0.08] shadow-2xl shadow-black/50 overflow-hidden z-50"
+          className="absolute top-full left-0 mt-1.5 w-64 rounded-xl bg-[#1A1F3A] border border-white/[0.08] shadow-2xl shadow-black/50 overflow-hidden z-50"
         >
           <div className="px-3 pt-2.5 pb-1.5">
             <div className="flex items-center gap-1.5 text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
@@ -170,10 +545,9 @@ function AgentSelectorDropdown({ agents, providers, selected, onSelect, loading,
             </div>
           </div>
 
-          <div className="max-h-[340px] overflow-y-auto">
+          <div className="max-h-[360px] overflow-y-auto">
             {providers.map((provider) => {
               const providerAgents = agents.filter(agent => (agent.provider || 'OPENCLAW') === provider.name);
-              const providerDisabled = provider.name !== 'OPENCLAW';
               return (
                 <div key={provider.name} className="pb-1">
                   <div className="px-4 py-2 text-[10px] font-semibold uppercase tracking-wider text-slate-500 border-t border-white/[0.04] first:border-t-0">
@@ -182,7 +556,7 @@ function AgentSelectorDropdown({ agents, providers, selected, onSelect, loading,
                   {providerAgents.map((agent) => {
                     const key = makeSelectorKey(agent);
                     const isSelected = key === selected;
-                    const disabled = providerDisabled || agent.selectable === false;
+                    const disabled = agent.selectable === false;
                     return (
                       <button
                         key={key}
@@ -195,20 +569,20 @@ function AgentSelectorDropdown({ agents, providers, selected, onSelect, loading,
                               ? 'text-slate-500 cursor-not-allowed'
                               : 'text-slate-300 hover:bg-white/[0.04] hover:text-white'
                         }`}
-                        title={disabled ? (agent.disabledReason || provider.reason || `${provider.displayName} support coming soon`) : undefined}
+                        title={disabled ? (agent.disabledReason || provider.reason || `${provider.displayName} support unavailable`) : undefined}
                       >
                         <div className="w-6 h-6 rounded-lg bg-white/[0.06] flex items-center justify-center text-sm flex-shrink-0">
                           {getAgentEmoji(agent)}
                         </div>
                         <div className="flex-1 min-w-0 text-left">
                           <div className="truncate">{getAgentLabel(agent, assistantName)}</div>
-                          {(provider.name !== 'OPENCLAW' || agent.disabledReason) && (
-                            <div className="truncate text-[10px] text-slate-500 mt-0.5">{agent.disabledReason || provider.reason || 'Provider integration pending for Agent Tools tabs'}</div>
+                          {(agent.disabledReason || provider.reason) && (
+                            <div className="truncate text-[10px] text-slate-500 mt-0.5">{agent.disabledReason || provider.reason}</div>
                           )}
                         </div>
-                        {agent.model && (
+                        {typeof agent.model === "string" && agent.model && (
                           <span className="text-[10px] text-slate-600 font-mono truncate max-w-[60px]">
-                            {getShortModelLabel(agent.model)}
+                            {agent.model.split('/').pop()}
                           </span>
                         )}
                         {isSelected && <Check size={14} className="text-emerald-400 flex-shrink-0" />}
@@ -249,19 +623,19 @@ export default function AgentToolsPage() {
 
     async function fetchAgents() {
       try {
-        const [agentsResp, providersResp] = await Promise.all([
+        const [agentsResp, providersResp] = await Promise.allSettled([
           client.get('/gateway/agents'),
-          client.get('/gateway/providers'),
+          client.get('/gateway/providers?all=true'),
         ]);
         if (cancelled) return;
 
-        const providerList: ProviderInfo[] = Array.isArray(providersResp.data?.providers)
-          ? providersResp.data.providers
+        const providerList: ProviderInfo[] = providersResp.status === 'fulfilled' && Array.isArray(providersResp.value.data?.providers)
+          ? providersResp.value.data.providers
           : [{ name: 'OPENCLAW', displayName: 'OpenClaw', usable: true, installed: true, implemented: true }];
         setProviders(providerList);
 
-        const openclawAgents: OpenClawAgent[] = agentsResp.data?.agents?.length
-          ? agentsResp.data.agents.map((agent: OpenClawAgent) => ({ ...agent, provider: 'OPENCLAW', selectable: true }))
+        const openclawAgents: OpenClawAgent[] = agentsResp.status === 'fulfilled' && agentsResp.value.data?.agents?.length
+          ? agentsResp.value.data.agents.map((agent: OpenClawAgent) => ({ ...agent, provider: 'OPENCLAW', selectable: true }))
           : [{ id: 'main', provider: 'OPENCLAW', identity: '🤖', selectable: true }];
 
         const placeholderProviders = providerList
@@ -270,9 +644,9 @@ export default function AgentToolsPage() {
             id: '__provider__',
             provider: provider.name,
             providerDisplayName: provider.displayName,
-            identity: '🧩',
-            selectable: false,
-            disabledReason: provider.reason || 'Provider integration pending for Agent Tools tabs',
+            identity: PROVIDER_IDENTITY[provider.name] || '🧩',
+            selectable: true,
+            disabledReason: undefined,
           } satisfies OpenClawAgent));
 
         const nextAgents: OpenClawAgent[] = [...openclawAgents, ...placeholderProviders];
@@ -316,6 +690,9 @@ export default function AgentToolsPage() {
     setSelectedAgent((current) => (current === requestedKey ? current : requestedKey));
   }, [requestedTab, requestedProvider, requestedAgent]);
 
+  const selectedProvider = parseProviderAgent(selectedAgent).provider;
+  const selectedAgentId = parseProviderAgent(selectedAgent).agentId;
+
   useEffect(() => {
     const params = new URLSearchParams(searchParams);
     let changed = false;
@@ -348,7 +725,7 @@ export default function AgentToolsPage() {
     if (changed) {
       setSearchParams(params, { replace: true });
     }
-  }, [activeTab, selectedAgent, setSearchParams]);
+  }, [activeTab, searchParams, selectedAgent, selectedAgentId, selectedProvider, setSearchParams]);
 
   const handleTabChange = useCallback((tab: TabKey) => {
     setActiveTab(tab);
@@ -358,8 +735,7 @@ export default function AgentToolsPage() {
     setSelectedAgent(agentKey);
   }, []);
 
-  const selectedProvider = parseProviderAgent(selectedAgent).provider;
-  const selectedAgentId = parseProviderAgent(selectedAgent).agentId;
+  const selectedProviderInfo = providers.find((p) => p.name === selectedProvider);
 
   return (
     <div className="h-full flex flex-col overflow-hidden bg-[#0A0E27]">
@@ -368,7 +744,7 @@ export default function AgentToolsPage() {
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h1 className="text-xl sm:text-2xl font-bold text-white">Agent Tools</h1>
-              <p className="text-slate-400 text-sm mt-0.5">Automations, usage stats, and skills management</p>
+              <p className="text-slate-400 text-sm mt-0.5">Automations, usage stats, skills, and native provider controls</p>
             </div>
 
             <AgentSelectorDropdown
@@ -405,14 +781,16 @@ export default function AgentToolsPage() {
 
       <div className="flex-1 overflow-hidden">
         {selectedProvider !== 'OPENCLAW' ? (
-          <div className="h-full overflow-auto p-6 md:p-8">
-            <div className="max-w-4xl mx-auto rounded-3xl border border-amber-500/20 bg-amber-500/10 p-6 text-amber-100">
-              <div className="text-lg font-semibold">{providers.find((p) => p.name === selectedProvider)?.displayName || selectedProvider} support is not wired into Agent Tools yet</div>
-              <div className="mt-2 text-sm text-amber-100/80">
-                The selector is now provider-aware so we can add Agent Zero, Codex, Claude Code, Gemini, and Ollama cleanly without another rewrite. Today, these tabs still operate on OpenClaw-backed agents only.
+          selectedProviderInfo ? (
+            <NativeProviderToolsPanel provider={selectedProviderInfo} activeTab={activeTab} />
+          ) : (
+            <div className="h-full flex items-center justify-center p-6">
+              <div className="rounded-3xl border border-white/[0.08] bg-white/[0.04] px-6 py-5 text-slate-300 flex items-center gap-3">
+                <Loader2 size={18} className="animate-spin text-slate-400" />
+                Loading {selectedProvider} tooling…
               </div>
             </div>
-          </div>
+          )
         ) : (
           <Suspense fallback={<TabFallback />}>
             {activeTab === 'automations' && <AutomationsContent agentId={selectedAgentId} />}

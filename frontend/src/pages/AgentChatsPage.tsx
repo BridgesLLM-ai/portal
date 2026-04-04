@@ -11,12 +11,16 @@ import {
   PlayCircle,
   RefreshCw,
   Send,
+  Shield,
+  ShieldAlert,
   Sparkles,
   X,
   Zap,
 } from 'lucide-react';
 import { agentJobsAPI, AgentJob, TranscriptEntry } from '../api/agentJobs';
 import { agentRuntimeAPI, AgentRuntimeStatus } from '../api/agentRuntime';
+import client from '../api/client';
+import { gatewayAPI } from '../api/endpoints';
 
 /* ─── Constants ─────────────────────────────────────────────────────────── */
 
@@ -341,10 +345,13 @@ export default function AgentChatsPage() {
   const socketJobIdRef = useRef<string | null>(null);
   const reconnectAttemptRef = useRef(0);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [declaredModels, setDeclaredModels] = useState<Array<{ id: string; alias?: string | null; displayName: string }>>([]);
+  const [nativePermission, setNativePermission] = useState<'sandboxed' | 'elevated' | null>(null);
 
   const selectedJob = useMemo(() => jobs.find((j) => j.id === selectedJobId) || null, [jobs, selectedJobId]);
   const adapterSupportsModel = !!ADAPTER_MODEL_FLAGS[toolId];
   const isRunning = selectedJob?.status === 'running';
+  const isNativeProvider = ['claude-code', 'codex', 'gemini'].includes(toolId);
 
   // Auto-scroll
   useEffect(() => {
@@ -604,6 +611,38 @@ export default function AgentChatsPage() {
     setModel(localStorage.getItem(`${MODEL_STORAGE_PREFIX}${toolId}`) || '');
   }, [toolId]);
 
+  // Fetch declared model catalog and native permission for the selected adapter
+  useEffect(() => {
+    if (!toolId) return;
+    let cancelled = false;
+    const providerName = toolId === 'claude-code' ? 'CLAUDE_CODE' : toolId === 'codex' ? 'CODEX' : toolId === 'gemini' ? 'GEMINI' : null;
+    if (!providerName) { setDeclaredModels([]); setNativePermission(null); return; }
+
+    (async () => {
+      try {
+        const [modelsResp, permsResp] = await Promise.allSettled([
+          gatewayAPI.models(providerName),
+          client.get('/gateway/native-permissions'),
+        ]);
+        if (cancelled) return;
+        if (modelsResp.status === 'fulfilled' && Array.isArray(modelsResp.value?.models)) {
+          setDeclaredModels(modelsResp.value.models);
+        } else {
+          setDeclaredModels([]);
+        }
+        if (permsResp.status === 'fulfilled') {
+          const level = permsResp.value.data?.permissions?.[providerName];
+          setNativePermission(level === 'elevated' ? 'elevated' : 'sandboxed');
+        } else {
+          setNativePermission(null);
+        }
+      } catch {
+        if (!cancelled) { setDeclaredModels([]); setNativePermission(null); }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [toolId]);
+
   // Relative time refresh
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -795,6 +834,15 @@ export default function AgentChatsPage() {
                 </div>
               </div>
               <div className="flex items-center gap-2 shrink-0">
+                {nativePermission && ['claude-code', 'codex', 'gemini'].includes(selectedJob.toolId) && (
+                  <span
+                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] border cursor-default ${nativePermission === 'elevated' ? 'bg-rose-500/10 text-rose-300 border-rose-500/20' : 'bg-slate-500/10 text-slate-300 border-slate-500/20'}`}
+                    title={nativePermission === 'elevated' ? 'Elevated: broader filesystem access, auto mode' : 'Sandboxed: accept-edits mode, restricted access'}
+                  >
+                    {nativePermission === 'elevated' ? <ShieldAlert size={10} /> : <Shield size={10} />}
+                    {nativePermission}
+                  </span>
+                )}
                 <span className={`px-2 py-0.5 rounded-full text-[10px] border ${socketState === 'connected' ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20' : socketState === 'connecting' ? 'bg-amber-500/10 text-amber-300 border-amber-500/20' : 'bg-red-500/10 text-red-300 border-red-500/20'}`}>{socketState === 'connected' ? 'Live' : socketState === 'connecting' ? 'Connecting' : 'Polling'}</span>
                 <RuntimeTimer startedAt={selectedJob.startedAt} finishedAt={selectedJob.finishedAt} status={selectedJob.status} />
                 <button
@@ -951,6 +999,13 @@ export default function AgentChatsPage() {
                   <option value="gemini">{'\u2728'} Gemini</option>
                   <option value="shell">{'\ud83d\udda5\ufe0f'} Shell</option>
                 </select>
+                {isNativeProvider && nativePermission && (
+                  <div className={`mt-2 flex items-center gap-2 px-3 py-2 rounded-xl border text-xs ${nativePermission === 'elevated' ? 'bg-rose-500/10 border-rose-500/20 text-rose-200' : 'bg-slate-800/50 border-white/10 text-slate-400'}`}>
+                    {nativePermission === 'elevated' ? <ShieldAlert size={12} /> : <Shield size={12} />}
+                    <span>{nativePermission === 'elevated' ? 'Elevated mode — broader filesystem access' : 'Sandboxed mode — restricted access'}</span>
+                    <a href="/agent-tools?provider=CLAUDE_CODE&tab=usage" className="ml-auto text-[10px] text-slate-500 hover:text-slate-300 underline">Change</a>
+                  </div>
+                )}
               </div>
               {adapterSupportsModel && (
                 <div>
@@ -961,6 +1016,20 @@ export default function AgentChatsPage() {
                     onChange={(e) => setModel(e.target.value)}
                     placeholder="Remembered per adapter"
                   />
+                  {declaredModels.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 mt-2">
+                      {declaredModels.map((m) => (
+                        <button
+                          key={m.id}
+                          type="button"
+                          onClick={() => setModel(m.id)}
+                          className={`px-2.5 py-1 text-[11px] rounded-lg border transition-colors ${model === m.id ? 'bg-violet-500/20 border-violet-500/30 text-violet-200' : 'bg-slate-950 border-white/10 text-slate-400 hover:text-slate-200 hover:border-white/20'}`}
+                        >
+                          {m.alias || m.displayName}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
               <div>

@@ -2921,6 +2921,7 @@ interface SessionMeta {
   initialized?: boolean;
   model?: string;
   lastActivity?: string;
+  agentId?: string;
 }
 
 /**
@@ -2930,6 +2931,9 @@ interface SessionMeta {
  */
 // Cache of known agent IDs to avoid repeated config.get calls
 const knownAgentIds = new Set<string>();
+// If project-specific agent creation falls back to the generic portal agent, remember it
+// so we don't keep retrying the same failing config patch on every chat open.
+const fallbackProjectAgentIds = new Set<string>();
 
 async function ensureProjectAgent(
   userId: string,
@@ -2943,12 +2947,20 @@ async function ensureProjectAgent(
   if (knownAgentIds.has(agentId)) {
     return { agentId, created: false };
   }
+
+  // Known fallback path: project-specific agent creation previously failed, so reuse
+  // the generic portal agent instead of repeatedly retrying config mutations.
+  if (fallbackProjectAgentIds.has(agentId)) {
+    knownAgentIds.add('portal');
+    return { agentId: 'portal', created: false };
+  }
   
   // Check config for existing agent
   const configResult = await gatewayRpcCall('config.get', {});
   if (!configResult.ok) {
     console.error('[ensureProjectAgent] config.get failed:', configResult.error);
     // Fall back to generic portal agent
+    fallbackProjectAgentIds.add(agentId);
     knownAgentIds.add('portal');
     return { agentId: 'portal', created: false };
   }
@@ -2957,6 +2969,7 @@ async function ensureProjectAgent(
   const agents: any[] = config?.agents?.list || [];
   
   if (agents.some((a: any) => a.id === agentId)) {
+    fallbackProjectAgentIds.delete(agentId);
     knownAgentIds.add(agentId);
     return { agentId, created: false };
   }
@@ -3032,7 +3045,10 @@ Your workspace is /work but your PROJECT is at /home/user/project/.
   
   if (!patchResult.ok) {
     console.error(`[ensureProjectAgent] config.patch failed: ${patchResult.error}`);
-    // Fall back to generic portal agent
+    // Fall back to generic portal agent and remember that this project-specific agent
+    // is not currently creatable, so future opens stay fast.
+    fallbackProjectAgentIds.add(agentId);
+    knownAgentIds.add('portal');
     return { agentId: 'portal', created: false };
   }
   
@@ -3049,6 +3065,7 @@ Your workspace is /work but your PROJECT is at /home/user/project/.
     } catch {}
   }
   
+  fallbackProjectAgentIds.delete(agentId);
   knownAgentIds.add(agentId);
   return { agentId, created: true };
 }
@@ -3064,25 +3081,28 @@ async function getOrCreateSession(
   projectName: string,
   normalizedName: string
 ): Promise<{ sessionKey: string; agentId: string; needsInit: boolean }> {
-  // Phase 2: Get or create a dedicated agent for this project
-  const projectDirName = path.basename(projectDir);
-  const { agentId } = await ensureProjectAgent(userId, normalizedName, projectDirName);
-  
-  const sessionId = `portal-${userId}-${normalizedName}`;
-  const sessionKey = `agent:${agentId}:${sessionId}`;
-  
   // Auto-migrate legacy .assistant-* files to .agent-*
   migrateAssistantFiles(projectDir);
-  
-  // Check local state
+
+  // Check local state first so we can reuse a previously resolved agent ID
+  // (for example the generic 'portal' fallback) without re-running helper/config work.
   const sessionStatePath = path.join(projectDir, '.agent-session.json');
   let localInitialized = false;
+  let persistedAgentId = '';
   try {
     if (fs.existsSync(sessionStatePath)) {
       const meta = JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8'));
       localInitialized = meta.initialized === true;
+      persistedAgentId = typeof meta?.agentId === 'string' ? meta.agentId : '';
     }
   } catch {}
+
+  // Phase 2: Get or create a dedicated agent for this project
+  const projectDirName = path.basename(projectDir);
+  const agentId = persistedAgentId || (await ensureProjectAgent(userId, normalizedName, projectDirName)).agentId;
+
+  const sessionId = `portal-${userId}-${normalizedName}`;
+  const sessionKey = `agent:${agentId}:${sessionId}`;
   
   // Check if gateway actually has this session (handles gateway restarts)
   let gatewayHasSession = false;
@@ -3204,15 +3224,75 @@ Hello! I'm ready to help with this project. What would you like to work on?`;
 
       // Mark session as initialized
       const sessionStatePath = path.join(projectDir, '.agent-session.json');
-      fs.writeFileSync(sessionStatePath, JSON.stringify({ initialized: true, lastActivity: new Date().toISOString() }, null, 2), 'utf-8');
+      fs.writeFileSync(sessionStatePath, JSON.stringify({ initialized: true, lastActivity: new Date().toISOString(), agentId }, null, 2), 'utf-8');
     }
 
-    // Determine default model — use gateway's configured default, never hardcode a provider
-    const selectedModel = req.body?.model || getDefaultModel() || 'openai-codex/gpt-5.4';
+    // Report the actual active session model when no override is requested.
+    // Returning the gateway default here pollutes the project chat UI and causes
+    // later sends to reuse a stale model that was never actually active.
+    const sessionStatePath = path.join(projectDir, '.agent-session.json');
+    let persistedModel = '';
+    try {
+      if (fs.existsSync(sessionStatePath)) {
+        const meta = JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8'));
+        persistedModel = typeof meta?.model === 'string' ? meta.model : '';
+      }
+    } catch {
+      persistedModel = '';
+    }
+
+    const configuredDefault = getDefaultModel() || 'openai-codex/gpt-5.4';
+    let selectedModel = req.body?.model || persistedModel || configuredDefault;
 
     // Patch model if provided
     if (req.body?.model) {
       try { await patchSessionModel(sessionKey, req.body.model); } catch {}
+      try {
+        const nextMeta = fs.existsSync(sessionStatePath)
+          ? JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8'))
+          : {};
+        fs.writeFileSync(
+          sessionStatePath,
+          JSON.stringify({ ...nextMeta, initialized: true, lastActivity: new Date().toISOString(), model: req.body.model, agentId }, null, 2),
+          'utf-8'
+        );
+        persistedModel = req.body.model;
+      } catch {
+        // Best-effort only
+      }
+    } else {
+      try {
+        const info = await getSessionInfo(sessionKey);
+        if (info.ok && info.data) {
+          const session = info.data as any;
+          const [defaultProvider, ...defaultModelParts] = configuredDefault.split('/');
+          const defaultModel = defaultModelParts.join('/') || 'gpt-5.4';
+          const provider = session.modelProvider || defaultProvider || 'openai-codex';
+          const model = session.model || defaultModel;
+          selectedModel = `${provider}/${model}`;
+        }
+      } catch {
+        // Best-effort only — fall back to persisted/default model if session lookup fails.
+      }
+
+      if ((!selectedModel || selectedModel === configuredDefault) && persistedModel) {
+        selectedModel = persistedModel;
+      }
+    }
+
+    try {
+      const nextMeta = fs.existsSync(sessionStatePath)
+        ? JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8'))
+        : {};
+      if (nextMeta.agentId !== agentId) {
+        fs.writeFileSync(
+          sessionStatePath,
+          JSON.stringify({ ...nextMeta, agentId, initialized: nextMeta.initialized === true, model: nextMeta.model || selectedModel || '' }, null, 2),
+          'utf-8'
+        );
+      }
+    } catch {
+      // Best-effort only
     }
 
     res.json({
@@ -3784,6 +3864,7 @@ ${message}`;
       initialized: true,
       model: selectedModel,
       lastActivity: new Date().toISOString(),
+      agentId,
     };
     fs.writeFileSync(sessionStatePath, JSON.stringify(updatedMeta, null, 2), 'utf-8');
 

@@ -288,6 +288,7 @@ export default function FilesPage() {
   const [projectDirectories, setProjectDirectories] = useState<string[]>([]);
   const [loadingDirs, setLoadingDirs] = useState(false);
   const [moveFile, setMoveFile] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   
   // Secure thumbnail loading (blob URLs instead of query token)
   const imageFileIds = files.filter(f => f.mimeType?.startsWith('image/')).map(f => f.id);
@@ -319,6 +320,40 @@ export default function FilesPage() {
       setLoading(false);
     }
   }, [addToast]);
+
+  /** Sync filesystem with database — registers externally-added files */
+  const syncFromDisk = useCallback(async () => {
+    setSyncing(true);
+    try {
+      const result = await filesAPI.sync();
+      const parts: string[] = [];
+      if (result.added > 0) parts.push(`${result.added} added`);
+      if (result.removed > 0) parts.push(`${result.removed} orphaned removed`);
+      if (parts.length > 0) {
+        addToast('success', `Sync complete: ${parts.join(', ')}`);
+      } else {
+        addToast('info', 'Already in sync');
+      }
+      await loadFiles();
+    } catch (e) {
+      console.error('Sync failed:', e);
+      addToast('error', 'Failed to sync files from disk');
+    } finally {
+      setSyncing(false);
+    }
+  }, [addToast, loadFiles]);
+
+  // Auto-sync on mount to pick up externally-added files
+  useEffect(() => {
+    const autoSync = async () => {
+      try {
+        await filesAPI.sync();
+      } catch {
+        // Silent fail for auto-sync — manual sync button remains available
+      }
+    };
+    autoSync();
+  }, []);
 
   useEffect(() => { loadFiles(); }, [loadFiles]);
 
@@ -643,8 +678,18 @@ export default function FilesPage() {
             <button
               onClick={() => { setLoading(true); loadFiles(); }}
               className="p-2 rounded-xl bg-white/5 border border-white/10 text-slate-400 hover:text-white transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center"
+              title="Refresh file list"
             >
               <RefreshCw size={18} className={loading ? 'animate-spin' : ''} />
+            </button>
+            <button
+              onClick={syncFromDisk}
+              disabled={syncing}
+              className="px-3 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20 transition-colors text-xs font-medium flex items-center gap-1.5 min-h-[44px] disabled:opacity-50"
+              title="Sync filesystem with portal database — registers externally-added files"
+            >
+              <RefreshCw size={14} className={syncing ? 'animate-spin' : ''} />
+              {syncing ? 'Syncing…' : 'Sync from Disk'}
             </button>
           </div>
         </div>

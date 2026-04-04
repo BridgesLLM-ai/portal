@@ -78,6 +78,14 @@ const assistantLastSeenTextMap: Map<string, string> = new Map();
 // Track which sessions have active runs (to filter stale replayed events)
 const activeRunIds: Map<string, string> = new Map();
 
+function shouldIgnoreLateRunContinuation(sessionKey: string, runId?: string | null): boolean {
+  if (!runId) return false;
+  const status = streamEventBus.getStreamStatus(sessionKey);
+  if (!status || status.active !== false) return false;
+  if (!streamEventBus.wasRecentlyDone(sessionKey, 30000)) return false;
+  return status.runId === runId;
+}
+
 // Event listeners
 const approvalRequestListeners: Set<ApprovalRequestCallback> = new Set();
 const approvalResolvedListeners: Set<ApprovalResolvedCallback> = new Set();
@@ -175,6 +183,10 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
 
   // If no active runId is set but the event has one, adopt it (new run segment after yield)
   if (!expectedRunId && runId) {
+    if (shouldIgnoreLateRunContinuation(sessionKey, runId)) {
+      debugLog(`Ignoring late agent event for completed runId=${runId} session=${sessionKey}`);
+      return;
+    }
     activeRunIds.set(sessionKey, runId);
     debugLog(`Adopted new runId=${runId} for session ${sessionKey} (resumed after yield)`);
     // Reset text accumulators for the new run
@@ -327,6 +339,10 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
 
   // If no active runId is set but the event has one, adopt it (new run segment)
   if (!expectedRunId && runId) {
+    if (shouldIgnoreLateRunContinuation(sessionKey, runId)) {
+      debugLog(`Ignoring late chat event for completed runId=${runId} session=${sessionKey}`);
+      return;
+    }
     const wasRecent = streamEventBus.wasRecentlyDone(sessionKey);
     activeRunIds.set(sessionKey, runId);
     debugLog(`Adopted new runId=${runId} for session ${sessionKey} via chat event (wasRecentlyDone=${wasRecent})`);
@@ -387,7 +403,8 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
       }
     }
 
-    streamEventBus.publish(sessionKey, { type: 'done', content: finalText });
+    // Don't send done with empty content (suppressed NO_REPLY etc)
+    streamEventBus.publish(sessionKey, { type: 'done', content: finalText || '' });
 
     // Use soft-clear instead of hard-clear: the agent may resume after a sub-agent
     // completes (sessions_yield → sub-agent → result injected → new run starts).

@@ -1486,7 +1486,7 @@ export default function SetupWizardPage() {
         </div>
 
         <div className="text-sm text-slate-500 text-center">
-          You can also set up Remote Desktop later from Settings → System → Feature Readiness.
+          You can also set up Remote Desktop later from Settings → System Health.
         </div>
       </StepShell>
     );
