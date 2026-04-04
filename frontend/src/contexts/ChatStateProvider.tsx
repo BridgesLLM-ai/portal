@@ -155,6 +155,7 @@ const CHAT_HISTORY_OMITTED_PLACEHOLDER = '[chat.history omitted: message too lar
 function normalizeProviderModel(provider: string, rawModel: string): string {
   const model = String(rawModel || '').trim();
   if (!model) return '';
+  if (!model || typeof model !== 'string') return model || '';
   if (provider === 'OPENCLAW' || provider === 'OLLAMA' || provider === 'GEMINI') return model;
 
   const lower = model.toLowerCase();

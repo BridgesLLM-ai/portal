@@ -747,7 +747,7 @@ export default function AgentSelector({
                               textClass="text-slate-300"
                             />
                             <span className="flex-1 text-left">{getAgentLabel(agent, assistantName)}</span>
-                            {agent.model && (
+                            {typeof agent.model === 'string' && agent.model && (
                               <span className="text-[10px] text-slate-600 font-mono truncate max-w-[80px]">
                                 {agent.model.split('/').pop()}
                               </span>

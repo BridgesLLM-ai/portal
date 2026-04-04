@@ -129,7 +129,7 @@ function ModelBreakdown({ data, loading }: ModelBreakdownProps) {
       ...item,
       // Shorten model name for display
       displayName: item.model.includes('/') 
-        ? item.model.split('/').slice(-1)[0] 
+        ? (typeof item.model === 'string' ? item.model.split('/').slice(-1)[0] : String(item.model || '')) 
         : item.model,
     }));
   }, [data]);
@@ -274,7 +274,7 @@ function RecentSessions({ sessions, loading }: RecentSessionsProps) {
                   <td className="py-3 pr-4">
                     <span className="text-slate-300 font-mono text-xs">
                       {session.model.includes('/') 
-                        ? session.model.split('/').slice(-1)[0] 
+                        ? (typeof session.model === 'string' ? session.model.split('/').slice(-1)[0] : String(session.model || '')) 
                         : session.model}
                     </span>
                   </td>
