@@ -181,7 +181,7 @@ export const useAuthStore = create<AuthState>()(
           // Try /auth/me — works with either localStorage token (Authorization header)
           // or httpOnly cookie (sent automatically with withCredentials: true).
           // This handles both normal login (localStorage) and setup wizard (cookie-only).
-          const user = await authAPI.me();
+          const user = await authAPI.me({ allowSessionRecovery: true });
           set({ isAuthenticated: true, user, isLoading: false, lastSessionRestoreAt: Date.now() });
           startSessionHeartbeat();
           return true;

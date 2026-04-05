@@ -76,6 +76,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.23.6 (April 5, 2026)
+- **Mobile Safari / 2FA login is hardened** — when login enters the 2FA step, the portal now explicitly clears stale auth cookies so an old session cannot immediately trigger a bogus refresh failure.
+- **Broken refresh tokens now clean up after themselves** — invalid or expired refresh/logout paths actively expire the browser auth cookies instead of leaving a poisoned session behind.
+- **Unauthenticated restore races are blocked** — the frontend only attempts cookie-based session recovery during explicit restore-session probes and never while 2FA is pending, so the generic `login failed` collapse stops happening on mobile.
+
 ### v3.23.5 (April 5, 2026)
 - **Claude (OpenClaw) setup is back on the sane path** — the failed Claude CLI bridge detour is gone, so Anthropic/OpenClaw setup is once again the normal setup-token flow.
 - **Anthropic billing is now explicit in the UI** — Claude setup surfaces now show a hard Extra Usage warning, explain that a bundle may be required, and link straight to Claude usage settings.

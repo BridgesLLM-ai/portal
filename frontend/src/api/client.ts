@@ -47,6 +47,12 @@ let lastSuccessfulAuth = Date.now();
  * Deduplicates concurrent refresh attempts.
  */
 async function refreshSession(): Promise<boolean> {
+  const { twoFactorPending } = useAuthStore.getState();
+  if (twoFactorPending) {
+    debugLog('[Auth] Skipping refresh while two-factor login is pending');
+    return false;
+  }
+
   // If already refreshing, wait for that result
   if (refreshPromise) {
     try {
@@ -148,6 +154,7 @@ client.interceptors.response.use(
       _silent?: boolean;
       _errorCaptured?: boolean;
       _errorReported?: boolean;
+      _allowSessionRecovery?: boolean;
     };
     const status = error.response?.status;
 
@@ -171,6 +178,16 @@ client.interceptors.response.use(
       // Exception: /auth/me should trigger refresh since it's used for session validation
       const isAuthEndpoint = originalRequest?.url?.includes('/auth/');
       if (isAuthEndpoint && !originalRequest?.url?.includes('/auth/me')) {
+        return Promise.reject(error);
+      }
+
+      const { isAuthenticated, twoFactorPending } = useAuthStore.getState();
+      const allowSessionRecovery = Boolean(originalRequest._allowSessionRecovery);
+
+      // Only refresh when we already consider the user authenticated, or when
+      // a restore-session probe explicitly opted into cookie-based recovery.
+      // During 2FA pending, refresh attempts are always wrong and can poison the UX.
+      if (twoFactorPending || (!isAuthenticated && !allowSessionRecovery)) {
         return Promise.reject(error);
       }
 

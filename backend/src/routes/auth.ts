@@ -6,7 +6,7 @@ import { config } from '../config/env';
 import rateLimit from 'express-rate-limit';
 import { prisma } from '../config/database';
 import { hashPassword, comparePassword, validatePasswordStrength } from '../utils/password';
-import { generateAccessToken, generateRefreshToken, verifyRefreshToken } from '../utils/jwt';
+import { generateAccessToken, generateRefreshToken, verifyAccessToken, verifyRefreshToken } from '../utils/jwt';
 import { authenticateToken } from '../middleware/auth';
 import { AppError } from '../middleware/errorHandler';
 import { ACTIVE_STATUS, canAccessPortal, describeBlockedAccountStatus } from '../utils/authz';
@@ -31,7 +31,7 @@ import {
   blockedIPs,
 } from '../utils/auth-tracking';
 import { buildPortalUrl } from '../utils/portalUrl';
-import { getAuthCookieOptions, setAuthCookies } from '../utils/authCookies';
+import { clearAuthCookies, setAuthCookies } from '../utils/authCookies';
 import { generateSecret as otpGenerateSecret, generateURI as otpGenerateURI, verify as otpVerify, NobleCryptoPlugin, ScureBase32Plugin } from 'otplib';
 import * as QRCode from 'qrcode';
 
@@ -368,6 +368,11 @@ router.post('/login', authLimiter, async (req: Request, res: Response, next: Nex
       // Return a short-lived pending token instead of raw userId
       const pendingToken = generate2FAPendingToken(user.id);
 
+      // If the browser is carrying stale auth cookies from an older session,
+      // clear them before the 2FA step. Otherwise mobile browsers can race a
+      // bad refresh request immediately after a successful password check.
+      clearAuthCookies(req, res);
+
       // If email 2FA, auto-send the code so the user doesn't have to click separately
       if (user.twoFactorMethod === 'email') {
         try {
@@ -467,15 +472,25 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
   try {
     const { refreshToken: bodyRefreshToken } = refreshSchema.parse(req.body || {});
     const refreshToken = bodyRefreshToken || req.cookies?.refreshToken;
-    if (!refreshToken) throw new AppError(401, 'Refresh token required');
+    if (!refreshToken) {
+      clearAuthCookies(req, res);
+      throw new AppError(401, 'Refresh token required');
+    }
+
     const payload = verifyRefreshToken(refreshToken);
-    if (!payload) throw new AppError(401, 'Invalid refresh token');
+    if (!payload) {
+      clearAuthCookies(req, res);
+      throw new AppError(401, 'Invalid refresh token');
+    }
 
     const sessions = await prisma.session.findMany({
       where: { userId: payload.userId },
       orderBy: { createdAt: 'desc' },
     });
-    if (!sessions.length) throw new AppError(401, 'Session not found');
+    if (!sessions.length) {
+      clearAuthCookies(req, res);
+      throw new AppError(401, 'Session not found');
+    }
 
     let session: any = null;
     for (const candidate of sessions) {
@@ -486,12 +501,22 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
       }
     }
 
-    if (!session) throw new AppError(401, 'Invalid refresh token');
-    if (session.expiresAt < new Date()) throw new AppError(401, 'Refresh token expired');
+    if (!session) {
+      clearAuthCookies(req, res);
+      throw new AppError(401, 'Invalid refresh token');
+    }
+    if (session.expiresAt < new Date()) {
+      clearAuthCookies(req, res);
+      throw new AppError(401, 'Refresh token expired');
+    }
 
     const user = await prisma.user.findUnique({ where: { id: payload.userId } });
-    if (!user) throw new AppError(401, 'User not found');
+    if (!user) {
+      clearAuthCookies(req, res);
+      throw new AppError(401, 'User not found');
+    }
     if (!canAccessPortal((user as any).accountStatus, user.isActive)) {
+      clearAuthCookies(req, res);
       throw new AppError(403, describeBlockedAccountStatus((user as any).accountStatus));
     }
 
@@ -512,50 +537,57 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
 
 /**
  * POST /api/auth/logout
+ * Best-effort logout: clears browser cookies even if the access token is already dead.
  */
-router.post('/logout', authenticateToken, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/logout', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    if (!req.user) throw new AppError(401, 'User not authenticated');
-
     const meta = extractTrackingMetadata(req);
-
-    await prisma.activityLog.create({
-      data: {
-        userId: req.user.userId,
-        action: 'LOGOUT',
-        resource: 'auth',
-        severity: 'INFO',
-        ipAddress: meta.ip,
-        userAgent: meta.rawUserAgent,
-        translatedMessage: 'Signed out of the portal',
-        metadata: { ip: meta.ip, geo: meta.geo, device: meta.device },
-      },
-    }).catch(() => {});
-
+    const authHeader = req.headers.authorization;
+    const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
+    const accessToken = bearerToken || req.cookies?.accessToken;
     const refreshToken = req.cookies?.refreshToken;
-    if (refreshToken) {
-      const sessions = await prisma.session.findMany({ where: { userId: req.user.userId } });
-      let matchedSessionId: string | null = null;
-      for (const session of sessions) {
-        const tokenMatch = await comparePassword(refreshToken, session.refreshTokenHash);
-        if (tokenMatch) {
-          matchedSessionId = session.id;
-          break;
-        }
-      }
 
-      if (matchedSessionId) {
-        await prisma.session.delete({ where: { id: matchedSessionId } });
-      } else {
-        await prisma.session.deleteMany({ where: { userId: req.user.userId } });
+    const accessPayload = accessToken ? verifyAccessToken(accessToken) : null;
+    const refreshPayload = refreshToken ? verifyRefreshToken(refreshToken) : null;
+    const userId = accessPayload?.userId || refreshPayload?.userId || null;
+
+    if (userId) {
+      await prisma.activityLog.create({
+        data: {
+          userId,
+          action: 'LOGOUT',
+          resource: 'auth',
+          severity: 'INFO',
+          ipAddress: meta.ip,
+          userAgent: meta.rawUserAgent,
+          translatedMessage: 'Signed out of the portal',
+          metadata: { ip: meta.ip, geo: meta.geo, device: meta.device },
+        },
+      }).catch(() => {});
+
+      if (refreshToken) {
+        const sessions = await prisma.session.findMany({ where: { userId } });
+        let matchedSessionId: string | null = null;
+        for (const session of sessions) {
+          const tokenMatch = await comparePassword(refreshToken, session.refreshTokenHash);
+          if (tokenMatch) {
+            matchedSessionId = session.id;
+            break;
+          }
+        }
+
+        if (matchedSessionId) {
+          await prisma.session.delete({ where: { id: matchedSessionId } });
+        } else if (accessPayload) {
+          // Preserve the old authenticated logout behavior as a fallback.
+          await prisma.session.deleteMany({ where: { userId } });
+        }
+      } else if (accessPayload) {
+        await prisma.session.deleteMany({ where: { userId } });
       }
-    } else {
-      await prisma.session.deleteMany({ where: { userId: req.user.userId } });
     }
 
-    const clearCookieOptions = getAuthCookieOptions(req);
-    res.clearCookie('accessToken', clearCookieOptions);
-    res.clearCookie('refreshToken', clearCookieOptions);
+    clearAuthCookies(req, res);
     res.json({ message: 'Logged out successfully' });
   } catch (error) {
     next(error);

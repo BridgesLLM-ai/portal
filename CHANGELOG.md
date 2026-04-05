@@ -2,6 +2,15 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.23.6] — 2026-04-05
+
+### 🐛 Bug Fixes
+
+#### Mobile Auth / 2FA
+- **Clear stale auth cookies before the 2FA handoff** — login responses that enter email/TOTP verification now explicitly expire leftover access and refresh cookies, so old mobile Safari sessions cannot poison the next step with a bad refresh attempt.
+- **Clear broken cookies on refresh failure and best-effort logout** — invalid/expired refresh-token paths now actively clear auth cookies, and logout still clears the browser session even when the access token is already dead.
+- **Stop bogus session refresh retries during unauthenticated / 2FA-pending flows** — the frontend now limits cookie-based session recovery to explicit restore-session probes and refuses to refresh while 2FA is pending, preventing the generic mobile `login failed` collapse.
+
 ## [3.23.5] — 2026-04-05
 
 ### 🐛 Bug Fixes

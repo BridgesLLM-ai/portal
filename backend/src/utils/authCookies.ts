@@ -1,5 +1,7 @@
 import type { Request, Response } from 'express';
 
+const AUTH_COOKIE_NAMES = ['accessToken', 'refreshToken'] as const;
+
 function requestIsSecure(req?: Request): boolean {
   if (!req) return false;
   if ((req as any).secure) return true;
@@ -30,4 +32,11 @@ export function setAuthCookies(
 ) {
   res.cookie('accessToken', accessToken, getAuthCookieOptions(req, accessMaxAge));
   res.cookie('refreshToken', refreshToken, getAuthCookieOptions(req, refreshMaxAge));
+}
+
+export function clearAuthCookies(req: Request, res: Response) {
+  const clearCookieOptions = getAuthCookieOptions(req);
+  for (const cookieName of AUTH_COOKIE_NAMES) {
+    res.clearCookie(cookieName, clearCookieOptions);
+  }
 }

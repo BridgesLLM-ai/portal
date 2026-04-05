@@ -69,8 +69,10 @@ export const authAPI = {
     await client.post('/auth/logout');
   },
 
-  me: async () => {
-    const { data } = await client.get('/auth/me');
+  me: async (options?: { allowSessionRecovery?: boolean }) => {
+    const { data } = await client.get('/auth/me', {
+      _allowSessionRecovery: options?.allowSessionRecovery,
+    } as any);
     return data;
   },
 
