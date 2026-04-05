@@ -3,17 +3,20 @@ import { AlertTriangle, CheckCircle2, ClipboardPaste, ExternalLink, Loader2, X }
 import client from '../../api/client';
 import ModelSelector from './ModelSelector';
 import type { ProviderUIConfig } from './providerConfig';
+import type { ProviderStatus } from './ProviderCard';
 
 interface SetupTokenFlowProps {
   provider: ProviderUIConfig;
+  status?: ProviderStatus | null;
   apiBase: string;
   onComplete: () => void;
   onCancel: () => void;
+  onNativeCliLogin?: () => void;
 }
 
-type Step = 'prereqs' | 'starting' | 'waiting' | 'paste-code' | 'completing' | 'model' | 'manual-paste' | 'done' | 'error';
+type Step = 'prereqs' | 'starting' | 'waiting' | 'paste-code' | 'completing' | 'activating-cli' | 'model' | 'manual-paste' | 'done' | 'error';
 
-export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel }: SetupTokenFlowProps) {
+export default function SetupTokenFlow({ provider, status, apiBase, onComplete, onCancel, onNativeCliLogin }: SetupTokenFlowProps) {
   const [step, setStep] = useState<Step>('prereqs');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [authUrl, setAuthUrl] = useState<string | null>(null);
@@ -23,18 +26,36 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
   const [pasteCode, setPasteCode] = useState('');
   const [manualToken, setManualToken] = useState('');
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [connectedVia, setConnectedVia] = useState<'native-cli' | 'setup-token' | null>(status?.authType === 'cli' ? 'native-cli' : null);
 
-  // Only auto-select a default model if no default is already configured
+  const normalizeModelForSelector = React.useCallback((modelId: string | null | undefined) => {
+    if (!modelId) return null;
+    if (modelId.startsWith('claude-cli/')) return modelId.replace(/^claude-cli\//, 'anthropic/');
+    return modelId;
+  }, []);
+
+  const mapSelectorModelToRuntime = React.useCallback((modelId: string | null | undefined) => {
+    if (!modelId) return null;
+    if (connectedVia === 'native-cli' && modelId.startsWith('anthropic/')) return modelId.replace(/^anthropic\//, 'claude-cli/');
+    return modelId;
+  }, [connectedVia]);
+
   React.useEffect(() => {
     client.get(`${apiBase}/status`).then(({ data }: { data: any }) => {
-      const current = data?.defaultModel || null;
-      if (!current) {
-        setSelectedModel(
-          provider.defaultModels.find((m) => m.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null,
-        );
-      }
-    }).catch(() => {});
-  }, [apiBase, provider]);
+      const current = normalizeModelForSelector(data?.defaultModel || null);
+      const supportedCurrent = current && provider.defaultModels.some((model) => model.id === current) ? current : null;
+      setSelectedModel(
+        supportedCurrent
+        || provider.defaultModels.find((m) => m.tier === 'balanced')?.id
+        || provider.defaultModels[0]?.id
+        || null,
+      );
+    }).catch(() => {
+      setSelectedModel(
+        provider.defaultModels.find((m) => m.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null,
+      );
+    });
+  }, [apiBase, normalizeModelForSelector, provider]);
 
   // Poll for auto-completion
   const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
@@ -101,6 +122,7 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
     try {
       const { data } = await client.post(`${apiBase}/claude/paste-code`, { sessionId, code: pasteCode.trim() });
       if (data.success) {
+        setConnectedVia('setup-token');
         setStep('model');
       } else {
         setError(data.error || 'Failed to complete sign-in');
@@ -118,6 +140,7 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
     try {
       const { data } = await client.post(`${apiBase}/claude/complete`, { sessionId });
       if (data.success) {
+        setConnectedVia('setup-token');
         setStep('model');
       } else {
         setError(data.error || 'Failed to capture setup token');
@@ -126,6 +149,27 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
     } catch (err: any) {
       setError(err?.response?.data?.error || err?.message || 'Failed to complete Claude setup');
       setStep('error');
+    }
+  };
+
+  const activateNativeCli = async () => {
+    setLoading(true);
+    setError(null);
+    setStep('activating-cli');
+    try {
+      const { data } = await client.post(`${apiBase}/claude/use-native-cli`, {
+        model: selectedModel,
+      });
+      if (!data?.success) {
+        throw new Error(data?.error || 'Failed to connect Claude CLI to OpenClaw');
+      }
+      setConnectedVia('native-cli');
+      setStep('model');
+    } catch (err: any) {
+      setError(err?.response?.data?.error || err?.message || 'Failed to connect Claude CLI to OpenClaw');
+      setStep('error');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -152,8 +196,9 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
     setLoading(true);
     setError(null);
     try {
-      if (selectedModel) {
-        await client.post(`${apiBase}/set-default-model`, { model: selectedModel });
+      const runtimeModel = mapSelectorModelToRuntime(selectedModel);
+      if (runtimeModel) {
+        await client.post(`${apiBase}/set-default-model`, { model: runtimeModel });
       }
       setStep('done');
       onComplete();
@@ -163,6 +208,8 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
       setLoading(false);
     }
   };
+
+  const nativeCliReady = provider.id === 'anthropic' && status?.nativeCliAuthStatus === 'authenticated';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
@@ -184,53 +231,75 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
           {step === 'prereqs' ? (
             <div className="space-y-5">
               <p className="text-sm leading-relaxed text-slate-300">
-                You'll sign in with your <strong className="text-white">Claude / Anthropic account</strong>.
-                This requires an active Claude subscription (Pro, Team, or Enterprise).
+                Recommended path: log into <strong className="text-white">Claude Code on this server</strong>, then let OpenClaw use the local Claude CLI runtime.
+                That keeps Claude on your subscription path instead of pushing users toward API keys.
               </p>
 
-              <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-4">
-                <div className="text-sm font-medium text-white">Before you start:</div>
-                <ul className="mt-3 space-y-2.5 text-sm text-slate-300">
+              <div className={`rounded-lg border p-4 ${nativeCliReady ? 'border-emerald-500/25 bg-emerald-500/10' : 'border-amber-500/25 bg-amber-500/10'}`}>
+                <div className={`text-sm font-medium ${nativeCliReady ? 'text-emerald-100' : 'text-amber-100'}`}>
+                  {nativeCliReady ? 'Claude Code is already logged in on this server' : 'Claude Code is not logged in on this server yet'}
+                </div>
+                <ul className={`mt-3 space-y-2.5 text-sm ${nativeCliReady ? 'text-emerald-50/90' : 'text-amber-50/90'}`}>
                   <li className="flex items-start gap-2">
-                    <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-orange-400" />
+                    <span className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${nativeCliReady ? 'bg-emerald-300' : 'bg-amber-300'}`} />
                     <span>
-                      Make sure you have an active <strong className="text-white">Claude subscription</strong>.{' '}
-                      <a href="https://claude.ai/settings/billing" target="_blank" rel="noreferrer" className="font-medium text-orange-400 underline decoration-orange-400/30 hover:text-orange-300">
+                      You still need an active <strong className="text-white">Claude subscription</strong>.{' '}
+                      <a href="https://claude.ai/settings/billing" target="_blank" rel="noreferrer" className="font-medium text-orange-300 underline decoration-orange-400/30 hover:text-orange-200">
                         Check your plan
                       </a>
                     </span>
                   </li>
                   <li className="flex items-start gap-2">
-                    <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-orange-400" />
-                    <span>The portal will handle the sign-in automatically — just complete the browser authorization when it opens.</span>
+                    <span className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${nativeCliReady ? 'bg-emerald-300' : 'bg-amber-300'}`} />
+                    <span>
+                      OpenClaw will switch to <code className="rounded bg-slate-900/80 px-1.5 py-0.5 text-xs text-white">claude-cli/...</code> models under the hood.
+                    </span>
                   </li>
+                  {!nativeCliReady ? (
+                    <li className="flex items-start gap-2">
+                      <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-300" />
+                      <span>Use the Claude Code native login first, then come back here and connect it to OpenClaw.</span>
+                    </li>
+                  ) : null}
                 </ul>
               </div>
 
               <div className="rounded-lg border border-slate-700/50 bg-slate-800/30 px-4 py-3 text-sm text-slate-300">
-                This connects Claude through OpenClaw. To use Claude Code as a native agent, set it up from its own card in the AI Providers page.
+                Manual <code className="rounded bg-slate-900/80 px-1.5 py-0.5 text-xs text-slate-100">setup-token</code> is still available below, but it is now the fallback path.
               </div>
 
               {error ? (
                 <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">{error}</div>
               ) : null}
 
-              <button
-                type="button"
-                onClick={startAutomated}
-                disabled={loading}
-                className="flex w-full items-center justify-center gap-2 rounded-xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 shadow transition hover:bg-slate-100 disabled:opacity-50"
-              >
-                {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ExternalLink className="h-4 w-4" />}
-                Sign in with Claude
-              </button>
+              {nativeCliReady ? (
+                <button
+                  type="button"
+                  onClick={activateNativeCli}
+                  disabled={loading}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 shadow transition hover:bg-slate-100 disabled:opacity-50"
+                >
+                  {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                  Use Claude subscription on this server
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={onNativeCliLogin}
+                  disabled={!onNativeCliLogin}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 shadow transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <ExternalLink className="h-4 w-4" />
+                  Log into Claude Code on this server
+                </button>
+              )}
 
               <button
                 type="button"
                 onClick={() => setStep('manual-paste')}
                 className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition"
               >
-                I already have a setup-token — paste it manually
+                Use the fallback setup-token path instead
               </button>
             </div>
           ) : null}
@@ -351,16 +420,27 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
             </div>
           ) : null}
 
+          {step === 'activating-cli' ? (
+            <div className="space-y-5 py-8 text-center">
+              <Loader2 className="mx-auto h-8 w-8 animate-spin text-emerald-400" />
+              <p className="text-sm text-slate-400">Connecting the server Claude CLI to OpenClaw…</p>
+            </div>
+          ) : null}
+
           {/* ── Model selection ── */}
           {step === 'model' ? (
             <div className="space-y-4">
               <div className="flex items-center gap-2 text-emerald-400">
                 <CheckCircle2 className="h-5 w-5" />
-                <span className="text-sm font-semibold">Claude connected successfully!</span>
+                <span className="text-sm font-semibold">
+                  {connectedVia === 'native-cli' ? 'Claude subscription connected through server Claude CLI!' : 'Claude connected successfully!'}
+                </span>
               </div>
 
               <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
-                All available Claude models have been added automatically. You can use any of them in the portal.
+                {connectedVia === 'native-cli'
+                  ? 'OpenClaw is now using claude-cli models on this server. Claude stays on the local Claude CLI subscription path instead of API-key billing.'
+                  : 'All available Claude models have been added automatically. You can use any of them in the portal.'}
               </div>
 
               <p className="text-sm text-slate-300">
@@ -388,7 +468,7 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
           {step === 'manual-paste' ? (
             <div className="space-y-5">
               <p className="text-sm text-slate-300">
-                If you've already generated a setup-token, paste it below.
+                If you need the fallback path, paste a Claude <code className="rounded bg-slate-800 px-1.5 py-0.5 text-xs text-slate-100">setup-token</code> below.
               </p>
 
               <div className="rounded-xl border border-slate-700 bg-slate-950/60 px-4 py-4">
@@ -455,6 +535,15 @@ export default function SetupTokenFlow({ provider, apiBase, onComplete, onCancel
               >
                 Try Again
               </button>
+              {provider.id === 'anthropic' && onNativeCliLogin ? (
+                <button
+                  type="button"
+                  onClick={onNativeCliLogin}
+                  className="w-full text-center text-sm text-slate-400 hover:text-slate-200 transition"
+                >
+                  Log into Claude Code on this server
+                </button>
+              ) : null}
               <button
                 type="button"
                 onClick={() => { setError(null); setStep('manual-paste'); }}

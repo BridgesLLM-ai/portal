@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { getAiProviderMeta } from '../config/aiProviders';
 import { validateApiKey } from '../services/aiProviderValidator';
 import { completeNativeCliFlow, completeOAuthFlow, getClaudeSetupToken, getOAuthFlowStatus, pasteCodeToClaudeSession, saveClaudeToken, startClaudeSetupTokenFlow, startDeviceCodeFlow, startNativeCliFlow, startOAuthFlow } from '../services/oauthFlowManager';
+import { getNativeCliAuthStatus } from '../agents/nativeCliAuth';
 import {
   AUTH_PROFILES_PATH,
   CONFIG_PATH,
@@ -51,6 +52,13 @@ const saveSetupTokenSchema = z.object({
 }).superRefine((data, ctx) => {
   if (data.setDefault && !data.model) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['model'], message: 'Model is required when setDefault is true' });
+  }
+});
+const useNativeClaudeCliSchema = z.object({
+  model: z.string().max(200).optional(),
+}).superRefine((data, ctx) => {
+  if (data.model && !data.model.startsWith('anthropic/') && !data.model.startsWith('claude-cli/')) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['model'], message: 'Claude CLI setup expects an Anthropic or claude-cli model id' });
   }
 });
 const setFallbacksSchema = z.object({
@@ -104,6 +112,10 @@ function atomicWriteJson(targetPath: string, data: unknown) {
   fs.renameSync(tempPath, targetPath);
 }
 
+function shellEscape(arg: string): string {
+  return `'${arg.replace(/'/g, `'"'"'`)}'`;
+}
+
 function runOpenClaw(args: string[], timeout = 30000) {
   const raw = execFileSync(OPENCLAW_BIN, args, { timeout, encoding: 'utf8' });
   // OpenClaw sometimes prints diagnostic messages to stdout before JSON output.
@@ -112,6 +124,18 @@ function runOpenClaw(args: string[], timeout = 30000) {
     return raw.slice(raw.indexOf('{'));
   }
   return raw;
+}
+
+function runOpenClawWithTty(args: string[], timeout = 30000) {
+  return execFileSync('script', ['-qefc', [OPENCLAW_BIN, ...args].map(shellEscape).join(' '), '/dev/null'], {
+    timeout,
+    encoding: 'utf8',
+  });
+}
+
+function mapAnthropicModelToClaudeCli(model?: string | null): string | null {
+  if (!model) return null;
+  return model.startsWith('anthropic/') ? model.replace(/^anthropic\//, 'claude-cli/') : model;
 }
 
 /**
@@ -446,6 +470,46 @@ export function createAiSetupRouter(): Router {
     }
   });
 
+  router.post('/claude/use-native-cli', async (req: Request, res: Response) => {
+    const parsed = useNativeClaudeCliSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues.map((i: any) => i.message).join('; ') || 'Invalid request' });
+      return;
+    }
+
+    const nativeAuth = getNativeCliAuthStatus('CLAUDE_CODE');
+    if (nativeAuth.status !== 'authenticated') {
+      res.status(409).json({
+        success: false,
+        needsNativeLogin: true,
+        loginCommand: nativeAuth.loginCommand || 'claude',
+        error: nativeAuth.message,
+      });
+      return;
+    }
+
+    try {
+      runOpenClawWithTty(['models', 'auth', 'login', '--provider', 'anthropic', '--method', 'cli', '--set-default'], 45000);
+
+      const cliModel = mapAnthropicModelToClaudeCli(parsed.data.model);
+      if (cliModel) {
+        runOpenClaw(['models', 'set', cliModel], 10000);
+      }
+
+      registerProviderModels('claude-cli');
+      await restartGateway();
+      res.json({ success: true, model: cliModel || getDefaultModel() });
+    } catch (error: any) {
+      const message = error?.message || 'Failed to connect Claude CLI to OpenClaw';
+      res.status(500).json({
+        success: false,
+        error: /claude/i.test(message) && /login|auth|credentials|subscription/i.test(message)
+          ? 'Claude Code CLI is not ready on this server yet. Log into Claude Code first, then try again.'
+          : message,
+      });
+    }
+  });
+
   router.post('/save-setup-token', async (req: Request, res: Response) => {
     const parsed = saveSetupTokenSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -566,7 +630,8 @@ export function createAiSetupRouter(): Router {
       if (openclawConfig?.auth) openclawConfig.auth.profiles = configProfiles;
 
       const defaultModel = openclawConfig?.agents?.defaults?.model?.primary;
-      if (typeof defaultModel === 'string' && defaultModel.startsWith(`${providerId}/`)) {
+      const removeClaudeCliRefs = providerId === 'anthropic';
+      if (typeof defaultModel === 'string' && (defaultModel.startsWith(`${providerId}/`) || (removeClaudeCliRefs && defaultModel.startsWith('claude-cli/')))) {
         if (openclawConfig?.agents?.defaults?.model) {
           delete openclawConfig.agents.defaults.model.primary;
         }
@@ -574,7 +639,21 @@ export function createAiSetupRouter(): Router {
 
       const fallbacks = openclawConfig?.agents?.defaults?.model?.fallbacks;
       if (Array.isArray(fallbacks)) {
-        openclawConfig.agents.defaults.model.fallbacks = fallbacks.filter((model: unknown) => typeof model !== 'string' || !model.startsWith(`${providerId}/`));
+        openclawConfig.agents.defaults.model.fallbacks = fallbacks.filter((model: unknown) => {
+          if (typeof model !== 'string') return true;
+          if (model.startsWith(`${providerId}/`)) return false;
+          if (removeClaudeCliRefs && model.startsWith('claude-cli/')) return false;
+          return true;
+        });
+      }
+
+      const modelRegistry = openclawConfig?.agents?.defaults?.models;
+      if (modelRegistry && typeof modelRegistry === 'object' && !Array.isArray(modelRegistry)) {
+        for (const modelId of Object.keys(modelRegistry)) {
+          if (modelId.startsWith(`${providerId}/`) || (removeClaudeCliRefs && modelId.startsWith('claude-cli/'))) {
+            delete modelRegistry[modelId];
+          }
+        }
       }
 
       if (typeof authProfiles.version !== 'number') {

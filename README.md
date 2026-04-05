@@ -76,6 +76,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.23.3 (April 4, 2026)
+- **Claude subscription setup now prefers server Claude CLI** — admins are guided to log into Claude Code on the server first, then connect OpenClaw to the local `claude-cli/...` runtime instead of defaulting people toward API-key billing.
+- **OpenClaw Anthropic bridge added** — the portal can now switch OpenClaw over to Claude CLI-backed Anthropic auth from the UI and keep the chosen Claude model aligned.
+- **Claude provider status is more honest** — the AI Providers page now recognizes Claude CLI-backed Anthropic setups, labels them correctly, and cleans them up properly if removed.
+
 ### v3.23.2 (April 4, 2026)
 - **Claude Code OAuth fix** — Agent Chat now strips conflicting inherited Anthropic API keys when Claude Code is already logged in on the server, fixing the bogus `Invalid API key · Fix external API key` failure after successful OAuth setup.
 - **Native provider session hardening** — switching from OpenClaw into Claude/Codex/Gemini no longer reuses foreign session IDs, so native provider history loads and first messages start cleanly instead of failing against stale `main`, `new-*`, or `agent:*` session keys.

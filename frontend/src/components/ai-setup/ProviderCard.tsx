@@ -70,7 +70,12 @@ function statusStyles(status: ProviderStatus['status'] | undefined) {
   }
 }
 
-function authLabel(provider: ProviderUIConfig) {
+function authLabel(provider: ProviderUIConfig, status?: ProviderStatus | null) {
+  if (status?.authType === 'cli') return 'Claude CLI';
+  if (status?.authType === 'oauth') return 'OAuth';
+  if (status?.authType === 'token') return provider.id === 'anthropic' ? 'Setup Token' : 'Token';
+  if (status?.authType === 'api_key') return provider.id === 'ollama' ? 'Local' : 'API Key';
+
   switch (provider.primaryAuthType) {
     case 'oauth':
       return 'OAuth';
@@ -182,7 +187,7 @@ export default function ProviderCard({ provider, status, onConfigure, onRemove, 
       <div className="mt-4 grid gap-3 md:grid-cols-2">
         <div className="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2">
           <div className="text-[11px] uppercase tracking-wide text-slate-500">Auth</div>
-          <div className="mt-1 text-sm text-slate-200">{authLabel(provider)}</div>
+          <div className="mt-1 text-sm text-slate-200">{authLabel(provider, status)}</div>
         </div>
         <div className="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2">
           <div className="text-[11px] uppercase tracking-wide text-slate-500">Model</div>

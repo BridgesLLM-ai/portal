@@ -2,6 +2,17 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.23.3] — 2026-04-04
+
+### 🔧 Maintenance
+
+#### Claude Subscription / OpenClaw Setup
+- **Make Claude subscription setup prefer the server Claude CLI path** — The Claude Subscription setup flow now tells admins to log into Claude Code on the server first, then connect OpenClaw to the local `claude-cli/...` runtime instead of steering people toward API-key billing.
+- **Add OpenClaw Claude CLI bridge for Anthropic** — The portal can now switch OpenClaw’s Anthropic path over to `claude-cli` by running the proper OpenClaw CLI auth flow on the server, then setting the chosen Claude model automatically.
+- **Detect Claude CLI-backed Anthropic setups correctly** — AI Provider status now recognizes Anthropic/OpenClaw setups that are using `claude-cli/...` model references, labels them as `Claude CLI`, and surfaces missing native Claude login as an actual error state.
+- **Clean up Claude CLI-backed Anthropic config on removal** — Removing the Claude Subscription provider now also removes `claude-cli/...` model defaults, fallbacks, and registry entries instead of leaving stale Anthropic CLI config behind.
+- **Clarify the native Claude login handoff** — After Claude Code server login, the portal now explicitly points admins back to the Claude Subscription card to connect that login to OpenClaw.
+
 ## [3.23.2] — 2026-04-04
 
 ### 🐛 Bug Fixes

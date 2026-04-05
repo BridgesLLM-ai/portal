@@ -167,7 +167,17 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
           <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
         ) : null}
         {activeSetup?.primaryAuthType === 'setup_token' ? (
-          <SetupTokenFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
+          <SetupTokenFlow
+            provider={activeSetup}
+            status={statusMap.get(activeSetup.id) || null}
+            apiBase={apiBase}
+            onComplete={handleComplete}
+            onCancel={() => setActiveSetup(null)}
+            onNativeCliLogin={() => {
+              setActiveSetup(null);
+              setActiveNativeCliFlow('claude-code');
+            }}
+          />
         ) : null}
         {activeDeviceFlow ? (
           <DeviceCodeFlow apiBase={apiBase} onComplete={async () => { await handleComplete(); setActiveDeviceFlow(false); }} onCancel={() => setActiveDeviceFlow(false)} />
@@ -272,7 +282,17 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
         <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
       ) : null}
       {activeSetup?.primaryAuthType === 'setup_token' ? (
-        <SetupTokenFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
+        <SetupTokenFlow
+          provider={activeSetup}
+          status={statusMap.get(activeSetup.id) || null}
+          apiBase={apiBase}
+          onComplete={handleComplete}
+          onCancel={() => setActiveSetup(null)}
+          onNativeCliLogin={() => {
+            setActiveSetup(null);
+            setActiveNativeCliFlow('claude-code');
+          }}
+        />
       ) : null}
       {activeDeviceFlow ? (
         <DeviceCodeFlow

@@ -73,6 +73,27 @@ export function getDefaultModel(): string | null {
   return config?.agents?.defaults?.model?.primary || null;
 }
 
+export function isClaudeCliModelId(model: unknown): model is string {
+  return typeof model === 'string' && model.startsWith('claude-cli/');
+}
+
+export function hasAnthropicClaudeCliReferences(config: any): boolean {
+  const primary = config?.agents?.defaults?.model?.primary;
+  if (isClaudeCliModelId(primary)) return true;
+
+  const fallbacks = config?.agents?.defaults?.model?.fallbacks;
+  if (Array.isArray(fallbacks) && fallbacks.some((model) => isClaudeCliModelId(model))) {
+    return true;
+  }
+
+  const modelsRegistry = config?.agents?.defaults?.models;
+  if (modelsRegistry && typeof modelsRegistry === 'object' && !Array.isArray(modelsRegistry)) {
+    return Object.keys(modelsRegistry).some((modelId) => isClaudeCliModelId(modelId));
+  }
+
+  return false;
+}
+
 export function getFallbackModels(): string[] {
   const config = readOpenClawConfig();
   const fallbacks = config?.agents?.defaults?.model?.fallbacks;
@@ -159,10 +180,15 @@ export function getProviderStatuses(): ProviderStatus[] {
     const cooldownUntil = usage?.cooldownUntil ?? null;
     const lastUsed = usage?.lastUsed ?? null;
     const errorCount = usage?.errorCount ?? 0;
-    const currentModel = defaultModel && defaultModel.startsWith(`${provider.id}/`) ? defaultModel : null;
     const hasConfigProfile = Boolean(matchingConfigProfileId);
     const hasStoredProfile = Boolean(matchingStoredProfileId);
-    const isConfigured = Boolean(profileId && hasConfigProfile && hasStoredProfile);
+    const regularProfileConfigured = Boolean(profileId && hasConfigProfile && hasStoredProfile);
+    const anthropicCliConfigured = provider.id === 'anthropic'
+      && (isClaudeCliModelId(defaultModel) || (!regularProfileConfigured && hasAnthropicClaudeCliReferences(config)));
+    const currentModel = provider.id === 'anthropic'
+      ? (defaultModel && (defaultModel.startsWith('anthropic/') || isClaudeCliModelId(defaultModel)) ? defaultModel : null)
+      : (defaultModel && defaultModel.startsWith(`${provider.id}/`) ? defaultModel : null);
+    const isConfigured = anthropicCliConfigured || regularProfileConfigured;
 
     let status: ProviderStatus['status'] = 'unconfigured';
     let error: string | null = null;
@@ -172,7 +198,17 @@ export function getProviderStatuses(): ProviderStatus[] {
     const nativeProvider = getNativeProviderLinkedToOpenClawProvider(provider.id);
     const nativeAuth = nativeProvider ? getNativeCliAuthStatus(nativeProvider) : null;
 
-    if (isConfigured) {
+    if (anthropicCliConfigured) {
+      status = 'configured';
+      effectiveAuthType = 'cli';
+
+      if (nativeAuth?.status === 'needs_login') {
+        status = 'error';
+        error = nativeAuth.message;
+      } else if (nativeAuth?.status === 'unknown') {
+        warning = nativeAuth.message;
+      }
+    } else if (regularProfileConfigured) {
       status = 'configured';
       effectiveProfileId = profileId;
       effectiveAuthType = storedProfile?.type || configProfiles[matchingConfigProfileId || '']?.mode || null;
