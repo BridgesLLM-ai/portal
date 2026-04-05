@@ -1,4 +1,4 @@
-import { CheckCircle2, ChevronRight, X } from 'lucide-react';
+import { CheckCircle2, ChevronRight, ExternalLink, X } from 'lucide-react';
 import type { ProviderStatus } from './ProviderCard';
 import { PROVIDERS, type ProviderUIConfig } from './providerConfig';
 
@@ -46,29 +46,50 @@ export default function OpenClawProviderPicker({ statusMap, onSelect, onDeviceFl
     const configured = status?.status === 'configured';
 
     return (
-      <button
+      <div
         key={provider.id}
-        type="button"
-        onClick={() => handleClick(provider)}
-        className="group flex w-full items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-3 text-left transition hover:border-slate-700 hover:bg-slate-900/80"
+        className="rounded-xl border border-slate-800 bg-slate-950/60 transition hover:border-slate-700 hover:bg-slate-900/80"
       >
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-white">{provider.name}</span>
-            {configured ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /> : null}
-          </div>
-          <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-500">
-            <span>{authLabel(provider)}</span>
-            {provider.freeTier ? (
-              <>
-                <span className="text-slate-700">·</span>
-                <span className="text-emerald-400">{provider.freeTier}</span>
-              </>
+        <button
+          type="button"
+          onClick={() => handleClick(provider)}
+          className="group flex w-full items-center justify-between gap-3 px-4 py-3 text-left"
+        >
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium text-white">{provider.name}</span>
+              {configured ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /> : null}
+            </div>
+            <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-500">
+              <span>{authLabel(provider)}</span>
+              {provider.freeTier ? (
+                <>
+                  <span className="text-slate-700">·</span>
+                  <span className="text-emerald-400">{provider.freeTier}</span>
+                </>
+              ) : null}
+            </div>
+            {provider.dangerNote ? (
+              <div className="mt-1 text-[11px] leading-relaxed text-red-300">{provider.dangerNote.compactDetail || provider.dangerNote.title}</div>
             ) : null}
           </div>
-        </div>
-        <ChevronRight className="h-4 w-4 shrink-0 text-slate-600 transition group-hover:text-slate-400" />
-      </button>
+          <ChevronRight className="h-4 w-4 shrink-0 text-slate-600 transition group-hover:text-slate-400" />
+        </button>
+        {provider.dangerNote?.link ? (
+          <div className="px-4 pb-3 pt-0">
+            <a
+              href={provider.dangerNote.link.url}
+              target="_blank"
+              rel="noreferrer"
+              onClick={(event) => event.stopPropagation()}
+              className="inline-flex items-center gap-1.5 text-xs font-medium text-sky-300 underline decoration-sky-400/40 hover:text-sky-200"
+            >
+              {provider.dangerNote.link.label}
+              <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+          </div>
+        ) : null}
+      </div>
     );
   };
 

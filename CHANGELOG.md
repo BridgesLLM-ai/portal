@@ -2,6 +2,33 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.23.5] — 2026-04-05
+
+### 🐛 Bug Fixes
+
+#### Claude (OpenClaw) Setup
+- **Revert the Claude CLI bridge detour** — Claude/OpenClaw setup is back on the normal setup-token path instead of trying to repurpose the server Claude Code login as an OpenClaw auth bridge.
+- **Show a hard Anthropic Extra Usage warning throughout setup** — the Claude provider card, provider picker, setup flow, and completion state now warn that OpenClaw-driven Claude requests require Anthropic Extra Usage and may require purchasing an Extra Usage bundle.
+- **Add a direct link to Anthropic usage settings** — admins can jump straight to `https://claude.ai/settings/usage` from the warning UI instead of hunting through Anthropic settings.
+- **Keep native Claude Code login separate** — native Claude Code remains available for the portal's native agent path, but it is no longer presented as the OpenClaw Claude provider setup.
+
+#### Project Chat
+- **Unstick project chat when streams end without a final `done`** — project chat now treats `stream_ended` as terminal so the UI stops spinning when the gateway never emits a last completion event.
+
+## [3.23.4] — 2026-04-05
+
+### 🐛 Bug Fixes
+
+#### Claude Subscription / OpenClaw
+- **Stop driving the broken `claude-cli/...` model path** — Claude Subscription setup now imports the server Claude Code OAuth session into OpenClaw as an Anthropic OAuth profile, keeps the live model on canonical `anthropic/...` IDs, and explicitly prefers that Claude CLI-backed profile in `auth.order` instead of sending the gateway into `Unknown model` / `Missing auth` failures.
+- **Scrub leaked portal OpenClaw env before local CLI calls** — the AI setup flow and other OpenClaw CLI helpers now strip inherited `OPENCLAW_API_URL` / `OPENCLAW_GATEWAY_TOKEN`-style service env before spawning `openclaw`, so setup works from the real systemd service context instead of only from a clean root shell.
+- **Auto-repair stale Claude model config** — legacy `claude-cli/sonnet-4.6` / `claude-cli/...` defaults, fallbacks, and model registry entries are now normalized back onto canonical Anthropic model IDs so stale config cannot keep poisoning new chats.
+- **Make OpenClaw chat/session model switching actually stick** — project session bootstrap now patches existing sessions onto the intended selected/default model instead of silently reusing an older Claude/Codex session model.
+- **Unstick turns that ended on `stream_ended` without final `done`** — both main chat and project chat now treat `stream_ended` as a terminal state, clearing the spinner/watchdog even when the gateway never emits a final completion event.
+
+#### Model Picker Clarity
+- **Add clearer model labels and collapse broken Claude duplicates** — OpenClaw model lists are normalized before they reach the UI, duplicate `claude-cli/...` catalog variants collapse onto Anthropic IDs, and chat model pickers now show clearer display names plus provider/runtime badges and the canonical model ID.
+
 ## [3.23.3] — 2026-04-04
 
 ### 🔧 Maintenance

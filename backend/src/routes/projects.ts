@@ -17,6 +17,7 @@ import extract from 'extract-zip';
 import { getGatewayToken } from '../utils/gatewayToken';
 import { desktopExec, desktopExecDetached } from '../utils/desktopEnv';
 import { getDefaultModel } from '../services/openclawConfigManager';
+import { normalizePortalModelId } from '../utils/openclawCli';
 
 /** Shell-escape a filename for safe use in execSync commands */
 function shellEscape(s: string): string {
@@ -3208,12 +3209,17 @@ Hello! I'm ready to help with this project. What would you like to work on?`;
     }
 
     // Determine default model — use gateway's configured default, never hardcode a provider
-    const selectedModel = req.body?.model || getDefaultModel() || 'openai-codex/gpt-5.4';
+    const requestedModel = normalizePortalModelId(req.body?.model || '');
+    const selectedModel = requestedModel || getDefaultModel() || 'openai-codex/gpt-5.4';
 
-    // Patch model if provided
-    if (req.body?.model) {
-      try { await patchSessionModel(sessionKey, req.body.model); } catch {}
-    }
+    // Patch model when explicitly requested, or when the session is still pinned to an older model.
+    try {
+      const sessionInfo = await getSessionInfo(sessionKey);
+      const currentSessionModel = normalizePortalModelId(sessionInfo.ok ? String(sessionInfo.data?.model || '') : '');
+      if (selectedModel && currentSessionModel !== selectedModel) {
+        await patchSessionModel(sessionKey, selectedModel);
+      }
+    } catch {}
 
     res.json({
       sessionKey,
@@ -3628,7 +3634,7 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
     const projectDir = getProjectPath(ownerId, name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
 
-    const selectedModel = model || getDefaultModel() || 'openai-codex/gpt-5.4';
+    const selectedModel = normalizePortalModelId(model || '') || getDefaultModel() || 'openai-codex/gpt-5.4';
     // FIX BUG-5: Normalize project name for case-insensitive session keys
     const normalizedName = name.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
     
@@ -3653,7 +3659,7 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
     try {
       if (fs.existsSync(sessionStatePath)) {
         const meta = JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8'));
-        previousModel = meta.model || '';
+        previousModel = normalizePortalModelId(meta.model || '');
       }
     } catch {}
     const modelChanged = previousModel && previousModel !== selectedModel;

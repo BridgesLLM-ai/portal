@@ -42,7 +42,7 @@ Visit [bridgesllm.ai](https://bridgesllm.ai) for live video demos of every featu
 ## 🎯 What You Get
 
 ### Agent Chat
-Talk to Claude, Codex, Gemini, or Ollama — all via flat-rate OAuth subscriptions, not per-token billing. Switch models mid-conversation. Powered by [OpenClaw](https://github.com/openclaw/openclaw).
+Talk to Claude, Codex, Gemini, or Ollama through OAuth and API-key provider flows. Switch models mid-conversation. Powered by [OpenClaw](https://github.com/openclaw/openclaw).
 
 ### Shared Browser
 Your agent controls a real Chrome browser via CDP — navigating, clicking, filling forms, extracting data — while you watch live on the remote desktop. Ask it to research something, check a page for bugs, or automate a web workflow.
@@ -75,6 +75,16 @@ Everything configured in-browser. Domain, SSL, OAuth providers, users — no CLI
 One-click updates from the browser. Admin dashboard with user management, storage monitoring, and session controls.
 
 ## 🆕 Recent Changes
+
+### v3.23.5 (April 5, 2026)
+- **Claude (OpenClaw) setup is back on the sane path** — the failed Claude CLI bridge detour is gone, so Anthropic/OpenClaw setup is once again the normal setup-token flow.
+- **Anthropic billing is now explicit in the UI** — Claude setup surfaces now show a hard Extra Usage warning, explain that a bundle may be required, and link straight to Claude usage settings.
+- **Project chat no longer gets stuck after a missing final completion event** — `stream_ended` is now treated as terminal so hanging spinners clear properly.
+
+### v3.23.4 (April 5, 2026)
+- **Claude subscription setup actually works from the portal now** — the server Claude Code login is imported into OpenClaw as Anthropic OAuth, the default stays on canonical `anthropic/...` model IDs, and the bad `claude-cli/...` runtime mismatch is no longer surfaced to users.
+- **Model picker labels are finally unambiguous** — OpenClaw chat selectors now show clearer provider/runtime badges and canonical model IDs, so duplicate-looking Sonnet/Opus entries stop being a guessing game.
+- **Session/model switching and stuck-wait states are hardened** — project chat now repatches stale sessions onto the intended model, and both main/project chat stop spinning forever when the stream ends without a final `done` event.
 
 ### v3.23.3 (April 4, 2026)
 - **Claude subscription setup now prefers server Claude CLI** — admins are guided to log into Claude Code on the server first, then connect OpenClaw to the local `claude-cli/...` runtime instead of defaulting people toward API-key billing.
@@ -154,7 +164,7 @@ flowchart TD
 | Gaming PC + API keys | $285–635/mo | $1,200 |
 | Cloud IDEs (Codespaces) | $58+/mo | $0 (limited AI) |
 
-*Portal is free. VPS is $5–20/mo. AI subscriptions (Claude, Codex, Gemini) are ~$20/mo each — flat-rate, not per-token.*
+*Portal is free. VPS is $5–20/mo. AI access costs depend on your provider setup and billing model.*
 
 ## 🔧 Tech Stack
 

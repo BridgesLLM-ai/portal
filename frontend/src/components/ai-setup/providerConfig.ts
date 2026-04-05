@@ -30,6 +30,12 @@ export interface ProviderUIConfig {
   pricingNote: string;
   freeTier: string | null;
   description: string;
+  dangerNote?: {
+    title: string;
+    detail: string;
+    compactDetail?: string;
+    link?: { url: string; label: string };
+  };
   setupInstructions: ProviderInstruction[];
   defaultModels: ProviderModelPreset[];
   onboardingNotes?: {
@@ -45,21 +51,28 @@ export interface ProviderUIConfig {
 export const PROVIDERS: ProviderUIConfig[] = [
   {
     id: 'anthropic',
-    name: 'Claude Subscription',
+    name: 'Claude (OpenClaw)',
     tier: 1,
     icon: 'sparkles',
     primaryAuthType: 'setup_token',
     keyPlaceholder: 'Paste Claude setup-token',
     consoleUrl: 'https://docs.anthropic.com/en/docs/claude-code',
     signupUrl: 'https://claude.ai/',
-    pricingNote: 'Recommended: use the server Claude CLI login so OpenClaw can use your subscription without API keys. Manual setup-token remains available as a fallback.',
+    pricingNote: 'Requires a Claude plan plus Anthropic Extra Usage for OpenClaw-driven requests. Anthropic is currently advertising discounted Extra Usage bundles (about 30% off).',
     freeTier: null,
-    description: 'Use your Claude subscription through Claude Code on the server, then point OpenClaw at the local Claude CLI. Manual setup-token is the fallback path.',
+    description: 'Connect Claude to OpenClaw with the normal setup-token flow. Anthropic now bills OpenClaw traffic through Extra Usage instead of the included subscription pool.',
+    dangerNote: {
+      title: 'Extra Usage required',
+      detail: 'Anthropic now treats OpenClaw-driven Claude requests as Extra Usage. This path is only usable if Extra Usage is turned on for the Claude account, and you may need to purchase an Anthropic Extra Usage bundle first. Anthropic is currently advertising discounted bundles at roughly 30% off.',
+      compactDetail: 'Requires Anthropic Extra Usage + bundle purchase.',
+      link: { url: 'https://claude.ai/settings/usage', label: 'Open Claude Usage Settings' },
+    },
     setupInstructions: [
-      { stepNumber: 1, title: 'Log into Claude Code on the server', detail: 'Use the Claude Code native login card in the portal (or log in from the server terminal) so Claude CLI is authenticated on the same machine as the gateway.' },
-      { stepNumber: 2, title: 'Return to Claude Subscription', detail: 'Come back to this Claude Subscription card and choose the server Claude CLI path.' },
-      { stepNumber: 3, title: 'Pick your default Claude model', detail: 'Choose Opus, Sonnet, or Haiku. The portal will map it onto OpenClaw’s claude-cli runtime.' },
-      { stepNumber: 4, title: 'Manual setup-token is still available', detail: 'If you cannot use server Claude CLI, you can still generate a setup-token with Claude Code and paste it manually.' },
+      { stepNumber: 1, title: 'Confirm your Claude plan', detail: 'You still need an active Claude plan on the Anthropic account you will use for setup.' },
+      { stepNumber: 2, title: 'Turn on Extra Usage', detail: 'Open Claude billing/usage settings and enable Extra Usage before connecting Claude to OpenClaw.', link: { url: 'https://claude.ai/settings/usage', label: 'Open Claude Usage Settings' } },
+      { stepNumber: 3, title: 'Buy the discounted bundle if Anthropic prompts for it', detail: 'Anthropic is currently advertising discounted Extra Usage bundles (about 30% off). If your account is capped, buy the bundle first so OpenClaw requests can run.' },
+      { stepNumber: 4, title: 'Start Claude setup through OpenClaw', detail: 'Use the portal flow below, or run Claude setup-token manually and paste the token back here. The direct OpenClaw path is the main setup path again.' },
+      { stepNumber: 5, title: 'Pick your default Claude model', detail: 'Choose Opus, Sonnet, or Haiku. OpenClaw will keep normal Anthropic model IDs for runtime use.' },
     ],
     defaultModels: [
       { id: 'anthropic/claude-opus-4-6', name: 'Claude Opus 4.6', tier: 'frontier', description: 'Most capable Claude model.' },
@@ -67,16 +80,16 @@ export const PROVIDERS: ProviderUIConfig[] = [
       { id: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', tier: 'fast', description: 'Fastest and lowest-cost Claude model.' },
     ],
     onboardingNotes: {
-      intro: 'Claude subscription now works best when the server is logged into Claude Code and OpenClaw uses the local Claude CLI runtime. Manual setup-token is the fallback, not the main path.',
-      exactGoal: 'Use the server Claude Code login to let OpenClaw run Claude subscription-backed models through claude-cli, without API keys.',
+      intro: 'Best path here is the direct OpenClaw Claude setup flow again. It still works, but Anthropic treats OpenClaw-driven Claude requests as Extra Usage rather than included subscription-only usage.',
+      exactGoal: 'Enable Anthropic Extra Usage first, then connect Claude to OpenClaw and choose a default model.',
       expectedConfusions: [
-        'Claude CLI login lives on the server and is separate from Anthropic API keys.',
-        'OpenClaw will use claude-cli model ids under the hood even though you pick normal Claude models here.',
-        'Setup-token still exists, but it is now the fallback path rather than the recommended one.'
+        'Claude subscription alone is no longer enough for OpenClaw-driven Claude traffic.',
+        'OpenClaw Claude setup now means the direct setup-token flow, not a server Claude CLI bridge.',
+        'You can use the portal\'s automated Claude flow or paste a setup-token manually; both are still OpenClaw paths.'
       ],
-      callbackLabel: 'Paste the full Claude setup-token (fallback only)',
+      callbackLabel: 'Paste the full Claude setup-token',
       callbackExample: 'Paste the entire token string exactly as Claude Code prints it',
-      afterLoginLabel: 'If you use the fallback setup-token path, paste the whole token exactly as Claude Code prints it.'
+      afterLoginLabel: 'If you use the manual setup-token path, paste the whole token exactly as Claude Code prints it.'
     },
   },
   {

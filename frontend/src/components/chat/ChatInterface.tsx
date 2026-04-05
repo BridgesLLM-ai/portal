@@ -41,7 +41,14 @@ import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../
 import { executeSlashCommand } from '../../utils/slashCommandExecutor';
 import client from '../../api/client';
 import sounds from '../../utils/sounds';
-import { getShortModelLabel } from '../../utils/modelId';
+import {
+  canonicalizePortalModelId,
+  getModelDisplayName,
+  getModelIdBadge,
+  getModelProviderLabel,
+  getModelRuntimeLabel,
+  getShortModelLabel,
+} from '../../utils/modelId';
 
 /* ─── Per-agent identity ────────────────────────────────────────────────── */
 
@@ -169,13 +176,25 @@ const OPENCLAW_MODEL_FALLBACK = [
   'openrouter/deepseek/deepseek-v3.2', 'openrouter/meta-llama/llama-4-maverick',
 ];
 
-// Display-friendly names for full model IDs (strips provider prefix)
 function modelDisplayName(modelId: string): string {
-  // Strip provider prefix for display
-  const parts = modelId.split('/');
-  if (parts.length >= 3) return parts.slice(1).join('/'); // openrouter/deepseek/v3.2 → deepseek/v3.2
-  if (parts.length === 2) return parts[1]; // anthropic/claude-opus-4-6 → claude-opus-4-6
-  return modelId;
+  return getModelDisplayName(modelId, modelId || 'Default model');
+}
+
+function ModelMeta({ modelId, compact = false }: { modelId: string; compact?: boolean }) {
+  const provider = getModelProviderLabel(modelId);
+  const runtime = getModelRuntimeLabel(modelId);
+  const canonicalId = getModelIdBadge(modelId);
+
+  return (
+    <div className="min-w-0 flex-1">
+      <div className="flex items-center gap-1.5 min-w-0">
+        <span className={`${compact ? 'text-[11px]' : 'text-xs'} font-medium text-left truncate`}>{modelDisplayName(modelId)}</span>
+        {!compact && provider ? <span className="px-1.5 py-0.5 rounded-full bg-sky-500/10 text-sky-300 text-[9px] uppercase tracking-wide">{provider}</span> : null}
+        {!compact && runtime ? <span className="px-1.5 py-0.5 rounded-full bg-violet-500/10 text-violet-300 text-[9px] uppercase tracking-wide">{runtime}</span> : null}
+      </div>
+      {!compact && canonicalId ? <div className="mt-0.5 text-[10px] text-slate-500 font-mono truncate">{canonicalId}</div> : null}
+    </div>
+  );
 }
 
 const MODEL_STORAGE_PREFIX = 'agentChats.lastModel.';
@@ -376,7 +395,9 @@ function ModelPicker({
       >
         {/* Icon-only on mobile, text on desktop */}
         <Code2 size={13} className="sm:hidden flex-shrink-0" />
-        <span className="hidden sm:inline truncate max-w-[120px]">{value ? modelDisplayName(value) : 'Default model'}</span>
+        <div className="hidden sm:flex items-center gap-1.5 min-w-0 max-w-[220px]">
+          {value ? <ModelMeta modelId={value} compact /> : <span className="truncate max-w-[120px]">Default model</span>}
+        </div>
         <ChevronDown size={12} className={`transition-transform ${open ? 'rotate-180' : ''} hidden sm:block`} />
       </button>
       <ModelPickerDropdown open={open} onClose={() => { setOpen(false); setCustom(false); }}>
@@ -403,8 +424,8 @@ function ModelPicker({
                 value === m ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'
               }`}
             >
-              <span className="flex-1 text-left font-mono">{modelDisplayName(m)}</span>
-              {value === m && <Check size={12} className="text-violet-400" />}
+              <ModelMeta modelId={m} />
+              {value === m && <Check size={12} className="text-violet-400 flex-shrink-0" />}
             </button>
           ))}
           {supportsCustomModelInput && (
@@ -2363,7 +2384,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     gatewayAPI.models(provider)
       .then(({ provider: providerName, models, capabilities }) => {
         if (cancelled) return;
-        const normalizedModels = (models || []).map((m) => m.id).filter(Boolean);
+        const normalizedModels = Array.from(new Set((models || []).map((m) => canonicalizePortalModelId(m.id)).filter(Boolean)));
         providerModelsCache.set(providerName, { models: normalizedModels, capabilities });
         setProviderModels((prev) => ({
           ...prev,
@@ -2408,7 +2429,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     gatewayAPI.models('OPENCLAW')
       .then(({ provider: providerName, models, capabilities }) => {
         if (cancelled) return;
-        const normalizedModels = (models || []).map((m) => m.id).filter(Boolean);
+        const normalizedModels = Array.from(new Set((models || []).map((m) => canonicalizePortalModelId(m.id)).filter(Boolean)));
         providerModelsCache.set(providerName, { models: normalizedModels, capabilities });
         setProviderModels((prev) => ({ ...prev, [providerName]: normalizedModels }));
         setCompactionAvailableModels(normalizedModels.length ? normalizedModels : OPENCLAW_MODEL_FALLBACK);

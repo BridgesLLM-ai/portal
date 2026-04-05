@@ -24,6 +24,13 @@ import {
   sanitizeAssistantContent,
   sanitizeAssistantChunk,
 } from '../../utils/chatStream';
+import {
+  canonicalizePortalModelId,
+  getModelDisplayName,
+  getModelIdBadge,
+  getModelProviderLabel,
+  getModelRuntimeLabel,
+} from '../../utils/modelId';
 
 import type { ToolCall, ChatMessage, StreamingPhase } from '../../contexts/ChatStateProvider';
 
@@ -435,10 +442,24 @@ function AttachmentChip({ attachment, onRemove }: { attachment: PendingAttachmen
 /* ═══ Model options ═══ */
 
 function modelDisplayName(modelId: string): string {
-  const parts = String(modelId || '').split('/');
-  if (parts.length >= 3) return parts.slice(1).join('/');
-  if (parts.length === 2) return parts[1];
-  return modelId || 'Default model';
+  return getModelDisplayName(modelId, 'Default model');
+}
+
+function ModelMeta({ modelId, compact = false }: { modelId: string; compact?: boolean }) {
+  const provider = getModelProviderLabel(modelId);
+  const runtime = getModelRuntimeLabel(modelId);
+  const canonicalId = getModelIdBadge(modelId);
+
+  return (
+    <div className="min-w-0 flex-1">
+      <div className="flex items-center gap-1.5 min-w-0">
+        <span className={`${compact ? 'text-[11px]' : 'text-xs'} font-medium text-left truncate`}>{modelDisplayName(modelId)}</span>
+        {!compact && provider ? <span className="px-1.5 py-0.5 rounded-full bg-sky-500/10 text-sky-300 text-[9px] uppercase tracking-wide">{provider}</span> : null}
+        {!compact && runtime ? <span className="px-1.5 py-0.5 rounded-full bg-violet-500/10 text-violet-300 text-[9px] uppercase tracking-wide">{runtime}</span> : null}
+      </div>
+      {!compact && canonicalId ? <div className="mt-0.5 text-[10px] text-slate-500 font-mono truncate">{canonicalId}</div> : null}
+    </div>
+  );
 }
 
 function ModelPickerDropdown({ open, onClose, children }: { open: boolean; onClose: () => void; children: React.ReactNode }) {
@@ -502,7 +523,9 @@ function ProjectModelPicker({ value, onChange, models }: { value: string; onChan
     <div ref={ref} className="relative">
       <button onClick={() => setOpen(!open)} className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.10] border border-white/[0.08] text-[11px] text-slate-400 hover:text-slate-200 transition-colors" title={value || 'Default model'}>
         <Code2 size={13} className="sm:hidden flex-shrink-0" />
-        <span className="hidden sm:inline truncate max-w-[140px]">{value ? modelDisplayName(value) : 'Default model'}</span>
+        <div className="hidden sm:flex items-center gap-1.5 min-w-0 max-w-[220px]">
+          {value ? <ModelMeta modelId={value} compact /> : <span className="truncate max-w-[140px]">Default model</span>}
+        </div>
         <ChevronDown size={12} className={`transition-transform ${open ? 'rotate-180' : ''} hidden sm:block`} />
       </button>
       <ModelPickerDropdown open={open} onClose={() => { setOpen(false); setCustom(false); }}>
@@ -513,8 +536,8 @@ function ProjectModelPicker({ value, onChange, models }: { value: string; onChan
           </button>
           {models.map((m) => (
             <button key={m} onClick={() => { onChange(m); setCustom(false); setOpen(false); }} className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs transition-colors ${value === m ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'}`}>
-              <span className="flex-1 text-left font-mono">{modelDisplayName(m)}</span>
-              {value === m && <Check size={12} className="text-violet-400" />}
+              <ModelMeta modelId={m} />
+              {value === m && <Check size={12} className="text-violet-400 flex-shrink-0" />}
             </button>
           ))}
           <div className="border-t border-white/[0.06] mt-1 pt-1">
@@ -543,7 +566,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const [sessionKey, setSessionKey] = useState<string | null>(null);
   const [agentId, setAgentId] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<string>(() =>
-    localStorage.getItem(`agent-model-${projectName}`) || ''
+    canonicalizePortalModelId(localStorage.getItem(`agent-model-${projectName}`) || '')
   );
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [sessionReady, setSessionReady] = useState(false);
@@ -594,13 +617,13 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
   // Persist model selection
   useEffect(() => {
-    localStorage.setItem(`agent-model-${projectName}`, selectedModel);
+    localStorage.setItem(`agent-model-${projectName}`, canonicalizePortalModelId(selectedModel));
   }, [selectedModel, projectName]);
 
   const loadAvailableModels = useCallback(async () => {
     const data = await gatewayAPI.models();
     const models = Array.isArray(data?.models)
-      ? data.models.map((m: any) => String(m?.id || '').trim()).filter(Boolean)
+      ? Array.from(new Set(data.models.map((m: any) => canonicalizePortalModelId(String(m?.id || '').trim())).filter(Boolean)))
       : [];
     setAvailableModels(models);
     // If no model selected or selected model isn't available, pick the first one
@@ -742,6 +765,30 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     if (cid) {
       setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: '' } : m));
     }
+  }, []);
+
+  const finalizeStreamingAssistant = useCallback(() => {
+    const cid = streamingAssistantIdRef.current;
+    const finalContent = assembledRef.current.substring(lastSegmentStartRef.current) || assembledRef.current || '';
+    if (cid && finalContent) {
+      setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: finalContent } : m));
+    }
+    setStatusText(null);
+    setStreamingPhase('idle');
+    setActiveToolName(null);
+    setIsRunning(false);
+    if (compactionPhaseRef.current === 'compacting') {
+      compactionPhaseRef.current = 'idle';
+      setCompactionPhase('idle');
+      if (compactionTimerRef.current) {
+        clearTimeout(compactionTimerRef.current);
+        compactionTimerRef.current = null;
+      }
+    }
+    isStreamActiveRef.current = false;
+    resumeSeededContentRef.current = false;
+    suppressLiveBubbleContentRef.current = false;
+    streamingAssistantIdRef.current = null;
   }, []);
 
   const syncStreamState = useCallback(async (
@@ -1083,10 +1130,17 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setConnectionNotice(null);
         break;
       case 'stream_ended':
+        setIsRunning(false);
+        setStreamingPhase('idle');
+        setStatusText(null);
+        setActiveToolName(null);
+        clearWatchdog();
+        finalizeStreamingAssistant();
+        break;
       case 'keepalive':
         break;
     }
-  }, [clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent]);
+  }, [clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent, finalizeStreamingAssistant]);
 
   const handleWsEventRef = useRef(handleWsEvent);
   useEffect(() => { handleWsEventRef.current = handleWsEvent; }, [handleWsEvent]);
@@ -1109,7 +1163,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         const { sessionKey: sk, agentId: aid, model: m } = data;
         setSessionKey(sk);
         setAgentId(aid);
-        if (m) setSelectedModel(m);
+        if (m) setSelectedModel(canonicalizePortalModelId(m));
 
         const manager = createLocalWsManager(getWsUrl());
         wsRef.current = manager;
@@ -1382,11 +1436,12 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
   // ── Model change ──
   const handleModelChange = useCallback(async (newModel: string) => {
-    setSelectedModel(newModel);
+    const normalizedModel = canonicalizePortalModelId(newModel);
+    setSelectedModel(normalizedModel);
     // Patch the session model
     if (sessionKeyRef.current) {
       try {
-        await client.post(`/projects/${projectName}/assistant/ensure-session`, { model: newModel });
+        await client.post(`/projects/${projectName}/assistant/ensure-session`, { model: normalizedModel });
       } catch {}
     }
   }, [projectName]);

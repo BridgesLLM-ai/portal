@@ -32,6 +32,7 @@ import { canAccessPortal, canUseInteractivePortal, isElevatedRole, isOwnerRole }
 import { hasGatewayToken, getGatewayToken } from '../utils/gatewayToken';
 import { getOpenClawWsUrl } from '../config/openclaw';
 import { isAllowedWebSocketOrigin } from '../utils/websocketOrigin';
+import { buildOpenClawCliEnv, normalizePortalModelId } from '../utils/openclawCli';
 // @ts-ignore - ws doesn't have type declarations in this project
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server as HttpServer, IncomingMessage } from 'http';
@@ -908,7 +909,7 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
 
     try {
       const { execFileSync } = require('child_process');
-      const output = execFileSync('openclaw', args, { timeout: 10000, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }) as string;
+      const output = execFileSync('openclaw', args, { timeout: 10000, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], env: buildOpenClawCliEnv() }) as string;
       const parsed = JSON.parse(output.trim());
       // --all-agents returns { agents: { id: { sessions: [...] } } } — flatten
       if (parsed.agents && !parsed.sessions) {
@@ -953,7 +954,7 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
     // Get session list
     let sessions: any[] = [];
     try {
-      const sessionsRaw = execSync('openclaw sessions --json 2>/dev/null', { timeout: 10000, encoding: 'utf-8' });
+      const sessionsRaw = execSync('openclaw sessions --json 2>/dev/null', { timeout: 10000, encoding: 'utf-8', env: buildOpenClawCliEnv() });
       const parsed = JSON.parse(sessionsRaw.trim());
       // Handle both { sessions: [...] } and { agents: { id: { sessions: [...] } } } formats
       if (parsed.sessions && Array.isArray(parsed.sessions)) {
@@ -972,7 +973,7 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
     // Get cron job count
     let cronJobs: any[] = [];
     try {
-      const cronsRaw = execSync('openclaw cron list --json 2>/dev/null', { timeout: 10000, encoding: 'utf-8' });
+      const cronsRaw = execSync('openclaw cron list --json 2>/dev/null', { timeout: 10000, encoding: 'utf-8', env: buildOpenClawCliEnv() });
       const parsed = JSON.parse(cronsRaw.trim());
       cronJobs = parsed.jobs || [];
     } catch {
@@ -2985,7 +2986,7 @@ export default router;
 function normalizeRequestedModel(providerName: AgentProviderName, rawModel: string): string {
   const model = String(rawModel || '').trim();
   if (!model) return '';
-  if (providerName === 'OPENCLAW' || providerName === 'OLLAMA' || providerName === 'GEMINI') return model;
+  if (providerName === 'OPENCLAW' || providerName === 'OLLAMA' || providerName === 'GEMINI') return normalizePortalModelId(model);
 
   const parts = model.split('/').filter(Boolean);
   if (parts.length < 2) return model;

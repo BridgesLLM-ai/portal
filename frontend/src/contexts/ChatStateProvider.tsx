@@ -31,6 +31,7 @@ import {
   type GatewayEvent,
   type GatewayChatMessage,
 } from '../utils/openclawGatewayClient';
+import { canonicalizePortalModelId } from '../utils/modelId';
 
 const DEBUG_CHAT_STATE = import.meta.env.DEV;
 // Feature flag: Use direct gateway connection for OPENCLAW provider
@@ -290,7 +291,9 @@ const CHAT_HISTORY_OMITTED_PLACEHOLDER = '[chat.history omitted: message too lar
 function normalizeProviderModel(provider: string, rawModel: string): string {
   const model = String(rawModel || '').trim();
   if (!model) return '';
-  if (provider === 'OPENCLAW' || provider === 'OLLAMA' || provider === 'GEMINI') return model;
+  if (provider === 'OPENCLAW' || provider === 'OLLAMA' || provider === 'GEMINI') {
+    return canonicalizePortalModelId(model);
+  }
 
   const lower = model.toLowerCase();
   if (provider === 'CLAUDE_CODE' && (lower.startsWith('anthropic/') || lower.startsWith('claude/'))) {
@@ -1500,9 +1503,20 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         resetStreamWatchdog();
         break;
       }
-      case 'stream_ended':
-        // Backend says no active stream — nothing to do
+      case 'stream_ended': {
+        clearStreamWatchdog();
+        if (textThrottleTimerRef.current) {
+          clearTimeout(textThrottleTimerRef.current);
+          textThrottleTimerRef.current = null;
+        }
+        pendingTextUpdateRef.current = null;
+        setStatusText(null);
+        setStreamingPhase('idle');
+        setIsRunning(false);
+        isStreamActiveRef.current = false;
+        streamingAssistantIdRef.current = null;
         break;
+      }
       case 'connected':
       case 'keepalive':
         break;

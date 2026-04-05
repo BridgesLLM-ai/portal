@@ -4,6 +4,7 @@ import path from 'path';
 import { prisma } from '../config/database';
 import { config } from '../config/env';
 import type { AgentProviderName } from './AgentProvider.interface';
+import { buildOpenClawCliEnv, normalizePortalModelId } from '../utils/openclawCli';
 
 export interface ProviderModelDescriptor {
   id: string;
@@ -54,7 +55,7 @@ function safeExecFile(command: string, args: string[]): string | null {
     return execFileSync(command, args, {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
+      env: buildOpenClawCliEnv(),
       timeout: 8000,
       maxBuffer: 1024 * 1024 * 8,
     }).trim();
@@ -68,15 +69,22 @@ function listOpenClawModels(): ProviderModelDescriptor[] {
     const output = execSync('openclaw config get agents.defaults.models 2>/dev/null', {
       timeout: 8000,
       encoding: 'utf-8',
+      env: buildOpenClawCliEnv(),
     });
     const raw: Record<string, { alias?: string }> = JSON.parse(output.trim());
-    return Object.entries(raw).map(([id, cfg]) => ({
-      id,
-      alias: cfg.alias || null,
-      provider: id.split('/')[0] || 'other',
-      displayName: cfg.alias || id.split('/').slice(1).join('/') || id,
-      source: 'dynamic' as const,
-    }));
+    const deduped = new Map<string, ProviderModelDescriptor>();
+    for (const [id, cfg] of Object.entries(raw)) {
+      const normalizedId = normalizePortalModelId(id);
+      if (!normalizedId || deduped.has(normalizedId)) continue;
+      deduped.set(normalizedId, {
+        id: normalizedId,
+        alias: cfg.alias || null,
+        provider: normalizedId.split('/')[0] || 'other',
+        displayName: cfg.alias || normalizedId.split('/').slice(1).join('/') || normalizedId,
+        source: 'dynamic' as const,
+      });
+    }
+    return Array.from(deduped.values());
   } catch {
     return [];
   }

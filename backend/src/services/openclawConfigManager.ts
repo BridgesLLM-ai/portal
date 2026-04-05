@@ -7,6 +7,7 @@ import {
   type NativeCliAuthState,
 } from '../agents/nativeCliAuth';
 import { AI_PROVIDERS } from '../config/aiProviders';
+import { normalizePortalModelId, repairClaudeSubscriptionConfig } from '../utils/openclawCli';
 
 const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(process.env.HOME || '/root', '.openclaw');
 export const CONFIG_PATH = path.join(OPENCLAW_HOME, 'openclaw.json');
@@ -61,6 +62,7 @@ function safeReadJson<T>(targetPath: string, fallback: T): T {
 }
 
 export function readOpenClawConfig(): any {
+  repairClaudeSubscriptionConfig();
   return safeReadJson(CONFIG_PATH, {});
 }
 
@@ -70,7 +72,7 @@ export function readAuthProfiles(): AuthProfilesFile {
 
 export function getDefaultModel(): string | null {
   const config = readOpenClawConfig();
-  return config?.agents?.defaults?.model?.primary || null;
+  return normalizePortalModelId(config?.agents?.defaults?.model?.primary || '') || null;
 }
 
 export function isClaudeCliModelId(model: unknown): model is string {
@@ -97,7 +99,12 @@ export function hasAnthropicClaudeCliReferences(config: any): boolean {
 export function getFallbackModels(): string[] {
   const config = readOpenClawConfig();
   const fallbacks = config?.agents?.defaults?.model?.fallbacks;
-  return Array.isArray(fallbacks) ? fallbacks.filter((item: unknown): item is string => typeof item === 'string') : [];
+  return Array.isArray(fallbacks)
+    ? fallbacks
+      .filter((item: unknown): item is string => typeof item === 'string')
+      .map((model) => normalizePortalModelId(model))
+      .filter(Boolean)
+    : [];
 }
 
 const MODELS_JSON_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'models.json');
@@ -183,12 +190,9 @@ export function getProviderStatuses(): ProviderStatus[] {
     const hasConfigProfile = Boolean(matchingConfigProfileId);
     const hasStoredProfile = Boolean(matchingStoredProfileId);
     const regularProfileConfigured = Boolean(profileId && hasConfigProfile && hasStoredProfile);
-    const anthropicCliConfigured = provider.id === 'anthropic'
-      && (isClaudeCliModelId(defaultModel) || (!regularProfileConfigured && hasAnthropicClaudeCliReferences(config)));
     const currentModel = provider.id === 'anthropic'
-      ? (defaultModel && (defaultModel.startsWith('anthropic/') || isClaudeCliModelId(defaultModel)) ? defaultModel : null)
+      ? (defaultModel && defaultModel.startsWith('anthropic/') ? defaultModel : null)
       : (defaultModel && defaultModel.startsWith(`${provider.id}/`) ? defaultModel : null);
-    const isConfigured = anthropicCliConfigured || regularProfileConfigured;
 
     let status: ProviderStatus['status'] = 'unconfigured';
     let error: string | null = null;
@@ -198,17 +202,7 @@ export function getProviderStatuses(): ProviderStatus[] {
     const nativeProvider = getNativeProviderLinkedToOpenClawProvider(provider.id);
     const nativeAuth = nativeProvider ? getNativeCliAuthStatus(nativeProvider) : null;
 
-    if (anthropicCliConfigured) {
-      status = 'configured';
-      effectiveAuthType = 'cli';
-
-      if (nativeAuth?.status === 'needs_login') {
-        status = 'error';
-        error = nativeAuth.message;
-      } else if (nativeAuth?.status === 'unknown') {
-        warning = nativeAuth.message;
-      }
-    } else if (regularProfileConfigured) {
+    if (regularProfileConfigured) {
       status = 'configured';
       effectiveProfileId = profileId;
       effectiveAuthType = storedProfile?.type || configProfiles[matchingConfigProfileId || '']?.mode || null;
@@ -223,7 +217,7 @@ export function getProviderStatuses(): ProviderStatus[] {
         error = `Provider has recorded ${errorCount} recent error${errorCount === 1 ? '' : 's'}.`;
       }
 
-      if (nativeAuth?.status === 'needs_login') {
+      if (provider.id !== 'anthropic' && nativeAuth?.status === 'needs_login') {
         warning = `${nativeAuth.message} OpenClaw can use this provider, but the portal's native ${nativeProvider} adapter still needs its own server-side auth.`;
       }
     } else if (hasConfigProfile || hasStoredProfile) {

@@ -1,4 +1,4 @@
-import { AlertTriangle, CheckCircle2, ChevronRight, Cpu, Globe, Network, Rocket, Server, Sparkles, Wind, Zap } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronRight, Cpu, ExternalLink, Globe, Network, Rocket, Server, Sparkles, Wind, Zap } from 'lucide-react';
 import type { ProviderUIConfig } from './providerConfig';
 
 export interface ProviderStatus {
@@ -71,7 +71,7 @@ function statusStyles(status: ProviderStatus['status'] | undefined) {
 }
 
 function authLabel(provider: ProviderUIConfig, status?: ProviderStatus | null) {
-  if (status?.authType === 'cli') return 'Claude CLI';
+  if (status?.authType === 'cli') return provider.id === 'anthropic' ? 'Claude CLI OAuth' : 'CLI';
   if (status?.authType === 'oauth') return 'OAuth';
   if (status?.authType === 'token') return provider.id === 'anthropic' ? 'Setup Token' : 'Token';
   if (status?.authType === 'api_key') return provider.id === 'ollama' ? 'Local' : 'API Key';
@@ -126,6 +126,24 @@ export default function ProviderCard({ provider, status, onConfigure, onRemove, 
             {tone.label}
           </span>
         </div>
+
+        {provider.dangerNote ? (
+          <div className="mt-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-[10px] leading-relaxed text-red-200">
+            <div className="font-semibold text-red-100">{provider.dangerNote.title}</div>
+            <div className="mt-0.5">{provider.dangerNote.compactDetail || provider.dangerNote.detail}</div>
+            {provider.dangerNote.link ? (
+              <a
+                href={provider.dangerNote.link.url}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-1 inline-flex items-center gap-1 font-medium text-sky-300 underline decoration-sky-400/40 hover:text-sky-200"
+              >
+                {provider.dangerNote.link.label}
+                <ExternalLink className="h-2.5 w-2.5" />
+              </a>
+            ) : null}
+          </div>
+        ) : null}
 
         {status?.error ? (
           <div className="mt-1.5 text-[10px] text-red-300 truncate">{status.error}</div>
@@ -184,6 +202,24 @@ export default function ProviderCard({ provider, status, onConfigure, onRemove, 
         </span>
       </div>
 
+      {provider.dangerNote ? (
+        <div className="mt-4 rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-100">
+          <div className="font-semibold text-red-50">{provider.dangerNote.title}</div>
+          <div className="mt-1 leading-relaxed text-red-100/90">{provider.dangerNote.detail}</div>
+          {provider.dangerNote.link ? (
+            <a
+              href={provider.dangerNote.link.url}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-2 inline-flex items-center gap-1.5 font-medium text-sky-300 underline decoration-sky-400/40 hover:text-sky-200"
+            >
+              {provider.dangerNote.link.label}
+              <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+          ) : null}
+        </div>
+      ) : null}
+
       <div className="mt-4 grid gap-3 md:grid-cols-2">
         <div className="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2">
           <div className="text-[11px] uppercase tracking-wide text-slate-500">Auth</div>
@@ -195,7 +231,7 @@ export default function ProviderCard({ provider, status, onConfigure, onRemove, 
         </div>
       </div>
 
-      {status?.nativeProvider ? (
+      {status?.nativeProvider && provider.id !== 'anthropic' ? (
         <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>

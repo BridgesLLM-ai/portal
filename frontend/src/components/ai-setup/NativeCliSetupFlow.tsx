@@ -132,7 +132,7 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
             </p>
             <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-sm text-amber-100">
               <strong>Note:</strong> This is separate from OpenClaw auth. The native CLI has its own credential store.
-              {provider === 'claude-code' ? ' After this login finishes, go back to the Claude Subscription card to tell OpenClaw to use the server Claude CLI runtime.' : ''}
+              {provider === 'claude-code' ? ' This login is for the portal\'s native Claude Code features, not the OpenClaw Claude provider setup.' : ''}
             </div>
             <div className="flex justify-end">
               <button
