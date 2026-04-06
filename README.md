@@ -18,9 +18,9 @@
 
 ---
 
-BridgesLLM Portal installs [OpenClaw](https://github.com/openclaw/openclaw) on any VPS and wraps it in a complete browser-based AI workstation — multi-provider agent chat, sandboxed code execution, a shared browser your agent controls while you watch, remote desktop, project management, file manager, email, and more.
+BridgesLLM Portal runs on [OpenClaw](https://github.com/openclaw/openclaw) and turns a supported Ubuntu or Debian VPS into a complete browser-based AI workstation — multi-provider agent chat, sandboxed code execution, a shared browser your agent controls while you watch, remote desktop, project management, file manager, email, and more. If OpenClaw is already installed, the portal installer detects it and uses the existing installation.
 
-**Stop bouncing between tools.** Chat with Claude, Codex, or Gemini. Have your agent browse the web, write code, manage files, send email — all from one tab, on a server you own.
+**Stop bouncing between tools.** Chat with Claude, Codex, Gemini, or local models. Have your agent browse the web, write code, manage files, send email — all from one tab, on a server you own.
 
 **One command. Five minutes.**
 
@@ -42,7 +42,7 @@ Visit [bridgesllm.ai](https://bridgesllm.ai) for live video demos of every featu
 ## 🎯 What You Get
 
 ### Agent Chat
-Talk to Claude, Codex, Gemini, or Ollama through OAuth and API-key provider flows. Switch models mid-conversation. Powered by [OpenClaw](https://github.com/openclaw/openclaw).
+Talk to Claude, Codex, Gemini, or Ollama through the provider path that fits each one — account sign-in where supported, Claude setup-token flow, API keys, or local models. Switch models mid-conversation. Powered by [OpenClaw](https://github.com/openclaw/openclaw).
 
 ### Shared Browser
 Your agent controls a real Chrome browser via CDP — navigating, clicking, filling forms, extracting data — while you watch live on the remote desktop. Ask it to research something, check a page for bugs, or automate a web workflow.
@@ -69,7 +69,7 @@ Schedule recurring AI tasks with cron from the browser. Monitoring, reports, mai
 Browse and install agent skills from [ClawHub](https://clawhub.ai) with one click. Configure MCP tools and extend your agent's capabilities.
 
 ### Setup Wizard
-Everything configured in-browser. Domain, SSL, OAuth providers, users — no CLI expertise needed. One-click OAuth sign-in for Claude, Codex, and Gemini.
+Everything configured in-browser. Domain, SSL, providers, users — no CLI expertise needed. Codex and Gemini support account sign-in, Claude uses the guided setup-token flow, and key-based providers use API keys.
 
 ### Self-Updating Dashboard
 One-click updates from the browser. Admin dashboard with user management, storage monitoring, and session controls.
@@ -149,9 +149,9 @@ flowchart TD
       API --> Mail["Stalwart Mail\nLoopback mail server"]
     end
 
-    Gateway --> Claude["Claude\nOAuth"]
-    Gateway --> Codex["Codex\nOAuth"]
-    Gateway --> Gemini["Gemini\nOAuth"]
+    Gateway --> Claude["Claude\nSetup-token / Extra Usage"]
+    Gateway --> Codex["Codex\nAccount sign-in"]
+    Gateway --> Gemini["Gemini\nAccount sign-in"]
     Gateway --> Ollama["Ollama\nLocal models"]
 ```
 
@@ -160,16 +160,25 @@ flowchart TD
 - **Docker sandboxes** isolate each project's code execution from the host.
 - **Stalwart** provides email on the loopback interface — not exposed as an open relay.
 
-## 💰 Cost Comparison
+## 💰 Cost Model
 
-| Setup | Monthly Cost | Hardware Upfront |
-|-------|-------------|-----------------|
-| **VPS + BridgesLLM Portal** | **$80–140/mo** | **$0** |
-| Mac Mini M4 + API keys | $217–517/mo | $800 |
-| Gaming PC + API keys | $285–635/mo | $1,200 |
-| Cloud IDEs (Codespaces) | $58+/mo | $0 (limited AI) |
+BridgesLLM Portal itself is **free**. Your cost is the combination of:
 
-*Portal is free. VPS is $5–20/mo. AI access costs depend on your provider setup and billing model.*
+- your VPS
+- the provider path you choose
+- your usage pattern
+
+Typical cost components:
+
+| Component | Typical cost model |
+|-----------|--------------------|
+| VPS | Usually ~$20–40/mo for a comfortably sized box |
+| Codex / Gemini | Account or subscription-style sign-in paths are available |
+| Claude | Claude plan **plus Anthropic Extra Usage** for OpenClaw-driven traffic |
+| API-key providers | Usage-based billing |
+| Ollama | Local compute on your own server |
+
+There is no single universal monthly total because provider billing differs by path.
 
 ## 🔧 Tech Stack
 
@@ -186,13 +195,29 @@ flowchart TD
 
 ## 🔄 Updating
 
-From your portal dashboard, click the **Update** button. Or from SSH:
+Best path: click the **Update** button in the portal dashboard. Or from SSH:
 
 ```bash
 curl -fsSL https://bridgesllm.ai/install.sh | sudo bash -s -- --update
 ```
 
-Updates preserve all your data, projects, and configuration.
+The update flow updates the portal and checks installed dependencies, including OpenClaw, so you usually do **not** need to update OpenClaw separately first.
+
+Updates preserve your data, projects, and configuration.
+
+## ❓ Common Questions
+
+### Can I install BridgesLLM Portal on a VPS that already has OpenClaw?
+Yes. The installer detects an existing OpenClaw installation and uses it. If OpenClaw is not already present, the installer installs it for you.
+
+### Do I need API keys for every provider?
+No. Codex and Gemini support account sign-in flows. Claude uses the guided setup-token flow and currently requires Anthropic Extra Usage for OpenClaw-driven requests. Key-based providers still use API keys, and Ollama is local.
+
+### Does my data stay on my VPS?
+Yes. Your portal data, files, projects, and local services stay on your server. If you connect external AI providers, model requests still go to the provider you chose.
+
+### What does the installer set up automatically?
+The installer sets up the portal app, OpenClaw, PostgreSQL, Caddy, and the main system services. The browser setup flow then handles your admin account, provider connection, and domain/SSL steps.
 
 ## 🔒 Security
 
