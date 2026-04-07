@@ -76,6 +76,10 @@ rsync -a \
   --exclude='tmp' \
   --exclude='backend/server.log' \
   --exclude='backend/backend.log' \
+  --exclude='*.bak' \
+  --exclude='*.bak*' \
+  --exclude='*.orig' \
+  --exclude='*.rej' \
   \
   `# Stale frontend build artifacts (assets/ at root = old deploy copies)` \
   --exclude='/assets/assets' \
@@ -159,6 +163,7 @@ while IFS= read -r hit; do
 done < <(find "$TMP_ROOT" -type f \( \
   -name '.env' -o -name '.env.*' -o -name '*id_rsa*' -o -name '*terminal_key*' \
   -o -name '*.pem' -o -name '*.key' -o -name '.openclaw-portal-device.json' \
+  -o -name '*.bak' -o -name '*.bak*' -o -name '*.orig' -o -name '*.rej' \
 \) -not -path '*/.git/*' | sed "s#^$TMP_ROOT/##")
 
 # Scan for hardcoded API keys (actual key values, not env var references)

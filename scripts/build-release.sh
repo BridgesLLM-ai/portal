@@ -40,6 +40,10 @@ tar czf "$OUT_FILE" \
   --exclude='backend/server.log' \
   --exclude='backend/backend.log' \
   --exclude='frontend/frontend.log' \
+  --exclude='*.bak' \
+  --exclude='*.bak*' \
+  --exclude='*.orig' \
+  --exclude='*.rej' \
   --exclude='*.tar.gz' \
   --exclude='*.map' \
   --exclude='.data' \
@@ -69,7 +73,9 @@ tar czf "$OUT_FILE" \
   --exclude='backend/cleanup-job.js' \
   --exclude='backend/tmp-*.js' \
   --exclude='backend/CLEANUP-README.md' \
+  --exclude='backend/src' \
   --exclude='backend/.ssh' \
+  --exclude='frontend/src' \
   --exclude='backup-full.sh' \
   --exclude='projects' \
   --exclude='assets/avatars' \

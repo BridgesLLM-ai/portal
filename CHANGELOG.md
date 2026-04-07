@@ -2,6 +2,20 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.23.8] — 2026-04-07
+
+### Fixed
+- **Project chat survives project renames** — assistant session identity is now stable per project instead of being tied to the mutable project name.
+- **Large text files preview cleanly** — files over 10MB now open in a graceful read-only preview instead of hard failing, while edit limits remain enforced.
+- **Project chat got real session controls** — session controls and slash-command autocomplete are now available directly in project chat.
+- **Tasks tab no longer stampedes the gateway** — task loading was reduced to a single cached gateway fetch with in-flight dedupe and stale fallback behavior.
+
+### Security
+- **Project downloads stop leaking internal agent state** — clean and stripped exports now exclude `.assistant-*`, `.agent-*`, `.marcus-*`, and `.portal-project.json` files.
+
+### Maintenance
+- **Release packaging is tighter** — release and public-export scripts now exclude editor backup files, and release tarballs omit unneeded frontend and backend source trees.
+
 ## [3.23.7] — 2026-04-07
 
 ### Improved

@@ -1128,75 +1128,73 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
   }
 });
 
+const TASKS_ROUTE_CACHE_TTL_MS = 10000;
+let tasksRouteCache: { at: number; payload: any } | null = null;
+let tasksRouteInflight: Promise<any> | null = null;
+
+async function fetchTasksSnapshot() {
+  const result = await gatewayRpcCall('sessions.list', {}, 30000);
+
+  if (!result.ok || !result.data?.sessions) {
+    throw new Error(result.error || 'Gateway unavailable');
+  }
+
+  const sessions = Array.isArray(result.data.sessions) ? result.data.sessions : [];
+  const taskSessions = sessions.filter((s: any) => {
+    const key = s.key || s.sessionKey || '';
+    const kind = String(s.kind || '').toLowerCase();
+    return kind === 'subagent' || kind === 'cron' || key.includes(':subagent:') || key.includes(':cron:');
+  });
+
+  const tasks = taskSessions.map((s: any) => ({
+    id: s.key || s.sessionKey || s.id || 'unknown',
+    name: s.displayName || s.origin?.label || s.key?.split(':').pop() || 'Task',
+    status: s.status === 'done' ? 'done' : s.status === 'error' ? 'failed' : s.endedAt ? 'done' : 'running',
+    model: normalizeGatewayModelId(s.model) || s.modelProvider || 'unknown',
+    kind: String(s.kind || s.key || s.sessionKey || '').includes('cron') ? 'cron' : 'subagent',
+    createdAt: s.startedAt,
+    updatedAt: s.endedAt || s.updatedAt,
+    duration: s.runtimeMs,
+    summary: pickTaskSummaryCandidate(s),
+    prompt: pickTaskPromptCandidate(s),
+    detail: null,
+    parentSession: s.origin?.from || null,
+    error: s.status === 'error' ? summarizeTaskText(s.error || 'Task failed') : null,
+  }));
+
+  tasks.sort((a: any, b: any) => {
+    const aTime = Number(a.updatedAt || a.createdAt || 0);
+    const bTime = Number(b.updatedAt || b.createdAt || 0);
+    return bTime - aTime;
+  });
+
+  return { ok: true, tasks, fetchedAt: new Date().toISOString() };
+}
+
 // GET /api/gateway/tasks — Query OpenClaw gateway for task/subagent state
-router.get('/tasks', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+router.get('/tasks', authenticateToken, requireApproved, async (_req: Request, res: Response) => {
+  const now = Date.now();
+  if (tasksRouteCache && now - tasksRouteCache.at < TASKS_ROUTE_CACHE_TTL_MS) {
+    res.json(tasksRouteCache.payload);
+    return;
+  }
+
   try {
-    const result = await gatewayRpcCall('sessions.list', {});
-    if (!result.ok || !result.data?.sessions) {
-      res.status(502).json({ ok: false, error: result.error || 'Gateway unavailable' });
-      return;
+    if (!tasksRouteInflight) {
+      tasksRouteInflight = fetchTasksSnapshot().finally(() => {
+        tasksRouteInflight = null;
+      });
     }
-
-    const sessions = Array.isArray(result.data.sessions) ? result.data.sessions : [];
-
-    const taskSessions = sessions.filter((s: any) => {
-      const key = s.key || s.sessionKey || '';
-      return key.includes(':subagent:') || key.includes(':cron:');
-    });
-
-    const baseTasks = taskSessions.map((s: any) => ({
-      id: s.key || s.sessionKey || s.id || 'unknown',
-      name: s.displayName || s.origin?.label || s.key?.split(':').pop() || 'Task',
-      status: s.status === 'done' ? 'done' : s.status === 'error' ? 'failed' : s.endedAt ? 'done' : 'running',
-      model: normalizeGatewayModelId(s.model) || s.modelProvider || 'unknown',
-      kind: String(s.key || s.sessionKey || '').includes(':cron:') ? 'cron' : 'subagent',
-      createdAt: s.startedAt,
-      updatedAt: s.endedAt || s.updatedAt,
-      duration: s.runtimeMs,
-      summary: pickTaskSummaryCandidate(s),
-      prompt: pickTaskPromptCandidate(s),
-      detail: null,
-      parentSession: s.origin?.from || null,
-      error: s.status === 'error' ? summarizeTaskText(s.error || 'Task failed') : null,
-      session: s,
-    }));
-
-    const tasks = await Promise.all(baseTasks.map(async (task: any) => {
-      const sessionKey = String(task.id || '').trim();
-      if (!sessionKey) {
-        const { session, ...rest } = task;
-        return rest;
-      }
-
-      try {
-        const history = await gatewayRpcCall('chat.history', { sessionKey, limit: 16 }, 4000);
-        if (history.ok) {
-          const insights = extractTaskHistoryInsights(history.data?.messages || []);
-          const summary = insights.summary || extractTaskHistorySummary(history.data?.messages || []);
-          if (summary) task.summary = summary;
-          if (!task.prompt && insights.prompt) task.prompt = insights.prompt;
-          if (insights.detail && insights.detail !== task.summary) task.detail = insights.detail;
-          if (!task.error && task.status === 'failed' && insights.error) task.error = insights.error;
-        }
-      } catch {
-        // best-effort enrichment only
-      }
-
-      const { session, ...rest } = task;
-      return rest;
-    }));
-
-    tasks.sort((a: any, b: any) => {
-      const aTime = Number(a.updatedAt || a.createdAt || 0);
-      const bTime = Number(b.updatedAt || b.createdAt || 0);
-      return bTime - aTime;
-    });
-
-    res.json({ ok: true, tasks });
+    const payload = await tasksRouteInflight;
+    tasksRouteCache = { at: Date.now(), payload };
+    res.json(payload);
   } catch (err: any) {
     console.error('[gateway] tasks error:', err);
-    const status = err.message?.includes('ECONNREFUSED') ? 502 : 500;
-    res.status(status).json({ ok: false, error: err.message || 'Failed to get tasks' });
+    if (tasksRouteCache) {
+      res.json({ ...tasksRouteCache.payload, stale: true, warning: err.message || 'Tasks temporarily unavailable' });
+      return;
+    }
+    res.json({ ok: false, tasks: [], stale: true, warning: err.message || 'Tasks temporarily unavailable' });
   }
 });
 

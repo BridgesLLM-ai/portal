@@ -78,8 +78,177 @@ const fileUpload = multer({
 
 const PROJECTS_DIR = path.join(process.env.PORTAL_ROOT || '/portal', 'projects');
 const DEPLOY_DIR = process.env.APPS_ROOT || '/var/www/bridgesllm-apps';
+const PROJECT_IDENTITY_FILENAME = '.portal-project.json';
+const PROJECT_EDIT_MAX_BYTES = 10 * 1024 * 1024;
+const PROJECT_RAW_MAX_BYTES = 100 * 1024 * 1024;
 fs.mkdirSync(PROJECTS_DIR, { recursive: true });
 fs.mkdirSync(DEPLOY_DIR, { recursive: true });
+
+type ProjectIdentityMeta = {
+  version: 1;
+  stableSlug: string;
+  createdAt: string;
+};
+
+function normalizeProjectSlug(value: string): string {
+  const normalized = value.toLowerCase().replace(/[^a-z0-9_-]/g, '_').replace(/^_+|_+$/g, '');
+  return normalized || 'project';
+}
+
+function createProjectStableSlug(projectName: string): string {
+  const base = normalizeProjectSlug(projectName).slice(0, 32) || 'project';
+  return `${base}-${nanoid(8).toLowerCase()}`;
+}
+
+function getProjectIdentityPath(projectDir: string) {
+  return path.join(projectDir, PROJECT_IDENTITY_FILENAME);
+}
+
+function readProjectIdentity(projectDir: string): ProjectIdentityMeta | null {
+  try {
+    const identityPath = getProjectIdentityPath(projectDir);
+    if (!fs.existsSync(identityPath)) return null;
+    const parsed = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+    if (!parsed || typeof parsed !== 'object' || typeof parsed.stableSlug !== 'string' || !parsed.stableSlug.trim()) {
+      return null;
+    }
+    return {
+      version: 1,
+      stableSlug: normalizeProjectSlug(parsed.stableSlug).slice(0, 48),
+      createdAt: typeof parsed.createdAt === 'string' && parsed.createdAt ? parsed.createdAt : new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeProjectIdentity(projectDir: string, stableSlug: string): ProjectIdentityMeta {
+  const normalizedStableSlug = normalizeProjectSlug(stableSlug).slice(0, 48) || createProjectStableSlug(path.basename(projectDir));
+  const existing = readProjectIdentity(projectDir);
+  const meta: ProjectIdentityMeta = {
+    version: 1,
+    stableSlug: normalizedStableSlug,
+    createdAt: existing?.createdAt || new Date().toISOString(),
+  };
+  fs.writeFileSync(getProjectIdentityPath(projectDir), JSON.stringify(meta, null, 2), 'utf-8');
+  return meta;
+}
+
+function getProjectAgentId(userId: string, stableSlug: string) {
+  return `portal-${userId.slice(0, 8)}-${stableSlug}`.slice(0, 64);
+}
+
+function getProjectSessionId(userId: string, stableSlug: string) {
+  return `portal-${userId}-${stableSlug}`;
+}
+
+function projectHasLocalAssistantState(projectDir: string): boolean {
+  const markers = [
+    '.agent-session.json',
+    '.assistant-session.json',
+    '.marcus-session.json',
+    '.agent-history.json',
+    '.assistant-history.json',
+    '.marcus-history.json',
+    '.agent-memory.md',
+    '.assistant-memory.md',
+    '.marcus-memory.md',
+  ];
+  return markers.some((marker) => fs.existsSync(path.join(projectDir, marker)));
+}
+
+async function projectHasLegacyAssistantState(userId: string, stableSlug: string): Promise<boolean> {
+  const legacyAgentId = getProjectAgentId(userId, stableSlug);
+  if (knownAgentIds.has(legacyAgentId)) return true;
+  if (fs.existsSync(path.join(OPENCLAW_HOME, 'agents', legacyAgentId))) return true;
+  try {
+    const row = await prisma.projectChatSession.findUnique({ where: { sessionKey: getProjectSessionId(userId, stableSlug) } });
+    return !!row;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureProjectAssistantIdentity(
+  projectDir: string,
+  userId: string,
+  projectName: string,
+  options?: { preferLegacySlug?: boolean }
+): Promise<ProjectIdentityMeta & { legacySlug: string; agentId: string; sessionId: string; sessionKey: string }> {
+  const legacySlug = normalizeProjectSlug(projectName);
+  let meta = readProjectIdentity(projectDir);
+
+  if (!meta) {
+    let stableSlug = '';
+    if ((options?.preferLegacySlug ?? true) && projectHasLocalAssistantState(projectDir) && await projectHasLegacyAssistantState(userId, legacySlug)) {
+      stableSlug = legacySlug;
+    }
+    if (!stableSlug) stableSlug = createProjectStableSlug(projectName);
+    meta = writeProjectIdentity(projectDir, stableSlug);
+  }
+
+  const agentId = getProjectAgentId(userId, meta.stableSlug);
+  const sessionId = getProjectSessionId(userId, meta.stableSlug);
+  return {
+    ...meta,
+    legacySlug,
+    agentId,
+    sessionId,
+    sessionKey: `agent:${agentId}:${sessionId}`,
+  };
+}
+
+async function updateProjectAgentBindIfPresent(userId: string, stableSlug: string, projectDirName: string) {
+  const agentId = getProjectAgentId(userId, stableSlug);
+  const expectedBind = `${PROJECTS_DIR}/${userId}/${projectDirName}:/home/user/project:rw`;
+  const configResult = await gatewayRpcCall('config.get', {});
+  if (!configResult.ok) return;
+
+  const config = configResult.data?.config || configResult.data?.parsed || {};
+  const agents: any[] = config?.agents?.list || [];
+  const index = agents.findIndex((agent: any) => agent?.id === agentId);
+  if (index === -1) return;
+
+  const currentBinds = agents[index]?.sandbox?.docker?.binds;
+  if (Array.isArray(currentBinds) && currentBinds.length === 1 && currentBinds[0] === expectedBind) return;
+
+  const updatedAgent = {
+    ...agents[index],
+    sandbox: {
+      ...agents[index]?.sandbox,
+      docker: {
+        ...agents[index]?.sandbox?.docker,
+        dangerouslyAllowExternalBindSources: true,
+        binds: [expectedBind],
+      },
+    },
+  };
+  const updatedList = [...agents];
+  updatedList[index] = updatedAgent;
+
+  await gatewayRpcCall('config.patch', {
+    raw: JSON.stringify({ agents: { list: updatedList } }),
+    baseHash: configResult.data?.hash || '',
+  }, 15000);
+}
+
+function isTextPreviewableFile(filePath: string): boolean {
+  const normalized = filePath.toLowerCase();
+  const baseName = path.basename(normalized);
+  const ext = path.extname(normalized);
+  const previewableExts = new Set([
+    '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+    '.html', '.htm', '.css', '.scss', '.sass', '.less',
+    '.json', '.jsonl', '.md', '.txt', '.xml', '.svg',
+    '.py', '.sh', '.bash', '.zsh', '.fish', '.yml', '.yaml',
+    '.sql', '.rs', '.go', '.rb', '.php', '.java', '.c', '.cpp', '.h', '.hpp',
+    '.vue', '.svelte', '.toml', '.ini', '.conf', '.cfg', '.log',
+  ]);
+  const previewableNames = new Set(['dockerfile', '.gitignore', '.npmrc', '.gitattributes', '.editorconfig']);
+  if (previewableExts.has(ext)) return true;
+  if (previewableNames.has(baseName) || baseName.startsWith('.env')) return true;
+  return false;
+}
 
 function getUserProjectDir(userId: string) {
   const dir = path.join(PROJECTS_DIR, userId);
@@ -289,6 +458,7 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
     }
 
     fs.mkdirSync(projectDir, { recursive: true });
+    writeProjectIdentity(projectDir, createProjectStableSlug(safeName));
 
     const tmpl = TEMPLATES[template] || TEMPLATES['static-html'];
     for (const [fname, content] of Object.entries(tmpl.files)) {
@@ -335,6 +505,7 @@ router.post('/clone', authenticateToken, async (req: Request, res: Response) => 
     }
 
     execSync(`git clone --depth 1 ${shellEscape(url)} ${shellEscape(projectDir)}`, { timeout: 120000 });
+    writeProjectIdentity(projectDir, createProjectStableSlug(safeName));
 
     res.status(201).json({ name: safeName, clonedFrom: url });
   } catch (error: any) {
@@ -480,7 +651,7 @@ router.get('/:name/raw', browserAuthRedirect, requireApproved, async (req: Reque
     }
 
     const stat = fs.statSync(resolved);
-    if (stat.size > 100 * 1024 * 1024) {
+    if (stat.size > PROJECT_RAW_MAX_BYTES) {
       res.status(413).json({ error: 'File too large (max 100MB)' });
       return;
     }
@@ -506,10 +677,18 @@ router.get('/:name/raw', browserAuthRedirect, requireApproved, async (req: Reque
       '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.otf': 'font/otf',
     };
 
-    const mime = mimeMap[ext] || 'application/octet-stream';
+    const mode = String(req.query.mode || '').toLowerCase();
+    const forceText = mode === 'text';
+    if (forceText && !isTextPreviewableFile(filePath)) {
+      res.status(400).json({ error: 'This file cannot be previewed as text' });
+      return;
+    }
+
+    const mime = forceText ? 'text/plain; charset=utf-8' : (mimeMap[ext] || 'application/octet-stream');
     res.setHeader('Content-Type', mime);
     res.setHeader('Content-Length', stat.size);
     res.setHeader('Cache-Control', 'private, max-age=300');
+    if (forceText) res.setHeader('X-Content-Type-Options', 'nosniff');
 
     const stream = fs.createReadStream(resolved);
     stream.pipe(res);
@@ -537,7 +716,7 @@ router.get('/:name/file', authenticateToken, async (req: Request, res: Response)
     }
 
     const stat = fs.statSync(resolved);
-    if (stat.size > 10 * 1024 * 1024) {
+    if (stat.size > PROJECT_EDIT_MAX_BYTES) {
       res.status(413).json({ error: 'File too large to edit (max 10MB)' });
       return;
     }
@@ -1018,6 +1197,7 @@ router.post('/upload-zip', authenticateToken, zipUpload.single('file'), async (r
     }
 
     fs.mkdirSync(projectDir, { recursive: true });
+    writeProjectIdentity(projectDir, createProjectStableSlug(name));
 
     // Extract ZIP (pure JS — no system unzip dependency)
     await extract(req.file.path, { dir: path.resolve(projectDir) });
@@ -1106,6 +1286,7 @@ router.post('/create-from-upload', authenticateToken, async (req: Request, res: 
     }
 
     fs.mkdirSync(projectDir, { recursive: true });
+    writeProjectIdentity(projectDir, createProjectStableSlug(safeName));
 
     // Extract ZIP (pure JS — no system unzip dependency)
     await extract(fullPath, { dir: path.resolve(projectDir) });
@@ -1327,6 +1508,8 @@ router.patch('/:name/rename', authenticateToken, async (req: Request, res: Respo
     const oldDir = getProjectPath(ownerId, req.params.name);
     if (!fs.existsSync(oldDir)) { res.status(404).json({ error: 'Project not found' }); return; }
 
+    const identity = await ensureProjectAssistantIdentity(oldDir, ownerId, req.params.name);
+
     const newDir = getProjectPath(ownerId, sanitized);
     if (fs.existsSync(newDir)) { res.status(409).json({ error: 'A project with that name already exists' }); return; }
 
@@ -1338,6 +1521,15 @@ router.patch('/:name/rename', authenticateToken, async (req: Request, res: Respo
       await prisma.app.update({ where: { id: app.id }, data: { name: sanitized } });
     }
 
+    await prisma.projectChatSession.updateMany({
+      where: { userId: ownerId, projectId: req.params.name },
+      data: { projectId: sanitized },
+    });
+    await prisma.projectChatMessage.updateMany({
+      where: { userId: ownerId, projectId: req.params.name },
+      data: { projectId: sanitized },
+    });
+
     // Rename deployment dir if it exists
     const oldDeployId = `${ownerId}-${req.params.name}`;
     const newDeployId = `${ownerId}-${sanitized}`;
@@ -1346,6 +1538,8 @@ router.patch('/:name/rename', authenticateToken, async (req: Request, res: Respo
     if (fs.existsSync(oldDeployPath)) {
       fs.renameSync(oldDeployPath, newDeployPath);
     }
+
+    await updateProjectAgentBindIfPresent(ownerId, identity.stableSlug, sanitized);
 
     await prisma.activityLog.create({
       data: {
@@ -2587,7 +2781,9 @@ router.get('/:name/chat/history', authenticateToken, async (req: Request, res: R
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
     const userId = ownerId;
-    const sessionKey = `portal-${userId}-${name}`;
+    const projectDir = getProjectPath(userId, name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const { sessionId: sessionKey } = await ensureProjectAssistantIdentity(projectDir, userId, name);
     
     const messages = await prisma.projectChatMessage.findMany({
       where: { userId, sessionKey },
@@ -2626,7 +2822,9 @@ router.post('/:name/chat/message', authenticateToken, async (req: Request, res: 
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
     const userId = ownerId;
-    const sessionKey = `portal-${userId}-${name}`;
+    const projectDir = getProjectPath(userId, name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const { sessionId: sessionKey } = await ensureProjectAssistantIdentity(projectDir, userId, name);
     const { role, content, messageId } = req.body;
     
     if (!role || !content) {
@@ -2673,7 +2871,9 @@ router.post('/:name/chat/messages', authenticateToken, async (req: Request, res:
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
     const userId = ownerId;
-    const sessionKey = `portal-${userId}-${name}`;
+    const projectDir = getProjectPath(userId, name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const { sessionId: sessionKey } = await ensureProjectAssistantIdentity(projectDir, userId, name);
     const { messages } = req.body;
     
     if (!Array.isArray(messages) || messages.length === 0) {
@@ -2706,7 +2906,9 @@ router.delete('/:name/chat/history', authenticateToken, async (req: Request, res
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
     const userId = ownerId;
-    const sessionKey = `portal-${userId}-${name}`;
+    const projectDir = getProjectPath(userId, name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const { sessionId: sessionKey } = await ensureProjectAssistantIdentity(projectDir, userId, name);
     
     await prisma.projectChatMessage.deleteMany({
       where: { userId, sessionKey },
@@ -2731,10 +2933,9 @@ router.get('/:name/chat/session-status', authenticateToken, async (req: Request,
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
     const userId = ownerId;
-    // FIX BUG-5: Normalize project name for case-insensitive session keys
-    const normalizedName = name.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
-    const sessionId = `portal-${userId}-${normalizedName}`;
-    const projectAgentId = `portal-${userId.slice(0, 8)}-${normalizedName}`.slice(0, 64);
+    const projectDir = getProjectPath(userId, name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const { agentId: projectAgentId, sessionId } = await ensureProjectAssistantIdentity(projectDir, userId, name);
     // Try project-specific agent first, then legacy
     let sessionKey = `agent:${projectAgentId}:${sessionId}`;
     let result = await getSessionInfo(sessionKey);
@@ -2981,6 +3182,7 @@ interface SessionMeta {
   initialized?: boolean;
   model?: string;
   lastActivity?: string;
+  stableSlug?: string;
 }
 
 /**
@@ -2993,11 +3195,10 @@ const knownAgentIds = new Set<string>();
 
 async function ensureProjectAgent(
   userId: string,
-  normalizedName: string,
-  projectDirName: string, // actual directory name on disk (may differ from normalizedName)
+  stableSlug: string,
+  projectDirName: string,
 ): Promise<{ agentId: string; created: boolean }> {
-  // Agent ID format: portal-{userId8}-{normalizedName}, max 64 chars
-  const agentId = `portal-${userId.slice(0, 8)}-${normalizedName}`.slice(0, 64);
+  const agentId = getProjectAgentId(userId, stableSlug);
   
   // Fast path: already known from this process lifetime
   if (knownAgentIds.has(agentId)) {
@@ -3125,13 +3326,13 @@ async function getOrCreateSession(
   projectDir: string,
   userId: string,
   projectName: string,
-  normalizedName: string
-): Promise<{ sessionKey: string; agentId: string; needsInit: boolean }> {
+): Promise<{ sessionKey: string; agentId: string; needsInit: boolean; stableSlug: string; sessionId: string }> {
+  const identity = await ensureProjectAssistantIdentity(projectDir, userId, projectName);
+
   // Phase 2: Get or create a dedicated agent for this project
   const projectDirName = path.basename(projectDir);
-  const { agentId } = await ensureProjectAgent(userId, normalizedName, projectDirName);
-  
-  const sessionId = `portal-${userId}-${normalizedName}`;
+  const { agentId } = await ensureProjectAgent(userId, identity.stableSlug, projectDirName);
+  const sessionId = identity.sessionId;
   const sessionKey = `agent:${agentId}:${sessionId}`;
   
   // Auto-migrate legacy .assistant-* files to .agent-*
@@ -3156,17 +3357,20 @@ async function getOrCreateSession(
   
   const needsInit = !localInitialized || !gatewayHasSession;
   
-  return { sessionKey, agentId, needsInit };
+  return { sessionKey, agentId, needsInit, stableSlug: identity.stableSlug, sessionId };
 }
 
 
-// --- Legacy backward-compat: .assistant-* → .agent-* ---
-// Also auto-migrate .assistant-* files to .agent-* on first access.
+// --- Legacy backward-compat: .assistant-* / .marcus-* → .agent-* ---
+// Auto-migrate known legacy internal files on first access.
 function migrateAssistantFiles(projectDir: string) {
   const migrations = [
     ['.assistant-memory.md', '.agent-memory.md'],
     ['.assistant-session.json', '.agent-session.json'],
     ['.assistant-history.json', '.agent-history.json'],
+    ['.marcus-memory.md', '.agent-memory.md'],
+    ['.marcus-session.json', '.agent-session.json'],
+    ['.marcus-history.json', '.agent-history.json'],
   ];
   for (const [oldName, newName] of migrations) {
     const oldPath = path.join(projectDir, oldName);
@@ -3188,12 +3392,11 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
     const projectDir = getProjectPath(ownerId, name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
 
-    const normalizedName = name.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
     const userId = ownerId;
 
     // Get or create session (reuses existing functions)
-    const { sessionKey, agentId, needsInit } = await getOrCreateSession(
-      projectDir, userId, name, normalizedName
+    const { sessionKey, agentId, needsInit, stableSlug } = await getOrCreateSession(
+      projectDir, userId, name
     );
 
     // Determine default model — use gateway's configured default, never hardcode a provider
@@ -3282,7 +3485,7 @@ Hello! I'm ready to help with this project. What would you like to work on?`;
 
       // Mark session as initialized
       const sessionStatePath = path.join(projectDir, '.agent-session.json');
-      fs.writeFileSync(sessionStatePath, JSON.stringify({ initialized: true, lastActivity: new Date().toISOString() }, null, 2), 'utf-8');
+      fs.writeFileSync(sessionStatePath, JSON.stringify({ initialized: true, lastActivity: new Date().toISOString(), stableSlug }, null, 2), 'utf-8');
     }
 
     res.json({
@@ -3338,11 +3541,10 @@ router.get('/:name/assistant/active-model', authenticateToken, async (req: Reque
   try {
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
-    // FIX BUG-5: Normalize project name for case-insensitive session keys
-    const normalizedName = name.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
     const userId = ownerId;
-    const sessionId = `portal-${userId}-${normalizedName}`;
-    const projectAgentId = `portal-${userId.slice(0, 8)}-${normalizedName}`.slice(0, 64);
+    const projectDir = getProjectPath(userId, name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const { agentId: projectAgentId, sessionId } = await ensureProjectAssistantIdentity(projectDir, userId, name);
     // Try project-specific agent first, then legacy
     let sessionKey = `agent:${projectAgentId}:${sessionId}`;
     let result = await getSessionInfo(sessionKey);
@@ -3413,10 +3615,10 @@ router.post('/:name/assistant/reset', authenticateToken, async (req: Request, re
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
 
     // Delete the gateway session (both project-specific and legacy)
-    const normalizedName = req.params.name.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
     const userId = ownerId;
-    const sessionId = `portal-${userId}-${normalizedName}`;
-    const projectAgentId = `portal-${userId.slice(0, 8)}-${normalizedName}`.slice(0, 64);
+    const identity = await ensureProjectAssistantIdentity(projectDir, userId, req.params.name);
+    const sessionId = identity.sessionId;
+    const projectAgentId = identity.agentId;
     
     // Delete project-specific agent session
     try {
@@ -3439,7 +3641,7 @@ router.post('/:name/assistant/reset', authenticateToken, async (req: Request, re
     
     // Reset session state
     const sessionStatePath = path.join(projectDir, '.agent-session.json');
-    fs.writeFileSync(sessionStatePath, JSON.stringify({ initialized: false }, null, 2), 'utf-8');
+    fs.writeFileSync(sessionStatePath, JSON.stringify({ initialized: false, stableSlug: identity.stableSlug }, null, 2), 'utf-8');
     
     // Clear history file
     const historyPath = path.join(projectDir, '.agent-history.json');
@@ -3488,11 +3690,10 @@ router.get('/:name/assistant/poll', authenticateToken, assistantPollLimiter, asy
     const userId = ownerId;
     const afterLine = parseInt(req.query.after as string) || 0;
     const projectDir = getProjectPath(userId, name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const { agentId: projectAgentId, sessionId } = await ensureProjectAssistantIdentity(projectDir, userId, name);
     
     // Phase 2: Derive agent ID and session key for this project
-    const normalizedName = name.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
-    const projectAgentId = `portal-${userId.slice(0, 8)}-${normalizedName}`.slice(0, 64);
-    const sessionId = `portal-${userId}-${normalizedName}`;
     // Try project-specific agent first, then fall back to generic portal
     const sessionKeyProject = `agent:${projectAgentId}:${sessionId}`;
     const sessionKeyLegacy = `agent:portal:${sessionId}`;
@@ -3699,12 +3900,10 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
 
     const selectedModel = normalizePortalModelId(model || '') || getDefaultModel() || 'openai-codex/gpt-5.4';
-    // FIX BUG-5: Normalize project name for case-insensitive session keys
-    const normalizedName = name.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
     
     // Get or create session (Phase 2: per-project agent isolation)
-    const { sessionKey, agentId, needsInit } = await getOrCreateSession(
-      projectDir, ownerId, name, normalizedName
+    const { sessionKey, agentId, needsInit, stableSlug } = await getOrCreateSession(
+      projectDir, ownerId, name
     );
     
     const gatewayToken = getGatewayToken();
@@ -3854,6 +4053,7 @@ ${message}`;
       initialized: true,
       model: selectedModel,
       lastActivity: new Date().toISOString(),
+      stableSlug,
     };
     fs.writeFileSync(sessionStatePath, JSON.stringify(updatedMeta, null, 2), 'utf-8');
 
@@ -3884,7 +4084,7 @@ router.post('/:name/assistant/read-file', authenticateToken, async (req: Request
     }
 
     const stat = fs.statSync(resolved);
-    if (stat.size > 10 * 1024 * 1024) {
+    if (stat.size > PROJECT_EDIT_MAX_BYTES) {
       res.status(413).json({ error: 'File too large (max 10MB)' });
       return;
     }
@@ -3912,6 +4112,9 @@ router.get('/:name/download', authenticateToken, async (req: Request, res: Respo
     // Files to always exclude
     const alwaysExclude = [
       '.assistant-*',
+      '.agent-*',
+      '.marcus-*',
+      '.portal-project.json',
       '.git/**',
       'node_modules/**',
       '.venv/**',

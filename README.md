@@ -76,6 +76,13 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.23.8 (April 7, 2026)
+- **Project chat survives renames** — per-project assistant and session identity is now stable, so renaming a project no longer strands its AI chat state.
+- **Large files degrade gracefully** — text files over 10MB now open in read-only preview mode instead of failing outright.
+- **Project chat got session controls** — slash-command autocomplete and session controls are now available directly from the project chat UI.
+- **Tasks tab is stabilized** — the Agent Tools Tasks view now uses a single cached gateway fetch instead of hammering the gateway with per-task history lookups.
+- **Project ZIP exports are cleaner** — internal agent-state files are stripped from clean and stripped downloads.
+
 ### v3.23.7 (April 7, 2026)
 - **Project AI chat is far more dependable** — first-open model selection, per-project session routing, history recovery, and rapid project switching all got a real stability pass.
 - **Agent chats recover better** — reloads, reconnects, attachment handoff, active stream recovery, and fallback abort behavior are all more reliable.

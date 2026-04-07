@@ -105,7 +105,7 @@ function activityLabel(action: string) {
 }
 
 // --- Media file type detection ---
-type FileCategory = 'code' | 'image' | 'video' | 'audio' | 'pdf' | 'excel' | 'binary';
+type FileCategory = 'code' | 'image' | 'video' | 'audio' | 'pdf' | 'excel' | 'binary' | 'text';
 
 function getFileCategory(filename: string): FileCategory {
   const ext = filename.split('.').pop()?.toLowerCase() || '';
@@ -122,9 +122,11 @@ function getFileCategory(filename: string): FileCategory {
   return 'code';
 }
 
-function getProjectRawUrl(projectName: string, filePath: string): string {
+function getProjectRawUrl(projectName: string, filePath: string, options?: { mode?: 'text' }): string {
   const apiUrl = import.meta.env.VITE_API_URL || '';
-  return `${apiUrl}/projects/${encodeURIComponent(projectName)}/raw?path=${encodeURIComponent(filePath)}`;
+  const params = new URLSearchParams({ path: filePath });
+  if (options?.mode) params.set('mode', options.mode);
+  return `${apiUrl}/projects/${encodeURIComponent(projectName)}/raw?${params.toString()}`;
 }
 
 // --- Inline Media Viewers for Projects ---
@@ -313,6 +315,45 @@ function ProjectPdfViewer({ src }: { src: string }) {
         <div className="sticky bottom-0 text-center py-2 bg-[#2a2a2a]/90 backdrop-blur-sm text-xs text-slate-500">
           {numPages} page{numPages !== 1 ? 's' : ''}
         </div>
+      )}
+    </div>
+  );
+}
+
+function ProjectTextPreviewViewer({ src, name }: { src: string; name: string }) {
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState(false);
+
+  return (
+    <div className="flex-1 flex flex-col bg-white overflow-hidden">
+      {!loaded && !error && (
+        <div className="flex-1 flex items-center justify-center gap-3 bg-[#0a0e1a] text-slate-400">
+          <Loader2 size={22} className="animate-spin" />
+          <div className="text-sm">
+            <div className="text-slate-200">Loading preview…</div>
+            <div className="text-xs text-slate-500">This file is too large for inline editing, so it is opening read-only.</div>
+          </div>
+        </div>
+      )}
+      {error ? (
+        <div className="flex-1 flex flex-col items-center justify-center gap-3 bg-[#0a0e1a] text-slate-400">
+          <AlertCircle size={24} className="text-red-400" />
+          <div className="text-center">
+            <div className="text-sm text-slate-200">Could not load text preview</div>
+            <div className="text-xs text-slate-500">Try downloading {name} instead.</div>
+          </div>
+          <a href={src} download className="px-4 py-2 rounded-lg bg-emerald-500/20 text-emerald-300 text-sm hover:bg-emerald-500/30 inline-flex items-center gap-2">
+            <Download size={14} /> Download
+          </a>
+        </div>
+      ) : (
+        <iframe
+          title={`${name} preview`}
+          src={src}
+          className={`flex-1 w-full border-0 ${loaded ? 'block' : 'hidden'}`}
+          onLoad={() => setLoaded(true)}
+          onError={() => { setError(true); setLoaded(false); }}
+        />
       )}
     </div>
   );
@@ -614,7 +655,7 @@ export default function AppsPage() {
   const [tree, setTree] = useState<TreeEntry[]>([]);
   const [expandedDirs, setExpandedDirs] = useState<Record<string, TreeEntry[]>>({});
   const [openFile, setOpenFile] = useState<{ path: string; content: string; language: string } | null>(null);
-  const [openMedia, setOpenMedia] = useState<{ path: string; category: FileCategory; url: string } | null>(null);
+  const [openMedia, setOpenMedia] = useState<{ path: string; category: FileCategory; url: string; note?: string } | null>(null);
   const [modified, setModified] = useState(false);
   const [editorContent, setEditorContent] = useState('');
   const [saving, setSaving] = useState(false);
@@ -955,7 +996,22 @@ export default function AppsPage() {
       setOpenFile({ path: filePath, content: data.content, language: data.language });
       setEditorContent(data.content);
       setModified(false);
-    } catch (err) { showErrorToast(err, `Opening file: ${filePath}`); }
+    } catch (err: any) {
+      const tooLarge = err?.response?.status === 413;
+      if (tooLarge) {
+        setOpenFile(null);
+        setOpenMedia({
+          path: filePath,
+          category: 'text',
+          url: getProjectRawUrl(selectedProject, filePath, { mode: 'text' }),
+          note: 'Preview only, this file is larger than the 10MB inline editor limit.',
+        });
+        setModified(false);
+        showToast('Opened in read-only preview mode because the file is larger than 10MB.', 'info');
+        return;
+      }
+      showErrorToast(err, `Opening file: ${filePath}`);
+    }
   };
 
   const saveFile = async () => {
@@ -1159,7 +1215,12 @@ export default function AppsPage() {
     const newName = renameProjectValue.trim();
     if (newName === renamingProject) { setRenamingProject(null); return; }
     try {
+      const wasAgentChatActive = localStorage.getItem(`agent-active-${renamingProject}`) === 'true';
       const result = await projectsAPI.rename(renamingProject, newName);
+      if (wasAgentChatActive) {
+        localStorage.setItem(`agent-active-${result.name}`, 'true');
+        localStorage.removeItem(`agent-active-${renamingProject}`);
+      }
       if (selectedProject === renamingProject) setSelectedProject(result.name);
       await loadProjects();
       showToast(`Renamed to "${result.name}"`);
@@ -2565,9 +2626,11 @@ export default function AppsPage() {
                  openMedia.category === 'audio' ? <Music size={12} className="text-pink-400" /> :
                  openMedia.category === 'pdf' ? <FileText size={12} className="text-red-400" /> :
                  openMedia.category === 'excel' ? <FileText size={12} className="text-emerald-400" /> :
+                 openMedia.category === 'text' ? <FileCode size={12} className="text-cyan-400" /> :
                  <FileQuestion size={12} className="text-slate-400" />}
                 <span className="text-slate-300">{openMedia.path.split('/').pop()}</span>
                 <span className="text-[10px] text-slate-600 bg-white/5 px-1.5 py-0.5 rounded">{openMedia.category}</span>
+                {openMedia.note && <span className="text-[10px] text-amber-300/80 ml-1">{openMedia.note}</span>}
               </div>
               <div className="flex-1 flex overflow-hidden">
                 {openMedia.category === 'image' && <ProjectImageViewer src={openMedia.url} name={openMedia.path.split('/').pop() || ''} />}
@@ -2575,6 +2638,7 @@ export default function AppsPage() {
                 {openMedia.category === 'video' && <ProjectVideoViewer src={openMedia.url} name={openMedia.path.split('/').pop() || ''} />}
                 {openMedia.category === 'pdf' && <ProjectPdfViewer src={openMedia.url} />}
                 {openMedia.category === 'excel' && <ProjectExcelViewer src={openMedia.url} name={openMedia.path.split('/').pop() || ''} />}
+                {openMedia.category === 'text' && <ProjectTextPreviewViewer src={openMedia.url} name={openMedia.path.split('/').pop() || ''} />}
                 {openMedia.category === 'binary' && <ProjectBinaryViewer name={openMedia.path.split('/').pop() || ''} src={openMedia.url} />}
               </div>
             </>

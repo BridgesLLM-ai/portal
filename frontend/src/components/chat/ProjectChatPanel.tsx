@@ -14,6 +14,7 @@ import {
   Clock, Mic, MicOff, XCircle, CheckCircle2, RotateCcw
 } from 'lucide-react';
 import MarkdownRenderer from './MarkdownRenderer';
+import SlashCommandMenu from './SlashCommandMenu';
 import client from '../../api/client';
 import { gatewayAPI } from '../../api/endpoints';
 import { useIsMobile } from '../../hooks/useIsMobile';
@@ -31,6 +32,7 @@ import {
   getModelProviderLabel,
   getModelRuntimeLabel,
 } from '../../utils/modelId';
+import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../utils/slashCommands';
 
 import type { ToolCall, ChatMessage, StreamingPhase } from '../../contexts/ChatStateProvider';
 
@@ -599,6 +601,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   // Input state
   const [input, setInput] = useState('');
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const [showSlashMenu, setShowSlashMenu] = useState(false);
+  const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
+  const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
+  const [showSessionControls, setShowSessionControls] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -1555,19 +1561,171 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   }, [pendingAttachments]);
 
   // ── Form submit ──
-  const handleSubmit = useCallback((e: React.FormEvent) => {
+  const appendSystemMessage = useCallback((content: string) => {
+    setMessages(prev => ([...prev, {
+      id: nextId(),
+      role: 'system',
+      content,
+      createdAt: new Date(),
+    }]));
+  }, []);
+
+  const refreshSlashAutocomplete = useCallback((value: string, caret = value.length) => {
+    const activeText = value.slice(0, caret);
+    const tokenMatch = activeText.match(/(?:^|\s)(\/[^\s]*)$/);
+    if (!tokenMatch) {
+      setShowSlashMenu(false);
+      setSlashCommands([]);
+      setSelectedSlashIndex(0);
+      return;
+    }
+    const matches = matchSlashCommands(tokenMatch[1]);
+    setSlashCommands(matches);
+    setSelectedSlashIndex(0);
+    setShowSlashMenu(matches.length > 0);
+  }, []);
+
+  const insertSlashCommand = useCallback((command: SlashCommand) => {
+    const textarea = inputRef.current;
+    if (!textarea) return;
+    const nextValue = `${command.command}${command.argsHint ? ' ' : ''}`;
+    setInput(nextValue);
+    setShowSlashMenu(false);
+    setSlashCommands([]);
+    setSelectedSlashIndex(0);
+    requestAnimationFrame(() => {
+      textarea.focus();
+      textarea.selectionStart = textarea.selectionEnd = nextValue.length;
+      textarea.style.height = 'auto';
+      textarea.style.height = `${Math.min(textarea.scrollHeight, 140)}px`;
+    });
+  }, []);
+
+  const exportChatMarkdown = useCallback(() => {
+    const lines = messages.map((msg) => {
+      const heading = msg.role === 'user'
+        ? '## User'
+        : msg.role === 'assistant'
+          ? '## Assistant'
+          : msg.role === 'system'
+            ? '## System'
+            : '## Tool';
+      return `${heading}\n\n${msg.content || ''}`;
+    });
+    const blob = new Blob([`# ${projectName} Project Chat\n\n${lines.join('\n\n---\n\n')}\n`], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${projectName}-project-chat.md`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    appendSystemMessage('Exported chat as markdown.');
+  }, [appendSystemMessage, messages, projectName]);
+
+  const showSessionStatus = useCallback(async () => {
+    try {
+      const [statusRes, modelRes] = await Promise.allSettled([
+        client.get(`/projects/${encodeURIComponent(projectName)}/chat/session-status`),
+        client.get(`/projects/${encodeURIComponent(projectName)}/assistant/active-model`),
+      ]);
+      const statusData = statusRes.status === 'fulfilled' ? statusRes.value.data : null;
+      const modelData = modelRes.status === 'fulfilled' ? modelRes.value.data : null;
+      const lines = [
+        `Project: ${projectName}`,
+        `Gateway session: ${statusData?.active ? 'active' : 'inactive'}`,
+        `WebSocket: ${wsConnected ? 'connected' : 'disconnected'}`,
+        `Session key: ${sessionKeyRef.current || 'not ready'}`,
+        `Configured model: ${selectedModel || 'not set'}`,
+        `Active model: ${modelData?.activeModel || statusData?.model || 'unknown'}`,
+      ];
+      if (statusData?.dbStatus) lines.push(`DB status: ${statusData.dbStatus}`);
+      appendSystemMessage(lines.join('\n'));
+    } catch (err: any) {
+      appendSystemMessage(`Failed to load session status: ${err?.response?.data?.error || err?.message || 'Unknown error'}`);
+    }
+  }, [appendSystemMessage, projectName, selectedModel, wsConnected]);
+
+  const maybeExecuteSlashCommand = useCallback(async () => {
+    const parsed = parseSlashCommand(input);
+    if (!parsed) return false;
+
+    const rawArg = parsed.args?.trim() || '';
+    switch (parsed.command.command) {
+      case '/help':
+        appendSystemMessage('Available project chat commands: /new, /stop, /models, /model <id>, /status, /clear, /export, /help');
+        setShowSessionControls(true);
+        return true;
+      case '/new':
+      case '/clear':
+        await clearChat();
+        return true;
+      case '/stop':
+        if (isRunning) {
+          cancelStream();
+          appendSystemMessage('Stopping current response…');
+        } else {
+          appendSystemMessage('No active response to stop.');
+        }
+        return true;
+      case '/models': {
+        const models = availableModels.length > 0 ? availableModels : await loadAvailableModels();
+        const list = models.length > 0 ? models.join('\n') : 'No models available';
+        appendSystemMessage(`Available models:\n${list}`);
+        return true;
+      }
+      case '/model': {
+        if (!rawArg) {
+          appendSystemMessage('Usage: /model <model-id>');
+          return true;
+        }
+        const nextModel = canonicalizePortalModelId(rawArg);
+        try {
+          setSelectedModel(nextModel);
+          modelRef.current = nextModel;
+          localStorage.setItem(`project-chat-model-${projectName}`, nextModel);
+          await client.post(`/projects/${encodeURIComponent(projectName)}/assistant/ensure-session`, { model: nextModel });
+          appendSystemMessage(`Model switched to ${nextModel}`);
+        } catch (err: any) {
+          appendSystemMessage(`Failed to switch model to ${nextModel}: ${err?.response?.data?.error || err?.message || 'Unknown error'}`);
+        }
+        return true;
+      }
+      case '/status':
+        await showSessionStatus();
+        return true;
+      case '/export':
+        exportChatMarkdown();
+        return true;
+      default:
+        return false;
+    }
+  }, [appendSystemMessage, availableModels, cancelStream, clearChat, exportChatMarkdown, input, isRunning, loadAvailableModels, projectName, showSessionStatus]);
+
+  const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim() || isRunning || !sessionReady) return;
     const stillUploading = pendingAttachments.some(a => a.uploadStatus === 'uploading');
     if (stillUploading) return;
+    if (await maybeExecuteSlashCommand()) {
+      setInput('');
+      setShowSlashMenu(false);
+      setSlashCommands([]);
+      setSelectedSlashIndex(0);
+      return;
+    }
     const attachText = buildAttachmentText();
     const fullMessage = attachText + input.trim();
     const sent = sendMessage(fullMessage);
     if (sent) {
       setInput('');
       setPendingAttachments([]);
+      setShowSlashMenu(false);
+      setSlashCommands([]);
+      setSelectedSlashIndex(0);
     }
-  }, [input, isRunning, sessionReady, pendingAttachments, buildAttachmentText, sendMessage]);
+  }, [input, isRunning, sessionReady, pendingAttachments, maybeExecuteSlashCommand, buildAttachmentText, sendMessage]);
 
   // ── Model change ──
   const handleModelChange = useCallback(async (newModel: string) => {
@@ -1645,13 +1803,47 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             {wsConnected ? '●' : '○'}
           </span>
         </div>
-        <div className="flex items-center gap-1 flex-shrink-0">
+        <div className="flex items-center gap-1 flex-shrink-0 relative">
           {/* Model selector */}
           <ProjectModelPicker
             value={selectedModel}
             onChange={handleModelChange}
             models={availableModels}
           />
+          <button
+            onClick={() => setShowSessionControls(v => !v)}
+            className={`p-1 rounded transition-colors ${showSessionControls ? 'bg-cyan-500/15 text-cyan-300' : 'hover:bg-white/5 text-slate-500 hover:text-cyan-300'}`}
+            title="Session Controls"
+          >
+            <Wrench size={12} />
+          </button>
+          {showSessionControls && (
+            <div className="absolute right-0 top-full mt-2 w-72 rounded-xl border border-white/10 bg-[#0B0F22]/98 backdrop-blur-xl shadow-2xl p-3 z-30">
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <div className="text-xs font-medium text-white">Session Controls</div>
+                  <div className="text-[10px] text-slate-500">Control this OpenClaw project agent directly.</div>
+                </div>
+                <button onClick={() => setShowSessionControls(false)} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white">
+                  <X size={12} />
+                </button>
+              </div>
+              <div className="space-y-1.5 text-[11px] text-slate-300 mb-3">
+                <div><span className="text-slate-500">Session:</span> <span className="text-slate-200 break-all">{sessionKey || 'starting…'}</span></div>
+                <div><span className="text-slate-500">Model:</span> <span className="text-slate-200">{selectedModel || 'not set'}</span></div>
+                <div><span className="text-slate-500">Connection:</span> <span className={wsConnected ? 'text-emerald-300' : 'text-amber-300'}>{wsConnected ? 'connected' : 'disconnected'}</span></div>
+              </div>
+              <div className="grid grid-cols-2 gap-2 mb-3">
+                <button onClick={() => { void showSessionStatus(); setShowSessionControls(false); }} className="px-2 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-slate-200">Status</button>
+                <button onClick={() => { exportChatMarkdown(); setShowSessionControls(false); }} className="px-2 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-slate-200">Export</button>
+                <button onClick={() => { if (isRunning) cancelStream(); setShowSessionControls(false); }} className="px-2 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-slate-200 disabled:opacity-50" disabled={!isRunning}>Stop</button>
+                <button onClick={() => { void clearChat(); setShowSessionControls(false); }} className="px-2 py-2 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-xs text-amber-200">New Session</button>
+              </div>
+              <div className="rounded-lg border border-white/6 bg-black/20 px-2 py-2 text-[10px] text-slate-400 leading-relaxed">
+                Slash commands: <span className="text-slate-200">/new</span>, <span className="text-slate-200">/stop</span>, <span className="text-slate-200">/status</span>, <span className="text-slate-200">/models</span>, <span className="text-slate-200">/model &lt;id&gt;</span>, <span className="text-slate-200">/clear</span>, <span className="text-slate-200">/export</span>
+              </div>
+            </div>
+          )}
           {/* Clear chat */}
           {messages.length > 0 && (
             <button onClick={clearChat} className="p-1 rounded hover:bg-white/5 text-slate-600 hover:text-amber-400 transition-colors" title="Clear chat">
@@ -1968,30 +2160,64 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             />
 
             {/* Text input */}
-            <textarea
-              ref={inputRef}
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  handleSubmit(e as any);
-                }
-              }}
-              placeholder={isRunning ? 'Agent is responding…' : `Message Agent…`}
-              disabled={isRunning || !sessionReady}
-              className={`flex-1 resize-none rounded-xl px-3 py-2 text-[11px] placeholder-slate-600 focus:outline-none transition-all min-h-[36px] max-h-[120px] overflow-y-auto ${
-                isRunning
-                  ? 'bg-amber-500/[0.04] border border-amber-500/15 text-slate-500 cursor-not-allowed'
-                  : 'bg-white/[0.06] border border-white/[0.08] text-white focus:ring-1 focus:ring-emerald-500/30'
-              }`}
-              rows={1}
-              onInput={e => {
-                const t = e.currentTarget;
-                t.style.height = 'auto';
-                t.style.height = `${Math.min(t.scrollHeight, 120)}px`;
-              }}
-            />
+            <div className="relative flex-1">
+              <textarea
+                ref={inputRef}
+                value={input}
+                onChange={e => {
+                  setInput(e.target.value);
+                  refreshSlashAutocomplete(e.target.value, e.target.selectionStart ?? e.target.value.length);
+                }}
+                onKeyDown={e => {
+                  if (showSlashMenu && slashCommands.length > 0) {
+                    if (e.key === 'ArrowDown') {
+                      e.preventDefault();
+                      setSelectedSlashIndex(prev => (prev + 1) % slashCommands.length);
+                      return;
+                    }
+                    if (e.key === 'ArrowUp') {
+                      e.preventDefault();
+                      setSelectedSlashIndex(prev => (prev - 1 + slashCommands.length) % slashCommands.length);
+                      return;
+                    }
+                    if (e.key === 'Tab' || e.key === 'Enter') {
+                      e.preventDefault();
+                      insertSlashCommand(slashCommands[selectedSlashIndex] || slashCommands[0]);
+                      return;
+                    }
+                    if (e.key === 'Escape') {
+                      e.preventDefault();
+                      setShowSlashMenu(false);
+                      return;
+                    }
+                  }
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    void handleSubmit(e as any);
+                  }
+                }}
+                placeholder={isRunning ? 'Agent is responding…' : `Message Agent…`}
+                disabled={isRunning || !sessionReady}
+                className={`w-full resize-none rounded-xl px-3 py-2 text-[11px] placeholder-slate-600 focus:outline-none transition-all min-h-[36px] max-h-[120px] overflow-y-auto ${
+                  isRunning
+                    ? 'bg-amber-500/[0.04] border border-amber-500/15 text-slate-500 cursor-not-allowed'
+                    : 'bg-white/[0.06] border border-white/[0.08] text-white focus:ring-1 focus:ring-emerald-500/30'
+                }`}
+                rows={1}
+                onInput={e => {
+                  const t = e.currentTarget;
+                  t.style.height = 'auto';
+                  t.style.height = `${Math.min(t.scrollHeight, 120)}px`;
+                }}
+              />
+              {showSlashMenu && slashCommands.length > 0 && !isRunning && (
+                <SlashCommandMenu
+                  commands={slashCommands}
+                  selectedIndex={selectedSlashIndex}
+                  onSelect={insertSlashCommand}
+                />
+              )}
+            </div>
 
             {/* Mic button */}
             {speechSupported && (
