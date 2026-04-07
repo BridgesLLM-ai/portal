@@ -39,7 +39,8 @@ export interface UseExecApprovalsReturn {
   isConnected: boolean;
 }
 
-export function useExecApprovals(): UseExecApprovalsReturn {
+export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprovalsReturn {
+  const enabled = options?.enabled !== false;
   const [pendingApproval, setPendingApproval] = useState<ExecApprovalRequest | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -160,12 +161,26 @@ export function useExecApprovals(): UseExecApprovalsReturn {
     };
   }, []);
 
-  // Connect on mount
+  // Connect only when enabled. Agent Chats can defer this fallback SSE until the
+  // critical initial history load is finished, so approval listening does not steal
+  // startup bandwidth from the transcript itself.
   useEffect(() => {
+    if (!enabled) {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+      setIsConnected(false);
+      return;
+    }
+
     connect();
 
     return () => {
-      // Cleanup on unmount
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -176,7 +191,7 @@ export function useExecApprovals(): UseExecApprovalsReturn {
       }
       setIsConnected(false);
     };
-  }, [connect]);
+  }, [connect, enabled]);
 
   // Auto-dismiss expired approvals
   useEffect(() => {

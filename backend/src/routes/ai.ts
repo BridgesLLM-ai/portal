@@ -9,6 +9,29 @@ const router = Router();
 const UPLOAD_DIR = '/portal/files';
 const PROJECTS_DIR = path.join(process.env.PORTAL_ROOT || '/portal', 'projects');
 
+function resolvePathWithinBase(baseDir: string, ...parts: string[]): string | null {
+  const base = path.resolve(baseDir);
+  const candidate = path.resolve(base, ...parts.filter((part): part is string => typeof part === 'string' && part.length > 0));
+  if (candidate === base || candidate.startsWith(base + path.sep)) {
+    return candidate;
+  }
+  return null;
+}
+
+function resolveAiTargetPath(userId: string, filePath?: string, projectName?: string): string | null {
+  if (!filePath || typeof filePath !== 'string') return null;
+
+  if (projectName && typeof projectName === 'string' && projectName.trim()) {
+    const userProjectsBase = path.join(PROJECTS_DIR, userId);
+    const projectDir = resolvePathWithinBase(userProjectsBase, projectName.trim());
+    if (!projectDir) return null;
+    return resolvePathWithinBase(projectDir, filePath);
+  }
+
+  const userUploadBase = path.join(UPLOAD_DIR, userId);
+  return resolvePathWithinBase(userUploadBase, filePath);
+}
+
 // Test Ollama availability
 const testOllama = async (): Promise<boolean> => {
   try {
@@ -28,15 +51,14 @@ router.post('/analyze', authenticateToken, async (req: Request, res: Response) =
     const { filePath, projectName, prompt = 'Analyze this code and provide suggestions for improvement.' } = req.body;
     
     let content = '';
-    let resolvedPath = '';
+    const resolvedPath = resolveAiTargetPath(req.user!.userId, filePath, projectName);
 
-    if (projectName && filePath) {
-      resolvedPath = path.join(PROJECTS_DIR, req.user!.userId, projectName, filePath);
-    } else if (filePath) {
-      resolvedPath = path.join(UPLOAD_DIR, req.user!.userId, filePath);
+    if (!resolvedPath) {
+      res.status(403).json({ error: 'Invalid file path' });
+      return;
     }
 
-    if (!resolvedPath || !fs.existsSync(resolvedPath)) {
+    if (!fs.existsSync(resolvedPath)) {
       res.status(404).json({ error: 'File not found' });
       return;
     }
@@ -135,14 +157,13 @@ router.get('/file-content', authenticateToken, async (req: Request, res: Respons
     const filePath = req.query.path as string;
     const projectName = req.query.project as string;
 
-    let resolved = '';
-    if (projectName && filePath) {
-      resolved = path.join(PROJECTS_DIR, req.user!.userId, projectName, filePath);
-    } else if (filePath) {
-      resolved = path.join(UPLOAD_DIR, req.user!.userId, filePath);
+    const resolved = resolveAiTargetPath(req.user!.userId, filePath, projectName);
+    if (!resolved) {
+      res.status(403).json({ error: 'Invalid file path' });
+      return;
     }
 
-    if (!resolved || !fs.existsSync(resolved)) {
+    if (!fs.existsSync(resolved)) {
       res.status(404).json({ error: 'File not found' });
       return;
     }

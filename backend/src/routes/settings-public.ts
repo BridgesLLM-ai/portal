@@ -2,6 +2,11 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { prisma } from '../config/database';
 import { APPEARANCE_DEFAULTS, REMOTE_DESKTOP_DEFAULTS } from '../config/settings.schema';
 
+function normalizeBoolean(value?: string | null): boolean {
+  const raw = String(value || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
 function normalizeAllowedPathPrefixes(value?: string | null): string {
   const raw = (value || REMOTE_DESKTOP_DEFAULTS.allowedPathPrefixes).trim();
   const prefixes = raw
@@ -86,6 +91,7 @@ router.get('/public', async (_req: Request, res: Response, next: NextFunction) =
       remoteDesktopAllowedPathPrefixes: normalizeAllowedPathPrefixes(map['remoteDesktop.allowedPathPrefixes']),
       defaultOpenClawAgentId: map['agent.defaultOpenClawAgentId'] || 'main',
       visibleBrowserOpenClawAgentId: map['agent.visibleBrowserOpenClawAgentId'] || '',
+      useDirectGateway: normalizeBoolean(process.env.USE_DIRECT_GATEWAY || process.env.VITE_USE_DIRECT_GATEWAY),
     });
   } catch (error) {
     next(error);

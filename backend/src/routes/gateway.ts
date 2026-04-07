@@ -423,6 +423,88 @@ function summarizeSessionLabel(params: { sessionKey: string; sessionId: string; 
   };
 }
 
+function summarizeTaskText(raw: unknown, max = 220): string | null {
+  const text = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : '';
+  if (!text) return null;
+  return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
+}
+
+function pickTaskSummaryCandidate(session: any): string | null {
+  return summarizeTaskText(
+    session?.preview
+      ?? session?.lastMessagePreview
+      ?? session?.summary
+      ?? session?.origin?.preview
+      ?? session?.origin?.summary,
+  );
+}
+
+function pickTaskPromptCandidate(session: any): string | null {
+  return summarizeTaskText(
+    session?.origin?.task
+      ?? session?.origin?.message
+      ?? session?.origin?.label
+      ?? session?.displayName
+      ?? session?.summary,
+    240,
+  );
+}
+
+function extractTaskHistorySummary(messages: any[]): string | null {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (!msg || msg.role === 'user') continue;
+    const text = summarizeTaskText(extractText(msg.content));
+    if (text) return text;
+  }
+  return null;
+}
+
+function extractTaskHistoryInsights(messages: any[]): { prompt: string | null; summary: string | null; detail: string | null; error: string | null } {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return { prompt: null, summary: null, detail: null, error: null };
+  }
+
+  let prompt: string | null = null;
+  let latestAssistant: string | null = null;
+  let latestNonUser: string | null = null;
+  let error: string | null = null;
+
+  for (const msg of messages) {
+    if (!msg) continue;
+    const text = extractText(msg.content);
+    const summaryText = summarizeTaskText(text, 260);
+    const detailText = summarizeTaskText(text, 900);
+    if (!summaryText && !detailText) continue;
+
+    const role = typeof msg.role === 'string' ? msg.role : '';
+    if (!prompt && role === 'user' && summaryText) {
+      prompt = summaryText;
+      continue;
+    }
+
+    if (role === 'assistant' && summaryText) {
+      latestAssistant = summaryText;
+    }
+
+    if (role !== 'user' && detailText) {
+      latestNonUser = detailText;
+    }
+
+    if (!error && /\b(error|failed|exception)\b/i.test(detailText || '')) {
+      error = summarizeTaskText(detailText, 320);
+    }
+  }
+
+  return {
+    prompt,
+    summary: latestAssistant ?? latestNonUser,
+    detail: latestNonUser,
+    error,
+  };
+}
+
 function readLastJsonlLines(filePath: string, maxLines: number): { lines: string[]; hitStart: boolean } {
   if (!existsSync(filePath) || maxLines <= 0) return { lines: [], hitStart: true };
 
@@ -546,6 +628,21 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
         if (entry.type !== 'message' || !entry.message) return null;
         const role = entry.message.role;
         const content = entry.message.content;
+        const executedModel = normalizeGatewayModelId(
+          entry.message.model
+          ?? entry.message.modelId
+          ?? entry.message.model_id
+          ?? entry.message.actualModel
+          ?? entry.message.executedModel
+          ?? entry.message.metadata?.model
+          ?? entry.message.providerResponse?.model
+          ?? entry.model
+          ?? entry.modelId
+          ?? entry.actualModel
+          ?? entry.executedModel
+          ?? entry.metadata?.model
+          ?? entry.providerResponse?.model,
+        );
 
         if (role === 'user') {
           const text = extractText(content);
@@ -595,6 +692,7 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
               id: entry.id,
               role: 'assistant',
               content: text,
+              model: executedModel,
               toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
               // Include segments for frontend to reconstruct graduated timeline
               segments: hasToolCalls && segments.length > 0 ? segments : undefined,
@@ -603,7 +701,7 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
           }
 
           const text = extractText(content);
-          return text ? { id: entry.id, role: 'assistant', content: text, timestamp: entry.timestamp } : null;
+          return text ? { id: entry.id, role: 'assistant', content: text, model: executedModel, timestamp: entry.timestamp } : null;
         }
 
         if (role === 'toolResult') {
@@ -1046,18 +1144,53 @@ router.get('/tasks', authenticateToken, requireApproved, async (req: Request, re
       return key.includes(':subagent:') || key.includes(':cron:');
     });
 
-    const tasks = taskSessions.map((s: any) => ({
+    const baseTasks = taskSessions.map((s: any) => ({
       id: s.key || s.sessionKey || s.id || 'unknown',
       name: s.displayName || s.origin?.label || s.key?.split(':').pop() || 'Task',
       status: s.status === 'done' ? 'done' : s.status === 'error' ? 'failed' : s.endedAt ? 'done' : 'running',
       model: normalizeGatewayModelId(s.model) || s.modelProvider || 'unknown',
+      kind: String(s.key || s.sessionKey || '').includes(':cron:') ? 'cron' : 'subagent',
       createdAt: s.startedAt,
       updatedAt: s.endedAt || s.updatedAt,
       duration: s.runtimeMs,
-      summary: s.origin?.label || s.displayName || null,
+      summary: pickTaskSummaryCandidate(s),
+      prompt: pickTaskPromptCandidate(s),
+      detail: null,
       parentSession: s.origin?.from || null,
-      error: s.status === 'error' ? (s.error || 'Task failed') : null,
+      error: s.status === 'error' ? summarizeTaskText(s.error || 'Task failed') : null,
+      session: s,
     }));
+
+    const tasks = await Promise.all(baseTasks.map(async (task: any) => {
+      const sessionKey = String(task.id || '').trim();
+      if (!sessionKey) {
+        const { session, ...rest } = task;
+        return rest;
+      }
+
+      try {
+        const history = await gatewayRpcCall('chat.history', { sessionKey, limit: 16 }, 4000);
+        if (history.ok) {
+          const insights = extractTaskHistoryInsights(history.data?.messages || []);
+          const summary = insights.summary || extractTaskHistorySummary(history.data?.messages || []);
+          if (summary) task.summary = summary;
+          if (!task.prompt && insights.prompt) task.prompt = insights.prompt;
+          if (insights.detail && insights.detail !== task.summary) task.detail = insights.detail;
+          if (!task.error && task.status === 'failed' && insights.error) task.error = insights.error;
+        }
+      } catch {
+        // best-effort enrichment only
+      }
+
+      const { session, ...rest } = task;
+      return rest;
+    }));
+
+    tasks.sort((a: any, b: any) => {
+      const aTime = Number(a.updatedAt || a.createdAt || 0);
+      const bTime = Number(b.updatedAt || b.createdAt || 0);
+      return bTime - aTime;
+    });
 
     res.json({ ok: true, tasks });
   } catch (err: any) {
@@ -1554,7 +1687,26 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
       const idx = messages.findIndex((m: any) => m.id === afterId);
       if (idx >= 0) messages = messages.slice(idx + 1);
     }
-    res.json({ messages, sessionId });
+
+    const activeStream = providerName === 'OPENCLAW'
+      ? (() => {
+          const info = streamEventBus.getStreamStatus(sessionKey);
+          if (!info) return { active: false };
+          return {
+            active: true,
+            phase: info.phase,
+            toolName: info.toolName || null,
+            statusText: info.statusText || null,
+            provenance: info.provenance || null,
+            model: info.model || null,
+            compactionPhase: info.compactionPhase || 'idle',
+            content: info.latestText || streamEventBus.getLatestText(sessionKey) || '',
+            runId: info.runId || null,
+          };
+        })()
+      : null;
+
+    res.json({ messages, sessionId, activeStream });
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 500;
     res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to get history', detail: err.message });
@@ -1624,6 +1776,10 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     assertGatewaySessionAccess(sessionId, req.user!, { providerName: provider.providerName });
 
     if (requestedModel && provider.providerName === 'OPENCLAW') {
+      if (!String(requestedModel).includes('/')) {
+        res.status(400).json({ error: 'model must include provider prefix' });
+        return;
+      }
       try {
         await patchSessionModel(sessionId, requestedModel);
       } catch (err: any) {
@@ -1669,44 +1825,194 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         res.write(data);
         if (typeof (res as any).flush === 'function') (res as any).flush();
       };
-      sseWrite(`data: ${JSON.stringify({ type: 'session', sessionId, provenance })}\n\n`);
+      sseWrite(`data: ${JSON.stringify({ type: 'session', sessionId, provenance, model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || null })}\n\n`);
 
       let sseAlive = true;
-      const keepaliveTimer = setInterval(() => { if (sseAlive) try { sseWrite(': keepalive\n\n'); } catch { sseAlive = false; } }, 15000);
-      req.on('close', () => { sseAlive = false; clearInterval(keepaliveTimer); });
-
+      let sseFinished = false;
       let gotRealStatus = false;
-      const fallbackTimer = setTimeout(() => {
+      let streamUnsub: (() => void) | null = null;
+      let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+      const keepaliveTimer = setInterval(() => { if (sseAlive) try { sseWrite(': keepalive\n\n'); } catch { sseAlive = false; } }, 15000);
+      const finishSse = () => {
+        if (sseFinished) return;
+        sseFinished = true;
+        sseAlive = false;
+        if (fallbackTimer) {
+          clearTimeout(fallbackTimer);
+          fallbackTimer = null;
+        }
+        clearInterval(keepaliveTimer);
+        if (streamUnsub) {
+          streamUnsub();
+          streamUnsub = null;
+        }
+        try { sseWrite('data: [DONE]\n\n'); } catch {}
+        res.end();
+      };
+      req.on('close', () => {
+        sseAlive = false;
+        if (fallbackTimer) {
+          clearTimeout(fallbackTimer);
+          fallbackTimer = null;
+        }
+        clearInterval(keepaliveTimer);
+        if (streamUnsub) {
+          streamUnsub();
+          streamUnsub = null;
+        }
+      });
+
+      fallbackTimer = setTimeout(() => {
         if (!gotRealStatus && sseAlive) try { sseWrite(`data: ${JSON.stringify({ type: 'status', content: `${provider.displayName} is thinking…` })}\n\n`); } catch { sseAlive = false; }
       }, 2000);
 
+      const senderIdentity = req.user ? { label: req.user.email, userId: req.user.userId } : undefined;
+
+      if (provider.providerName === 'OPENCLAW') {
+        // Single-path SSE delivery for OpenClaw: the persistent gateway WS publishes
+        // into StreamEventBus, and this SSE response forwards that bus directly.
+        // Do not re-publish provider callbacks back into StreamEventBus, or the
+        // HTTP send path will recursively amplify the same events.
+        streamEventBus.startStream(sessionId, undefined, {
+          provenance,
+          model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
+        });
+
+        let sawTerminalEvent = false;
+        streamUnsub = streamEventBus.subscribe(sessionId, (evt: StreamEvent) => {
+          if (!sseAlive || sseFinished) return;
+          gotRealStatus = true;
+          try {
+            sseWrite(`data: ${JSON.stringify(evt)}\n\n`);
+          } catch {
+            sseAlive = false;
+            return;
+          }
+          if (evt.type === 'done' || evt.type === 'error') {
+            sawTerminalEvent = true;
+            finishSse();
+          }
+        });
+
+        try {
+          const result = await (provider as any).sendMessage(
+            sessionId,
+            message,
+            (_chunk: string) => {},
+            (_evt: { type: string; content?: string; [key: string]: any }) => {},
+            (_approval: ExecApprovalRequest) => {},
+            senderIdentity,
+          );
+          if (!sawTerminalEvent && sseAlive && !sseFinished) {
+            sseWrite(`data: ${JSON.stringify({
+              type: 'done',
+              content: result.fullText,
+              provenance,
+              model: normalizeGatewayModelId(result.metadata?.model) || null,
+              metadata: result.metadata || {},
+            })}\n\n`);
+            finishSse();
+          }
+        } catch (err: any) {
+          const friendlyError = humanizeProviderError(provider.providerName, err?.message || String(err));
+          if (!sseFinished && sseAlive) {
+            try { sseWrite(`data: ${JSON.stringify({ type: 'error', content: friendlyError })}\n\n`); } catch {}
+          }
+          finishSse();
+        }
+        return;
+      }
+
       const onStatus = (evt: { type: string; content: string; [key: string]: any }) => {
         gotRealStatus = true;
+        const runId = typeof evt.runId === 'string' ? evt.runId : undefined;
+        if (evt.type === 'tool_start') {
+          streamEventBus.startStream(sessionId, runId, {
+            provenance,
+            model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
+          });
+          streamEventBus.updateStreamPhase(sessionId, { phase: 'tool', toolName: typeof evt.toolName === 'string' ? evt.toolName : undefined, runId });
+        } else if (evt.type === 'tool_end') {
+          streamEventBus.startStream(sessionId, runId, {
+            provenance,
+            model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
+          });
+          streamEventBus.updateStreamPhase(sessionId, { phase: 'thinking', runId });
+        } else if (evt.type === 'thinking' || evt.type === 'status') {
+          streamEventBus.startStream(sessionId, runId, {
+            provenance,
+            model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
+          });
+          streamEventBus.updateStreamPhase(sessionId, { phase: 'thinking', runId });
+        } else if (evt.type === 'run_resumed') {
+          streamEventBus.startStream(sessionId, runId, {
+            provenance,
+            model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
+          });
+        }
+        streamEventBus.publish(sessionId, evt as StreamEvent);
         if (sseAlive) try { sseWrite(`data: ${JSON.stringify(evt)}\n\n`); } catch { sseAlive = false; }
       };
       const onExecApproval = (approval: ExecApprovalRequest) => {
         if (sseAlive) try { sseWrite(`data: ${JSON.stringify({ type: 'exec_approval', approval })}\n\n`); } catch { sseAlive = false; }
       };
-      const senderIdentity = req.user ? { label: req.user.email, userId: req.user.userId } : undefined;
+      streamEventBus.startStream(sessionId, undefined, {
+        provenance,
+        model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
+      });
 
       try {
-        const result = await (provider as any).sendMessage(sessionId, message, (chunk: string) => {
-          if (sseAlive) try { sseWrite(`data: ${JSON.stringify({ type: 'text', content: chunk })}\n\n`); } catch { sseAlive = false; }
-        }, onStatus, onExecApproval, senderIdentity);
-        clearTimeout(fallbackTimer); clearInterval(keepaliveTimer);
-        if (sseAlive) {
-          sseWrite(`data: ${JSON.stringify({ type: 'done', content: result.fullText, provenance })}\n\n`);
-          sseWrite('data: [DONE]\n\n');
+        const result = await (provider as any).sendMessage(
+          sessionId,
+          message,
+          (chunk: string) => {
+            streamEventBus.startStream(sessionId, undefined, {
+              provenance,
+              model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
+            });
+            streamEventBus.updateStreamPhase(sessionId, { phase: 'streaming' });
+            streamEventBus.publish(sessionId, { type: 'text', content: chunk } as StreamEvent);
+            if (sseAlive) try { sseWrite(`data: ${JSON.stringify({ type: 'text', content: chunk })}\n\n`); } catch { sseAlive = false; }
+          },
+          onStatus,
+          onExecApproval,
+          senderIdentity,
+        );
+        if (fallbackTimer) {
+          clearTimeout(fallbackTimer);
+          fallbackTimer = null;
         }
+        clearInterval(keepaliveTimer);
+        streamEventBus.publish(sessionId, {
+          type: 'done',
+          content: result.fullText,
+          model: normalizeGatewayModelId(result.metadata?.model) || null,
+        } as StreamEvent);
+        streamEventBus.softClearStream(sessionId);
+        if (sseAlive) {
+          sseWrite(`data: ${JSON.stringify({
+            type: 'done',
+            content: result.fullText,
+            provenance,
+            model: normalizeGatewayModelId(result.metadata?.model) || null,
+            metadata: result.metadata || {},
+          })}\n\n`);
+        }
+        finishSse();
       } catch (err: any) {
-        clearTimeout(fallbackTimer); clearInterval(keepaliveTimer);
+        if (fallbackTimer) {
+          clearTimeout(fallbackTimer);
+          fallbackTimer = null;
+        }
+        clearInterval(keepaliveTimer);
         const friendlyError = humanizeProviderError(provider.providerName, err?.message || String(err));
+        streamEventBus.publish(sessionId, { type: 'error', content: friendlyError } as StreamEvent);
+        streamEventBus.clearStream(sessionId);
         if (sseAlive) {
           sseWrite(`data: ${JSON.stringify({ type: 'error', content: friendlyError })}\n\n`);
-          sseWrite('data: [DONE]\n\n');
         }
+        finishSse();
       }
-      res.end();
       return;
     }
 
@@ -1812,6 +2118,10 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
       active: true,
       phase: info.phase,
       toolName: info.toolName || null,
+      statusText: info.statusText || null,
+      provenance: info.provenance || null,
+      model: info.model || null,
+      compactionPhase: info.compactionPhase || 'idle',
       startedAt: info.startedAt,
       runId: info.runId || null,
       content: content || undefined,
@@ -1878,6 +2188,7 @@ router.post('/chat/abort', authenticateToken, requireApproved, async (req: Reque
     const result = await gatewayRpcCall('chat.abort', payload);
     console.log(`[gateway] HTTP ABORT RESULT: ok=${result.ok} error=${result.error || 'none'}`);
     if (!result.ok) { res.status(500).json({ error: 'Abort failed', detail: result.error }); return; }
+    streamEventBus.clearStream(sessionKey);
     res.json({ ok: true, sessionKey, provider: providerName });
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 500;
@@ -2006,6 +2317,86 @@ function wsSend(ws: WebSocket, data: any) {
 
 /* ─── WS message handlers ─────────────────────────────────────────────── */
 
+// Per-WS stream cleanup: maps sessionKey → unsubscribe function.
+// Used by handleWsAbort to tear down the stream when the user aborts.
+const wsStreamCleanups = new WeakMap<WebSocket, Map<string, () => void>>();
+
+function registerWsStreamCleanup(ws: WebSocket, sessionKey: string, unsub: () => void): void {
+  let map = wsStreamCleanups.get(ws);
+  if (!map) { map = new Map(); wsStreamCleanups.set(ws, map); }
+  // If there's an existing subscription for this session, clean it up first
+  const existing = map.get(sessionKey);
+  if (existing) existing();
+  map.set(sessionKey, unsub);
+}
+
+function runWsStreamCleanup(ws: WebSocket, sessionKey: string): void {
+  const map = wsStreamCleanups.get(ws);
+  if (!map) return;
+  const unsub = map.get(sessionKey);
+  if (unsub) { unsub(); map.delete(sessionKey); }
+}
+
+function attachBrowserWsToSessionStream(params: {
+  ws: WebSocket;
+  sessionKey: string;
+  streamInfo?: ReturnType<typeof streamEventBus.getStreamStatus> | null;
+  sendResume?: boolean;
+  keepSubscriptionAfterDone?: boolean;
+  onEvent?: (evt: StreamEvent) => void;
+}): boolean {
+  const {
+    ws,
+    sessionKey,
+    streamInfo,
+    sendResume = false,
+    keepSubscriptionAfterDone = true,
+    onEvent,
+  } = params;
+
+  const status = streamInfo ?? streamEventBus.getStreamStatus(sessionKey);
+
+  if (sendResume) {
+    if (!status?.active) return false;
+    const latestText = status.phase === 'streaming'
+      ? streamEventBus.getLatestText(sessionKey)
+      : '';
+    wsSend(ws, {
+      type: 'stream_resume',
+      sessionKey,
+      phase: status.phase,
+      toolName: status.toolName || null,
+      runId: status.runId || null,
+      content: latestText || undefined,
+    });
+  }
+
+  let unsubscribed = false;
+  const unsub = streamEventBus.subscribe(sessionKey, (evt: StreamEvent) => {
+    onEvent?.(evt);
+    wsSend(ws, { ...evt, sessionKey });
+    if (evt.type === 'error') {
+      runWsStreamCleanup(ws, sessionKey);
+      return;
+    }
+    if (evt.type === 'done' && !keepSubscriptionAfterDone) {
+      runWsStreamCleanup(ws, sessionKey);
+    }
+  });
+
+  const onClose = () => runWsStreamCleanup(ws, sessionKey);
+  const cleanup = () => {
+    if (unsubscribed) return;
+    unsubscribed = true;
+    ws.removeListener('close', onClose);
+    unsub();
+  };
+
+  ws.once('close', onClose);
+  registerWsStreamCleanup(ws, sessionKey, cleanup);
+  return true;
+}
+
 async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
   const sessionKey = resolveOpenClawSessionKey(msg.session, user);
   const providerName = msg.provider as AgentProviderName | undefined;
@@ -2032,50 +2423,16 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
 
     // After sending history, check if there's an active stream on this session.
     // If so, send a stream_resume event and subscribe to StreamEventBus.
-    const streamInfo = streamEventBus.getStreamStatus(sessionKey);
-    if (streamInfo && streamInfo.active) {
-      wsSend(ws, {
-        type: 'stream_resume',
-        sessionKey,
-        phase: streamInfo.phase,
-        toolName: streamInfo.toolName || null,
-        runId: streamInfo.runId || null,
-      });
-
-      // Subscribe to StreamEventBus and forward events to this browser WS.
-      // Use registerWsStreamCleanup so that if handleWsSend later creates its
-      // own subscription for the same session, the old one gets cleaned up first.
-      // Without this, both subscribers forward events → browser gets text TWICE → cascade!
-      const unsub = streamEventBus.subscribe(sessionKey, (evt: StreamEvent) => {
-        wsSend(ws, { ...evt, sessionKey });
-        if (evt.type === 'done' || evt.type === 'error') unsub();
-      });
-      ws.once('close', unsub);
-      registerWsStreamCleanup(ws, sessionKey, unsub);
-    }
+    attachBrowserWsToSessionStream({
+      ws,
+      sessionKey,
+      sendResume: true,
+      // Keep subscription alive after done so resumed runs continue forwarding.
+      keepSubscriptionAfterDone: true,
+    });
   } catch (err: any) {
     wsSend(ws, { type: 'error', content: err?.message === 'Admin access required' ? 'Admin access required' : `History failed: ${err.message}`, requestId });
   }
-}
-
-// Per-WS stream cleanup: maps sessionKey → unsubscribe function.
-// Used by handleWsAbort to tear down the stream when the user aborts.
-const wsStreamCleanups = new WeakMap<WebSocket, Map<string, () => void>>();
-
-function registerWsStreamCleanup(ws: WebSocket, sessionKey: string, unsub: () => void): void {
-  let map = wsStreamCleanups.get(ws);
-  if (!map) { map = new Map(); wsStreamCleanups.set(ws, map); }
-  // If there's an existing subscription for this session, clean it up first
-  const existing = map.get(sessionKey);
-  if (existing) existing();
-  map.set(sessionKey, unsub);
-}
-
-function runWsStreamCleanup(ws: WebSocket, sessionKey: string): void {
-  const map = wsStreamCleanups.get(ws);
-  if (!map) return;
-  const unsub = map.get(sessionKey);
-  if (unsub) { unsub(); map.delete(sessionKey); }
 }
 
 async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
@@ -2172,14 +2529,34 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       });
       if (slashResult.handled) {
         resolvedSessionId = slashResult.sessionId;
-        wsSend(ws, { type: 'session', sessionId: slashResult.sessionId, provenance });
-        wsSend(ws, { type: 'done', content: slashResult.content || '', provenance, metadata: slashResult.metadata || {} });
+        wsSend(ws, {
+          type: 'session',
+          sessionId: slashResult.sessionId,
+          provenance,
+          model: normalizeGatewayModelId(slashResult.metadata?.model)
+            || normalizeGatewayModelId(loadNativeSession(provider.providerName, slashResult.sessionId)?.model)
+            || null,
+        });
+        wsSend(ws, {
+          type: 'done',
+          content: slashResult.content || '',
+          provenance,
+          model: normalizeGatewayModelId(slashResult.metadata?.model)
+            || normalizeGatewayModelId(loadNativeSession(provider.providerName, slashResult.sessionId)?.model)
+            || null,
+          metadata: slashResult.metadata || {},
+        });
         return;
       }
     }
 
     resolvedSessionId = sessionId;
-    wsSend(ws, { type: 'session', sessionId, provenance });
+    wsSend(ws, {
+      type: 'session',
+      sessionId,
+      provenance,
+      model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || null,
+    });
 
     let gotRealStatus = false;
     const fallbackTimer = setTimeout(() => {
@@ -2206,7 +2583,10 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       // the 'done' event is emitted once from PersistentGatewayWs, and both
       // subscribers see it in the same publish() call.
 
-      streamEventBus.startStream(sessionId);
+      streamEventBus.startStream(sessionId, undefined, {
+        provenance,
+        model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
+      });
 
       // Subscribe to StreamEventBus for this session.
       // IMPORTANT: We do NOT unsubscribe on 'done'. The agent may yield to a
@@ -2214,9 +2594,12 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       // the agent resumes with a NEW runId when the sub-agent completes. If we
       // unsubscribe on 'done', the resumed run's events are never forwarded.
       // The subscription stays alive until the browser WS closes.
-      const unsubBus = streamEventBus.subscribe(sessionId, (evt: StreamEvent) => {
+      attachBrowserWsToSessionStream({
+        ws,
+        sessionKey: sessionId,
+        keepSubscriptionAfterDone: true,
+        onEvent: (evt: StreamEvent) => {
         gotRealStatus = true;
-        wsSend(ws, { ...evt, sessionKey: sessionId });
         if (evt.type === 'done') {
           // Stop keepalive during idle gap, but do NOT unsub — agent may resume
           if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
@@ -2233,19 +2616,8 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
         if (evt.type === 'error') {
           // Hard error — clean up fully
           if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
-          ws.removeListener('close', busCleanup);
-          unsubBus();
         }
-      });
-
-      const busCleanup = () => { unsubBus(); runWsStreamCleanup(ws, sessionId); };
-      ws.once('close', busCleanup);
-
-      // Register so handleWsAbort can tear down this subscription
-      registerWsStreamCleanup(ws, sessionId, () => {
-        if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
-        ws.removeListener('close', busCleanup);
-        unsubBus();
+        },
       });
 
       // No-op callbacks — all events go through StreamEventBus above
@@ -2267,8 +2639,7 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
         // The bus subscriber may already have forwarded an 'error' event.
         // Clean up anything remaining.
         if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
-        ws.removeListener('close', busCleanup);
-        unsubBus();
+        runWsStreamCleanup(ws, sessionId);
         throw sendErr;
       }
       return;
@@ -2418,31 +2789,16 @@ function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtP
 
   const streamInfo = streamEventBus.getStreamStatus(sessionKey);
   if (streamInfo && streamInfo.active) {
-    // Stream is active — subscribe and forward events.
-    // Only replay accumulated assistant text while the assistant is actively streaming.
-    // Tool/thinking resumes should show current status, not stale text from a prior run.
-    const latestText = streamInfo.phase === 'streaming'
-      ? streamEventBus.getLatestText(sessionKey)
-      : '';
-    wsSend(ws, {
-      type: 'stream_resume',
+    attachBrowserWsToSessionStream({
+      ws,
       sessionKey,
-      phase: streamInfo.phase,
-      toolName: streamInfo.toolName || null,
-      runId: streamInfo.runId || null,
-      content: latestText || undefined,
+      streamInfo,
+      sendResume: true,
+      keepSubscriptionAfterDone: true,
+      onEvent: (evt: StreamEvent) => {
+        if (evt.type === 'text') debugLog(`[Gateway] RECONNECT→browser TEXT: len=${(evt.content||'').length} "${(evt.content||'').substring(0, 40)}..."`);
+      },
     });
-
-    const unsub = streamEventBus.subscribe(sessionKey, (evt: StreamEvent) => {
-      if (evt.type === 'text') debugLog(`[Gateway] RECONNECT→browser TEXT: len=${(evt.content||'').length} "${(evt.content||'').substring(0, 40)}..."`);
-      wsSend(ws, { ...evt, sessionKey });
-      // Keep subscription alive on 'done' for sub-agent resume (same as send handler)
-      if (evt.type === 'error') unsub();
-    });
-    ws.once('close', unsub);
-    // Register cleanup so abort can tear it down
-    registerWsStreamCleanup(ws, sessionKey, unsub);
-
     debugLog(`[gateway-ws] Client reconnected to active stream: ${sessionKey}`);
   } else {
     // No active stream
@@ -2533,7 +2889,7 @@ const DIRECT_PROXY_DEVICE_KEYS = getOrCreateDeviceKeys();
 const DIRECT_PROXY_CLIENT_ID = 'gateway-client';
 const DIRECT_PROXY_CLIENT_MODE = 'backend';
 const DIRECT_PROXY_ROLE = 'operator';
-const DIRECT_PROXY_SCOPES = ['operator.admin', 'operator.approvals'];
+const DIRECT_PROXY_SCOPES = ['operator.read', 'operator.write'];
 const DIRECT_PROXY_PROTOCOL = 3;
 
 const ALLOWED_GATEWAY_METHODS = new Set([
@@ -2542,10 +2898,6 @@ const ALLOWED_GATEWAY_METHODS = new Set([
   'chat.abort',
   'chat.history',
   'chat.inject',
-  'sessions.list',
-  'sessions.get',
-  'sessions.resolve',
-  'models.list',
 ]);
 
 /**
@@ -2555,7 +2907,6 @@ const ALLOWED_GATEWAY_METHODS = new Set([
  */
 function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
   const userId = user.userId;
-  let directProxyUnsub: (() => void) | null = null;
 
   // Enforce per-user connection limit
   const currentCount = directUserConnections.get(userId) || 0;
@@ -2582,39 +2933,6 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
 
   gatewayWs.on('open', () => {
     debugLog('[gateway-direct] Connected to gateway');
-    // Subscribe to the default main session immediately so tool events
-    // from PersistentGatewayWs reach the browser even before first chat.send
-    if (!directProxyUnsub) {
-      const defaultSession = 'agent:main:main';
-      directProxyUnsub = streamEventBus.subscribe(defaultSession, (evt: StreamEvent) => {
-        console.log(`[gateway-direct] BUS EVENT for ${defaultSession}: type=${evt.type}`);
-        if (evt.type === 'tool_start' || evt.type === 'tool_end' || evt.type === 'tool_used') {
-          if (browserWs.readyState === WebSocket.OPEN) {
-            const toolPayload = evt.type === 'tool_start' ? {
-              phase: 'start',
-              name: evt.toolName || 'tool',
-              toolCallId: undefined,
-              args: evt.toolArgs,
-            } : {
-              phase: 'end',
-              name: evt.toolName || 'tool',
-              toolCallId: undefined,
-              output: (evt as any).toolResult,
-            };
-            browserWs.send(JSON.stringify({
-              type: 'event',
-              event: 'agent',
-              sessionKey: defaultSession,
-              payload: {
-                stream: 'tool',
-                data: toolPayload,
-              },
-            }));
-          }
-        }
-      });
-      debugLog(`[gateway-direct] Subscribed to StreamEventBus for session ${defaultSession} on connect`);
-    }
     // Send a connected event to the browser
     try {
       browserWs.send(JSON.stringify({ type: 'connected' }));
@@ -2770,51 +3088,6 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       return;
     }
 
-    // When the browser sends chat.send via direct proxy, subscribe to StreamEventBus
-    // for this session so tool events (which are targeted at PersistentGatewayWs and
-    // re-emitted to the bus) are forwarded to the browser alongside raw gateway events.
-    if (frame.type === 'req' && frame.method === 'chat.send') {
-      const sessionKey = frame.params?.sessionKey || frame.params?.session;
-      if (sessionKey) {
-        // Unsubscribe previous session if switching
-        if (directProxyUnsub) {
-          directProxyUnsub();
-          directProxyUnsub = null;
-        }
-        directProxyUnsub = streamEventBus.subscribe(sessionKey, (evt: StreamEvent) => {
-          console.log(`[gateway-direct] BUS EVENT for ${sessionKey}: type=${evt.type}`);
-          // Only forward tool events — gateway already forwards text/final/etc via raw WS
-          if (evt.type === 'tool_start' || evt.type === 'tool_end' || evt.type === 'tool_used') {
-            if (browserWs.readyState === WebSocket.OPEN) {
-              // Send in the same format the frontend's handleDirectGatewayEvent expects
-              // for agent stream=tool events
-              const toolPayload = evt.type === 'tool_start' ? {
-                phase: 'start',
-                name: evt.toolName || 'tool',
-                toolCallId: undefined,
-                args: evt.toolArgs,
-              } : {
-                phase: 'end',
-                name: evt.toolName || 'tool',
-                toolCallId: undefined,
-                output: (evt as any).toolResult,
-              };
-              browserWs.send(JSON.stringify({
-                type: 'event',
-                event: 'agent',
-                sessionKey,
-                payload: {
-                  stream: 'tool',
-                  data: toolPayload,
-                },
-              }));
-            }
-          }
-        });
-        debugLog(`[gateway-direct] Subscribed to StreamEventBus for session ${sessionKey}`);
-      }
-    }
-
     // Filter out non-standard frame types that the gateway doesn't understand
     // (ping, reconnect, etc. — these are client-side keepalive/session management)
     if (frame.type !== 'req') {
@@ -2846,9 +3119,6 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
   browserWs.on('close', (code: number, reason: Buffer) => {
     browserClosed = true;
     debugLog(`[gateway-direct] Browser closed: ${code} ${reason?.toString()}`);
-
-    // Clean up StreamEventBus subscription
-    if (directProxyUnsub) { directProxyUnsub(); directProxyUnsub = null; }
 
     // Decrement per-user connection count
     const count = directUserConnections.get(userId) || 0;

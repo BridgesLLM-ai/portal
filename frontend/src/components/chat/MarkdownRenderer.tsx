@@ -17,6 +17,32 @@ import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import { Copy, Check, Eye, EyeOff, Maximize2, Minimize2 } from 'lucide-react';
 
+function resolvePortalHref(rawHref?: string): { href: string; external?: boolean } {
+  const href = String(rawHref || '').trim();
+  if (!href) return { href: '#' };
+
+  const portalAbsolute = href.match(/^https?:\/\/[^/]+(\/files\?(?:file|path)=[^\s#]+)/i);
+  if (portalAbsolute?.[1]) return { href: portalAbsolute[1] };
+  if (/^https?:\/\//i.test(href) || href.startsWith('mailto:') || href.startsWith('tel:')) return { href, external: true };
+
+  const uploadedFile = href.match(/\/api\/files\/([^\s?#)]+)/i);
+  if (uploadedFile?.[1]) return { href: `/files?file=${encodeURIComponent(uploadedFile[1])}` };
+
+  const fileQuery = href.match(/^\/files\?file=([^\s#]+)/i);
+  if (fileQuery?.[1]) return { href: `/files?file=${fileQuery[1]}` };
+  const pathQuery = href.match(/^\/files\?path=([^\s#]+)/i);
+  if (pathQuery?.[1]) return { href: `/files?path=${pathQuery[1]}` };
+
+  const explicitPath = href.match(/(?:server(?:_|\s)path|path):\s*([^\]\n)]+)/i)?.[1]?.trim()
+    || href.match(/^\/?var\/portal-files\/[^\s)]+/i)?.[0]
+    || href.match(/^\/?(?:root\/)?\.openclaw\/media\/portal-files\/[^\s)]+/i)?.[0]
+    || href.match(/^~\/?\.openclaw\/media\/portal-files\/[^\s)]+/i)?.[0];
+  if (explicitPath) return { href: `/files?path=${encodeURIComponent(explicitPath)}` };
+
+  if (/^\/files(?:[/?#]|$)/i.test(href)) return { href };
+  return { href, external: !href.startsWith('/') };
+}
+
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
 
 function extractTextContent(children: ReactNode): string {
@@ -327,11 +353,12 @@ const components = {
     );
   },
   a({ href, children, ...props }: any) {
+    const resolved = resolvePortalHref(href);
     return (
       <a
-        href={href}
-        target="_blank"
-        rel="noopener noreferrer"
+        href={resolved.href}
+        target={resolved.external ? '_blank' : undefined}
+        rel={resolved.external ? 'noopener noreferrer' : undefined}
         className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 decoration-emerald-400/30 hover:decoration-emerald-400/60 transition-colors"
         {...props}
       >
@@ -390,6 +417,105 @@ function closeUnclosedBacktickFence(content: string, isStreaming: boolean): stri
   return `${content}\n\`\`\``;
 }
 
+function splitTrailingPunctuation(raw: string): { core: string; trailing: string } {
+  const match = raw.match(/^(.*?)([.,!?;:]+)?$/);
+  return {
+    core: match?.[1] || raw,
+    trailing: match?.[2] || '',
+  };
+}
+
+function buildPortalLinkNode(url: string, label: string) {
+  return {
+    type: 'link',
+    url,
+    title: null,
+    children: [{ type: 'text', value: label }],
+  };
+}
+
+function parsePortalTextToNodes(text: string): any[] | null {
+  const pattern = /(Shared Browser|Files section|file section|\/api\/files\/[^\s?#)]+|\/files\?(?:file|path)=[^\s)]+|https?:\/\/[^\s)]+\/files\?(?:file|path)=[^\s)]+|\/?var\/portal-files\/[^\s)]+|\/?(?:root\/)?\.openclaw\/media\/portal-files\/[^\s)]+|~\/?\.openclaw\/media\/portal-files\/[^\s)]+)/gi;
+  let match: RegExpExecArray | null;
+  let lastIndex = 0;
+  const nodes: any[] = [];
+
+  while ((match = pattern.exec(text)) !== null) {
+    const raw = match[0];
+    const start = match.index;
+    const end = start + raw.length;
+
+    if (start > lastIndex) {
+      nodes.push({ type: 'text', value: text.slice(lastIndex, start) });
+    }
+
+    const lower = raw.toLowerCase();
+    if (lower === 'shared browser') {
+      nodes.push(buildPortalLinkNode('/desktop', raw));
+      lastIndex = end;
+      continue;
+    }
+
+    if (lower === 'files section' || lower === 'file section') {
+      nodes.push(buildPortalLinkNode('/files', raw));
+      lastIndex = end;
+      continue;
+    }
+
+    const { core, trailing } = splitTrailingPunctuation(raw);
+    if (/^\/api\/files\//i.test(core)) {
+      const fileId = core.replace(/^\/api\/files\//i, '').trim();
+      if (fileId) {
+        nodes.push(buildPortalLinkNode(`/files?file=${encodeURIComponent(fileId)}`, core));
+      } else {
+        nodes.push({ type: 'text', value: core });
+      }
+    } else if (/^\/files\?(?:file|path)=/i.test(core)) {
+      nodes.push(buildPortalLinkNode(core, core));
+    } else if (/^https?:\/\/[^/]+\/files\?(?:file|path)=/i.test(core)) {
+      const resolved = resolvePortalHref(core);
+      nodes.push(buildPortalLinkNode(resolved.href, core));
+    } else {
+      const normalizedPath = core.startsWith('/') ? core : `/${core}`;
+      nodes.push(buildPortalLinkNode(`/files?path=${encodeURIComponent(normalizedPath)}`, core));
+    }
+    if (trailing) nodes.push({ type: 'text', value: trailing });
+    lastIndex = end;
+  }
+
+  if (lastIndex === 0) return null;
+  if (lastIndex < text.length) {
+    nodes.push({ type: 'text', value: text.slice(lastIndex) });
+  }
+  return nodes;
+}
+
+function remarkPortalLinks() {
+  return (tree: any) => {
+    const visit = (node: any) => {
+      if (!node || !Array.isArray(node.children)) return;
+      for (let i = 0; i < node.children.length; i += 1) {
+        const child = node.children[i];
+        if (!child) continue;
+        if (child.type === 'text') {
+          const replacement = parsePortalTextToNodes(String(child.value || ''));
+          if (replacement && replacement.length > 0) {
+            node.children.splice(i, 1, ...replacement);
+            i += replacement.length - 1;
+          }
+          continue;
+        }
+        if (['code', 'inlineCode', 'link', 'definition', 'image', 'imageReference', 'linkReference', 'html'].includes(child.type)) {
+          continue;
+        }
+        visit(child);
+      }
+    };
+
+    visit(tree);
+  };
+}
+
 /** Memoized markdown renderer - prevents re-parsing identical content */
 /**
  * Detect if content is a raw HTML document without markdown code fences.
@@ -431,7 +557,7 @@ const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, is
   return (
     <div className={`text-sm text-slate-200 leading-relaxed ${className || ''}`}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkPortalLinks]}
         rehypePlugins={[rehypeHighlight]}
         components={markdownComponents}
       >

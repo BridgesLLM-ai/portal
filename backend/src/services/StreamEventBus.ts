@@ -20,6 +20,10 @@ export interface StreamInfo {
   active: boolean;
   phase: 'thinking' | 'tool' | 'streaming';
   toolName?: string;
+  statusText?: string;
+  provenance?: string;
+  model?: string;
+  compactionPhase?: 'idle' | 'compacting' | 'compacted';
   startedAt: number;
   runId?: string;
   latestText: string;
@@ -115,30 +119,57 @@ class StreamEventBus {
    * Also notifies global listeners for session-level events (compaction).
    */
   publish(sessionKey: string, event: StreamEvent): void {
+    const info = this.activeStreams.get(sessionKey);
+    const now = Date.now();
+    if (info) {
+      info.lastEventAt = now;
+      if (typeof event.provenance === 'string' && event.provenance.trim()) {
+        info.provenance = event.provenance.trim();
+      }
+      if (typeof event.model === 'string' && event.model.trim()) {
+        info.model = event.model.trim();
+      }
+    }
+
     if (event.type === 'text') {
       const isReplace = event.replace === true;
       const nextText = isReplace
         ? (typeof event.content === 'string' ? event.content : '')
         : (this.latestText.get(sessionKey) || '') + (typeof event.content === 'string' ? event.content : '');
       this.latestText.set(sessionKey, nextText);
-      const info = this.activeStreams.get(sessionKey);
       if (info) {
         info.latestText = nextText;
-        info.lastEventAt = Date.now();
+        info.statusText = undefined;
       }
     } else if (event.type === 'done') {
       const finalText = typeof event.content === 'string' && event.content.length > 0
         ? event.content
         : (this.latestText.get(sessionKey) || '');
       this.latestText.set(sessionKey, finalText);
-      const info = this.activeStreams.get(sessionKey);
       if (info) {
         info.latestText = finalText;
-        info.lastEventAt = Date.now();
+        info.statusText = undefined;
+        info.compactionPhase = 'idle';
       }
-    } else {
-      const info = this.activeStreams.get(sessionKey);
-      if (info) info.lastEventAt = Date.now();
+    } else if (info) {
+      if (event.type === 'thinking') {
+        info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : 'Thinking…';
+      } else if (event.type === 'status') {
+        info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : info.statusText;
+      } else if (event.type === 'tool_start') {
+        info.toolName = typeof event.toolName === 'string' && event.toolName.trim() ? event.toolName.trim() : info.toolName;
+        info.statusText = info.toolName ? `Using ${info.toolName}…` : info.statusText;
+      } else if (event.type === 'tool_end') {
+        info.statusText = undefined;
+      } else if (event.type === 'compaction_start') {
+        info.compactionPhase = 'compacting';
+        info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : 'Compacting context…';
+      } else if (event.type === 'compaction_end') {
+        info.compactionPhase = 'compacted';
+        info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : 'Context compacted';
+      } else if (event.type === 'run_resumed') {
+        info.statusText = 'Resuming stream…';
+      }
     }
 
     const subs = this.listeners.get(sessionKey);
@@ -199,14 +230,30 @@ class StreamEventBus {
   updateStreamPhase(sessionKey: string, info: Partial<StreamInfo> & { phase: StreamInfo['phase'] }): void {
     const existing = this.activeStreams.get(sessionKey);
     if (existing) {
+      const wasDormant = existing.active === false;
+      existing.active = true;
       existing.phase = info.phase;
-      if (info.toolName !== undefined) existing.toolName = info.toolName;
-      if (info.runId !== undefined) existing.runId = info.runId;
+      if ('toolName' in info) existing.toolName = info.toolName;
+      if ('runId' in info) existing.runId = info.runId;
+      if ('statusText' in info) existing.statusText = info.statusText;
+      if ('provenance' in info) existing.provenance = info.provenance;
+      if ('model' in info) existing.model = info.model;
+      if ('compactionPhase' in info) existing.compactionPhase = info.compactionPhase;
+      if (wasDormant) {
+        existing.startedAt = info.startedAt || Date.now();
+        existing.latestText = this.latestText.get(sessionKey) || '';
+        delete existing.lastDoneAt;
+      }
+      existing.lastEventAt = Date.now();
     } else {
       this.activeStreams.set(sessionKey, {
         active: true,
         phase: info.phase,
         toolName: info.toolName,
+        statusText: info.statusText,
+        provenance: info.provenance,
+        model: info.model,
+        compactionPhase: info.compactionPhase,
         startedAt: info.startedAt || Date.now(),
         runId: info.runId,
         latestText: this.latestText.get(sessionKey) || '',
@@ -218,21 +265,38 @@ class StreamEventBus {
   /**
    * Mark a stream as started (called when PersistentGatewayWs sees first event).
    */
-  startStream(sessionKey: string, runId?: string): void {
+  startStream(sessionKey: string, runId?: string, info?: Partial<StreamInfo>): void {
     if (!this.activeStreams.has(sessionKey)) {
       this.activeStreams.set(sessionKey, {
         active: true,
         phase: 'thinking',
+        statusText: info?.statusText || 'Thinking…',
+        provenance: info?.provenance,
+        model: info?.model,
+        compactionPhase: info?.compactionPhase || 'idle',
         startedAt: Date.now(),
         runId,
         latestText: this.latestText.get(sessionKey) || '',
         lastEventAt: Date.now(),
       });
     } else {
-      const info = this.activeStreams.get(sessionKey)!;
-      if (runId) info.runId = runId;
-      info.lastEventAt = Date.now();
-      info.latestText = this.latestText.get(sessionKey) || info.latestText || '';
+      const current = this.activeStreams.get(sessionKey)!;
+      const wasDormant = current.active === false;
+      current.active = true;
+      if (wasDormant) {
+        current.phase = 'thinking';
+        current.startedAt = Date.now();
+        current.toolName = undefined;
+        current.statusText = info?.statusText || 'Thinking…';
+        current.compactionPhase = info?.compactionPhase || 'idle';
+        current.latestText = this.latestText.get(sessionKey) || '';
+        delete current.lastDoneAt;
+      }
+      if (runId) current.runId = runId;
+      if (info?.provenance) current.provenance = info.provenance;
+      if (info?.model) current.model = info.model;
+      current.lastEventAt = Date.now();
+      current.latestText = this.latestText.get(sessionKey) || current.latestText || '';
     }
   }
 
@@ -257,6 +321,11 @@ class StreamEventBus {
     this.activeStreams.set(sessionKey, {
       active: false,
       phase: 'thinking',
+      toolName: info?.toolName,
+      statusText: info?.statusText,
+      provenance: info?.provenance,
+      model: info?.model,
+      compactionPhase: info?.compactionPhase,
       startedAt: info?.startedAt || lastDoneAt,
       latestText: '',
       lastEventAt: lastDoneAt,

@@ -2,10 +2,13 @@ import { Router, Request, Response } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
+import jwt from 'jsonwebtoken';
 import { authenticateToken } from '../middleware/auth';
 import { requireApproved } from '../middleware/requireApproved';
 import { scanFile } from '../services/virusScan';
 import { prisma } from '../config/database';
+import { config } from '../config/env';
 import { getWorkspaceOwnerId } from '../utils/workspaceScope';
 
 const router = Router();
@@ -17,8 +20,119 @@ function getUserUploadDir(userId: string): string {
   return path.join(BASE_UPLOAD_DIR, `user-${userId}`, 'uploads');
 }
 
-// Ensure base directory exists
+function resolveOpenClawMediaMirrorBase(): string {
+  const candidates = [
+    process.env.OPENCLAW_STATE_DIR?.trim(),
+    path.join(os.homedir(), '.openclaw'),
+    '/root/.openclaw',
+  ].filter((value): value is string => Boolean(value && value.trim()));
+
+  for (const candidate of candidates) {
+    const normalized = path.resolve(candidate);
+    if (fs.existsSync(normalized)) {
+      return path.join(normalized, 'media', 'portal-files');
+    }
+  }
+
+  return path.join(path.join(os.homedir(), '.openclaw'), 'media', 'portal-files');
+}
+
+const OPENCLAW_MEDIA_MIRROR_BASE = resolveOpenClawMediaMirrorBase();
+const FILE_DIRECT_CONTENT_PURPOSE = 'file-direct-content';
+
+function getToolMirrorPath(userId: string, fileName: string): string {
+  return path.join(OPENCLAW_MEDIA_MIRROR_BASE, `user-${userId}`, 'uploads', path.basename(fileName));
+}
+
+function ensureToolMirror(userId: string, sourcePath: string, fileName?: string): string {
+  const mirrorPath = getToolMirrorPath(userId, fileName || path.basename(sourcePath));
+  fs.mkdirSync(path.dirname(mirrorPath), { recursive: true });
+  try {
+    if (fs.existsSync(mirrorPath)) fs.unlinkSync(mirrorPath);
+  } catch {}
+
+  try {
+    fs.linkSync(sourcePath, mirrorPath);
+  } catch (error: any) {
+    if (!['EXDEV', 'EPERM', 'EMLINK', 'EEXIST'].includes(error?.code || '')) {
+      throw error;
+    }
+    fs.copyFileSync(sourcePath, mirrorPath);
+  }
+
+  return mirrorPath;
+}
+
+function removeToolMirror(userId: string, fileName: string) {
+  const mirrorPath = getToolMirrorPath(userId, fileName);
+  try {
+    if (fs.existsSync(mirrorPath)) fs.unlinkSync(mirrorPath);
+  } catch {}
+}
+
+function renameToolMirror(userId: string, oldFileName: string, newFileName: string, sourcePathForFallback?: string) {
+  const oldMirrorPath = getToolMirrorPath(userId, oldFileName);
+  const newMirrorPath = getToolMirrorPath(userId, newFileName);
+  fs.mkdirSync(path.dirname(newMirrorPath), { recursive: true });
+
+  try {
+    if (fs.existsSync(oldMirrorPath)) {
+      if (fs.existsSync(newMirrorPath)) fs.unlinkSync(newMirrorPath);
+      fs.renameSync(oldMirrorPath, newMirrorPath);
+      return newMirrorPath;
+    }
+  } catch {}
+
+  if (sourcePathForFallback && fs.existsSync(sourcePathForFallback)) {
+    return ensureToolMirror(userId, sourcePathForFallback, newFileName);
+  }
+
+  return newMirrorPath;
+}
+
+function createDirectFileToken(fileId: string, ownerId: string): string {
+  return jwt.sign({ fileId, ownerId, purpose: FILE_DIRECT_CONTENT_PURPOSE }, config.jwtSecret, { expiresIn: '24h' });
+}
+
+function normalizeOrigin(raw: string): string | null {
+  try {
+    return new URL(raw).origin;
+  } catch {
+    return null;
+  }
+}
+
+function getConfiguredPortalOrigins(): string[] {
+  return Array.from(new Set(
+    (config.corsOrigin || [])
+      .map(origin => normalizeOrigin(String(origin || '').trim()))
+      .filter((origin): origin is string => Boolean(origin))
+  ));
+}
+
+function getTrustedRequestOrigin(req?: Request): string | null {
+  if (!req) return null;
+  const host = String(req.get('host') || '').trim();
+  if (!host) return null;
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0]?.trim();
+  const proto = forwardedProto || req.protocol || 'http';
+  const candidate = normalizeOrigin(`${proto}://${host}`);
+  if (!candidate) return null;
+  const configuredOrigins = getConfiguredPortalOrigins();
+  return configuredOrigins.includes(candidate) ? candidate : null;
+}
+
+function buildDirectFileUrl(fileId: string, ownerId: string, req?: Request): string {
+  const token = createDirectFileToken(fileId, ownerId);
+  const relativePath = `/api/files/${encodeURIComponent(fileId)}/direct-content?token=${encodeURIComponent(token)}`;
+  const trustedOrigin = getTrustedRequestOrigin(req);
+  const fallbackOrigin = getConfiguredPortalOrigins()[0] || '';
+  return `${trustedOrigin || fallbackOrigin}${relativePath}`;
+}
+
+// Ensure base directories exist
 fs.mkdirSync(BASE_UPLOAD_DIR, { recursive: true });
+fs.mkdirSync(OPENCLAW_MEDIA_MIRROR_BASE, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -116,6 +230,46 @@ router.get('/', authenticateToken, requireApproved, async (req: Request, res: Re
   }
 });
 
+// GET /api/files/resolve - resolve one file by id or path for deep-linking
+router.get('/resolve', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const ownerId = await getScopedOwnerId(req);
+    const id = String(req.query.id || '').trim();
+    const rawPath = String(req.query.path || '').trim();
+    if (!id && !rawPath) {
+      res.status(400).json({ error: 'id or path required' });
+      return;
+    }
+
+    const normalizedPath = rawPath.replace(/\\/g, '/');
+    const basename = normalizedPath.split('/').filter(Boolean).pop() || normalizedPath;
+    const file = await prisma.file.findFirst({
+      where: {
+        userId: ownerId,
+        ...(id
+          ? { id }
+          : {
+              OR: [
+                { path: normalizedPath },
+                { path: basename },
+              ],
+            }),
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (!file) {
+      res.status(404).json({ error: 'File not found' });
+      return;
+    }
+
+    res.json({ ...file, size: file.size.toString() });
+  } catch (error) {
+    console.error('Resolve file error:', error);
+    res.status(500).json({ error: 'Failed to resolve file' });
+  }
+});
+
 // POST /api/files - upload file
 router.post('/', authenticateToken, requireApproved, upload.single('file'), async (req: Request, res: Response) => {
   try {
@@ -175,12 +329,68 @@ router.post('/', authenticateToken, requireApproved, upload.single('file'), asyn
     // Ensure symlink exists for user
     ensureUserSymlink(ownerId);
 
-    // Include full disk path so agent chat can reference the file
-    const diskPath = path.join(getUserUploadDir(ownerId), req.file.filename);
-    res.status(201).json({ ...file, size: file.size.toString(), diskPath });
+    // Mirror uploads into an OpenClaw-readable media root so image/pdf tools
+    // can access them directly even though the canonical upload storage lives
+    // outside the default allowed local media directories.
+    const originalDiskPath = path.join(getUserUploadDir(ownerId), req.file.filename);
+    const diskPath = ensureToolMirror(ownerId, originalDiskPath, req.file.filename);
+    const toolUrl = buildDirectFileUrl(file.id, ownerId, req);
+    res.status(201).json({ ...file, size: file.size.toString(), diskPath, originalDiskPath, toolUrl });
   } catch (error) {
     console.error('Upload error:', error);
     res.status(500).json({ error: 'Failed to upload file' });
+  }
+});
+
+// GET /api/files/:id/direct-content - signed direct file content for tool access across hosts
+router.get('/:id/direct-content', async (req: Request, res: Response) => {
+  try {
+    const token = String(req.query.token || '').trim();
+    if (!token) {
+      res.status(401).json({ error: 'Token required' });
+      return;
+    }
+
+    let payload: any;
+    try {
+      payload = jwt.verify(token, config.jwtSecret);
+    } catch {
+      res.status(401).json({ error: 'Invalid or expired token' });
+      return;
+    }
+
+    if (payload?.purpose !== FILE_DIRECT_CONTENT_PURPOSE || payload?.fileId !== req.params.id || typeof payload?.ownerId !== 'string') {
+      res.status(403).json({ error: 'Token mismatch' });
+      return;
+    }
+
+    const file = await prisma.file.findFirst({
+      where: { id: req.params.id, userId: payload.ownerId },
+    });
+
+    if (!file) {
+      res.status(404).json({ error: 'File not found' });
+      return;
+    }
+
+    const filePath = resolveFilePath(payload.ownerId, file.path);
+    if (!filePath) {
+      res.status(404).json({ error: 'File not found on disk' });
+      return;
+    }
+
+    res.setHeader('Content-Type', file.mimeType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename="${file.originalName || path.basename(file.path)}"`);
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+
+    const stat = fs.statSync(filePath);
+    res.setHeader('Content-Length', stat.size.toString());
+
+    const stream = fs.createReadStream(filePath);
+    stream.pipe(res);
+  } catch (error) {
+    console.error('Direct content error:', error);
+    res.status(500).json({ error: 'Failed to read file' });
   }
 });
 
@@ -297,6 +507,7 @@ router.delete('/:id', authenticateToken, async (req: Request, res: Response) => 
     if (filePath) {
       fs.unlinkSync(filePath);
     }
+    removeToolMirror(ownerId, file.path);
 
     await prisma.file.delete({ where: { id: file.id } });
     await logActivity(req.user!.userId, 'FILE_DELETE', 'file', file.id, req);
@@ -327,6 +538,7 @@ router.post('/batch-delete', authenticateToken, async (req: Request, res: Respon
       if (filePath) {
         try { fs.unlinkSync(filePath); } catch {}
       }
+      removeToolMirror(ownerId, file.path);
     }
 
     await prisma.file.deleteMany({
@@ -389,6 +601,7 @@ router.patch('/:id/rename', authenticateToken, async (req: Request, res: Respons
 
     // Rename on filesystem
     fs.renameSync(oldPath, newFullPath);
+    renameToolMirror(ownerId, file.path, newPath, newFullPath);
 
     // Update database
     const updated = await prisma.file.update({
@@ -459,6 +672,7 @@ router.post('/:id/copy-to-project', authenticateToken, async (req: Request, res:
     // Copy or move the file
     if (moveFile) {
       fs.renameSync(sourcePath, destPath);
+      removeToolMirror(ownerId, file.path);
       // Delete from database
       await prisma.file.delete({ where: { id } });
     } else {

@@ -403,7 +403,7 @@ export default function AgentToolsPage() {
         </div>
       </div>
 
-      <div className="flex-1 overflow-hidden">
+      <div className="flex-1 min-h-0 overflow-hidden">
         {selectedProvider !== 'OPENCLAW' ? (
           <div className="h-full overflow-auto p-6 md:p-8">
             <div className="max-w-4xl mx-auto rounded-3xl border border-amber-500/20 bg-amber-500/10 p-6 text-amber-100">

@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { useAuthStore } from '../contexts/AuthContext';
 import UserAvatar from './UserAvatar';
+import { usePublicSettings } from '../hooks/usePublicSettings';
 
 const navItems = [
   { path: '/', label: 'Dashboard', icon: LayoutDashboard },
@@ -24,9 +25,10 @@ const navItems = [
 export default function Drawer({ children }: { children: React.ReactNode }) {
   const [isOpen, setIsOpen] = useState(false);
   const [isDesktop, setIsDesktop] = useState(window.innerWidth >= 1280);
-  const [assistantName, setAssistantName] = useState('Assistant');
   const location = useLocation();
   const { logout, user } = useAuthStore();
+  const publicSettings = usePublicSettings();
+  const assistantName = publicSettings?.assistantName || 'Assistant';
 
   useEffect(() => {
     const handleResize = () => {
@@ -38,13 +40,6 @@ export default function Drawer({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-
-  useEffect(() => {
-    fetch('/api/settings/public')
-      .then(r => r.ok ? r.json() : null)
-      .then(data => { if (data?.assistantName) setAssistantName(data.assistantName); })
-      .catch(() => {});
-  }, []);
   // Close mobile drawer on navigation
   useEffect(() => {
     if (!isDesktop) setIsOpen(false);

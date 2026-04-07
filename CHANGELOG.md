@@ -2,6 +2,22 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.23.7] — 2026-04-07
+
+### Fixed
+- Project AI chat now resolves the selected model before first session initialization, reuses the correct concrete session per project, and stays stable during rapid project switching.
+- Main Agent Chat HTTP abort fallback now clears portal stream state after a successful OpenClaw abort, so disconnected aborts no longer look stuck.
+- Project model availability now demotes providers excluded by auth-order overrides instead of surfacing dead defaults first.
+
+### Security
+- Hardened AI file helper routes against traversal by resolving requests only inside the allowed user and project bases.
+- Scoped share-link mutation routes to the correct owner and project instead of raw link id only.
+- Hardened signed direct-content tool URL origin selection and narrowed direct gateway browser exposure.
+
+### Internal
+- Updated portal operator guidance to reflect the real WebSocket chat path, project-session invariants, abort behavior, and Files handoff rules.
+- Excluded private operational docs and backup scripts from public export and release packaging.
+
 ## [3.23.6] — 2026-04-05
 
 ### 🐛 Bug Fixes

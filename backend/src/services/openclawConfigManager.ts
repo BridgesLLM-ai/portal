@@ -171,6 +171,7 @@ export function getProviderStatuses(): ProviderStatus[] {
   const configProfiles = config?.auth?.profiles ?? {};
   const storedProfiles = authProfiles?.profiles ?? {};
   const usageStats = authProfiles?.usageStats ?? {};
+  const authOrder = config?.auth?.order ?? {};
   const defaultModel = getDefaultModel();
   const now = Date.now();
 
@@ -190,6 +191,8 @@ export function getProviderStatuses(): ProviderStatus[] {
     const hasConfigProfile = Boolean(matchingConfigProfileId);
     const hasStoredProfile = Boolean(matchingStoredProfileId);
     const regularProfileConfigured = Boolean(profileId && hasConfigProfile && hasStoredProfile);
+    const providerOrder = authOrder?.[provider.id];
+    const excludedByAuthOrder = Array.isArray(providerOrder) && providerOrder.length === 0;
     const currentModel = provider.id === 'anthropic'
       ? (defaultModel && defaultModel.startsWith('anthropic/') ? defaultModel : null)
       : (defaultModel && defaultModel.startsWith(`${provider.id}/`) ? defaultModel : null);
@@ -206,7 +209,10 @@ export function getProviderStatuses(): ProviderStatus[] {
       status = 'configured';
       effectiveProfileId = profileId;
       effectiveAuthType = storedProfile?.type || configProfiles[matchingConfigProfileId || '']?.mode || null;
-      if (expiresAt && expiresAt <= now) {
+      if (excludedByAuthOrder) {
+        status = 'error';
+        error = 'Provider is excluded by auth.order (empty provider order), so no credentials are eligible.';
+      } else if (expiresAt && expiresAt <= now) {
         status = 'expired';
         error = 'Stored OAuth credentials expired.';
       } else if (cooldownUntil && cooldownUntil > now) {

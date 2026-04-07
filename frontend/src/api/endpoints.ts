@@ -2,8 +2,12 @@ import client from './client';
 import { Metrics, ActivityLog } from '../types';
 
 export const filesAPI = {
-  list: async (path?: string) => {
-    const { data } = await client.get('/files', { params: { path } });
+  list: async (params?: { path?: string; page?: number; limit?: number; search?: string; mime?: string }) => {
+    const { data } = await client.get('/files', { params });
+    return data;
+  },
+  resolve: async (params: { id?: string; path?: string }) => {
+    const { data } = await client.get('/files/resolve', { params });
     return data;
   },
   upload: async (formData: FormData) => {

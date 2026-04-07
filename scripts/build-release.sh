@@ -39,6 +39,7 @@ tar czf "$OUT_FILE" \
   --exclude='backend/.env.production' \
   --exclude='backend/server.log' \
   --exclude='backend/backend.log' \
+  --exclude='frontend/frontend.log' \
   --exclude='*.tar.gz' \
   --exclude='*.map' \
   --exclude='.data' \
@@ -63,11 +64,14 @@ tar czf "$OUT_FILE" \
   --exclude='docs/AGENT-CHAT-STATUS-*.md' \
   --exclude='docs/OPENCLAW-UI-AUDIT-*.md' \
   --exclude='docs/OPENCLAW-PORTAL-COMPAT-VERIFY-*.md' \
+  --exclude='docs/runtime-stabilization-checklist.md' \
   --exclude='backend/test-*.js' \
   --exclude='backend/cleanup-job.js' \
   --exclude='backend/tmp-*.js' \
   --exclude='backend/CLEANUP-README.md' \
   --exclude='backend/.ssh' \
+  --exclude='backup-full.sh' \
+  --exclude='projects' \
   --exclude='assets/avatars' \
   --exclude='assets/assets' \
   --exclude='assets/branding' \

@@ -3,6 +3,7 @@ import { Pencil } from 'lucide-react';
 import AvatarEditor from './AvatarEditor';
 import { useAuthStore } from '../contexts/AuthContext';
 import { isElevated } from '../utils/authz';
+import { setCachedUserAvatarUrl, useUserAvatarUrl } from '../hooks/useUserAvatarUrl';
 
 interface UserAvatarProps {
   size?: string;
@@ -15,48 +16,35 @@ interface UserAvatarProps {
 type GatewayStatus = 'connected' | 'disconnected' | 'checking';
 
 export default function UserAvatar({ size = 'w-10 h-10', ringColor = 'ring-purple-500/50', editable = true, username, assistant = false }: UserAvatarProps) {
-  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+  const userAvatarUrl = useUserAvatarUrl({ enabled: !assistant });
+  const [assistantAvatarUrl, setAssistantAvatarUrl] = useState<string | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [hover, setHover] = useState(false);
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>('checking');
   const { user } = useAuthStore();
-  const cacheKey = assistant ? 'cached_assistantAvatar' : 'cached_userAvatar';
+  const avatarUrl = assistant ? assistantAvatarUrl : userAvatarUrl;
 
   useEffect(() => {
-    // Serve from session cache immediately — zero flicker on section switches
+    if (!assistant) return;
+    const cacheKey = 'cached_assistantAvatar';
     const cached = sessionStorage.getItem(cacheKey);
     if (cached) {
-      setAvatarUrl(cached);
-      // Cache hit — skip the network round-trip entirely for this session
+      setAssistantAvatarUrl(cached);
       return;
     }
 
-    // No cache yet — fetch once and cache for the lifetime of this browser session
-    if (assistant) {
-      fetch('/api/users/assistant-avatar', { headers: {} })
-        .then(r => r.ok ? r.json() : null)
-        .then(data => {
-          if (data?.avatarUrl) {
-            // No cache-busting — let browser cache handle freshness
-            setAvatarUrl(data.avatarUrl);
-            sessionStorage.setItem(cacheKey, data.avatarUrl);
-          }
-        })
-        .catch(() => {
-          // No fallback file — the initial-based circle renders automatically
-        });
-    } else {
-            fetch('/api/users/me/avatar', { headers: {} })
-        .then(r => r.ok ? r.json() : null)
-        .then(data => {
-          if (data?.avatarUrl) {
-            setAvatarUrl(data.avatarUrl);
-            sessionStorage.setItem(cacheKey, data.avatarUrl);
-          }
-        })
-        .catch(() => {});
-    }
-  }, [assistant, cacheKey]);
+    fetch('/api/users/assistant-avatar', { headers: {} })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data?.avatarUrl) {
+          setAssistantAvatarUrl(data.avatarUrl);
+          sessionStorage.setItem(cacheKey, data.avatarUrl);
+        }
+      })
+      .catch(() => {
+        // No fallback file — the initial-based circle renders automatically
+      });
+  }, [assistant]);
 
   // Check OpenClaw gateway connection status (Assistant only)
   useEffect(() => {
@@ -114,7 +102,10 @@ export default function UserAvatar({ size = 'w-10 h-10', ringColor = 'ring-purpl
             src={avatarUrl}
             alt={assistant ? 'Assistant' : username || 'User'}
             className={`avatar-hq ${size} rounded-full object-cover ring-2 ${defaultRing} ${assistant ? 'shadow-lg shadow-emerald-500/20' : ''}`}
-            onError={() => setAvatarUrl(null)}
+            onError={() => {
+              if (assistant) setAssistantAvatarUrl(null);
+              else setCachedUserAvatarUrl(null);
+            }}
           />
         ) : (
           <div className={`${size} rounded-full ring-2 ${defaultRing} ${defaultBg} flex items-center justify-center ${defaultText} font-bold text-sm`}>
@@ -158,12 +149,14 @@ export default function UserAvatar({ size = 'w-10 h-10', ringColor = 'ring-purpl
           isOpen={editorOpen}
           onClose={() => setEditorOpen(false)}
           onSaved={(url) => {
-            // Keep cache-buster to force browser to load the new image
-            setAvatarUrl(url);
-            // Store clean URL for future sessions (browser cache will have the new file by then)
             const cleanUrl = url ? url.replace(/[?&]t=\d+/, '') : null;
-            if (cleanUrl) sessionStorage.setItem(cacheKey, cleanUrl);
-            else sessionStorage.removeItem(cacheKey);
+            if (assistant) {
+              setAssistantAvatarUrl(url);
+              if (cleanUrl) sessionStorage.setItem('cached_assistantAvatar', cleanUrl);
+              else sessionStorage.removeItem('cached_assistantAvatar');
+            } else {
+              setCachedUserAvatarUrl(url, cleanUrl);
+            }
           }}
           currentAvatarUrl={avatarUrl}
           uploadEndpoint={assistant ? '/users/assistant-avatar' : '/users/me/avatar'}

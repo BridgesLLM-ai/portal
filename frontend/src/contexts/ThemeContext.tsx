@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useState, useCallback, type ReactNode } from 'react';
+import { usePublicSettings } from '../hooks/usePublicSettings';
 
 type ThemeMode = 'dark' | 'light' | 'system';
 
@@ -87,33 +88,18 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     return localStorage.getItem(LS_ACCENT_KEY) || DEFAULT_ACCENT;
   });
 
-  const [serverLoaded, setServerLoaded] = useState(false);
+  const publicSettings = usePublicSettings();
 
   const resolvedTheme = resolveTheme(theme);
 
-  // Fetch server appearance settings once on mount
   useEffect(() => {
-    const fetchPublicSettings = async () => {
-      try {
-        const apiUrl = import.meta.env.VITE_API_URL || '';
-        const res = await fetch(`${apiUrl}/settings/public`);
-        if (res.ok) {
-          const data = await res.json();
-          // Only apply server values if user hasn't set a local preference
-          if (!localStorage.getItem(LS_THEME_KEY) && data.theme) {
-            setThemeState(data.theme as ThemeMode);
-          }
-          if (!localStorage.getItem(LS_ACCENT_KEY) && data.accentColor) {
-            setAccentState(data.accentColor);
-          }
-        }
-      } catch {
-        // Server unavailable, stick with defaults/localStorage
-      }
-      setServerLoaded(true);
-    };
-    fetchPublicSettings();
-  }, []);
+    if (!localStorage.getItem(LS_THEME_KEY) && publicSettings?.theme) {
+      setThemeState(publicSettings.theme as ThemeMode);
+    }
+    if (!localStorage.getItem(LS_ACCENT_KEY) && publicSettings?.accentColor) {
+      setAccentState(publicSettings.accentColor);
+    }
+  }, [publicSettings]);
 
   // Apply theme to DOM whenever it changes
   useEffect(() => {

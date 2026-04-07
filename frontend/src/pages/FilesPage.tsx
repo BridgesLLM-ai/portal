@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useDropzone } from 'react-dropzone';
 import { filesAPI } from '../api/endpoints';
@@ -266,6 +267,7 @@ function UploadProgressCard({ upload }: { upload: ActiveUpload }) {
 
 // ─── Main Component ──────────────────────────────────────────
 export default function FilesPage() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
@@ -310,7 +312,7 @@ export default function FilesPage() {
 
   const loadFiles = useCallback(async () => {
     try {
-      const data = await filesAPI.list();
+      const data = await filesAPI.list({ limit: 200 });
       setFiles(Array.isArray(data) ? data : data.files || []);
     } catch (e) {
       console.error('Failed to load files:', e);
@@ -321,6 +323,84 @@ export default function FilesPage() {
   }, [addToast]);
 
   useEffect(() => { loadFiles(); }, [loadFiles]);
+
+  const missingDeepLinkRef = useRef<string | null>(null);
+  const resolvingDeepLinkRef = useRef<string | null>(null);
+
+  const clearPreviewSearchParams = useCallback(() => {
+    const next = new URLSearchParams(searchParams);
+    if (!next.has('file') && !next.has('path')) return;
+    next.delete('file');
+    next.delete('path');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (loading) return;
+    const requestedId = searchParams.get('file');
+    const requestedPath = searchParams.get('path');
+    if (!requestedId && !requestedPath) {
+      missingDeepLinkRef.current = null;
+      resolvingDeepLinkRef.current = null;
+      return;
+    }
+
+    const normalizedRequestedPath = requestedPath?.trim() || '';
+    const match = files.find((file) => {
+      if (requestedId && file.id === requestedId) return true;
+      if (!normalizedRequestedPath) return false;
+      return file.path === normalizedRequestedPath
+        || normalizedRequestedPath.endsWith(`/${file.path}`);
+    });
+
+    if (match) {
+      missingDeepLinkRef.current = null;
+      resolvingDeepLinkRef.current = null;
+      setPreview(current => current?.id === match.id ? current : match);
+      return;
+    }
+
+    const deepLinkKey = `${requestedId || ''}|${requestedPath || ''}`;
+    if (resolvingDeepLinkRef.current === deepLinkKey) return;
+    resolvingDeepLinkRef.current = deepLinkKey;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const resolved = await filesAPI.resolve({ id: requestedId || undefined, path: requestedPath || undefined });
+        if (cancelled || !resolved?.id) return;
+        setFiles(prev => prev.some(file => file.id === resolved.id) ? prev : [resolved, ...prev]);
+        missingDeepLinkRef.current = null;
+        setPreview(current => current?.id === resolved.id ? current : resolved);
+      } catch (err) {
+        if (cancelled) return;
+        setPreview(current => current ? null : current);
+        if (missingDeepLinkRef.current !== deepLinkKey) {
+          addToast('info', 'That file could not be found in your Files library.');
+          missingDeepLinkRef.current = deepLinkKey;
+        }
+        clearPreviewSearchParams();
+      } finally {
+        if (!cancelled && resolvingDeepLinkRef.current === deepLinkKey) {
+          resolvingDeepLinkRef.current = null;
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [addToast, clearPreviewSearchParams, loading, files, searchParams]);
+
+  useEffect(() => {
+    if (!preview) return;
+    const next = new URLSearchParams(searchParams);
+    next.set('file', preview.id);
+    next.set('path', preview.path);
+    if (next.toString() !== searchParams.toString()) {
+      setSearchParams(next, { replace: true });
+    }
+  }, [preview, searchParams, setSearchParams]);
 
   const globalUploadStore = useUploadStore();
 
@@ -927,7 +1007,10 @@ export default function FilesPage() {
           <MediaViewer
             file={preview}
             files={filtered}
-            onClose={() => setPreview(null)}
+            onClose={() => {
+              setPreview(null);
+              clearPreviewSearchParams();
+            }}
             onNavigate={setPreview}
             onDelete={(id) => { requestDelete(id); }}
             onRename={(f) => startRename(f)}
@@ -951,7 +1034,11 @@ export default function FilesPage() {
         confirmLabel="Delete"
         variant="danger"
         icon="trash"
-        onConfirm={() => { executeDelete(); setPreview(null); }}
+        onConfirm={() => {
+          executeDelete();
+          setPreview(null);
+          clearPreviewSearchParams();
+        }}
         onCancel={() => setConfirmDelete(null)}
       />
 

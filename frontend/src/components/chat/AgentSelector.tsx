@@ -395,13 +395,17 @@ export default function AgentSelector({
   const [agents, setAgents] = useState<OpenClawAgent[]>([]);
   const [sessions, setSessions] = useState<GatewaySession[]>([]);
   const [open, setOpen] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [agentsLoading, setAgentsLoading] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
-  // Fetch providers on mount and whenever dropdown opens
+  // Fetch providers lazily when the selector opens. The current provider/agent is
+  // already known from parent state, so Agent Chats should not spend startup budget
+  // populating dropdown options before the user asks for them.
   useEffect(() => {
+    if (!open) return;
     let cancelled = false;
+    setLoading(true);
     async function fetchProviders() {
       try {
         const { data } = await client.get('/gateway/providers');
@@ -423,14 +427,14 @@ export default function AgentSelector({
           }
         }
       } catch {
-        setProviders([{ name: 'OPENCLAW', displayName: 'OpenClaw' }]);
+        if (!cancelled) setProviders([{ name: 'OPENCLAW', displayName: 'OpenClaw' }]);
       } finally {
         if (!cancelled) setLoading(false);
       }
     }
-    fetchProviders();
+    void fetchProviders();
     return () => { cancelled = true; };
-  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open, defaultOpenClawAgentId, onChange, value]);
 
   useEffect(() => {
     if (value !== 'OPENCLAW' || !defaultOpenClawAgentId || !agents.length) return;
@@ -443,9 +447,8 @@ export default function AgentSelector({
     localStorage.setItem(AGENT_STORAGE_KEY, defaultOpenClawAgentId);
   }, [value, agentId, agents, defaultOpenClawAgentId, onChange]);
 
-  // Fetch OpenClaw sub-agents — with localStorage cache and retry for durability.
-  // If the API call fails (auth race, network hiccup, server restart), we fall back
-  // to the last-known-good agent list so the dropdown never silently loses sub-agents.
+  // Fetch OpenClaw sub-agents lazily when the selector opens. Cache still seeds the
+  // UI immediately, but we do not spend first-load bandwidth on hidden dropdown data.
   useEffect(() => {
     let cancelled = false;
 
@@ -476,12 +479,10 @@ export default function AgentSelector({
         if (!cancelled) setAgentsLoading(false);
       } catch {
         if (!cancelled) {
-          // On first failure, retry once after a brief delay (handles auth refresh races)
           if (attempt < 2) {
             setTimeout(() => { if (!cancelled) fetchAgents(attempt + 1); }, 1500);
             return;
           }
-          // After retries exhausted, fall back to cached agents or default
           const cached = loadCachedAgents();
           setAgents(cached || [{ id: 'main', identity: '🤖' }]);
           setAgentsLoading(false);
@@ -489,18 +490,20 @@ export default function AgentSelector({
       }
     }
 
-    // Seed from cache immediately so sub-agents are visible while fetch is in-flight
     const cached = loadCachedAgents();
     if (cached) setAgents(cached);
+    if (!open) return () => { cancelled = true; };
 
-    fetchAgents();
+    void fetchAgents();
     return () => { cancelled = true; };
-  }, []);
+  }, [open]);
 
-  // Fetch sessions for the currently selected provider when supported.
-  // For OpenClaw, optionally filter to the selected sub-agent; for native providers,
-  // request provider-scoped sessions so the transcript list matches that runtime.
+  // Fetch sessions only when the selector is open.
   useEffect(() => {
+    if (!open) {
+      setSessions([]);
+      return;
+    }
     const selectedProvider = providers.find((p) => p.name === value);
     const supportsSessionList = value === 'OPENCLAW' || selectedProvider?.capabilities?.supportsSessionList === true;
     if (!supportsSessionList) {
@@ -523,10 +526,10 @@ export default function AgentSelector({
         if (!cancelled) setSessions([]);
       }
     }
-    fetchSessions();
+    void fetchSessions();
     const interval = setInterval(fetchSessions, 30000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [value, agentId, providers]);
+  }, [open, value, agentId, providers]);
 
   // Close on click outside (desktop only — mobile uses backdrop onClick)
   useEffect(() => {

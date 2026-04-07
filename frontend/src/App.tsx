@@ -4,7 +4,7 @@ import { useAuthStore } from './contexts/AuthContext';
 import { canUseInteractivePortal, isElevated } from './utils/authz';
 import { ChatStateProvider } from './contexts/ChatStateProvider';
 import { activityAPI } from './api/endpoints';
-import { preloadPublicSettings, usePublicSettings } from './hooks/usePublicSettings';
+import { usePublicSettings } from './hooks/usePublicSettings';
 import Layout from './components/Layout';
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
@@ -62,7 +62,6 @@ export default function App() {
   useEffect(() => {
     const bootstrap = async () => {
       try {
-        void preloadPublicSettings();
         const res = await fetch('/api/setup/status');
         if (res.ok) {
           const data = await res.json();

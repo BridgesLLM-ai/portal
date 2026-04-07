@@ -797,7 +797,7 @@ if (config.nodeEnv === 'production') {
   if (fs.existsSync(frontendDist)) {
     app.use(express.static(frontendDist));
     app.get('*', async (req, res, next) => {
-      const nonSpaPrefixes = ['/api', '/share', '/hosted', '/novnc', '/static-assets'];
+      const nonSpaPrefixes = ['/api', '/share', '/hosted', '/novnc', '/static-assets', '/assets'];
       if (nonSpaPrefixes.some(prefix => req.path === prefix || req.path.startsWith(`${prefix}/`))) {
         return next();
       }

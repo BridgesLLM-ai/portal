@@ -76,6 +76,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.23.7 (April 7, 2026)
+- **Project AI chat is materially more stable** — first-open model resolution, concrete per-project session identity, and rapid project switching now behave correctly instead of drifting into stale/default-session weirdness.
+- **Abort behavior is cleaner** — the portal now clears its own stream state after a successful OpenClaw abort, so fallback aborts stop looking stuck.
+- **Security got tighter** — AI file helpers, share-link mutations, signed tool URLs, and browser direct-gateway exposure were all hardened in this pass.
+
 ### v3.23.6 (April 5, 2026)
 - **Mobile Safari / 2FA login is hardened** — when login enters the 2FA step, the portal now explicitly clears stale auth cookies so an old session cannot immediately trigger a bogus refresh failure.
 - **Broken refresh tokens now clean up after themselves** — invalid or expired refresh/logout paths actively expire the browser auth cookies instead of leaving a poisoned session behind.

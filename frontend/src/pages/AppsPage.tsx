@@ -3358,6 +3358,7 @@ export default function AppsPage() {
         <AnimatePresence>
           {agentChatOpen && selectedProject && (
             <ProjectChatPanel
+              key={`project-agent-chat:${selectedProject}`}
               projectName={selectedProject}
               onClose={closeAgentChat}
             />

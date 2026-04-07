@@ -49,7 +49,9 @@ interface PendingAttachment {
   type: 'image' | 'text' | 'other';
   previewUrl?: string;
   textContent?: string;
+  fileId?: string;
   serverPath?: string;
+  toolUrl?: string;
   uploadStatus?: 'uploading' | 'done' | 'error';
   uploadError?: string;
 }
@@ -184,19 +186,25 @@ function getWsUrl(): string {
 /* ═══ Helpers ═══ */
 
 let msgCounter = 0;
+const CHAT_HISTORY_OMITTED_PLACEHOLDER = '[chat.history omitted: message too large]';
+
 function nextId() {
   return 'pmsg-' + Date.now() + '-' + (++msgCounter);
 }
 
 function parseHistoryMessage(m: any): ChatMessage {
+  const rawContent = m.content || '';
+  const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
+
   const msg: ChatMessage = {
     id: m.id || nextId(),
-    role: m.role,
-    content: m.role === 'assistant'
-      ? sanitizeAssistantContent(m.content || '')
-      : (m.content || ''),
+    role: isTruncationPlaceholder ? 'system' : m.role,
+    content: isTruncationPlaceholder
+      ? 'Earlier assistant output was omitted from history because the message was too large.'
+      : (m.role === 'assistant' ? sanitizeAssistantContent(rawContent) : rawContent),
     createdAt: new Date(m.timestamp || Date.now()),
     provenance: m.provenance,
+    model: typeof m.model === 'string' ? m.model : undefined,
   };
   if (m.toolCalls) {
     msg.toolCalls = m.toolCalls.map((tc: any) => ({
@@ -207,6 +215,9 @@ function parseHistoryMessage(m: any): ChatMessage {
       endedAt: Date.now(),
       status: 'done' as const,
     }));
+  }
+  if (Array.isArray(m.segments)) {
+    msg.segments = m.segments;
   }
   if (m.role === 'toolResult') {
     msg.toolCallId = m.toolCallId;
@@ -605,7 +616,19 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const compactionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionKeyRef = useRef<string | null>(null);
+  const historyGenRef = useRef(0);
   const modelRef = useRef(selectedModel);
+
+  const appendSystemNotice = useCallback((content: string) => {
+    const now = Date.now();
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      if (last?.role === 'system' && last.content === content && now - last.createdAt.getTime() < 4000) {
+        return prev;
+      }
+      return [...prev, { id: nextId(), role: 'system', content, createdAt: new Date(now) }];
+    });
+  }, []);
 
   // Scroll
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -724,36 +747,74 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     return currentId;
   }, []);
 
-  const loadHistoryViaWs = useCallback(async (manager: LocalWsManager, session: string) => {
-    const loaded = await new Promise<ChatMessage[]>((resolve, reject) => {
-      const requestId = 'phist-' + Date.now();
-      const histHandler = (d: any) => {
-        if (d.type === 'history' && d.requestId === requestId) {
-          clearTimeout(timeout);
-          manager.removeHandler(histHandler);
-          resolve((d.messages || []).map(parseHistoryMessage));
-        } else if (d.type === 'error' && d.requestId === requestId) {
-          clearTimeout(timeout);
-          manager.removeHandler(histHandler);
-          reject(new Error(d.content));
-        }
-      };
-      const timeout = setTimeout(() => {
-        manager.removeHandler(histHandler);
-        reject(new Error('History timeout'));
-      }, 10000);
-      manager.addHandler(histHandler);
-      const sent = manager.send({ type: 'history', session, provider: 'OPENCLAW', requestId });
-      if (!sent) {
-        clearTimeout(timeout);
-        manager.removeHandler(histHandler);
-        reject(new Error('Live chat socket is disconnected'));
-      }
-    });
+  const isStaleSessionLoad = useCallback((expectedSession: string, expectedGen: number) => {
+    return sessionKeyRef.current !== expectedSession || historyGenRef.current !== expectedGen;
+  }, []);
+
+  const applyActiveStreamSnapshot = useCallback((
+    snapshot: any,
+    expectedSession: string,
+    expectedGen: number,
+    manager?: LocalWsManager | null,
+  ) => {
+    if (!snapshot?.active || isStaleSessionLoad(expectedSession, expectedGen)) return false;
+
+    isStreamActiveRef.current = true;
+    suppressLiveBubbleContentRef.current = true;
+    setIsRunning(true);
+    const resumePhase = snapshot.phase === 'tool' ? 'tool' : snapshot.phase === 'streaming' ? 'streaming' : 'thinking';
+    setStreamingPhase(resumePhase);
+    setActiveToolName(snapshot.toolName || null);
+    setStatusText(snapshot.toolName ? `Using ${snapshot.toolName}…` : (snapshot.statusText || 'Reconnecting to stream…'));
+    setConnectionNotice(null);
+
+    const snapshotCompaction = snapshot.compactionPhase;
+    if (snapshotCompaction === 'compacting' || snapshotCompaction === 'compacted' || snapshotCompaction === 'idle') {
+      compactionPhaseRef.current = snapshotCompaction;
+      setCompactionPhase(snapshotCompaction);
+    }
+
+    const snapshotContent = typeof snapshot.content === 'string' ? sanitizeAssistantContent(snapshot.content) : '';
+    const assistantId = ensureStreamingAssistant(snapshotContent || undefined);
+    resumeSeededContentRef.current = resumePhase === 'streaming' && snapshotContent.length > 0;
+    assembledRef.current = snapshotContent;
+    lastSegmentStartRef.current = 0;
+    lastRawTextLenRef.current = snapshotContent.length;
+
+    if (assistantId && snapshot.model) {
+      const normalizedModel = canonicalizePortalModelId(String(snapshot.model));
+      setMessages(prev => prev.map(m => (
+        m.id === assistantId ? { ...m, model: normalizedModel || m.model } : m
+      )));
+    }
+
+    manager?.send({ type: 'reconnect', session: expectedSession, provider: 'OPENCLAW' });
+    resetWatchdog();
+    return true;
+  }, [ensureStreamingAssistant, isStaleSessionLoad, resetWatchdog]);
+
+  const loadHistorySnapshot = useCallback(async (
+    session: string,
+    options: { expectedGen?: number; manager?: LocalWsManager | null; hydrateActiveStream?: boolean } = {},
+  ) => {
+    const expectedGen = options.expectedGen ?? historyGenRef.current;
+    const { data } = await client.get('/gateway/history', {
+      params: { session, provider: 'OPENCLAW', enhanced: '1' },
+      _silent: true,
+    } as any);
+
+    if (isStaleSessionLoad(session, expectedGen)) return null;
+
+    const loaded = data?.messages ? data.messages.map(parseHistoryMessage) : [];
     setMessages(loaded);
     setSessionError(null);
-    return loaded;
-  }, []);
+
+    if (options.hydrateActiveStream !== false && data?.activeStream?.active) {
+      applyActiveStreamSnapshot(data.activeStream, session, expectedGen, options.manager || null);
+    }
+
+    return { messages: loaded, activeStream: data?.activeStream || null };
+  }, [applyActiveStreamSnapshot, isStaleSessionLoad]);
 
   const clearResumeSeededContent = useCallback((assistantId?: string | null) => {
     if (!resumeSeededContentRef.current) return;
@@ -793,9 +854,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
   const syncStreamState = useCallback(async (
     manager: LocalWsManager | null,
-    options: { reloadHistoryIfIdle?: boolean } = {}
+    options: { reloadHistoryIfIdle?: boolean } = {},
+    context: { expectedSession?: string; expectedGen?: number } = {},
   ) => {
-    const currentSession = sessionKeyRef.current;
+    const currentSession = context.expectedSession || sessionKeyRef.current;
+    const expectedGen = context.expectedGen ?? historyGenRef.current;
     if (!currentSession) return false;
 
     const { data } = await client.get('/gateway/stream-status', {
@@ -803,34 +866,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       _silent: true,
     } as any);
 
+    if (isStaleSessionLoad(currentSession, expectedGen)) return false;
+
     if (data.active) {
-      isStreamActiveRef.current = true;
-      suppressLiveBubbleContentRef.current = true;
-      setIsRunning(true);
-      const resumePhase = data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking';
-      setStreamingPhase(resumePhase);
-      setActiveToolName(data.toolName || null);
-      setStatusText(data.toolName ? `Using ${data.toolName}…` : 'Reconnecting to stream…');
-      setConnectionNotice(null);
-
-      if (resumePhase === 'streaming' && typeof data.content === 'string' && data.content.length > 0) {
-        const safeText = sanitizeAssistantContent(data.content);
-        resumeSeededContentRef.current = true;
-        assembledRef.current = safeText;
-        lastSegmentStartRef.current = 0;
-        lastRawTextLenRef.current = safeText.length;
-        ensureStreamingAssistant(safeText);
-      } else {
-        resumeSeededContentRef.current = false;
-        assembledRef.current = '';
-        lastSegmentStartRef.current = 0;
-        lastRawTextLenRef.current = 0;
-        ensureStreamingAssistant();
-      }
-
-      manager?.send({ type: 'reconnect', session: currentSession, provider: 'OPENCLAW' });
-      resetWatchdog();
-      return true;
+      return applyActiveStreamSnapshot(data, currentSession, expectedGen, manager);
     }
 
     clearWatchdog();
@@ -844,17 +883,23 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       streamingAssistantIdRef.current = null;
     }
 
-    if (options.reloadHistoryIfIdle && manager) {
+    if (options.reloadHistoryIfIdle) {
       setIsLoadingHistory(true);
       try {
-        await loadHistoryViaWs(manager, currentSession);
+        await loadHistorySnapshot(currentSession, {
+          expectedGen,
+          manager,
+          hydrateActiveStream: false,
+        });
       } finally {
-        setIsLoadingHistory(false);
+        if (!isStaleSessionLoad(currentSession, expectedGen)) {
+          setIsLoadingHistory(false);
+        }
       }
     }
 
     return false;
-  }, [clearWatchdog, ensureStreamingAssistant, loadHistoryViaWs, resetWatchdog]);
+  }, [applyActiveStreamSnapshot, clearWatchdog, isStaleSessionLoad, loadHistorySnapshot]);
 
   const appendThinkingChunk = useCallback((assistantId: string | null, chunk: string) => {
     if (!chunk) return;
@@ -900,12 +945,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         compactionPhaseRef.current = 'compacting';
         setCompactionPhase('compacting');
         setStatusText('Compacting context…');
+        appendSystemNotice('Context compaction started.');
         if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
         break;
       }
       case 'compaction_end': {
         compactionPhaseRef.current = 'compacted';
         setCompactionPhase('compacted');
+        appendSystemNotice('Context compaction finished.');
         if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
         compactionTimerRef.current = setTimeout(() => { compactionPhaseRef.current = 'idle'; setCompactionPhase('idle'); compactionTimerRef.current = null; }, 3000);
         setStatusText(null);
@@ -1054,6 +1101,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         const finalText = hasFinal ? sanitizeAssistantContent(data.content) : fst;
         const fc = finalText || '';
         const prov = data.provenance || null;
+        const model = canonicalizePortalModelId(
+          typeof data?.metadata?.model === 'string'
+            ? data.metadata.model
+            : (typeof data?.model === 'string' ? data.model : '')
+        );
         const cid = streamingAssistantIdRef.current;
         setStatusText(null);
         setStreamingPhase('idle');
@@ -1068,7 +1120,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         resumeSeededContentRef.current = false;
         suppressLiveBubbleContentRef.current = false;
         setMessages(prev => prev.map(m =>
-          m.id === cid ? { ...m, content: fc, provenance: prov || undefined } : m
+          m.id === cid ? { ...m, content: fc, provenance: prov || undefined, model: model || m.model } : m
         ));
         break;
       }
@@ -1149,18 +1201,33 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   useEffect(() => {
     let cancelled = false;
     let cleanupTransport: (() => void) | null = null;
+    const myGen = ++historyGenRef.current;
 
     async function init() {
       try {
         setIsLoadingHistory(true);
+        setSessionReady(false);
+        setSessionError(null);
+        setWsConnected(false);
         setConnectionNotice('Connecting to project agent…');
 
+        let preferredModel = modelRef.current;
+        if (!preferredModel) {
+          const discoveredModels = availableModels.length > 0 ? availableModels : await loadAvailableModels();
+          preferredModel = canonicalizePortalModelId(modelRef.current || discoveredModels[0] || '');
+          if (preferredModel && preferredModel !== modelRef.current) {
+            modelRef.current = preferredModel;
+            setSelectedModel(preferredModel);
+          }
+        }
+
         const { data } = await client.post(`/projects/${projectName}/assistant/ensure-session`, {
-          model: modelRef.current,
+          model: preferredModel,
         });
-        if (cancelled) return;
+        if (cancelled || historyGenRef.current !== myGen) return;
 
         const { sessionKey: sk, agentId: aid, model: m } = data;
+        sessionKeyRef.current = sk;
         setSessionKey(sk);
         setAgentId(aid);
         if (m) setSelectedModel(canonicalizePortalModelId(m));
@@ -1168,10 +1235,13 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         const manager = createLocalWsManager(getWsUrl());
         wsRef.current = manager;
 
-        const stableHandler = (d: any) => handleWsEventRef.current(d);
-        manager.addHandler(stableHandler);
+        const stableHandler = (d: any) => {
+          if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) return;
+          handleWsEventRef.current(d);
+        };
 
         const unsubDisconnect = manager.onDisconnect(() => {
+          if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) return;
           setWsConnected(false);
           setConnectionNotice(
             isStreamActiveRef.current
@@ -1186,10 +1256,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         });
 
         const unsubReconnect = manager.onReconnect(async () => {
+          if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) return;
           setWsConnected(true);
           setConnectionNotice(null);
           try {
-            await syncStreamState(manager, { reloadHistoryIfIdle: true });
+            await syncStreamState(manager, { reloadHistoryIfIdle: true }, { expectedSession: sk, expectedGen: myGen });
           } catch (err) {
             console.warn('[ProjectChat] Reconnect sync failed:', err);
           }
@@ -1201,20 +1272,35 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           unsubReconnect();
         };
 
-        if (manager.isConnected()) {
-          setWsConnected(true);
-          setConnectionNotice(null);
-        }
-
-        await new Promise<void>((resolve) => {
+        const waitForInitialConnect = new Promise<void>((resolve) => {
           if (manager.isConnected()) { resolve(); return; }
           const check = setInterval(() => {
-            if (manager.isConnected() || cancelled) { clearInterval(check); resolve(); }
+            if (manager.isConnected() || cancelled || historyGenRef.current !== myGen) {
+              clearInterval(check);
+              resolve();
+            }
           }, 100);
-          setTimeout(() => { clearInterval(check); resolve(); }, 3000);
+          setTimeout(() => {
+            clearInterval(check);
+            resolve();
+          }, 3000);
         });
 
-        if (cancelled) {
+        const historyResult = await loadHistorySnapshot(sk, {
+          expectedGen: myGen,
+          hydrateActiveStream: true,
+        });
+
+        if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) {
+          cleanupTransport?.();
+          manager.close();
+          return;
+        }
+
+        manager.addHandler(stableHandler);
+        await waitForInitialConnect;
+
+        if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) {
           cleanupTransport?.();
           manager.close();
           return;
@@ -1222,24 +1308,24 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
         setWsConnected(manager.isConnected());
         setSessionReady(true);
-        if (manager.isConnected()) setConnectionNotice(null);
-        sessionKeyRef.current = sk;
 
-        await loadHistoryViaWs(manager, sk);
-        await syncStreamState(manager);
+        if (manager.isConnected()) {
+          setConnectionNotice(null);
+          if (historyResult?.activeStream?.active) {
+            manager.send({ type: 'reconnect', session: sk, provider: 'OPENCLAW' });
+          } else {
+            await syncStreamState(manager, { reloadHistoryIfIdle: false }, { expectedSession: sk, expectedGen: myGen });
+          }
+        } else if (!historyResult?.activeStream?.active) {
+          setConnectionNotice('Live chat socket is still reconnecting…');
+        }
 
-        if (!cancelled) {
+        if (!cancelled && historyGenRef.current === myGen) {
           setIsLoadingHistory(false);
         }
       } catch (err: any) {
-        if (!cancelled) {
-          const message = err?.message || 'Failed to initialize session';
-          if (message === 'History timeout' || message === 'Live chat socket is disconnected') {
-            setSessionError(null);
-            setConnectionNotice('Live chat socket is still reconnecting…');
-          } else {
-            setSessionError(message);
-          }
+        if (!cancelled && historyGenRef.current === myGen) {
+          setSessionError(err?.message || 'Failed to initialize session');
           setIsLoadingHistory(false);
         }
       }
@@ -1257,7 +1343,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       if (watchdogRef.current) clearTimeout(watchdogRef.current);
       if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
     };
-  }, [projectName, loadHistoryViaWs, syncStreamState]);
+  }, [projectName, loadHistorySnapshot, syncStreamState]);
 
   // ── Send message ──
   const sendMessage = useCallback((text: string) => {
@@ -1372,8 +1458,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       const resp = await fetch('/api/files/', { method: 'POST', credentials: 'include', body: formData });
       if (!resp.ok) throw new Error(`Upload failed: ${resp.status}`);
       const data = await resp.json();
-      const serverPath = data.diskPath || `/var/portal-files/uploads/${data.path}`;
-      setPendingAttachments(prev => prev.map(a => a.id === attachId ? { ...a, serverPath, uploadStatus: 'done' as const } : a));
+      const fileId = typeof data?.id === 'string' ? data.id : undefined;
+      const serverPath = typeof data?.diskPath === 'string' ? data.diskPath : undefined;
+      const toolUrl = typeof data?.toolUrl === 'string' ? data.toolUrl : undefined;
+      setPendingAttachments(prev => prev.map(a => a.id === attachId ? { ...a, fileId, serverPath, toolUrl, uploadStatus: 'done' as const } : a));
     } catch (err: any) {
       setPendingAttachments(prev => prev.map(a => a.id === attachId ? { ...a, uploadStatus: 'error' as const, uploadError: err.message } : a));
     }
@@ -1411,10 +1499,57 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     if (pendingAttachments.length === 0) return '';
     const parts: string[] = [];
     for (const att of pendingAttachments) {
-      if (att.type === 'image' && att.serverPath) parts.push(`[Image attached: ${att.name} (server path: ${att.serverPath})]`);
-      else if (att.type === 'text' && att.textContent) parts.push(`\`\`\`${att.name}\n${att.textContent}\n\`\`\``);
-      else if (att.serverPath) parts.push(`[File attached: ${att.name} (server path: ${att.serverPath})]`);
-      else parts.push(`[File attached: ${att.name}]`);
+      const fileHref = att.fileId
+        ? `/files?file=${encodeURIComponent(att.fileId)}`
+        : att.serverPath
+          ? `/files?path=${encodeURIComponent(att.serverPath)}`
+          : '';
+      const portalUrl = fileHref ? `${window.location.origin}${fileHref}` : '';
+      const diskPathLine = att.serverPath ? `- server_path: ${att.serverPath}` : null;
+      const toolUrlLine = att.toolUrl ? `- tool_url: ${att.toolUrl}` : null;
+      const portalLine = portalUrl ? `- portal_url: ${portalUrl}` : null;
+      if (att.type === 'text' && att.textContent) {
+        parts.push([
+          `Attached text file: ${att.name}`,
+          diskPathLine,
+          portalLine,
+          'The file content is inlined below.',
+          `\`\`\`${att.name}\n${att.textContent}\n\`\`\``,
+        ].filter(Boolean).join('\n'));
+        continue;
+      }
+      const typeHint = att.type === 'image'
+        ? [
+            'This is an image attachment.',
+            'IMPORTANT: prefer tool_url when present because the gateway host may differ from the portal host.',
+            att.toolUrl
+              ? `Use the image tool with image="${att.toolUrl}".`
+              : att.serverPath
+                ? `Use the image tool with image="${att.serverPath}".`
+                : 'Use the image tool on tool_url or server_path.',
+            'Do not say you cannot access the image unless the tool itself returns an error.',
+          ].join(' ')
+        : /\.pdf$/i.test(att.name)
+          ? [
+              'This is a PDF attachment.',
+              'IMPORTANT: prefer tool_url when present because the gateway host may differ from the portal host.',
+              att.toolUrl
+                ? `Use the pdf tool with pdf="${att.toolUrl}".`
+                : att.serverPath
+                  ? `Use the pdf tool with pdf="${att.serverPath}".`
+                  : 'Use the pdf tool on tool_url or server_path.',
+              'Do not say you cannot access the PDF unless the tool itself returns an error.',
+            ].join(' ')
+          : 'This file is attached on disk. Use tool_url or server_path to inspect it if needed.';
+      parts.push([
+        `Attached file: ${att.name}`,
+        `- kind: ${att.type}`,
+        `- size: ${att.size} bytes`,
+        diskPathLine,
+        toolUrlLine,
+        portalLine,
+        typeHint,
+      ].filter(Boolean).join('\n'));
     }
     return parts.join('\n\n') + '\n\n';
   }, [pendingAttachments]);
@@ -1598,7 +1733,15 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
       {/* Messages */}
       <div ref={scrollRef} className="flex-1 overflow-auto" onScroll={handleScroll}>
-        {isLoadingHistory ? (
+        {isLoadingHistory && messages.length > 0 && (
+          <div className="sticky top-0 z-[5] flex justify-center pt-2 px-3 pointer-events-none">
+            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/[0.06] border border-white/[0.08] text-[10px] text-slate-400 backdrop-blur-sm">
+              <Loader2 size={10} className="animate-spin" />
+              <span>Refreshing chat…</span>
+            </div>
+          </div>
+        )}
+        {isLoadingHistory && messages.length === 0 ? (
           <div className="flex items-center justify-center py-12">
             <Loader2 size={18} className="animate-spin text-slate-500" />
             <span className="ml-2 text-xs text-slate-500">Loading history…</span>
@@ -1627,6 +1770,16 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                 );
               }
 
+              if (msg.role === 'system') {
+                return (
+                  <div key={msg.id} className="px-3 py-1.5">
+                    <div className="mx-auto max-w-[90%] rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-center text-[10px] tracking-wide text-slate-400">
+                      {msg.content}
+                    </div>
+                  </div>
+                );
+              }
+
               if (msg.role === 'toolResult') {
                 return <ToolResultPill key={msg.id} message={msg} />;
               }
@@ -1644,9 +1797,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                 const visibleContent = suppressCurrentBubbleText ? '' : msg.content;
                 const hasContent = !!visibleContent;
                 const thinkingContent = msg.thinkingContent;
+                const modelLabel = msg.model ? modelDisplayName(msg.model) : '';
+                const timeLabel = msg.createdAt ? msg.createdAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
 
                 return (
-                  <div key={msg.id} className="px-3 py-1.5">
+                  <div key={msg.id} className="px-3 py-1.5 group">
                     {/* Thinking block — hidden during active streaming (status bar shows it) */}
                     <AnimatePresence>
                       {thinkingContent && !isCurrentlyStreaming && (
@@ -1703,9 +1858,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                               </>
                             )}
                           </div>
-                          {/* Actions */}
-                          <div className="flex items-center gap-1 mt-0.5 ml-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                            {hasContent && <CopyButton text={msg.content} />}
+                          {/* Footer + actions */}
+                          <div className="flex items-center gap-2 mt-1 ml-1 min-h-[16px]">
+                            {msg.provenance ? <span className="text-[10px] text-slate-500 italic truncate">{msg.provenance}</span> : null}
+                            {modelLabel ? <span className="text-[10px] text-slate-500 truncate">• {modelLabel}</span> : null}
+                            {timeLabel ? <span className="text-[10px] text-slate-600 truncate">• {timeLabel}</span> : null}
+                            <div className="flex items-center gap-1 ml-auto opacity-0 group-hover:opacity-100 transition-opacity">
+                              {hasContent && <CopyButton text={msg.content} />}
+                            </div>
                           </div>
                         </div>
                       </div>

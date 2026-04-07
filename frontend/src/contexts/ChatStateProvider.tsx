@@ -32,11 +32,10 @@ import {
   type GatewayChatMessage,
 } from '../utils/openclawGatewayClient';
 import { canonicalizePortalModelId } from '../utils/modelId';
+import { usePublicSettings } from '../hooks/usePublicSettings';
 
 const DEBUG_CHAT_STATE = import.meta.env.DEV;
-// Feature flag: Use direct gateway connection for OPENCLAW provider
-// Set to true to bypass the portal WS middleman
-const USE_DIRECT_GATEWAY = import.meta.env.VITE_USE_DIRECT_GATEWAY === 'true';
+const BUILD_TIME_USE_DIRECT_GATEWAY = import.meta.env.VITE_USE_DIRECT_GATEWAY === 'true';
 const debugLog = (...args: unknown[]) => {
   if (DEBUG_CHAT_STATE) console.debug('[ChatState]', ...args);
 };
@@ -81,6 +80,7 @@ export interface ChatMessage {
   createdAt: Date;
   queued?: boolean;
   provenance?: string;
+  model?: string;
   toolCalls?: ToolCall[];
   thinkingContent?: string;
   toolCallId?: string;
@@ -317,6 +317,7 @@ function parseHistoryMessage(m: any): ChatMessage {
       : (m.role === 'assistant' ? sanitizeAssistantContent(rawContent) : rawContent),
     createdAt: new Date(m.timestamp || Date.now()),
     provenance: m.provenance,
+    model: typeof m.model === 'string' ? m.model : undefined,
   };
   if (m.toolCalls) {
     msg.toolCalls = m.toolCalls.map((tc: any) => ({
@@ -403,6 +404,7 @@ function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage {
       ? 'Earlier assistant output was omitted from history because the message was too large.'
       : (msg.role === 'assistant' ? sanitizeAssistantContent(text) : text),
     createdAt: new Date(msg.timestamp || Date.now()),
+    model: typeof (msg as any).model === 'string' ? (msg as any).model : undefined,
     toolCalls,
     thinkingContent: thinking,
   };
@@ -549,6 +551,7 @@ export interface ChatStateContextValue {
   compactionModelLoading: boolean;
   compactionModelError: string | null;
   sessionControlsSupported: boolean;
+  ensureSessionControlsMetadataLoaded: () => Promise<void>;
 }
 
 const ChatStateContext = createContext<ChatStateContextValue | null>(null);
@@ -561,18 +564,31 @@ export function useChatState(): ChatStateContextValue {
 
 /* ═══ Provider Component ═══ */
 
+function normalizeInitialSession(provider: string, session: string): string {
+  const p = String(provider || '').trim().toUpperCase();
+  const s = String(session || '').trim() || 'main';
+  if (p === 'OPENCLAW' && s === 'main') return 'agent:main:main';
+  return s;
+}
+
 export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
   const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive'];
   const FAST_MODEL_STORAGE_KEY = 'agent-chat-fast-model';
+  const publicSettings = usePublicSettings();
+  const useDirectGateway = publicSettings?.useDirectGateway ?? BUILD_TIME_USE_DIRECT_GATEWAY;
 
   // Persisted selection state
   const [provider, setProviderRaw] = useState(
     () => localStorage.getItem('agent-chat-provider') || 'OPENCLAW',
   );
-  const [session, setSessionRaw] = useState(
-    () => localStorage.getItem('agent-chat-session') || 'main',
-  );
+  const [session, setSessionRaw] = useState(() => {
+    const storedProvider = localStorage.getItem('agent-chat-provider') || 'OPENCLAW';
+    const storedSession = localStorage.getItem('agent-chat-session') || 'main';
+    const normalized = normalizeInitialSession(storedProvider, storedSession);
+    if (normalized !== storedSession) localStorage.setItem('agent-chat-session', normalized);
+    return normalized;
+  });
   const [agentId, setAgentIdRaw] = useState<string | undefined>(
     () => localStorage.getItem('agent-chat-agentId') || undefined,
   );
@@ -602,8 +618,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
   const setSession = useCallback((s: string) => {
-    localStorage.setItem('agent-chat-session', s);
-    setSessionRaw(s);
+    const normalized = normalizeInitialSession(providerRef.current, s);
+    localStorage.setItem('agent-chat-session', normalized);
+    setSessionRaw(normalized);
   }, []);
   const setAgentId = useCallback((a: string | undefined) => {
     if (a) localStorage.setItem('agent-chat-agentId', a);
@@ -616,6 +633,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (normalized) localStorage.setItem(MODEL_STORAGE_PREFIX + provider, normalized);
     else localStorage.removeItem(MODEL_STORAGE_PREFIX + provider);
   }, [provider]);
+
+  useEffect(() => {
+    const normalized = normalizeInitialSession(provider, session);
+    if (normalized !== session) {
+      localStorage.setItem('agent-chat-session', normalized);
+      setSessionRaw(normalized);
+    }
+  }, [provider, session]);
 
   const deriveSessionModel = useCallback((sessionInfo: any): string => {
     const joinModel = (providerName: string, modelName: string): string => {
@@ -675,6 +700,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const [streamingPhase, setStreamingPhase] = useState<StreamingPhase>('idle');
   const [activeToolName, setActiveToolName] = useState<string | null>(null);
   const [thinkingContent, setThinkingContent] = useState<string>('');
+  const [startupReady, setStartupReady] = useState(false);
   // Graduated streaming segments — when a tool call starts, current accumulated text
   // gets "graduated" into a segment so it renders as a finalized bubble. This matches
   // the OpenClaw web UI v2 pattern where thoughts don't disappear on tool transitions.
@@ -694,17 +720,19 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const [compactionModelOverride, setCompactionModelOverrideState] = useState<string>('');
   const [compactionModelLoading, setCompactionModelLoading] = useState(false);
   const [compactionModelError, setCompactionModelError] = useState<string | null>(null);
+  const [sessionControlsMetadataLoaded, setSessionControlsMetadataLoaded] = useState(false);
 
   // Refs
   const streamWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const STREAM_TIMEOUT_MS = 90_000;
   const compactionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reconnectCatchUpTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const toolCounterRef = useRef(0);
   const hasRealToolEventsRef = useRef(false);
+  const sessionControlsMetadataPromiseRef = useRef<Promise<void> | null>(null);
   const wsManagerRef = useRef<WsManager | null>(null);
   // Direct gateway client for OPENCLAW provider (bypasses portal WS middleman)
   const directClientRef = useRef<OpenClawGatewayClient | null>(null);
+  const streamTransportRef = useRef<'portal' | 'direct' | null>(null);
   const currentRunIdRef = useRef<string | null>(null);
   const streamingAssistantIdRef = useRef<string | null>(null);
   const assembledRef = useRef('');
@@ -734,17 +762,25 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => { modelRef.current = selectedModel; }, [selectedModel]);
   useEffect(() => { messageQueueRef.current = messageQueue; }, [messageQueue]);
 
-  useEffect(() => {
-    let cancelled = false;
+  const ensureSessionControlsMetadataLoaded = useCallback(async () => {
+    if (!startupReady || provider !== 'OPENCLAW' || !session || !session.startsWith('agent:')) return;
+    if (sessionControlsMetadataLoaded) return;
+    if (sessionControlsMetadataPromiseRef.current) {
+      await sessionControlsMetadataPromiseRef.current;
+      return;
+    }
 
-    const syncSelectedSessionModel = async () => {
-      if (provider !== 'OPENCLAW' || !session || !session.startsWith('agent:')) return;
-      try {
-        // Use silent mode — 404 is expected for expired/stale sessions and
-        // should not trigger error sounds or the ErrorPanel.
-        const data = await gatewayAPI.sessionInfo(session, { silent: true });
+    const loadPromise = (async () => {
+      setCompactionModelError(null);
+      const [sessionInfoResult, compactionResult] = await Promise.allSettled([
+        gatewayAPI.sessionInfo(session, { silent: true }),
+        gatewayAPI.getConfigPath('agents.defaults.compaction.model'),
+      ]);
+
+      if (sessionInfoResult.status === 'fulfilled') {
+        const data = sessionInfoResult.value;
         const actualModel = deriveSessionModel(data?.session);
-        if (!cancelled && actualModel) {
+        if (actualModel) {
           setSelectedModelRaw((prev) => (prev === actualModel ? prev : actualModel));
         }
         const sessionThinking = String(
@@ -753,30 +789,47 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           || data?.session?.settings?.thinking
           || '',
         ).toLowerCase();
-        if (!cancelled && THINKING_LEVELS.includes(sessionThinking as ThinkingLevel)) {
+        if (THINKING_LEVELS.includes(sessionThinking as ThinkingLevel)) {
           setThinkingLevelState(sessionThinking as ThinkingLevel);
-        } else if (!cancelled) {
-          // No explicit thinking level set — infer default from model.
-          // Anthropic Claude 4.6+ models default to adaptive thinking.
+        } else {
           const modelStr = String(actualModel || '').toLowerCase();
           const isAdaptiveDefault = /claude-(opus|sonnet)-4[._-](5|6|7|8|9)|claude-(opus|sonnet)-[5-9]/.test(modelStr);
           setThinkingLevelState(isAdaptiveDefault ? 'adaptive' : 'off');
         }
-        if (!cancelled) {
-          setFastModeEnabled(Boolean(
-            data?.session?.fastMode
-            ?? data?.session?.settings?.fastMode
-            ?? false,
-          ));
-        }
-      } catch {
-        // Keep the locally selected model if the session lookup fails.
+        setFastModeEnabled(Boolean(
+          data?.session?.fastMode
+          ?? data?.session?.settings?.fastMode
+          ?? false,
+        ));
       }
-    };
 
-    syncSelectedSessionModel();
-    return () => { cancelled = true; };
-  }, [provider, session, deriveSessionModel]);
+      if (compactionResult.status === 'fulfilled') {
+        const value = typeof compactionResult.value?.value === 'string' ? compactionResult.value.value.trim() : '';
+        setCompactionModelOverrideState(value);
+      } else {
+        setCompactionModelOverrideState('');
+      }
+
+      setSessionControlsMetadataLoaded(true);
+    })();
+
+    sessionControlsMetadataPromiseRef.current = loadPromise;
+    try {
+      await loadPromise;
+    } finally {
+      sessionControlsMetadataPromiseRef.current = null;
+    }
+  }, [startupReady, provider, session, sessionControlsMetadataLoaded, deriveSessionModel]);
+
+  useEffect(() => {
+    setSessionControlsMetadataLoaded(false);
+    sessionControlsMetadataPromiseRef.current = null;
+    setThinkingLevelState('off');
+    setFastModeEnabled(false);
+    setBaseModel(null);
+    setCompactionModelOverrideState('');
+    setCompactionModelError(null);
+  }, [provider, session]);
 
   const normalizeAgentError = useCallback((err: unknown, fallback = 'Agent request failed') => {
     const raw = err instanceof Error ? err.message : String(err || '').trim();
@@ -814,7 +867,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, content: safeText } : m));
             }
           }
-          if (USE_DIRECT_GATEWAY && currentProvider === 'OPENCLAW') {
+          if (useDirectGateway && currentProvider === 'OPENCLAW') {
             directClientRef.current?.connect();
           } else if (wsManagerRef.current && !wsManagerRef.current.isConnected()) {
             wsManagerRef.current.reconnect();
@@ -843,7 +896,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         streamingAssistantIdRef.current = null;
       }
     }, STREAM_TIMEOUT_MS);
-  }, []);
+  }, [useDirectGateway]);
   const clearStreamWatchdog = useCallback(() => {
     if (streamWatchdogRef.current) { clearTimeout(streamWatchdogRef.current); streamWatchdogRef.current = null; }
   }, []);
@@ -858,6 +911,17 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     return sessionKey;
   }, [user]);
 
+  const appendSystemNotice = useCallback((content: string) => {
+    const now = Date.now();
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      if (last?.role === 'system' && last.content === content && now - last.createdAt.getTime() < 4000) {
+        return prev;
+      }
+      return [...prev, { id: nextId(), role: 'system', content, createdAt: new Date(now) }];
+    });
+  }, []);
+
   const applyCompactionState = useCallback((phase: 'start' | 'end') => {
     if (providerRef.current !== 'OPENCLAW') return;
     if (phase === 'start') {
@@ -865,17 +929,19 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       compactionPhaseRef.current = 'compacting';
       setCompactionPhase('compacting');
       setThinkingContent('');
+      appendSystemNotice('Context compaction started.');
       return;
     }
     compactionPhaseRef.current = 'compacted';
     setCompactionPhase('compacted');
+    appendSystemNotice('Context compaction finished.');
     if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
     compactionTimerRef.current = setTimeout(() => {
       compactionPhaseRef.current = 'idle';
       setCompactionPhase('idle');
       compactionTimerRef.current = null;
     }, 3000);
-  }, []);
+  }, [appendSystemNotice]);
 
   const mergeStreamText = useCallback((incoming?: string, opts?: { replace?: boolean }) => {
     const chunk = typeof incoming === 'string' ? incoming : '';
@@ -890,6 +956,48 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: text } : m));
   }, []);
 
+  const ensureStreamingAssistantBubble = useCallback((params?: {
+    idPrefix?: string;
+    content?: string;
+    resetIfCreated?: boolean;
+  }) => {
+    const prefix = params?.idPrefix || 'stream';
+    let assistantId = streamingAssistantIdRef.current;
+    let created = false;
+    if (!assistantId) {
+      assistantId = `${prefix}-${Date.now()}`;
+      streamingAssistantIdRef.current = assistantId;
+      created = true;
+      if (params?.resetIfCreated) {
+        assembledRef.current = '';
+        lastSegmentStartRef.current = 0;
+        lastRawTextLenRef.current = 0;
+        toolCounterRef.current = 0;
+        hasRealToolEventsRef.current = false;
+        setThinkingContent('');
+      }
+    }
+
+    const maybeContent = typeof params?.content === 'string' ? params.content : null;
+    setMessages(prev => {
+      const index = prev.findIndex(m => m.id === assistantId);
+      if (index >= 0) {
+        if (maybeContent === null) return prev;
+        const next = [...prev];
+        next[index] = { ...next[index], content: maybeContent };
+        return next;
+      }
+      return [...prev, {
+        id: assistantId!,
+        role: 'assistant' as const,
+        content: maybeContent ?? '',
+        createdAt: new Date(),
+        toolCalls: [],
+      }];
+    });
+    return { assistantId, created };
+  }, []);
+
   const appendThinkingChunk = useCallback((assistantId: string | null, chunk: string) => {
     if (!chunk) return;
     setThinkingContent(prev => mergeThinkingStream(prev, chunk));
@@ -901,17 +1009,118 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     ));
   }, []);
 
+  const clearActiveStreamState = useCallback(() => {
+    clearStreamWatchdog();
+    isStreamActiveRef.current = false;
+    streamTransportRef.current = null;
+    setIsRunning(false);
+    setStreamingPhase('idle');
+    setStatusText(null);
+    setActiveToolName(null);
+  }, [clearStreamWatchdog]);
+
+  const applyOpenClawActiveStreamSnapshot = useCallback((snapshot: any, options?: {
+    statusTextWhenNoTool?: string | null;
+    source?: 'portal' | 'direct';
+  }) => {
+    if (!snapshot?.active) return false;
+    isStreamActiveRef.current = true;
+    streamTransportRef.current = options?.source || 'portal';
+    setIsRunning(true);
+    setStreamingPhase(snapshot.phase === 'tool' ? 'tool' : snapshot.phase === 'streaming' ? 'streaming' : 'thinking');
+    setActiveToolName(snapshot.toolName || null);
+    setStatusText(snapshot.toolName ? `Using ${snapshot.toolName}…` : ((snapshot.statusText || options?.statusTextWhenNoTool) ?? null));
+    const snapshotCompaction = snapshot.compactionPhase;
+    if (snapshotCompaction === 'compacting' || snapshotCompaction === 'compacted' || snapshotCompaction === 'idle') {
+      compactionPhaseRef.current = snapshotCompaction;
+      setCompactionPhase(snapshotCompaction);
+    }
+    if (snapshot.provenance) setLastProvenance(String(snapshot.provenance));
+    const snapshotContent = typeof snapshot.content === 'string' ? sanitizeAssistantContent(snapshot.content) : '';
+    if (snapshotContent) {
+      mergeStreamText(snapshotContent, { replace: true });
+    }
+    const { assistantId } = ensureStreamingAssistantBubble({
+      idPrefix: 'stream-resume',
+      content: snapshotContent || '',
+    });
+    if (snapshot.model && assistantId) {
+      setMessages(prev => prev.map(m => (
+        m.id === assistantId
+          ? { ...m, model: normalizeProviderModel(providerRef.current, String(snapshot.model)) }
+          : m
+      )));
+    }
+    resetStreamWatchdog();
+    return true;
+  }, [ensureStreamingAssistantBubble, mergeStreamText, resetStreamWatchdog]);
+
+  const hydrateActiveStream = useCallback(async (
+    sessionKey: string,
+    prov?: string,
+    snapshot?: any,
+    options?: { clearIfInactive?: boolean; reconnect?: boolean },
+  ) => {
+    if (!sessionKey || prov !== 'OPENCLAW') return false;
+    const expectedSession = sessionKey;
+    const expectedProvider = prov;
+    const expectedHistoryGen = historyGenRef.current;
+    try {
+      let data = snapshot;
+      if (!data) {
+        const params: Record<string, string> = { session: sessionKey };
+        if (prov) params.provider = prov;
+        const response = await client.get('/gateway/stream-status', { params, _silent: true } as any);
+        data = response.data;
+      }
+      if (
+        sessionRef.current !== expectedSession
+        || providerRef.current !== expectedProvider
+        || historyGenRef.current !== expectedHistoryGen
+      ) {
+        debugLog('[ChatState] Ignoring stale active-stream snapshot', {
+          expectedSession,
+          currentSession: sessionRef.current,
+          expectedProvider,
+          currentProvider: providerRef.current,
+          expectedHistoryGen,
+          currentHistoryGen: historyGenRef.current,
+        });
+        return false;
+      }
+      if (!data?.active) {
+        if (options?.clearIfInactive && isStreamActiveRef.current) {
+          debugLog('[ChatState] Active-stream snapshot is idle — clearing stale stream UI');
+          clearActiveStreamState();
+        }
+        return false;
+      }
+      if (isStreamActiveRef.current) return true;
+      debugLog('[ChatState] Active stream found during history load — hydrating');
+      applyOpenClawActiveStreamSnapshot(data, { statusTextWhenNoTool: 'Reconnecting to stream…' });
+      const manager = wsManagerRef.current;
+      if (options?.reconnect !== false && manager?.isConnected()) {
+        manager.send({ type: 'reconnect', session: sessionKey, provider: prov });
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }, [applyOpenClawActiveStreamSnapshot, clearActiveStreamState]);
+
   // History loader
-  const loadHistoryInternal = useCallback(async (sessionKey: string, prov?: string, options?: { force?: boolean }): Promise<void> => {
-    if (!sessionKey || (isStreamActiveRef.current && !options?.force)) return;
+  const loadHistoryInternal = useCallback(async (sessionKey: string, prov?: string, options?: { force?: boolean }): Promise<boolean> => {
+    if (!sessionKey || (isStreamActiveRef.current && !options?.force)) return false;
     // Snapshot the current generation — if it changes while we await, discard results.
     const myGen = ++historyGenRef.current;
     setIsLoadingHistory(true);
 
+    let historyActiveStream: any = undefined;
     const loadViaHttp = async (): Promise<ChatMessage[]> => {
       const params: Record<string, string> = { session: sessionKey, enhanced: '1' };
       if (prov) params.provider = prov;
       const { data } = await client.get('/gateway/history', { params });
+      historyActiveStream = data?.activeStream;
       return data.messages ? data.messages.map(parseHistoryMessage) : [];
     };
 
@@ -934,10 +1143,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     try {
       let loaded: ChatMessage[];
 
-      // Try direct gateway for OPENCLAW when enabled
+      // For OPENCLAW, prefer HTTP history unless the direct gateway is already connected.
+      // That keeps history + activeStream hydration in one request and avoids the portal WS
+      // timeout tax on fresh reopen.
       const directClient = directClientRef.current;
-      console.log('[ChatState] loadHistoryInternal: USE_DIRECT=', USE_DIRECT_GATEWAY, 'prov=', prov, 'directConnected=', directClient?.isConnected, 'session=', sessionKey, 'force=', options?.force);
-      if (USE_DIRECT_GATEWAY && prov === 'OPENCLAW' && directClient?.isConnected) {
+      const useDirectHistory = useDirectGateway && prov === 'OPENCLAW' && directClient?.isConnected && !options?.force;
+      console.log('[ChatState] loadHistoryInternal: USE_DIRECT=', useDirectGateway, 'prov=', prov, 'directConnected=', directClient?.isConnected, 'session=', sessionKey, 'force=', options?.force);
+      if (useDirectHistory) {
         try {
           console.log('[ChatState] 📜 Loading history via DIRECT gateway');
           loaded = await loadViaDirect();
@@ -945,8 +1157,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           console.warn('[ChatState] Direct gateway history failed; falling back to HTTP', err);
           loaded = await loadViaHttp();
         }
+      } else if (prov === 'OPENCLAW') {
+        loaded = await loadViaHttp();
       } else {
-        // Use existing portal WS or HTTP path
+        // Non-OpenClaw providers can still use the existing portal WS fast path.
         const manager = wsManagerRef.current;
         if (manager && manager.isConnected()) {
           try {
@@ -966,7 +1180,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               const timeout = setTimeout(() => {
                 manager.removeHandler(handler);
                 reject(new Error('History timeout'));
-              }, 5000);
+              }, 1500);
               manager.addHandler(handler);
               const sent = manager.send({ type: 'history', session: sessionKey, provider: prov, requestId });
               if (!sent) {
@@ -985,17 +1199,27 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
 
       // Only apply if still the current generation
-      if (historyGenRef.current === myGen) setMessages(mergeToolResultsIntoToolCalls(dedupeHistoryMessages(loaded)));
+      if (historyGenRef.current === myGen) {
+        setMessages(mergeToolResultsIntoToolCalls(dedupeHistoryMessages(loaded)));
+        if (!useDirectHistory) {
+          return await hydrateActiveStream(sessionKey, prov, historyActiveStream, {
+            clearIfInactive: Boolean(options?.force),
+          });
+        }
+      }
     } catch (err) {
       console.error('[ChatState] History load failed:', err);
       if (historyGenRef.current === myGen) setMessages([]);
+      return false;
     } finally {
       if (historyGenRef.current === myGen) {
         setIsLoadingHistory(false);
         setIsSwitchingSession(false);
+        setStartupReady(true);
       }
     }
-  }, [resolveOpenClawSessionKey]);
+    return false;
+  }, [hydrateActiveStream, resolveOpenClawSessionKey, useDirectGateway]);
 
   const loadHistory = useCallback(async (sessionKey: string, prov?: string) => {
     await loadHistoryInternal(sessionKey, prov);
@@ -1030,61 +1254,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const currentSession = sessionRef.current;
     const currentProvider = providerRef.current;
     if (!currentSession) return;
-    debugLog('[ChatState] Manual refresh — reloading history + checking stream');
+    debugLog('[ChatState] Manual refresh — reloading history');
     try {
-      // 1. Always reload committed history first (applies server-side text filtering
-      //    and merges tool results into pills — live streaming accumulates text that
-      //    includes pre-tool narration, which the JSONL parser strips out).
       await loadHistoryInternal(currentSession, currentProvider, { force: true });
-
-      // 2. Then check if there's an active stream we should reconnect to
-      const params: Record<string, string> = { session: currentSession };
-      if (currentProvider) params.provider = currentProvider;
-      const { data } = await client.get('/gateway/stream-status', { params });
-      if (data.active) {
-        debugLog('[ChatState] Active stream found on refresh — resubscribing');
-        isStreamActiveRef.current = true;
-        setIsRunning(true);
-        setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
-        if (data.toolName) setActiveToolName(data.toolName);
-        if (typeof data.content === 'string' && data.content.length > 0) {
-          const safeText = sanitizeAssistantContent(data.content);
-          mergeStreamText(safeText, { replace: true });
-          upsertStreamingAssistant(safeText);
-        }
-        wsManagerRef.current?.send({ type: 'reconnect', session: currentSession });
-
-        // B19 fix: Stale stream watchdog — if no stream events arrive within 8s,
-        // re-check stream-status and reset if the stream has ended. Prevents
-        // indefinite "thinking" state when stream-status was stale.
-        const staleSession = currentSession;
-        const staleProvider = currentProvider;
-        setTimeout(async () => {
-          if (!isStreamActiveRef.current) return; // already resolved
-          try {
-            const staleParams: Record<string, string> = { session: staleSession };
-            if (staleProvider) staleParams.provider = staleProvider;
-            const { data: recheck } = await client.get('/gateway/stream-status', { params: staleParams, _silent: true } as any);
-            if (!recheck.active && isStreamActiveRef.current) {
-              debugLog('[ChatState] Stale stream detected — resetting to idle');
-              isStreamActiveRef.current = false;
-              setIsRunning(false);
-              setStreamingPhase('idle');
-              setStatusText(null);
-              setActiveToolName(null);
-            }
-          } catch { /* best-effort */ }
-        }, 8000);
-      } else if (isStreamActiveRef.current) {
-        // Stream ended — clean up
-        isStreamActiveRef.current = false;
-        setIsRunning(false);
-        setStreamingPhase('idle');
-        setStatusText(null);
-      }
     } catch (err) {
       console.error('[ChatState] Refresh error:', err);
-      // Still try to reload history even if stream-status fails
       try { await loadHistoryInternal(currentSession, currentProvider); } catch {}
     }
   }, [loadHistoryInternal]);
@@ -1095,41 +1269,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // messages array is already empty by the time this effect fires.
   useEffect(() => {
     if (session && !isStreamActiveRef.current) {
+      setStartupReady(false);
       setIsLoadingHistory(true); // show spinner immediately, before async fetch
-      loadHistoryInternal(session, provider).then(() => {
-        // After loading history, check if there's an active stream to reconnect to.
-        // This covers page refresh mid-stream — without this, there's a gap between
-        // history load and the first WS event where the UI shows no streaming indicator.
-        if (!isStreamActiveRef.current && session.startsWith('agent:')) {
-          const params: Record<string, string> = { session };
-          if (provider) params.provider = provider;
-          client.get('/gateway/stream-status', { params, _silent: true } as any).then(({ data }) => {
-            if (data.active && !isStreamActiveRef.current) {
-              debugLog('[ChatState] Active stream detected on initial load — showing streaming UI');
-              isStreamActiveRef.current = true;
-              setIsRunning(true);
-              setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
-              if (data.toolName) setActiveToolName(data.toolName);
-              if (typeof data.content === 'string' && data.content.length > 0) {
-                const safeText = sanitizeAssistantContent(data.content);
-                assembledRef.current = safeText;
-                upsertStreamingAssistant(safeText);
-              } else {
-                // Create empty streaming bubble so events have somewhere to land
-                const resumeId = 'stream-resume-' + Date.now();
-                streamingAssistantIdRef.current = resumeId;
-                setMessages(prev => [...prev, {
-                  id: resumeId,
-                  role: 'assistant' as const,
-                  content: '',
-                  createdAt: new Date(),
-                  toolCalls: [],
-                }]);
-              }
-            }
-          }).catch(() => { /* stream-status check is best-effort */ });
-        }
-      });
+      void loadHistoryInternal(session, provider);
     }
   }, [session, provider, loadHistoryInternal]);
 
@@ -1138,7 +1280,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     // When the direct gateway client is connected, it handles all streaming events
     // (chat, agent) directly. The Socket.IO/WS path should NOT also process them,
     // otherwise the browser receives the same text twice causing stutter/cascade.
-    if (directClientRef.current?.isConnected) {
+    if (directClientRef.current?.isConnected && streamTransportRef.current === 'direct') {
       // Still allow non-streaming events (session, exec_approval, connected, keepalive)
       const directHandledTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'done', 'stream_resume', 'stream_ended', 'run_resumed'];
       if (directHandledTypes.includes(data?.type)) {
@@ -1172,32 +1314,16 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const passthrough = ['session', 'exec_approval', 'exec_approval_resolved', 'connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended', 'run_resumed'];
     const streamTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'done'];
     if (!streamingAssistantIdRef.current && !passthrough.includes(data.type)) {
-      if (streamTypes.includes(data.type) && data.type !== 'done') {
+      if (streamTypes.includes(data.type)) {
         // Agent resumed after a sub-agent or multi-run — create a new assistant bubble
-        console.log(`[ChatState] Agent resumed (${data.type}) — creating new assistant bubble`);
-        const resumeId = 'resume-' + Date.now();
-        streamingAssistantIdRef.current = resumeId;
-        assembledRef.current = '';
-        lastSegmentStartRef.current = 0;
-        lastRawTextLenRef.current = 0;
-        toolCounterRef.current = 0;
-        hasRealToolEventsRef.current = false;
-        setThinkingContent('');
-        setMessages(prev => [...prev, {
-          id: resumeId,
-          role: 'assistant' as const,
-          content: '',
-          createdAt: new Date(),
-          toolCalls: [],
-        }]);
+        ensureStreamingAssistantBubble({ idPrefix: 'resume', content: '', resetIfCreated: true });
         isStreamActiveRef.current = true;
+        if (!streamTransportRef.current) streamTransportRef.current = 'portal';
         setIsRunning(true);
         resetStreamWatchdog();
         // Don't return — fall through to process this event with the new assistantId
       } else {
-        if (data.type !== 'done') {
-          console.warn(`[ChatState] DROPPED event: type=${data.type} (no assistantId)`);
-        }
+        console.warn(`[ChatState] DROPPED event: type=${data.type} (no assistantId)`);
         return;
       }
     }
@@ -1212,6 +1338,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           localStorage.setItem('agent-chat-session', data.sessionId);
         }
         if (data.provenance) setLastProvenance(data.provenance);
+        if (data.model) {
+          setMessages(prev => prev.map(m => (
+            m.id === streamingAssistantIdRef.current
+              ? { ...m, model: normalizeProviderModel(providerRef.current, String(data.model)) }
+              : m
+          )));
+        }
         break;
       }
       case 'status': {
@@ -1369,6 +1502,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         const finalContent = hasFinal ? sanitizeAssistantContent(data.content) : assembledRef.current;
         assembledRef.current = finalContent;
         const prov = data.provenance || null;
+        const model = normalizeProviderModel(providerRef.current, typeof data?.metadata?.model === 'string' ? data.metadata.model : (typeof data?.model === 'string' ? data.model : ''));
         const cid = streamingAssistantIdRef.current;
         
         // Check if tools were used during this streaming session — we'll reload
@@ -1391,6 +1525,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         // The guard at the top of handleWsEvent will create a new bubble when
         // stream events arrive without an active assistantId.
         isStreamActiveRef.current = false;
+        streamTransportRef.current = null;
         streamingAssistantIdRef.current = null;
         // Reset text accumulator so the next run segment starts fresh
         assembledRef.current = '';
@@ -1414,7 +1549,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
         setMessages(prev => prev.map(m => {
           if (m.id !== cid) return m;
-          const update: Partial<ChatMessage> = { content: finalContent, provenance: prov || undefined };
+          const update: Partial<ChatMessage> = { content: finalContent, provenance: prov || undefined, model: model || m.model };
           if (graduatedSegments.length > 0) {
             update.segments = graduatedSegments;
           }
@@ -1468,28 +1603,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         break;
       }
       case 'stream_resume': {
-        // Backend detected an active stream on reconnect — preserve the current bubble if it exists.
-        if (!streamingAssistantIdRef.current) {
-          const resumeId = 'stream-resume-' + Date.now();
-          streamingAssistantIdRef.current = resumeId;
-          setMessages(prev => [...prev, {
-            id: resumeId,
-            role: 'assistant' as const,
-            content: '',
-            createdAt: new Date(),
-            toolCalls: [],
-          }]);
-        }
-        isStreamActiveRef.current = true;
-        setIsRunning(true);
-        setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
-        setActiveToolName(data.toolName || null);
-        setStatusText(data.toolName ? `Using ${data.toolName}…` : 'Reconnecting to stream…');
-        if (typeof data.content === 'string') {
-          const nextText = mergeStreamText(sanitizeAssistantContent(data.content), { replace: true });
-          upsertStreamingAssistant(nextText);
-        }
-        resetStreamWatchdog();
+        applyOpenClawActiveStreamSnapshot({ ...data, active: true }, { statusTextWhenNoTool: 'Reconnecting to stream…', source: 'portal' });
         break;
       }
       case 'run_resumed': {
@@ -1521,7 +1635,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'keepalive':
         break;
     }
-  }, [normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyCompactionState, mergeStreamText, upsertStreamingAssistant]);
+  }, [applyOpenClawActiveStreamSnapshot, ensureStreamingAssistantBubble, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyCompactionState, mergeStreamText, upsertStreamingAssistant]);
 
   // Keep handleWsEvent in a ref so the WS handler always calls the latest version
   const handleWsEventRef = useRef(handleWsEvent);
@@ -1532,7 +1646,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
    * Maps native gateway events to our internal event format.
    */
   const handleDirectGatewayEvent = useCallback((evt: GatewayEvent) => {
-    console.log('[ChatState] 🔔 Direct gateway event:', evt.event, 'state:', evt.payload?.state, 'runId:', evt.payload?.runId);
+    const isStreamEvent = evt.event === 'chat' || evt.event === 'agent';
+    if (streamTransportRef.current === 'portal' && isStreamActiveRef.current && isStreamEvent) {
+      return;
+    }
 
     if (evt.event === 'chat') {
       const payload = evt.payload;
@@ -1551,6 +1668,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       if (payload.runId) {
         currentRunIdRef.current = payload.runId;
       }
+      streamTransportRef.current = 'direct';
 
       switch (state) {
         case 'delta': {
@@ -1563,18 +1681,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           // without a separate 'start' event, or on reconnect/resume.
           let assistantId = streamingAssistantIdRef.current;
           if (!assistantId) {
-            assistantId = 'direct-' + Date.now();
-            streamingAssistantIdRef.current = assistantId;
+            assistantId = ensureStreamingAssistantBubble({ idPrefix: 'direct', content: '', resetIfCreated: true }).assistantId;
             isStreamActiveRef.current = true;
+            streamTransportRef.current = 'direct';
             setIsRunning(true);
-            setMessages(prev => [...prev, {
-              id: assistantId!,
-              role: 'assistant' as const,
-              content: '',
-              createdAt: new Date(),
-              toolCalls: [],
-            }]);
-            debugLog('[ChatState] Direct gateway: created assistant bubble on first delta');
           }
 
           // Extract thinking content from thinking blocks
@@ -1705,6 +1815,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           // Cleared on next message send or session switch.
 
           isStreamActiveRef.current = false;
+          streamTransportRef.current = null;
           streamingAssistantIdRef.current = null;
           currentRunIdRef.current = null;
           assembledRef.current = '';
@@ -1753,6 +1864,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           setIsRunning(false);
           setStreamSegments([]);
           isStreamActiveRef.current = false;
+          streamTransportRef.current = null;
           streamingAssistantIdRef.current = null;
           currentRunIdRef.current = null;
 
@@ -1784,6 +1896,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           setCompactionPhase('idle');
           setIsRunning(false);
           isStreamActiveRef.current = false;
+          streamTransportRef.current = null;
           streamingAssistantIdRef.current = null;
           currentRunIdRef.current = null;
           assembledRef.current = '';
@@ -1902,7 +2015,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
       }
     }
-  }, [normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState]);
+  }, [ensureStreamingAssistantBubble, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState]);
 
   // WS setup — runs once on mount, survives entire app lifetime
   // Handler registration MUST happen in the same effect that creates the manager,
@@ -1916,7 +2029,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     manager.addHandler(stableHandler);
 
     const statusHandler = (data: any) => {
-      if (data.type === 'connected') setWsConnected(true);
+      if (data.type === 'connected') {
+        setWsConnected(true);
+        if (isStreamActiveRef.current) {
+          debugLog('[ChatState] WS connected while stream active — sending reconnect');
+          wsManagerRef.current?.send({ type: 'reconnect', session: sessionRef.current, provider: providerRef.current });
+          resetStreamWatchdog();
+        }
+      }
     };
     manager.addHandler(statusHandler);
 
@@ -1935,37 +2055,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setStatusText('Reconnecting to stream…');
       }
     });
-
-    // On reconnect: check stream status & reload history delta
+    // On reconnect: for OpenClaw, reconcile from HTTP history first so one request
+    // can restore both committed messages and the active-stream snapshot.
     const unsubReconnect = manager.onReconnect(async () => {
       setWsConnected(true);
-      debugLog('[ChatState] WS reconnected \u2014 checking stream status');
+      debugLog('[ChatState] WS reconnected — reconciling session state');
       try {
-        const params: Record<string, string> = { session: sessionRef.current };
-        if (providerRef.current) params.provider = providerRef.current;
-        const { data } = await client.get('/gateway/stream-status', { params });
-        if (data.active) {
-          debugLog('[ChatState] Stream still active after reconnect — subscribing via WS');
-          isStreamActiveRef.current = true;
-          setIsRunning(true);
-          setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
-          setActiveToolName(data.toolName || null);
-          if (typeof data.content === 'string' && data.content.length > 0) {
-            const nextText = mergeStreamText(sanitizeAssistantContent(data.content), { replace: true });
-            upsertStreamingAssistant(nextText);
-          }
-          // Send reconnect message to subscribe to StreamEventBus via WS
-          wsManagerRef.current?.send({ type: 'reconnect', session: sessionRef.current });
-          resetStreamWatchdog();
-          return;
-        } else if (isStreamActiveRef.current) {
-          debugLog('[ChatState] Stream ended during disconnect');
-          isStreamActiveRef.current = false;
-          setIsRunning(false);
-          setStreamingPhase('idle');
-          setStatusText(null);
-        }
-        // Only reload committed history when no active stream remains.
         await loadHistoryInternal(sessionRef.current, providerRef.current, { force: true });
       } catch (err) {
         console.warn('[ChatState] Reconnect sync failed:', err);
@@ -1983,14 +2078,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Direct gateway client setup for OPENCLAW provider
-  // When USE_DIRECT_GATEWAY is enabled and provider is OPENCLAW, use the direct
+  // When useDirectGateway is enabled and provider is OPENCLAW, use the direct
   // gateway connection instead of the portal WS middleman.
   // Gate on gateway health check first to avoid reconnect loops on fresh installs.
   useEffect(() => {
     // Only create direct client when:
     // 1. Feature flag is enabled
     // 2. Provider is OPENCLAW
-    if (!USE_DIRECT_GATEWAY || provider !== 'OPENCLAW') {
+    if (!useDirectGateway || provider !== 'OPENCLAW') {
       // Disconnect existing direct client if switching away from OPENCLAW
       if (directClientRef.current) {
         debugLog('[ChatState] Disconnecting direct gateway client (provider changed)');
@@ -2031,12 +2126,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         url: createGatewayDirectUrl(),
         onEvent: handleDirectGatewayEvent,
         onConnected: () => {
-          console.log('[ChatState] 🔌 Direct gateway RECONNECTED (onConnected fired)');
-          console.log('[ChatState] sessionRef.current =', sessionRef.current);
           setWsConnected(true);
-          // Subscribe to current session and check for active streams
+          // Subscribe to current session and reconcile from history snapshot.
           const currentSession = resolveOpenClawSessionKey(sessionRef.current);
-          console.log('[ChatState] resolved session =', currentSession);
           const currentProvider = providerRef.current;
           if (currentSession && currentSession !== sessionRef.current) {
             sessionRef.current = currentSession;
@@ -2047,85 +2139,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             directClient.subscribeSession(currentSession).catch((err) => {
               console.warn('[ChatState] Failed to subscribe to session:', err);
             });
-            // Check for active stream immediately after reconnect
-            const params: Record<string, string> = { session: currentSession };
-            if (currentProvider) params.provider = currentProvider;
-            console.log('[ChatState] 📡 Checking stream-status for', currentSession);
-            client.get('/gateway/stream-status', { params, _silent: true } as any).then(({ data }: any) => {
-              console.log('[ChatState] 📡 stream-status response:', JSON.stringify(data));
-              if (data.active) {
-                console.log('[ChatState] ✅ Active stream detected — resuming');
-                if (!streamingAssistantIdRef.current) {
-                  const resumeId = 'stream-resume-' + Date.now();
-                  streamingAssistantIdRef.current = resumeId;
-                  setMessages(prev => [...prev, {
-                    id: resumeId,
-                    role: 'assistant' as const,
-                    content: '',
-                    createdAt: new Date(),
-                    toolCalls: [],
-                  }]);
-                }
-                isStreamActiveRef.current = true;
-                setIsRunning(true);
-                setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
-                setActiveToolName(data.toolName || null);
-                setStatusText(data.toolName ? `Using ${data.toolName}…` : 'Reconnecting to stream…');
-                if (typeof data.content === 'string' && data.content.length > 0) {
-                  const safeText = sanitizeAssistantContent(data.content);
-                  assembledRef.current = safeText;
-                  upsertStreamingAssistant(safeText);
-                }
-                resetStreamWatchdog();
-              } else {
-                // Stream finished during disconnect — reload history to pick up
-                // any messages we missed (e.g. final assistant response after a
-                // service restart killed the WS mid-turn).
-                const wasStreaming = isStreamActiveRef.current;
-                console.log('[ChatState] 📥 No active stream — RELOADING HISTORY (wasStreaming:', wasStreaming, ')');
-                if (isStreamActiveRef.current) {
-                  isStreamActiveRef.current = false;
-                  setIsRunning(false);
-                  setStreamingPhase('idle');
-                  setStatusText(null);
-                }
-                loadHistoryInternal(currentSession, currentProvider, { force: true }).catch(() => {});
-
-                // If the stream was interrupted by disconnect, the gateway may not
-                // have committed the final assistant message yet. Schedule follow-up
-                // reloads to catch late commits.
-                if (wasStreaming) {
-                  const catchUpDelays = [3000, 8000, 15000];
-                  reconnectCatchUpTimersRef.current.forEach(t => clearTimeout(t));
-                  reconnectCatchUpTimersRef.current = [];
-                  const scheduleCatchUp = (idx: number) => {
-                    if (idx >= catchUpDelays.length) return;
-                    const timer = setTimeout(async () => {
-                      if (isStreamActiveRef.current || !directClientRef.current?.isConnected) return;
-                      console.log(`[ChatState] 🔄 Catch-up reload ${idx + 1}/${catchUpDelays.length}`);
-                      try {
-                        await loadHistoryInternal(currentSession, currentProvider, { force: true });
-                      } catch {}
-                      scheduleCatchUp(idx + 1);
-                    }, catchUpDelays[idx]);
-                    reconnectCatchUpTimersRef.current.push(timer);
-                  };
-                  scheduleCatchUp(0);
-                }
-              }
-            }).catch(() => {
-              // stream-status failed — still try to reload history as fallback
-              console.log('[ChatState] ❌ stream-status FAILED on reconnect — reloading history as fallback');
-              loadHistoryInternal(currentSession, currentProvider, { force: true }).catch(() => {});
+            loadHistoryInternal(currentSession, currentProvider, { force: true }).catch((err) => {
+              console.warn('[ChatState] Direct reconnect history sync failed:', err);
             });
           }
         },
         onDisconnected: () => {
-          console.log('[ChatState] ⚡ Direct gateway DISCONNECTED');
-          console.log('[ChatState] isStreamActiveRef =', isStreamActiveRef.current);
-          // Cancel any pending catch-up reloads
-          reconnectCatchUpTimersRef.current.forEach(t => clearTimeout(t));
-          reconnectCatchUpTimersRef.current = [];
           setWsConnected(false);
           if (isStreamActiveRef.current) {
             console.warn('[ChatState] Direct gateway disconnected during active stream');
@@ -2153,11 +2172,36 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         directClientRef.current = null;
       }
     };
-  }, [provider, handleDirectGatewayEvent]);
+  }, [provider, handleDirectGatewayEvent, useDirectGateway]);
 
-  // Visibility change handler: when tab becomes visible again, check stream status
-  // and resubscribe if needed. Mobile browsers are aggressive about backgrounding
-  // WebSockets, so this helps recover lost streams.
+  // Fresh page loads can race transport/session setup. Give OpenClaw a short retry window
+  // to detect an already-active stream so second-device reopen reliably attaches mid-turn.
+  useEffect(() => {
+    if (provider !== 'OPENCLAW' || useDirectGateway || isLoadingHistory) return;
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let attempts = 0;
+
+    const tick = async () => {
+      if (cancelled || isStreamActiveRef.current) return;
+      attempts += 1;
+      await hydrateActiveStream(session, provider);
+      if (!cancelled && !isStreamActiveRef.current && attempts < 5) {
+        timer = setTimeout(tick, 3000);
+      }
+    };
+
+    timer = setTimeout(tick, 1200);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [hydrateActiveStream, isLoadingHistory, provider, session, useDirectGateway]);
+
+  // Visibility change handler: when the tab becomes visible again, reopen the live
+  // stream if we already know it's active; otherwise reconcile from history so
+  // OpenClaw uses one HTTP round trip instead of a status probe + reload pair.
   useEffect(() => {
     const handleVisibilityChange = async () => {
       if (document.visibilityState !== 'visible') return;
@@ -2169,9 +2213,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
       if (!currentSession) return;
 
-      debugLog('[ChatState] Tab became visible — checking stream status');
+      debugLog('[ChatState] Tab became visible — reconciling session state');
 
-      const usingDirectGateway = USE_DIRECT_GATEWAY && currentProvider === 'OPENCLAW';
+      const usingDirectGateway = useDirectGateway && currentProvider === 'OPENCLAW';
       const transportConnected = usingDirectGateway
         ? Boolean(directClient?.isConnected)
         : Boolean(manager && manager.isConnected());
@@ -2194,32 +2238,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
         return;
       }
-
       try {
-        const params: Record<string, string> = { session: currentSession };
-        if (currentProvider) params.provider = currentProvider;
-        const { data } = await client.get('/gateway/stream-status', { params, _silent: true } as any);
-
-        if (data.active) {
-          debugLog('[ChatState] Discovered active stream on visibility — reconnecting');
-          if (usingDirectGateway) {
-            setIsRunning(true);
-            setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
-            setActiveToolName(data.toolName || null);
-            setStatusText(data.toolName ? `Using ${data.toolName}…` : 'Reconnecting to stream…');
-            if (typeof data.content === 'string' && data.content.length > 0) {
-              const safeText = sanitizeAssistantContent(data.content);
-              assembledRef.current = safeText;
-              upsertStreamingAssistant(safeText);
-            }
-            resetStreamWatchdog();
-          } else {
-            manager?.send({ type: 'reconnect', session: currentSession, provider: currentProvider });
-          }
-        } else {
-          debugLog('[ChatState] No active stream on visibility — reloading history for missed messages');
-          loadHistoryInternal(currentSession, currentProvider);
+        if (currentProvider === 'OPENCLAW' && !usingDirectGateway) {
+          await loadHistoryInternal(currentSession, currentProvider, { force: true });
+          return;
         }
+        debugLog('[ChatState] No active stream on visibility — reloading history for missed messages');
+        await loadHistoryInternal(currentSession, currentProvider, { force: true });
       } catch (err) {
         console.warn('[ChatState] Visibility check failed:', err);
       }
@@ -2229,7 +2254,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [loadHistoryInternal, resetStreamWatchdog, resolveOpenClawSessionKey, upsertStreamingAssistant]);
+  }, [loadHistoryInternal, resetStreamWatchdog, resolveOpenClawSessionKey, useDirectGateway]);
 
   // Clear messages helper — also invalidates any in-flight history load and
   // resets transient stream UI so switching sessions always starts clean.
@@ -2253,6 +2278,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     hasRealToolEventsRef.current = false;
     streamingAssistantIdRef.current = null;
     isStreamActiveRef.current = false;
+    streamTransportRef.current = null;
     isQueueDrainActiveRef.current = false;
     if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
     if (streamWatchdogRef.current) { clearTimeout(streamWatchdogRef.current); streamWatchdogRef.current = null; }
@@ -2305,7 +2331,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       try {
         const targetSession = resolveOpenClawSessionKey(sessionRef.current || 'main');
         const directClient = directClientRef.current;
-        if (USE_DIRECT_GATEWAY && directClient?.isConnected) {
+        if (useDirectGateway && directClient?.isConnected) {
           await directClient.injectMessage(targetSession, normalized);
         } else {
           const manager = wsManagerRef.current;
@@ -2388,8 +2414,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
     // For OPENCLAW with direct gateway enabled, use the direct client
     const directClient = directClientRef.current;
-    if (USE_DIRECT_GATEWAY && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
+    if (useDirectGateway && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
       try {
+        streamTransportRef.current = 'direct';
         const currentSession = resolveOpenClawSessionKey(sessionRef.current || 'main');
         if (currentSession !== sessionRef.current) {
           sessionRef.current = currentSession;
@@ -2409,6 +2436,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setIsRunning(false);
         setStreamingPhase('idle');
         isStreamActiveRef.current = false;
+        streamTransportRef.current = null;
         streamingAssistantIdRef.current = null;
       }
       return;
@@ -2417,6 +2445,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     // Send via WS (portal middleman path for non-OPENCLAW or when direct gateway unavailable)
     const manager = wsManagerRef.current;
     if (manager && manager.isConnected()) {
+      streamTransportRef.current = 'portal';
       const payload: Record<string, unknown> = {
         type: 'send',
         message: normalized,
@@ -2436,12 +2465,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           setIsRunning(false);
           setStreamingPhase('idle');
           isStreamActiveRef.current = false;
+          streamTransportRef.current = null;
           streamingAssistantIdRef.current = null;
         }
       }
     } else {
       // SSE fallback
       try {
+        streamTransportRef.current = 'portal';
         await sendViaSSE(normalized, assistantId);
       } catch (err: any) {
         setMessages(prev => prev.map(m =>
@@ -2450,10 +2481,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setIsRunning(false);
         setStreamingPhase('idle');
         isStreamActiveRef.current = false;
+        streamTransportRef.current = null;
         streamingAssistantIdRef.current = null;
       }
     }
-  }, [normalizeAgentError, resetStreamWatchdog, resolveOpenClawSessionKey]);
+  }, [normalizeAgentError, resetStreamWatchdog, resolveOpenClawSessionKey, useDirectGateway]);
 
   const drainNextQueuedMessage = useCallback(() => {
     if (isStreamActiveRef.current || isQueueDrainActiveRef.current) return;
@@ -2472,6 +2504,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const sendViaSSE = useCallback(async (text: string, initialAssistantId: string) => {
     let assembled = '';
     let assistantId = initialAssistantId;
+    streamTransportRef.current = 'portal';
 
     const apiUrl = import.meta.env.VITE_API_URL || '';
     const body: Record<string, unknown> = {
@@ -2603,7 +2636,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
     const targetSession = sessionKey || sessionRef.current;
     const directClient = directClientRef.current;
-    if (USE_DIRECT_GATEWAY && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
+    if (useDirectGateway && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
       await directClient.injectMessage(targetSession, note);
       return;
     }
@@ -2615,14 +2648,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
 
     await client.post('/gateway/chat/inject', { session: targetSession, text: note });
-  }, []);
+  }, [useDirectGateway]);
 
   // Cancel stream
   const cancelStream = useCallback(async () => {
     try {
       // For OPENCLAW with direct gateway, use the direct client for abort
       const directClient = directClientRef.current;
-      if (USE_DIRECT_GATEWAY && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
+      if (useDirectGateway && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
         const currentSession = sessionRef.current;
         const runId = currentRunIdRef.current;
         debugLog('[ChatState] Aborting via direct gateway, session:', currentSession, 'runId:', runId);
@@ -2654,7 +2687,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         streamingAssistantIdRef.current = null;
       }
     }
-  }, [clearStreamWatchdog]);
+  }, [clearStreamWatchdog, useDirectGateway]);
 
   // Session controls: check if supported (OPENCLAW with concrete session)
   const sessionControlsSupported = provider === 'OPENCLAW' && session.startsWith('agent:');
@@ -2670,13 +2703,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   }, [sessionControlsSupported, session, provider]);
 
   const reconnectSocket = useCallback(() => {
-    if (USE_DIRECT_GATEWAY && providerRef.current === 'OPENCLAW' && directClientRef.current) {
+    if (useDirectGateway && providerRef.current === 'OPENCLAW' && directClientRef.current) {
       directClientRef.current.disconnect();
       directClientRef.current.connect();
       return;
     }
     wsManagerRef.current?.reconnect();
-  }, []);
+  }, [useDirectGateway]);
 
   const setFastModeModel = useCallback(async (nextModel: string) => {
     const normalized = String(nextModel || '').trim();
@@ -2732,21 +2765,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    gatewayAPI.getConfigPath('agents.defaults.compaction.model')
-      .then((data) => {
-        if (cancelled) return;
-        const value = typeof data?.value === 'string' ? data.value.trim() : '';
-        setCompactionModelOverrideState(value);
-      })
-      .catch(() => {
-        if (!cancelled) setCompactionModelOverrideState('');
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   // Build context value
   const contextValue: ChatStateContextValue = {
@@ -2800,6 +2818,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     compactionModelLoading,
     compactionModelError,
     sessionControlsSupported,
+    ensureSessionControlsMetadataLoaded,
   };
 
   return (

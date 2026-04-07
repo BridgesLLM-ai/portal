@@ -68,6 +68,7 @@ rsync -a \
   --exclude='uploads' \
   --exclude='assets/avatars' \
   --exclude='assets/branding' \
+  --exclude='backup-full.sh' \
   --exclude='*.log' \
   --exclude='*.db' \
   --exclude='*.sqlite' \
@@ -102,6 +103,7 @@ rsync -a \
   --exclude='docs/GITHUB-SOP.md' \
   --exclude='docs/OPENCLAW-PORTAL-COMPAT-VERIFY-*.md' \
   --exclude='docs/SECURITY.md' \
+  --exclude='docs/runtime-stabilization-checklist.md' \
   \
   `# Test & temp files` \
   --exclude='backend/test-*.js' \

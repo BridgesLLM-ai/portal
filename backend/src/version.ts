@@ -1,1 +1,1 @@
-export const PORTAL_VERSION = '3.23.6';
+export const PORTAL_VERSION = '3.23.7';

@@ -34,6 +34,31 @@ const CLIENT_MODE = 'backend';
 const GATEWAY_ROLE = 'operator';
 const GATEWAY_SCOPES = ['operator.admin', 'operator.approvals'];
 
+function extractGatewayMessageModel(payload: any): string | null {
+  const message = payload?.message;
+  const candidates = [
+    message?.model,
+    message?.modelId,
+    message?.model_id,
+    message?.actualModel,
+    message?.executedModel,
+    message?.metadata?.model,
+    payload?.model,
+    payload?.modelId,
+    payload?.model_id,
+    payload?.actualModel,
+    payload?.executedModel,
+    payload?.metadata?.model,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
+}
+
 export interface ExecApprovalRequest {
   id: string;
   request: {
@@ -77,6 +102,15 @@ const assistantLastSeenTextMap: Map<string, string> = new Map();
 
 // Track which sessions have active runs (to filter stale replayed events)
 const activeRunIds: Map<string, string> = new Map();
+
+type ToolPhaseState = {
+  runId?: string;
+  toolName: string;
+  phase: 'start' | 'result';
+};
+
+// Deduplicate repeated gateway tool snapshots for the same session/run/tool phase.
+const lastToolPhaseBySession: Map<string, ToolPhaseState> = new Map();
 
 // Event listeners
 const approvalRequestListeners: Set<ApprovalRequestCallback> = new Set();
@@ -179,6 +213,7 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
     debugLog(`Adopted new runId=${runId} for session ${sessionKey} (resumed after yield)`);
     // Reset text accumulators for the new run
     assistantLastSeenTextMap.delete(sessionKey);
+    lastToolPhaseBySession.delete(sessionKey);
     streamEventBus.setLastSeenText(sessionKey, '');
     streamEventBus.setLatestText(sessionKey, '');
     // Signal the frontend that a new run segment has started
@@ -235,9 +270,23 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   if (stream === 'tool') {
     const phase = typeof data.phase === 'string' ? data.phase : '';
     const toolName = typeof data.name === 'string' ? data.name : 'tool';
+    const lastToolPhase = lastToolPhaseBySession.get(sessionKey);
+    const isDuplicateToolPhase = (
+      lastToolPhase
+      && lastToolPhase.phase === phase
+      && lastToolPhase.toolName === toolName
+      && (lastToolPhase.runId || '') === (runId || '')
+    );
+
+    if (isDuplicateToolPhase) {
+      debugLog(`Ignoring duplicate tool.${phase} for ${sessionKey} runId=${runId || 'none'} tool=${toolName}`);
+      return;
+    }
+
     console.log(`[PersistentGatewayWs] TOOL EVENT: phase=${phase} name=${toolName} session=${sessionKey}`);
 
     if (phase === 'start') {
+      lastToolPhaseBySession.set(sessionKey, { runId, toolName, phase: 'start' });
       const lastSeen = streamEventBus.getLastSeenText(sessionKey);
       if (lastSeen.length > 0) {
         streamEventBus.publish(sessionKey, { type: 'segment_break', content: '' });
@@ -252,6 +301,7 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
         toolArgs: data.input || data.args,
       });
     } else if (phase === 'result') {
+      lastToolPhaseBySession.set(sessionKey, { runId, toolName, phase: 'result' });
       streamEventBus.updateStreamPhase(sessionKey, { phase: 'streaming', toolName: undefined });
       const output = typeof data.output === 'string' ? data.output.substring(0, 500) : undefined;
       streamEventBus.publish(sessionKey, {
@@ -279,6 +329,7 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
       streamEventBus.clearStream(sessionKey);
       activeRunIds.delete(sessionKey);
       assistantLastSeenTextMap.delete(sessionKey);
+      lastToolPhaseBySession.delete(sessionKey);
     } else if (phase === 'started' || phase === 'running') {
       streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking' });
       streamEventBus.publish(sessionKey, { type: 'thinking', content: '🧠 Agent is thinking…' });
@@ -332,6 +383,7 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     debugLog(`Adopted new runId=${runId} for session ${sessionKey} via chat event (wasRecentlyDone=${wasRecent})`);
     // Reset text accumulators for the new run
     assistantLastSeenTextMap.delete(sessionKey);
+    lastToolPhaseBySession.delete(sessionKey);
     streamEventBus.setLastSeenText(sessionKey, '');
     streamEventBus.setLatestText(sessionKey, '');
     // If the session was recently done, signal resumption
@@ -353,6 +405,7 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
   if (state === 'final') {
     const message = payload.message as Record<string, unknown> | undefined;
     const finalText = message ? extractTextFromContent(message.content) : '';
+    const finalModel = extractGatewayMessageModel(payload);
 
     // Reconcile final text against what was already streamed.
     // IMPORTANT: After tool calls, the gateway's final message.content contains ALL
@@ -387,7 +440,7 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
       }
     }
 
-    streamEventBus.publish(sessionKey, { type: 'done', content: finalText });
+    streamEventBus.publish(sessionKey, { type: 'done', content: finalText, model: finalModel });
 
     // Use soft-clear instead of hard-clear: the agent may resume after a sub-agent
     // completes (sessions_yield → sub-agent → result injected → new run starts).
@@ -396,6 +449,7 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     streamEventBus.softClearStream(sessionKey);
     activeRunIds.delete(sessionKey);
     assistantLastSeenTextMap.delete(sessionKey);
+    lastToolPhaseBySession.delete(sessionKey);
     return;
   }
 
@@ -407,6 +461,7 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     streamEventBus.clearStream(sessionKey);
     activeRunIds.delete(sessionKey);
     assistantLastSeenTextMap.delete(sessionKey);
+    lastToolPhaseBySession.delete(sessionKey);
     return;
   }
 
@@ -415,10 +470,11 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     const abortedText = typeof payload.text === 'string' && payload.text.length > 0
       ? payload.text
       : latestText;
-    streamEventBus.publish(sessionKey, { type: 'done', content: abortedText });
+    streamEventBus.publish(sessionKey, { type: 'done', content: abortedText, model: extractGatewayMessageModel(payload) });
     streamEventBus.clearStream(sessionKey);
     activeRunIds.delete(sessionKey);
     assistantLastSeenTextMap.delete(sessionKey);
+    lastToolPhaseBySession.delete(sessionKey);
     return;
   }
 }
@@ -923,4 +979,5 @@ export function registerRun(sessionKey: string, runId: string): void {
 export function clearRun(sessionKey: string): void {
   activeRunIds.delete(sessionKey);
   assistantLastSeenTextMap.delete(sessionKey);
+  lastToolPhaseBySession.delete(sessionKey);
 }

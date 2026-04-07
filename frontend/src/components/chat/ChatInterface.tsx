@@ -41,6 +41,8 @@ import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../
 import { executeSlashCommand } from '../../utils/slashCommandExecutor';
 import client from '../../api/client';
 import sounds from '../../utils/sounds';
+import { usePublicSettings } from '../../hooks/usePublicSettings';
+import { useUserAvatarUrl } from '../../hooks/useUserAvatarUrl';
 import {
   canonicalizePortalModelId,
   getModelDisplayName,
@@ -353,6 +355,7 @@ function ModelPicker({
   supportsCustomModelInput = true,
   modelCatalogKind = 'dynamic',
   disabled = false,
+  onOpen,
 }: {
   provider: string;
   value: string;
@@ -361,6 +364,7 @@ function ModelPicker({
   supportsCustomModelInput?: boolean;
   modelCatalogKind?: 'none' | 'declared' | 'dynamic';
   disabled?: boolean;
+  onOpen?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [custom, setCustom] = useState(false);
@@ -388,7 +392,11 @@ function ModelPicker({
   return (
     <div ref={ref} className="relative">
       <button
-        onClick={() => { if (!disabled) setOpen(!open); }}
+        onClick={() => {
+          if (disabled) return;
+          if (!open) onOpen?.();
+          setOpen(!open);
+        }}
         disabled={disabled}
         className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg border text-[11px] transition-colors ${disabled ? 'bg-white/[0.03] border-white/[0.05] text-slate-500 cursor-not-allowed opacity-60' : 'bg-white/[0.06] hover:bg-white/[0.10] border-white/[0.08] text-slate-400 hover:text-slate-200'}`}
         title={disabled ? 'Finish or abort the current response before switching models' : (value || 'Default model')}
@@ -1807,8 +1815,11 @@ interface PendingAttachment {
   type: 'image' | 'text' | 'other';
   previewUrl?: string;
   textContent?: string;
-  /** Server-side path after upload (for non-text files) */
+  fileId?: string;
+  /** Server-side path after upload (when the backend exposes one) */
   serverPath?: string;
+  /** Signed direct URL for cross-host tool access */
+  toolUrl?: string;
   /** Upload status */
   uploadStatus?: 'uploading' | 'done' | 'error';
   uploadError?: string;
@@ -1883,9 +1894,10 @@ const UserBubble = React.memo(function UserBubble({ message, avatarUrl, username
       <div className="flex-1 min-w-0" />
       <div className="max-w-[78%]">
         <div className={`rounded-2xl rounded-br-sm px-4 py-2.5 shadow-lg shadow-blue-600/15 transition-opacity ${message.queued ? 'bg-blue-600/65 opacity-85' : 'bg-blue-600/90'}`}>
-          <p className="text-sm text-white leading-relaxed whitespace-pre-wrap break-words">
-            {message.content}
-          </p>
+          <MarkdownRenderer
+            content={message.content}
+            className="text-white [&_p]:text-white [&_li]:text-white/95 [&_strong]:text-white [&_em]:text-white/95 [&_code]:text-blue-50 [&_pre]:bg-blue-950/40 [&_pre]:border-white/10 [&_blockquote]:text-blue-100/85 [&_blockquote]:border-blue-200/30 [&_a]:text-cyan-100 [&_a]:decoration-cyan-200/40 hover:[&_a]:text-white hover:[&_a]:decoration-cyan-100/70"
+          />
         </div>
         {message.queued && (
           <div className="mt-1 mr-1 flex justify-end gap-2">
@@ -1958,6 +1970,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
 }) {
   const [hovered, setHovered] = useState(false);
   const provenance = message.provenance || agent.provenance;
+  const modelLabel = message.model ? getShortModelLabel(message.model) : '';
   const toolCalls = message.toolCalls || [];
   // For the streaming message, prefer live thinking content from context;
   // otherwise fall back to persisted content on the message object
@@ -2049,6 +2062,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
         {/* Footer: provenance + actions + timestamp */}
         <div className="flex items-center gap-2 mt-1 ml-1">
           <span className="text-[10px] text-slate-500 italic">{provenance}</span>
+          {modelLabel ? <span className="text-[10px] text-slate-500">• {modelLabel}</span> : null}
 
           <AnimatePresence>
             {hovered && hasContent && (
@@ -2252,6 +2266,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const compactionModelLoading = chatState.compactionModelLoading;
   const compactionModelError = chatState.compactionModelError;
   const sessionControlsSupported = chatState.sessionControlsSupported;
+  const ensureSessionControlsMetadataLoaded = chatState.ensureSessionControlsMetadataLoaded;
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [providerModels, setProviderModels] = useState<Record<string, string[]>>({ OPENCLAW: OPENCLAW_MODEL_FALLBACK });
@@ -2264,6 +2279,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     slashCommandsLoaded?: boolean;
     slashCommandsLoading?: boolean;
   }>>({});
+  const [deferGatewayMetadata, setDeferGatewayMetadata] = useState(true);
+  const initialHistoryLoadStartedRef = useRef(false);
 
   // Apply defaultProvider on first mount if provided
   useEffect(() => {
@@ -2275,6 +2292,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const isAdmin = isElevated(user);
 
   useEffect(() => {
+    if (deferGatewayMetadata || provider === 'OPENCLAW') return;
     let cancelled = false;
     client.get('/gateway/providers')
       .then(({ data }) => {
@@ -2288,7 +2306,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [deferGatewayMetadata, provider]);
 
   const loadProviderCommands = useCallback(async (targetProvider: string, options?: { force?: boolean }) => {
     const cached = !options?.force ? providerCommandsCache.get(targetProvider) : undefined;
@@ -2349,73 +2367,81 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     }
   }, []);
 
-  useEffect(() => {
-    loadProviderCommands(provider).catch(() => {
-      // Keep existing provider metadata if command discovery fails.
-    });
-  }, [provider, loadProviderCommands]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const cachedModels = providerModelsCache.get(provider);
-
+  const ensureProviderModelsLoaded = useCallback(async (targetProvider: string) => {
+    const cachedModels = providerModelsCache.get(targetProvider);
     if (cachedModels) {
       setProviderModels((prev) => ({
         ...prev,
-        [provider]: cachedModels.models,
+        [targetProvider]: cachedModels.models,
       }));
       if (cachedModels.capabilities) {
         setProviderCatalog((prev) => ({
           ...prev,
-          [provider]: {
-            ...(prev[provider] || {}),
+          [targetProvider]: {
+            ...(prev[targetProvider] || {}),
             capabilities: {
-              ...(prev[provider]?.capabilities || {}),
+              ...(prev[targetProvider]?.capabilities || {}),
               ...cachedModels.capabilities,
             },
           },
         }));
       }
-      return () => {
-        cancelled = true;
-      };
+      return cachedModels.models;
     }
 
-    gatewayAPI.models(provider)
-      .then(({ provider: providerName, models, capabilities }) => {
-        if (cancelled) return;
-        const normalizedModels = Array.from(new Set((models || []).map((m) => canonicalizePortalModelId(m.id)).filter(Boolean)));
-        providerModelsCache.set(providerName, { models: normalizedModels, capabilities });
-        setProviderModels((prev) => ({
+    try {
+      const { provider: providerName, models, capabilities } = await gatewayAPI.models(targetProvider);
+      const normalizedModels = Array.from(new Set((models || []).map((m) => canonicalizePortalModelId(m.id)).filter(Boolean)));
+      providerModelsCache.set(providerName, { models: normalizedModels, capabilities });
+      setProviderModels((prev) => ({
+        ...prev,
+        [providerName]: normalizedModels,
+      }));
+      if (capabilities) {
+        setProviderCatalog((prev) => ({
           ...prev,
-          [providerName]: normalizedModels,
-        }));
-        if (capabilities) {
-          setProviderCatalog((prev) => ({
-            ...prev,
-            [providerName]: {
-              ...(prev[providerName] || {}),
-              capabilities: {
-                ...(prev[providerName]?.capabilities || {}),
-                ...capabilities,
-              },
+          [providerName]: {
+            ...(prev[providerName] || {}),
+            capabilities: {
+              ...(prev[providerName]?.capabilities || {}),
+              ...capabilities,
             },
-          }));
-        }
-      })
-      .catch(() => {
-        if (cancelled) return;
-        if (provider === 'OPENCLAW') {
-          setProviderModels((prev) => ({ ...prev, OPENCLAW: OPENCLAW_MODEL_FALLBACK }));
-        }
-      });
+          },
+        }));
+      }
+      return normalizedModels;
+    } catch (error) {
+      if (targetProvider === 'OPENCLAW') {
+        setProviderModels((prev) => ({ ...prev, OPENCLAW: OPENCLAW_MODEL_FALLBACK }));
+        return OPENCLAW_MODEL_FALLBACK;
+      }
+      throw error;
+    }
+  }, []);
 
-    return () => {
-      cancelled = true;
-    };
+  useEffect(() => {
+    const cachedModels = providerModelsCache.get(provider);
+    if (!cachedModels) return;
+    setProviderModels((prev) => ({
+      ...prev,
+      [provider]: cachedModels.models,
+    }));
+    if (cachedModels.capabilities) {
+      setProviderCatalog((prev) => ({
+        ...prev,
+        [provider]: {
+          ...(prev[provider] || {}),
+          capabilities: {
+            ...(prev[provider]?.capabilities || {}),
+            ...cachedModels.capabilities,
+          },
+        },
+      }));
+    }
   }, [provider]);
 
   useEffect(() => {
+    if (deferGatewayMetadata || !settingsOpen) return;
     let cancelled = false;
     const cached = providerModelsCache.get('OPENCLAW');
     if (cached?.models?.length) {
@@ -2444,9 +2470,18 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [deferGatewayMetadata, settingsOpen]);
 
-  const providerMeta = providerCatalog[provider] || {};
+  const providerMeta = providerCatalog[provider] || (provider === 'OPENCLAW'
+    ? {
+        capabilities: {
+          supportsModelSelection: true,
+          supportsCustomModelInput: true,
+          modelCatalogKind: 'dynamic' as const,
+          supportsInTurnSteering: true,
+        },
+      }
+    : {});
   const availableModels = providerModels[provider] || [];
   const canSelectModel = providerMeta.capabilities?.supportsModelSelection === true;
   const supportsCustomModelInput = providerMeta.capabilities?.supportsCustomModelInput !== false;
@@ -2466,12 +2501,13 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       ? 'Loading provider commands…'
       : 'Provider commands on demand';
 
+  const publicSettings = usePublicSettings();
+  const userAvatarUrl = useUserAvatarUrl();
   const [agentAvatars, setAgentAvatars] = useState<Record<string, string>>({});
   const [subAgentAvatars, setSubAgentAvatars] = useState<Record<string, string>>({});
   const [assistantName, setAssistantName] = useState<string>('');
   const [defaultOpenClawAgentId, setDefaultOpenClawAgentId] = useState<string>('main');
   const [avatarEditorProvider, setAvatarEditorProvider] = useState<string | null>(null);
-  const [userAvatarUrl, setUserAvatarUrl] = useState<string | null>(null);
 
   // Fix #2: Scroll tracking
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -2516,14 +2552,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       });
       if (!resp.ok) throw new Error(`Upload failed: ${resp.status}`);
       const data = await resp.json();
-      // data has { id, path, originalName, size, mimeType }
-      // path is relative filename within user's upload dir
-      // The full server path is /var/portal-files/user-{userId}/uploads/{path}
-      // But we don't know userId here — ask backend. For now use the returned serverPath if present,
-      // otherwise construct from the response.
-      const serverPath = data.diskPath || `/var/portal-files/uploads/${data.path}`;
+      const fileId = typeof data?.id === 'string' ? data.id : undefined;
+      const serverPath = typeof data?.diskPath === 'string' ? data.diskPath : undefined;
+      const toolUrl = typeof data?.toolUrl === 'string' ? data.toolUrl : undefined;
       setPendingAttachments(prev => prev.map(a =>
-        a.id === attachId ? { ...a, serverPath, uploadStatus: 'done' as const } : a
+        a.id === attachId ? { ...a, fileId, serverPath, toolUrl, uploadStatus: 'done' as const } : a
       ));
     } catch (err: any) {
       setPendingAttachments(prev => prev.map(a =>
@@ -2683,6 +2716,28 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     onSessionResolved: handleSessionResolved,
   });
 
+  useEffect(() => {
+    initialHistoryLoadStartedRef.current = false;
+    setDeferGatewayMetadata(true);
+  }, [session, provider]);
+
+  useEffect(() => {
+    if (isLoadingHistory) {
+      initialHistoryLoadStartedRef.current = true;
+    }
+  }, [isLoadingHistory]);
+
+  useEffect(() => {
+    if (!deferGatewayMetadata) return;
+    if (messages.length > 0) {
+      setDeferGatewayMetadata(false);
+      return;
+    }
+    if (initialHistoryLoadStartedRef.current && !isLoadingHistory) {
+      setDeferGatewayMetadata(false);
+    }
+  }, [deferGatewayMetadata, isLoadingHistory, messages.length]);
+
   const sendButtonTitle = isRunning
     ? (liveSteerEnabled ? 'Send live steer to running turn' : 'Queue follow-up after current turn')
     : `Send message to ${providerLabel}`;
@@ -2692,7 +2747,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     pendingApproval: globalPendingApproval,
     resolveApproval: globalResolveApproval,
     dismissApproval: globalDismissApproval,
-  } = useExecApprovals();
+  } = useExecApprovals({ enabled: !deferGatewayMetadata });
 
   // Merge approval sources: prefer stream-based if both exist, otherwise use global
   // The stream-based approval comes from the active chat SSE, while global comes
@@ -2849,30 +2904,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   );
 
   useEffect(() => {
-    fetch('/api/settings/public')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (data?.agentAvatars) setAgentAvatars(data.agentAvatars);
-        if (data?.subAgentAvatars) setSubAgentAvatars(data.subAgentAvatars);
-        if (data?.assistantName) setAssistantName(data.assistantName);
-        if (data?.defaultOpenClawAgentId) setDefaultOpenClawAgentId(data.defaultOpenClawAgentId);
-      })
-      .catch(() => {});
-
-    // Fetch user avatar (try cache first, then API)
-    const cachedAvatar = sessionStorage.getItem('cached_userAvatar');
-    if (cachedAvatar) setUserAvatarUrl(cachedAvatar);
-    fetch('/api/users/me/avatar', { headers: {} })
-        .then((r) => (r.ok ? r.json() : null))
-        .then((data) => {
-          if (data?.avatarUrl) {
-            const url = data.avatarUrl + '?t=' + Date.now();
-            setUserAvatarUrl(url);
-            sessionStorage.setItem('cached_userAvatar', url);
-          }
-        })
-        .catch(() => {});
-  }, []);
+    if (publicSettings?.agentAvatars) setAgentAvatars(publicSettings.agentAvatars);
+    if (publicSettings?.subAgentAvatars) setSubAgentAvatars(publicSettings.subAgentAvatars);
+    if (publicSettings?.assistantName) setAssistantName(publicSettings.assistantName);
+    if (publicSettings?.defaultOpenClawAgentId) setDefaultOpenClawAgentId(publicSettings.defaultOpenClawAgentId);
+  }, [publicSettings]);
 
   const handleSelectAgent = useCallback(
     async (selection: AgentSelection) => {
@@ -2925,31 +2961,77 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     if (pendingAttachments.length === 0) return '';
     const parts: string[] = [];
     for (const att of pendingAttachments) {
-      if (att.type === 'image' && att.serverPath) {
-        parts.push(`[Image attached: ${att.name} (${(att.size / 1024 / 1024).toFixed(1)}MB, server path: ${att.serverPath})]`);
-      } else if (att.type === 'image') {
-        parts.push(`[Image attached: ${att.name}]`);
-      } else if (att.type === 'text' && att.textContent) {
-        parts.push(`\`\`\`${att.name}\n${att.textContent}\n\`\`\``);
-      } else if (att.serverPath) {
-        parts.push(`[File attached: ${att.name} (${(att.size / 1024 / 1024).toFixed(1)}MB, server path: ${att.serverPath})]`);
-      } else if (att.uploadStatus === 'error') {
-        parts.push(`[File attached: ${att.name} (upload failed: ${att.uploadError || 'unknown error'})]`);
-      } else {
-        parts.push(`[File attached: ${att.name} (${att.size} bytes)]`);
+      const fileHref = att.fileId
+        ? `/files?file=${encodeURIComponent(att.fileId)}`
+        : att.serverPath
+          ? `/files?path=${encodeURIComponent(att.serverPath)}`
+          : '';
+      const portalUrl = fileHref ? `${window.location.origin}${fileHref}` : '';
+      const diskPathLine = att.serverPath ? `- server_path: ${att.serverPath}` : null;
+      const toolUrlLine = att.toolUrl ? `- tool_url: ${att.toolUrl}` : null;
+      const portalLine = portalUrl ? `- portal_url: ${portalUrl}` : null;
+
+      if (att.type === 'text' && att.textContent) {
+        parts.push([
+          `Attached text file: ${att.name}`,
+          diskPathLine,
+          portalLine,
+          'The file content is inlined below.',
+          `\`\`\`${att.name}\n${att.textContent}\n\`\`\``,
+        ].filter(Boolean).join('\n'));
+        continue;
       }
+
+      if (att.uploadStatus === 'error') {
+        parts.push(`[File attached: ${att.name} (upload failed: ${att.uploadError || 'unknown error'})]`);
+        continue;
+      }
+
+      const typeHint = att.type === 'image'
+        ? [
+            'This is an image attachment.',
+            'IMPORTANT: prefer tool_url when present because the gateway host may differ from the portal host.',
+            att.toolUrl
+              ? `Use the image tool with image="${att.toolUrl}".`
+              : att.serverPath
+                ? `Use the image tool with image="${att.serverPath}".`
+                : 'Use the image tool on tool_url or server_path.',
+            'Do not say you cannot access the image unless the tool itself returns an error.',
+          ].join(' ')
+        : /\.pdf$/i.test(att.name)
+          ? [
+              'This is a PDF attachment.',
+              'IMPORTANT: prefer tool_url when present because the gateway host may differ from the portal host.',
+              att.toolUrl
+                ? `Use the pdf tool with pdf="${att.toolUrl}".`
+                : att.serverPath
+                  ? `Use the pdf tool with pdf="${att.serverPath}".`
+                  : 'Use the pdf tool on tool_url or server_path.',
+              'Do not say you cannot access the PDF unless the tool itself returns an error.',
+            ].join(' ')
+          : 'This file is attached on disk. Use tool_url or server_path to inspect it if needed.';
+
+      parts.push([
+        `Attached file: ${att.name}`,
+        `- kind: ${att.type}`,
+        `- size: ${att.size} bytes`,
+        diskPathLine,
+        toolUrlLine,
+        portalLine,
+        typeHint,
+      ].filter(Boolean).join('\n'));
     }
     return parts.join('\n\n') + '\n\n';
   }, [pendingAttachments]);
 
   // Intercept send to prepend attachments
-  const handleSendWithAttachments = useCallback(() => {
-    if (pendingAttachments.length === 0) return;
+  const handleSendWithAttachments = useCallback((options?: { submit?: boolean }) => {
+    if (pendingAttachments.length === 0) return false;
     // Block send while any file is still uploading
     const stillUploading = pendingAttachments.some(a => a.uploadStatus === 'uploading');
-    if (stillUploading) return;
+    if (stillUploading) return false;
     const attachText = buildAttachmentText();
-    if (!composerInputRef.current) return;
+    if (!composerInputRef.current) return false;
     const current = composerInputRef.current.value;
     const combined = attachText + current;
     const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
@@ -2958,7 +3040,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     )?.set;
     nativeInputValueSetter?.call(composerInputRef.current, combined);
     composerInputRef.current.dispatchEvent(new Event('input', { bubbles: true }));
+    if (options?.submit) {
+      requestAnimationFrame(() => composerInputRef.current?.form?.requestSubmit());
+    }
     setPendingAttachments([]);
+    return true;
   }, [pendingAttachments, buildAttachmentText]);
 
   return (
@@ -3001,7 +3087,16 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
 
             <div className="flex items-center gap-1 sm:gap-2 ml-auto">
               {canSelectModel && (
-                <ModelPicker provider={provider} value={selectedModel} onChange={handleModelChange} models={availableModels} supportsCustomModelInput={supportsCustomModelInput} modelCatalogKind={modelCatalogKind} disabled={isRunning} />
+                <ModelPicker
+                  provider={provider}
+                  value={selectedModel}
+                  onChange={handleModelChange}
+                  models={availableModels}
+                  supportsCustomModelInput={supportsCustomModelInput}
+                  modelCatalogKind={modelCatalogKind}
+                  disabled={isRunning}
+                  onOpen={() => { void ensureProviderModelsLoaded(provider); }}
+                />
               )}
               <SessionControls
                 thinkingLevel={thinkingLevel}
@@ -3022,7 +3117,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 compactionModelError={compactionModelError}
                 compactionModelOptionsLoading={compactionModelOptionsLoading}
                 sessionControlsSupported={sessionControlsSupported}
-                onPanelOpen={() => { void loadProviderCommands(provider, { force: true }); }}
+                onPanelOpen={() => {
+                  void ensureSessionControlsMetadataLoaded();
+                  void loadProviderCommands(provider, { force: true });
+                  void ensureProviderModelsLoaded(provider);
+                }}
                 disabled={false}
                 currentModel={selectedModel}
                 sessionKey={session}
@@ -3488,9 +3587,12 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                       // On desktop: Shift+Enter inserts newline, plain Enter submits
                       if (!isMobileDevice && e.key === 'Enter' && !e.shiftKey) {
                         // Let ComposerPrimitive handle the submit (via submitMode="enter")
-                        // But first prepend attachments if any
+                        // But if attachments exist, force the mutation first and then submit.
                         if (pendingAttachments.length > 0) {
-                          handleSendWithAttachments();
+                          e.preventDefault();
+                          if (handleSendWithAttachments({ submit: true })) {
+                            return;
+                          }
                         }
                         // Slash commands are sent as messages to the agent (not executed locally)
                       }
@@ -3517,7 +3619,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   <ComposerPrimitive.Send asChild>
                     <button
                       onClick={async (e) => {
-                        handleSendWithAttachments();
+                        if (pendingAttachments.length > 0 && handleSendWithAttachments({ submit: true })) {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          return;
+                        }
                         if (await maybeExecuteSlashCommand()) {
                           e.preventDefault();
                           e.stopPropagation();

@@ -265,13 +265,13 @@ export default function Layout() {
         {/* Page Content */}
         <main className="flex-1 overflow-hidden min-h-0 bg-theme-bg text-theme-text">
           <ErrorBoundary>
-            {/* Terminal is always mounted but hidden when not active — preserves xterm instances */}
-            {showPersistentTerminal && (
-              <div style={{ display: isTerminalRoute ? 'contents' : 'none' }}>
-                <Suspense fallback={null}>
-                  <TerminalPage />
-                </Suspense>
-              </div>
+            {/* Only mount TerminalPage on the terminal route.
+                Keeping it hidden-but-live on every page spins up background Socket.IO
+                sessions that interfere with unrelated screens like Agent Chats. */}
+            {showPersistentTerminal && isTerminalRoute && (
+              <Suspense fallback={null}>
+                <TerminalPage />
+              </Suspense>
             )}
             {!isTerminalRoute && <Outlet />}
           </ErrorBoundary>

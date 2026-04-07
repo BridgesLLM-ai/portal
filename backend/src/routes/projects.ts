@@ -16,7 +16,7 @@ import { getWorkspaceOwnerId } from '../utils/workspaceScope';
 import extract from 'extract-zip';
 import { getGatewayToken } from '../utils/gatewayToken';
 import { desktopExec, desktopExecDetached } from '../utils/desktopEnv';
-import { getDefaultModel } from '../services/openclawConfigManager';
+import { getDefaultModel, getProviderStatuses } from '../services/openclawConfigManager';
 import { normalizePortalModelId } from '../utils/openclawCli';
 
 /** Shell-escape a filename for safe use in execSync commands */
@@ -26,6 +26,25 @@ function shellEscape(s: string): string {
 }
 
 const router = Router();
+const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(process.env.HOME || '/root', '.openclaw');
+const MAIN_AGENT_DIR = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent');
+const MAIN_AUTH_PROFILES_PATH = path.join(MAIN_AGENT_DIR, 'auth-profiles.json');
+const MAIN_MODELS_PATH = path.join(MAIN_AGENT_DIR, 'models.json');
+
+function syncProjectAgentRuntimeFiles(agentId: string) {
+  try {
+    const targetDir = path.join(OPENCLAW_HOME, 'agents', agentId, 'agent');
+    fs.mkdirSync(targetDir, { recursive: true });
+    if (fs.existsSync(MAIN_AUTH_PROFILES_PATH)) {
+      fs.copyFileSync(MAIN_AUTH_PROFILES_PATH, path.join(targetDir, 'auth-profiles.json'));
+    }
+    if (fs.existsSync(MAIN_MODELS_PATH)) {
+      fs.copyFileSync(MAIN_MODELS_PATH, path.join(targetDir, 'models.json'));
+    }
+  } catch (error) {
+    console.warn(`[ensureProjectAgent] Failed to sync runtime files for ${agentId}:`, error);
+  }
+}
 
 // Multer for ZIP uploads
 const ZIPS_DIR = '/portal/project-zips';
@@ -329,7 +348,9 @@ router.post('/clone', authenticateToken, async (req: Request, res: Response) => 
 router.get('/models/available', authenticateToken, async (_req: Request, res: Response) => {
   try {
     const result = await listGatewayModels();
-    
+    const providerStatus = new Map(getProviderStatuses().map((p) => [p.id, p]));
+    const defaultModel = getDefaultModel();
+
     if (result.ok && result.models) {
       const models = result.models.map((m: any) => ({
         id: m.id ? (m.provider ? `${m.provider}/${m.id}` : m.id) : m.model,
@@ -339,6 +360,19 @@ router.get('/models/available', authenticateToken, async (_req: Request, res: Re
         contextWindow: m.contextWindow,
         cost: m.cost,
       }));
+
+      models.sort((a, b) => {
+        const aStatus = a.provider ? providerStatus.get(a.provider) : undefined;
+        const bStatus = b.provider ? providerStatus.get(b.provider) : undefined;
+        const aHealthy = aStatus ? (aStatus.status === 'configured' || aStatus.status === 'cooldown') : false;
+        const bHealthy = bStatus ? (bStatus.status === 'configured' || bStatus.status === 'cooldown') : false;
+        if (aHealthy !== bHealthy) return aHealthy ? -1 : 1;
+        const aIsDefault = a.id === defaultModel;
+        const bIsDefault = b.id === defaultModel;
+        if (aIsDefault !== bIsDefault) return aIsDefault ? -1 : 1;
+        return 0;
+      });
+
       res.json({ models });
     } else {
       res.json({ 
@@ -2388,6 +2422,19 @@ router.get('/:name/shares', authenticateToken, async (req: Request, res: Respons
   }
 });
 
+async function findOwnedShareLink(ownerId: string, projectName: string, linkId: string) {
+  return prisma.appShareLink.findFirst({
+    where: {
+      id: linkId,
+      userId: ownerId,
+      app: {
+        userId: ownerId,
+        name: projectName,
+      },
+    },
+  });
+}
+
 // PATCH /api/projects/:name/share/:linkId - update share link (public ↔ secure, active toggle)
 router.patch('/:name/share/:linkId', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -2411,8 +2458,14 @@ router.patch('/:name/share/:linkId', authenticateToken, async (req: Request, res
       updateData.passwordHash = await bcrypt.hash(password, 12);
     }
 
+    const existingLink = await findOwnedShareLink(ownerId, req.params.name, req.params.linkId);
+    if (!existingLink) {
+      res.status(404).json({ error: 'Share link not found' });
+      return;
+    }
+
     const link = await prisma.appShareLink.update({
-      where: { id: req.params.linkId },
+      where: { id: existingLink.id },
       data: updateData,
     });
 
@@ -2428,14 +2481,20 @@ router.delete('/:name/share/:linkId', authenticateToken, async (req: Request, re
   try {
     const ownerId = await getScopedOwnerId(req);
     const { permanent } = req.query;
+    const existingLink = await findOwnedShareLink(ownerId, req.params.name, req.params.linkId);
+    if (!existingLink) {
+      res.status(404).json({ error: 'Share link not found' });
+      return;
+    }
+
     if (permanent === 'true') {
       await prisma.appShareLink.delete({
-        where: { id: req.params.linkId },
+        where: { id: existingLink.id },
       });
       res.json({ message: 'Share link deleted permanently' });
     } else {
       await prisma.appShareLink.update({
-        where: { id: req.params.linkId },
+        where: { id: existingLink.id },
         data: { isActive: false },
       });
       res.json({ message: 'Share link revoked' });
@@ -2458,7 +2517,7 @@ router.post('/:name/share/:linkId/email', authenticateToken, async (req: Request
       res.status(400).json({ error: 'Invalid email address' }); return;
     }
 
-    const link = await prisma.appShareLink.findUnique({ where: { id: req.params.linkId } });
+    const link = await findOwnedShareLink(ownerId, req.params.name, req.params.linkId);
     if (!link || !link.isActive) {
       res.status(404).json({ error: 'Share link not found or inactive' }); return;
     }
@@ -2942,6 +3001,7 @@ async function ensureProjectAgent(
   
   // Fast path: already known from this process lifetime
   if (knownAgentIds.has(agentId)) {
+    syncProjectAgentRuntimeFiles(agentId);
     return { agentId, created: false };
   }
   
@@ -2959,6 +3019,7 @@ async function ensureProjectAgent(
   
   if (agents.some((a: any) => a.id === agentId)) {
     knownAgentIds.add(agentId);
+    syncProjectAgentRuntimeFiles(agentId);
     return { agentId, created: false };
   }
   
@@ -3051,6 +3112,7 @@ Your workspace is /work but your PROJECT is at /home/user/project/.
   }
   
   knownAgentIds.add(agentId);
+  syncProjectAgentRuntimeFiles(agentId);
   return { agentId, created: true };
 }
 
@@ -3134,6 +3196,20 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
       projectDir, userId, name, normalizedName
     );
 
+    // Determine default model — use gateway's configured default, never hardcode a provider
+    const requestedModel = normalizePortalModelId(req.body?.model || '');
+    const selectedModel = requestedModel || getDefaultModel() || 'openai-codex/gpt-5.4';
+
+    // Patch the session model before any init traffic so a newly-created project
+    // session does not accidentally boot under an unauthenticated default model.
+    try {
+      const sessionInfo = await getSessionInfo(sessionKey);
+      const currentSessionModel = normalizePortalModelId(sessionInfo.ok ? String(sessionInfo.data?.model || '') : '');
+      if (selectedModel && currentSessionModel !== selectedModel) {
+        await patchSessionModel(sessionKey, selectedModel);
+      }
+    } catch {}
+
     // If session needs init, send the project context as the first message via gateway RPC
     if (needsInit) {
       const assistantName = await getAssistantName();
@@ -3198,6 +3274,7 @@ Hello! I'm ready to help with this project. What would you like to work on?`;
           'x-openclaw-session-key': sessionKey,
         },
         body: JSON.stringify({
+          model: selectedModel,
           messages: [sandboxSystemMessage, { role: 'user', content: initMessage }],
         }),
         signal: controller.signal,
@@ -3207,19 +3284,6 @@ Hello! I'm ready to help with this project. What would you like to work on?`;
       const sessionStatePath = path.join(projectDir, '.agent-session.json');
       fs.writeFileSync(sessionStatePath, JSON.stringify({ initialized: true, lastActivity: new Date().toISOString() }, null, 2), 'utf-8');
     }
-
-    // Determine default model — use gateway's configured default, never hardcode a provider
-    const requestedModel = normalizePortalModelId(req.body?.model || '');
-    const selectedModel = requestedModel || getDefaultModel() || 'openai-codex/gpt-5.4';
-
-    // Patch model when explicitly requested, or when the session is still pinned to an older model.
-    try {
-      const sessionInfo = await getSessionInfo(sessionKey);
-      const currentSessionModel = normalizePortalModelId(sessionInfo.ok ? String(sessionInfo.data?.model || '') : '');
-      if (selectedModel && currentSessionModel !== selectedModel) {
-        await patchSessionModel(sessionKey, selectedModel);
-      }
-    } catch {}
 
     res.json({
       sessionKey,
