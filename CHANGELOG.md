@@ -4,19 +4,27 @@ All notable changes to BridgesLLM Portal are documented here.
 
 ## [3.23.7] — 2026-04-07
 
-### Fixed
-- Project AI chat now resolves the selected model before first session initialization, reuses the correct concrete session per project, and stays stable during rapid project switching.
-- Main Agent Chat HTTP abort fallback now clears portal stream state after a successful OpenClaw abort, so disconnected aborts no longer look stuck.
+### Agent chat and streaming
+- Fixed chat refresh resume and attachment handoff, and enriched active stream snapshots so reload/reconnect recovery is much more reliable.
+- Improved task summaries and task tab usability, with cleaner loading behavior around session controls and long-running work.
+- Fixed a stuck-state edge case where HTTP abort fallback could succeed in OpenClaw but still look active in the portal until refresh.
+- Fixed a blank-page class of failures by returning proper 404s for missing frontend assets instead of letting the app fall into broken routing behavior.
+
+### Project AI chat
+- Reworked project chat history hydration and switch handling so rapid project switching is far less likely to cross wires or lose the current conversation state.
+- Fixed first-open model resolution so project chats choose the intended model before session initialization instead of drifting into bad defaults.
+- Fixed per-project session identity so each project keeps the right concrete session, with cleaner remount behavior on project switches.
+- Patched project chat gaps around file-link handling and under-the-hood session consistency.
 - Project model availability now demotes providers excluded by auth-order overrides instead of surfacing dead defaults first.
+
+### Files and attachments
+- Fixed attachment access across refreshes and split-host deployments.
+- Improved file link rendering and deep-link resolution so chat references land in the right place more consistently.
 
 ### Security
 - Hardened AI file helper routes against traversal by resolving requests only inside the allowed user and project bases.
-- Scoped share-link mutation routes to the correct owner and project instead of raw link id only.
-- Hardened signed direct-content tool URL origin selection and narrowed direct gateway browser exposure.
-
-### Internal
-- Updated portal operator guidance to reflect the real WebSocket chat path, project-session invariants, abort behavior, and Files handoff rules.
-- Excluded private operational docs and backup scripts from public export and release packaging.
+- Scoped share-link mutations to the correct owner and project instead of allowing raw-link-id-only writes.
+- Hardened signed direct-content tool URL origin selection and narrowed browser direct-gateway exposure.
 
 ## [3.23.6] — 2026-04-05
 
