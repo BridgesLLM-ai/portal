@@ -4,27 +4,18 @@ All notable changes to BridgesLLM Portal are documented here.
 
 ## [3.23.7] — 2026-04-07
 
-### Agent chat and streaming
-- Fixed chat refresh resume and attachment handoff, and enriched active stream snapshots so reload/reconnect recovery is much more reliable.
-- Improved task summaries and task tab usability, with cleaner loading behavior around session controls and long-running work.
-- Fixed a stuck-state edge case where HTTP abort fallback could succeed in OpenClaw but still look active in the portal until refresh.
-- Fixed a blank-page class of failures by returning proper 404s for missing frontend assets instead of letting the app fall into broken routing behavior.
-
-### Project AI chat
-- Reworked project chat history hydration and switch handling so rapid project switching is far less likely to cross wires or lose the current conversation state.
-- Fixed first-open model resolution so project chats choose the intended model before session initialization instead of drifting into bad defaults.
-- Fixed per-project session identity so each project keeps the right concrete session, with cleaner remount behavior on project switches.
-- Patched project chat gaps around file-link handling and under-the-hood session consistency.
-- Project model availability now demotes providers excluded by auth-order overrides instead of surfacing dead defaults first.
-
-### Files and attachments
-- Fixed attachment access across refreshes and split-host deployments.
-- Improved file link rendering and deep-link resolution so chat references land in the right place more consistently.
+### Improved
+- **Agent chats recover more gracefully** — reloads, reconnects, attachment handoff, and active stream recovery are all more reliable now.
+- **Project AI chat is much more stable** — history recovery, first-open model selection, per-project session routing, and rapid switching between projects all behave more predictably.
+- **Files and chat links are more dependable** — attachment access across refreshes and split-host installs is fixed, and file links resolve more cleanly.
+- **Tasks and session controls feel cleaner** — long-running work, summaries, and related session controls load with less friction.
+- **Missing frontend assets now fail safely** — bad asset requests return proper 404s instead of cascading into blank-page failures.
+- **Project model defaults are saner** — providers excluded by auth-order overrides are pushed behind healthy options instead of surfacing first.
 
 ### Security
-- Hardened AI file helper routes against traversal by resolving requests only inside the allowed user and project bases.
-- Scoped share-link mutations to the correct owner and project instead of allowing raw-link-id-only writes.
-- Hardened signed direct-content tool URL origin selection and narrowed browser direct-gateway exposure.
+- **File access is tighter** — AI file helper routes are constrained to the correct user and project paths.
+- **Share links are safer** — mutations are now scoped to the correct owner and project instead of raw link id alone.
+- **Signed tool URLs are harder to abuse** — origin selection is stricter, and browser direct-gateway exposure is narrower.
 
 ## [3.23.6] — 2026-04-05
 

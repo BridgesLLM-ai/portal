@@ -77,10 +77,10 @@ One-click updates from the browser. Admin dashboard with user management, storag
 ## 🆕 Recent Changes
 
 ### v3.23.7 (April 7, 2026)
-- **Project AI chat got a real stability pass** — first-open model selection, per-project session identity, history hydration, and rapid project switching were all tightened up.
-- **Main Agent Chat recovery is better** — refresh resume, attachment handoff, active stream recovery, and fallback abort behavior are all more reliable.
+- **Project AI chat is far more dependable** — first-open model selection, per-project session routing, history recovery, and rapid project switching all got a real stability pass.
+- **Agent chats recover better** — reloads, reconnects, attachment handoff, active stream recovery, and fallback abort behavior are all more reliable.
 - **Files and links behave better** — attachment access across refreshes and split-host setups is fixed, and chat file links resolve more cleanly.
-- **Tasks and session UX improved** — task summaries and task detail handling are cleaner, with less junk state hanging around.
+- **Tasks feel cleaner** — long-running work, summaries, and related session controls load with less friction.
 - **Security got tighter** — AI file helpers, share-link mutations, signed tool URLs, and browser direct-gateway exposure were all hardened in this pass.
 
 ### v3.23.6 (April 5, 2026)
