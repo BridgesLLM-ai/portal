@@ -5,9 +5,18 @@ All notable changes to BridgesLLM Portal are documented here.
 ## [3.23.9] — 2026-04-09
 
 ### Improved
+- **Session controls are substantially better in both main chat and project chat** — OpenClaw sessions now expose native fast mode controls, project chats gained thinking controls, and session-control state behaves more consistently across reconnects.
+- **Project model handling is more reliable** — the portal now preserves intended project models, normalizes model IDs reported back from session info, and reduces bad fallbacks that used to make model switching look flaky.
+- **Agent chat recovery is tougher under long or interrupted runs** — reconnect behavior, control filtering, hidden-resume handling, and yielded-run recovery were tightened so stale streams and ghost resumes are far less likely.
 - **OpenClaw compatibility hotfix is now explicit and admin-controlled** — admins can inspect the installed runtime patch state and apply the older OpenClaw long-run relay hotfix directly from Agent Chat session controls or Settings instead of relying on hidden manual server edits.
+- **Ollama defaults were refreshed** — recommendation defaults now line up with the current Ollama guidance shipped in the portal.
 
 ### Fixed
+- **Dormant and yielded-run reconnect bugs** — the portal now recovers more cleanly after inactive or backgrounded OpenClaw runs instead of leaving stale session controls or dead-looking chats behind.
+- **Stale UI state after reloads** — the stale public-settings cache issue, hidden interrupted-stream bubbles after idle timeout, replayed duplicate chat output, and avatar 404 noise were all cleaned up.
+- **Heartbeat/session-control edge cases** — false heartbeat-model update failures are avoided, and session-control refresh behavior is more stable.
+- **Agent Tools request pressure is bounded** — tab request behavior is tighter, which reduces unnecessary gateway churn.
+- **Approved signup passwords are preserved correctly** — the auth flow no longer drops the approved password state during signup.
 - **Compatibility hotfix installs now bundle the actual patch helper** — portal releases now ship `scripts/patch-openclaw-long-run-relay-hotfix.sh`, so the admin action works on fresh installs instead of failing with a missing-script error.
 - **Hotfix apply now restarts more safely on non-systemd OpenClaw setups** — when `openclaw gateway restart` only reports a disabled service, the portal now falls back to signaling the live gateway process so the patched runtime actually reloads.
 
