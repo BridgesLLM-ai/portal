@@ -5,6 +5,7 @@ import { prisma } from '../config/database';
 import fs from 'fs';
 import path from 'path';
 import net from 'net';
+import { createHash } from 'crypto';
 import { exec as cpExec } from 'child_process';
 
 const router = Router();
@@ -20,6 +21,37 @@ const OPENCLAW_WORKSPACE = process.env.OPENCLAW_WORKSPACE || '/root/.openclaw/wo
 const OPENCLAW_CONFIG_PATH = process.env.OPENCLAW_CONFIG_PATH || path.join(process.env.HOME || '/root', '.openclaw/openclaw.json');
 const PORTAL_STATIC_NOVNC_DIR = path.resolve(process.cwd(), '../static/novnc');
 const SYSTEM_NOVNC_DIR = '/usr/share/novnc';
+
+function hashDirectoryContents(root: string): string | null {
+  try {
+    if (!fs.existsSync(root)) return null;
+    const hash = createHash('sha256');
+
+    const walk = (dir: string, relative = '') => {
+      const entries = fs.readdirSync(dir, { withFileTypes: true })
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      for (const entry of entries) {
+        const relPath = relative ? `${relative}/${entry.name}` : entry.name;
+        const fullPath = path.join(dir, entry.name);
+        hash.update(relPath);
+        hash.update(entry.isDirectory() ? 'dir' : entry.isSymbolicLink() ? 'link' : 'file');
+        if (entry.isDirectory()) {
+          walk(fullPath, relPath);
+        } else if (entry.isFile()) {
+          hash.update(fs.readFileSync(fullPath));
+        } else if (entry.isSymbolicLink()) {
+          hash.update(fs.readlinkSync(fullPath));
+        }
+      }
+    };
+
+    walk(root);
+    return hash.digest('hex');
+  } catch {
+    return null;
+  }
+}
 
 function normalizeRemoteDesktopUrl(raw: string): string {
   const value = (raw || '').trim();
@@ -140,12 +172,21 @@ function ensurePortalSkillInstalled(): { changed: boolean; note: string } {
     if (!fs.existsSync(path.join(portalSkillSrc, 'SKILL.md'))) {
       return { changed: false, note: `Skill source not found at ${portalSkillSrc}` };
     }
+
+    const oldSkill = path.join(OPENCLAW_WORKSPACE, 'skills/shared-browser');
+    const oldSkillExists = fs.existsSync(oldSkill);
+    const sourceHash = hashDirectoryContents(portalSkillSrc);
+    const destHash = hashDirectoryContents(skillDest);
+
+    if (sourceHash && destHash && sourceHash === destHash && !oldSkillExists) {
+      return { changed: false, note: `Managed skill already current at ${skillDest}` };
+    }
+
     const needsCopy = !fs.existsSync(path.join(skillDest, 'SKILL.md'));
     fs.mkdirSync(path.dirname(skillDest), { recursive: true });
     fs.rmSync(skillDest, { recursive: true, force: true });
     fs.cpSync(portalSkillSrc, skillDest, { recursive: true, force: true });
-    const oldSkill = path.join(OPENCLAW_WORKSPACE, 'skills/shared-browser');
-    if (fs.existsSync(oldSkill)) fs.rmSync(oldSkill, { recursive: true, force: true });
+    if (oldSkillExists) fs.rmSync(oldSkill, { recursive: true, force: true });
     return { changed: true, note: needsCopy ? `Installed managed skill to ${skillDest}` : `Refreshed managed skill at ${skillDest}` };
   } catch (err: any) {
     return { changed: false, note: `Failed to install managed skill: ${err?.message || 'unknown error'}` };

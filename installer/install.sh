@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.23.10"
+readonly VERSION="3.24.1"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -1539,27 +1539,30 @@ SVCEOF
   if ! $SKIP_OPENCLAW && command -v openclaw &>/dev/null; then
     local oc_bin
     oc_bin="$(which openclaw 2>/dev/null || echo '/usr/bin/openclaw')"
-    if [[ ! -f /etc/systemd/system/openclaw-gateway.service ]]; then
-      cat > /etc/systemd/system/openclaw-gateway.service << OCSVCEOF
+    cat > /etc/systemd/system/openclaw-gateway.service << OCSVCEOF
 [Unit]
 Description=OpenClaw AI Gateway
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=${oc_bin} gateway run
+ExecStart=${oc_bin} gateway --port 18789
 Restart=always
 RestartSec=5
+TimeoutStopSec=30
+TimeoutStartSec=30
+SuccessExitStatus=0 143
+KillMode=control-group
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 OCSVCEOF
-      systemctl daemon-reload
-      systemctl enable openclaw-gateway >> "$LOG_FILE" 2>&1
-    fi
+    systemctl daemon-reload
+    systemctl enable openclaw-gateway >> "$LOG_FILE" 2>&1 || true
     ok "OpenClaw gateway service configured"
   fi
 
@@ -1780,13 +1783,40 @@ WSSVCEOF
 # Step 8: Start
 # ═══════════════════════════════════════════════════════════════
 
+ensure_openclaw_gateway_boots_cleanly() {
+  if ! systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
+    return 0
+  fi
+
+  systemctl start openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+  sleep 5
+
+  if curl -fsS --max-time 5 http://127.0.0.1:18789/ >/dev/null 2>&1; then
+    return 0
+  fi
+
+  warn "OpenClaw gateway did not come up cleanly. Clearing stale gateway processes and retrying once."
+  systemctl stop openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+  pkill -f 'openclaw-gateway|/usr/bin/openclaw gateway|/usr/local/bin/openclaw gateway|openclaw$' >> "$LOG_FILE" 2>&1 || true
+  sleep 2
+  systemctl start openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+  sleep 5
+
+  if curl -fsS --max-time 5 http://127.0.0.1:18789/ >/dev/null 2>&1; then
+    return 0
+  fi
+
+  warn "OpenClaw gateway still did not answer on 127.0.0.1:18789 after retry."
+  return 1
+}
+
 start_portal() {
   step_header "Starting portal"
   CURRENT_STEP="startup"
 
   # Start OpenClaw gateway first (portal connects to it)
   if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
-    systemctl start openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+    ensure_openclaw_gateway_boots_cleanly || true
     sleep 3  # Let gateway fully initialize and write its config
 
     # CRITICAL: Sync the gateway token into .env.production

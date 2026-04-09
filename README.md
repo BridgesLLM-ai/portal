@@ -76,6 +76,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.24.1 (April 9, 2026)
+- **Gateway restart recovery is less fragile** — explicit reconnects now clear stale backoff state so Agent Chat does not sit around waiting on an old reconnect timer after the gateway comes back.
+- **Portal skill installs stop re-copying themselves for no reason** — unchanged managed skill payloads are detected by hash and left alone.
+- **Installer updates repair the gateway service more decisively** — the shipped update path now rewrites the OpenClaw gateway systemd unit and retries a clean loopback boot when stale processes are in the way.
+
 ### v3.23.10 (April 9, 2026)
 - **The fake steering pill is gone** — the purple follow-up pill under the composer was removed instead of advertising a `/steer` path that does not reliably work.
 - **Agent Chat wording is honest now** — the running-state UI now says "live note" instead of pretending it can always steer the active turn.

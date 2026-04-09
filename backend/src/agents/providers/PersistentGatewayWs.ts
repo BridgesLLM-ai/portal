@@ -969,6 +969,11 @@ export function isConnected(): boolean {
  */
 export function reconnectNow(): void {
   if (isConnected() || isConnecting) return;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  reconnectAttempts = 0;
   // Re-resolve token on each reconnect attempt (picks up config changes)
   GATEWAY_TOKEN = getGatewayToken();
   if (!GATEWAY_TOKEN) return;

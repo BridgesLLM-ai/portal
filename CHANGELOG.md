@@ -2,6 +2,13 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.24.1] — 2026-04-09
+
+### Fixed
+- **Agent Chat recovers faster after gateway restarts** — the persistent OpenClaw WebSocket now clears stale reconnect timers and resets retry state when the portal explicitly asks it to reconnect, which stops startup-time restart churn from stretching into dead-looking chats.
+- **Managed portal skill sync stops thrashing unchanged installs** — Remote Desktop now hashes the bundled portal skill and skips unnecessary refreshes when the installed copy is already identical.
+- **Installer repairs the OpenClaw gateway service more aggressively** — updates now rewrite the gateway unit to run `openclaw gateway --port 18789`, enable it, and retry a clean boot when stale gateway processes or port conflicts block startup.
+
 ## [3.23.10] — 2026-04-09
 
 ### Fixed
