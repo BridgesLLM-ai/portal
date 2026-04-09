@@ -77,11 +77,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 ## 🆕 Recent Changes
 
 ### v3.23.9 (April 9, 2026)
-- **Session controls got real cleanup and expansion** — main chat and project chat now behave better across reconnects, expose native OpenClaw fast mode more cleanly, and include project thinking controls.
-- **Model switching and project model persistence are more reliable** — the portal preserves intended project models, normalizes session-reported model IDs, and avoids several stale-model failure paths.
-- **Long-run and stale-stream recovery is tougher** — yielded runs, hidden resumes, stale interrupted bubbles, and stale public-settings cache behavior were all tightened up.
+- **Session controls got a serious stability pass** — main chat and project chat now carry fast mode, thinking controls, and recovered session state more reliably instead of dropping into stale UI nonsense.
+- **Model switching and project model persistence are more reliable** — the portal preserves intended project models, normalizes session-reported model IDs, and fixes several stale-model / switch-looked-like-it-failed paths.
+- **Session switching and long-run recovery are tougher** — yielded runs, hidden resumes, stale interrupted bubbles, reconnect state, and stale public-settings cache behavior were all tightened up.
 - **OpenClaw compatibility hotfix is explicit now** — admins can inspect and apply the older long-run relay patch directly from Settings or Agent Chat instead of doing hidden server-side edits.
-- **The hotfix helper is actually bundled, and reload fallback is safer** — fresh installs include the patch script, and if `openclaw gateway restart` only reports a disabled service, the portal now signals the live gateway process so the hotfix still takes effect.
+- **The hotfix helper is bundled, and reload fallback is safer** — fresh installs include the patch script, and if `openclaw gateway restart` only reports a disabled service, the portal now signals the live gateway process so the hotfix still takes effect.
 
 ### v3.23.8 (April 7, 2026)
 - **Project chat survives renames** — per-project assistant and session identity is now stable, so renaming a project no longer strands its AI chat state.

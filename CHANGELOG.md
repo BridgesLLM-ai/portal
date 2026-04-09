@@ -5,15 +5,17 @@ All notable changes to BridgesLLM Portal are documented here.
 ## [3.23.9] — 2026-04-09
 
 ### Improved
-- **Session controls are substantially better in both main chat and project chat** — OpenClaw sessions now expose native fast mode controls, project chats gained thinking controls, and session-control state behaves more consistently across reconnects.
-- **Project model handling is more reliable** — the portal now preserves intended project models, normalizes model IDs reported back from session info, and reduces bad fallbacks that used to make model switching look flaky.
-- **Agent chat recovery is tougher under long or interrupted runs** — reconnect behavior, control filtering, hidden-resume handling, and yielded-run recovery were tightened so stale streams and ghost resumes are far less likely.
+- **Main-chat and project-chat session controls got a real upgrade** — OpenClaw sessions now expose native fast mode controls more cleanly, project chats gained thinking controls, and session-control state behaves more consistently across reconnects and recovered sessions.
+- **Model switching is more trustworthy** — the portal now normalizes model IDs reported back from session info, preserves intended project models, and reduces stale-model fallbacks that used to make model changes look like they silently failed.
+- **Project switching and session switching are more resilient** — project chat state, selected session metadata, and reconnect behavior now survive switching flows with less stale state and fewer ghost controls.
+- **Long-run and interrupted chat recovery is tougher** — reconnect behavior, control filtering, hidden-resume handling, and yielded-run recovery were tightened so stale streams and phantom resumes are far less likely.
 - **OpenClaw compatibility hotfix is now explicit and admin-controlled** — admins can inspect the installed runtime patch state and apply the older OpenClaw long-run relay hotfix directly from Agent Chat session controls or Settings instead of relying on hidden manual server edits.
 - **Ollama defaults were refreshed** — recommendation defaults now line up with the current Ollama guidance shipped in the portal.
 
 ### Fixed
-- **Dormant and yielded-run reconnect bugs** — the portal now recovers more cleanly after inactive or backgrounded OpenClaw runs instead of leaving stale session controls or dead-looking chats behind.
-- **Stale UI state after reloads** — the stale public-settings cache issue, hidden interrupted-stream bubbles after idle timeout, replayed duplicate chat output, and avatar 404 noise were all cleaned up.
+- **Fast mode toggle paths now behave correctly across main and project sessions** — native OpenClaw `fastMode` patching is wired through the real session controls instead of being easy to lose in stale UI state.
+- **Dormant, idle, and yielded-run reconnect bugs** — the portal now recovers more cleanly after inactive or backgrounded OpenClaw runs instead of leaving stale session controls, stuck spinners, or dead-looking chats behind.
+- **Session switcher / stale-state bugs after reloads** — the stale public-settings cache issue, hidden interrupted-stream bubbles after idle timeout, replayed duplicate chat output, and avatar 404 noise were all cleaned up.
 - **Heartbeat/session-control edge cases** — false heartbeat-model update failures are avoided, and session-control refresh behavior is more stable.
 - **Agent Tools request pressure is bounded** — tab request behavior is tighter, which reduces unnecessary gateway churn.
 - **Approved signup passwords are preserved correctly** — the auth flow no longer drops the approved password state during signup.
