@@ -2434,12 +2434,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setMessages(prev => [...prev, {
           id: nextId(),
           role: 'system',
-          content: `Steer sent to running OpenClaw turn: ${normalized}`,
+          content: `Live note sent to running OpenClaw turn: ${normalized}`, 
           createdAt: new Date(),
           provenance: 'live-steer',
         }]);
-        setStatusText('Steer sent to running OpenClaw turn');
-        setTimeout(() => setStatusText((curr) => curr === 'Steer sent to running OpenClaw turn' ? null : curr), 2200);
+        setStatusText('Live note sent to running OpenClaw turn');
+        setTimeout(() => setStatusText((curr) => curr === 'Live note sent to running OpenClaw turn' ? null : curr), 2200);
       } catch (err: any) {
         console.error('[ChatState] Failed to inject note into active OpenClaw turn:', err);
         setStatusText(`⚠️ ${normalizeAgentError(err, 'Live steer failed')}`);

@@ -333,7 +333,7 @@ function buildProviderCapabilityPills(params: {
   pills.push({ icon: <ListChecks size={11} />, label: capabilities?.supportsSessionList ? 'Session list available' : 'No session list', tone: capabilities?.supportsSessionList ? 'sky' : 'slate' });
 
   if (capabilities?.supportsInTurnSteering) {
-    pills.push({ icon: <MessageSquare size={11} />, label: 'Live FYI / steer while running', tone: 'emerald' });
+    pills.push({ icon: <MessageSquare size={11} />, label: 'Live note injection while running', tone: 'emerald' });
   } else if (capabilities?.supportsQueuedFollowUps !== false) {
     pills.push({ icon: <Clock size={11} />, label: 'Queued follow-ups while running', tone: 'amber' });
   }
@@ -2692,7 +2692,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const providerLabel = getAgent(provider).name;
   const liveSteerEnabled = providerMeta.capabilities?.supportsInTurnSteering === true;
   const runningComposerPlaceholder = liveSteerEnabled
-    ? 'OpenClaw is working — send FYI / steer for this turn…'
+    ? 'OpenClaw is working, send a live note for this turn…'
     : 'Agent is working — queue a follow-up message…';
   const providerCommandCount = providerMeta.slashCommands?.length || 0;
   const providerCommandStatus = providerMeta.slashCommandsLoaded
@@ -2939,7 +2939,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   }, [deferGatewayMetadata, isLoadingHistory, messages.length]);
 
   const sendButtonTitle = isRunning
-    ? (liveSteerEnabled ? 'Send live steer to running turn' : 'Queue follow-up after current turn')
+    ? (liveSteerEnabled ? 'Send live note to running turn' : 'Queue follow-up after current turn')
     : `Send message to ${providerLabel}`;
 
   // Global exec approval listener (works even when no chat stream is active)
@@ -3691,11 +3691,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   <span>{canSelectModel ? 'Model switching available' : 'Fixed provider defaults'}</span>
                   <span>{modelCatalogKind === 'none' ? 'Manual model ids may be required' : `Model catalog: ${availableModels.length || 'live'}`}</span>
                   <span className="text-slate-600">Try <span className="font-mono text-slate-400">/help</span> or <span className="font-mono text-slate-400">/status</span></span>
-                  {isRunning && (
-                    <span className="rounded-full border border-violet-400/20 bg-violet-500/10 px-2 py-0.5 text-violet-200">
-                      Follow-ups queue after this turn. Use <span className="font-mono">/steer</span> or inject a portal note for in-turn guidance.
-                    </span>
-                  )}
                 </div>
                 <ComposerPrimitive.Root className="relative flex items-end gap-1.5 sm:gap-2">
                   {/* Fix #4: Attachment button (hidden during streaming) */}

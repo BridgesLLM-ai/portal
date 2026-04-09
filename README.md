@@ -76,6 +76,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.23.10 (April 9, 2026)
+- **The fake steering pill is gone** — the purple follow-up pill under the composer was removed instead of advertising a `/steer` path that does not reliably work.
+- **Agent Chat wording is honest now** — the running-state UI now says "live note" instead of pretending it can always steer the active turn.
+- **The bundled OpenClaw compatibility helper is tougher** — the shipped patch script now handles the current OpenClaw bundle shapes instead of only the earlier dist layout.
+
 ### v3.23.9 (April 9, 2026)
 - **Session controls got a serious stability pass** — main chat and project chat now carry fast mode, thinking controls, and recovered session state more reliably instead of dropping into stale UI nonsense.
 - **Model switching and project model persistence are more reliable** — the portal preserves intended project models, normalizes session-reported model IDs, and fixes several stale-model / switch-looked-like-it-failed paths.

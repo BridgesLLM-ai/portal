@@ -2,6 +2,13 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.23.10] — 2026-04-09
+
+### Fixed
+- **Dishonest in-turn steering UI was cleaned up** — the purple follow-up pill under the composer is gone instead of pretending `/steer` works reliably in the current OpenClaw path.
+- **Agent Chat copy now says what it actually does** — "Live FYI / steer" wording was replaced with "live note" language in capability pills, the running composer placeholder, and send-button text.
+- **Bundled OpenClaw hotfix helper now patches current installs cleanly** — `scripts/patch-openclaw-long-run-relay-hotfix.sh` now recognizes both the older and current bundle shapes for heartbeat detection, relay routing, and reply-state preservation.
+
 ## [3.23.9] — 2026-04-09
 
 ### Improved
