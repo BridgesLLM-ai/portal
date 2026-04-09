@@ -10,6 +10,7 @@ import { config } from '../config/env';
 import { APPEARANCE_DEFAULTS, SECURITY_DEFAULTS } from '../config/settings.schema';
 import multer from 'multer';
 import { setAuthCookies } from '../utils/authCookies';
+import { getOllamaRecommendationsByRam } from '../utils/ollamaRecommendations';
 
 const router = Router();
 
@@ -405,27 +406,19 @@ router.get('/ollama-status', requireSetupPending, async (_req: Request, res: Res
 
     // RAM-based recommendations
     const os = require('os');
-    const ramGb = Math.round((os.totalmem() / (1024 ** 3)) * 10) / 10;
+    const totalRam = os.totalmem();
+    const ramGb = Math.round((totalRam / (1024 ** 3)) * 10) / 10;
+    const { ramTier, warning, recommendedModels } = getOllamaRecommendationsByRam(totalRam);
 
-    let ramTier = '<4GB';
-    let warning: string | null = 'Low-memory system. Stick to tiny models.';
-    let recommendedModels = ['phi3:mini', 'tinyllama'];
-
-    if (ramGb >= 16) {
-      ramTier = '16GB+';
-      warning = null;
-      recommendedModels = ['llama3.1:8b', 'qwen2.5-coder:7b', 'mistral:7b'];
-    } else if (ramGb >= 8) {
-      ramTier = '8-16GB';
-      warning = null;
-      recommendedModels = ['llama3.2:3b', 'qwen2.5-coder:3b', 'mistral:7b'];
-    } else if (ramGb >= 4) {
-      ramTier = '4-8GB';
-      warning = 'Limited RAM — smaller models recommended.';
-      recommendedModels = ['llama3.2:3b', 'phi3:mini'];
-    }
-
-    res.json({ running, endpoint: ollamaUrl, models, ramGb, ramTier, warning, recommendedModels });
+    res.json({
+      running,
+      endpoint: ollamaUrl,
+      models,
+      ramGb,
+      ramTier,
+      warning,
+      recommendedModels: recommendedModels.map((model) => model.name),
+    });
   } catch (error) {
     next(error);
   }

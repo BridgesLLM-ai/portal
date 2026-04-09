@@ -10,7 +10,7 @@ import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Bot, X, Trash2, Send, Loader2, ChevronRight, ChevronDown,
-  Wrench, Sparkles, StopCircle, Paperclip, Copy, Check, Code2,
+  Wrench, Sparkles, StopCircle, Paperclip, Copy, Check, Code2, Radio,
   Clock, Mic, MicOff, XCircle, CheckCircle2, RotateCcw
 } from 'lucide-react';
 import MarkdownRenderer from './MarkdownRenderer';
@@ -20,6 +20,7 @@ import { gatewayAPI } from '../../api/endpoints';
 import { useIsMobile } from '../../hooks/useIsMobile';
 import {
   extractThinkingChunk,
+  isControlOnlyAssistantContent,
   mergeAssistantStream,
   mergeThinkingStream,
   sanitizeAssistantContent,
@@ -31,6 +32,7 @@ import {
   getModelIdBadge,
   getModelProviderLabel,
   getModelRuntimeLabel,
+  normalizeModelId,
 } from '../../utils/modelId';
 import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../utils/slashCommands';
 
@@ -56,6 +58,29 @@ interface PendingAttachment {
   toolUrl?: string;
   uploadStatus?: 'uploading' | 'done' | 'error';
   uploadError?: string;
+}
+
+type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
+
+const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive'];
+const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
+  off: 'Off',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'Max',
+  adaptive: 'Adaptive',
+};
+
+const OPENCLAW_FAST_MODE_MODELS = new Set([
+  'openai/gpt-5.4',
+  'openai-codex/gpt-5.4',
+]);
+
+function supportsOpenClawFastModeModel(model?: string | null): boolean {
+  const normalized = String(model || '').trim().toLowerCase();
+  return OPENCLAW_FAST_MODE_MODELS.has(normalized);
 }
 
 /* ═══ WS Manager (local, not shared) ═══ */
@@ -194,9 +219,12 @@ function nextId() {
   return 'pmsg-' + Date.now() + '-' + (++msgCounter);
 }
 
-function parseHistoryMessage(m: any): ChatMessage {
+function parseHistoryMessage(m: any): ChatMessage | null {
   const rawContent = m.content || '';
   const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
+  if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(rawContent)) {
+    return null;
+  }
 
   const msg: ChatMessage = {
     id: m.id || nextId(),
@@ -226,6 +254,38 @@ function parseHistoryMessage(m: any): ChatMessage {
     msg.toolName = m.toolName;
   }
   return msg;
+}
+
+const HISTORY_REPLAY_DUPLICATE_WINDOW_MS = 5_000;
+
+function normalizeHistoryReplayContent(content: string): string {
+  return (content || '').replace(/\r\n/g, '\n').trim();
+}
+
+function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
+  const deduped: ChatMessage[] = [];
+  for (const msg of messages) {
+    const previous = deduped[deduped.length - 1];
+    if (!previous || previous.role !== 'user' || msg.role !== 'user') {
+      deduped.push(msg);
+      continue;
+    }
+
+    const previousContent = normalizeHistoryReplayContent(previous.content);
+    const nextContent = normalizeHistoryReplayContent(msg.content);
+    const previousTs = previous.createdAt instanceof Date ? previous.createdAt.getTime() : NaN;
+    const nextTs = msg.createdAt instanceof Date ? msg.createdAt.getTime() : NaN;
+
+    const isReplayDuplicate = Boolean(previousContent)
+      && previousContent === nextContent
+      && Number.isFinite(previousTs)
+      && Number.isFinite(nextTs)
+      && nextTs >= previousTs
+      && (nextTs - previousTs) <= HISTORY_REPLAY_DUPLICATE_WINDOW_MS;
+
+    if (!isReplayDuplicate) deduped.push(msg);
+  }
+  return deduped;
 }
 
 /* ═══ Tool Summary ═══ */
@@ -605,6 +665,9 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
   const [showSessionControls, setShowSessionControls] = useState(false);
+  const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>('off');
+  const [fastModeEnabled, setFastModeEnabled] = useState(false);
+  const [thinkingPending, setThinkingPending] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -643,6 +706,61 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
   useEffect(() => { sessionKeyRef.current = sessionKey; }, [sessionKey]);
   useEffect(() => { modelRef.current = selectedModel; }, [selectedModel]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!sessionKey) {
+      setThinkingLevel('off');
+      setFastModeEnabled(false);
+      return;
+    }
+
+    gatewayAPI.sessionInfo(sessionKey, { silent: true })
+      .then((data) => {
+        if (cancelled) return;
+        const actualModel = normalizeModelId(
+          {
+            provider: data?.session?.modelProvider || data?.session?.currentModel?.provider,
+            model: data?.session?.model || data?.session?.currentModel?.model,
+          }
+        ) || canonicalizePortalModelId(String(
+          data?.resolved?.model
+          || modelRef.current
+          || ''
+        ));
+        const rawThinking = String(
+          data?.session?.thinkingLevel
+          || data?.session?.thinking
+          || data?.session?.settings?.thinking
+          || ''
+        ).toLowerCase();
+        if (actualModel) {
+          setSelectedModel((prev) => prev === actualModel ? prev : actualModel);
+        }
+        if (THINKING_LEVELS.includes(rawThinking as ThinkingLevel)) {
+          setThinkingLevel(rawThinking as ThinkingLevel);
+        } else {
+          const modelStr = String(actualModel || '').toLowerCase();
+          const adaptiveDefault = /claude-(opus|sonnet)-4[._-](5|6|7|8|9)|claude-(opus|sonnet)-[5-9]/.test(modelStr);
+          setThinkingLevel(adaptiveDefault ? 'adaptive' : 'off');
+        }
+        setFastModeEnabled(Boolean(
+          data?.session?.fastMode
+          ?? data?.session?.settings?.fastMode
+          ?? false,
+        ));
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setThinkingLevel('off');
+          setFastModeEnabled(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionKey]);
 
   // Persist model selection
   useEffect(() => {
@@ -713,19 +831,28 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     watchdogRef.current = setTimeout(() => {
       if (!isStreamActiveRef.current) return;
       console.warn('[ProjectChat] Stream watchdog: no activity for 60s');
+      const cid = streamingAssistantIdRef.current;
+      const ft = assembledRef.current.substring(lastSegmentStartRef.current);
+      const shouldHideTurn = !ft.trim() && !hasRealToolEventsRef.current;
       isStreamActiveRef.current = false;
       setIsRunning(false);
       setStreamingPhase('idle');
       setStatusText(null);
+      setThinkingContent('');
+      setActiveToolName(null);
       compactionPhaseRef.current = 'idle';
       setCompactionPhase('idle');
       if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
-      const cid = streamingAssistantIdRef.current;
       if (cid) {
-        const ft = assembledRef.current.substring(lastSegmentStartRef.current);
-        if (ft) setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: ft + '\n\n*(stream interrupted)*' } : m));
+        if (shouldHideTurn) {
+          setMessages(prev => prev.filter(m => m.id !== cid));
+        } else if (ft) {
+          setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: ft + '\n\n*(stream interrupted)*' } : m));
+        }
         streamingAssistantIdRef.current = null;
       }
+      resumeSeededContentRef.current = false;
+      suppressLiveBubbleContentRef.current = false;
     }, STREAM_TIMEOUT_MS);
   }, []);
 
@@ -765,10 +892,18 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   ) => {
     if (!snapshot?.active || isStaleSessionLoad(expectedSession, expectedGen)) return false;
 
+    const resumePhase = snapshot.phase === 'tool' ? 'tool' : snapshot.phase === 'streaming' ? 'streaming' : 'thinking';
+    const snapshotContent = typeof snapshot.content === 'string' && !isControlOnlyAssistantContent(snapshot.content)
+      ? sanitizeAssistantContent(snapshot.content)
+      : '';
+    const shouldMaterializeBubble = Boolean(snapshotContent) || Boolean(snapshot.toolName) || Boolean(streamingAssistantIdRef.current);
+    if (!shouldMaterializeBubble) {
+      return false;
+    }
+
     isStreamActiveRef.current = true;
     suppressLiveBubbleContentRef.current = true;
     setIsRunning(true);
-    const resumePhase = snapshot.phase === 'tool' ? 'tool' : snapshot.phase === 'streaming' ? 'streaming' : 'thinking';
     setStreamingPhase(resumePhase);
     setActiveToolName(snapshot.toolName || null);
     setStatusText(snapshot.toolName ? `Using ${snapshot.toolName}…` : (snapshot.statusText || 'Reconnecting to stream…'));
@@ -780,7 +915,6 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       setCompactionPhase(snapshotCompaction);
     }
 
-    const snapshotContent = typeof snapshot.content === 'string' ? sanitizeAssistantContent(snapshot.content) : '';
     const assistantId = ensureStreamingAssistant(snapshotContent || undefined);
     resumeSeededContentRef.current = resumePhase === 'streaming' && snapshotContent.length > 0;
     assembledRef.current = snapshotContent;
@@ -811,8 +945,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
     if (isStaleSessionLoad(session, expectedGen)) return null;
 
-    const loaded = data?.messages ? data.messages.map(parseHistoryMessage) : [];
-    setMessages(loaded);
+    const loaded = data?.messages ? data.messages.map(parseHistoryMessage).filter(Boolean) as ChatMessage[] : [];
+    setMessages(dedupeHistoryMessages(loaded));
     setSessionError(null);
 
     if (options.hydrateActiveStream !== false && data?.activeStream?.active) {
@@ -837,8 +971,12 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const finalizeStreamingAssistant = useCallback(() => {
     const cid = streamingAssistantIdRef.current;
     const finalContent = assembledRef.current.substring(lastSegmentStartRef.current) || assembledRef.current || '';
-    if (cid && finalContent) {
-      setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: finalContent } : m));
+    if (cid) {
+      if (finalContent) {
+        setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: finalContent } : m));
+      } else {
+        setMessages(prev => prev.filter(m => m.id !== cid));
+      }
     }
     setStatusText(null);
     setStreamingPhase('idle');
@@ -876,6 +1014,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
     if (data.active) {
       return applyActiveStreamSnapshot(data, currentSession, expectedGen, manager);
+    }
+
+    if (manager?.isConnected()) {
+      manager.send({ type: 'reconnect', session: currentSession, provider: 'OPENCLAW' });
     }
 
     clearWatchdog();
@@ -920,9 +1062,23 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
   // ── WS Event Handler ──
   const handleWsEvent = useCallback((data: any) => {
+    const passthrough = ['connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended'];
+    const autoCreateBubbleTypes = ['text', 'tool_start', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
+    const waitForVisibleStreamTypes = ['status', 'thinking', 'done', 'error'];
+    if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOnlyAssistantContent(data.content)) {
+      return;
+    }
+    if (!streamingAssistantIdRef.current && !passthrough.includes(data.type)) {
+      if (autoCreateBubbleTypes.includes(data.type)) {
+        ensureStreamingAssistant();
+        isStreamActiveRef.current = true;
+        setIsRunning(true);
+      } else if (!waitForVisibleStreamTypes.includes(data.type)) {
+        return;
+      }
+    }
     const assistantId = streamingAssistantIdRef.current;
-    if (!assistantId && !['connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended', 'thinking'].includes(data.type)) return;
-    resetWatchdog();
+    if (assistantId || isStreamActiveRef.current) resetWatchdog();
 
     switch (data.type) {
       case 'session': {
@@ -932,13 +1088,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         break;
       }
       case 'status': {
+        if (!assistantId && !isStreamActiveRef.current) break;
         clearResumeSeededContent(assistantId);
         setStatusText(data.content || null);
-        // OpenClaw streams thinking separately; keep status out of thought text.
         if (!assembledRef.current) setStreamingPhase('thinking');
         break;
       }
       case 'thinking': {
+        if (!assistantId && !isStreamActiveRef.current) break;
         clearResumeSeededContent(assistantId);
         appendThinkingChunk(
           assistantId,
@@ -1064,6 +1221,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         break;
       }
       case 'text': {
+        const rawChunk = typeof data.content === 'string' ? data.content : '';
+        if (rawChunk && isControlOnlyAssistantContent(rawChunk)) {
+          break;
+        }
         const safeChunk = typeof data.content === 'string'
           ? (data.replace === true ? sanitizeAssistantContent(data.content) : sanitizeAssistantChunk(data.content))
           : '';
@@ -1103,8 +1264,9 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       case 'done': {
         clearWatchdog();
         const fst = assembledRef.current.substring(lastSegmentStartRef.current);
-        const hasFinal = typeof data.content === 'string' && data.content.length > 0;
-        const finalText = hasFinal ? sanitizeAssistantContent(data.content) : fst;
+        const rawFinal = typeof data.content === 'string' ? data.content : '';
+        const hasFinal = rawFinal.length > 0 && !isControlOnlyAssistantContent(rawFinal);
+        const finalText = hasFinal ? sanitizeAssistantContent(rawFinal) : fst;
         const fc = finalText || '';
         const prov = data.provenance || null;
         const model = canonicalizePortalModelId(
@@ -1113,9 +1275,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             : (typeof data?.model === 'string' ? data.model : '')
         );
         const cid = streamingAssistantIdRef.current;
+        const shouldHideTurn = !fc.trim() && !hasRealToolEventsRef.current;
         setStatusText(null);
         setStreamingPhase('idle');
         setIsRunning(false);
+        setThinkingContent('');
         if (compactionPhaseRef.current === 'compacting') {
           compactionPhaseRef.current = 'idle';
           setCompactionPhase('idle');
@@ -1125,9 +1289,15 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         streamingAssistantIdRef.current = null;
         resumeSeededContentRef.current = false;
         suppressLiveBubbleContentRef.current = false;
-        setMessages(prev => prev.map(m =>
-          m.id === cid ? { ...m, content: fc, provenance: prov || undefined, model: model || m.model } : m
-        ));
+        if (cid) {
+          if (shouldHideTurn) {
+            setMessages(prev => prev.filter(m => m.id !== cid));
+          } else {
+            setMessages(prev => prev.map(m =>
+              m.id === cid ? { ...m, content: fc, provenance: prov || undefined, model: model || m.model } : m
+            ));
+          }
+        }
         break;
       }
       case 'error': {
@@ -1138,6 +1308,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         }
         setStatusText(null);
         setStreamingPhase('idle');
+        setThinkingContent('');
         setIsRunning(false);
         isStreamActiveRef.current = false;
         streamingAssistantIdRef.current = null;
@@ -1148,18 +1319,25 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       case 'stream_resume': {
         suppressLiveBubbleContentRef.current = true;
         const resumePhase = data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking';
+        const resumeContent = typeof data.content === 'string' && !isControlOnlyAssistantContent(data.content)
+          ? sanitizeAssistantContent(data.content)
+          : '';
+        const shouldMaterializeBubble = Boolean(streamingAssistantIdRef.current) || Boolean(data.toolName) || Boolean(resumeContent);
+        if (!shouldMaterializeBubble) {
+          break;
+        }
         if (!streamingAssistantIdRef.current) {
           const resumeId = 'stream-resume-' + Date.now();
           streamingAssistantIdRef.current = resumeId;
           assembledRef.current = '';
-          isStreamActiveRef.current = true;
-          setIsRunning(true);
-          setStreamingPhase(resumePhase);
-          setActiveToolName(data.toolName || null);
-          if (data.toolName) setStatusText(`Using ${data.toolName}…`);
           setMessages(prev => [...prev, { id: resumeId, role: 'assistant' as const, content: '', createdAt: new Date(), toolCalls: [] }]);
         }
-        if (resumePhase === 'streaming' && typeof data.content === 'string') {
+        isStreamActiveRef.current = true;
+        setIsRunning(true);
+        setStreamingPhase(resumePhase);
+        setActiveToolName(data.toolName || null);
+        setStatusText(data.toolName ? `Using ${data.toolName}…` : null);
+        if (resumePhase === 'streaming' && typeof data.content === 'string' && !isControlOnlyAssistantContent(data.content)) {
           resumeSeededContentRef.current = true;
           const safeChunk = sanitizeAssistantContent(data.content);
           const fullText = mergeAssistantStream(assembledRef.current, safeChunk, { replace: true });
@@ -1191,6 +1369,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setIsRunning(false);
         setStreamingPhase('idle');
         setStatusText(null);
+        setThinkingContent('');
         setActiveToolName(null);
         clearWatchdog();
         finalizeStreamingAssistant();
@@ -1739,6 +1918,32 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     }
   }, [projectName]);
 
+  const handleThinkingLevelChange = useCallback(async (nextLevel: ThinkingLevel) => {
+    const sk = sessionKeyRef.current;
+    if (!sk) return;
+    setThinkingLevel(nextLevel);
+    setThinkingPending(true);
+    try {
+      await gatewayAPI.patchSession(sk, { thinking: nextLevel }, 'OPENCLAW');
+    } catch (err) {
+      console.error('[ProjectChatPanel] Failed to patch thinking level:', err);
+    } finally {
+      setThinkingPending(false);
+    }
+  }, []);
+
+  const handleFastModeToggle = useCallback(async () => {
+    const sk = sessionKeyRef.current;
+    if (!sk) return;
+    try {
+      await gatewayAPI.patchSession(sk, { fastMode: !fastModeEnabled }, 'OPENCLAW');
+      setFastModeEnabled((prev) => !prev);
+    } catch (err) {
+      console.error('[ProjectChatPanel] Failed to patch fast mode:', err);
+      appendSystemNotice('Failed to update fast mode.');
+    }
+  }, [appendSystemNotice, fastModeEnabled]);
+
   // ── Speech recognition ──
   const [isListening, setIsListening] = useState(false);
   const recognitionRef = useRef<any>(null);
@@ -1833,6 +2038,57 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                 <div><span className="text-slate-500">Model:</span> <span className="text-slate-200">{selectedModel || 'not set'}</span></div>
                 <div><span className="text-slate-500">Connection:</span> <span className={wsConnected ? 'text-emerald-300' : 'text-amber-300'}>{wsConnected ? 'connected' : 'disconnected'}</span></div>
               </div>
+              <div className="mb-3 rounded-lg border border-white/6 bg-black/20 px-2 py-2">
+                <div className="flex items-center gap-2 mb-2">
+                  <Sparkles size={12} className={thinkingLevel !== 'off' ? 'text-violet-300' : 'text-slate-500'} />
+                  <div>
+                    <div className="text-[11px] font-medium text-white">Thinking Level</div>
+                    <div className="text-[10px] text-slate-500">Controls reasoning depth for this project agent session.</div>
+                  </div>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={THINKING_LEVELS.length - 1}
+                  step={1}
+                  value={Math.max(0, THINKING_LEVELS.indexOf(thinkingLevel))}
+                  disabled={!sessionKey || thinkingPending}
+                  onChange={(e) => {
+                    const next = THINKING_LEVELS[Number(e.target.value)] || 'off';
+                    void handleThinkingLevelChange(next);
+                  }}
+                  className="w-full accent-violet-400"
+                />
+                <div className="mt-1 text-[10px] text-slate-400">
+                  Current: <span className={`font-semibold uppercase ${thinkingLevel === 'adaptive' ? 'text-cyan-300' : 'text-violet-300'}`}>{THINKING_LEVEL_LABELS[thinkingLevel]}</span>
+                  {thinkingPending && <span className="ml-2 text-slate-500">Saving…</span>}
+                </div>
+              </div>
+              {(supportsOpenClawFastModeModel(selectedModel) || fastModeEnabled) && (
+                <div className="mb-3 rounded-lg border border-white/6 bg-black/20 px-2 py-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <Radio size={12} className={fastModeEnabled ? 'text-amber-300' : 'text-slate-500'} />
+                      <div>
+                        <div className="text-[11px] font-medium text-white">Codex Fast Mode</div>
+                        <div className="text-[10px] text-slate-500">Native OpenClaw fast mode for GPT-5.4 and Codex project sessions.</div>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => { void handleFastModeToggle(); }}
+                      disabled={!sessionKey}
+                      className={`relative h-5 w-10 rounded-full transition-colors ${fastModeEnabled ? 'bg-amber-500' : 'bg-white/10'} disabled:opacity-50`}
+                    >
+                      <span
+                        className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform ${fastModeEnabled ? 'translate-x-5' : 'translate-x-0'}`}
+                      />
+                    </button>
+                  </div>
+                  <div className="mt-2 text-[10px] text-slate-400">
+                    Current: <span className="text-slate-200">{fastModeEnabled ? 'enabled' : 'disabled'}</span> for <span className="font-mono text-slate-300">{selectedModel || 'default'}</span>
+                  </div>
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-2 mb-3">
                 <button onClick={() => { void showSessionStatus(); setShowSessionControls(false); }} className="px-2 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-slate-200">Status</button>
                 <button onClick={() => { exportChatMarkdown(); setShowSessionControls(false); }} className="px-2 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-slate-200">Export</button>

@@ -41,10 +41,17 @@ router.post('/me/avatar', authenticateToken, uploadAvatar, async (req: Request, 
 router.get('/me/avatar', authenticateToken, async (req: Request, res: Response): Promise<void> => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user!.userId }, select: { avatarPath: true } });
-    if (!user?.avatarPath) { res.status(404).json({ error: 'No avatar set' }); return; }
+    if (!user?.avatarPath) {
+      res.json({ avatarUrl: null });
+      return;
+    }
 
     const filePath = path.join(AVATARS_DIR, user.avatarPath);
-    if (!fs.existsSync(filePath)) { res.status(404).json({ error: 'Avatar file missing' }); return; }
+    if (!fs.existsSync(filePath)) {
+      await prisma.user.update({ where: { id: req.user!.userId }, data: { avatarPath: null } }).catch(() => {});
+      res.json({ avatarUrl: null });
+      return;
+    }
 
     res.json({ avatarUrl: `/static-assets/avatars/${user.avatarPath}` });
   } catch (error) {

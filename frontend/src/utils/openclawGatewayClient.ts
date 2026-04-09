@@ -327,11 +327,10 @@ export class OpenClawGatewayClient {
 
     this.reconnecting = true;
 
-    // Cap reconnect attempts to avoid infinite loops on fresh installs
-    // or when the gateway is permanently down
-    const MAX_RECONNECT_ATTEMPTS = 10;
-    if (this.reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
-      console.warn(`[OpenClawGatewayClient] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached, giving up`);
+    const hasActiveStream = Boolean(this.activeRunSessionKey);
+    const maxReconnectAttempts = hasActiveStream ? Number.POSITIVE_INFINITY : 10;
+    if (Number.isFinite(maxReconnectAttempts) && this.reconnectAttempt >= maxReconnectAttempts) {
+      console.warn(`[OpenClawGatewayClient] Max reconnect attempts (${maxReconnectAttempts}) reached, giving up`);
       this.intentionallyClosed = true;
       return;
     }
@@ -339,7 +338,10 @@ export class OpenClawGatewayClient {
     const delay = RECONNECT_DELAYS[Math.min(this.reconnectAttempt, RECONNECT_DELAYS.length - 1)];
     this.reconnectAttempt++;
 
-    console.log(`[OpenClawGatewayClient] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS})`);
+    const attemptLabel = Number.isFinite(maxReconnectAttempts)
+      ? `${this.reconnectAttempt}/${maxReconnectAttempts}`
+      : `${this.reconnectAttempt}/∞`;
+    console.log(`[OpenClawGatewayClient] Reconnecting in ${delay}ms (attempt ${attemptLabel})`);
     this.onReconnecting?.(this.reconnectAttempt, delay);
 
     this.reconnectTimer = setTimeout(() => {
@@ -363,12 +365,13 @@ export class OpenClawGatewayClient {
 
 
   private sendReconnectFrame(): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.currentSessionKey) {
+    const sessionKey = this.activeRunSessionKey;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !sessionKey) {
       return;
     }
 
     try {
-      this.ws.send(JSON.stringify({ type: 'reconnect', session: this.currentSessionKey }));
+      this.ws.send(JSON.stringify({ type: 'reconnect', session: sessionKey }));
     } catch (error) {
       console.warn('[OpenClawGatewayClient] Failed to send reconnect frame:', error);
     }
@@ -376,6 +379,9 @@ export class OpenClawGatewayClient {
 
   setCurrentSession(sessionKey: string | null): void {
     this.currentSessionKey = sessionKey;
+    if (!sessionKey && this.activeRunSessionKey) {
+      this.activeRunSessionKey = null;
+    }
   }
 
   setActiveStreamSession(sessionKey: string | null): void {
@@ -485,7 +491,6 @@ export class OpenClawGatewayClient {
    */
   async subscribeSession(sessionKey: string): Promise<void> {
     this.currentSessionKey = sessionKey;
-    this.activeRunSessionKey = sessionKey;
     // No RPC needed — gateway pushes events to all connected backend clients
   }
 }

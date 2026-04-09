@@ -76,6 +76,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.23.9 (April 9, 2026)
+- **OpenClaw compatibility hotfix is explicit now** — admins can inspect and apply the older long-run relay patch directly from Settings or Agent Chat instead of doing hidden server-side edits.
+- **The hotfix helper is actually bundled** — fresh installs now include the patch script the admin action depends on.
+- **Gateway reloads fall back cleanly** — if `openclaw gateway restart` only reports a disabled service, the portal now signals the live gateway process so the hotfix still takes effect.
+
 ### v3.23.8 (April 7, 2026)
 - **Project chat survives renames** — per-project assistant and session identity is now stable, so renaming a project no longer strands its AI chat state.
 - **Large files degrade gracefully** — text files over 10MB now open in read-only preview mode instead of failing outright.

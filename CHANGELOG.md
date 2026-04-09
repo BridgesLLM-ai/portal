@@ -2,6 +2,15 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.23.9] — 2026-04-09
+
+### Improved
+- **OpenClaw compatibility hotfix is now explicit and admin-controlled** — admins can inspect the installed runtime patch state and apply the older OpenClaw long-run relay hotfix directly from Agent Chat session controls or Settings instead of relying on hidden manual server edits.
+
+### Fixed
+- **Compatibility hotfix installs now bundle the actual patch helper** — portal releases now ship `scripts/patch-openclaw-long-run-relay-hotfix.sh`, so the admin action works on fresh installs instead of failing with a missing-script error.
+- **Hotfix apply now restarts more safely on non-systemd OpenClaw setups** — when `openclaw gateway restart` only reports a disabled service, the portal now falls back to signaling the live gateway process so the patched runtime actually reloads.
+
 ## [3.23.8] — 2026-04-07
 
 ### Fixed

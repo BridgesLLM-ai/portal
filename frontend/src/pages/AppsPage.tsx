@@ -714,7 +714,7 @@ export default function AppsPage() {
   const [pathEditValue, setPathEditValue] = useState('');
 
   // Code analysis
-  const [analyzeModel, setAnalyzeModel] = useState<string>('qwen2.5-coder:7b');
+  const [analyzeModel, setAnalyzeModel] = useState<string>('qwen3:4b');
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisResults, setAnalysisResults] = useState<any[]>([]);
   const [showAnalysisPanel, setShowAnalysisPanel] = useState(false);
@@ -2343,7 +2343,7 @@ export default function AppsPage() {
               <MobileOverflowMenu actions={[
                 ...(openFile ? [
                   { label: 'Fullscreen Editor', icon: <Maximize2 size={16} />, onClick: () => setEditorFullscreen(true) },
-                  { label: `Analyze (${analyzeModel === 'qwen2.5-coder:3b' ? 'Snappy' : analyzeModel === 'qwen3:8b' ? 'Best' : 'Smart'})`, icon: <Zap size={16} />, onClick: analyzeFile, disabled: analyzing },
+                  { label: `Analyze (${analyzeModel === 'qwen3:1.7b' ? 'Snappy' : analyzeModel === 'qwen3:8b' ? 'Best' : 'Smart'})`, icon: <Zap size={16} />, onClick: analyzeFile, disabled: analyzing },
                 ] : []),
                 // Show Check for runtime, Preview for others
                 ...(isRuntimeProject 
@@ -2376,8 +2376,8 @@ export default function AppsPage() {
                   </button>
                   <select value={analyzeModel} onChange={e => setAnalyzeModel(e.target.value)}
                     className="px-2 py-1.5 rounded-lg bg-white/5 border border-white/10 text-xs text-slate-300 focus:outline-none focus:border-purple-500/30">
-                    <option value="qwen2.5-coder:3b">⚡ Snappy (Qwen 3B)</option>
-                    <option value="qwen2.5-coder:7b">🧠 Smart (Qwen 7B)</option>
+                    <option value="qwen3:1.7b">⚡ Snappy (Qwen3 1.7B)</option>
+                    <option value="qwen3:4b">🧠 Smart (Qwen3 4B)</option>
                     <option value="qwen3:8b">🚀 Best (Qwen3 8B)</option>
                   </select>
                   <button onClick={analyzeFile} disabled={analyzing}

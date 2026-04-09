@@ -592,13 +592,11 @@ router.post('/registration-requests/:id/approve', requireOwner, async (req: Requ
       approvedUserId = updatedUser.id;
       approvedUsername = updatedUser.username;
     } else {
-      // Create user with a temporary random password and require reset via approval email
-      const tempHash = await hashPassword(crypto.randomUUID());
       const createdUser = await prisma.user.create({
         data: {
           email: request.email,
           username: request.name.toLowerCase().replace(/[^a-z0-9]/g, '') || request.email.split('@')[0],
-          passwordHash: tempHash,
+          passwordHash: request.passwordHash || await hashPassword(crypto.randomUUID()),
           role: 'USER',
           accountStatus: 'ACTIVE',
           isActive: true,

@@ -3067,7 +3067,11 @@ function getModelDisplayName(model: string): string {
     'anthropic/claude-haiku-4-20250514': 'Claude Haiku 4',
     'ollama/qwen2.5-coder:3b': 'Qwen Coder 3B',
     'ollama/qwen2.5-coder:7b': 'Qwen Coder 7B',
+    'ollama/qwen3:1.7b': 'Qwen3 1.7B',
+    'ollama/qwen3:4b': 'Qwen3 4B',
     'ollama/qwen3:8b': 'Qwen3 8B',
+    'ollama/gemma4:e2b': 'Gemma 4 E2B',
+    'ollama/gemma4:e4b': 'Gemma 4 E4B',
     'openai-codex/gpt-5.1': 'GPT-5.1',
     'openai-codex/gpt-5.2': 'GPT-5.2',
     'openai-codex/gpt-5.3-codex': 'Codex (5.3)',
@@ -3399,19 +3403,28 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
       projectDir, userId, name
     );
 
-    // Determine default model — use gateway's configured default, never hardcode a provider
+    // Determine which model should back this session. If the caller explicitly
+    // requested a model, honor it. Otherwise preserve the existing session model
+    // when one already exists, and only fall back to the configured gateway
+    // default for brand-new / unset sessions.
     const requestedModel = normalizePortalModelId(req.body?.model || '');
-    const selectedModel = requestedModel || getDefaultModel() || 'openai-codex/gpt-5.4';
-
-    // Patch the session model before any init traffic so a newly-created project
-    // session does not accidentally boot under an unauthenticated default model.
+    let currentSessionModel = '';
     try {
       const sessionInfo = await getSessionInfo(sessionKey);
-      const currentSessionModel = normalizePortalModelId(sessionInfo.ok ? String(sessionInfo.data?.model || '') : '');
-      if (selectedModel && currentSessionModel !== selectedModel) {
-        await patchSessionModel(sessionKey, selectedModel);
-      }
+      currentSessionModel = normalizePortalModelId(sessionInfo.ok ? String(sessionInfo.data?.model || '') : '');
     } catch {}
+
+    const selectedModel = requestedModel || currentSessionModel || getDefaultModel() || 'openai-codex/gpt-5.4';
+
+    // Patch the session model before any init traffic only when the caller asked
+    // for a specific model or when a new/empty session still needs its first
+    // concrete model. Do not silently reset an existing session back to the
+    // gateway default on reload.
+    if (selectedModel && currentSessionModel !== selectedModel && (Boolean(requestedModel) || !currentSessionModel)) {
+      try {
+        await patchSessionModel(sessionKey, selectedModel);
+      } catch {}
+    }
 
     // If session needs init, send the project context as the first message via gateway RPC
     if (needsInit) {

@@ -17,7 +17,7 @@ import WebSocket from 'ws';
 import { buildSignedDevice, getOrCreateDeviceKeys } from '../../utils/deviceIdentity';
 import { getOpenClawWsUrl } from '../../config/openclaw';
 import { streamEventBus } from '../../services/StreamEventBus';
-import { sanitizeAssistantText } from '../../utils/chatText';
+import { sanitizeAssistantText, isControlOnlyAssistantText } from '../../utils/chatText';
 import { getGatewayToken } from '../../utils/gatewayToken';
 
 const DEBUG_GATEWAY_WS = process.env.DEBUG_GATEWAY_WS === '1';
@@ -157,6 +157,12 @@ function extractTextFromContent(content: unknown): string {
   return '';
 }
 
+function sanitizeAssistantDelta(text: string): string {
+  if (!text) return '';
+  const sanitized = sanitizeAssistantText(text);
+  return isControlOnlyAssistantText(sanitized) ? '' : sanitized;
+}
+
 function getToolIcon(name: string): string {
   const icons: Record<string, string> = {
     Read: '📖', read: '📖', Write: '✏️', write: '✏️', Edit: '✏️', edit: '✏️',
@@ -224,8 +230,8 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   streamEventBus.startStream(sessionKey, runId);
 
   if (stream === 'assistant') {
-    const text = typeof data.text === 'string' ? sanitizeAssistantText(data.text) : undefined;
-    const delta = typeof data.delta === 'string' ? data.delta : undefined;
+    const text = typeof data.text === 'string' ? sanitizeAssistantDelta(data.text) : undefined;
+    const delta = typeof data.delta === 'string' ? sanitizeAssistantDelta(data.delta) : undefined;
 
     const assistantLastSeen = assistantLastSeenTextMap.get(sessionKey) || '';
 
@@ -416,7 +422,7 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     // (a) nothing was streamed at all, or
     // (b) the final text is a direct continuation of what was streamed.
     // If the streamed text is a substring of the final (multi-segment concat), skip.
-    if (finalText) {
+    if (finalText && !isControlOnlyAssistantText(finalText)) {
       const streamedText = streamEventBus.getLatestText(sessionKey);
       if (!streamedText) {
         // Nothing was streamed — deliver the full final text
@@ -440,7 +446,11 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
       }
     }
 
-    streamEventBus.publish(sessionKey, { type: 'done', content: finalText, model: finalModel });
+    streamEventBus.publish(sessionKey, {
+      type: 'done',
+      content: isControlOnlyAssistantText(finalText) ? '' : finalText,
+      model: finalModel,
+    });
 
     // Use soft-clear instead of hard-clear: the agent may resume after a sub-agent
     // completes (sessions_yield → sub-agent → result injected → new run starts).

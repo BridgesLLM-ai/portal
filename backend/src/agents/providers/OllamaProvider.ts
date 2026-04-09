@@ -1,4 +1,6 @@
 import { execFileSync } from 'child_process';
+import { prisma } from '../../config/database';
+import { config as envConfig } from '../../config/env';
 import {
   AgentProvider,
   AgentProviderName,
@@ -26,25 +28,50 @@ function nextId(): string {
   return `ollama-msg-${Date.now()}-${++idCounter}`;
 }
 
-function detectDefaultModel(): string {
-  const envModel = process.env.OLLAMA_MODEL || process.env.OLLAMA_DEFAULT_MODEL;
-  if (envModel) return envModel;
+const DEFAULT_OLLAMA_MODEL_CANDIDATES = [
+  'qwen3:4b',
+  'qwen3:8b',
+  'qwen3:1.7b',
+  'gemma4:e4b',
+  'gemma4:e2b',
+  'deepseek-r1:8b',
+  'deepseek-r1:1.5b',
+];
+
+function listInstalledModels(): string[] {
   try {
     const out = execFileSync('ollama', ['list'], { encoding: 'utf8', env: process.env, maxBuffer: 1024 * 1024 * 2 });
     const lines = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    for (const line of lines.slice(1)) {
-      const match = line.match(/^(\S+)/);
-      if (match?.[1]) return match[1];
-    }
+    return lines.slice(1)
+      .map((line) => line.match(/^(\S+)/)?.[1] || '')
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function resolveDefaultModel(): Promise<string> {
+  const envModel = (process.env.OLLAMA_MODEL || process.env.OLLAMA_DEFAULT_MODEL || '').trim();
+  if (envModel) return envModel;
+
+  try {
+    const setting = await prisma.systemSetting.findUnique({ where: { key: 'ollama.defaultModel' } });
+    if (setting?.value?.trim()) return setting.value.trim();
   } catch {}
-  return 'qwen2.5-coder:7b';
+
+  const installedModels = listInstalledModels();
+  const preferredInstalled = DEFAULT_OLLAMA_MODEL_CANDIDATES.find((candidate) => installedModels.includes(candidate));
+  if (preferredInstalled) return preferredInstalled;
+  if (installedModels[0]) return installedModels[0];
+
+  return envConfig.ollamaModel;
 }
 
 function requireSession(sessionId: AgentSessionId): NativeSessionData {
   const session = loadNativeSession('OLLAMA', sessionId);
   if (session) {
     if (!session.model) {
-      session.model = detectDefaultModel();
+      session.model = envConfig.ollamaModel;
       saveNativeSession(session);
     }
     return session;
@@ -59,7 +86,7 @@ export class OllamaProvider implements AgentProvider {
   async startSession(userId: string, config?: AgentSessionConfig): Promise<AgentSessionId> {
     const session = createNativeSession('OLLAMA', userId, config);
     if (!session.model) {
-      session.model = detectDefaultModel();
+      session.model = await resolveDefaultModel();
       saveNativeSession(session);
     }
     return session.sessionId;
@@ -72,17 +99,22 @@ export class OllamaProvider implements AgentProvider {
     onStatus?: OnStatusCallback,
   ): Promise<AgentSendResult> {
     const session = requireSession(sessionId);
+    if (!session.model) {
+      session.model = await resolveDefaultModel();
+      saveNativeSession(session);
+    }
+
     appendNativeMessage(session, { id: nextId(), role: 'user', content: message, timestamp: new Date().toISOString() });
     onStatus?.({ type: 'status', content: `Running Ollama (${session.model})...` });
 
     const prompt = buildTranscriptPrompt(session.messages.slice(0, -1), message);
-    const baseUrl = process.env.OLLAMA_HOST || 'http://localhost:11434';
+    const baseUrl = (process.env.OLLAMA_HOST || envConfig.ollamaApiUrl || 'http://localhost:11434').replace(/\/$/, '');
 
-    const response = await fetch(`${baseUrl.replace(/\/$/, '')}/api/generate`, {
+    const response = await fetch(`${baseUrl}/api/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: session.model || detectDefaultModel(),
+        model: session.model,
         prompt,
         stream: true,
         think: false,

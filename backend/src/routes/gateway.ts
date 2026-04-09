@@ -3,6 +3,7 @@ import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
 import { requireApproved } from '../middleware/requireApproved';
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'fs';
+import { execFile, execFileSync } from 'child_process';
 import path from 'path';
 import { AgentRegistry, AgentProviderName } from '../agents';
 import { AgentAbortError } from '../agents/AgentProvider.interface';
@@ -27,7 +28,7 @@ import { buildSignedDevice, getOrCreateDeviceKeys } from '../utils/deviceIdentit
 import { prisma } from '../config/database';
 import { getOpenClawApiUrl } from '../config/openclaw';
 import { shouldIsolateUser } from '../utils/workspaceScope';
-import { extractTextFromContent as extractSanitizedText } from '../utils/chatText';
+import { extractTextFromContent as extractSanitizedText, isControlOnlyAssistantText } from '../utils/chatText';
 import { canAccessPortal, canUseInteractivePortal, isElevatedRole, isOwnerRole } from '../utils/authz';
 import { hasGatewayToken, getGatewayToken } from '../utils/gatewayToken';
 import { getOpenClawWsUrl } from '../config/openclaw';
@@ -61,6 +62,111 @@ router.use(authenticateToken, requireApproved);
 const AGENTS_BASE = path.join(process.env.HOME || '/root', '.openclaw/agents');
 const SESSIONS_DIR = path.join(AGENTS_BASE, 'main/sessions');
 const GATEWAY_URL = getOpenClawApiUrl();
+const OPENCLAW_DIST_DIR = '/usr/lib/node_modules/openclaw/dist';
+const PORTAL_ROOT = path.resolve(__dirname, '../../..');
+const OPENCLAW_COMPAT_HOTFIX_SCRIPT = path.join(PORTAL_ROOT, 'scripts', 'patch-openclaw-long-run-relay-hotfix.sh');
+
+function resolveOpenClawDistBundle(prefix: string): string | null {
+  try {
+    if (!existsSync(OPENCLAW_DIST_DIR)) return null;
+    const match = readdirSync(OPENCLAW_DIST_DIR)
+      .filter((name) => name.startsWith(prefix) && name.endsWith('.js'))
+      .sort()[0];
+    return match ? path.join(OPENCLAW_DIST_DIR, match) : null;
+  } catch {
+    return null;
+  }
+}
+
+function getOpenClawCompatibilityHotfixStatus() {
+  const heartbeatRunnerPath = resolveOpenClawDistBundle('heartbeat-runner-');
+  const replyBundlePath = resolveOpenClawDistBundle('reply-');
+  const scriptExists = existsSync(OPENCLAW_COMPAT_HOTFIX_SCRIPT);
+  const issues: string[] = [];
+
+  if (!scriptExists) issues.push('Portal hotfix script is not installed.');
+  if (!heartbeatRunnerPath) issues.push('Could not locate the OpenClaw heartbeat runner bundle.');
+  if (!replyBundlePath) issues.push('Could not locate the OpenClaw reply bundle.');
+
+  const heartbeatText = heartbeatRunnerPath && existsSync(heartbeatRunnerPath)
+    ? readFileSync(heartbeatRunnerPath, 'utf8')
+    : '';
+  const replyText = replyBundlePath && existsSync(replyBundlePath)
+    ? readFileSync(replyBundlePath, 'utf8')
+    : '';
+
+  const detectorPatched = heartbeatText.includes('return lower.includes("exec finished") || lower.includes("exec completed");');
+  const relayPatched = heartbeatText.includes('const isDirectWebchatSession =')
+    && heartbeatText.includes('delivery.channel === "none" && isDirectWebchatSession');
+  const replyPatched = replyText.includes('normalizedIncomingTo === "heartbeat" && params.persistedLastTo');
+
+  return {
+    scriptExists,
+    supported: scriptExists && Boolean(heartbeatRunnerPath) && Boolean(replyBundlePath),
+    applied: detectorPatched && relayPatched && replyPatched,
+    detectorPatched,
+    relayPatched,
+    replyPatched,
+    heartbeatRunner: heartbeatRunnerPath ? path.basename(heartbeatRunnerPath) : null,
+    replyBundle: replyBundlePath ? path.basename(replyBundlePath) : null,
+    issues,
+  };
+}
+
+function restartOpenClawGatewayBySignal(): string {
+  const output = execFileSync('pgrep', ['-f', 'openclaw.*gateway|gateway.*openclaw|/openclaw/dist/.*gateway|openclaw-gateway'], {
+    encoding: 'utf8',
+    timeout: 5000,
+  });
+  const pid = output.split(/\s+/).map((value) => value.trim()).find(Boolean);
+  if (!pid) {
+    throw new Error('No gateway PID found for signal fallback.');
+  }
+  process.kill(Number(pid), 'SIGUSR1');
+  return `Gateway restart fallback sent via SIGUSR1 to PID ${pid}.`;
+}
+
+async function restartOpenClawGateway(): Promise<string> {
+  const systemdAvailable = existsSync('/run/systemd/system') && existsSync('/bin/systemctl');
+  if (!systemdAvailable) {
+    const signalMessage = restartOpenClawGatewayBySignal();
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    return signalMessage;
+  }
+
+  const cliRun = await execFileText('openclaw', ['gateway', 'restart'], 45000);
+  const cliOutput = [cliRun.stdout, cliRun.stderr].filter(Boolean).join('\n').trim();
+  const serviceUnavailable = /Gateway service disabled\.|systemd user services are unavailable|systemd not installed/i.test(cliOutput);
+
+  if (serviceUnavailable) {
+    const signalMessage = restartOpenClawGatewayBySignal();
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    return [cliOutput, signalMessage].filter(Boolean).join('\n');
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 3000));
+  return cliOutput;
+}
+
+async function execFileText(command: string, args: string[], timeout: number): Promise<{ stdout: string; stderr: string }> {
+  return await new Promise((resolve, reject) => {
+    execFile(command, args, {
+      timeout,
+      encoding: 'utf8',
+      env: buildOpenClawCliEnv(),
+      maxBuffer: 1024 * 1024 * 4,
+    }, (error, stdout, stderr) => {
+      const normalizedStdout = String(stdout || '').trim();
+      const normalizedStderr = String(stderr || '').trim();
+      if (error) {
+        const detail = normalizedStderr || normalizedStdout || error.message || `${command} failed`;
+        reject(new Error(detail));
+        return;
+      }
+      resolve({ stdout: normalizedStdout, stderr: normalizedStderr });
+    });
+  });
+}
 
 /**
  * Resolve sessions directory for a given session key.
@@ -606,6 +712,7 @@ async function readSessionMessages(sessionId: string, limit = 100, sessionsDir =
         if (role !== 'user' && role !== 'assistant') return null;
         const text = extractText(entry.message.content);
         if (!text) return null;
+        if (role === 'assistant' && isControlOnlyAssistantText(text)) return null;
         return { id: entry.id, role, content: text, timestamp: entry.timestamp };
       } catch {
         return null;
@@ -677,7 +784,10 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
               } else if (block.type === 'text' && block.text) {
                 const position = !lastToolSeen ? 'before' : 
                                  (toolCount === toolCalls.length ? 'after' : 'between');
-                segments.push({ text: block.text, position });
+                const segmentText = extractSanitizedText(block.text);
+                if (segmentText) {
+                  segments.push({ text: segmentText, position });
+                }
               }
             }
             
@@ -687,7 +797,8 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
               .map(b => b.text!)
               .join('\n');
             const text = extractSanitizedText(allText);
-            
+            if (!text || isControlOnlyAssistantText(text)) return null;
+
             return {
               id: entry.id,
               role: 'assistant',
@@ -701,7 +812,8 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
           }
 
           const text = extractText(content);
-          return text ? { id: entry.id, role: 'assistant', content: text, model: executedModel, timestamp: entry.timestamp } : null;
+          if (!text || isControlOnlyAssistantText(text)) return null;
+          return { id: entry.id, role: 'assistant', content: text, model: executedModel, timestamp: entry.timestamp };
         }
 
         if (role === 'toolResult') {
@@ -852,6 +964,52 @@ router.post('/reconnect', authenticateToken, requireAdmin, async (_req: Request,
     res.json({ ok: false, wasConnected: false, message: 'Reconnect attempt timed out. Check gateway service and token.' });
   } catch (err: any) {
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+router.get('/compatibility-hotfix', authenticateToken, requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const status = getOpenClawCompatibilityHotfixStatus();
+    res.json({
+      ok: true,
+      ...status,
+      note: status.applied
+        ? 'Portal compatibility hotfix is already present in the installed OpenClaw bundles.'
+        : 'Optional temporary patch for long-run exec relay issues on older OpenClaw builds. Applying it will restart the OpenClaw gateway.',
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to inspect compatibility hotfix status', detail: err.message });
+  }
+});
+
+router.post('/compatibility-hotfix/apply', authenticateToken, requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const before = getOpenClawCompatibilityHotfixStatus();
+    if (!before.scriptExists) {
+      res.status(500).json({ error: 'Portal hotfix script is missing from this install.' });
+      return;
+    }
+    if (!before.supported) {
+      res.status(500).json({ error: 'This OpenClaw install does not expose the runtime bundles expected by the compatibility hotfix.', status: before });
+      return;
+    }
+
+    const patchRun = await execFileText('bash', [OPENCLAW_COMPAT_HOTFIX_SCRIPT, OPENCLAW_DIST_DIR], 30000);
+    const restartOutput = await restartOpenClawGateway();
+    const after = getOpenClawCompatibilityHotfixStatus();
+
+    res.json({
+      ok: after.applied,
+      alreadyApplied: before.applied,
+      status: after,
+      patchOutput: [patchRun.stdout, patchRun.stderr].filter(Boolean).join('\n'),
+      restartOutput,
+      message: after.applied
+        ? 'Compatibility hotfix applied and OpenClaw gateway restarted.'
+        : 'Hotfix command ran, but the expected patch markers were not detected afterward.',
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to apply compatibility hotfix', detail: err.message });
   }
 });
 
@@ -1006,7 +1164,6 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
     }
 
     try {
-      const { execFileSync } = require('child_process');
       const output = execFileSync('openclaw', args, { timeout: 10000, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], env: buildOpenClawCliEnv() }) as string;
       const parsed = JSON.parse(output.trim());
       // --all-agents returns { agents: { id: { sessions: [...] } } } — flatten
@@ -1040,42 +1197,41 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
   }
 });
 
-// GET /api/gateway/usage-stats — aggregates session and cron data for usage dashboard
-router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const { execSync } = require('child_process');
-    const selectedAgent =
-      (typeof req.query.agent === 'string' && req.query.agent.trim())
-      || (typeof req.query.agentId === 'string' && req.query.agentId.trim())
-      || '';
+const USAGE_STATS_CACHE_TTL_MS = 15000;
+const usageStatsCache = new Map<string, { at: number; payload: any }>();
+const usageStatsInflight = new Map<string, Promise<any>>();
 
-    // Get session list
+async function getUsageStatsSnapshot(selectedAgent: string) {
+  const cacheKey = selectedAgent || '__all__';
+  const now = Date.now();
+  const cached = usageStatsCache.get(cacheKey);
+  if (cached && (now - cached.at) < USAGE_STATS_CACHE_TTL_MS) {
+    return cached.payload;
+  }
+
+  const existing = usageStatsInflight.get(cacheKey);
+  if (existing) return existing;
+
+  const promise = (async () => {
+    const { execSync } = require('child_process');
+
     let sessions: any[] = [];
     try {
-      const sessionsRaw = execSync('openclaw sessions --json 2>/dev/null', { timeout: 10000, encoding: 'utf-8', env: buildOpenClawCliEnv() });
-      const parsed = JSON.parse(sessionsRaw.trim());
-      // Handle both { sessions: [...] } and { agents: { id: { sessions: [...] } } } formats
-      if (parsed.sessions && Array.isArray(parsed.sessions)) {
-        sessions = parsed.sessions;
-      } else if (parsed.agents) {
-        for (const agent of Object.values(parsed.agents) as any[]) {
-          if (agent.sessions && Array.isArray(agent.sessions)) {
-            sessions.push(...agent.sessions);
-          }
-        }
+      const sessionsResult = await gatewayRpcCall('sessions.list', {}, 10000);
+      if (sessionsResult.ok && Array.isArray(sessionsResult.data?.sessions)) {
+        sessions = sessionsResult.data.sessions;
       }
     } catch {
-      // Sessions list failed — continue with empty array
+      // continue with empty sessions
     }
 
-    // Get cron job count
     let cronJobs: any[] = [];
     try {
       const cronsRaw = execSync('openclaw cron list --json 2>/dev/null', { timeout: 10000, encoding: 'utf-8', env: buildOpenClawCliEnv() });
       const parsed = JSON.parse(cronsRaw.trim());
       cronJobs = parsed.jobs || [];
     } catch {
-      // Cron list failed — continue with empty array
+      // continue with empty crons
     }
 
     const agentFilteredSessions = selectedAgent
@@ -1086,13 +1242,11 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
       : cronJobs;
 
     const totalSessions = agentFilteredSessions.length;
-    const now = Date.now();
     const activeSessions = agentFilteredSessions.filter((s: any) => {
       const lastMs = s.lastActivityMs || s.updatedAt || s.updatedAtMs || 0;
-      return now - lastMs < 3600000; // active in last hour
+      return now - lastMs < 3600000;
     }).length;
 
-    // Model breakdown
     const modelCounts: Record<string, number> = {};
     agentFilteredSessions.forEach((s: any) => {
       const model = normalizeGatewayModelId(s.model ?? s.defaultModel) || 'unknown';
@@ -1102,7 +1256,6 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
       .map(([model, count]) => ({ model, sessions: count }))
       .sort((a, b) => b.sessions - a.sessions);
 
-    // Recent sessions (last 20)
     const recentSessions = agentFilteredSessions
       .sort((a: any, b: any) => (b.lastActivityMs || b.updatedAt || 0) - (a.lastActivityMs || a.updatedAt || 0))
       .slice(0, 20)
@@ -1114,14 +1267,36 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
         turns: s.turns || 0,
       }));
 
-    res.json({
+    const payload = {
       totalSessions,
       activeSessions,
       cronJobs: agentFilteredCrons.length,
       activeCrons: agentFilteredCrons.filter((j: any) => j.enabled !== false).length,
       modelBreakdown,
       recentSessions,
-    });
+    };
+
+    usageStatsCache.set(cacheKey, { at: Date.now(), payload });
+    return payload;
+  })();
+
+  usageStatsInflight.set(cacheKey, promise);
+  try {
+    return await promise;
+  } finally {
+    usageStatsInflight.delete(cacheKey);
+  }
+}
+
+// GET /api/gateway/usage-stats — aggregates session and cron data for usage dashboard
+router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const selectedAgent =
+      (typeof req.query.agent === 'string' && req.query.agent.trim())
+      || (typeof req.query.agentId === 'string' && req.query.agentId.trim())
+      || '';
+
+    res.json(await getUsageStatsSnapshot(selectedAgent));
   } catch (err: any) {
     console.error('[gateway] usage-stats error:', err);
     res.status(500).json({ error: err.message || 'Failed to get usage stats' });
@@ -1323,34 +1498,51 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
 
     const thinking = typeof settings.thinking === 'string' ? settings.thinking.trim().toLowerCase() : '';
     const model = typeof settings.model === 'string' ? settings.model.trim() : '';
+    const rawFastMode = settings.fastMode;
 
-    const out: Record<string, any> = { ok: true };
+    const patch: Record<string, any> = { key: sessionKey };
 
-    // Thinking is NOT supported by sessions.patch; apply it by sending /think to the concrete session.
     if (thinking) {
       const allowedThinking = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive']);
       if (!allowedThinking.has(thinking)) {
         res.status(400).json({ error: `Unsupported thinking level: ${thinking}` });
         return;
       }
-      const thinkResult = await chatSend(sessionKey, `/think ${thinking}`, `portal-think-${sessionKey}-${Date.now()}`);
-      if (!thinkResult.ok) {
-        res.status(502).json({ error: thinkResult.error || 'Failed to set thinking level' });
+      patch.thinkingLevel = thinking;
+    }
+
+    if (typeof rawFastMode === 'boolean' || rawFastMode === null) {
+      patch.fastMode = rawFastMode;
+    } else if (typeof rawFastMode === 'string') {
+      const normalizedFastMode = rawFastMode.trim().toLowerCase();
+      if (normalizedFastMode === 'on' || normalizedFastMode === 'true') {
+        patch.fastMode = true;
+      } else if (normalizedFastMode === 'off' || normalizedFastMode === 'false') {
+        patch.fastMode = false;
+      } else if (normalizedFastMode === 'inherit' || normalizedFastMode === 'default' || normalizedFastMode === 'auto' || normalizedFastMode === 'null') {
+        patch.fastMode = null;
+      } else if (normalizedFastMode) {
+        res.status(400).json({ error: `Unsupported fast mode value: ${rawFastMode}` });
         return;
       }
-      out.thinking = { ok: true, level: thinking, runId: thinkResult.runId, status: thinkResult.status };
     }
 
     if (model) {
-      const result = await gatewayRpcCall('sessions.patch', { key: sessionKey, model });
-      if (!result.ok) {
-        res.status(502).json({ error: result.error || 'Failed to patch session model' });
-        return;
-      }
-      out.model = result.data;
+      patch.model = model;
     }
 
-    res.json(out);
+    if (Object.keys(patch).length === 1) {
+      res.json({ ok: true, session: null });
+      return;
+    }
+
+    const result = await gatewayRpcCall('sessions.patch', patch);
+    if (!result.ok) {
+      res.status(502).json({ error: result.error || 'Failed to patch session' });
+      return;
+    }
+
+    res.json({ ok: true, session: result.data || null });
   } catch (err: any) {
     console.error('[gateway] session-patch error:', err);
     const status = err?.message === 'Admin access required' ? 403 : 500;
@@ -2338,7 +2530,7 @@ function runWsStreamCleanup(ws: WebSocket, sessionKey: string): void {
 function attachBrowserWsToSessionStream(params: {
   ws: WebSocket;
   sessionKey: string;
-  streamInfo?: ReturnType<typeof streamEventBus.getStreamStatus> | null;
+  streamInfo?: ReturnType<typeof streamEventBus.getTrackedStream> | null;
   sendResume?: boolean;
   keepSubscriptionAfterDone?: boolean;
   onEvent?: (evt: StreamEvent) => void;
@@ -2352,10 +2544,10 @@ function attachBrowserWsToSessionStream(params: {
     onEvent,
   } = params;
 
-  const status = streamInfo ?? streamEventBus.getStreamStatus(sessionKey);
+  const status = streamInfo ?? streamEventBus.getTrackedStream(sessionKey);
+  if (!status) return false;
 
-  if (sendResume) {
-    if (!status?.active) return false;
+  if (sendResume && status.active) {
     const latestText = status.phase === 'streaming'
       ? streamEventBus.getLatestText(sessionKey)
       : '';
@@ -2785,8 +2977,8 @@ function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtP
     return;
   }
 
-  const streamInfo = streamEventBus.getStreamStatus(sessionKey);
-  if (streamInfo && streamInfo.active) {
+  const streamInfo = streamEventBus.getTrackedStream(sessionKey);
+  if (streamInfo) {
     attachBrowserWsToSessionStream({
       ws,
       sessionKey,
@@ -2797,9 +2989,9 @@ function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtP
         if (evt.type === 'text') debugLog(`[Gateway] RECONNECT→browser TEXT: len=${(evt.content||'').length} "${(evt.content||'').substring(0, 40)}..."`);
       },
     });
-    debugLog(`[gateway-ws] Client reconnected to active stream: ${sessionKey}`);
+    debugLog(`[gateway-ws] Client reconnected to ${streamInfo.active ? 'active' : 'dormant'} stream: ${sessionKey}`);
   } else {
-    // No active stream
+    // No tracked stream
     wsSend(ws, { type: 'stream_ended' });
   }
 }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
@@ -307,34 +307,57 @@ export function UsageContent({ agentId, showHeader = false }: UsageContentProps)
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const inFlightRef = useRef<AbortController | null>(null);
+  const refreshTimerRef = useRef<number | null>(null);
 
-  const fetchStats = useCallback(async (isRefresh = false) => {
+  const fetchStats = useCallback(async (isRefresh = false, force = false) => {
+    if (!force && inFlightRef.current) return;
+
+    inFlightRef.current?.abort();
+    const controller = new AbortController();
+    inFlightRef.current = controller;
+
     try {
       if (isRefresh) setRefreshing(true);
       else setLoading(true);
       setError(null);
 
       const effectiveAgentId = agentId && agentId !== 'main' ? agentId : undefined;
-      const data = await usageAPI.stats(effectiveAgentId);
+      const data = await usageAPI.stats(effectiveAgentId, { signal: controller.signal });
+      if (inFlightRef.current !== controller) return;
       setStats(data);
     } catch (err: any) {
+      if (controller.signal.aborted) return;
       console.error('[UsagePage] Failed to fetch stats:', err);
       setError(err.message || 'Failed to load usage statistics');
     } finally {
+      if (inFlightRef.current === controller) {
+        inFlightRef.current = null;
+      }
       setLoading(false);
       setRefreshing(false);
     }
   }, [agentId]);
 
-  // Initial fetch
   useEffect(() => {
-    fetchStats();
-  }, [fetchStats]);
+    void fetchStats(false, true);
 
-  // Auto-refresh every 60 seconds
-  useEffect(() => {
-    const interval = setInterval(() => fetchStats(true), 60000);
-    return () => clearInterval(interval);
+    const tick = () => {
+      if (document.visibilityState !== 'visible') return;
+      void fetchStats(true);
+    };
+
+    refreshTimerRef.current = window.setInterval(tick, 60000);
+    document.addEventListener('visibilitychange', tick);
+
+    return () => {
+      if (refreshTimerRef.current !== null) {
+        window.clearInterval(refreshTimerRef.current);
+      }
+      document.removeEventListener('visibilitychange', tick);
+      inFlightRef.current?.abort();
+      inFlightRef.current = null;
+    };
   }, [fetchStats]);
 
   return (

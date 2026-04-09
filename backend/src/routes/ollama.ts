@@ -5,6 +5,7 @@ import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
 import { prisma } from '../config/database';
 import os from 'os';
+import { getOllamaRecommendationsByRam } from '../utils/ollamaRecommendations';
 
 const router = Router();
 router.use(authenticateToken);
@@ -31,36 +32,6 @@ async function getSettings(keys: string[]): Promise<Record<string, string>> {
     acc[row.key] = row.value;
     return acc;
   }, {});
-}
-
-function getRecommendationsByRam(totalBytes: number) {
-  const gb = totalBytes / (1024 ** 3);
-  if (gb < 4) {
-    return {
-      ramTier: '<4GB',
-      warning: 'Low-memory VPS detected. Stick to tiny models.',
-      recommendedModels: ['phi3:mini', 'tinyllama'],
-    };
-  }
-  if (gb < 8) {
-    return {
-      ramTier: '4-8GB',
-      warning: null,
-      recommendedModels: ['llama3.2:3b', 'mistral:7b'],
-    };
-  }
-  if (gb < 16) {
-    return {
-      ramTier: '8-16GB',
-      warning: null,
-      recommendedModels: ['llama3.1:8b', 'mistral:7b', 'codellama:7b'],
-    };
-  }
-  return {
-    ramTier: '16GB+',
-    warning: null,
-    recommendedModels: ['llama3.1:70b', 'deepseek-coder:33b'],
-  };
 }
 
 async function listModelsFromHost(baseUrl: string): Promise<OllamaModel[]> {
@@ -201,7 +172,7 @@ router.post('/pull', requireAdmin, async (req: Request, res: Response) => {
 router.get('/recommendations', async (_req: Request, res: Response) => {
   try {
     const totalBytes = os.totalmem();
-    const rec = getRecommendationsByRam(totalBytes);
+    const rec = getOllamaRecommendationsByRam(totalBytes);
     res.json({
       ramBytes: totalBytes,
       ramGb: Math.round((totalBytes / (1024 ** 3)) * 10) / 10,

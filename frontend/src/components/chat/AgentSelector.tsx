@@ -498,12 +498,9 @@ export default function AgentSelector({
     return () => { cancelled = true; };
   }, [open]);
 
-  // Fetch sessions only when the selector is open.
+  // Keep the session list warm independently of the agent dropdown so the
+  // dedicated session picker keeps working even after the dropdown closes.
   useEffect(() => {
-    if (!open) {
-      setSessions([]);
-      return;
-    }
     const selectedProvider = providers.find((p) => p.name === value);
     const supportsSessionList = value === 'OPENCLAW' || selectedProvider?.capabilities?.supportsSessionList === true;
     if (!supportsSessionList) {
@@ -529,7 +526,7 @@ export default function AgentSelector({
     void fetchSessions();
     const interval = setInterval(fetchSessions, 30000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [open, value, agentId, providers]);
+  }, [value, agentId, providers]);
 
   // Close on click outside (desktop only — mobile uses backdrop onClick)
   useEffect(() => {

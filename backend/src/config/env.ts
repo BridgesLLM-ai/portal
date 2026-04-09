@@ -19,7 +19,10 @@ export const config = {
 
   // Ollama
   ollamaApiUrl: process.env.OLLAMA_API_URL || 'http://127.0.0.1:11434',
-  ollamaModel: process.env.OLLAMA_MODEL || 'qwen2.5-coder:7b',
+  // Conservative modern fallback when no DB setting or tier is configured.
+  // qwen3:4b tracks the refreshed recommendation set better than the old
+  // coder-only default while still fitting more local CPU hosts than qwen3:8b.
+  ollamaModel: process.env.OLLAMA_MODEL || 'qwen3:4b',
 
   // OpenClaw
   openclawApiUrl: process.env.OPENCLAW_API_URL || 'http://localhost:18789',

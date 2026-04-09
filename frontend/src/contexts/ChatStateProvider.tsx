@@ -20,6 +20,7 @@ import { useAuthStore } from './AuthContext';
 import { isOwner } from '../utils/authz';
 import {
   extractThinkingChunk,
+  isControlOnlyAssistantContent,
   mergeAssistantStream,
   mergeThinkingStream,
   sanitizeAssistantContent,
@@ -305,9 +306,12 @@ function normalizeProviderModel(provider: string, rawModel: string): string {
   return model;
 }
 
-function parseHistoryMessage(m: any): ChatMessage {
+function parseHistoryMessage(m: any): ChatMessage | null {
   const rawContent = m.content || '';
   const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
+  if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(rawContent)) {
+    return null;
+  }
 
   const msg: ChatMessage = {
     id: m.id || nextId(),
@@ -391,11 +395,14 @@ function extractThinkingFromGatewayMessage(msg: GatewayChatMessage): string | un
 /**
  * Map a gateway message to our ChatMessage format.
  */
-function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage {
+function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage | null {
   const text = extractTextFromGatewayMessage(msg);
   const toolCalls = extractToolCallsFromGatewayMessage(msg);
   const thinking = extractThinkingFromGatewayMessage(msg);
   const isTruncationPlaceholder = msg.role === 'assistant' && text === CHAT_HISTORY_OMITTED_PLACEHOLDER;
+  if (msg.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(text)) {
+    return null;
+  }
 
   return {
     id: msg.id || msg.messageId || `gw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -410,12 +417,34 @@ function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage {
   };
 }
 
+const HISTORY_REPLAY_DUPLICATE_WINDOW_MS = 5_000;
+
+function normalizeHistoryReplayContent(content: string): string {
+  return (content || '').replace(/\r\n/g, '\n').trim();
+}
+
+function isLikelyHistoryReplayDuplicate(previous: ChatMessage | undefined, next: ChatMessage): boolean {
+  if (!previous || previous.role !== next.role || next.role !== 'user') return false;
+
+  const previousContent = normalizeHistoryReplayContent(previous.content);
+  const nextContent = normalizeHistoryReplayContent(next.content);
+  if (!previousContent || previousContent !== nextContent) return false;
+
+  const previousTs = previous.createdAt instanceof Date ? previous.createdAt.getTime() : NaN;
+  const nextTs = next.createdAt instanceof Date ? next.createdAt.getTime() : NaN;
+  if (!Number.isFinite(previousTs) || !Number.isFinite(nextTs) || nextTs < previousTs) return false;
+
+  return (nextTs - previousTs) <= HISTORY_REPLAY_DUPLICATE_WINDOW_MS;
+}
+
 function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
   const seenIds = new Set<string>();
   const seenSignatures = new Set<string>();
   const deduped: ChatMessage[] = [];
   for (const msg of messages) {
     if (msg.id && seenIds.has(msg.id)) continue;
+    const previous = deduped[deduped.length - 1];
+    if (isLikelyHistoryReplayDuplicate(previous, msg)) continue;
     const ts = msg.createdAt instanceof Date ? msg.createdAt.getTime() : Date.now();
     const signature = `${msg.role}|${Number.isFinite(ts) ? ts : 0}|${msg.content}`;
     if (msg.role === 'assistant' && seenSignatures.has(signature)) continue;
@@ -539,12 +568,10 @@ export interface ChatStateContextValue {
   refreshChat: () => Promise<void>;
   wsManager: WsManager | null;
   reconnectSocket: () => void;
-  // Session controls (OpenClaw session thinking + portal model override)
+  // Session controls (OpenClaw session thinking + fast mode)
   thinkingLevel: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
   setThinkingLevel: (level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive') => Promise<void>;
   fastModeEnabled: boolean;
-  fastModeModel: string;
-  setFastModeModel: (model: string) => Promise<void>;
   toggleFastMode: () => Promise<void>;
   compactionModelOverride: string;
   setCompactionModelOverride: (model: string) => Promise<void>;
@@ -574,7 +601,6 @@ function normalizeInitialSession(provider: string, session: string): string {
 export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
   const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive'];
-  const FAST_MODEL_STORAGE_KEY = 'agent-chat-fast-model';
   const publicSettings = usePublicSettings();
   const useDirectGateway = publicSettings?.useDirectGateway ?? BUILD_TIME_USE_DIRECT_GATEWAY;
 
@@ -715,8 +741,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // Session controls state (thinking/fast mode)
   const [thinkingLevel, setThinkingLevelState] = useState<ThinkingLevel>('off');
   const [fastModeEnabled, setFastModeEnabled] = useState(false);
-  const [fastModeModel, setFastModeModelState] = useState(() => localStorage.getItem(FAST_MODEL_STORAGE_KEY) || 'anthropic/claude-haiku-4-5-20250514');
-  const [baseModel, setBaseModel] = useState<string | null>(null); // Store original model when fast mode is active
   const [compactionModelOverride, setCompactionModelOverrideState] = useState<string>('');
   const [compactionModelLoading, setCompactionModelLoading] = useState(false);
   const [compactionModelError, setCompactionModelError] = useState<string | null>(null);
@@ -724,7 +748,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   // Refs
   const streamWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const STREAM_TIMEOUT_MS = 90_000;
+  const STREAM_TIMEOUT_MS = 180_000;
   const compactionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toolCounterRef = useRef(0);
   const hasRealToolEventsRef = useRef(false);
@@ -749,6 +773,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // switch or clearMessages. Any async history load that started in a previous
   // generation simply discards its result, eliminating race conditions.
   const historyGenRef = useRef(0);
+  const loadHistoryInternalRef = useRef<((sessionKey: string, prov?: string, options?: { force?: boolean }) => Promise<boolean>) | null>(null);
   // Throttle refs for streaming text updates — batch text deltas to reduce re-renders
   const textThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingTextUpdateRef = useRef<string | null>(null);
@@ -826,7 +851,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     sessionControlsMetadataPromiseRef.current = null;
     setThinkingLevelState('off');
     setFastModeEnabled(false);
-    setBaseModel(null);
     setCompactionModelOverrideState('');
     setCompactionModelError(null);
   }, [provider, session]);
@@ -846,7 +870,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (!isStreamActiveRef.current) return;
     streamWatchdogRef.current = setTimeout(async () => {
       if (!isStreamActiveRef.current) return;
-      console.warn('[ChatState] Stream watchdog: no activity for 90s — verifying stream status');
+      console.warn('[ChatState] Stream watchdog: no activity for 180s — verifying stream status');
 
       try {
         const currentSession = sessionRef.current || 'main';
@@ -855,22 +879,34 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (currentProvider) params.provider = currentProvider;
         const { data } = await client.get('/gateway/stream-status', { params, _silent: true } as any);
         if (data?.active) {
+          const hasVisibleSnapshotText = typeof data.content === 'string'
+            && data.content.length > 0
+            && !isControlOnlyAssistantContent(data.content);
+          const shouldSurfaceStream = Boolean(data.toolName) || hasVisibleSnapshotText || Boolean(streamingAssistantIdRef.current);
+
+          if (useDirectGateway && currentProvider === 'OPENCLAW') {
+            directClientRef.current?.connect();
+          } else if (wsManagerRef.current && !wsManagerRef.current.isConnected()) {
+            wsManagerRef.current.reconnect();
+          }
+
+          if (!shouldSurfaceStream) {
+            clearActiveStreamState();
+            return;
+          }
+
+          directClientRef.current?.setActiveStreamSession(currentSession);
           setIsRunning(true);
           setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
           setActiveToolName(data.toolName || null);
           setStatusText(data.toolName ? `Using ${data.toolName}…` : 'Still working…');
-          if (typeof data.content === 'string' && data.content.length > 0) {
+          if (hasVisibleSnapshotText) {
             const safeText = sanitizeAssistantContent(data.content);
             assembledRef.current = safeText;
             const assistantId = streamingAssistantIdRef.current;
             if (assistantId) {
               setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, content: safeText } : m));
             }
-          }
-          if (useDirectGateway && currentProvider === 'OPENCLAW') {
-            directClientRef.current?.connect();
-          } else if (wsManagerRef.current && !wsManagerRef.current.isConnected()) {
-            wsManagerRef.current.reconnect();
           }
           resetStreamWatchdog();
           return;
@@ -879,21 +915,40 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         console.warn('[ChatState] Stream watchdog verification failed:', err);
       }
 
+      const ft = assembledRef.current;
+      const currentSession = sessionRef.current || 'main';
+      const currentProvider = providerRef.current;
+      const shouldReloadHistoryIfIdle = currentProvider === 'OPENCLAW'
+        && !ft.trim()
+        && streamSegmentsRef.current.length === 0
+        && !hasRealToolEventsRef.current;
+
       isStreamActiveRef.current = false;
+      streamTransportRef.current = null;
       setIsRunning(false);
       setStreamingPhase('idle');
       setStatusText(null);
+      setThinkingContent('');
+      setActiveToolName(null);
       setCompactionPhase('idle');
       if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
       const cid = streamingAssistantIdRef.current;
-      if (cid) {
-        const ft = assembledRef.current;
-        if (ft) {
-          setMessages(prev => prev.map(m =>
-            m.id === cid ? { ...m, content: ft + '\n\n*(stream interrupted)*' } : m
-          ));
-        }
-        streamingAssistantIdRef.current = null;
+      streamingAssistantIdRef.current = null;
+      currentRunIdRef.current = null;
+      directClientRef.current?.setActiveStreamSession(null);
+      assembledRef.current = '';
+      lastSegmentStartRef.current = 0;
+      lastRawTextLenRef.current = 0;
+
+      if (shouldReloadHistoryIfIdle) {
+        void loadHistoryInternalRef.current?.(currentSession, currentProvider, { force: true });
+        return;
+      }
+
+      if (cid && ft) {
+        setMessages(prev => prev.map(m =>
+          m.id === cid ? { ...m, content: ft + '\n\n*(stream interrupted)*' } : m
+        ));
       }
     }, STREAM_TIMEOUT_MS);
   }, [useDirectGateway]);
@@ -1013,9 +1068,17 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     clearStreamWatchdog();
     isStreamActiveRef.current = false;
     streamTransportRef.current = null;
+    currentRunIdRef.current = null;
+    streamingAssistantIdRef.current = null;
+    assembledRef.current = '';
+    lastSegmentStartRef.current = 0;
+    lastRawTextLenRef.current = 0;
+    pendingTextUpdateRef.current = null;
+    directClientRef.current?.setActiveStreamSession(null);
     setIsRunning(false);
     setStreamingPhase('idle');
     setStatusText(null);
+    setThinkingContent('');
     setActiveToolName(null);
   }, [clearStreamWatchdog]);
 
@@ -1024,8 +1087,18 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     source?: 'portal' | 'direct';
   }) => {
     if (!snapshot?.active) return false;
+    const snapshotContent = typeof snapshot.content === 'string' && !isControlOnlyAssistantContent(snapshot.content)
+      ? sanitizeAssistantContent(snapshot.content)
+      : '';
+    let assistantId = streamingAssistantIdRef.current;
+    const shouldMaterializeBubble = Boolean(snapshotContent) || Boolean(snapshot.toolName) || Boolean(assistantId);
+    if (!shouldMaterializeBubble) {
+      return false;
+    }
+
     isStreamActiveRef.current = true;
     streamTransportRef.current = options?.source || 'portal';
+    directClientRef.current?.setActiveStreamSession(sessionRef.current || null);
     setIsRunning(true);
     setStreamingPhase(snapshot.phase === 'tool' ? 'tool' : snapshot.phase === 'streaming' ? 'streaming' : 'thinking');
     setActiveToolName(snapshot.toolName || null);
@@ -1036,14 +1109,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       setCompactionPhase(snapshotCompaction);
     }
     if (snapshot.provenance) setLastProvenance(String(snapshot.provenance));
-    const snapshotContent = typeof snapshot.content === 'string' ? sanitizeAssistantContent(snapshot.content) : '';
     if (snapshotContent) {
       mergeStreamText(snapshotContent, { replace: true });
     }
-    const { assistantId } = ensureStreamingAssistantBubble({
+    assistantId = ensureStreamingAssistantBubble({
       idPrefix: 'stream-resume',
       content: snapshotContent || '',
-    });
+    }).assistantId;
     if (snapshot.model && assistantId) {
       setMessages(prev => prev.map(m => (
         m.id === assistantId
@@ -1088,7 +1160,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         });
         return false;
       }
+      const manager = wsManagerRef.current;
       if (!data?.active) {
+        if (options?.reconnect !== false && manager?.isConnected()) {
+          manager.send({ type: 'reconnect', session: sessionKey, provider: prov });
+        }
         if (options?.clearIfInactive && isStreamActiveRef.current) {
           debugLog('[ChatState] Active-stream snapshot is idle — clearing stale stream UI');
           clearActiveStreamState();
@@ -1098,7 +1174,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       if (isStreamActiveRef.current) return true;
       debugLog('[ChatState] Active stream found during history load — hydrating');
       applyOpenClawActiveStreamSnapshot(data, { statusTextWhenNoTool: 'Reconnecting to stream…' });
-      const manager = wsManagerRef.current;
       if (options?.reconnect !== false && manager?.isConnected()) {
         manager.send({ type: 'reconnect', session: sessionKey, provider: prov });
       }
@@ -1121,7 +1196,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       if (prov) params.provider = prov;
       const { data } = await client.get('/gateway/history', { params });
       historyActiveStream = data?.activeStream;
-      return data.messages ? data.messages.map(parseHistoryMessage) : [];
+      return data.messages ? data.messages.map(parseHistoryMessage).filter(Boolean) as ChatMessage[] : [];
     };
 
     // Load via direct gateway client for OPENCLAW
@@ -1137,7 +1212,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         localStorage.setItem('agent-chat-session', resolvedSessionKey);
       }
       const result = await directClient.loadHistory(resolvedSessionKey || sessionKey);
-      return result.messages.map(mapGatewayMessage);
+      return result.messages.map(mapGatewayMessage).filter(Boolean) as ChatMessage[];
     };
 
     try {
@@ -1170,7 +1245,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                 if (data.type === 'history' && data.requestId === requestId) {
                   clearTimeout(timeout);
                   manager.removeHandler(handler);
-                  resolve((data.messages || []).map(parseHistoryMessage));
+                  resolve((data.messages || []).map(parseHistoryMessage).filter(Boolean) as ChatMessage[]);
                 } else if (data.type === 'error' && data.requestId === requestId) {
                   clearTimeout(timeout);
                   manager.removeHandler(handler);
@@ -1220,6 +1295,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
     return false;
   }, [hydrateActiveStream, resolveOpenClawSessionKey, useDirectGateway]);
+
+  useEffect(() => {
+    loadHistoryInternalRef.current = loadHistoryInternal;
+  }, [loadHistoryInternal]);
 
   const loadHistory = useCallback(async (sessionKey: string, prov?: string) => {
     await loadHistoryInternal(sessionKey, prov);
@@ -1308,28 +1387,31 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       console.log(`[ChatState] WS event: type=${data.type} assistantId=${streamingAssistantIdRef.current || 'NULL'} toolName=${data.toolName || '-'} contentLen=${(data.content||'').length}`);
     }
     // Only process stream events if we have an active assistant message.
-    // Some event types are allowed without an assistant bubble (session metadata, approvals, etc.).
-    // 'run_resumed' signals the agent resumed after a sub-agent — we need to create a new bubble.
-    // Stream events (text, tool_*, thinking) after a done also need a new bubble (agent resumed).
+    // Some event types are allowed without a bubble so we can wait for visible
+    // content before materializing a resumed turn.
     const passthrough = ['session', 'exec_approval', 'exec_approval_resolved', 'connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended', 'run_resumed'];
-    const streamTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'done'];
+    const autoCreateBubbleTypes = ['text', 'tool_start', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
+    const waitForVisibleStreamTypes = ['status', 'thinking', 'done', 'error'];
+    if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOnlyAssistantContent(data.content)) {
+      return;
+    }
     if (!streamingAssistantIdRef.current && !passthrough.includes(data.type)) {
-      if (streamTypes.includes(data.type)) {
-        // Agent resumed after a sub-agent or multi-run — create a new assistant bubble
+      if (autoCreateBubbleTypes.includes(data.type)) {
         ensureStreamingAssistantBubble({ idPrefix: 'resume', content: '', resetIfCreated: true });
         isStreamActiveRef.current = true;
         if (!streamTransportRef.current) streamTransportRef.current = 'portal';
+        directClientRef.current?.setActiveStreamSession(sessionRef.current || null);
         setIsRunning(true);
-        resetStreamWatchdog();
-        // Don't return — fall through to process this event with the new assistantId
-      } else {
+      } else if (!waitForVisibleStreamTypes.includes(data.type)) {
         console.warn(`[ChatState] DROPPED event: type=${data.type} (no assistantId)`);
         return;
       }
     }
     // Read assistantId AFTER potential bubble creation so it picks up the new ref
     const assistantId = streamingAssistantIdRef.current;
-    resetStreamWatchdog();
+    if (assistantId || isStreamActiveRef.current) {
+      resetStreamWatchdog();
+    }
 
     switch (data.type) {
       case 'session': {
@@ -1348,6 +1430,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         break;
       }
       case 'status': {
+        if (!assistantId && !isStreamActiveRef.current) break;
         setStatusText(data.content || null);
         // OpenClaw emits dedicated `thinking` events; avoid mixing generic
         // status text into the thought bubble (live-only divergence vs refresh).
@@ -1361,6 +1444,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         break;
       }
       case 'thinking': {
+        if (!assistantId && !isStreamActiveRef.current) break;
         appendThinkingChunk(assistantId, extractThinkingChunk('thinking', data.content, assembledRef.current.length > 0));
         if (!assembledRef.current) setStreamingPhase('thinking');
         break;
@@ -1467,6 +1551,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         break;
       }
       case 'text': {
+        const rawChunk = typeof data.content === 'string' ? data.content : '';
+        if (rawChunk && isControlOnlyAssistantContent(rawChunk)) {
+          break;
+        }
         const safeChunk = typeof data.content === 'string'
           ? (data.replace === true ? sanitizeAssistantContent(data.content) : sanitizeAssistantChunk(data.content))
           : data.content;
@@ -1492,25 +1580,29 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       case 'done': {
         clearStreamWatchdog();
-        // Flush any pending throttled text update immediately
         if (textThrottleTimerRef.current) {
           clearTimeout(textThrottleTimerRef.current);
           textThrottleTimerRef.current = null;
         }
         pendingTextUpdateRef.current = null;
-        const hasFinal = typeof data.content === 'string' && data.content.length > 0;
-        const finalContent = hasFinal ? sanitizeAssistantContent(data.content) : assembledRef.current;
+
+        const rawFinal = typeof data.content === 'string' ? data.content : '';
+        const hasVisibleFinal = rawFinal.length > 0 && !isControlOnlyAssistantContent(rawFinal);
+        const finalContent = hasVisibleFinal ? sanitizeAssistantContent(rawFinal) : assembledRef.current;
         assembledRef.current = finalContent;
         const prov = data.provenance || null;
         const model = normalizeProviderModel(providerRef.current, typeof data?.metadata?.model === 'string' ? data.metadata.model : (typeof data?.model === 'string' ? data.model : ''));
-        const cid = streamingAssistantIdRef.current;
-        
-        // Check if tools were used during this streaming session — we'll reload
-        // history to get the clean server-side formatted tool results.
         const hadToolEvents = hasRealToolEventsRef.current;
-        
+        const currentStreamSegs = [...streamSegmentsRef.current];
+        const shouldHideTurn = !finalContent.trim() && currentStreamSegs.length === 0 && !hadToolEvents;
+        let cid = streamingAssistantIdRef.current;
+        if (!cid && !shouldHideTurn) {
+          cid = ensureStreamingAssistantBubble({ idPrefix: 'resume-done', content: '', resetIfCreated: false }).assistantId;
+        }
+
         setStatusText(null);
         setStreamingPhase('idle');
+        setThinkingContent('');
         setLastProvenance(prov);
         setIsRunning(false);
         if (compactionPhaseRef.current === 'compacting') {
@@ -1518,50 +1610,40 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           setCompactionPhase('idle');
           if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
         }
-        // Keep graduated segments — they show the agent's thought process leading to the final response.
-        // They'll be cleared on next message send or session switch.
-        // Mark stream as inactive but DON'T null out streamingAssistantIdRef yet.
-        // The agent may resume after a sub-agent completes (sessions_yield flow).
-        // The guard at the top of handleWsEvent will create a new bubble when
-        // stream events arrive without an active assistantId.
+
         isStreamActiveRef.current = false;
         streamTransportRef.current = null;
         streamingAssistantIdRef.current = null;
-        // Reset text accumulator so the next run segment starts fresh
+        currentRunIdRef.current = null;
+        directClientRef.current?.setActiveStreamSession(null);
         assembledRef.current = '';
         lastSegmentStartRef.current = 0;
         lastRawTextLenRef.current = 0;
-        // Persist graduated stream segments into the message so the interleaved
-        // timeline survives after streaming ends (when streamSegments state is cleared
-        // or the message is no longer the last one). Convert live segments to the same
-        // TextSegment format the backend returns for history messages.
+
         const graduatedSegments: TextSegment[] = [];
-        const currentStreamSegs = [...streamSegmentsRef.current];
-        if (currentStreamSegs.length > 0 || (cid && hasRealToolEventsRef.current)) {
+        if (currentStreamSegs.length > 0 || (cid && hadToolEvents)) {
           for (const seg of currentStreamSegs) {
             graduatedSegments.push({ text: seg.text, position: 'before' });
           }
-          // The final content is the "after" segment (text after the last tool call)
           if (finalContent && finalContent.trim()) {
             graduatedSegments.push({ text: finalContent, position: 'after' });
           }
         }
 
-        setMessages(prev => prev.map(m => {
-          if (m.id !== cid) return m;
-          const update: Partial<ChatMessage> = { content: finalContent, provenance: prov || undefined, model: model || m.model };
-          if (graduatedSegments.length > 0) {
-            update.segments = graduatedSegments;
+        if (cid) {
+          if (shouldHideTurn) {
+            setMessages(prev => prev.filter(m => m.id !== cid));
+          } else {
+            setMessages(prev => prev.map(m => {
+              if (m.id !== cid) return m;
+              const update: Partial<ChatMessage> = { content: finalContent, provenance: prov || undefined, model: model || m.model };
+              if (graduatedSegments.length > 0) {
+                update.segments = graduatedSegments;
+              }
+              return { ...m, ...update };
+            }));
           }
-          return { ...m, ...update };
-        }));
-        
-        // The streaming state is already accurate at this point — the graduated segments
-        // were promoted during the run, tool calls have their results from tool_end events,
-        // and the final message content was set above. A history reload here would DESTROY
-        // the clean streaming state by replacing it with the server's JSONL which strips
-        // pre-tool-call text (thoughts/narration) and causes a jarring visual flash.
-        // Only reload on manual refresh or session switch.
+        }
         break;
       }
       case 'error': {
@@ -1589,6 +1671,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         currentRunIdRef.current = null;
         isStreamActiveRef.current = false;
         streamingAssistantIdRef.current = null;
+        directClientRef.current?.setActiveStreamSession(null);
         assembledRef.current = '';
         break;
       }
@@ -1607,8 +1690,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         break;
       }
       case 'run_resumed': {
-        // Agent resumed after a sub-agent completed — the bubble creation
-        // already happened in the guard above. Just ensure we're in the right state.
+        if (!streamingAssistantIdRef.current) {
+          console.log('[ChatState] run_resumed — waiting for visible stream event');
+          break;
+        }
         console.log('[ChatState] run_resumed — agent continuing after sub-agent');
         isStreamActiveRef.current = true;
         setIsRunning(true);
@@ -1626,9 +1711,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         pendingTextUpdateRef.current = null;
         setStatusText(null);
         setStreamingPhase('idle');
+        setThinkingContent('');
         setIsRunning(false);
         isStreamActiveRef.current = false;
         streamingAssistantIdRef.current = null;
+        currentRunIdRef.current = null;
+        directClientRef.current?.setActiveStreamSession(null);
         break;
       }
       case 'connected':
@@ -1667,6 +1755,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       // Track current run for abort functionality
       if (payload.runId) {
         currentRunIdRef.current = payload.runId;
+        directClientRef.current?.setActiveStreamSession(sessionRef.current || null);
       }
       streamTransportRef.current = 'direct';
 
@@ -1676,39 +1765,18 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             ? payload.message.content
             : [];
 
-          // Ensure assistant bubble exists — create one if missing.
-          // This can happen with OpenAI-style providers that send deltas
-          // without a separate 'start' event, or on reconnect/resume.
           let assistantId = streamingAssistantIdRef.current;
-          if (!assistantId) {
-            assistantId = ensureStreamingAssistantBubble({ idPrefix: 'direct', content: '', resetIfCreated: true }).assistantId;
-            isStreamActiveRef.current = true;
-            streamTransportRef.current = 'direct';
-            setIsRunning(true);
-          }
 
-          // Extract thinking content from thinking blocks
           const thinkingText = contentBlocks
             .filter((b: any) => b.type === 'thinking')
             .map((b: any) => b.text || '')
             .join('');
 
-          if (thinkingText) {
-            appendThinkingChunk(
-              assistantId,
-              extractThinkingChunk('thinking', thinkingText, assembledRef.current.length > 0),
-            );
-            if (!assembledRef.current) setStreamingPhase('thinking');
-          }
-
-          // Extract text content — use content blocks, NOT payload.message.text
-          // (which may be a pre-concatenated string including thinking content)
           const text = contentBlocks
             .filter((b: any) => b.type === 'text')
             .map((b: any) => b.text || '')
             .join('');
 
-          // DIAG: detect thinking content leaking into text blocks
           if (thinkingText && text && text.includes(thinkingText.slice(0, 50))) {
             console.warn('[CASCADE-DIAG] ⚠️ THINKING LEAK: thinking text found inside text blocks!', {
               thinkingLen: thinkingText.length,
@@ -1717,26 +1785,37 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             });
           }
 
-          if (text) {
-            const safeChunk = sanitizeAssistantChunk(text);
-            // Gateway sends FULL accumulated turn text in every delta (replace mode).
-            // After tool calls, this includes pre-tool text that's already graduated
-            // to segments. Slice off the graduated portion so only new text shows
-            // in the main bubble.
-            const fullText = safeChunk;
+          if (text && isControlOnlyAssistantContent(text)) {
+            if (assistantId || isStreamActiveRef.current) resetStreamWatchdog();
+            break;
+          }
 
-            // Track raw text length for accurate graduation offset calculation.
-            // lastSegmentStartRef tracks how much of the gateway's accumulated text
-            // has been graduated into segments. We use the raw fullText length
-            // (post-sanitize but pre-slice) so the offset stays aligned with what
-            // the gateway actually sends.
+          const safeChunk = text ? sanitizeAssistantChunk(text) : '';
+          const hasVisibleText = Boolean(safeChunk);
+          if (!assistantId && hasVisibleText) {
+            assistantId = ensureStreamingAssistantBubble({ idPrefix: 'direct', content: '', resetIfCreated: true }).assistantId;
+            isStreamActiveRef.current = true;
+            streamTransportRef.current = 'direct';
+            setIsRunning(true);
+            directClientRef.current?.setActiveStreamSession(sessionRef.current || null);
+          }
+
+          if (thinkingText) {
+            appendThinkingChunk(
+              assistantId,
+              extractThinkingChunk('thinking', thinkingText, assembledRef.current.length > 0),
+            );
+            if (!assembledRef.current && assistantId) setStreamingPhase('thinking');
+          }
+
+          if (hasVisibleText) {
+            const fullText = safeChunk;
             lastRawTextLenRef.current = fullText.length;
 
             const sliced = lastSegmentStartRef.current > 0
               ? fullText.slice(lastSegmentStartRef.current)
               : fullText;
 
-            // DIAG: cascade debugging — log slice math on every delta
             if (lastSegmentStartRef.current > 0 || fullText.length > 500) {
               console.log('[CASCADE-DIAG] delta:', {
                 segStartRef: lastSegmentStartRef.current,
@@ -1748,15 +1827,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               });
             }
 
-            // Use replace: assembledRef gets the post-graduation text only
             assembledRef.current = sliced;
-            const nextText = sliced;
             setStatusText(null);
             setStreamingPhase('streaming');
+            setThinkingContent('');
             setActiveToolName(null);
 
-            // Throttle UI updates
-            pendingTextUpdateRef.current = nextText;
+            pendingTextUpdateRef.current = sliced;
             if (!textThrottleTimerRef.current) {
               textThrottleTimerRef.current = setTimeout(() => {
                 textThrottleTimerRef.current = null;
@@ -1767,41 +1844,44 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               }, TEXT_THROTTLE_MS);
             }
           }
-          resetStreamWatchdog();
+          if (assistantId || isStreamActiveRef.current) resetStreamWatchdog();
           break;
         }
         case 'final': {
           clearStreamWatchdog();
-          // Flush any pending throttled text update
           if (textThrottleTimerRef.current) {
             clearTimeout(textThrottleTimerRef.current);
             textThrottleTimerRef.current = null;
           }
           pendingTextUpdateRef.current = null;
 
-          // Extract ONLY text blocks — never use payload.message.text which may
-          // include thinking content concatenated with response text
           const finalTextBlocks = Array.isArray(payload.message?.content)
             ? payload.message.content
                 .filter((b: any) => b.type === 'text')
                 .map((b: any) => b.text || '')
                 .join('')
             : '';
-          // Gateway final contains FULL turn text. Slice off graduated portion
-          // so the main bubble only shows post-tool content (segments hold the rest).
           let finalText = finalTextBlocks || assembledRef.current;
           if (lastSegmentStartRef.current > 0 && finalText.length > lastSegmentStartRef.current) {
             finalText = finalText.slice(lastSegmentStartRef.current);
           }
 
-          const finalContent = sanitizeAssistantContent(finalText);
+          const finalContent = isControlOnlyAssistantContent(finalText)
+            ? assembledRef.current
+            : sanitizeAssistantContent(finalText);
           assembledRef.current = finalContent;
 
-          const cid = streamingAssistantIdRef.current;
           const hadToolEvents = hasRealToolEventsRef.current;
+          const currentStreamSegs = [...streamSegmentsRef.current];
+          const shouldHideTurn = !finalContent.trim() && currentStreamSegs.length === 0 && !hadToolEvents;
+          let cid = streamingAssistantIdRef.current;
+          if (!cid && !shouldHideTurn) {
+            cid = ensureStreamingAssistantBubble({ idPrefix: 'direct-final', content: '', resetIfCreated: false }).assistantId;
+          }
 
           setStatusText(null);
           setStreamingPhase('idle');
+          setThinkingContent('');
           setIsRunning(false);
           if (compactionPhaseRef.current === 'compacting') {
             compactionPhaseRef.current = 'idle';
@@ -1811,41 +1891,40 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               compactionTimerRef.current = null;
             }
           }
-          // Keep graduated segments — they show the thought process.
-          // Cleared on next message send or session switch.
 
           isStreamActiveRef.current = false;
           streamTransportRef.current = null;
           streamingAssistantIdRef.current = null;
           currentRunIdRef.current = null;
+          directClientRef.current?.setActiveStreamSession(null);
           assembledRef.current = '';
           lastSegmentStartRef.current = 0;
           lastRawTextLenRef.current = 0;
 
-          // Persist graduated stream segments into the message (same as WS path)
-          if (cid) {
-            const graduatedSegments: TextSegment[] = [];
-            const currentStreamSegs = [...streamSegmentsRef.current];
-            if (currentStreamSegs.length > 0 || hadToolEvents) {
-              for (const seg of currentStreamSegs) {
-                graduatedSegments.push({ text: seg.text, position: 'before' });
-              }
-              if (finalContent && finalContent.trim()) {
-                graduatedSegments.push({ text: finalContent, position: 'after' });
-              }
+          const graduatedSegments: TextSegment[] = [];
+          if (currentStreamSegs.length > 0 || hadToolEvents) {
+            for (const seg of currentStreamSegs) {
+              graduatedSegments.push({ text: seg.text, position: 'before' });
             }
-            setMessages(prev => prev.map(m => {
-              if (m.id !== cid) return m;
-              const update: Partial<ChatMessage> = { content: finalContent };
-              if (graduatedSegments.length > 0) {
-                update.segments = graduatedSegments;
-              }
-              return { ...m, ...update };
-            }));
+            if (finalContent && finalContent.trim()) {
+              graduatedSegments.push({ text: finalContent, position: 'after' });
+            }
           }
 
-          // Don't reload history on done — streaming state is already accurate.
-          // History reload strips pre-tool text (thoughts) and causes a visual flash.
+          if (cid) {
+            if (shouldHideTurn) {
+              setMessages(prev => prev.filter(m => m.id !== cid));
+            } else {
+              setMessages(prev => prev.map(m => {
+                if (m.id !== cid) return m;
+                const update: Partial<ChatMessage> = { content: finalContent };
+                if (graduatedSegments.length > 0) {
+                  update.segments = graduatedSegments;
+                }
+                return { ...m, ...update };
+              }));
+            }
+          }
           break;
         }
         case 'aborted': {
@@ -1867,6 +1946,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           streamTransportRef.current = null;
           streamingAssistantIdRef.current = null;
           currentRunIdRef.current = null;
+          directClientRef.current?.setActiveStreamSession(null);
 
           if (cid && currentText) {
             setMessages(prev => prev.map(m =>
@@ -1899,6 +1979,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           streamTransportRef.current = null;
           streamingAssistantIdRef.current = null;
           currentRunIdRef.current = null;
+          directClientRef.current?.setActiveStreamSession(null);
           assembledRef.current = '';
 
           if (cid) {
@@ -1914,10 +1995,17 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
       if (payload.stream === 'tool' && payload.data) {
         const data = payload.data;
-        const assistantId = streamingAssistantIdRef.current;
+        let assistantId = streamingAssistantIdRef.current;
 
         switch (data.phase) {
           case 'start': {
+            if (!assistantId) {
+              assistantId = ensureStreamingAssistantBubble({ idPrefix: 'direct-tool', content: '', resetIfCreated: true }).assistantId;
+              isStreamActiveRef.current = true;
+              streamTransportRef.current = 'direct';
+              setIsRunning(true);
+              directClientRef.current?.setActiveStreamSession(sessionRef.current || null);
+            }
             hasRealToolEventsRef.current = true;
             // Graduate current streaming text into a finalized segment.
             // Use lastRawTextLenRef (the full gateway text length seen so far)
@@ -2136,9 +2224,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             localStorage.setItem('agent-chat-session', currentSession);
           }
           if (currentSession && currentSession.startsWith('agent:')) {
-            directClient.subscribeSession(currentSession).catch((err) => {
-              console.warn('[ChatState] Failed to subscribe to session:', err);
-            });
+            directClient.setCurrentSession(currentSession);
             loadHistoryInternal(currentSession, currentProvider, { force: true }).catch((err) => {
               console.warn('[ChatState] Direct reconnect history sync failed:', err);
             });
@@ -2555,6 +2641,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             if (evt.sessionId) { setSessionRaw(evt.sessionId); localStorage.setItem('agent-chat-session', evt.sessionId); }
             if (evt.provenance) setLastProvenance(evt.provenance);
           } else if (evt.type === 'text') {
+            const rawChunk = typeof evt.content === 'string' ? evt.content : '';
+            if (rawChunk && isControlOnlyAssistantContent(rawChunk)) {
+              continue;
+            }
             const chunk = typeof evt.content === 'string' ? sanitizeAssistantContent(evt.content) : '';
             assembled = mergeAssistantStream(assembled, chunk, { replace: evt.replace === true });
             setStreamingPhase('streaming');
@@ -2581,8 +2671,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           } else if (evt.type === 'segment_break') {
             // Don't create a new bubble — keep all text in a single streaming message.
           } else if (evt.type === 'done') {
-            const hasFinal = typeof evt.content === 'string' && evt.content.length > 0;
-            const finalContent = hasFinal ? sanitizeAssistantContent(evt.content) : (assembled || '');
+            const rawFinal = typeof evt.content === 'string' ? evt.content : '';
+            const hasFinal = rawFinal.length > 0 && !isControlOnlyAssistantContent(rawFinal);
+            const finalContent = hasFinal ? sanitizeAssistantContent(rawFinal) : (assembled || '');
             assembled = finalContent;
             const prov = evt.provenance || null;
             setMessages(prev => prev.map(m =>
@@ -2593,6 +2684,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             setLastProvenance(prov);
             isStreamActiveRef.current = false;
             streamingAssistantIdRef.current = null;
+            directClientRef.current?.setActiveStreamSession(null);
             drainNextQueuedMessage();
           } else if (evt.type === 'error') {
             clearStreamWatchdog();
@@ -2612,6 +2704,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             currentRunIdRef.current = null;
             isStreamActiveRef.current = false;
             streamingAssistantIdRef.current = null;
+            directClientRef.current?.setActiveStreamSession(null);
           } else if (evt.type === 'exec_approval') {
             if (evt.approval?.id) { setPendingApproval(evt.approval); setStatusText('\u23f3 Waiting for command approval\u2026'); }
           }
@@ -2711,42 +2804,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     wsManagerRef.current?.reconnect();
   }, [useDirectGateway]);
 
-  const setFastModeModel = useCallback(async (nextModel: string) => {
-    const normalized = String(nextModel || '').trim();
-    if (!normalized) return;
-    localStorage.setItem(FAST_MODEL_STORAGE_KEY, normalized);
-    setFastModeModelState(normalized);
-    if (!sessionControlsSupported || !fastModeEnabled) return;
-    try {
-      await gatewayAPI.patchSessionModel(session, normalized, provider);
-      setSelectedModelRaw(normalized);
-    } catch (err) {
-      console.error('[ChatState] Failed to switch active fast model:', err);
-    }
-  }, [sessionControlsSupported, fastModeEnabled, session, provider]);
-
-  // Toggle portal fast mode (model override to a cheaper/faster model; not a native OpenClaw fast-session flag)
   const toggleFastMode = useCallback(async () => {
     if (!sessionControlsSupported) return;
     try {
-      if (!fastModeEnabled) {
-        // Store current model and switch to fast model
-        setBaseModel(selectedModel);
-        await gatewayAPI.patchSessionModel(session, fastModeModel, provider);
-        setSelectedModelRaw(fastModeModel);
-        setFastModeEnabled(true);
-      } else {
-        // Restore original model
-        const restoreModel = baseModel || 'anthropic/claude-sonnet-4-20250514';
-        await gatewayAPI.patchSessionModel(session, restoreModel, provider);
-        setSelectedModelRaw(restoreModel);
-        setBaseModel(null);
-        setFastModeEnabled(false);
-      }
+      await gatewayAPI.patchSession(session, { fastMode: !fastModeEnabled }, provider);
+      setFastModeEnabled((prev) => !prev);
     } catch (err) {
       console.error('[ChatState] Failed to toggle fast mode:', err);
     }
-  }, [sessionControlsSupported, fastModeEnabled, selectedModel, baseModel, fastModeModel, session, provider]);
+  }, [sessionControlsSupported, fastModeEnabled, session, provider]);
 
   const setCompactionModelOverride = useCallback(async (model: string) => {
     setCompactionModelLoading(true);
@@ -2810,8 +2876,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     thinkingLevel,
     setThinkingLevel,
     fastModeEnabled,
-    fastModeModel,
-    setFastModeModel,
     toggleFastMode,
     compactionModelOverride,
     setCompactionModelOverride,

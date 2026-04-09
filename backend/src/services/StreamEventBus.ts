@@ -173,14 +173,15 @@ class StreamEventBus {
     }
 
     const subs = this.listeners.get(sessionKey);
-    if (subs && subs.size > 1 && event.type === 'text') {
-      // Only log once per 10 seconds to avoid log spam
+    if (subs && subs.size > 2 && event.type === 'text') {
+      // Two subscribers is normal during portal streaming: one OpenClawProvider waiter
+      // plus one browser forwarder. Warn only when we exceed that expected baseline.
       const now = Date.now();
       const lastWarnKey = `__lastDupWarn_${sessionKey}`;
       const lastWarn = (this as any)[lastWarnKey] || 0;
       if (now - lastWarn > 10000) {
         (this as any)[lastWarnKey] = now;
-        console.warn(`[StreamEventBus] ⚠️ DUPLICATE SUBS: ${subs.size} subscribers for ${sessionKey} on text event (len=${(event.content||'').length}). Consider checking registerWsStreamCleanup lifecycle.`);
+        console.warn(`[StreamEventBus] ⚠️ EXTRA SUBS: ${subs.size} subscribers for ${sessionKey} on text event (expected <= 2). Check registerWsStreamCleanup / reconnect lifecycle.`);
       }
     }
     if (subs && subs.size > 0) {
@@ -222,6 +223,14 @@ class StreamEventBus {
     // when a run segment completes but a new run might follow.
     if (info && info.active === false) return null;
     return info || null;
+  }
+
+  /**
+   * Get the tracked stream entry for a session, including dormant post-done
+   * entries kept alive for yield/resume handoff.
+   */
+  getTrackedStream(sessionKey: string): StreamInfo | null {
+    return this.activeStreams.get(sessionKey) || null;
   }
 
   /**

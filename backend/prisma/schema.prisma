@@ -206,6 +206,7 @@ model RegistrationRequest {
   id          String                    @id @default(uuid())
   email       String
   name        String
+  passwordHash String?
   message     String?                   @db.Text
   status      RegistrationRequestStatus @default(PENDING)
   requestedAt DateTime                  @default(now())

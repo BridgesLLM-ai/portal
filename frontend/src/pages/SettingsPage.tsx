@@ -10,6 +10,7 @@ import { isElevated, isOwnerRole } from '../utils/authz';
 import { useTheme } from '../contexts/ThemeContext';
 import { adminAPI } from '../api/admin';
 import client from '../api/client';
+import { gatewayAPI, type CompatibilityHotfixStatus } from '../api/endpoints';
 import { agentRuntimeAPI, AgentRuntimeStatus } from '../api/agentRuntime';
 import { authAPI, TwoFactorSetupResponse, TwoFactorStatusResponse } from '../api/auth';
 import BackupsTab from '../components/settings/BackupsTab';
@@ -1017,9 +1018,15 @@ function SystemTab({ settings, updateSetting, onSave, isDirty, addToast }: {
   const [mailboxLoading, setMailboxLoading] = useState(false);
   const [deletingMailbox, setDeletingMailbox] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const { user } = useAuthStore();
+  const isAdmin = isElevated(user);
   const [codingTools, setCodingTools] = useState<Array<{ id: string; name: string; description: string; installed: boolean; version: string }>>([]);
   const [codingToolsLoading, setCodingToolsLoading] = useState(false);
   const [installingToolId, setInstallingToolId] = useState('');
+  const [compatHotfixStatus, setCompatHotfixStatus] = useState<CompatibilityHotfixStatus | null>(null);
+  const [compatHotfixLoading, setCompatHotfixLoading] = useState(false);
+  const [compatHotfixApplying, setCompatHotfixApplying] = useState(false);
+  const [compatHotfixOutput, setCompatHotfixOutput] = useState('');
 
   const loadMailboxes = useCallback(() => {
     setMailboxLoading(true);
@@ -1045,6 +1052,33 @@ function SystemTab({ settings, updateSetting, onSave, isDirty, addToast }: {
 
   useEffect(() => { loadCodingTools(); }, [loadCodingTools]);
 
+  const loadCompatibilityHotfixStatus = useCallback(async () => {
+    if (!isAdmin) {
+      setCompatHotfixStatus(null);
+      setCompatHotfixLoading(false);
+      return;
+    }
+    setCompatHotfixLoading(true);
+    try {
+      const status = await gatewayAPI.getCompatibilityHotfixStatus();
+      setCompatHotfixStatus(status);
+    } catch (err: any) {
+      setCompatHotfixStatus(null);
+      addToast('error', err?.response?.data?.error || 'Failed to load hotfix status');
+    } finally {
+      setCompatHotfixLoading(false);
+    }
+  }, [addToast, isAdmin]);
+
+  useEffect(() => {
+    if (!isAdmin) {
+      setCompatHotfixStatus(null);
+      setCompatHotfixLoading(false);
+      return;
+    }
+    void loadCompatibilityHotfixStatus();
+  }, [isAdmin, loadCompatibilityHotfixStatus]);
+
   const handleInstallTool = async (toolId: string) => {
     setInstallingToolId(toolId);
     try {
@@ -1068,6 +1102,24 @@ function SystemTab({ settings, updateSetting, onSave, isDirty, addToast }: {
       console.error('Failed to delete mailbox:', err);
     } finally {
       setDeletingMailbox(null);
+    }
+  };
+
+  const handleApplyCompatibilityHotfix = async () => {
+    if (!isAdmin) return;
+    setCompatHotfixApplying(true);
+    try {
+      const result = await gatewayAPI.applyCompatibilityHotfix();
+      const combinedOutput = [result.patchOutput, result.restartOutput].filter(Boolean).join('\n\n');
+      setCompatHotfixOutput(combinedOutput);
+      setCompatHotfixStatus(result.status);
+      addToast('success', result.message || 'Compatibility hotfix applied');
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail || err?.response?.data?.error || 'Failed to apply compatibility hotfix';
+      addToast('error', detail);
+    } finally {
+      setCompatHotfixApplying(false);
+      void loadCompatibilityHotfixStatus();
     }
   };
 
@@ -1192,6 +1244,71 @@ function SystemTab({ settings, updateSetting, onSave, isDirty, addToast }: {
         )}
       </SectionCard>
 
+      {isAdmin && (
+        <SectionCard title="OpenClaw Compatibility Hotfix">
+          <div className="space-y-3">
+            <p className="text-sm text-slate-400">
+              Optional temporary patch for the long-run OpenClaw exec relay bug on older installs. Applying it patches the installed OpenClaw runtime files and restarts the OpenClaw gateway.
+            </p>
+
+            {compatHotfixLoading ? (
+              <div className="flex items-center gap-2 text-slate-400 text-sm">
+                <Loader2 size={16} className="animate-spin" /> Checking hotfix status...
+              </div>
+            ) : compatHotfixStatus ? (
+              <>
+                <div className={`rounded-xl border p-3 ${compatHotfixStatus.applied ? 'border-emerald-500/20 bg-emerald-500/10' : 'border-amber-500/20 bg-amber-500/10'}`}>
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    {compatHotfixStatus.applied ? <CheckCircle2 size={16} className="text-emerald-400" /> : <AlertCircle size={16} className="text-amber-300" />}
+                    <span className={compatHotfixStatus.applied ? 'text-emerald-300' : 'text-amber-200'}>
+                      {compatHotfixStatus.applied ? 'Hotfix present in the installed OpenClaw bundle' : 'Hotfix not applied'}
+                    </span>
+                  </div>
+                  <div className="mt-2 space-y-1 text-xs text-slate-300">
+                    <div>Heartbeat bundle: <span className="font-mono text-slate-400">{compatHotfixStatus.heartbeatRunner || 'missing'}</span></div>
+                    <div>Reply bundle: <span className="font-mono text-slate-400">{compatHotfixStatus.replyBundle || 'missing'}</span></div>
+                    {compatHotfixStatus.note && <div className="text-slate-400">{compatHotfixStatus.note}</div>}
+                  </div>
+                </div>
+
+                {compatHotfixStatus.issues.length > 0 && (
+                  <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-200 space-y-1">
+                    {compatHotfixStatus.issues.map((issue) => (
+                      <div key={issue}>{issue}</div>
+                    ))}
+                  </div>
+                )}
+
+                {compatHotfixOutput && (
+                  <details className="rounded-lg border border-white/[0.08] bg-black/20 px-3 py-2">
+                    <summary className="cursor-pointer text-xs font-medium text-slate-300">Last hotfix output</summary>
+                    <pre className="mt-2 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-slate-400">{compatHotfixOutput}</pre>
+                  </details>
+                )}
+
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    onClick={() => { void loadCompatibilityHotfixStatus(); }}
+                    className="flex items-center gap-1 text-xs text-slate-400 hover:text-white"
+                  >
+                    <RefreshCw size={12} /> Refresh status
+                  </button>
+                  <button
+                    onClick={handleApplyCompatibilityHotfix}
+                    disabled={compatHotfixApplying || !compatHotfixStatus.supported}
+                    className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-black hover:bg-amber-400 disabled:opacity-50"
+                  >
+                    {compatHotfixApplying ? 'Applying + restarting…' : compatHotfixStatus.applied ? 'Reapply hotfix + restart' : 'Apply hotfix + restart'}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="text-sm text-slate-500">Could not load compatibility hotfix status.</div>
+            )}
+          </div>
+        </SectionCard>
+      )}
+
       <div className="flex justify-end">
         <SaveButton onClick={onSave} isDirty={isDirty} />
       </div>
@@ -1200,14 +1317,19 @@ function SystemTab({ settings, updateSetting, onSave, isDirty, addToast }: {
 }
 
 
+type OllamaModelRecommendation = {
+  name: string;
+  description: string;
+  size: string;
+};
 
-function modelRecommendationsByRam(totalRamBytes: number) {
-  const gb = totalRamBytes / (1024 ** 3);
-  if (gb < 4) return { tier: '<4GB', warning: 'Avoid larger models on this host.', models: ['phi3:mini', 'tinyllama'] };
-  if (gb < 8) return { tier: '4-8GB', warning: '', models: ['llama3.2:3b', 'mistral:7b'] };
-  if (gb < 16) return { tier: '8-16GB', warning: '', models: ['llama3.1:8b', 'mistral:7b', 'codellama:7b'] };
-  return { tier: '16GB+', warning: '', models: ['llama3.1:70b', 'deepseek-coder:33b'] };
-}
+type OllamaRecommendationsResponse = {
+  ramBytes: number;
+  ramGb: number;
+  ramTier: string;
+  warning: string | null;
+  recommendedModels: OllamaModelRecommendation[];
+};
 
 function OllamaTab({ settings, updateSetting, onSave, isDirty, addToast }: {
   settings: Record<string, string>;
@@ -1221,7 +1343,7 @@ function OllamaTab({ settings, updateSetting, onSave, isDirty, addToast }: {
   const [loadingModels, setLoadingModels] = useState(false);
   const [pullModel, setPullModel] = useState('');
   const [testingRemote, setTestingRemote] = useState(false);
-  const [recommendation, setRecommendation] = useState<{ tier: string; warning: string; models: string[] } | null>(null);
+  const [recommendation, setRecommendation] = useState<OllamaRecommendationsResponse | null>(null);
   const [tailscalePeers, setTailscalePeers] = useState<{ available: boolean; peers: { hostname: string; ip: string; os: string; online: boolean }[]; self: { hostname: string; ip: string } | null } | null>(null);
   const [copiedCmd, setCopiedCmd] = useState(false);
 
@@ -1239,8 +1361,8 @@ function OllamaTab({ settings, updateSetting, onSave, isDirty, addToast }: {
 
   useEffect(() => {
     loadModels();
-    client.get('/system/stats').then((res) => {
-      setRecommendation(modelRecommendationsByRam(Number(res.data?.memory?.total || 0)));
+    client.get('/ollama/recommendations').then((res) => {
+      setRecommendation(res.data);
     }).catch(() => {});
     client.get('/system/stats/tailscale-peers').then((res) => {
       setTailscalePeers(res.data);
@@ -1300,7 +1422,7 @@ function OllamaTab({ settings, updateSetting, onSave, isDirty, addToast }: {
 
       <SectionCard title="Pull Model">
         <div className="flex gap-2">
-          <TextInput value={pullModel} onChange={setPullModel} placeholder="llama3.1:8b" />
+          <TextInput value={pullModel} onChange={setPullModel} placeholder="qwen3:8b" />
           <button onClick={() => pullNow()} className="px-3 py-2 rounded-lg bg-violet-500/20 text-violet-300 border border-violet-500/30">Pull</button>
           <button onClick={loadModels} className="px-3 py-2 rounded-lg bg-white/[0.04] text-slate-300 border border-white/[0.08]">Refresh</button>
         </div>
@@ -1453,12 +1575,35 @@ function OllamaTab({ settings, updateSetting, onSave, isDirty, addToast }: {
 
       {recommendation && (
         <SectionCard title="Recommended Models">
-          <div className="text-sm text-slate-300 mb-2">RAM Tier: {recommendation.tier}</div>
-          {recommendation.warning && <div className="text-xs text-amber-300 mb-2">{recommendation.warning}</div>}
-          <div className="flex flex-wrap gap-2">
-            {recommendation.models.map((m) => (
-              <button key={m} onClick={() => pullNow(m)} className="px-2 py-1 rounded bg-white/[0.04] border border-white/[0.08] text-xs text-slate-200 hover:bg-white/[0.08]">{m}</button>
-            ))}
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <div className="text-sm text-slate-300">RAM Tier: {recommendation.ramTier}</div>
+            <div className="text-xs text-slate-500">Host RAM: {recommendation.ramGb} GB</div>
+          </div>
+          {recommendation.warning && <div className="text-xs text-amber-300 mb-3">{recommendation.warning}</div>}
+          <div className="space-y-2">
+            {recommendation.recommendedModels.map((model) => {
+              const installed = models.includes(model.name);
+              return (
+                <div key={model.name} className="flex flex-col gap-3 rounded-xl border border-white/[0.08] bg-white/[0.03] p-3 md:flex-row md:items-center md:justify-between">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <div className="text-sm font-medium text-slate-100">{model.name}</div>
+                      <span className="rounded-full border border-white/[0.08] bg-white/[0.04] px-2 py-0.5 text-[11px] text-slate-400">{model.size}</span>
+                    </div>
+                    <div className="mt-1 text-xs text-slate-400">{model.description}</div>
+                  </div>
+                  {installed ? (
+                    <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-300">
+                      <CheckCircle2 size={12} /> Installed
+                    </span>
+                  ) : (
+                    <button onClick={() => pullNow(model.name)} className="px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-xs text-slate-200 hover:bg-white/[0.08]">
+                      Pull {model.name}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </SectionCard>
       )}

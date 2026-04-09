@@ -20,7 +20,7 @@ async function translateMessage(action: string, resource: string, resourceId?: s
     const response = await fetch(`${config.ollamaApiUrl}/api/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: config.ollamaModel || 'gemma2:2b', prompt, stream: false }),
+      body: JSON.stringify({ model: config.ollamaModel, prompt, stream: false }),
       signal: AbortSignal.timeout(15000),
     });
     if (!response.ok) throw new Error('Ollama unavailable');

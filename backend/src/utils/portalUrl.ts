@@ -1,9 +1,12 @@
 import type { Request } from 'express';
 
+function csvValues(raw?: string): string[] {
+  if (!raw) return [];
+  return raw.split(',').map((v) => v.trim()).filter(Boolean);
+}
+
 function firstNonEmptyCsvValue(raw?: string): string | null {
-  if (!raw) return null;
-  const first = raw.split(',').map((v) => v.trim()).find(Boolean);
-  return first || null;
+  return csvValues(raw)[0] || null;
 }
 
 function parseUrlOrNull(value?: string | null): URL | null {
@@ -16,14 +19,23 @@ function parseUrlOrNull(value?: string | null): URL | null {
 }
 
 export function getPortalBaseUrl(req?: Request): string {
+  const requestOrigin = req?.get('host') ? `${req.protocol}://${req.get('host')}` : null;
+  const allowedCorsOrigins = csvValues(process.env.CORS_ORIGIN)
+    .map((value) => parseUrlOrNull(value)?.origin || null)
+    .filter((value): value is string => Boolean(value));
+
+  if (requestOrigin && allowedCorsOrigins.includes(requestOrigin)) {
+    return requestOrigin;
+  }
+
   const fromCors = parseUrlOrNull(firstNonEmptyCsvValue(process.env.CORS_ORIGIN));
   if (fromCors) return fromCors.origin;
 
   const fromPortalDomain = parseUrlOrNull(process.env.PORTAL_DOMAIN);
   if (fromPortalDomain) return fromPortalDomain.origin;
 
-  if (req?.get('host')) {
-    return `${req.protocol}://${req.get('host')}`;
+  if (requestOrigin) {
+    return requestOrigin;
   }
 
   return 'http://localhost:3001';

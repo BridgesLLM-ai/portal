@@ -35,7 +35,7 @@ import AiProviderSetup from '../ai-setup/AiProviderSetup';
 import { useAuthStore } from '../../contexts/AuthContext';
 import { isElevated, isOwner } from '../../utils/authz';
 import { agentToolsAPI, AgentTool } from '../../api/agentTools';
-import { gatewayAPI } from '../../api/endpoints';
+import { gatewayAPI, type CompatibilityHotfixStatus } from '../../api/endpoints';
 import SlashCommandMenu from './SlashCommandMenu';
 import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../utils/slashCommands';
 import { executeSlashCommand } from '../../utils/slashCommandExecutor';
@@ -626,7 +626,7 @@ function GatewaySessionsPanel({ onViewSession }: { onViewSession: (sessionKey: s
   );
 }
 
-/* ─── Session Controls (real OpenClaw thinking + portal fast-model override) ───────────────────── */
+/* ─── Session Controls (real OpenClaw thinking + native OpenClaw fast mode) ───────────────────── */
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
 const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive'];
@@ -640,15 +640,35 @@ const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
   adaptive: 'Adaptive',
 };
 
+const OPENCLAW_FAST_MODE_MODELS = new Set([
+  'openai/gpt-5.4',
+  'openai-codex/gpt-5.4',
+]);
+
+function supportsOpenClawFastModeModel(model?: string | null): boolean {
+  const normalized = String(model || '').trim().toLowerCase();
+  return OPENCLAW_FAST_MODE_MODELS.has(normalized);
+}
+
 interface SessionControlsProps {
   thinkingLevel: ThinkingLevel;
   fastModeEnabled: boolean;
-  fastModeModel: string;
   compactionModelOverride: string;
+  heartbeatModel: string;
+  heartbeatModelLoading?: boolean;
+  heartbeatModelError?: string | null;
+  showHeartbeatModel?: boolean;
+  showCompatibilityHotfix?: boolean;
+  compatibilityHotfixStatus?: CompatibilityHotfixStatus | null;
+  compatibilityHotfixLoading?: boolean;
+  compatibilityHotfixApplying?: boolean;
+  compatibilityHotfixMessage?: string | null;
+  onRefreshCompatibilityHotfix?: () => void;
+  onApplyCompatibilityHotfix?: () => void;
   onSetThinkingLevel: (level: ThinkingLevel) => void;
   onToggleFastMode: () => void;
-  onSetFastModeModel: (model: string) => void;
   onSetCompactionModelOverride: (model: string) => void;
+  onSetHeartbeatModel: (model: string) => void;
   providerLabel: string;
   providerCommandCount: number;
   providerCommandStatus: string;
@@ -678,12 +698,22 @@ interface SessionControlsProps {
 function SessionControls({
   thinkingLevel,
   fastModeEnabled,
-  fastModeModel,
   compactionModelOverride,
+  heartbeatModel,
+  heartbeatModelLoading = false,
+  heartbeatModelError = null,
+  showHeartbeatModel = false,
+  showCompatibilityHotfix = false,
+  compatibilityHotfixStatus = null,
+  compatibilityHotfixLoading = false,
+  compatibilityHotfixApplying = false,
+  compatibilityHotfixMessage = null,
+  onRefreshCompatibilityHotfix,
+  onApplyCompatibilityHotfix,
   onSetThinkingLevel,
   onToggleFastMode,
-  onSetFastModeModel,
   onSetCompactionModelOverride,
+  onSetHeartbeatModel,
   providerLabel,
   providerCommandCount,
   providerCommandStatus,
@@ -715,8 +745,13 @@ function SessionControls({
     ...compactionAvailableModels,
     ...(compactionModelOverride && !compactionAvailableModels.includes(compactionModelOverride) ? [compactionModelOverride] : []),
   ]));
+  const effectiveHeartbeatModels = Array.from(new Set([
+    ...availableModels,
+    ...(heartbeatModel && !availableModels.includes(heartbeatModel) ? [heartbeatModel] : []),
+  ]));
   const currentModelLower = String(currentModel || '').toLowerCase();
   const adaptiveSupported = /claude-(opus|sonnet)-4[._-](5|6|7|8|9)|claude-(opus|sonnet)-[5-9]/.test(currentModelLower);
+  const fastModeSupported = supportsOpenClawFastModeModel(currentModel) || fastModeEnabled;
   const visibleThinkingLevels = THINKING_LEVELS.filter((level) => level !== 'adaptive' || adaptiveSupported || thinkingLevel === 'adaptive');
   const effectiveThinking = (!adaptiveSupported && localThinking === 'adaptive') ? 'medium' : localThinking;
   const thinkingIndex = Math.max(0, visibleThinkingLevels.indexOf(effectiveThinking));
@@ -815,15 +850,15 @@ function SessionControls({
                   <div className="flex items-center gap-2">
                     <Radio size={14} className={fastModeEnabled ? 'text-amber-400' : 'text-slate-500'} />
                     <div>
-                      <div className="text-xs font-medium text-white">Quick-Reply Model</div>
-                      <div className="text-[10px] text-slate-500">Enable to run this session on the selected faster model.</div>
+                      <div className="text-xs font-medium text-white">Codex Fast Mode</div>
+                      <div className="text-[10px] text-slate-500">Toggles OpenClaw session fast mode for GPT-5.4 and Codex sessions.</div>
                     </div>
                   </div>
                   <button
                     onClick={() => {
                       onToggleFastMode();
                     }}
-                    disabled={disabled || !sessionControlsSupported}
+                    disabled={disabled || !sessionControlsSupported || !fastModeSupported}
                     className={`relative w-10 h-5 rounded-full transition-colors ${
                       fastModeEnabled ? 'bg-amber-500' : 'bg-white/[0.12]'
                     } disabled:opacity-50`}
@@ -835,19 +870,42 @@ function SessionControls({
                     />
                   </button>
                 </div>
-                <select
-                  value={fastModeModel}
-                  onChange={(e) => onSetFastModeModel(e.target.value)}
-                  disabled={disabled || !sessionControlsSupported || availableModels.length === 0}
-                  className="w-full rounded-lg border border-white/[0.08] bg-[#141A43] px-2 py-1.5 text-xs text-slate-200 disabled:opacity-50"
-                >
-                  {availableModels.map((modelId) => (
-                    <option key={modelId} value={modelId}>
-                      {modelDisplayName(modelId)}
-                    </option>
-                  ))}
-                </select>
+                <div className="text-[10px] text-slate-400">
+                  {fastModeSupported
+                    ? `Current: ${fastModeEnabled ? 'enabled' : 'disabled'} for ${shortModel}`
+                    : 'Available when the session model is openai/gpt-5.4 or openai-codex/gpt-5.4.'}
+                </div>
               </div>
+
+              {showHeartbeatModel && (
+                <div className="p-2 rounded-lg bg-white/[0.02] space-y-2">
+                  <div className="flex items-center gap-2">
+                    <Clock size={14} className={heartbeatModel ? 'text-cyan-400' : 'text-slate-500'} />
+                    <div>
+                      <div className="text-xs font-medium text-white">Heartbeat Model</div>
+                      <div className="text-[10px] text-slate-500">Default OpenClaw heartbeat model for the main agent.</div>
+                    </div>
+                  </div>
+                  <select
+                    value={heartbeatModel}
+                    onChange={(e) => onSetHeartbeatModel(e.target.value)}
+                    disabled={disabled || heartbeatModelLoading || effectiveHeartbeatModels.length === 0}
+                    className="w-full rounded-lg border border-white/[0.08] bg-[#141A43] px-2 py-1.5 text-xs text-slate-200 disabled:opacity-50"
+                  >
+                    <option value="">Default</option>
+                    {effectiveHeartbeatModels.map((modelId) => (
+                      <option key={`heartbeat-${modelId}`} value={modelId}>
+                        {modelDisplayName(modelId)}
+                      </option>
+                    ))}
+                  </select>
+                  {heartbeatModelError && (
+                    <div className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[10px] leading-relaxed text-amber-200">
+                      {heartbeatModelError}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="p-2 rounded-lg bg-white/[0.02] space-y-2">
                 <div className="flex items-center gap-2">
@@ -877,12 +935,54 @@ function SessionControls({
                 )}
               </div>
 
+              {showCompatibilityHotfix && (
+                <div className="p-2 rounded-lg bg-white/[0.02] space-y-2">
+                  <div className="flex items-start gap-2">
+                    <Wrench size={14} className={compatibilityHotfixStatus?.applied ? 'text-emerald-400' : 'text-amber-400'} />
+                    <div className="min-w-0 flex-1">
+                      <div className="text-xs font-medium text-white">Compatibility Hotfix</div>
+                      <div className="text-[10px] text-slate-500">Optional OpenClaw runtime patch for the long-run exec relay bug. Applying it restarts the gateway.</div>
+                    </div>
+                  </div>
+                  <div className={`rounded border px-2 py-1 text-[10px] leading-relaxed ${compatibilityHotfixStatus?.applied ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200' : 'border-amber-500/20 bg-amber-500/10 text-amber-200'}`}>
+                    {compatibilityHotfixLoading
+                      ? 'Checking current hotfix status…'
+                      : compatibilityHotfixStatus?.applied
+                        ? 'Hotfix already present in the installed OpenClaw bundle.'
+                        : compatibilityHotfixStatus?.supported
+                          ? 'Hotfix not applied on this install.'
+                          : (compatibilityHotfixStatus?.issues?.[0] || 'This install does not expose the expected OpenClaw bundle layout.')}
+                  </div>
+                  {compatibilityHotfixMessage && (
+                    <div className="rounded border border-white/[0.08] bg-black/20 px-2 py-1 text-[10px] leading-relaxed text-slate-300">
+                      {compatibilityHotfixMessage}
+                    </div>
+                  )}
+                  <div className="flex items-center justify-between gap-2">
+                    <button
+                      onClick={() => onRefreshCompatibilityHotfix?.()}
+                      disabled={disabled || compatibilityHotfixLoading || compatibilityHotfixApplying}
+                      className="flex items-center gap-1 text-[10px] text-slate-400 hover:text-white disabled:opacity-50"
+                    >
+                      <RefreshCw size={11} /> Refresh
+                    </button>
+                    <button
+                      onClick={() => onApplyCompatibilityHotfix?.()}
+                      disabled={disabled || compatibilityHotfixApplying || compatibilityHotfixLoading || !compatibilityHotfixStatus?.supported}
+                      className="rounded-md bg-amber-500 px-2.5 py-1 text-[10px] font-medium text-black hover:bg-amber-400 disabled:opacity-50"
+                    >
+                      {compatibilityHotfixApplying ? 'Applying…' : compatibilityHotfixStatus?.applied ? 'Reapply + restart' : 'Apply + restart'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div className="pt-2 border-t border-white/[0.06] space-y-1">
                 <div className="text-[10px] text-slate-500">
                   Model: <span className="text-slate-400 font-mono">{shortModel}</span>
                 </div>
                 <div className="text-[10px] text-slate-600 leading-relaxed">
-                  {!sessionControlsSupported ? 'Thinking and quick-reply controls activate once a concrete OpenClaw session is selected.' : 'Quick-reply override is a portal behavior, not a native provider mode.'}
+                  {!sessionControlsSupported ? 'Thinking and fast-mode controls activate once a concrete OpenClaw session is selected.' : 'Fast mode writes the native OpenClaw session fastMode override.'}
                 </div>
               </div>
 
@@ -2258,8 +2358,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const thinkingLevel = chatState.thinkingLevel;
   const setThinkingLevel = chatState.setThinkingLevel;
   const fastModeEnabled = chatState.fastModeEnabled;
-  const fastModeModel = chatState.fastModeModel;
-  const setFastModeModel = chatState.setFastModeModel;
   const toggleFastMode = chatState.toggleFastMode;
   const compactionModelOverride = chatState.compactionModelOverride;
   const setCompactionModelOverride = chatState.setCompactionModelOverride;
@@ -2290,6 +2388,13 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const { user } = useAuthStore();
   const isAdmin = isElevated(user);
+  const [heartbeatModel, setHeartbeatModel] = useState('');
+  const [heartbeatModelLoading, setHeartbeatModelLoading] = useState(false);
+  const [heartbeatModelError, setHeartbeatModelError] = useState<string | null>(null);
+  const [compatibilityHotfixStatus, setCompatibilityHotfixStatus] = useState<CompatibilityHotfixStatus | null>(null);
+  const [compatibilityHotfixLoading, setCompatibilityHotfixLoading] = useState(false);
+  const [compatibilityHotfixApplying, setCompatibilityHotfixApplying] = useState(false);
+  const [compatibilityHotfixMessage, setCompatibilityHotfixMessage] = useState<string | null>(null);
 
   useEffect(() => {
     if (deferGatewayMetadata || provider === 'OPENCLAW') return;
@@ -2307,6 +2412,101 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       cancelled = true;
     };
   }, [deferGatewayMetadata, provider]);
+
+  const showHeartbeatModel = provider === 'OPENCLAW' && isAdmin && (!agentId || agentId === 'main');
+  const showCompatibilityHotfix = provider === 'OPENCLAW' && isAdmin;
+
+  const loadCompatibilityHotfixStatus = useCallback(async () => {
+    if (!showCompatibilityHotfix) {
+      setCompatibilityHotfixStatus(null);
+      setCompatibilityHotfixMessage(null);
+      return;
+    }
+    setCompatibilityHotfixLoading(true);
+    try {
+      const status = await gatewayAPI.getCompatibilityHotfixStatus();
+      setCompatibilityHotfixStatus(status);
+    } catch (err) {
+      console.error('[ChatInterface] Failed to load compatibility hotfix status:', err);
+      setCompatibilityHotfixStatus(null);
+      setCompatibilityHotfixMessage('Could not load hotfix status right now.');
+    } finally {
+      setCompatibilityHotfixLoading(false);
+    }
+  }, [showCompatibilityHotfix]);
+
+  const handleApplyCompatibilityHotfix = useCallback(async () => {
+    if (!showCompatibilityHotfix) return;
+    setCompatibilityHotfixApplying(true);
+    setCompatibilityHotfixMessage(null);
+    try {
+      const result = await gatewayAPI.applyCompatibilityHotfix();
+      setCompatibilityHotfixStatus(result.status);
+      setCompatibilityHotfixMessage(result.message || 'Compatibility hotfix applied.');
+    } catch (err: any) {
+      console.error('[ChatInterface] Failed to apply compatibility hotfix:', err);
+      const detail = err?.response?.data?.detail || err?.response?.data?.error || 'Failed to apply compatibility hotfix.';
+      setCompatibilityHotfixMessage(detail);
+    } finally {
+      setCompatibilityHotfixApplying(false);
+      void loadCompatibilityHotfixStatus();
+    }
+  }, [loadCompatibilityHotfixStatus, showCompatibilityHotfix]);
+
+  useEffect(() => {
+    if (!showCompatibilityHotfix) {
+      setCompatibilityHotfixStatus(null);
+      setCompatibilityHotfixLoading(false);
+      setCompatibilityHotfixApplying(false);
+      setCompatibilityHotfixMessage(null);
+    }
+  }, [showCompatibilityHotfix]);
+
+  const loadHeartbeatModel = useCallback(async () => {
+    if (!showHeartbeatModel) {
+      setHeartbeatModel('');
+      setHeartbeatModelError(null);
+      return;
+    }
+    setHeartbeatModelLoading(true);
+    setHeartbeatModelError(null);
+    try {
+      const data = await gatewayAPI.getConfigPath('agents.defaults.heartbeat.model');
+      const value = typeof data?.value === 'string' ? data.value.trim() : '';
+      setHeartbeatModel(value);
+    } catch (err) {
+      console.error('[ChatInterface] Failed to load heartbeat model:', err);
+      setHeartbeatModel('');
+      setHeartbeatModelError('Could not load the heartbeat model right now.');
+    } finally {
+      setHeartbeatModelLoading(false);
+    }
+  }, [showHeartbeatModel]);
+
+  const handleHeartbeatModelChange = useCallback(async (nextModel: string) => {
+    if (!showHeartbeatModel) return;
+    setHeartbeatModelLoading(true);
+    setHeartbeatModelError(null);
+    try {
+      const normalized = String(nextModel || '').trim();
+      const patchResult = await gatewayAPI.patchConfigPath('agents.defaults.heartbeat.model', normalized || null);
+      const patchedValue = typeof patchResult?.value === 'string' ? patchResult.value.trim() : '';
+      setHeartbeatModel(patchedValue);
+
+      try {
+        const fresh = await gatewayAPI.getConfigPath('agents.defaults.heartbeat.model');
+        const freshValue = typeof fresh?.value === 'string' ? fresh.value.trim() : '';
+        setHeartbeatModel(freshValue);
+      } catch (refreshErr) {
+        console.warn('[ChatInterface] Heartbeat model patched but refresh readback failed:', refreshErr);
+      }
+    } catch (err) {
+      console.error('[ChatInterface] Failed to patch heartbeat model:', err);
+      setHeartbeatModelError('Could not update the heartbeat model.');
+    } finally {
+      setHeartbeatModelLoading(false);
+    }
+  }, [showHeartbeatModel]);
 
   const loadProviderCommands = useCallback(async (targetProvider: string, options?: { force?: boolean }) => {
     const cached = !options?.force ? providerCommandsCache.get(targetProvider) : undefined;
@@ -3101,12 +3301,22 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               <SessionControls
                 thinkingLevel={thinkingLevel}
                 fastModeEnabled={fastModeEnabled}
-                fastModeModel={fastModeModel}
                 compactionModelOverride={compactionModelOverride}
+                heartbeatModel={heartbeatModel}
+                heartbeatModelLoading={heartbeatModelLoading}
+                heartbeatModelError={heartbeatModelError}
+                showHeartbeatModel={showHeartbeatModel}
+                showCompatibilityHotfix={showCompatibilityHotfix}
+                compatibilityHotfixStatus={compatibilityHotfixStatus}
+                compatibilityHotfixLoading={compatibilityHotfixLoading}
+                compatibilityHotfixApplying={compatibilityHotfixApplying}
+                compatibilityHotfixMessage={compatibilityHotfixMessage}
+                onRefreshCompatibilityHotfix={() => { void loadCompatibilityHotfixStatus(); }}
+                onApplyCompatibilityHotfix={() => { void handleApplyCompatibilityHotfix(); }}
                 onSetThinkingLevel={(level) => { void setThinkingLevel(level); }}
                 onToggleFastMode={() => { void toggleFastMode(); }}
-                onSetFastModeModel={(model) => { void setFastModeModel(model); }}
                 onSetCompactionModelOverride={(model) => { void setCompactionModelOverride(model); }}
+                onSetHeartbeatModel={(model) => { void handleHeartbeatModelChange(model); }}
                 providerLabel={providerLabel}
                 providerCommandCount={providerCommandCount}
                 providerCommandStatus={providerCommandStatus}
@@ -3121,6 +3331,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   void ensureSessionControlsMetadataLoaded();
                   void loadProviderCommands(provider, { force: true });
                   void ensureProviderModelsLoaded(provider);
+                  void loadHeartbeatModel();
+                  void loadCompatibilityHotfixStatus();
                 }}
                 disabled={false}
                 currentModel={selectedModel}
@@ -3474,11 +3686,16 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 )}
 
                 {/* Composer row: [paperclip] [textarea] [mic] [send] */}
-                <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500">
+                <div className={`mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] ${isRunning ? 'text-violet-300/80' : 'text-slate-500'}`}>
                   <span className="inline-flex items-center gap-1"><kbd className="px-1 py-0.5 rounded bg-white/[0.05] text-[10px] font-mono text-slate-400">/</kbd> {providerCommandStatus}</span>
                   <span>{canSelectModel ? 'Model switching available' : 'Fixed provider defaults'}</span>
                   <span>{modelCatalogKind === 'none' ? 'Manual model ids may be required' : `Model catalog: ${availableModels.length || 'live'}`}</span>
                   <span className="text-slate-600">Try <span className="font-mono text-slate-400">/help</span> or <span className="font-mono text-slate-400">/status</span></span>
+                  {isRunning && (
+                    <span className="rounded-full border border-violet-400/20 bg-violet-500/10 px-2 py-0.5 text-violet-200">
+                      Follow-ups queue after this turn. Use <span className="font-mono">/steer</span> or inject a portal note for in-turn guidance.
+                    </span>
+                  )}
                 </div>
                 <ComposerPrimitive.Root className="relative flex items-end gap-1.5 sm:gap-2">
                   {/* Fix #4: Attachment button (hidden during streaming) */}

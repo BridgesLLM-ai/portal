@@ -26,8 +26,38 @@ export function stripOpenClawReplyTags(text: string): string {
     .trim();
 }
 
+const CONTROL_ONLY_ASSISTANT_OUTPUTS = new Set([
+  'HEARTBEAT_OK',
+  'NO_REPLY',
+]);
+
+function normalizeAssistantControlCandidate(text: string): string {
+  return stripOpenClawReplyTags(stripEnvelope(text || '')).replace(/\r\n/g, '\n');
+}
+
+function stripAssistantControlLines(text: string): string {
+  const normalized = normalizeAssistantControlCandidate(text);
+  if (!normalized) return normalized;
+  return normalized
+    .split('\n')
+    .filter((line) => !CONTROL_ONLY_ASSISTANT_OUTPUTS.has(line.trim().toUpperCase()))
+    .join('\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 export function sanitizeAssistantText(text: string): string {
-  return stripOpenClawReplyTags(stripEnvelope(text || ''));
+  return stripAssistantControlLines(text || '');
+}
+
+export function isControlOnlyAssistantText(text: string): boolean {
+  const normalized = normalizeAssistantControlCandidate(text || '');
+  const lines = normalized
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.length > 0 && lines.every((line) => CONTROL_ONLY_ASSISTANT_OUTPUTS.has(line.toUpperCase()));
 }
 
 export function extractTextFromContent(content: unknown): string {

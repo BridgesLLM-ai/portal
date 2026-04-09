@@ -17,6 +17,7 @@ const CACHE_KEY = 'cached_publicSettings';
 
 let cachedSettings: PublicSettings | null | undefined;
 let inflightPromise: Promise<PublicSettings | null> | null = null;
+let hasNetworkRefresh = false;
 const listeners = new Set<(settings: PublicSettings | null) => void>();
 
 function publishSettings(settings: PublicSettings | null) {
@@ -41,21 +42,29 @@ function primeFromSessionStorage(): PublicSettings | null {
   }
 }
 
-async function fetchPublicSettings(): Promise<PublicSettings | null> {
-  if (cachedSettings !== undefined) return cachedSettings;
-  const cached = primeFromSessionStorage();
-  if (cached) return cached;
+async function fetchPublicSettings(options?: { revalidate?: boolean }): Promise<PublicSettings | null> {
+  const revalidate = options?.revalidate === true;
+
+  if (!revalidate) {
+    if (cachedSettings !== undefined) return cachedSettings;
+    const cached = primeFromSessionStorage();
+    if (cached) return cached;
+  } else if (cachedSettings === undefined) {
+    primeFromSessionStorage();
+  }
+
   if (inflightPromise) return inflightPromise;
 
   inflightPromise = fetch('/api/settings/public')
     .then((r) => (r.ok ? r.json() : null))
     .then((data) => {
+      hasNetworkRefresh = true;
       publishSettings(data || null);
       return data || null;
     })
     .catch(() => {
-      publishSettings(null);
-      return null;
+      hasNetworkRefresh = true;
+      return cachedSettings ?? null;
     })
     .finally(() => {
       inflightPromise = null;
@@ -72,8 +81,8 @@ export function usePublicSettings() {
 
   useEffect(() => {
     listeners.add(setSettings);
-    if (cachedSettings === undefined) {
-      void fetchPublicSettings();
+    if (!hasNetworkRefresh) {
+      void fetchPublicSettings({ revalidate: true });
     }
     return () => {
       listeners.delete(setSettings);

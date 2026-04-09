@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Timer, Plus, Play, Pause, Trash2, Edit2, Clock, 
@@ -926,29 +926,58 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
   const [deleteSubmitting, setDeleteSubmitting] = useState(false);
-  
-  const fetchJobs = useCallback(async (opts?: { isRefresh?: boolean }) => {
+  const inFlightRef = useRef<AbortController | null>(null);
+  const refreshTimerRef = useRef<number | null>(null);
+
+  const fetchJobs = useCallback(async (opts?: { isRefresh?: boolean; force?: boolean }) => {
     const isRefresh = Boolean(opts?.isRefresh);
+    const force = Boolean(opts?.force);
+
+    if (!force && inFlightRef.current) return;
+
+    inFlightRef.current?.abort();
+    const controller = new AbortController();
+    inFlightRef.current = controller;
+
     try {
       if (!isRefresh) setLoading(true);
       else setRefreshing(true);
-      const data = await automationsAPI.list(agentId);
+      const data = await automationsAPI.list(agentId, { signal: controller.signal });
+      if (inFlightRef.current !== controller) return;
       setJobs(normalizeJobsResponse(data));
       setError(null);
     } catch (err: any) {
+      if (controller.signal.aborted) return;
       console.error('Failed to load automations:', err);
       setError(extractApiError(err, 'Failed to load automations'));
     } finally {
+      if (inFlightRef.current === controller) {
+        inFlightRef.current = null;
+      }
       setLoading(false);
       setRefreshing(false);
     }
   }, [agentId]);
-  
+
   useEffect(() => {
-    fetchJobs();
-    // Refresh every 30 seconds
-    const interval = setInterval(() => fetchJobs({ isRefresh: true }), 30000);
-    return () => clearInterval(interval);
+    void fetchJobs({ force: true });
+
+    const tick = () => {
+      if (document.visibilityState !== 'visible') return;
+      void fetchJobs({ isRefresh: true });
+    };
+
+    refreshTimerRef.current = window.setInterval(tick, 30000);
+    document.addEventListener('visibilitychange', tick);
+
+    return () => {
+      if (refreshTimerRef.current !== null) {
+        window.clearInterval(refreshTimerRef.current);
+      }
+      document.removeEventListener('visibilitychange', tick);
+      inFlightRef.current?.abort();
+      inFlightRef.current = null;
+    };
   }, [fetchJobs]);
   
   const handleCreate = () => {

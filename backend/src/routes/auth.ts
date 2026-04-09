@@ -616,17 +616,11 @@ router.post('/forgot-password', forgotPasswordLimiter, async (req: Request, res:
     const user = await prisma.user.findUnique({ where: { email } });
 
     if (user) {
-      // Delete any existing unused tokens for this user
-      await prisma.passwordResetToken.deleteMany({
-        where: { userId: user.id, usedAt: null },
-      });
-
       // Generate raw token and hash it for storage
       const rawToken = crypto.randomBytes(32).toString('hex');
       const tokenHash = await hashPassword(rawToken);
 
-      // Store hashed token
-      await prisma.passwordResetToken.create({
+      const resetToken = await prisma.passwordResetToken.create({
         data: {
           userId: user.id,
           token: tokenHash,
@@ -634,9 +628,23 @@ router.post('/forgot-password', forgotPasswordLimiter, async (req: Request, res:
         },
       });
 
-      // Send reset email via Stalwart JMAP
-      const resetUrl = buildPortalUrl(`/reset-password?token=${encodeURIComponent(rawToken)}`, req);
-      await sendPasswordResetEmail({ email: user.email }, resetUrl);
+      try {
+        // Send reset email via Stalwart JMAP
+        const resetUrl = buildPortalUrl(`/reset-password?token=${encodeURIComponent(rawToken)}`, req);
+        await sendPasswordResetEmail({ email: user.email }, resetUrl);
+
+        // Only invalidate older unused links after the new email is successfully queued.
+        await prisma.passwordResetToken.deleteMany({
+          where: {
+            userId: user.id,
+            usedAt: null,
+            id: { not: resetToken.id },
+          },
+        });
+      } catch (mailError) {
+        await prisma.passwordResetToken.delete({ where: { id: resetToken.id } }).catch(() => {});
+        console.error('[auth] Failed to send password reset email:', mailError);
+      }
 
       // Log to activity log
       await prisma.activityLog.create({
@@ -885,11 +893,14 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
         },
       });
     } else if (mode === 'approval') {
+      const passwordHash = await hashPassword(password);
+
       // Create registration request
       await prisma.registrationRequest.create({
         data: {
           email,
           name,
+          passwordHash,
           message: message || null,
         },
       });

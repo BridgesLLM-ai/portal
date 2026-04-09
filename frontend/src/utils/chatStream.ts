@@ -10,8 +10,41 @@ export function stripOpenClawReplyTags(text: string): string {
     .trim();
 }
 
+const CONTROL_ONLY_ASSISTANT_OUTPUTS = new Set([
+  'HEARTBEAT_OK',
+  'NO_REPLY',
+]);
+
+function normalizeAssistantControlCandidate(text: string): string {
+  return stripOpenClawReplyTags(text || '').replace(/\r\n/g, '\n');
+}
+
+function stripAssistantControlLines(text: string, trimResult: boolean): string {
+  const normalized = text.replace(/\r\n/g, '\n');
+  if (!normalized) return normalized;
+  const filtered = normalized
+    .split('\n')
+    .filter((line) => !CONTROL_ONLY_ASSISTANT_OUTPUTS.has(line.trim().toUpperCase()))
+    .join('\n');
+
+  if (!trimResult) return filtered;
+  return filtered
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 export function sanitizeAssistantContent(text: string): string {
-  return stripOpenClawReplyTags(text || '');
+  return stripAssistantControlLines(stripOpenClawReplyTags(text || ''), true);
+}
+
+export function isControlOnlyAssistantContent(text: string): boolean {
+  const normalized = normalizeAssistantControlCandidate(text || '');
+  const lines = normalized
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.length > 0 && lines.every((line) => CONTROL_ONLY_ASSISTANT_OUTPUTS.has(line.toUpperCase()));
 }
 
 // Streaming-safe sanitization for live OpenClaw chunks.
@@ -20,10 +53,11 @@ export function sanitizeAssistantContent(text: string): string {
 // live rendering, while full-history refresh still looks correct.
 export function sanitizeAssistantChunk(text: string): string {
   if (!text) return text;
-  return text.replace(
+  const withoutReplyTags = text.replace(
     /\[\[\s*(?:reply_to_current|reply_to|reply_to_message|reply_to_user|route_to|delegate_to)\b[^\]]*\]\]/gi,
     '',
   );
+  return stripAssistantControlLines(withoutReplyTags, false);
 }
 
 export function mergeAssistantStream(

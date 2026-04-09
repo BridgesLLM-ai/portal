@@ -315,13 +315,27 @@ export const terminalAPI = {
 };
 
 export const usageAPI = {
-  stats: async (agentId?: string) => {
+  stats: async (agentId?: string, options?: { signal?: AbortSignal }) => {
     const params: Record<string, string> = {};
     if (agentId) params.agent = agentId;
-    const { data } = await client.get('/gateway/usage-stats', { params });
+    const { data } = await client.get('/gateway/usage-stats', { params, signal: options?.signal });
     return data;
   },
 };
+
+export interface CompatibilityHotfixStatus {
+  ok?: boolean;
+  applied: boolean;
+  supported: boolean;
+  scriptExists: boolean;
+  detectorPatched: boolean;
+  relayPatched: boolean;
+  replyPatched: boolean;
+  heartbeatRunner: string | null;
+  replyBundle: string | null;
+  issues: string[];
+  note?: string;
+}
 
 export const gatewayAPI = {
   status: async () => {
@@ -361,6 +375,14 @@ export const gatewayAPI = {
   },
   patchConfigPath: async (path: string, value: any) => {
     const { data } = await client.post('/gateway/config-path', { path, value });
+    return data;
+  },
+  getCompatibilityHotfixStatus: async (): Promise<CompatibilityHotfixStatus> => {
+    const { data } = await client.get('/gateway/compatibility-hotfix');
+    return data;
+  },
+  applyCompatibilityHotfix: async (): Promise<{ ok: boolean; alreadyApplied: boolean; status: CompatibilityHotfixStatus; patchOutput?: string; restartOutput?: string; message?: string }> => {
+    const { data } = await client.post('/gateway/compatibility-hotfix/apply');
     return data;
   },
   send: async (message: string, session = 'main') => {
@@ -502,13 +524,13 @@ export const alertsAPI = {
 };
 
 export const automationsAPI = {
-  list: async (agentId?: string) => {
+  list: async (agentId?: string, options?: { signal?: AbortSignal }) => {
     const params: Record<string, string> = {};
     if (agentId) {
       params.agentId = agentId;
       params.agent = agentId;
     }
-    const { data } = await client.get('/automations/list', { params });
+    const { data } = await client.get('/automations/list', { params, signal: options?.signal });
     return data;
   },
   get: async (id: string) => {

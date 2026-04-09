@@ -2,10 +2,15 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
 import { execFile } from 'child_process';
+import { buildOpenClawCliEnv } from '../utils/openclawCli';
 
 const router = Router();
 
 router.use(authenticateToken, requireAdmin);
+
+const AUTOMATIONS_LIST_CACHE_TTL_MS = 5000;
+let automationsListCache: { at: number; jobs: any[] } | null = null;
+let automationsListInflight: Promise<any[]> | null = null;
 
 type CronResult = { ok: true; stdout: string; stderr: string } | { ok: false; error: string; stdout: string; stderr: string };
 
@@ -40,7 +45,7 @@ function isTransientGatewayError(text: string): boolean {
 
 function runCronOnce(args: string[], timeoutMs = 30000): Promise<CronResult> {
   return new Promise((resolve) => {
-    execFile('openclaw', ['cron', ...args], { timeout: timeoutMs, encoding: 'utf-8' }, (error, stdout, stderr) => {
+    execFile('openclaw', ['cron', ...args], { timeout: timeoutMs, encoding: 'utf-8', env: buildOpenClawCliEnv() }, (error, stdout, stderr) => {
       if (error) {
         resolve({
           ok: false,
@@ -220,15 +225,46 @@ function validateAutomationInput(input: AutomationInput, mode: 'create' | 'updat
   }
 }
 
-async function listAutomations(req: Request, res: Response) {
-  const result = await runCron(['list', '--json', '--all']);
-  if (!result.ok) {
-    res.status(500).json({ error: result.error || 'Failed to list cron jobs' });
-    return;
+function invalidateAutomationsListCache() {
+  automationsListCache = null;
+}
+
+async function getCachedAutomationJobs(): Promise<any[]> {
+  const now = Date.now();
+  if (automationsListCache && (now - automationsListCache.at) < AUTOMATIONS_LIST_CACHE_TTL_MS) {
+    return automationsListCache.jobs;
   }
 
-  const parsed = parseJsonLoose(result.stdout);
-  let jobs = normalizeJobs(parsed);
+  if (automationsListInflight) {
+    return automationsListInflight;
+  }
+
+  automationsListInflight = (async () => {
+    const result = await runCron(['list', '--json', '--all']);
+    if (!result.ok) {
+      throw new Error(result.error || 'Failed to list cron jobs');
+    }
+
+    const jobs = normalizeJobs(parseJsonLoose(result.stdout));
+    automationsListCache = { at: Date.now(), jobs };
+    return jobs;
+  })();
+
+  try {
+    return await automationsListInflight;
+  } finally {
+    automationsListInflight = null;
+  }
+}
+
+async function listAutomations(req: Request, res: Response) {
+  let jobs: any[];
+  try {
+    jobs = [...await getCachedAutomationJobs()];
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || 'Failed to list cron jobs' });
+    return;
+  }
   const agentId = typeof req.query.agentId === 'string'
     ? req.query.agentId
     : (typeof req.query.agent === 'string' ? req.query.agent : undefined);
@@ -274,6 +310,7 @@ router.post('/', async (req: Request, res: Response) => {
     res.status(500).json({ error: result.error || 'Failed to create cron job' });
     return;
   }
+  invalidateAutomationsListCache();
   res.json({ ok: true, result: parseJsonLoose(result.stdout) || { message: result.stdout.trim() } });
 });
 
@@ -301,6 +338,7 @@ router.put('/:id', async (req: Request, res: Response) => {
     res.status(500).json({ error: result.error || 'Failed to update cron job' });
     return;
   }
+  invalidateAutomationsListCache();
   res.json({ ok: true, result: parseJsonLoose(result.stdout) || { message: result.stdout.trim() } });
 });
 
@@ -331,6 +369,7 @@ router.post('/:id/toggle', async (req: Request, res: Response) => {
     res.status(500).json({ error: result.error || `Failed to ${targetEnabled ? 'enable' : 'disable'} cron job` });
     return;
   }
+  invalidateAutomationsListCache();
   res.json({ ok: true, enabled: targetEnabled });
 });
 
@@ -341,6 +380,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
     res.status(500).json({ error: result.error || 'Failed to delete cron job' });
     return;
   }
+  invalidateAutomationsListCache();
   res.json({ ok: true });
 });
 
@@ -351,6 +391,7 @@ router.post('/:id/run', async (req: Request, res: Response) => {
     res.status(500).json({ error: result.error || 'Failed to run cron job' });
     return;
   }
+  invalidateAutomationsListCache();
   res.json({ ok: true, result: parseJsonLoose(result.stdout) || { message: result.stdout.trim() } });
 });
 
@@ -373,12 +414,13 @@ router.get('/:id/runs', async (req: Request, res: Response) => {
 
 router.get('/:id', async (req: Request, res: Response) => {
   const { id } = req.params;
-  const result = await runCron(['list', '--json', '--all']);
-  if (!result.ok) {
-    res.status(500).json({ error: result.error || 'Failed to fetch cron job' });
+  let jobs: any[];
+  try {
+    jobs = await getCachedAutomationJobs();
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || 'Failed to fetch cron job' });
     return;
   }
-  const jobs = normalizeJobs(parseJsonLoose(result.stdout));
   const job = jobs.find((entry: any) => entry?.id === id);
   if (!job) {
     res.status(404).json({ error: 'Cron job not found' });

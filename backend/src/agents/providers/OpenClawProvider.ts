@@ -51,6 +51,7 @@ import path from 'path';
 
 const AGENTS_BASE = path.join(process.env.HOME || '/root', '.openclaw/agents');
 const SESSIONS_DIR = path.join(AGENTS_BASE, 'main/sessions');
+const OPENCLAW_STREAM_INACTIVITY_TIMEOUT_MS = 60 * 60 * 1000;
 
 function resolveAgentSessionsDir(sessionKey?: string): string {
   if (!sessionKey) return SESSIONS_DIR;
@@ -99,13 +100,15 @@ async function readSessionMessages(sessionFileId: string, limit = 200, sessionsD
             }
           }
           const text = extractSanitizedText(textParts.join('\n'));
-          messages.push({
-            id: entry.id || '',
-            role: 'assistant',
-            content: text,
-            timestamp: entry.timestamp || new Date().toISOString(),
-            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-          } as any);
+          if (text || toolCalls.length > 0) {
+            messages.push({
+              id: entry.id || '',
+              role: 'assistant',
+              content: text,
+              timestamp: entry.timestamp || new Date().toISOString(),
+              toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+            } as any);
+          }
         } else {
           const text = extractText(content);
           if (text) {
@@ -185,12 +188,30 @@ function sendMessageViaPersistentWs(
   onChunk?: OnChunkCallback,
   onStatus?: (statusEvent: { type: string; content: string; [key: string]: any }) => void,
   onExecApproval?: OnExecApprovalCallback,
-  timeoutMs = 600000,
+  inactivityTimeoutMs = OPENCLAW_STREAM_INACTIVITY_TIMEOUT_MS,
 ): Promise<AgentSendResult> {
   return new Promise((resolve, reject) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let unsubBus: (() => void) | null = null;
+
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (unsubBus) { unsubBus(); unsubBus = null; }
+      // Don't call clearStream here. PersistentGatewayWs owns lifecycle cleanup,
+      // and a timeout should not make the frontend lose a stream that may resume.
+      reject(err);
+    };
+
+    const resetInactivityTimer = () => {
+      if (settled) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        fail(new Error(`OpenClaw streaming timed out after ${Math.round(inactivityTimeoutMs / 1000)}s of inactivity`));
+      }, inactivityTimeoutMs);
+    };
 
     const done = (result: AgentSendResult) => {
       if (settled) return;
@@ -200,29 +221,16 @@ function sendMessageViaPersistentWs(
       resolve(result);
     };
 
-    const fail = (err: Error) => {
-      if (settled) return;
-      settled = true;
-      if (timer) { clearTimeout(timer); timer = null; }
-      if (unsubBus) { unsubBus(); unsubBus = null; }
-      // Don't call clearStream here — PersistentGatewayWs owns the stream lifecycle.
-      // If the error came from chat.send failing, the stream was never started.
-      // If the error came from the bus (type: 'error'), PersistentGatewayWs already cleared it.
-      reject(err);
-    };
-
-    // Overall timeout
-    timer = setTimeout(() => {
-      fail(new Error(`OpenClaw streaming timed out after ${timeoutMs / 1000}s`));
-    }, timeoutMs);
+    resetInactivityTimer();
 
     // Subscribe to StreamEventBus BEFORE sending the message.
     // This ensures we don't miss any events if the response is very fast.
     // Note: PersistentGatewayWs.handleAgentEvent() also calls startStream()
-    // when the first event arrives — this pre-registration just ensures the
+    // when the first event arrives. This pre-registration just ensures the
     // subscriber is in place before events can arrive.
     unsubBus = streamEventBus.subscribe(sessionId, (evt: StreamEvent) => {
       if (settled) return;
+      resetInactivityTimer();
 
       switch (evt.type) {
         case 'text':
@@ -258,12 +266,10 @@ function sendMessageViaPersistentWs(
       }
     });
 
-    // Send the message via the persistent WS
     sendChatMessage(sessionId, message, idempotencyKey)
       .then(({ runId }) => {
         debugLog(`chat.send accepted: sessionKey=${sessionId} runId=${runId}`);
-        // The persistent WS will now receive events and publish to StreamEventBus.
-        // Our subscription above will handle them.
+        resetInactivityTimer();
       })
       .catch((err) => {
         fail(new Error(`chat.send failed: ${err.message}`));
@@ -324,7 +330,7 @@ export class OpenClawProvider implements AgentProvider {
       onChunk,
       onStatus,
       onExecApproval,
-      600000,
+      OPENCLAW_STREAM_INACTIVITY_TIMEOUT_MS,
     );
   }
 

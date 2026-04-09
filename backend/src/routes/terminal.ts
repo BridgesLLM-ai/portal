@@ -149,7 +149,7 @@ Flag dangerous commands with warnings. Keep explanations brief.`;
 
     res.json({
       commands: [],
-      summary: 'Ollama is not available. Please ensure Ollama is running with qwen2.5-coder models.',
+      summary: 'Ollama is not available. Please ensure Ollama is running with one of your configured local models.',
       model: 'unavailable',
       source: 'none',
     });

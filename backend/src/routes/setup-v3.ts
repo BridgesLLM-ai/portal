@@ -33,6 +33,7 @@ import {
   installCodingTool,
   updateEnvFile,
 } from '../utils/serverSetup';
+import { getOllamaRecommendationsByRam } from '../utils/ollamaRecommendations';
 
 const router = Router();
 
@@ -1027,41 +1028,9 @@ router.get('/ollama-status', requireSetupPending, requireSetupToken, async (_req
     } catch {}
 
     const os = require('os');
-    const ramGb = Math.round((os.totalmem() / (1024 ** 3)) * 10) / 10;
-
-    let ramTier: string;
-    let warning: string | null;
-    let recommendedModels: Array<{ name: string; description: string; size: string }>;
-
-    if (ramGb >= 16) {
-      ramTier = '16GB+';
-      warning = null;
-      recommendedModels = [
-        { name: 'llama3.1:8b', description: 'Meta\'s general-purpose AI — great all-rounder', size: '~4.7GB' },
-        { name: 'qwen2.5-coder:7b', description: 'Specialized for code generation and analysis', size: '~4.7GB' },
-        { name: 'mistral:7b', description: 'Fast and efficient for conversations', size: '~4.1GB' },
-      ];
-    } else if (ramGb >= 8) {
-      ramTier = '8-16GB';
-      warning = null;
-      recommendedModels = [
-        { name: 'llama3.2:3b', description: 'Compact but capable general AI', size: '~2GB' },
-        { name: 'qwen2.5-coder:3b', description: 'Lightweight code assistant', size: '~1.9GB' },
-      ];
-    } else if (ramGb >= 4) {
-      ramTier = '4-8GB';
-      warning = 'Your server has limited RAM. Smaller models will work best.';
-      recommendedModels = [
-        { name: 'llama3.2:1b', description: 'Minimal footprint, basic capabilities', size: '~1.3GB' },
-        { name: 'phi3:mini', description: 'Microsoft\'s compact model', size: '~2.3GB' },
-      ];
-    } else {
-      ramTier = 'under 4GB';
-      warning = 'Very limited RAM. Local AI models may not run well. Consider using cloud AI providers instead.';
-      recommendedModels = [
-        { name: 'tinyllama', description: 'Smallest available model', size: '~637MB' },
-      ];
-    }
+    const totalRam = os.totalmem();
+    const ramGb = Math.round((totalRam / (1024 ** 3)) * 10) / 10;
+    const { ramTier, warning, recommendedModels } = getOllamaRecommendationsByRam(totalRam);
 
     res.json({ running, endpoint: ollamaUrl, models, ramGb, ramTier, warning, recommendedModels });
   } catch (error) {

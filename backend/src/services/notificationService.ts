@@ -76,19 +76,15 @@ export async function sendPasswordChangedEmail(user: { email: string; username: 
  * Send password reset email with reset link
  */
 export async function sendPasswordResetEmail(user: { email: string }, resetUrl: string): Promise<void> {
-  try {
-    const branding = await getCachedBranding();
-    await sendEmail({
-      from: `noreply@${MAIL_DOMAIN}`,
-      fromName: branding.portalName,
-      to: [{ email: user.email }],
-      subject: `Reset your ${branding.portalName} password`,
-      htmlBody: passwordResetHtml(resetUrl, branding),
-      textBody: passwordResetText(resetUrl, branding),
-    });
-  } catch (err) {
-    console.error('[notificationService] Failed to send password reset email:', err);
-  }
+  const branding = await getCachedBranding();
+  await sendEmail({
+    from: `noreply@${MAIL_DOMAIN}`,
+    fromName: branding.portalName,
+    to: [{ email: user.email }],
+    subject: `Reset your ${branding.portalName} password`,
+    htmlBody: passwordResetHtml(resetUrl, branding),
+    textBody: passwordResetText(resetUrl, branding),
+  });
 }
 
 /**

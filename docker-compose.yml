@@ -43,7 +43,7 @@ services:
       HOST: 0.0.0.0
       CORS_ORIGIN: "${PORTAL_DOMAIN:-https://localhost}"
       OLLAMA_API_URL: "http://host.docker.internal:11436"
-      OLLAMA_MODEL: "qwen2.5-coder:7b"
+      OLLAMA_MODEL: "qwen3:4b"
       OPENCLAW_API_URL: "http://host.docker.internal:18789"
       OPENCLAW_GATEWAY_URL: "http://host.docker.internal:18789"
       FRED_API_KEY: "${FRED_API_KEY}"
