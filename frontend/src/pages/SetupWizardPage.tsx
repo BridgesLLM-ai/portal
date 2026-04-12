@@ -29,6 +29,7 @@ import { useAuthStore } from '../contexts/AuthContext';
 import client from '../api/client';
 import AiProviderSetup from '../components/ai-setup/AiProviderSetup';
 import { sounds } from '../utils/sounds';
+import { DEFAULT_REGISTRATION_MODE } from '../utils/securityDefaults';
 
 type ThemeMode = 'dark' | 'light' | 'system';
 type RegistrationMode = 'open' | 'approval' | 'closed';
@@ -153,6 +154,22 @@ const cardClass = 'rounded-2xl border border-slate-800 bg-slate-900/70';
 
 function friendlyError(error: any, fallback: string) {
   return error?.response?.data?.error || error?.message || fallback;
+}
+
+const PASSWORD_POLICY_HINT = 'Use at least 8 characters, including 1 uppercase letter, 1 lowercase letter, and 1 number.';
+
+function validatePasswordPolicy(password: string): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+
+  if (password.length < 8) errors.push('Use at least 8 characters.');
+  if (!/[A-Z]/.test(password)) errors.push('Add at least 1 uppercase letter.');
+  if (!/[a-z]/.test(password)) errors.push('Add at least 1 lowercase letter.');
+  if (!/[0-9]/.test(password)) errors.push('Add at least 1 number.');
+
+  return {
+    valid: errors.length === 0,
+    errors,
+  };
 }
 
 function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }) {
@@ -314,7 +331,7 @@ export default function SetupWizardPage() {
   const [logoFile, setLogoFile] = useState<File | null>(null);
   const [logoPreview, setLogoPreview] = useState('');
 
-  const [registrationMode, setRegistrationMode] = useState<RegistrationMode>('approval');
+  const [registrationMode, setRegistrationMode] = useState<RegistrationMode>(DEFAULT_REGISTRATION_MODE);
   const [allowTelemetry, setAllowTelemetry] = useState(true);
   const [searchEngineVisibility, setSearchEngineVisibility] = useState<'visible' | 'hidden'>('hidden');
 
@@ -355,9 +372,10 @@ export default function SetupWizardPage() {
 
   const progress = useMemo(() => ((step + 1) / STEPS.length) * 100, [step]);
   const emailLooksValid = useMemo(() => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email), [email]);
+  const passwordPolicy = useMemo(() => validatePasswordPolicy(password), [password]);
   const adminStepValid = useMemo(
-    () => name.trim().length >= 2 && emailLooksValid && password.length >= 8 && password === confirmPassword,
-    [confirmPassword, emailLooksValid, name, password],
+    () => name.trim().length >= 2 && emailLooksValid && passwordPolicy.valid && password === confirmPassword,
+    [confirmPassword, emailLooksValid, name, password, passwordPolicy.valid],
   );
   const domainConfigured = useMemo(() => Boolean(configuredDomainUrl || mailStatus?.domain || dnsStatus?.pointsToUs), [configuredDomainUrl, mailStatus?.domain, dnsStatus?.pointsToUs]);
 
@@ -464,13 +482,17 @@ export default function SetupWizardPage() {
   }, [api]);
 
   const [isReinstall, setIsReinstall] = useState(false);
-  const [ownerEmail, setOwnerEmail] = useState('');
+  const [ownerHint, setOwnerHint] = useState('');
+  const [reinstallPassword, setReinstallPassword] = useState('');
+  const [reinstallConfirmPassword, setReinstallConfirmPassword] = useState('');
+  const [reinstallError, setReinstallError] = useState('');
+  const [reinstallSubmitting, setReinstallSubmitting] = useState(false);
 
   useEffect(() => {
     api.get('/setup/status').then(({ data }) => {
       if (data.isReinstall) {
         setIsReinstall(true);
-        if (data.ownerEmail) setOwnerEmail(data.ownerEmail);
+        if (data.ownerHint) setOwnerHint(data.ownerHint);
       } else if (!data.needsSetup) {
         navigate('/login', { replace: true });
       }
@@ -505,6 +527,12 @@ export default function SetupWizardPage() {
     }
     if (step === 6 && (ollamaState === 'idle' || openClawState === 'idle')) loadAiStatus();
   }, [step, mailStatusState, ollamaState, openClawState, preflightState, loadMailStatus, loadMailPreflight, loadAiStatus]);
+
+  const reinstallPasswordPolicy = useMemo(() => validatePasswordPolicy(reinstallPassword), [reinstallPassword]);
+  const reinstallFormValid = useMemo(
+    () => reinstallPassword.length > 0 && reinstallPasswordPolicy.valid && reinstallPassword === reinstallConfirmPassword,
+    [reinstallConfirmPassword, reinstallPassword, reinstallPasswordPolicy.valid],
+  );
 
   const handleLogoChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -610,8 +638,18 @@ export default function SetupWizardPage() {
   };
 
   const handleComplete = async () => {
-    if (!adminStepValid) {
+    if (name.trim().length < 2 || !emailLooksValid) {
       setError('Finish the admin account step before launching the portal.');
+      return;
+    }
+
+    if (!passwordPolicy.valid) {
+      setError(PASSWORD_POLICY_HINT);
+      return;
+    }
+
+    if (password !== confirmPassword) {
+      setError('Passwords must match before launching the portal.');
       return;
     }
 
@@ -673,6 +711,32 @@ export default function SetupWizardPage() {
       sounds.error();
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleReinstallReset = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setReinstallError('');
+
+    if (reinstallPassword !== reinstallConfirmPassword) {
+      setReinstallError('Passwords must match.');
+      return;
+    }
+
+    if (!reinstallPasswordPolicy.valid) {
+      setReinstallError(PASSWORD_POLICY_HINT);
+      return;
+    }
+
+    setReinstallSubmitting(true);
+    try {
+      const { data } = await api.post('/setup/reinstall-reset', { password: reinstallPassword });
+      alert(`Password reset! Log in with: ${data.email || data.username}`);
+      navigate('/login', { replace: true });
+    } catch (err: any) {
+      setReinstallError(err?.response?.data?.error || 'Reset failed');
+    } finally {
+      setReinstallSubmitting(false);
     }
   };
 
@@ -771,8 +835,13 @@ export default function SetupWizardPage() {
         </div>
         <div>
           <label className="mb-2 block text-sm font-medium text-slate-300">Password</label>
-          <PasswordInput value={password} onChange={setPassword} placeholder="At least 8 characters" />
-          {password.length > 0 && password.length < 8 && <p className="mt-2 text-xs text-amber-400">Password must be at least 8 characters.</p>}
+          <PasswordInput value={password} onChange={setPassword} placeholder="Min 8 chars, upper/lower/number" />
+          <p className={`mt-2 text-xs ${password.length > 0 && !passwordPolicy.valid ? 'text-amber-400' : 'text-slate-500'}`}>{PASSWORD_POLICY_HINT}</p>
+          {password.length > 0 && !passwordPolicy.valid && (
+            <ul className="mt-2 space-y-1 text-xs text-amber-300">
+              {passwordPolicy.errors.map((message) => <li key={message}>• {message}</li>)}
+            </ul>
+          )}
         </div>
         <div>
           <label className="mb-2 block text-sm font-medium text-slate-300">Confirm password</label>
@@ -1610,40 +1679,32 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
               Your previous data (projects, settings, email) has been preserved.
               Set a new password to regain access to your account.
             </p>
-            {ownerEmail && (
+            {ownerHint && (
               <div className="mb-6 rounded-lg border border-slate-700 bg-slate-800/50 px-4 py-3">
-                <p className="text-xs text-slate-500">Your account</p>
-                <p className="text-sm font-medium text-white">{ownerEmail}</p>
+                <p className="text-xs text-slate-500">Owner account on file</p>
+                <p className="text-sm font-medium text-white">{ownerHint}</p>
               </div>
             )}
-            <form onSubmit={async (e) => {
-              e.preventDefault();
-              const form = e.target as HTMLFormElement;
-              const pw = (form.elements.namedItem('password') as HTMLInputElement).value;
-              const pw2 = (form.elements.namedItem('confirm') as HTMLInputElement).value;
-              if (pw !== pw2) { alert('Passwords do not match'); return; }
-              if (pw.length < 8) { alert('Password must be at least 8 characters'); return; }
-              try {
-                const { data } = await api.post('/setup/reinstall-reset', { password: pw });
-                alert(`Password reset! Log in with: ${data.email || data.username}`);
-                navigate('/login', { replace: true });
-              } catch (err: any) {
-                alert(err?.response?.data?.error || 'Reset failed');
-              }
-            }}>
+            <form onSubmit={handleReinstallReset}>
               <div className="mb-4">
                 <label className="mb-1 block text-sm font-medium text-slate-300">New Password</label>
-                <input name="password" type="password" required minLength={8}
-                  className="w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-2.5 text-white focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500" />
+                <PasswordInput value={reinstallPassword} onChange={setReinstallPassword} placeholder="Min 8 chars, upper/lower/number" />
+                <p className={`mt-2 text-xs ${reinstallPassword.length > 0 && !reinstallPasswordPolicy.valid ? 'text-amber-400' : 'text-slate-500'}`}>{PASSWORD_POLICY_HINT}</p>
+                {reinstallPassword.length > 0 && !reinstallPasswordPolicy.valid && (
+                  <ul className="mt-2 space-y-1 text-xs text-amber-300">
+                    {reinstallPasswordPolicy.errors.map((message) => <li key={message}>• {message}</li>)}
+                  </ul>
+                )}
               </div>
               <div className="mb-6">
                 <label className="mb-1 block text-sm font-medium text-slate-300">Confirm Password</label>
-                <input name="confirm" type="password" required minLength={8}
-                  className="w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-2.5 text-white focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500" />
+                <PasswordInput value={reinstallConfirmPassword} onChange={setReinstallConfirmPassword} placeholder="Repeat your password" />
+                {reinstallConfirmPassword.length > 0 && reinstallPassword !== reinstallConfirmPassword && <p className="mt-2 text-xs text-amber-400">Passwords must match.</p>}
               </div>
-              <button type="submit"
-                className="w-full rounded-lg bg-emerald-600 px-4 py-2.5 font-medium text-white hover:bg-emerald-500 transition-colors">
-                Reset Password & Continue
+              {reinstallError && <div className="mb-4 rounded-lg border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">{reinstallError}</div>}
+              <button type="submit" disabled={reinstallSubmitting || !reinstallFormValid}
+                className="w-full rounded-lg bg-emerald-600 px-4 py-2.5 font-medium text-white transition-colors hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-60">
+                {reinstallSubmitting ? 'Resetting…' : 'Reset Password & Continue'}
               </button>
             </form>
           </div>

@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Pencil } from 'lucide-react';
 import AvatarEditor from './AvatarEditor';
+import client from '../api/client';
 import { useAuthStore } from '../contexts/AuthContext';
 import { isElevated } from '../utils/authz';
 import { setCachedUserAvatarUrl, useUserAvatarUrl } from '../hooks/useUserAvatarUrl';
@@ -21,11 +22,16 @@ export default function UserAvatar({ size = 'w-10 h-10', ringColor = 'ring-purpl
   const [editorOpen, setEditorOpen] = useState(false);
   const [hover, setHover] = useState(false);
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>('checking');
-  const { user } = useAuthStore();
+  const { user, isAuthenticated } = useAuthStore();
   const avatarUrl = assistant ? assistantAvatarUrl : userAvatarUrl;
 
   useEffect(() => {
     if (!assistant) return;
+    if (!isAuthenticated) {
+      setAssistantAvatarUrl(null);
+      return;
+    }
+
     const cacheKey = 'cached_assistantAvatar';
     const cached = sessionStorage.getItem(cacheKey);
     if (cached) {
@@ -33,9 +39,8 @@ export default function UserAvatar({ size = 'w-10 h-10', ringColor = 'ring-purpl
       return;
     }
 
-    fetch('/api/users/assistant-avatar', { headers: {} })
-      .then(r => r.ok ? r.json() : null)
-      .then(data => {
+    client.get('/users/assistant-avatar', { _silent: true } as any)
+      .then(({ data }) => {
         if (data?.avatarUrl) {
           setAssistantAvatarUrl(data.avatarUrl);
           sessionStorage.setItem(cacheKey, data.avatarUrl);
@@ -44,44 +49,43 @@ export default function UserAvatar({ size = 'w-10 h-10', ringColor = 'ring-purpl
       .catch(() => {
         // No fallback file — the initial-based circle renders automatically
       });
-  }, [assistant]);
+  }, [assistant, isAuthenticated]);
 
   // Check OpenClaw gateway connection status (Assistant only)
   useEffect(() => {
     if (!assistant) return;
-    if (!isElevated(user)) {
+    if (!isAuthenticated || !isElevated(user)) {
       setGatewayStatus('disconnected');
       return;
     }
 
+    let cancelled = false;
+
     const checkGatewayStatus = async () => {
       try {
-                const response = await fetch('/api/gateway/health', {
-          headers: {},
-          signal: AbortSignal.timeout(5000) // 5 second timeout
-        });
-        
-        if (response.ok) {
-          const data = await response.json();
-          // Use wsConnected (authenticated persistent WS) — not just HTTP probe
-          // This ensures the green dot only shows when agent chat actually works
-          setGatewayStatus(data.wsConnected ? 'connected' : 'disconnected');
-        } else {
-          setGatewayStatus('disconnected');
-        }
-      } catch (error) {
-        setGatewayStatus('disconnected');
+        const { data } = await client.get('/gateway/health', {
+          timeout: 5000,
+          _silent: true,
+        } as any);
+
+        if (cancelled) return;
+
+        // Use wsConnected (authenticated persistent WS) — not just HTTP probe
+        // This ensures the green dot only shows when agent chat actually works
+        setGatewayStatus(data?.wsConnected ? 'connected' : 'disconnected');
+      } catch {
+        if (!cancelled) setGatewayStatus('disconnected');
       }
     };
 
-    // Initial check
-    checkGatewayStatus();
+    void checkGatewayStatus();
+    const interval = setInterval(() => { void checkGatewayStatus(); }, 30000);
 
-    // Check every 30 seconds
-    const interval = setInterval(checkGatewayStatus, 30000);
-
-    return () => clearInterval(interval);
-  }, [assistant, user]);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [assistant, isAuthenticated, user]);
 
   const initial = assistant ? 'A' : (username || 'U')[0].toUpperCase();
   const defaultRing = assistant ? 'ring-emerald-500/50' : ringColor;

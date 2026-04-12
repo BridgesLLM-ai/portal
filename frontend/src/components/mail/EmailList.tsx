@@ -235,10 +235,13 @@ export default function EmailList({
             <button onClick={onRefresh} className="text-xs text-violet-400 hover:underline">Try again</button>
           </div>
         ) : filtered.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-20 text-slate-500 px-4">
+          <div className="flex flex-col items-center justify-center py-20 text-slate-500 px-4 text-center">
             <Mail size={40} className="mb-4 opacity-20" />
-            <div className="text-sm">
-              {searchQuery ? 'No emails match your search' : 'No emails in this folder'}
+            <div className="text-sm text-slate-300">
+              {searchQuery ? 'No emails match your search.' : 'This folder is empty.'}
+            </div>
+            <div className="mt-1 text-xs text-slate-500 max-w-xs">
+              {searchQuery ? 'Try a different keyword or clear the search to see everything in this mailbox.' : 'New messages will appear here when mail arrives.'}
             </div>
           </div>
         ) : (

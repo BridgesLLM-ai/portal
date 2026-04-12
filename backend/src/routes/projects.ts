@@ -399,7 +399,7 @@ clean:
 };
 
 // GET /api/projects - list projects
-router.get('/', authenticateToken, async (req: Request, res: Response) => {
+router.get('/', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const userDir = getUserProjectDir(ownerId);
@@ -443,7 +443,7 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
 });
 
 // POST /api/projects - create from template
-router.post('/', authenticateToken, async (req: Request, res: Response) => {
+router.post('/', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { name, template = 'static-html' } = req.body;
@@ -484,7 +484,7 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
 });
 
 // POST /api/projects/clone - clone git repo
-router.post('/clone', authenticateToken, async (req: Request, res: Response) => {
+router.post('/clone', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { url, name } = req.body;
@@ -516,7 +516,7 @@ router.post('/clone', authenticateToken, async (req: Request, res: Response) => 
 
 // GET /api/projects/models/available - List available models from gateway catalog
 // NOTE: This MUST be defined BEFORE /:name routes to avoid matching "models" as a project name
-router.get('/models/available', authenticateToken, async (_req: Request, res: Response) => {
+router.get('/models/available', authenticateToken, requireApproved, async (_req: Request, res: Response) => {
   try {
     const result = await listGatewayModels();
     const providerStatus = new Map(getProviderStatuses().map((p) => [p.id, p]));
@@ -562,7 +562,7 @@ router.get('/models/available', authenticateToken, async (_req: Request, res: Re
 });
 
 // GET /api/projects/:name/tree - file tree with git status
-router.get('/:name/tree', authenticateToken, async (req: Request, res: Response) => {
+router.get('/:name/tree', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -699,7 +699,7 @@ router.get('/:name/raw', browserAuthRedirect, requireApproved, async (req: Reque
 });
 
 // GET /api/projects/:name/file - read file content
-router.get('/:name/file', authenticateToken, async (req: Request, res: Response) => {
+router.get('/:name/file', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -741,7 +741,7 @@ router.get('/:name/file', authenticateToken, async (req: Request, res: Response)
 });
 
 // PUT /api/projects/:name/file - write file content
-router.put('/:name/file', authenticateToken, async (req: Request, res: Response) => {
+router.put('/:name/file', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -763,7 +763,7 @@ router.put('/:name/file', authenticateToken, async (req: Request, res: Response)
 });
 
 // POST /api/projects/:name/file - create new file
-router.post('/:name/file', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/file', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -785,7 +785,7 @@ router.post('/:name/file', authenticateToken, async (req: Request, res: Response
 });
 
 // DELETE /api/projects/:name/file
-router.delete('/:name/file', authenticateToken, async (req: Request, res: Response) => {
+router.delete('/:name/file', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -811,7 +811,7 @@ router.delete('/:name/file', authenticateToken, async (req: Request, res: Respon
 });
 
 // POST /api/projects/:name/git - git operations (enhanced)
-router.post('/:name/git', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/git', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -1178,7 +1178,7 @@ router.post('/:name/git', authenticateToken, async (req: Request, res: Response)
 });
 
 // POST /api/projects/upload-zip - upload ZIP as project
-router.post('/upload-zip', authenticateToken, zipUpload.single('file'), async (req: Request, res: Response) => {
+router.post('/upload-zip', authenticateToken, requireApproved, zipUpload.single('file'), async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     if (!req.file) {
@@ -1256,7 +1256,7 @@ router.post('/upload-zip', authenticateToken, zipUpload.single('file'), async (r
 });
 
 // POST /api/projects/create-from-upload - create project from a chunked-uploaded file
-router.post('/create-from-upload', authenticateToken, async (req: Request, res: Response) => {
+router.post('/create-from-upload', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { name, filePath: uploadedFilePath } = req.body;
@@ -1345,7 +1345,7 @@ router.post('/create-from-upload', authenticateToken, async (req: Request, res: 
 });
 
 // POST /api/projects/:name/upload - upload files to existing project
-router.post('/:name/upload', authenticateToken, fileUpload.array('files', 50), async (req: Request, res: Response) => {
+router.post('/:name/upload', authenticateToken, requireApproved, fileUpload.array('files', 50), async (req: Request, res: Response) => {
   const uploadedFiles = req.files as Express.Multer.File[];
   try {
     const ownerId = await getScopedOwnerId(req);
@@ -1435,7 +1435,7 @@ router.post('/:name/upload', authenticateToken, fileUpload.array('files', 50), a
 });
 
 // GET /api/projects/:name/activity - project activity feed
-router.get('/:name/activity', authenticateToken, async (req: Request, res: Response) => {
+router.get('/:name/activity', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const limit = parseInt(req.query.limit as string) || 20;
@@ -1463,7 +1463,7 @@ router.get('/:name/activity', authenticateToken, async (req: Request, res: Respo
 });
 
 // DELETE /api/projects/:name - delete project
-router.delete('/:name', authenticateToken, async (req: Request, res: Response) => {
+router.delete('/:name', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -1496,7 +1496,7 @@ router.delete('/:name', authenticateToken, async (req: Request, res: Response) =
 });
 
 // PATCH /api/projects/:name/rename - rename a project
-router.patch('/:name/rename', authenticateToken, async (req: Request, res: Response) => {
+router.patch('/:name/rename', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { newName } = req.body;
@@ -1559,7 +1559,7 @@ router.patch('/:name/rename', authenticateToken, async (req: Request, res: Respo
 });
 
 // POST /api/projects/:name/check - syntax/compile check for runtime projects
-router.post('/:name/check', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/check', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -1978,7 +1978,7 @@ function writeDepsCache(projectDir: string, packages: string[]): void {
 }
 
 // GET /api/projects/:name/check-deps - check dependencies without installing
-router.get('/:name/check-deps', authenticateToken, async (req: Request, res: Response) => {
+router.get('/:name/check-deps', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -2005,7 +2005,7 @@ router.get('/:name/check-deps', authenticateToken, async (req: Request, res: Res
 });
 
 // POST /api/projects/:name/install-deps - install dependencies with SSE streaming
-router.post('/:name/install-deps', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/install-deps', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -2161,7 +2161,7 @@ router.post('/:name/install-deps', authenticateToken, async (req: Request, res: 
 });
 
 // POST /api/projects/:name/deploy - deploy with build support (static + fullstack + runtime)
-router.post('/:name/deploy', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -2423,7 +2423,7 @@ router.post('/:name/deploy', authenticateToken, async (req: Request, res: Respon
 });
 
 // POST /api/projects/:name/app-process — manage fullstack app process (start/stop/status/logs)
-router.post('/:name/app-process', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/app-process', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const appName = req.params.name;
@@ -2472,7 +2472,7 @@ router.post('/:name/app-process', authenticateToken, async (req: Request, res: R
   }
 });
 // POST /api/projects/:name/doc-update - auto-update documentation
-router.post('/:name/doc-update', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/doc-update', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -2525,7 +2525,7 @@ router.post('/:name/doc-update', authenticateToken, async (req: Request, res: Re
 });
 
 // POST /api/projects/:name/share - create share link for project
-router.post('/:name/share', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/share', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -2600,7 +2600,7 @@ router.post('/:name/share', authenticateToken, async (req: Request, res: Respons
 });
 
 // GET /api/projects/:name/shares - list share links
-router.get('/:name/shares', authenticateToken, async (req: Request, res: Response) => {
+router.get('/:name/shares', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const app = await prisma.app.findFirst({
@@ -2630,7 +2630,7 @@ async function findOwnedShareLink(ownerId: string, projectName: string, linkId: 
 }
 
 // PATCH /api/projects/:name/share/:linkId - update share link (public ↔ secure, active toggle)
-router.patch('/:name/share/:linkId', authenticateToken, async (req: Request, res: Response) => {
+router.patch('/:name/share/:linkId', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { isPublic, password, isActive } = req.body;
@@ -2671,7 +2671,7 @@ router.patch('/:name/share/:linkId', authenticateToken, async (req: Request, res
 });
 
 // DELETE /api/projects/:name/share/:linkId - delete share link permanently
-router.delete('/:name/share/:linkId', authenticateToken, async (req: Request, res: Response) => {
+router.delete('/:name/share/:linkId', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { permanent } = req.query;
@@ -2699,7 +2699,7 @@ router.delete('/:name/share/:linkId', authenticateToken, async (req: Request, re
 });
 
 // POST /api/projects/:name/share/:linkId/email - send share link via email
-router.post('/:name/share/:linkId/email', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/share/:linkId/email', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { recipientEmail, password } = req.body;
@@ -2750,7 +2750,7 @@ router.post('/:name/share/:linkId/email', authenticateToken, async (req: Request
 });
 
 // POST /api/projects/:name/rename-file - rename/move file
-router.post('/:name/rename-file', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/rename-file', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -2776,7 +2776,7 @@ router.post('/:name/rename-file', authenticateToken, async (req: Request, res: R
 // --- OpenClaw TUI Chat Persistence Routes ---
 
 // GET /api/projects/:name/chat/history - Load persisted chat messages for this project+user
-router.get('/:name/chat/history', authenticateToken, async (req: Request, res: Response) => {
+router.get('/:name/chat/history', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
@@ -2817,7 +2817,7 @@ router.get('/:name/chat/history', authenticateToken, async (req: Request, res: R
 });
 
 // POST /api/projects/:name/chat/message - Save a chat message
-router.post('/:name/chat/message', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/chat/message', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
@@ -2866,7 +2866,7 @@ router.post('/:name/chat/message', authenticateToken, async (req: Request, res: 
 });
 
 // POST /api/projects/:name/chat/messages - Batch save multiple messages
-router.post('/:name/chat/messages', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/chat/messages', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
@@ -2901,7 +2901,7 @@ router.post('/:name/chat/messages', authenticateToken, async (req: Request, res:
 });
 
 // DELETE /api/projects/:name/chat/history - Clear chat history for this project
-router.delete('/:name/chat/history', authenticateToken, async (req: Request, res: Response) => {
+router.delete('/:name/chat/history', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
@@ -2928,7 +2928,7 @@ router.delete('/:name/chat/history', authenticateToken, async (req: Request, res
 });
 
 // GET /api/projects/:name/chat/session-status - Check if gateway session is still active
-router.get('/:name/chat/session-status', authenticateToken, async (req: Request, res: Response) => {
+router.get('/:name/chat/session-status', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;

@@ -12,6 +12,28 @@ declare global {
   }
 }
 
+const AUTH_LOG_DEDUPE_WINDOW_MS = 60_000;
+const authFailureLogState = new Map<string, { lastLoggedAt: number; suppressedCount: number }>();
+
+function logAuthFailure(kind: 'Missing token' | 'Invalid token', req: Request) {
+  const ip = extractIP(req);
+  const key = `${kind}:${ip}:${req.method}:${req.path}`;
+  const now = Date.now();
+  const current = authFailureLogState.get(key);
+
+  if (!current || now - current.lastLoggedAt >= AUTH_LOG_DEDUPE_WINDOW_MS) {
+    const suppressedSuffix = current?.suppressedCount
+      ? ` (suppressed ${current.suppressedCount} duplicate${current.suppressedCount === 1 ? '' : 's'} in the last ${Math.round(AUTH_LOG_DEDUPE_WINDOW_MS / 1000)}s)`
+      : '';
+    console.warn(`[Auth] ${kind}: ${req.method} ${req.path} [ip=${ip}]${suppressedSuffix}`);
+    authFailureLogState.set(key, { lastLoggedAt: now, suppressedCount: 0 });
+    return;
+  }
+
+  current.suppressedCount += 1;
+  authFailureLogState.set(key, current);
+}
+
 function getTokenFromRequest(req: Request): string | undefined {
   const authHeader = req.headers['authorization'];
   let token = authHeader && authHeader.split(' ')[1];
@@ -53,14 +75,14 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
   const token = getTokenFromRequest(req);
 
   if (!token) {
-    console.warn(`[Auth] Missing token: ${req.method} ${req.path}`);
+    logAuthFailure('Missing token', req);
     res.status(401).json({ error: 'Access token required' });
     return;
   }
 
   const payload = verifyAccessToken(token);
   if (!payload) {
-    console.warn(`[Auth] Invalid token: ${req.method} ${req.path}`);
+    logAuthFailure('Invalid token', req);
     res.status(403).json({ error: 'Invalid or expired token' });
     return;
   }

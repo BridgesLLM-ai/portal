@@ -3,7 +3,7 @@ import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { prisma } from '../config/database';
-import { hashPassword } from '../utils/password';
+import { hashPassword, validatePasswordStrength } from '../utils/password';
 import { generateAccessToken, generateRefreshToken } from '../utils/jwt';
 import { AppError } from '../middleware/errorHandler';
 import { config } from '../config/env';
@@ -11,6 +11,7 @@ import { APPEARANCE_DEFAULTS, SECURITY_DEFAULTS } from '../config/settings.schem
 import multer from 'multer';
 import { setAuthCookies } from '../utils/authCookies';
 import { getOllamaRecommendationsByRam } from '../utils/ollamaRecommendations';
+import { isReservedSystemMailboxUsername } from '../utils/reservedMailboxUsernames';
 
 const router = Router();
 
@@ -45,8 +46,10 @@ async function createUniqueUsername(baseName: string, email: string): Promise<st
   let candidate = base;
   let suffix = 1;
   while (true) {
-    const existing = await prisma.user.findUnique({ where: { username: candidate } });
-    if (!existing) return candidate;
+    if (!isReservedSystemMailboxUsername(candidate)) {
+      const existing = await prisma.user.findUnique({ where: { username: candidate } });
+      if (!existing) return candidate;
+    }
     suffix += 1;
     candidate = `${base}${suffix}`.slice(0, 30);
   }
@@ -286,6 +289,11 @@ router.post('/complete', async (req: Request, res: Response, next: NextFunction)
     }
 
     const body = completeSetupSchema.parse(req.body);
+    const strength = validatePasswordStrength(body.password);
+    if (!strength.valid) {
+      throw new AppError(400, strength.errors.join('. '));
+    }
+
     const username = await createUniqueUsername(body.name, body.email);
     const passwordHash = await hashPassword(body.password);
 

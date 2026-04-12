@@ -325,24 +325,30 @@ export default function AgentToolsPage() {
       changed = true;
     }
 
-    if (selectedProvider !== 'OPENCLAW') {
-      if (params.get('provider') !== selectedProvider) {
-        params.set('provider', selectedProvider);
+    if (activeTab === 'skills' || activeTab === 'tasks') {
+      if (params.has('provider')) {
+        params.delete('provider');
         changed = true;
       }
-    } else if (params.has('provider')) {
-      params.delete('provider');
-      changed = true;
-    }
-
-    if (selectedAgentId === 'main' && selectedProvider === 'OPENCLAW') {
       if (params.has('agent')) {
         params.delete('agent');
         changed = true;
       }
-    } else if (params.get('agent') !== selectedAgentId) {
-      params.set('agent', selectedAgentId);
-      changed = true;
+    } else {
+      if (selectedProvider !== 'OPENCLAW') {
+        if (params.get('provider') !== selectedProvider) {
+          params.set('provider', selectedProvider);
+          changed = true;
+        }
+      } else if (params.has('provider')) {
+        params.delete('provider');
+        changed = true;
+      }
+
+      if (params.get('agent') !== selectedAgentId) {
+        params.set('agent', selectedAgentId);
+        changed = true;
+      }
     }
 
     if (changed) {
@@ -360,6 +366,17 @@ export default function AgentToolsPage() {
 
   const selectedProvider = parseProviderAgent(selectedAgent).provider;
   const selectedAgentId = parseProviderAgent(selectedAgent).agentId;
+  const isSharedScopeTab = activeTab === 'skills' || activeTab === 'tasks';
+  const showUnsupportedProviderState = !isSharedScopeTab && selectedProvider !== 'OPENCLAW';
+  const sharedScopeCard = activeTab === 'skills'
+    ? {
+        title: 'Shared skill inventory',
+        description: 'Skills and plugins are managed instance-wide across OpenClaw.',
+      }
+    : {
+        title: 'Shared task activity',
+        description: 'Tasks are shown across all OpenClaw agents.',
+      };
 
   return (
     <div className="h-full flex flex-col overflow-hidden bg-[#0A0E27]">
@@ -368,17 +385,25 @@ export default function AgentToolsPage() {
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h1 className="text-xl sm:text-2xl font-bold text-white">Agent Tools</h1>
-              <p className="text-slate-400 text-sm mt-0.5">Automations, usage stats, and skills management</p>
+              <p className="text-slate-400 text-sm mt-0.5">Automations, usage stats, skills, and background work</p>
             </div>
 
-            <AgentSelectorDropdown
-              agents={agents}
-              providers={providers}
-              selected={selectedAgent}
-              onSelect={handleAgentSelect}
-              loading={agentsLoading}
-              assistantName={assistantName}
-            />
+            {!isSharedScopeTab ? (
+              <AgentSelectorDropdown
+                agents={agents}
+                providers={providers}
+                selected={selectedAgent}
+                onSelect={handleAgentSelect}
+                loading={agentsLoading}
+                assistantName={assistantName}
+              />
+            ) : (
+              <div className="rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-left sm:text-right">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Scope</div>
+                <div className="mt-0.5 text-sm font-medium text-white">{sharedScopeCard.title}</div>
+                <div className="mt-0.5 text-[11px] text-slate-400">{sharedScopeCard.description}</div>
+              </div>
+            )}
           </div>
 
           <div className="flex items-center gap-1 overflow-x-auto scrollbar-none pb-0.5 -mb-px">
@@ -404,7 +429,7 @@ export default function AgentToolsPage() {
       </div>
 
       <div className="flex-1 min-h-0 overflow-hidden">
-        {selectedProvider !== 'OPENCLAW' ? (
+        {showUnsupportedProviderState ? (
           <div className="h-full overflow-auto p-6 md:p-8">
             <div className="max-w-4xl mx-auto rounded-3xl border border-amber-500/20 bg-amber-500/10 p-6 text-amber-100">
               <div className="text-lg font-semibold">{providers.find((p) => p.name === selectedProvider)?.displayName || selectedProvider} support is not wired into Agent Tools yet</div>
@@ -417,8 +442,8 @@ export default function AgentToolsPage() {
           <Suspense fallback={<TabFallback />}>
             {activeTab === 'automations' && <AutomationsContent agentId={selectedAgentId} />}
             {activeTab === 'usage' && <UsageContent agentId={selectedAgentId} />}
-            {activeTab === 'skills' && <SkillsContent agentId={selectedAgentId} />}
-            {activeTab === 'tasks' && <TasksContent agentId={selectedAgentId} />}
+            {activeTab === 'skills' && <SkillsContent />}
+            {activeTab === 'tasks' && <TasksContent />}
           </Suspense>
         )}
       </div>

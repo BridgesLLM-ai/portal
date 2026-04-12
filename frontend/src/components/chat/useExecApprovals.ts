@@ -10,6 +10,11 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import client from '../../api/client';
+import {
+  pruneExpiredExecApprovals,
+  removeExecApproval,
+  upsertExecApproval,
+} from '../../utils/execApprovalQueue';
 
 const DEBUG_EXEC_APPROVALS = import.meta.env.DEV;
 const debugLog = (...args: unknown[]) => {
@@ -34,14 +39,16 @@ export interface ExecApprovalRequest {
 
 export interface UseExecApprovalsReturn {
   pendingApproval: ExecApprovalRequest | null;
+  pendingApprovals: ExecApprovalRequest[];
+  pendingApprovalCount: number;
   resolveApproval: (approvalId: string, decision: 'allow-once' | 'deny' | 'allow-always') => Promise<void>;
-  dismissApproval: () => void;
+  dismissApproval: (approvalId?: string) => void;
   isConnected: boolean;
 }
 
 export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprovalsReturn {
   const enabled = options?.enabled !== false;
-  const [pendingApproval, setPendingApproval] = useState<ExecApprovalRequest | null>(null);
+  const [pendingApprovals, setPendingApprovals] = useState<ExecApprovalRequest[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -59,9 +66,7 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
       });
       if (response.data?.ok) {
         debugLog('[useExecApprovals] Approval resolved:', decision);
-        if (pendingApproval?.id === approvalId) {
-          setPendingApproval(null);
-        }
+        setPendingApprovals((prev) => removeExecApproval(prev, approvalId));
         return;
       }
       throw new Error('Approval did not complete');
@@ -70,11 +75,14 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
       // Keep the pending approval visible on failure so the user can retry or deny explicitly.
       throw err;
     }
-  }, [pendingApproval]);
+  }, []);
 
-  // Dismiss approval without resolving (e.g., modal closed)
-  const dismissApproval = useCallback(() => {
-    setPendingApproval(null);
+  // Dismiss approval without resolving (e.g., expired or intentionally hidden)
+  const dismissApproval = useCallback((approvalId?: string) => {
+    setPendingApprovals((prev) => {
+      if (!prev.length) return prev;
+      return approvalId ? removeExecApproval(prev, approvalId) : prev.slice(1);
+    });
   }, []);
 
   // Connect to SSE stream
@@ -125,7 +133,7 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
           const approval = data.approval as ExecApprovalRequest;
           if (approval?.id) {
             debugLog('[useExecApprovals] Approval requested:', approval.id);
-            setPendingApproval(approval);
+            setPendingApprovals((prev) => upsertExecApproval(prev, approval));
           }
           return;
         }
@@ -134,8 +142,7 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
           const resolved = data.resolved;
           if (resolved?.id) {
             debugLog('[useExecApprovals] Approval resolved:', resolved.id, resolved.decision);
-            // Clear if it's our pending approval
-            setPendingApproval((prev) => (prev?.id === resolved.id ? null : prev));
+            setPendingApprovals((prev) => removeExecApproval(prev, resolved.id));
           }
           return;
         }
@@ -195,26 +202,24 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
 
   // Auto-dismiss expired approvals
   useEffect(() => {
-    if (!pendingApproval) return;
+    if (!pendingApprovals.length) return;
 
-    const checkExpiry = () => {
-      if (Date.now() >= pendingApproval.expiresAtMs) {
-        debugLog('[useExecApprovals] Approval expired:', pendingApproval.id);
-        setPendingApproval(null);
-      }
+    const pruneExpired = () => {
+      setPendingApprovals((prev) => pruneExpiredExecApprovals(prev));
     };
 
-    // Check immediately
-    checkExpiry();
-
-    // Then check every 500ms
-    const interval = setInterval(checkExpiry, 500);
+    pruneExpired();
+    const interval = setInterval(pruneExpired, 500);
 
     return () => clearInterval(interval);
-  }, [pendingApproval]);
+  }, [pendingApprovals.length]);
+
+  const pendingApproval = pendingApprovals[0] || null;
 
   return {
     pendingApproval,
+    pendingApprovals,
+    pendingApprovalCount: pendingApprovals.length,
     resolveApproval,
     dismissApproval,
     isConnected,

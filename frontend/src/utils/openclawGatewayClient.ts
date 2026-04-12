@@ -32,13 +32,16 @@ export interface GatewayEventPayload {
   stream?: 'tool' | 'compaction' | 'lifecycle';
   ts?: number;
   data?: {
-    phase?: 'start' | 'update' | 'result';
+    phase?: 'start' | 'update' | 'result' | 'end';
     status?: 'start' | 'started' | 'end' | 'completed' | 'compacted';
     toolCallId?: string;
     name?: string;
     args?: unknown;
     result?: unknown;
     partialResult?: unknown;
+    completed?: boolean;
+    willRetry?: boolean;
+    statusText?: string;
   };
 }
 

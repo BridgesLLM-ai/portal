@@ -65,6 +65,23 @@ interface ResolvedAccount {
   email: string;
 }
 
+function getRequestedAccountId(req: Request): string | undefined {
+  const accountParam = typeof req.query.account === 'string' ? req.query.account : '';
+  return accountParam || undefined;
+}
+
+function isSharedMailboxAccount(accountId?: string): boolean {
+  return accountId === 'support' || accountId === 'noreply';
+}
+
+async function getSelectedPersonalMailboxCredentials(req: Request) {
+  const accountId = getRequestedAccountId(req);
+  if (isSharedMailboxAccount(accountId)) {
+    return null;
+  }
+  return getUserMailCredentials(req.user!.userId, accountId);
+}
+
 /**
  * Resolve which Stalwart account to use for a request.
  * - ?account=support or ?account=noreply → admin only
@@ -72,7 +89,7 @@ interface ResolvedAccount {
  * - If user has no mailbox, returns 'no_mailbox' string
  */
 async function resolveAccount(req: Request): Promise<ResolvedAccount | null | 'no_mailbox'> {
-  const accountParam = (req.query.account as string) || '';
+  const accountParam = getRequestedAccountId(req) || '';
   const isAdmin = isElevatedRole(req.user?.role);
 
   if (accountParam === 'support') {
@@ -82,7 +99,7 @@ async function resolveAccount(req: Request): Promise<ResolvedAccount | null | 'n
     return isAdmin ? { user: STALWART_NOREPLY_USER, pass: STALWART_NOREPLY_PASS, email: `noreply@${MAIL_DOMAIN}` } : null;
   }
 
-  const creds = await getUserMailCredentials(req.user!.userId, accountParam || undefined);
+  const creds = await getSelectedPersonalMailboxCredentials(req);
   if (!creds) return 'no_mailbox';
 
   return { user: creds.username, pass: creds.password, email: `${creds.username}@${MAIL_DOMAIN}` };
@@ -120,8 +137,8 @@ router.get('/accounts', async (req: Request, res: Response) => {
     
     if (isAdmin) {
       accounts.push(
-        { id: 'support', label: 'Support', email: `support@${MAIL_DOMAIN}` },
-        { id: 'noreply', label: 'No-Reply', email: `noreply@${MAIL_DOMAIN}` },
+        { id: 'support', label: 'Shared Support', email: `support@${MAIL_DOMAIN}` },
+        { id: 'noreply', label: 'Shared No-Reply', email: `noreply@${MAIL_DOMAIN}` },
       );
     }
     
@@ -194,7 +211,7 @@ router.get('/messages', async (req: Request, res: Response) => {
 
     // Auto-forward: trigger in background after response (non-blocking)
     if (result.emails?.length && effectiveRole === 'inbox') {
-      const creds = await getUserMailCredentials(req.user!.userId);
+      const creds = await getSelectedPersonalMailboxCredentials(req);
       if (creds) {
         const mailbox = await prisma.mailboxAccount.findFirst({
           where: { id: creds.accountId },
@@ -629,7 +646,13 @@ router.put('/signature', async (req: Request, res: Response) => {
 // ── GET /api/mail/forward-settings ────────────────────────────
 router.get('/forward-settings', async (req: Request, res: Response) => {
   try {
-    const creds = await getUserMailCredentials(req.user!.userId);
+    const accountId = getRequestedAccountId(req);
+    if (isSharedMailboxAccount(accountId)) {
+      res.status(400).json({ error: 'Forward settings are only available for personal mailboxes' });
+      return;
+    }
+
+    const creds = await getSelectedPersonalMailboxCredentials(req);
     if (!creds) {
       res.json({ autoForwardTo: null });
       return;
@@ -650,8 +673,14 @@ router.get('/forward-settings', async (req: Request, res: Response) => {
 // ── PUT /api/mail/forward-settings ────────────────────────────
 router.put('/forward-settings', async (req: Request, res: Response) => {
   try {
+    const accountId = getRequestedAccountId(req);
+    if (isSharedMailboxAccount(accountId)) {
+      res.status(400).json({ error: 'Forward settings are only available for personal mailboxes' });
+      return;
+    }
+
     const { autoForwardTo } = req.body;
-    const creds = await getUserMailCredentials(req.user!.userId);
+    const creds = await getSelectedPersonalMailboxCredentials(req);
 
     if (!creds) {
       res.status(400).json({ error: 'No mailbox configured' });
@@ -687,7 +716,13 @@ router.put('/forward-settings', async (req: Request, res: Response) => {
 // ── GET /api/mail/credentials ─────────────────────────────────
 router.get('/credentials', async (req: Request, res: Response) => {
   try {
-    const creds = await getUserMailCredentials(req.user!.userId);
+    const accountId = getRequestedAccountId(req);
+    if (isSharedMailboxAccount(accountId)) {
+      res.status(400).json({ error: 'Setup credentials are only available for personal mailboxes' });
+      return;
+    }
+
+    const creds = await getSelectedPersonalMailboxCredentials(req);
     if (!creds) {
       res.status(404).json({ error: 'No mailbox configured' });
       return;

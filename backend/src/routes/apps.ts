@@ -8,6 +8,7 @@ import { execFileSync, execSync } from 'child_process';
 import { nanoid } from 'nanoid';
 import bcrypt from 'bcrypt';
 import { authenticateToken } from '../middleware/auth';
+import { requireApproved } from '../middleware/requireApproved';
 import extract from 'extract-zip';
 import { scanFile } from '../services/virusScan';
 import { prisma } from '../config/database';
@@ -17,6 +18,11 @@ const router = Router();
 
 const APPS_DIR = '/portal/apps';
 const ZIPS_DIR = '/portal/app-zips';
+
+function redactShareLink<T extends { passwordHash?: string | null }>(shareLink: T): Omit<T, 'passwordHash'> {
+  const { passwordHash, ...safeShareLink } = shareLink;
+  return safeShareLink;
+}
 
 fs.mkdirSync(APPS_DIR, { recursive: true });
 fs.mkdirSync(ZIPS_DIR, { recursive: true });
@@ -41,7 +47,7 @@ const upload = multer({
 });
 
 // POST /api/apps - upload and extract
-router.post('/', authenticateToken, upload.single('file'), async (req: Request, res: Response) => {
+router.post('/', authenticateToken, requireApproved, upload.single('file'), async (req: Request, res: Response) => {
   try {
     if (!req.file) {
       res.status(400).json({ error: 'No zip file provided' });
@@ -128,14 +134,20 @@ router.post('/', authenticateToken, upload.single('file'), async (req: Request, 
 });
 
 // GET /api/apps - list
-router.get('/', authenticateToken, async (req: Request, res: Response) => {
+router.get('/', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const apps = await prisma.app.findMany({
       where: { userId: req.user!.userId },
       include: { shareLinks: { where: { isActive: true } } },
       orderBy: { createdAt: 'desc' },
     });
-    res.json({ apps });
+
+    const safeApps = apps.map(({ shareLinks, ...app }) => ({
+      ...app,
+      shareLinks: shareLinks.map((shareLink) => redactShareLink(shareLink)),
+    }));
+
+    res.json({ apps: safeApps });
   } catch (error) {
     console.error('List apps error:', error);
     res.status(500).json({ error: 'Failed to list apps' });
@@ -143,7 +155,7 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
 });
 
 // DELETE /api/apps/:id
-router.delete('/:id', authenticateToken, async (req: Request, res: Response) => {
+router.delete('/:id', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const app = await prisma.app.findFirst({
       where: { id: req.params.id, userId: req.user!.userId },
@@ -179,7 +191,7 @@ router.delete('/:id', authenticateToken, async (req: Request, res: Response) => 
 });
 
 // POST /api/apps/:id/share - create share link
-router.post('/:id/share', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:id/share', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const app = await prisma.app.findFirst({
       where: { id: req.params.id, userId: req.user!.userId },
@@ -201,7 +213,7 @@ router.post('/:id/share', authenticateToken, async (req: Request, res: Response)
       },
     });
 
-    res.status(201).json({ shareLink, url: `/share/${token}` });
+    res.status(201).json({ shareLink: redactShareLink(shareLink), url: `/share/${token}` });
   } catch (error) {
     console.error('Create share link error:', error);
     res.status(500).json({ error: 'Failed to create share link' });

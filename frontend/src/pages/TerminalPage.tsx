@@ -14,7 +14,6 @@ import { useIsMobile } from '../hooks/useIsMobile';
 import { captureError } from '../utils/errorHandler';
 import { getShortModelLabel } from '../utils/modelId';
 import sounds from '../utils/sounds';
-import { clientRandomId } from '../utils/clientId';
 import 'xterm/css/xterm.css';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
@@ -75,7 +74,7 @@ const TOOL_PRESET_GROUPS: Array<{ tool: string; commands: string[] }> = [
   { tool: 'OpenClaw', commands: ['openclaw status', 'openclaw gateway status', 'openclaw gateway restart', 'openclaw doctor'] },
   { tool: 'Setup', commands: ['openclaw onboard', 'openclaw configure', 'openclaw channels list', 'openclaw models status'] },
   { tool: 'Claude Code', commands: ['claude', 'claude --continue', 'claude --resume'] },
-  { tool: 'Codex', commands: ['codex', 'codex --approval-mode full-auto'] },
+  { tool: 'Codex', commands: ['codex', 'codex exec "task"'] },
   { tool: 'System', commands: ['htop', 'df -h', 'free -h', 'docker ps'] },
 ];
 
@@ -395,8 +394,8 @@ const AUTOCOMPLETE_DB: AutocompleteSuggestion[] = [
   { command: 'npx prisma migrate deploy', description: 'Apply prod migrations', category: 'database' },
   { command: 'npx prisma db push', description: 'Push schema to DB', category: 'database' },
   { command: 'npx prisma generate', description: 'Generate Prisma client', category: 'database' },
-  { command: 'psql -U bridges -d bridgesllm_portal', description: 'Connect to portal DB', category: 'database' },
-  { command: 'pg_dump -U bridges bridgesllm_portal > backup.sql', description: 'Backup database', category: 'database' },
+  { command: 'psql "$(grep \'^DATABASE_URL=\' /opt/bridgesllm/portal/backend/.env.production | cut -d= -f2- | tr -d \"\")"', description: 'Connect to configured portal DB', category: 'database' },
+  { command: 'pg_dump "$(grep \'^DATABASE_URL=\' /opt/bridgesllm/portal/backend/.env.production | cut -d= -f2- | tr -d \"\")" > backup.sql', description: 'Backup configured portal DB', category: 'database' },
   // ── SSL / Certbot ─────────────────────────────────────────────
   { command: 'certbot certificates', description: 'List SSL certificates', category: 'ssl' },
   { command: 'certbot renew --dry-run', description: 'Test certificate renewal', category: 'ssl' },
@@ -418,8 +417,8 @@ const AUTOCOMPLETE_DB: AutocompleteSuggestion[] = [
   { command: 'claude --resume', description: 'Resume Claude session', category: 'agents' },
   { command: 'claude -p "task"', description: 'One-shot Claude task', category: 'agents' },
   { command: 'codex', description: 'Start Codex session', category: 'agents' },
-  { command: 'codex --approval-mode full-auto', description: 'Codex in full-auto mode', category: 'agents' },
   { command: 'codex exec "task"', description: 'One-shot Codex task', category: 'agents' },
+  { command: 'codex --help', description: 'Show Codex CLI options', category: 'agents' },
   { command: 'gemini', description: 'Start Gemini CLI session', category: 'agents' },
   // ── Text Processing ───────────────────────────────────────────
   { command: 'wc -l', description: 'Count lines', category: 'text' },
@@ -1015,15 +1014,13 @@ interface TabSession {
 interface PersistedTerminalState {
   tabs: TabDescriptor[];
   activeTabId: string;
-  shellSessionByTab: Record<string, string>;
 }
 
 // ─── Independent Shell Tab Component ─────────────────────────────
 // Each instance creates its own PTY socket + xterm terminal.
 // The div persists; parent shows/hides via CSS.
-function ShellTabSession({ tabId, terminalSessionId, isActive, onConnectionChange, onRunningChange, onDanger, onShowAssistant, acActiveRef, acSelectedIndexRef, setAcSuggestions, setAcSelectedIndex, setAcVisible, setAcInput }: {
+function ShellTabSession({ tabId, isActive, onConnectionChange, onRunningChange, onDanger, onShowAssistant, acActiveRef, acSelectedIndexRef, setAcSuggestions, setAcSelectedIndex, setAcVisible, setAcInput }: {
   tabId: string;
-  terminalSessionId: string;
   isActive: boolean;
   onConnectionChange: (tabId: string, connected: boolean) => void;
   onRunningChange: (tabId: string, running: boolean) => void;
@@ -1062,7 +1059,6 @@ function ShellTabSession({ tabId, terminalSessionId, isActive, onConnectionChang
       transports: ['polling', 'websocket'],
       reconnection: false,
       withCredentials: true,
-      query: { terminalSessionId },
     });
 
     const session: TabSession = {
@@ -1073,17 +1069,26 @@ function ShellTabSession({ tabId, terminalSessionId, isActive, onConnectionChang
     tabSessionMap.set(tabId, session);
 
     socket.on('connect', () => {
+      const resumedAfterDisconnect = reconnectAttempt > 0;
       session.connected = true;
+      session.running = false;
+      session.inputBuffer = '';
       reconnectAttempt = 0;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
       onConnectionChange(tabId, true);
+      onRunningChange(tabId, false);
       term.writeln('\r\n\x1b[38;5;240m────────────────────────────────────────\x1b[0m');
-      term.writeln('\x1b[32m ✓ Connected to Terminal\x1b[0m');
-      term.writeln('\x1b[38;5;240m   Ctrl+K → AI Lookup  ·  Ctrl+T → New Tab\x1b[0m');
-      term.writeln('\x1b[38;5;240m   Ctrl+` → Assistant  ·  ⚠️ Dangerous cmds require confirmation\x1b[0m');
+      if (resumedAfterDisconnect) {
+        term.writeln('\x1b[33m ↻ Connected to a fresh shell\x1b[0m');
+        term.writeln('\x1b[38;5;240m   The previous shell could not be resumed after the disconnect.\x1b[0m');
+      } else {
+        term.writeln('\x1b[32m ✓ Connected to Terminal\x1b[0m');
+        term.writeln('\x1b[38;5;240m   Ctrl+K → AI Lookup  ·  Ctrl+T → New Tab\x1b[0m');
+        term.writeln('\x1b[38;5;240m   Ctrl+` → Assistant  ·  ⚠️ Dangerous cmds require confirmation\x1b[0m');
+      }
       term.writeln('\x1b[38;5;240m────────────────────────────────────────\x1b[0m\r\n');
     });
 
@@ -1093,13 +1098,17 @@ function ShellTabSession({ tabId, terminalSessionId, isActive, onConnectionChang
 
     socket.on('disconnect', (reason) => {
       session.connected = false;
+      session.running = false;
+      session.inputBuffer = '';
       onConnectionChange(tabId, false);
+      onRunningChange(tabId, false);
       // Don't attempt reconnect if intentionally closed
       if (reason === 'io client disconnect') {
-        term.writeln('\r\n\x1b[31m ✗ Disconnected from terminal\x1b[0m\r\n');
+        term.writeln('\r\n\x1b[31m ✗ Disconnected from terminal\x1b[0m');
+        term.writeln('\x1b[38;5;240m   Open a new tab or reset the terminal to start a fresh shell.\x1b[0m\r\n');
         return;
       }
-      term.writeln('\r\n\x1b[33m ⟳ Connection lost — reconnecting...\x1b[0m');
+      term.writeln('\r\n\x1b[33m ⟳ Connection lost — retrying with a fresh shell...\x1b[0m');
       reconnectAttempt = 0;
       const tryReconnect = () => {
         if (session.connected) return;
@@ -1118,7 +1127,7 @@ function ShellTabSession({ tabId, terminalSessionId, isActive, onConnectionChang
       // Treat these as transient until we've truly failed repeated recovery.
       if (reconnectAttempt === 0) {
         reconnectAttempt = 1;
-        term.writeln('\r\n\x1b[33m ⟳ Terminal connection failed — retrying...\x1b[0m');
+        term.writeln('\r\n\x1b[33m ⟳ Terminal connection failed — retrying a fresh shell...\x1b[0m');
       }
       if (reconnectAttempt < 10) {
         const delay = Math.min(1000 * Math.pow(2, reconnectAttempt - 1), 30000);
@@ -1129,7 +1138,7 @@ function ShellTabSession({ tabId, terminalSessionId, isActive, onConnectionChang
         reconnectAttempt++;
       } else {
         captureError(err || new Error('Terminal socket connect_error'), 'system', 'terminal websocket connect_error');
-        term.writeln('\r\n\x1b[31m ✗ Could not reconnect after 10 attempts\x1b[0m\r\n');
+        term.writeln('\r\n\x1b[31m ✗ Could not start a fresh shell after 10 attempts\x1b[0m\r\n');
       }
     });
 
@@ -1218,7 +1227,7 @@ function ShellTabSession({ tabId, terminalSessionId, isActive, onConnectionChang
       term.dispose();
       tabSessionMap.delete(tabId);
     };
-  }, [terminalSessionId]); // Mount once for a given persisted session id
+  }, [tabId, onConnectionChange, onDanger, onRunningChange, onShowAssistant, setAcInput, setAcSelectedIndex, setAcSuggestions, setAcVisible]);
 
   // Re-fit when becoming active or layout changes
   useEffect(() => {
@@ -1237,15 +1246,6 @@ function ShellTabSession({ tabId, terminalSessionId, isActive, onConnectionChang
 
 // Global session map — lets parent access any tab's terminal/socket without React state
 const tabSessionMap = new Map<string, TabSession>();
-const shellSessionIdMap = new Map<string, string>();
-
-function getOrCreateShellSessionId(tabId: string): string {
-  const existing = shellSessionIdMap.get(tabId);
-  if (existing) return existing;
-  const created = clientRandomId('term-');
-  shellSessionIdMap.set(tabId, created);
-  return created;
-}
 
 // ─── Simple tab descriptor (no heavy objects in React state) ─────
 interface TabDescriptor {
@@ -1822,7 +1822,6 @@ export default function TerminalPage() {
     return {
       tabs: [{ id: tabId, label: 'bash', type: 'shell' }],
       activeTabId: tabId,
-      shellSessionByTab: { [tabId]: clientRandomId('term-') },
     };
   };
 
@@ -1834,17 +1833,10 @@ export default function TerminalPage() {
       if (!Array.isArray(parsed?.tabs) || parsed.tabs.length === 0) return buildDefaultState();
       const normalizedTabs = parsed.tabs.filter((t) => t?.id && (t.type === 'shell' || t.type === 'chat' || t.type === 'openclaw-tui'));
       if (normalizedTabs.length === 0) return buildDefaultState();
-      const shellSessionByTab: Record<string, string> = { ...(parsed.shellSessionByTab || {}) };
-      for (const tab of normalizedTabs) {
-        if (tab.type === 'shell' && !shellSessionByTab[tab.id]) {
-          shellSessionByTab[tab.id] = clientRandomId('term-');
-        }
-      }
       const activeTabExists = normalizedTabs.some((t) => t.id === parsed.activeTabId);
       return {
         tabs: normalizedTabs,
         activeTabId: activeTabExists ? parsed.activeTabId : normalizedTabs[0].id,
-        shellSessionByTab,
       };
     } catch {
       return buildDefaultState();
@@ -1881,35 +1873,9 @@ export default function TerminalPage() {
   const newTabButtonRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
-    for (const tab of tabs) {
-      if (tab.type === 'shell') {
-        const existing = initialState.shellSessionByTab[tab.id] || shellSessionIdMap.get(tab.id);
-        if (existing) {
-          shellSessionIdMap.set(tab.id, existing);
-        } else {
-          shellSessionIdMap.set(tab.id, clientRandomId('term-'));
-        }
-      }
-    }
-  }, [tabs, initialState.shellSessionByTab]);
-
-  useEffect(() => {
-    const shellSessionByTab: Record<string, string> = {};
-    for (const tab of tabs) {
-      if (tab.type !== 'shell') continue;
-      const current = shellSessionIdMap.get(tab.id);
-      if (!current) {
-        const created = clientRandomId('term-');
-        shellSessionIdMap.set(tab.id, created);
-        shellSessionByTab[tab.id] = created;
-      } else {
-        shellSessionByTab[tab.id] = current;
-      }
-    }
     const snapshot: PersistedTerminalState = {
       tabs,
       activeTabId,
-      shellSessionByTab,
     };
     sessionStorage.setItem(TERMINAL_STATE_STORAGE_KEY, JSON.stringify(snapshot));
   }, [tabs, activeTabId]);
@@ -1922,9 +1888,6 @@ export default function TerminalPage() {
     if (type === 'shell') { const shellCount = tabs.filter(t => t.type === 'shell').length; label = `bash ${shellCount + 1}`; }
     else if (type === 'openclaw-tui') { label = '💬 OpenClaw'; }
     else { label = '💬 Assistant'; }
-    if (type === 'shell') {
-      shellSessionIdMap.set(id, clientRandomId('term-'));
-    }
     setTabs(prev => [...prev, { id, label, type }]);
     setActiveTabId(id);
     setShowNewTabMenu(false);
@@ -1935,7 +1898,6 @@ export default function TerminalPage() {
     if (tabs.length <= 1) return;
     // Session cleanup happens in ShellTabSession's useEffect return
     setTabs(prev => prev.filter(t => t.id !== tabId));
-    shellSessionIdMap.delete(tabId);
     if (activeTabId === tabId) {
       setActiveTabId(prev => {
         const remaining = tabs.filter(t => t.id !== tabId);
@@ -2216,7 +2178,6 @@ export default function TerminalPage() {
               <ShellTabSession
                 key={tab.id}
                 tabId={tab.id}
-                terminalSessionId={getOrCreateShellSessionId(tab.id)}
                 isActive={tab.id === activeTabId}
                 onConnectionChange={handleConnectionChange}
                 onRunningChange={handleRunningChange}

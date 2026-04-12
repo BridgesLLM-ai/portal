@@ -16,13 +16,16 @@ interface ComposeModalProps {
   mailboxes: MailboxInfo[];
   isMobile: boolean;
   account?: string;
+  accountEmail?: string;
 }
 
 export default function ComposeModal({
-  onClose, onSent, composeState, mailboxes, isMobile, account,
+  onClose, onSent, composeState, mailboxes, isMobile, account, accountEmail,
 }: ComposeModalProps) {
   const { mode, replyTo } = composeState;
-  const selfEmail = 'user@bridgesllm.com'; // Will be overridden by the account email
+  const normalizedSelfEmail = accountEmail?.trim().toLowerCase() || '';
+  const selfEmail = accountEmail?.trim() || 'user@bridgesllm.com';
+  const isSelfAddress = (email: string) => normalizedSelfEmail !== '' && email.trim().toLowerCase() === normalizedSelfEmail;
 
   const getInitialTo = () => {
     if (!replyTo) return '';
@@ -30,8 +33,8 @@ export default function ComposeModal({
       return (replyTo.replyTo || replyTo.from).map(a => a.email).join(', ');
     }
     if (mode === 'replyAll') {
-      const senders = (replyTo.replyTo || replyTo.from).map(a => a.email);
-      const toRecipients = (replyTo.to || []).map(a => a.email).filter(e => e !== selfEmail);
+      const senders = (replyTo.replyTo || replyTo.from).map(a => a.email).filter(email => !isSelfAddress(email));
+      const toRecipients = (replyTo.to || []).map(a => a.email).filter(email => !isSelfAddress(email));
       return [...new Set([...senders, ...toRecipients])].join(', ');
     }
     return '';
@@ -39,7 +42,7 @@ export default function ComposeModal({
 
   const getInitialCc = () => {
     if (mode === 'replyAll' && replyTo?.cc?.length) {
-      return replyTo.cc.map(a => a.email).filter(e => e !== selfEmail).join(', ');
+      return replyTo.cc.map(a => a.email).filter(email => !isSelfAddress(email)).join(', ');
     }
     return '';
   };

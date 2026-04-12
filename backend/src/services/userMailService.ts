@@ -7,6 +7,7 @@
 
 import crypto from 'crypto';
 import { prisma } from '../config/database';
+import { isReservedSystemMailboxUsername, normalizeMailboxUsername } from '../utils/reservedMailboxUsernames';
 
 function getStalwartUrl() { return process.env.STALWART_URL || 'http://127.0.0.1:8580'; }
 function getStalwartAdminPass() { return process.env.STALWART_ADMIN_PASS || ''; }
@@ -15,10 +16,6 @@ function getMailDomain() { return process.env.MAIL_DOMAIN || 'localhost'; }
 
 function adminAuthHeader(): string {
   return 'Basic ' + Buffer.from(`${STALWART_ADMIN_USER}:${getStalwartAdminPass()}`).toString('base64');
-}
-
-function normalizeMailboxUsername(username: string): string {
-  return username.trim().toLowerCase();
 }
 
 function generateMailPassword(): string {
@@ -49,6 +46,11 @@ async function ensureLegacyMailboxMigrated(userId: string): Promise<void> {
   }
 
   const normalized = normalizeMailboxUsername(user.username);
+  if (isReservedSystemMailboxUsername(normalized)) {
+    console.warn(`[userMail] Skipping legacy mailbox migration for reserved system username '${normalized}' on user ${userId}`);
+    return;
+  }
+
   await prisma.mailboxAccount.upsert({
     where: { username: normalized },
     update: {
@@ -84,6 +86,10 @@ export async function provisionUserMailbox(
   options?: { makePrimary?: boolean }
 ): Promise<string> {
   const stalwartName = normalizeMailboxUsername(username);
+  if (isReservedSystemMailboxUsername(stalwartName)) {
+    throw new Error(`Mailbox username '${stalwartName}' is reserved for system use`);
+  }
+
   const email = `${stalwartName}@${getMailDomain()}`;
 
   // If this user already has a DB record with a password, reuse it to avoid
@@ -167,6 +173,9 @@ export async function provisionUserMailbox(
 
 export async function deleteUserMailbox(username: string): Promise<void> {
   const stalwartName = normalizeMailboxUsername(username);
+  if (isReservedSystemMailboxUsername(stalwartName)) {
+    throw new Error(`Refusing to delete reserved system mailbox '${stalwartName}' through user mailbox cleanup`);
+  }
 
   try {
     const res = await fetch(`${getStalwartUrl()}/api/principal/${stalwartName}`, {
@@ -248,12 +257,14 @@ export async function getUserMailAccounts(userId: string): Promise<Array<{
     }
   }
 
-  return (user?.mailboxAccounts || []).map((mailbox) => ({
-    id: mailbox.id,
-    username: mailbox.username,
-    password: mailbox.mailPassword,
-    isPrimary: mailbox.isPrimary,
-  }));
+  return (user?.mailboxAccounts || [])
+    .filter((mailbox) => !isReservedSystemMailboxUsername(mailbox.username))
+    .map((mailbox) => ({
+      id: mailbox.id,
+      username: mailbox.username,
+      password: mailbox.mailPassword,
+      isPrimary: mailbox.isPrimary,
+    }));
 }
 
 export async function getUserMailCredentials(

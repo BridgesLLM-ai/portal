@@ -4,6 +4,22 @@ import axios from 'axios';
 import { prisma } from '../config/database';
 import { PORTAL_VERSION } from '../version';
 
+function describeTelemetryError(error: any): { level: 'warn' | 'info'; message: string } {
+  const status = Number(error?.response?.status || 0);
+  if (status === 429) {
+    return {
+      level: 'info',
+      message: 'Ping rate-limited by telemetry endpoint; keeping cached version state and retrying on the next scheduled check.',
+    };
+  }
+
+  const message = String(error?.message || error || 'Unknown telemetry error').trim();
+  return {
+    level: 'warn',
+    message,
+  };
+}
+
 const TELEMETRY_URL = 'https://bridgesllm.ai/api/telemetry/ping';
 const STARTUP_DELAY_MS = 30_000;
 const DAILY_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -165,7 +181,12 @@ async function sendTelemetryPing(): Promise<void> {
       await setSettingValue('system.latestVersion', latestVersion);
     }
   } catch (error: any) {
-    console.warn('[telemetry] Ping failed:', error?.message || error);
+    const details = describeTelemetryError(error);
+    if (details.level === 'info') {
+      console.info(`[telemetry] ${details.message}`);
+    } else {
+      console.warn('[telemetry] Ping failed:', details.message);
+    }
   }
 }
 

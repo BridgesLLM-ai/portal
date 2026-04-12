@@ -7,7 +7,7 @@
  * 2. Smart scroll-to-bottom button (only shown when scrolled up)
  * 3. Dictation / Speech-to-text button
  * 4. File attachment button with chip previews
- * 5. Thinking display with elapsed timer
+ * 5. Stream status shown through the shared status rail
  * 6. Tool use as centered iMessage-style system notification pills
  */
 import {
@@ -16,17 +16,17 @@ import {
   ComposerPrimitive,
 } from '@assistant-ui/react';
 import { useAgentRuntime, type ChatMessage, type ToolCall, type ExecApprovalRequest } from './useAgentRuntime';
-import { useChatState } from '../../contexts/ChatStateProvider';
+import { useChatState, type OpenClawSessionTelemetry } from '../../contexts/ChatStateProvider';
 import { useExecApprovals } from './useExecApprovals';
 import { ExecApprovalModal } from './ExecApprovalModal';
 import MarkdownRenderer from './MarkdownRenderer';
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Send, StopCircle, Pencil, Settings, X, ChevronDown,
   Check, RefreshCw, Wrench, Loader2, CheckCircle2, XCircle, ShieldAlert, Radio,
   Sparkles, Copy, RotateCcw, MessageSquare, Code2, Bug, ChevronRight, Clock,
-  Paperclip, Mic, PenSquare, ListChecks, Layers3, TerminalSquare, Slash, Settings2,
+  Paperclip, Mic, PenSquare, Layers3, Settings2,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import AgentSelector, { type AgentSelection } from './AgentSelector';
@@ -38,6 +38,7 @@ import { agentToolsAPI, AgentTool } from '../../api/agentTools';
 import { gatewayAPI, type CompatibilityHotfixStatus } from '../../api/endpoints';
 import SlashCommandMenu from './SlashCommandMenu';
 import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../utils/slashCommands';
+import { mergeExecApprovalQueues } from '../../utils/execApprovalQueue';
 import { executeSlashCommand } from '../../utils/slashCommandExecutor';
 import client from '../../api/client';
 import sounds from '../../utils/sounds';
@@ -51,6 +52,7 @@ import {
   getModelRuntimeLabel,
   getShortModelLabel,
 } from '../../utils/modelId';
+import ComposerStatusBadge from './ComposerStatusBadge';
 
 /* ─── Per-agent identity ────────────────────────────────────────────────── */
 
@@ -297,55 +299,6 @@ function ModelPickerDropdown({ open, onClose, children }: { open: boolean; onClo
   );
 }
 
-
-function capabilityPillTone(tone: 'violet' | 'sky' | 'emerald' | 'amber' | 'slate' = 'slate') {
-  switch (tone) {
-    case 'violet': return 'border-violet-500/20 bg-violet-500/10 text-violet-200';
-    case 'sky': return 'border-sky-500/20 bg-sky-500/10 text-sky-200';
-    case 'emerald': return 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200';
-    case 'amber': return 'border-amber-500/20 bg-amber-500/10 text-amber-200';
-    default: return 'border-white/[0.08] bg-white/[0.04] text-slate-300';
-  }
-}
-
-function buildProviderCapabilityPills(params: {
-  commandCount: number;
-  capabilities?: ProviderCapabilities;
-  availableModels: string[];
-}) {
-  const { commandCount, capabilities, availableModels } = params;
-  const pills: Array<{ icon: React.ReactNode; label: string; tone?: 'violet' | 'sky' | 'emerald' | 'amber' | 'slate' }> = [];
-
-  pills.push({ icon: <Slash size={11} />, label: `${commandCount} slash command${commandCount === 1 ? '' : 's'}`, tone: commandCount > 0 ? 'emerald' : 'amber' });
-
-  if (capabilities?.supportsModelSelection) {
-    const mode = capabilities.modelSelectionMode === 'launch' ? 'per chat' : capabilities.modelSelectionMode === 'session' ? 'live session' : 'manual';
-    pills.push({ icon: <Code2 size={11} />, label: `Model switching: ${mode}`, tone: 'violet' });
-  }
-
-  if (capabilities?.canEnumerateModels || availableModels.length > 0) {
-    const source = capabilities?.modelCatalogKind === 'declared' ? 'declared catalog' : 'live catalog';
-    pills.push({ icon: <Layers3 size={11} />, label: `${source}${availableModels.length > 0 ? ` (${availableModels.length})` : ''}`, tone: 'sky' });
-  } else if (capabilities?.supportsCustomModelInput !== false) {
-    pills.push({ icon: <TerminalSquare size={11} />, label: 'Manual model entry', tone: 'amber' });
-  }
-
-  pills.push({ icon: <ListChecks size={11} />, label: capabilities?.supportsSessionList ? 'Session list available' : 'No session list', tone: capabilities?.supportsSessionList ? 'sky' : 'slate' });
-
-  if (capabilities?.supportsInTurnSteering) {
-    pills.push({ icon: <MessageSquare size={11} />, label: 'Live note injection while running', tone: 'emerald' });
-  } else if (capabilities?.supportsQueuedFollowUps !== false) {
-    pills.push({ icon: <Clock size={11} />, label: 'Queued follow-ups while running', tone: 'amber' });
-  }
-
-  if (capabilities?.supportsExecApproval) {
-    pills.push({ icon: <ShieldAlert size={11} />, label: 'Exec approvals supported', tone: 'amber' });
-  }
-
-  pills.push({ icon: <Radio size={11} />, label: capabilities?.requiresGateway ? 'Gateway transport' : 'Native CLI transport', tone: capabilities?.requiresGateway ? 'sky' : 'slate' });
-
-  return pills;
-}
 
 function ModelPicker({
   provider,
@@ -669,20 +622,6 @@ interface SessionControlsProps {
   onToggleFastMode: () => void;
   onSetCompactionModelOverride: (model: string) => void;
   onSetHeartbeatModel: (model: string) => void;
-  providerLabel: string;
-  providerCommandCount: number;
-  providerCommandStatus: string;
-  providerCapabilities?: {
-    requiresGateway?: boolean;
-    supportsHistory?: boolean;
-    supportsModelSelection?: boolean;
-    modelSelectionMode?: string;
-    supportsCustomModelInput?: boolean;
-    canEnumerateModels?: boolean;
-    supportsSessionList?: boolean;
-    supportsExecApproval?: boolean;
-    modelCatalogKind?: string;
-  };
   availableModels: string[];
   compactionAvailableModels?: string[];
   compactionModelLoading?: boolean;
@@ -714,10 +653,6 @@ function SessionControls({
   onToggleFastMode,
   onSetCompactionModelOverride,
   onSetHeartbeatModel,
-  providerLabel,
-  providerCommandCount,
-  providerCommandStatus,
-  providerCapabilities,
   availableModels,
   compactionAvailableModels = [],
   compactionModelLoading = false,
@@ -730,17 +665,11 @@ function SessionControls({
   sessionKey,
 }: SessionControlsProps) {
   const [isOpen, setIsOpen] = useState(false);
-  const [providerInfoOpen, setProviderInfoOpen] = useState(false);
   const [localThinking, setLocalThinking] = useState(thinkingLevel);
   const localThinkingRef = useRef<number | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   // Sync local thinking with prop when it changes (e.g., after API confirms)
   useEffect(() => { setLocalThinking(thinkingLevel); }, [thinkingLevel]);
-  const providerPills = buildProviderCapabilityPills({
-    commandCount: providerCommandCount,
-    capabilities: providerCapabilities,
-    availableModels,
-  });
   const effectiveCompactionModels = Array.from(new Set([
     ...compactionAvailableModels,
     ...(compactionModelOverride && !compactionAvailableModels.includes(compactionModelOverride) ? [compactionModelOverride] : []),
@@ -969,7 +898,7 @@ function SessionControls({
                     <button
                       onClick={() => onApplyCompatibilityHotfix?.()}
                       disabled={disabled || compatibilityHotfixApplying || compatibilityHotfixLoading || !compatibilityHotfixStatus?.supported}
-                      className="rounded-md bg-amber-500 px-2.5 py-1 text-[10px] font-medium text-black hover:bg-amber-400 disabled:opacity-50"
+                      className="inline-flex min-h-[32px] items-center justify-center rounded-md border border-amber-200/70 bg-gradient-to-r from-amber-300 via-amber-400 to-amber-500 px-2.5 py-1 text-[10px] font-semibold text-slate-950 shadow-[0_8px_20px_rgba(245,158,11,0.24)] transition-all hover:-translate-y-0.5 hover:from-amber-200 hover:via-amber-300 hover:to-amber-400 hover:shadow-[0_12px_24px_rgba(245,158,11,0.3)] disabled:translate-y-0 disabled:cursor-not-allowed disabled:border-white/[0.08] disabled:bg-white/[0.08] disabled:bg-none disabled:text-slate-200 disabled:shadow-none"
                     >
                       {compatibilityHotfixApplying ? 'Applying…' : compatibilityHotfixStatus?.applied ? 'Reapply + restart' : 'Apply + restart'}
                     </button>
@@ -986,54 +915,6 @@ function SessionControls({
                 </div>
               </div>
 
-              <div className="pt-2 border-t border-white/[0.06]">
-                <button
-                  onClick={() => setProviderInfoOpen((prev) => !prev)}
-                  className="w-full flex items-center justify-between text-left rounded-lg px-2 py-1.5 hover:bg-white/[0.03] transition-colors"
-                >
-                  <div>
-                    <div className="text-xs font-medium text-white">Provider Info</div>
-                    <div className="text-[10px] text-slate-500">{providerLabel} runtime capabilities</div>
-                  </div>
-                  <ChevronDown size={13} className={`text-slate-400 transition-transform ${providerInfoOpen ? 'rotate-180' : ''}`} />
-                </button>
-                <AnimatePresence initial={false}>
-                  {providerInfoOpen && (
-                    <motion.div
-                      initial={{ opacity: 0, height: 0 }}
-                      animate={{ opacity: 1, height: 'auto' }}
-                      exit={{ opacity: 0, height: 0 }}
-                      className="overflow-hidden"
-                    >
-                      <div className="pt-2 space-y-2">
-                        <div className="grid grid-cols-2 gap-2">
-                          <div className="rounded-lg border border-white/[0.06] bg-white/[0.03] px-2.5 py-2">
-                            <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">Commands</div>
-                            <div className="mt-1 text-sm font-semibold text-white">{providerCommandCount}</div>
-                            <div className="text-[10px] text-slate-500 mt-1">{providerCommandStatus}</div>
-                          </div>
-                          <div className="rounded-lg border border-white/[0.06] bg-white/[0.03] px-2.5 py-2">
-                            <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">Models</div>
-                            <div className="mt-1 text-sm font-semibold text-white">{availableModels.length || '—'}</div>
-                          </div>
-                        </div>
-                        <div className="flex flex-wrap gap-1.5">
-                          {providerPills.map((pill, idx) => (
-                            <span
-                              key={`${pill.label}-${idx}`}
-                              className={`inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[10px] font-medium ${capabilityPillTone(pill.tone)}`}
-                              title={`${providerLabel}: ${pill.label}`}
-                            >
-                              {pill.icon}
-                              <span>{pill.label}</span>
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </div>
             </div>
           </motion.div>
         )}
@@ -1185,95 +1066,6 @@ function AgentSettingsDrawer({ open, onClose }: { open: boolean; onClose: () => 
         </>
       )}
     </AnimatePresence>
-  );
-}
-
-/* ─── Fix #5: Thinking Block with elapsed timer ─────────────────────────── */
-
-function ThinkingBlock({ content, isActive, activeLabel }: { content?: string; isActive: boolean; activeLabel?: string }) {
-  const [expanded, setExpanded] = useState(false);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const startTimeRef = useRef<number | null>(null);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  useEffect(() => {
-    if (isActive) {
-      startTimeRef.current = Date.now();
-      setElapsedSeconds(0);
-      intervalRef.current = setInterval(() => {
-        if (startTimeRef.current !== null) {
-          setElapsedSeconds(Math.floor((Date.now() - startTimeRef.current) / 1000));
-        }
-      }, 1000);
-    } else {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-      startTimeRef.current = null;
-    }
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, [isActive]);
-
-  if (!isActive && !content) return null;
-
-  // Allow expansion when there's content (even during streaming)
-  const canExpand = !!content;
-
-  return (
-    <motion.div
-      initial={{ opacity: 0, height: 0 }}
-      animate={{ opacity: 1, height: 'auto' }}
-      exit={{ opacity: 0, height: 0 }}
-      transition={{ duration: 0.2 }}
-      className="mb-3"
-    >
-      <button
-        onClick={() => canExpand && setExpanded(!expanded)}
-        className={`flex items-center gap-2.5 px-4 py-2 rounded-xl bg-violet-500/[0.08] border border-violet-500/[0.15] transition-colors w-full text-left ${canExpand ? 'hover:bg-violet-500/[0.12] cursor-pointer' : 'cursor-default'}`}
-      >
-        <div className={isActive ? 'animate-thinking-pulse' : ''}>
-          <Sparkles size={14} className="text-violet-400" />
-        </div>
-        <span className="text-xs text-violet-300 font-medium flex-1">
-          {isActive ? (activeLabel || 'Thinking…') : 'Thought process'}
-        </span>
-        {isActive && (
-          <>
-            <span className="text-[11px] text-violet-400/60 font-mono tabular-nums">
-              {elapsedSeconds}s
-            </span>
-            {!expanded && (
-              <span className="flex gap-0.5 ml-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '0ms' }} />
-                <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '150ms' }} />
-                <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '300ms' }} />
-              </span>
-            )}
-          </>
-        )}
-        {canExpand && (
-          <ChevronRight size={12} className={`text-violet-400 transition-transform ${expanded ? 'rotate-90' : ''}`} />
-        )}
-      </button>
-      <AnimatePresence>
-        {expanded && content && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.15 }}
-            className="overflow-hidden"
-          >
-            <div className="mt-1 px-3 py-2.5 rounded-lg bg-violet-500/[0.04] border border-violet-500/[0.08] text-[11px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere] [word-break:break-word] max-w-full min-w-0 max-h-[200px] overflow-auto">
-              {content}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </motion.div>
   );
 }
 
@@ -1485,145 +1277,91 @@ function ToolResultBlock({ message }: { message: ChatMessage }) {
 
 /* ─── Composer Status Badge ─────────────────────────────────────────────── */
 
-function ComposerStatusBadge({
-  phase,
-  toolName,
-  statusText,
-  showConnectionLost,
+function formatTokenCompact(value: number): string {
+  if (!Number.isFinite(value)) return '0';
+  if (value >= 1_000_000) {
+    const millions = value / 1_000_000;
+    return `${millions >= 10 ? Math.round(millions) : millions.toFixed(1).replace(/\.0$/, '')}M`;
+  }
+  if (value >= 1_000) {
+    const thousands = value / 1_000;
+    return `${thousands >= 100 ? Math.round(thousands) : thousands.toFixed(1).replace(/\.0$/, '')}k`;
+  }
+  return String(Math.round(value));
+}
+
+function getOpenClawContextSummary({
+  telemetry,
+  isRunning,
   compactionPhase,
-  queueCount,
-  onClearQueue,
+  statusText,
 }: {
-  phase: 'idle' | 'thinking' | 'tool' | 'streaming';
-  toolName: string | null;
-  statusText?: string | null;
-  showConnectionLost?: boolean;
+  telemetry: OpenClawSessionTelemetry | null;
+  isRunning: boolean;
   compactionPhase?: 'idle' | 'compacting' | 'compacted';
-  queueCount?: number;
-  onClearQueue?: () => void;
+  statusText?: string | null;
 }) {
-  const rawStatus = (statusText || '').trim();
-  const normalizedStatus = rawStatus.toLowerCase();
-
-  let tone = {
-    bg: 'bg-violet-500/[0.06] border-violet-500/[0.12]',
-    text: 'text-violet-300/80',
-    dot: 'bg-violet-400',
-    icon: null as React.ReactNode,
-    label: rawStatus || (phase === 'tool' ? `Using ${toolName || 'tool'}…` : phase === 'streaming' ? 'Responding…' : 'Thinking…'),
-    bounce: true,
-  };
-
-  if (showConnectionLost) {
-    tone = {
-      bg: 'bg-amber-500/[0.08] border-amber-500/20',
-      text: 'text-amber-300/85',
-      dot: 'bg-amber-400',
-      icon: <RefreshCw size={12} className="text-amber-300 animate-spin" />,
-      label: 'Reconnecting…',
-      bounce: false,
-    };
-  } else if (/\b(connected|reconnected|recovered)\b/.test(normalizedStatus)) {
-    tone = {
-      bg: 'bg-emerald-500/[0.08] border-emerald-500/20',
-      text: 'text-emerald-300/85',
-      dot: 'bg-emerald-400',
-      icon: <CheckCircle2 size={12} className="text-emerald-300" />,
-      label: rawStatus || 'Connected',
-      bounce: false,
-    };
-  } else if (compactionPhase === 'compacting' || /compact(ing|ion)/.test(normalizedStatus)) {
-    tone = {
-      bg: 'bg-blue-500/[0.08] border-blue-500/20',
-      text: 'text-blue-300/85',
-      dot: 'bg-blue-400',
-      icon: <Loader2 size={12} className="text-blue-300 animate-spin" />,
-      label: rawStatus || 'Compacting context… this may take a moment',
-      bounce: false,
-    };
-  } else if (compactionPhase === 'compacted' || /context compacted/.test(normalizedStatus)) {
-    tone = {
-      bg: 'bg-blue-500/[0.08] border-blue-500/20',
-      text: 'text-blue-300/85',
-      dot: 'bg-blue-400',
-      icon: <CheckCircle2 size={12} className="text-blue-300" />,
-      label: rawStatus || 'Context compacted',
-      bounce: false,
-    };
-  } else if (/approval|waiting for command approval/.test(normalizedStatus) || /reconnecting|queued|waiting/.test(normalizedStatus)) {
-    tone = {
-      bg: 'bg-amber-500/[0.08] border-amber-500/20',
-      text: 'text-amber-300/85',
-      dot: 'bg-amber-400',
-      icon: /approval/.test(normalizedStatus)
-        ? <Clock size={12} className="text-amber-300" />
-        : <RefreshCw size={12} className="text-amber-300 animate-spin" />,
-      label: rawStatus || `${queueCount} queued follow-up${queueCount === 1 ? '' : 's'}`,
-      bounce: false,
-    };
-  } else if (/denied|failed|error|disconnected/.test(normalizedStatus)) {
-    tone = {
-      bg: 'bg-rose-500/[0.08] border-rose-500/20',
-      text: 'text-rose-300/85',
-      dot: 'bg-rose-400',
-      icon: <Loader2 size={12} className="text-rose-300" />,
-      label: rawStatus,
-      bounce: false,
-    };
-  } else if (phase === 'idle' && queueCount && queueCount > 0) {
-    tone = {
-      bg: 'bg-amber-500/[0.08] border-amber-500/20',
-      text: 'text-amber-300/85',
-      dot: 'bg-amber-400',
-      icon: <Clock size={12} className="text-amber-300" />,
-      label: `${queueCount} queued follow-up${queueCount === 1 ? '' : 's'}`,
-      bounce: false,
-    };
-  } else if (phase === 'idle') {
+  if (!telemetry || telemetry.contextTokens == null || telemetry.totalTokens == null || telemetry.contextTokens <= 0) {
     return null;
   }
 
-  const showQueueMeta = queueCount && queueCount > 0 && !(phase === 'idle' && !showConnectionLost && compactionPhase === 'idle' && !/\b(connected|reconnected|recovered)\b/.test(normalizedStatus));
+  const ratio = telemetry.pressureRatio ?? Math.max(0, Math.min(1, telemetry.totalTokens / telemetry.contextTokens));
+  if (!Number.isFinite(ratio) || ratio <= 0) return null;
 
-  return (
-    <motion.div
-      initial={{ opacity: 0, height: 0 }}
-      animate={{ opacity: 1, height: 'auto' }}
-      exit={{ opacity: 0, height: 0 }}
-      transition={{ duration: 0.2 }}
-    >
-      <div className={`flex items-center justify-center gap-2.5 px-4 py-1.5 border-t ${tone.bg}`}>
-        {tone.bounce ? (
-          <div className="flex gap-0.5">
-            <span className={`w-1.5 h-1.5 rounded-full ${tone.dot} animate-bounce`} style={{ animationDelay: '0ms' }} />
-            <span className={`w-1.5 h-1.5 rounded-full ${tone.dot} animate-bounce`} style={{ animationDelay: '150ms' }} />
-            <span className={`w-1.5 h-1.5 rounded-full ${tone.dot} animate-bounce`} style={{ animationDelay: '300ms' }} />
-          </div>
-        ) : (
-          <>
-            <span className={`w-1.5 h-1.5 rounded-full ${tone.dot}`} />
-            {tone.icon}
-          </>
-        )}
-        <span className={`text-xs font-medium ${tone.text}`}>{tone.label}</span>
-        {showQueueMeta ? (
-          <>
-            <span className={`text-xs ${tone.text}`}>•</span>
-            <span className={`text-[11px] ${tone.text}`}>{queueCount} queued</span>
-            {onClearQueue ? (
-              <button
-                onClick={onClearQueue}
-                className={`rounded-md px-1.5 py-0.5 text-[10px] ${tone.text} hover:bg-white/[0.06] hover:text-white`}
-                title="Clear queued messages"
-              >
-                clear
-              </button>
-            ) : null}
-          </>
-        ) : null}
-      </div>
-    </motion.div>
-  );
+  const normalizedStatus = (statusText || '').toLowerCase();
+  const hasPressureSignal = /context (?:budget|limit|window|maintenance|compaction|flush)|memory flush|running out of context|near(?:ing)? context/i.test(normalizedStatus);
+  const percent = Math.round(ratio * 100);
+  const remainingTokens = Math.max(0, telemetry.contextTokens - telemetry.totalTokens);
+  const detailParts = [
+    `${formatTokenCompact(telemetry.totalTokens)} / ${formatTokenCompact(telemetry.contextTokens)} tokens`,
+    `${formatTokenCompact(remainingTokens)} headroom`,
+  ];
+  if (telemetry.compactionCount != null && telemetry.compactionCount > 0) {
+    detailParts.push(`${telemetry.compactionCount} auto-compaction${telemetry.compactionCount === 1 ? '' : 's'}`);
+  }
+
+  if (compactionPhase === 'compacting' || compactionPhase === 'compacted') {
+    return {
+      text: 'text-[rgba(191,219,254,0.92)]',
+      dot: 'bg-[#60a5fa]',
+      label: compactionPhase === 'compacting' ? `Context maintenance active (${percent}%)` : `Context maintenance finished (${percent}%)`,
+      detail: detailParts.join(' • '),
+    };
+  }
+
+  if (ratio >= 0.97) {
+    return {
+      text: 'text-[rgba(254,205,211,0.92)]',
+      dot: 'bg-[#fb7185]',
+      label: `Context critical ${percent}% • compaction likely next turn`,
+      detail: detailParts.join(' • '),
+    };
+  }
+
+  if (ratio >= 0.9 || hasPressureSignal) {
+    return {
+      text: 'text-[rgba(253,230,138,0.92)]',
+      dot: 'bg-[#fbbf24]',
+      label: `Context pressure ${percent}% • compaction likely soon`,
+      detail: detailParts.join(' • '),
+    };
+  }
+
+  if (ratio >= 0.75 || (isRunning && ratio >= 0.6)) {
+    return {
+      text: 'text-[rgba(191,219,254,0.92)]',
+      dot: 'bg-[#60a5fa]',
+      label: `Context ${percent}% used`,
+      detail: detailParts.join(' • '),
+    };
+  }
+
+  return {
+    text: 'text-slate-300/85',
+    dot: 'bg-slate-300',
+    label: `Context ${percent}% used`,
+    detail: detailParts.join(' • '),
+  };
 }
 
 /* ─── Loading Skeleton ──────────────────────────────────────────────────── */
@@ -2053,8 +1791,6 @@ const AssistantBubble = React.memo(function AssistantBubble({
   avatarUrl,
   isLast,
   isStreaming,
-  liveThinkingContent,
-  streamingPhase,
   onRetry,
 }: {
   agent: AgentIdentity;
@@ -2062,25 +1798,13 @@ const AssistantBubble = React.memo(function AssistantBubble({
   avatarUrl?: string;
   isLast: boolean;
   isStreaming: boolean;
-  /** Live thinking content from context state — used for the streaming message */
-  liveThinkingContent?: string;
-  /** Current streaming phase — controls thinking bubble visibility */
-  streamingPhase?: string;
   onRetry?: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
   const provenance = message.provenance || agent.provenance;
   const modelLabel = message.model ? getShortModelLabel(message.model) : '';
   const toolCalls = message.toolCalls || [];
-  // For the streaming message, prefer live thinking content from context;
-  // otherwise fall back to persisted content on the message object
   const isCurrentlyStreaming = isLast && isStreaming;
-  // During streaming: show thinking ONLY during the 'thinking' phase.
-  // Once streamingPhase moves to 'streaming' or 'tool', the thinking is done.
-  // After streaming completes, show persisted thinking for history (expandable).
-  const thinkingContent = isCurrentlyStreaming
-    ? (streamingPhase === 'thinking' ? (liveThinkingContent || '') : '')
-    : message.thinkingContent;
   const hasContent = !!message.content;
 
   return (
@@ -2097,19 +1821,6 @@ const AssistantBubble = React.memo(function AssistantBubble({
         )}
       </div>
       <div className="flex-1 min-w-0 max-w-[80%]">
-        {/* Thinking block — shows both during streaming (collapsible disclosure) and
-            after streaming completes (expandable historical content).
-            During streaming: shows as a collapsible block so user can peek at thoughts.
-            After streaming: shows as expandable historical content. */}
-        <AnimatePresence>
-          {thinkingContent && (
-            <ThinkingBlock
-              content={thinkingContent}
-              isActive={isCurrentlyStreaming}
-              activeLabel={isCurrentlyStreaming ? 'Internal monologue' : undefined}
-            />
-          )}
-        </AnimatePresence>
 
         {/* Tool call pills — centered system notifications */}
         {toolCalls.length > 0 && (
@@ -2365,6 +2076,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const compactionModelError = chatState.compactionModelError;
   const sessionControlsSupported = chatState.sessionControlsSupported;
   const ensureSessionControlsMetadataLoaded = chatState.ensureSessionControlsMetadataLoaded;
+  const sessionTelemetry = chatState.sessionTelemetry;
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [providerModels, setProviderModels] = useState<Record<string, string[]>>({ OPENCLAW: OPENCLAW_MODEL_FALLBACK });
@@ -2902,7 +2614,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     isRunning,
     isLoadingHistory,
     isSwitchingSession,
-    pendingApproval: streamPendingApproval,
+    pendingApprovals: streamPendingApprovals,
     resolveApproval: streamResolveApproval,
     dismissApproval: streamDismissApproval,
     compactionPhase,
@@ -2944,18 +2656,41 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
 
   // Global exec approval listener (works even when no chat stream is active)
   const {
-    pendingApproval: globalPendingApproval,
+    pendingApprovals: globalPendingApprovals,
     resolveApproval: globalResolveApproval,
     dismissApproval: globalDismissApproval,
   } = useExecApprovals({ enabled: !deferGatewayMetadata });
 
-  // Merge approval sources: prefer stream-based if both exist, otherwise use global
-  // The stream-based approval comes from the active chat SSE, while global comes
-  // from the persistent WebSocket SSE. We prioritize stream-based since it's
-  // tied to the current user's active chat.
-  const pendingApproval = streamPendingApproval || globalPendingApproval;
-  const resolveApproval = streamPendingApproval ? streamResolveApproval : globalResolveApproval;
-  const dismissApproval = streamPendingApproval ? streamDismissApproval : globalDismissApproval;
+  const pendingApprovals = useMemo(
+    () => mergeExecApprovalQueues(streamPendingApprovals, globalPendingApprovals),
+    [streamPendingApprovals, globalPendingApprovals],
+  );
+  const pendingApproval = pendingApprovals[0] || null;
+
+  const resolveApproval = useCallback(async (
+    approvalId: string,
+    decision: 'allow-once' | 'deny' | 'allow-always',
+  ) => {
+    if (streamPendingApprovals.some((approval) => approval.id === approvalId)) {
+      await streamResolveApproval(approvalId, decision);
+      return;
+    }
+    await globalResolveApproval(approvalId, decision);
+  }, [globalResolveApproval, globalPendingApprovals, streamPendingApprovals, streamResolveApproval]);
+
+  const dismissApproval = useCallback((approvalId?: string) => {
+    if (!approvalId) {
+      streamDismissApproval();
+      globalDismissApproval();
+      return;
+    }
+    if (streamPendingApprovals.some((approval) => approval.id === approvalId)) {
+      streamDismissApproval(approvalId);
+    }
+    if (globalPendingApprovals.some((approval) => approval.id === approvalId)) {
+      globalDismissApproval(approvalId);
+    }
+  }, [globalDismissApproval, globalPendingApprovals, streamDismissApproval, streamPendingApprovals]);
 
   const prevWsConnectedRef = useRef(wsConnected);
   useEffect(() => {
@@ -2987,9 +2722,20 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const agent = getAgent(provider);
   const providerSlashCommands = providerMeta.slashCommands || [];
   const streamIsStale = isRunning && !wsConnected;
-  // B20: Only show connection-lost UI when stream is active and WS dropped,
-  // not during idle disconnects (which auto-reconnect silently)
   const showConnectionLost = streamIsStale;
+  const idleConnectionStatus = provider === 'OPENCLAW' && !isRunning && queueCount === 0
+    ? (wsConnected ? 'Connected' : 'Disconnected')
+    : null;
+  const contextSummary = useMemo(() => (
+    provider === 'OPENCLAW'
+      ? getOpenClawContextSummary({
+          telemetry: sessionTelemetry,
+          isRunning,
+          compactionPhase,
+          statusText: statusText || idleConnectionStatus,
+        })
+      : null
+  ), [provider, sessionTelemetry, isRunning, compactionPhase, statusText, idleConnectionStatus]);
 
   // Mobile detection for keyboard behavior (Return key on mobile should insert newline, not submit)
   const [isMobileDevice, setIsMobileDevice] = useState(false);
@@ -3107,8 +2853,27 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     if (publicSettings?.agentAvatars) setAgentAvatars(publicSettings.agentAvatars);
     if (publicSettings?.subAgentAvatars) setSubAgentAvatars(publicSettings.subAgentAvatars);
     if (publicSettings?.assistantName) setAssistantName(publicSettings.assistantName);
-    if (publicSettings?.defaultOpenClawAgentId) setDefaultOpenClawAgentId(publicSettings.defaultOpenClawAgentId);
   }, [publicSettings]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadClientSettings() {
+      try {
+        const { data } = await client.get('/settings/client');
+        if (!cancelled && data?.defaultOpenClawAgentId) {
+          setDefaultOpenClawAgentId(data.defaultOpenClawAgentId);
+        }
+      } catch {
+        // Keep default main agent when authenticated settings are unavailable.
+      }
+    }
+
+    loadClientSettings();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleSelectAgent = useCallback(
     async (selection: AgentSelection) => {
@@ -3317,10 +3082,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 onToggleFastMode={() => { void toggleFastMode(); }}
                 onSetCompactionModelOverride={(model) => { void setCompactionModelOverride(model); }}
                 onSetHeartbeatModel={(model) => { void handleHeartbeatModelChange(model); }}
-                providerLabel={providerLabel}
-                providerCommandCount={providerCommandCount}
-                providerCommandStatus={providerCommandStatus}
-                providerCapabilities={providerMeta.capabilities}
                 availableModels={availableModels}
                 compactionAvailableModels={compactionAvailableModels}
                 compactionModelLoading={compactionModelLoading}
@@ -3585,8 +3346,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                               avatarUrl={agentAvatars[agent.providerName]}
                               isLast={idx === messages.length - 1}
                               isStreaming={isRunning}
-                              liveThinkingContent={idx === messages.length - 1 ? thinkingContent : undefined}
-                              streamingPhase={idx === messages.length - 1 ? streamingPhase : undefined}
                               onRetry={
                                 idx === messages.length - 1 && lastUserMessage
                                   ? () => {
@@ -3652,15 +3411,16 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
 
             {/* Compaction indicator */}
             <AnimatePresence>
-              {(showConnectionLost || compactionPhase !== 'idle' || isRunning || queueCount > 0) && (
+              {(provider === 'OPENCLAW' || showConnectionLost || compactionPhase !== 'idle' || isRunning || queueCount > 0 || Boolean(contextSummary)) && (
                 <ComposerStatusBadge
                   phase={isRunning ? streamingPhase : 'idle'}
                   toolName={activeToolName}
-                  statusText={statusText}
+                  statusText={statusText || idleConnectionStatus}
                   showConnectionLost={showConnectionLost}
                   compactionPhase={compactionPhase}
                   queueCount={queueCount}
                   onClearQueue={queueCount > 0 ? clearQueue : undefined}
+                  contextSummary={contextSummary}
                 />
               )}
             </AnimatePresence>
@@ -3887,6 +3647,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         {pendingApproval && (
           <ExecApprovalModal
             approval={pendingApproval}
+            queueCount={pendingApprovals.length}
             onResolve={resolveApproval}
             onDismiss={dismissApproval}
           />

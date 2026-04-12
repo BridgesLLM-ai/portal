@@ -16,14 +16,14 @@ import { execSync, spawn } from 'child_process';
 import { getGatewayToken, hasGatewayToken } from '../utils/gatewayToken';
 import dns from 'dns/promises';
 import { prisma } from '../config/database';
-import { hashPassword } from '../utils/password';
+import { hashPassword, validatePasswordStrength } from '../utils/password';
 import { PORTAL_VERSION } from '../version';
 import { generateAccessToken, generateRefreshToken } from '../utils/jwt';
 import { AppError } from '../middleware/errorHandler';
 import { config } from '../config/env';
 import { APPEARANCE_DEFAULTS, SECURITY_DEFAULTS } from '../config/settings.schema';
 import multer from 'multer';
-import { setAuthCookies } from '../utils/authCookies';
+import { clearAuthCookies, setAuthCookies } from '../utils/authCookies';
 import { provisionUserMailbox } from '../services/userMailService';
 import {
   buildIpFallbackCaddyConfig,
@@ -34,6 +34,7 @@ import {
   updateEnvFile,
 } from '../utils/serverSetup';
 import { getOllamaRecommendationsByRam } from '../utils/ollamaRecommendations';
+import { isReservedSystemMailboxUsername } from '../utils/reservedMailboxUsernames';
 
 const router = Router();
 
@@ -81,8 +82,10 @@ async function createUniqueUsername(baseName: string, email: string): Promise<st
   let candidate = base;
   let suffix = 1;
   while (true) {
-    const existing = await prisma.user.findUnique({ where: { username: candidate } });
-    if (!existing) return candidate;
+    if (!isReservedSystemMailboxUsername(candidate)) {
+      const existing = await prisma.user.findUnique({ where: { username: candidate } });
+      if (!existing) return candidate;
+    }
     suffix += 1;
     candidate = `${base}${suffix}`.slice(0, 30);
   }
@@ -311,6 +314,27 @@ const uploadLogo = multer({
 // Routes
 // ═══════════════════════════════════════════════════════════════
 
+function maskOwnerHint(email?: string | null, username?: string | null): string | undefined {
+  const trimmedEmail = (email || '').trim();
+  if (trimmedEmail.includes('@')) {
+    const [localPart, domainPart] = trimmedEmail.split('@');
+    if (localPart && domainPart) {
+      const visibleLocal = localPart.length <= 2
+        ? `${localPart[0] || ''}*`
+        : `${localPart.slice(0, 2)}${'*'.repeat(Math.max(1, localPart.length - 2))}`;
+      return `${visibleLocal}@${domainPart}`;
+    }
+  }
+
+  const trimmedUsername = (username || '').trim();
+  if (trimmedUsername) {
+    if (trimmedUsername.length <= 2) return `${trimmedUsername[0] || ''}*`;
+    return `${trimmedUsername.slice(0, 2)}${'*'.repeat(Math.max(1, trimmedUsername.length - 2))}`;
+  }
+
+  return undefined;
+}
+
 /**
  * GET /api/setup/status
  * Always accessible — checks if setup is needed.
@@ -325,17 +349,17 @@ router.get('/status', async (_req: Request, res: Response, next: NextFunction) =
     // The user needs to reset their password to regain access.
     const isReinstall = ownerCount > 0 && !!process.env.SETUP_TOKEN;
 
-    let reinstallInfo: { email?: string; username?: string } | undefined;
+    let ownerHint: string | undefined;
     if (isReinstall) {
       const owner = await prisma.user.findFirst({ where: { role: 'OWNER' as any }, select: { email: true, username: true } });
-      if (owner) reinstallInfo = { email: (owner as any).email, username: (owner as any).username };
+      ownerHint = maskOwnerHint((owner as any)?.email, (owner as any)?.username);
     }
 
     res.json({
       needsSetup,
       version: PORTAL_VERSION,
       incompleteSteps: needsSetup ? ['adminAccount', 'portalIdentity', 'security', 'domain', 'email', 'ai'] : [],
-      ...(isReinstall && { isReinstall: true, ownerEmail: reinstallInfo?.email, ownerUsername: reinstallInfo?.username }),
+      ...(isReinstall && { isReinstall: true, ownerHint }),
     });
   } catch (error) {
     next(error);
@@ -360,8 +384,13 @@ router.post('/reinstall-reset', requireSetupToken, async (req: Request, res: Res
     }
 
     const { password } = req.body;
-    if (!password || typeof password !== 'string' || password.length < 8) {
-      throw new AppError(400, 'Password must be at least 8 characters.');
+    if (!password || typeof password !== 'string') {
+      throw new AppError(400, 'Password is required.');
+    }
+
+    const strength = validatePasswordStrength(password);
+    if (!strength.valid) {
+      throw new AppError(400, strength.errors.join('. '));
     }
 
     const passwordHash = await hashPassword(password);
@@ -369,6 +398,17 @@ router.post('/reinstall-reset', requireSetupToken, async (req: Request, res: Res
       where: { id: owner.id },
       data: { passwordHash },
     });
+
+    // Reinstall recovery must revoke any preserved browser/device sessions.
+    // Otherwise an old refresh token can survive the password reset and keep
+    // access to the preserved portal state.
+    await prisma.session.deleteMany({
+      where: { userId: owner.id },
+    });
+
+    // Clear any stale auth cookies carried by the current browser so the user
+    // lands on a clean sign-in flow with the new password.
+    clearAuthCookies(req, res);
 
     // Clear the setup token — reinstall recovery is complete
     clearSetupToken();
@@ -1157,6 +1197,11 @@ router.post('/complete', requireSetupToken, async (req: Request, res: Response, 
     }
 
     const body = completeSetupSchema.parse(req.body);
+    const strength = validatePasswordStrength(body.password);
+    if (!strength.valid) {
+      throw new AppError(400, strength.errors.join('. '));
+    }
+
     const username = await createUniqueUsername(body.name, body.email);
     const passwordHash = await hashPassword(body.password);
 

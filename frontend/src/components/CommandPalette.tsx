@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, Command, File, Folder, Terminal, Layout, Settings, X } from 'lucide-react';
+import { Search, Command, File, Folder, Terminal, Layout, Rocket, Settings, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
+import { useAuthStore } from '../contexts/AuthContext';
+import { isElevated } from '../utils/authz';
 
 interface CommandItem {
   id: string;
@@ -24,9 +26,9 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
   const [filteredCommands, setFilteredCommands] = useState<CommandItem[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
+  const { user } = useAuthStore();
 
-  // Define available commands
-  const commands: CommandItem[] = [
+  const commands = useMemo<CommandItem[]>(() => [
     {
       id: 'nav-dashboard',
       label: 'Go to Dashboard',
@@ -52,13 +54,23 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
       keywords: ['browse', 'explorer'],
     },
     {
-      id: 'nav-terminal',
-      label: 'Go to Terminal',
-      icon: <Terminal size={16} />,
-      action: () => navigate('/terminal'),
+      id: 'nav-apps',
+      label: 'Go to Apps',
+      icon: <Rocket size={16} />,
+      action: () => navigate('/apps'),
       category: 'navigation',
-      keywords: ['shell', 'console', 'command'],
+      keywords: ['deploy', 'library', 'uploads'],
     },
+    ...(isElevated(user)
+      ? [{
+          id: 'nav-terminal',
+          label: 'Go to Terminal',
+          icon: <Terminal size={16} />,
+          action: () => navigate('/terminal'),
+          category: 'navigation' as const,
+          keywords: ['shell', 'console', 'command'],
+        }]
+      : []),
     {
       id: 'nav-settings',
       label: 'Go to Settings',
@@ -67,7 +79,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
       category: 'navigation',
       keywords: ['config', 'preferences'],
     },
-  ];
+  ], [navigate, user]);
 
   // Filter commands based on query
   useEffect(() => {
@@ -87,7 +99,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
 
     setFilteredCommands(filtered);
     setSelectedIndex(0);
-  }, [query]);
+  }, [commands, query]);
 
   // Focus input when opened
   useEffect(() => {

@@ -44,6 +44,7 @@ tar czf "$OUT_FILE" \
   --exclude='*.bak*' \
   --exclude='*.orig' \
   --exclude='*.rej' \
+  --exclude='backend/prisma/dev.db' \
   --exclude='*.tar.gz' \
   --exclude='*.map' \
   --exclude='.data' \

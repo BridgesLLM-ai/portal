@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import client from '../api/client';
+import { useAuthStore } from '../contexts/AuthContext';
+import { isElevated } from '../utils/authz';
 
 interface ProxyStatus {
   available: boolean;
@@ -20,25 +22,44 @@ let _cachedStatus: ProxyStatus | null = null;
 let _subscribers: Set<(s: ProxyStatus | null) => void> = new Set();
 let _intervalId: ReturnType<typeof setInterval> | null = null;
 
-async function _fetchStatus() {
-  try {
-    const res = await client.get('/system-control/ollama/proxy-status');
-    _cachedStatus = res.data;
-  } catch {
-    _cachedStatus = { available: false, backend: 'offline', version: null, models: [], runningModels: [], isGpu: false };
-  }
+function canPollOllamaStatus() {
+  const { isAuthenticated, user } = useAuthStore.getState();
+  return isAuthenticated && isElevated(user);
+}
+
+function publishStatus(status: ProxyStatus | null) {
+  _cachedStatus = status;
   _subscribers.forEach(fn => fn(_cachedStatus));
+}
+
+async function _fetchStatus() {
+  if (!canPollOllamaStatus()) {
+    publishStatus(null);
+    return;
+  }
+
+  try {
+    const res = await client.get('/system-control/ollama/proxy-status', { _silent: true } as any);
+    publishStatus(res.data);
+  } catch {
+    publishStatus({ available: false, backend: 'offline', version: null, models: [], runningModels: [], isGpu: false });
+  }
 }
 
 function subscribeOllamaStatus(fn: (s: ProxyStatus | null) => void): () => void {
   _subscribers.add(fn);
-  // Deliver cached value immediately if we have one
-  if (_cachedStatus !== null) fn(_cachedStatus);
-  // Start shared interval if not already running
-  if (!_intervalId) {
-    _fetchStatus(); // immediate first fetch
-    _intervalId = setInterval(_fetchStatus, 15000);
+
+  if (!canPollOllamaStatus()) {
+    fn(null);
+  } else if (_cachedStatus !== null) {
+    fn(_cachedStatus);
   }
+
+  if (canPollOllamaStatus() && !_intervalId) {
+    void _fetchStatus();
+    _intervalId = setInterval(() => { void _fetchStatus(); }, 15000);
+  }
+
   return () => {
     _subscribers.delete(fn);
     if (_subscribers.size === 0 && _intervalId) {
@@ -52,12 +73,19 @@ const OllamaControl: React.FC<OllamaControlProps> = ({ collapsed = false }) => {
   const [status, setStatus] = useState<ProxyStatus | null>(_cachedStatus);
   const [expanded, setExpanded] = useState(false);
   const [actionMsg, setActionMsg] = useState('');
+  const { isAuthenticated, user } = useAuthStore();
 
-  const fetchStatus = useCallback(() => { _fetchStatus(); }, []);
+  const fetchStatus = useCallback(() => { void _fetchStatus(); }, []);
 
   useEffect(() => {
+    if (!isAuthenticated || !isElevated(user)) {
+      setExpanded(false);
+      setStatus(null);
+      return;
+    }
+
     return subscribeOllamaStatus(setStatus);
-  }, []);
+  }, [isAuthenticated, user?.role]);
 
   if (!status) return null;
 

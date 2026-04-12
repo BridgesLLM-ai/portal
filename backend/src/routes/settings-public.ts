@@ -1,54 +1,23 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { prisma } from '../config/database';
-import { APPEARANCE_DEFAULTS, REMOTE_DESKTOP_DEFAULTS } from '../config/settings.schema';
+import { authenticateToken } from '../middleware/auth';
+import { APPEARANCE_DEFAULTS } from '../config/settings.schema';
 
 function normalizeBoolean(value?: string | null): boolean {
   const raw = String(value || '').trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 }
 
-function normalizeAllowedPathPrefixes(value?: string | null): string {
-  const raw = (value || REMOTE_DESKTOP_DEFAULTS.allowedPathPrefixes).trim();
-  const prefixes = raw
-    .split(',')
-    .map(v => v.trim())
-    .filter(Boolean)
-    .filter(v => v !== '/guacamole');
-  return prefixes.length ? prefixes.join(',') : REMOTE_DESKTOP_DEFAULTS.allowedPathPrefixes;
-}
-
-function normalizeRemoteDesktopUrl(value?: string | null): string {
-  const raw = (value || REMOTE_DESKTOP_DEFAULTS.url).trim();
-  if (!raw) return REMOTE_DESKTOP_DEFAULTS.url;
-  if (raw === '/novnc' || raw === '/vnc' || raw === '/guacamole') return REMOTE_DESKTOP_DEFAULTS.url;
-  if (raw.startsWith('/novnc/vnc.html')) return REMOTE_DESKTOP_DEFAULTS.url;
-  if (!raw.startsWith('/novnc/vnc_portal.html')) return raw;
-
-  let next = raw;
-  if (!/[?&]path=/.test(next)) {
-    next += (next.includes('?') ? '&' : '?') + 'path=novnc/websockify';
-  }
-  if (/[?&]resize=remote\b/.test(next)) {
-    next = next.replace('resize=remote', 'resize=smart');
-  } else if (/[?&]resize=scale\b/.test(next)) {
-    next = next.replace('resize=scale', 'resize=smart');
-  } else if (!/[?&]resize=/.test(next)) {
-    next += (next.includes('?') ? '&' : '?') + 'resize=smart';
-  }
-
-  return next;
-}
-
 const router = Router();
 
 /**
  * GET /api/settings/public
- * Returns only appearance settings (theme, accentColor, portalName, logoUrl).
+ * Returns only genuinely public appearance settings for unauthenticated theming.
  * No authentication required — needed for login page theming.
  */
 router.get('/public', async (_req: Request, res: Response, next: NextFunction) => {
   try {
-    const keys = ['appearance.theme', 'appearance.accentColor', 'appearance.portalName', 'appearance.logoUrl', 'appearance.assistantName', 'appearance.agentAvatar.OPENCLAW', 'appearance.agentAvatar.CLAUDE_CODE', 'appearance.agentAvatar.CODEX', 'appearance.agentAvatar.AGENT_ZERO', 'appearance.agentAvatar.GEMINI', 'appearance.agentAvatar.OLLAMA', 'remoteDesktop.url', 'remoteDesktop.allowedPathPrefixes', 'agent.defaultOpenClawAgentId', 'agent.visibleBrowserOpenClawAgentId'];
+    const keys = ['appearance.theme', 'appearance.accentColor', 'appearance.portalName', 'appearance.logoUrl', 'appearance.assistantName', 'appearance.agentAvatar.OPENCLAW', 'appearance.agentAvatar.CLAUDE_CODE', 'appearance.agentAvatar.CODEX', 'appearance.agentAvatar.AGENT_ZERO', 'appearance.agentAvatar.GEMINI', 'appearance.agentAvatar.OLLAMA'];
     const rows = await prisma.systemSetting.findMany({
       where: { key: { in: keys } },
     });
@@ -87,11 +56,32 @@ router.get('/public', async (_req: Request, res: Response, next: NextFunction) =
         OLLAMA: map['appearance.agentAvatar.OLLAMA'] || '',
       },
       subAgentAvatars,
-      remoteDesktopUrl: normalizeRemoteDesktopUrl(map['remoteDesktop.url']),
-      remoteDesktopAllowedPathPrefixes: normalizeAllowedPathPrefixes(map['remoteDesktop.allowedPathPrefixes']),
+      useDirectGateway: normalizeBoolean(process.env.USE_DIRECT_GATEWAY || process.env.VITE_USE_DIRECT_GATEWAY),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/settings/client
+ * Returns authenticated operational settings needed inside the app shell.
+ */
+router.get('/client', authenticateToken, async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const keys = ['agent.defaultOpenClawAgentId', 'agent.visibleBrowserOpenClawAgentId'];
+    const rows = await prisma.systemSetting.findMany({
+      where: { key: { in: keys } },
+    });
+
+    const map: Record<string, string> = {};
+    for (const row of rows) {
+      map[row.key] = row.value;
+    }
+
+    res.json({
       defaultOpenClawAgentId: map['agent.defaultOpenClawAgentId'] || 'main',
       visibleBrowserOpenClawAgentId: map['agent.visibleBrowserOpenClawAgentId'] || '',
-      useDirectGateway: normalizeBoolean(process.env.USE_DIRECT_GATEWAY || process.env.VITE_USE_DIRECT_GATEWAY),
     });
   } catch (error) {
     next(error);

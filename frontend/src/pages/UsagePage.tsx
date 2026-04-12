@@ -322,8 +322,7 @@ export function UsageContent({ agentId, showHeader = false }: UsageContentProps)
       else setLoading(true);
       setError(null);
 
-      const effectiveAgentId = agentId && agentId !== 'main' ? agentId : undefined;
-      const data = await usageAPI.stats(effectiveAgentId, { signal: controller.signal });
+      const data = await usageAPI.stats(agentId, { signal: controller.signal });
       if (inFlightRef.current !== controller) return;
       setStats(data);
     } catch (err: any) {

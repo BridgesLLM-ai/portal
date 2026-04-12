@@ -198,10 +198,10 @@ export default function ResetPasswordPage() {
                 </div>
                 <h2 className="text-lg font-semibold text-white mb-2">Password reset successfully</h2>
                 <p className="text-slate-400 text-sm leading-relaxed mb-6">
-                  Your password has been updated. You can now sign in with your new password.
+                  Your password has been updated, and other active sessions have been signed out. You can now sign in with your new password.
                 </p>
                 <Link
-                  to="/login"
+                  to="/login?password=changed"
                   className="inline-block"
                 >
                   <motion.div

@@ -1,20 +1,21 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 // Link removed — onboarding cards removed
-import {
-  AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
-} from 'recharts';
 import { io, Socket } from 'socket.io-client';
-import { metricsAPI, alertsAPI } from '../api/endpoints';
+import { metricsAPI, alertsAPI, systemStatsAPI, type SystemStats } from '../api/endpoints';
 import { Metrics, ActivityLog } from '../types';
 import ActivityLogTable from '../components/ActivityLogTable';
 import client from '../api/client';
+import { useAuthStore } from '../contexts/AuthContext';
+import { isElevated, isOwner } from '../utils/authz';
 import {
   Cpu, HardDrive, Wifi,
   AlertTriangle, MemoryStick,
   ArrowDown, ArrowUp, RefreshCw,
   Gauge, Layers, Timer, Loader2,
 } from 'lucide-react';
+
+const LazyDashboardCharts = lazy(() => import('../components/dashboard/DashboardCharts'));
 
 /* ─── helpers ──────────────────────────────────────────── */
 
@@ -65,32 +66,29 @@ const cardVariant = {
 /* ─── sparkline ────────────────────────────────────────── */
 
 function Sparkline({ data, color, height = 40 }: { data: number[]; color: string; height?: number }) {
-  const chartData = useMemo(() => data.map((v, i) => ({ i, v })), [data]);
-  if (chartData.length < 2) return null;
-  const id = useMemo(() => `spark-${Math.random().toString(36).slice(2, 8)}`, []);
+  if (data.length < 2) return null;
+  const values = data.map((v) => Number.isFinite(v) ? v : 0);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const width = 160;
+  const points = values.map((value, index) => {
+    const x = (index / Math.max(values.length - 1, 1)) * width;
+    const y = height - (((value - min) / range) * (height - 6) + 3);
+    return `${x},${y}`;
+  }).join(' ');
 
   return (
-    <div style={{ width: '100%', height }}>
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={chartData} margin={{ top: 2, right: 0, bottom: 0, left: 0 }}>
-          <defs>
-            <linearGradient id={id} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={color} stopOpacity={0.35} />
-              <stop offset="100%" stopColor={color} stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <Area
-            type="monotone"
-            dataKey="v"
-            stroke={color}
-            strokeWidth={1.5}
-            fill={`url(#${id})`}
-            isAnimationActive={false}
-            dot={false}
-          />
-        </AreaChart>
-      </ResponsiveContainer>
-    </div>
+    <svg viewBox={`0 0 ${width} ${height}`} className="w-full" style={{ height }} preserveAspectRatio="none" aria-hidden="true">
+      <polyline
+        fill="none"
+        stroke={color}
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        points={points}
+      />
+    </svg>
   );
 }
 
@@ -172,9 +170,17 @@ function MetricCard({ icon: Icon, label, value, unit, percent, color, sparkData,
 
 /* ─── main dashboard ──────────────────────────────────── */
 
+function getPrimaryDisk(disks: SystemStats['disk'] | undefined) {
+  if (!Array.isArray(disks) || disks.length === 0) return null;
+  return disks.find(d => d.mount === '/') || disks[0];
+}
+
 export default function DashboardPage() {
+  const user = useAuthStore((state) => state.user);
+  const canRunSelfUpdate = isOwner(user);
+  const canReconnectGateway = isElevated(user);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
-  const [metadata, setMetadata] = useState<any>(null);
+  const [systemStats, setSystemStats] = useState<SystemStats | null>(null);
   const [history, setHistory] = useState<Metrics[]>([]);
   const [connected, setConnected] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
@@ -186,10 +192,12 @@ export default function DashboardPage() {
   const [openClawStatus, setOpenClawStatus] = useState<'checking' | 'connected' | 'misconfigured' | 'offline'>('checking');
   const [openClawIssues, setOpenClawIssues] = useState<string[]>([]);
   const [reconnecting, setReconnecting] = useState(false);
+  const [showCharts, setShowCharts] = useState(false);
   // readiness + recentActivity sections removed per design cleanup
   const socketRef = useRef<Socket | null>(null);
+  const alertSocketRef = useRef<Socket | null>(null);
 
-  // Socket.io real-time connection
+  // Metrics socket is critical to the page, so keep it on the immediate path
   useEffect(() => {
     const wsUrl = import.meta.env.VITE_WS_URL || import.meta.env.VITE_API_URL?.replace('/api', '') || window.location.origin;
     const socket = io(`${wsUrl}/metrics`, {
@@ -212,7 +220,6 @@ export default function DashboardPage() {
         networkOut: data.networkOut,
       };
       setMetrics(m);
-      setMetadata(data.metadata || null);
       setLastUpdate(new Date());
       setHistory(prev => {
         const sixHoursAgo = Date.now() - 6 * 60 * 60 * 1000;
@@ -225,91 +232,157 @@ export default function DashboardPage() {
 
     socketRef.current = socket;
 
-    // Alerts socket
-    const alertSocket = io(`${wsUrl}/alerts`, {
-      transports: ['websocket', 'polling'],
-      reconnection: true,
-    });
-    alertSocket.on('alert', (alert: any) => {
-      const newAlert: ActivityLog = {
-        id: `rt-${Date.now()}`,
-        action: 'SYSTEM_ALERT',
-        resource: alert.resource,
-        severity: alert.severity,
-        translatedMessage: alert.translatedMessage,
-        createdAt: new Date().toISOString(),
-      };
-      setActiveAlerts(prev => [newAlert, ...prev].slice(0, 20));
-    });
+    return () => {
+      socket.disconnect();
+    };
+  }, []);
 
-    return () => { socket.disconnect(); alertSocket.disconnect(); };
+  // Alerts are secondary dashboard data, so keep their live connection off the initial mount path
+  useEffect(() => {
+    const wsUrl = import.meta.env.VITE_WS_URL || import.meta.env.VITE_API_URL?.replace('/api', '') || window.location.origin;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      const alertSocket = io(`${wsUrl}/alerts`, {
+        transports: ['websocket', 'polling'],
+        reconnection: true,
+      });
+      alertSocket.on('alert', (alert: any) => {
+        const newAlert: ActivityLog = {
+          id: `rt-${Date.now()}`,
+          action: 'SYSTEM_ALERT',
+          resource: alert.resource,
+          severity: alert.severity,
+          translatedMessage: alert.translatedMessage,
+          createdAt: new Date().toISOString(),
+        };
+        setActiveAlerts(prev => [newAlert, ...prev].slice(0, 20));
+      });
+      alertSocketRef.current = alertSocket;
+    }, 1200);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      alertSocketRef.current?.disconnect();
+      alertSocketRef.current = null;
+    };
   }, []);
 
 
 
-  // Initial data fetch
+  // Initial critical data fetch
   const fetchData = useCallback(async () => {
     try {
-      const [m, h, al, upd, gateway] = await Promise.all([
+      const [m, s, h] = await Promise.all([
         metricsAPI.latest().catch(() => null),
+        systemStatsAPI.latest().catch(() => null),
         metricsAPI.history(6).catch(() => []),
-        alertsAPI.list({ limit: 10, severity: 'CRITICAL' }).catch(() => ({ alerts: [], total: 0 })),
-        client.post('/admin/check-updates', {}, { _silent: true } as any).then(r => r.data).catch(() =>
-          client.get('/admin/update-status', { _silent: true } as any).then(r => r.data).catch(() => null)
-        ),
-        client.get('/gateway/health', { _silent: true } as any).then(r => r.data).catch(() => null),
       ]);
-      if (gateway?.ok) {
-        setOpenClawStatus('connected');
-        setOpenClawIssues([]);
-      } else if (gateway?.connected && !gateway?.wsConnected) {
-        // Gateway process is reachable but the authenticated WS channel is down — chat won't work
-        setOpenClawStatus('offline');
-        setOpenClawIssues(gateway?.issues || ['Gateway is reachable but agent chat connection failed. Try restarting the portal service.']);
-      } else if (gateway?.connected && !gateway?.modelsConfigured) {
-        setOpenClawStatus('misconfigured');
-        setOpenClawIssues(gateway?.issues || ['No AI models configured. Run "openclaw onboard" on the server.']);
-      } else {
-        setOpenClawStatus('offline');
-        setOpenClawIssues(gateway?.issues || []);
+      if (m) setMetrics(m);
+      if (s) {
+        setSystemStats(s);
+        setLastUpdate(new Date());
       }
-      if (upd) {
-        setUpdateStatus(upd);
-        const latest = typeof upd?.latest === 'string' ? upd.latest : null;
-        if (latest && localStorage.getItem(`dashboard-update-dismissed:${latest}`) === 'true') {
-          setUpdateBannerDismissed(true);
-        } else {
-          setUpdateBannerDismissed(false);
-        }
-      }
-      if (m) { setMetrics(m); setMetadata((m as any).metadata || null); }
       if (Array.isArray(h)) setHistory(h);
-      if (al.alerts?.length) {
-        setActiveAlerts(prev => {
-          const ids = new Set(prev.map(p => p.id));
-          const merged = [...prev];
-          for (const alert of al.alerts) {
-            if (!ids.has(alert.id)) merged.push(alert);
-          }
-          return merged.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).slice(0, 20);
-        });
-      }
-    } catch (err) { console.error('[Dashboard] Failed to fetch data:', err); }
+    } catch (err) { console.error('[Dashboard] Failed to fetch core data:', err); }
   }, []);
 
   useEffect(() => { fetchData(); }, [fetchData]);
+
+  // Defer non-critical startup checks so the main dashboard cards can settle first
+  useEffect(() => {
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        const [al, upd, gateway] = await Promise.all([
+          alertsAPI.list({ limit: 10, severity: 'CRITICAL' }).catch(() => ({ alerts: [], total: 0 })),
+          (canRunSelfUpdate
+            ? client.post('/admin/check-updates', {}, { _silent: true } as any).then(r => r.data).catch(() =>
+                client.get('/admin/update-status', { _silent: true } as any).then(r => r.data).catch(() => null)
+              )
+            : client.get('/admin/update-status', { _silent: true } as any).then(r => r.data).catch(() => null)),
+          client.get('/gateway/health', { _silent: true } as any).then(r => r.data).catch(() => null),
+        ]);
+        if (cancelled) return;
+        if (gateway?.ok) {
+          setOpenClawStatus('connected');
+          setOpenClawIssues([]);
+        } else if (gateway?.connected && !gateway?.wsConnected) {
+          setOpenClawStatus('offline');
+          setOpenClawIssues(gateway?.issues || ['Gateway is reachable but agent chat connection failed. Try restarting the portal service.']);
+        } else if (gateway?.connected && !gateway?.modelsConfigured) {
+          setOpenClawStatus('misconfigured');
+          setOpenClawIssues(gateway?.issues || ['No AI models configured. Run "openclaw onboard" on the server.']);
+        } else {
+          setOpenClawStatus('offline');
+          setOpenClawIssues(gateway?.issues || []);
+        }
+        if (upd) {
+          setUpdateStatus(upd);
+          const latest = typeof upd?.latest === 'string' ? upd.latest : null;
+          if (latest && localStorage.getItem(`dashboard-update-dismissed:${latest}`) === 'true') {
+            setUpdateBannerDismissed(true);
+          } else {
+            setUpdateBannerDismissed(false);
+          }
+        }
+        if (al.alerts?.length) {
+          setActiveAlerts(prev => {
+            const ids = new Set(prev.map(p => p.id));
+            const merged = [...prev];
+            for (const alert of al.alerts) {
+              if (!ids.has(alert.id)) merged.push(alert);
+            }
+            return merged.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).slice(0, 20);
+          });
+        }
+      } catch (err) {
+        if (!cancelled) console.error('[Dashboard] Failed to fetch secondary data:', err);
+      }
+    }, 1200);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [canRunSelfUpdate]);
 
   // Fallback polling if WebSocket disconnects
   useEffect(() => {
     if (connected) return;
     const iv = setInterval(async () => {
       try {
-        const m = await metricsAPI.latest();
-        if (m) { setMetrics(m); setMetadata((m as any).metadata || null); setLastUpdate(new Date()); }
+        const [m, s] = await Promise.all([
+          metricsAPI.latest().catch(() => null),
+          systemStatsAPI.latest().catch(() => null),
+        ]);
+        if (m) setMetrics(m);
+        if (s) {
+          setSystemStats(s);
+          setLastUpdate(new Date());
+        }
       } catch (err) { console.error('[Dashboard] Metrics poll error:', err); }
     }, 10000);
     return () => clearInterval(iv);
   }, [connected]);
+
+  // Defer chart bundle work until the cards have had a chance to render first
+  useEffect(() => {
+    let cancelled = false;
+    const revealCharts = () => {
+      if (!cancelled) setShowCharts(true);
+    };
+
+    const idleCallback = window.requestIdleCallback?.(() => revealCharts(), { timeout: 1500 });
+    const timer = window.setTimeout(revealCharts, 1200);
+
+    return () => {
+      cancelled = true;
+      if (idleCallback !== undefined) window.cancelIdleCallback?.(idleCallback);
+      window.clearTimeout(timer);
+    };
+  }, []);
 
   // Derived sparkline data
   const cpuHistory = useMemo(() => history.map(m => m.cpuUsage), [history]);
@@ -328,12 +401,19 @@ export default function DashboardPage() {
     netOut: Number(m.networkOut) / 1024 / 1024,
   })), [history]);
 
-  const uptimeSeconds = metadata?.uptimeSeconds || 0;
-  const cpuCores = metadata?.cpuCores || 0;
-  const memUsedGB = metadata?.memoryUsedBytes ? (metadata.memoryUsedBytes / 1073741824).toFixed(1) : '—';
-  const memTotalGB = metrics?.memoryTotal ? (Number(metrics.memoryTotal) / 1073741824).toFixed(1) : '—';
-  const diskTotalGB = metrics?.diskTotal ? (Number(metrics.diskTotal) / 1073741824).toFixed(0) : '—';
-  const loadAvg = metrics?.loadAverage || [];
+  const primaryDisk = getPrimaryDisk(systemStats?.disk);
+  const uptimeSeconds = systemStats?.uptime || 0;
+  const cpuCores = systemStats?.cpu?.perCore?.length || 0;
+  const memUsedGB = systemStats?.memory?.used ? (systemStats.memory.used / 1073741824).toFixed(1) : '—';
+  const memTotalGB = systemStats?.memory?.total ? (systemStats.memory.total / 1073741824).toFixed(1) : '—';
+  const diskTotalGB = primaryDisk?.total ? (primaryDisk.total / 1073741824).toFixed(0) : '—';
+  const currentCpuUsage = systemStats?.cpu?.overall ?? metrics?.cpuUsage;
+  const currentMemoryUsage = systemStats?.memory?.usagePercent ?? metrics?.memoryUsage;
+  const currentDiskUsage = primaryDisk?.usagePercent ?? metrics?.diskUsage;
+  const currentNetworkIn = metrics?.networkIn;
+  const currentNetworkOut = metrics?.networkOut;
+  const currentProcessCount = systemStats?.processes ?? metrics?.processCount;
+  const loadAvg = systemStats ? [systemStats.loadAverage['1min'], systemStats.loadAverage['5min'], systemStats.loadAverage['15min']] : (metrics?.loadAverage || []);
 
   const showUpdateBanner = Boolean(updateStatus?.updateAvailable && updateStatus.latest && !updateBannerDismissed);
 
@@ -345,6 +425,7 @@ export default function DashboardPage() {
   };
 
   const runSelfUpdate = useCallback(async () => {
+    if (!canRunSelfUpdate) return;
     try {
       setUpdateInProgress(true);
       setUpdateMessage('Updating... This may take a minute.');
@@ -376,7 +457,7 @@ export default function DashboardPage() {
       setUpdateMessage(err?.response?.data?.error || 'Update may have failed. Check server logs.');
       setUpdateInProgress(false);
     }
-  }, []);
+  }, [canRunSelfUpdate]);
 
   return (
     <motion.div
@@ -421,20 +502,30 @@ export default function DashboardPage() {
           <div className="relative flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <p className="text-sm font-semibold text-cyan-200">Update available: v{updateStatus.latest} (you have v{updateStatus.current})</p>
-              <p className="mt-1 text-sm text-slate-300">Install the latest portal bundle to pick up fixes and improvements.</p>
-              {updateMessage && (
+              <p className="mt-1 text-sm text-slate-300">
+                {canRunSelfUpdate
+                  ? 'Install the latest portal bundle to pick up fixes and improvements.'
+                  : 'A newer portal bundle is available. Only the owner can install updates from this dashboard.'}
+              </p>
+              {canRunSelfUpdate && updateMessage && (
                 <p className="mt-2 text-sm text-cyan-50">{updateMessage}</p>
               )}
             </div>
             <div className="flex flex-wrap gap-3">
-              <button
-                onClick={runSelfUpdate}
-                disabled={updateInProgress}
-                className="inline-flex items-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/80 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-70"
-              >
-                {updateInProgress ? <Loader2 size={16} className="animate-spin" /> : null}
-                Update Now
-              </button>
+              {canRunSelfUpdate ? (
+                <button
+                  onClick={runSelfUpdate}
+                  disabled={updateInProgress}
+                  className="inline-flex items-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/80 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  {updateInProgress ? <Loader2 size={16} className="animate-spin" /> : null}
+                  Update Now
+                </button>
+              ) : (
+                <div className="inline-flex items-center rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-300">
+                  Owner access required
+                </div>
+              )}
               <button
                 onClick={dismissUpdateBanner}
                 disabled={updateInProgress}
@@ -468,37 +559,45 @@ export default function DashboardPage() {
           }</span>
         </div>
         {(openClawStatus === 'offline' || openClawStatus === 'misconfigured') && openClawIssues.length > 0 && (
-          <div className="flex items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
-            <span className="flex-1">{openClawIssues[0]}</span>
-            <button
-              onClick={async () => {
-                setReconnecting(true);
-                try {
-                  const { data } = await client.post('/gateway/reconnect');
-                  if (data?.ok) {
-                    setOpenClawStatus('connected');
-                    setOpenClawIssues([]);
-                  } else {
-                    setOpenClawIssues([data?.message || 'Reconnect failed']);
+          <div className="flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
+            <span className="flex-1 min-w-[14rem]">{openClawIssues[0]}</span>
+            {canReconnectGateway ? (
+              <button
+                onClick={async () => {
+                  setReconnecting(true);
+                  try {
+                    const { data } = await client.post('/gateway/reconnect');
+                    if (data?.ok) {
+                      setOpenClawStatus('connected');
+                      setOpenClawIssues([]);
+                    } else {
+                      setOpenClawIssues([data?.message || 'Reconnect failed']);
+                    }
+                  } catch {
+                    setOpenClawIssues(['Reconnect request failed']);
+                  } finally {
+                    setReconnecting(false);
+                    fetchData();
                   }
-                } catch {
-                  setOpenClawIssues(['Reconnect request failed']);
-                } finally {
-                  setReconnecting(false);
-                  fetchData();
-                }
-              }}
-              disabled={reconnecting}
-              className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-amber-400/30 bg-amber-500/20 hover:bg-amber-500/30 px-3 py-1 text-xs font-medium text-amber-200 transition disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {reconnecting ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-              {reconnecting ? 'Reconnecting…' : 'Reconnect'}
-            </button>
+                }}
+                disabled={reconnecting}
+                className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-amber-400/30 bg-amber-500/20 hover:bg-amber-500/30 px-3 py-1 text-xs font-medium text-amber-200 transition disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {reconnecting ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                {reconnecting ? 'Reconnecting…' : 'Reconnect'}
+              </button>
+            ) : (
+              <span className="shrink-0 rounded-lg border border-amber-400/20 bg-black/10 px-2.5 py-1 text-xs text-amber-200/90">
+                Admin access required to reconnect OpenClaw.
+              </span>
+            )}
           </div>
         )}
         {openClawStatus === 'offline' && openClawIssues.length === 0 && (
           <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
-            OpenClaw gateway is not responding. Check Settings → System.
+            {canReconnectGateway
+              ? 'OpenClaw gateway is not responding. Check Settings → System.'
+              : 'OpenClaw gateway is not responding. An admin must reconnect it from Settings → System.'}
           </div>
         )}
       </div>
@@ -571,9 +670,9 @@ export default function DashboardPage() {
           icon={Cpu}
           label="CPU Usage"
           color="#10B981"
-          value={metrics?.cpuUsage?.toFixed(1) ?? '—'}
+          value={currentCpuUsage?.toFixed(1) ?? '—'}
           unit="%"
-          percent={metrics?.cpuUsage}
+          percent={currentCpuUsage}
           sparkData={cpuHistory}
           subtitle={cpuCores ? `${cpuCores} cores` : undefined}
         />
@@ -581,9 +680,9 @@ export default function DashboardPage() {
           icon={MemoryStick}
           label="Memory"
           color="#3B82F6"
-          value={metrics?.memoryUsage?.toFixed(1) ?? '—'}
+          value={currentMemoryUsage?.toFixed(1) ?? '—'}
           unit="%"
-          percent={metrics?.memoryUsage}
+          percent={currentMemoryUsage}
           sparkData={memHistory}
           subtitle={`${memUsedGB} / ${memTotalGB} GB`}
         />
@@ -591,9 +690,9 @@ export default function DashboardPage() {
           icon={HardDrive}
           label="Disk Usage"
           color="#8B5CF6"
-          value={metrics?.diskUsage?.toFixed(1) ?? '—'}
+          value={currentDiskUsage?.toFixed(1) ?? '—'}
           unit="%"
-          percent={metrics?.diskUsage}
+          percent={currentDiskUsage}
           sparkData={diskHistory}
           subtitle={`${diskTotalGB} GB total`}
         />
@@ -601,7 +700,7 @@ export default function DashboardPage() {
           icon={ArrowDown}
           label="Network In"
           color="#06B6D4"
-          value={metrics?.networkIn ? (Number(metrics.networkIn) / 1024 / 1024).toFixed(2) : '—'}
+          value={currentNetworkIn ? (Number(currentNetworkIn) / 1024 / 1024).toFixed(2) : '—'}
           unit="MB/s"
           sparkData={netInHistory}
         />
@@ -609,7 +708,7 @@ export default function DashboardPage() {
           icon={ArrowUp}
           label="Network Out"
           color="#F59E0B"
-          value={metrics?.networkOut ? (Number(metrics.networkOut) / 1024 / 1024).toFixed(2) : '—'}
+          value={currentNetworkOut ? (Number(currentNetworkOut) / 1024 / 1024).toFixed(2) : '—'}
           unit="MB/s"
           sparkData={netOutHistory}
         />
@@ -617,16 +716,17 @@ export default function DashboardPage() {
           icon={Layers}
           label="Processes"
           color="#EC4899"
-          value={metrics?.processCount?.toString() ?? '—'}
-          unit="running"
+          value={currentProcessCount?.toString() ?? '—'}
+          unit=""
+          subtitle="running"
           sparkData={processHistory}
         />
         <MetricCard
           icon={Gauge}
           label="Load Average"
           color="#F97316"
-          value={loadAvg.length >= 1 ? loadAvg[0].toFixed(2) : '—'}
-          unit={loadAvg.length >= 3 ? `${loadAvg[1]?.toFixed(1)} / ${loadAvg[2]?.toFixed(1)}` : '1 / 5 / 15m'}
+          value={loadAvg.length >= 3 ? `${loadAvg[0]?.toFixed(2)} / ${loadAvg[1]?.toFixed(2)} / ${loadAvg[2]?.toFixed(2)}` : (loadAvg.length >= 1 ? loadAvg[0].toFixed(2) : '—')}
+          unit=""
           subtitle="1 / 5 / 15 min"
         />
         <MetricCard
@@ -635,91 +735,21 @@ export default function DashboardPage() {
           color="#14B8A6"
           value={uptimeSeconds ? formatUptime(uptimeSeconds) : '—'}
           unit=""
-          subtitle={metadata?.hostname || ''}
+          subtitle={systemStats?.hostname || ''}
         />
       </motion.div>
 
       {/* Charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.3 }}
-          className="glass hover-glow p-5"
-        >
-          <h3 className="text-sm font-medium text-slate-400 mb-4 flex items-center gap-2">
-            <Cpu size={14} className="text-emerald-400" />
-            CPU & Memory (6h)
-          </h3>
-          <ResponsiveContainer width="100%" height={240}>
-            <AreaChart data={chartData}>
-              <defs>
-                <linearGradient id="cpuGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#10B981" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#10B981" stopOpacity={0} />
-                </linearGradient>
-                <linearGradient id="memGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#3B82F6" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#3B82F6" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <XAxis dataKey="time" tick={{ fill: '#64748B', fontSize: 11 }} axisLine={false} tickLine={false} />
-              <YAxis domain={[0, 100]} tick={{ fill: '#64748B', fontSize: 11 }} axisLine={false} tickLine={false} width={35} />
-              <Tooltip
-                contentStyle={{
-                  background: 'rgba(26,31,58,0.95)',
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  borderRadius: 12,
-                  color: '#F0F4F8',
-                  backdropFilter: 'blur(12px)',
-                }}
-              />
-              <Area type="monotone" dataKey="cpu" stroke="#10B981" fill="url(#cpuGrad)" strokeWidth={2} name="CPU %" />
-              <Area type="monotone" dataKey="memory" stroke="#3B82F6" fill="url(#memGrad)" strokeWidth={2} name="Memory %" />
-            </AreaChart>
-          </ResponsiveContainer>
-        </motion.div>
-
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.4 }}
-          className="glass hover-glow p-5"
-        >
-          <h3 className="text-sm font-medium text-slate-400 mb-4 flex items-center gap-2">
-            <Wifi size={14} className="text-cyan-400" />
-            Network I/O (6h)
-          </h3>
-          <ResponsiveContainer width="100%" height={240}>
-            <AreaChart data={chartData}>
-              <defs>
-                <linearGradient id="netInGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#06B6D4" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#06B6D4" stopOpacity={0} />
-                </linearGradient>
-                <linearGradient id="netOutGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#F59E0B" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#F59E0B" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <XAxis dataKey="time" tick={{ fill: '#64748B', fontSize: 11 }} axisLine={false} tickLine={false} />
-              <YAxis tick={{ fill: '#64748B', fontSize: 11 }} axisLine={false} tickLine={false} width={45} />
-              <Tooltip
-                contentStyle={{
-                  background: 'rgba(26,31,58,0.95)',
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  borderRadius: 12,
-                  color: '#F0F4F8',
-                  backdropFilter: 'blur(12px)',
-                }}
-                formatter={(v: number) => `${v.toFixed(2)} MB/s`}
-              />
-              <Area type="monotone" dataKey="netIn" stroke="#06B6D4" fill="url(#netInGrad)" strokeWidth={2} name="In" />
-              <Area type="monotone" dataKey="netOut" stroke="#F59E0B" fill="url(#netOutGrad)" strokeWidth={2} name="Out" />
-            </AreaChart>
-          </ResponsiveContainer>
-        </motion.div>
-      </div>
+      {showCharts ? (
+        <Suspense fallback={<div className="grid grid-cols-1 lg:grid-cols-2 gap-5"><div className="glass p-5 h-[304px] flex items-center justify-center text-slate-500 text-sm">Loading charts…</div><div className="glass p-5 h-[304px] flex items-center justify-center text-slate-500 text-sm">Loading charts…</div></div>}>
+          <LazyDashboardCharts chartData={chartData} />
+        </Suspense>
+      ) : (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5" aria-hidden="true">
+          <div className="glass p-5 h-[304px] flex items-center justify-center text-slate-500 text-sm">Preparing charts…</div>
+          <div className="glass p-5 h-[304px] flex items-center justify-center text-slate-500 text-sm">Preparing charts…</div>
+        </div>
+      )}
 
       {/* Activity Log */}
       <motion.div

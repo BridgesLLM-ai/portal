@@ -34,6 +34,11 @@ import {
 } from '../utils/openclawGatewayClient';
 import { canonicalizePortalModelId } from '../utils/modelId';
 import { usePublicSettings } from '../hooks/usePublicSettings';
+import {
+  pruneExpiredExecApprovals,
+  removeExecApproval,
+  upsertExecApproval,
+} from '../utils/execApprovalQueue';
 
 const DEBUG_CHAT_STATE = import.meta.env.DEV;
 const BUILD_TIME_USE_DIRECT_GATEWAY = import.meta.env.VITE_USE_DIRECT_GATEWAY === 'true';
@@ -306,6 +311,32 @@ function normalizeProviderModel(provider: string, rawModel: string): string {
   return model;
 }
 
+function normalizeToolCalls(toolCalls: any, defaultStatus: ToolCall['status'] = 'done'): ToolCall[] | undefined {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return undefined;
+
+  return toolCalls
+    .filter((tc) => tc && typeof tc === 'object' && typeof tc.name === 'string' && tc.name.trim())
+    .map((tc) => {
+      const startedAt = typeof tc.startedAt === 'number' && Number.isFinite(tc.startedAt)
+        ? tc.startedAt
+        : Date.now();
+      const endedAt = typeof tc.endedAt === 'number' && Number.isFinite(tc.endedAt)
+        ? tc.endedAt
+        : (tc.status === 'running' ? undefined : Date.now());
+      return {
+        id: typeof tc.id === 'string' && tc.id.trim() ? tc.id : nextId(),
+        name: tc.name,
+        arguments: tc.arguments,
+        startedAt,
+        endedAt,
+        result: typeof tc.result === 'string' ? tc.result : undefined,
+        status: tc.status === 'running' || tc.status === 'error' || tc.status === 'done'
+          ? tc.status
+          : defaultStatus,
+      };
+    });
+}
+
 function parseHistoryMessage(m: any): ChatMessage | null {
   const rawContent = m.content || '';
   const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
@@ -324,14 +355,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
     model: typeof m.model === 'string' ? m.model : undefined,
   };
   if (m.toolCalls) {
-    msg.toolCalls = m.toolCalls.map((tc: any) => ({
-      id: tc.id || nextId(),
-      name: tc.name,
-      arguments: tc.arguments,
-      startedAt: Date.now(),
-      endedAt: Date.now(),
-      status: 'done' as const,
-    }));
+    msg.toolCalls = normalizeToolCalls(m.toolCalls, 'done');
   }
   // Preserve segments for graduated timeline reconstruction
   if (m.segments && Array.isArray(m.segments)) {
@@ -364,18 +388,19 @@ function extractTextFromGatewayMessage(msg: GatewayChatMessage): string {
 function extractToolCallsFromGatewayMessage(msg: GatewayChatMessage): ToolCall[] | undefined {
   if (!Array.isArray(msg.content)) return undefined;
 
-  const toolCalls = msg.content
-    .filter((block) => block.type === 'toolCall' && block.name)
-    .map((block) => ({
-      id: block.id || nextId(),
-      name: block.name as string,
-      arguments: block.arguments,
-      startedAt: Date.now(),
-      endedAt: Date.now(),
-      status: 'done' as const,
-    }));
-
-  return toolCalls.length > 0 ? toolCalls : undefined;
+  return normalizeToolCalls(
+    msg.content
+      .filter((block) => block.type === 'toolCall' && block.name)
+      .map((block) => ({
+        id: block.id || nextId(),
+        name: block.name as string,
+        arguments: block.arguments,
+        startedAt: Date.now(),
+        endedAt: Date.now(),
+        status: 'done' as const,
+      })),
+    'done',
+  );
 }
 
 /**
@@ -549,8 +574,10 @@ export interface ChatStateContextValue {
   compactionPhase: 'idle' | 'compacting' | 'compacted';
   wsConnected: boolean;
   pendingApproval: ExecApprovalRequest | null;
+  pendingApprovals: ExecApprovalRequest[];
+  pendingApprovalCount: number;
   resolveApproval: (approvalId: string, decision: 'allow-once' | 'deny' | 'allow-always') => Promise<void>;
-  dismissApproval: () => void;
+  dismissApproval: (approvalId?: string) => void;
   provider: string;
   setProvider: (p: string) => void;
   session: string;
@@ -579,6 +606,7 @@ export interface ChatStateContextValue {
   compactionModelError: string | null;
   sessionControlsSupported: boolean;
   ensureSessionControlsMetadataLoaded: () => Promise<void>;
+  sessionTelemetry: OpenClawSessionTelemetry | null;
 }
 
 const ChatStateContext = createContext<ChatStateContextValue | null>(null);
@@ -596,6 +624,150 @@ function normalizeInitialSession(provider: string, session: string): string {
   const s = String(session || '').trim() || 'main';
   if (p === 'OPENCLAW' && s === 'main') return 'agent:main:main';
   return s;
+}
+
+const LIFECYCLE_CONTROL_TOKENS = new Set([
+  'start',
+  'started',
+  'running',
+  'end',
+  'ended',
+  'complete',
+  'completed',
+  'error',
+  'failed',
+  'idle',
+  'compacting',
+  'compacted',
+]);
+
+const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/i;
+const LIFECYCLE_FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context)\b/i;
+const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance complete(?:d)?)\b/i;
+const LIFECYCLE_COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction in progress)\b/i;
+const LIFECYCLE_COMPACTED_RE = /\b(context compacted|compaction complete(?:d)?)\b/i;
+
+type LifecycleMaintenanceSignal = 'idle' | 'maintenance' | 'maintenance_done' | 'compacting' | 'compacted';
+
+export interface OpenClawSessionTelemetry {
+  contextTokens: number | null;
+  totalTokens: number | null;
+  pressureRatio: number | null;
+  compactionCount: number | null;
+  model: string | null;
+  updatedAt: number;
+}
+
+function firstFiniteNumber(...candidates: unknown[]): number | null {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function extractOpenClawSessionTelemetry(sessionInfo: any, modelHint?: string): OpenClawSessionTelemetry | null {
+  if (!sessionInfo || typeof sessionInfo !== 'object') return null;
+
+  const contextTokens = firstFiniteNumber(
+    sessionInfo.contextTokens,
+    sessionInfo.contextWindowTokens,
+    sessionInfo.contextWindow,
+    sessionInfo.modelContextTokens,
+    sessionInfo.modelContextWindow,
+    sessionInfo.currentModel?.contextTokens,
+    sessionInfo.currentModel?.contextWindow,
+    sessionInfo.usage?.contextTokens,
+    sessionInfo.meta?.contextTokens,
+  );
+
+  const totalTokens = firstFiniteNumber(
+    sessionInfo.totalTokens,
+    sessionInfo.usage?.totalTokens,
+    sessionInfo.lastRun?.totalTokens,
+    sessionInfo.lastRun?.usage?.totalTokens,
+    sessionInfo.lastCallUsage?.totalTokens,
+    sessionInfo.meta?.totalTokens,
+  );
+
+  const compactionCount = firstFiniteNumber(
+    sessionInfo.compactionCount,
+    sessionInfo.agentMeta?.compactionCount,
+    sessionInfo.lastRun?.compactionCount,
+    sessionInfo.lastRunStatus?.compactionCount,
+    sessionInfo.meta?.compactionCount,
+  );
+
+  const model = typeof modelHint === 'string' && modelHint.trim() ? modelHint.trim() : null;
+  if (contextTokens == null && totalTokens == null && compactionCount == null && !model) return null;
+
+  return {
+    contextTokens,
+    totalTokens,
+    pressureRatio: contextTokens && totalTokens != null ? Math.max(0, Math.min(1, totalTokens / contextTokens)) : null,
+    compactionCount,
+    model,
+    updatedAt: Date.now(),
+  };
+}
+
+function extractLifecycleStatusText(data: any): string | null {
+  const candidates = [
+    data?.statusText,
+    data?.message,
+    data?.text,
+    data?.content,
+    data?.detail,
+    data?.description,
+    data?.status,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const next = candidate.trim();
+    if (!next) continue;
+    if (LIFECYCLE_CONTROL_TOKENS.has(next.toLowerCase())) continue;
+    return next;
+  }
+
+  return null;
+}
+
+function inferLifecycleMaintenanceSignal(phase: string, statusText: string | null): LifecycleMaintenanceSignal {
+  const normalizedPhase = String(phase || '').trim().toLowerCase();
+  const normalizedStatus = String(statusText || '').trim();
+
+  if (normalizedPhase === 'compacted' || normalizedPhase === 'compaction_end' || normalizedPhase === 'compaction_completed') {
+    return 'compacted';
+  }
+  if (normalizedPhase === 'compacting' || normalizedPhase === 'compaction_start' || normalizedPhase === 'compaction_started') {
+    return 'compacting';
+  }
+  if (!normalizedStatus) {
+    return 'idle';
+  }
+  if (LIFECYCLE_COMPACTED_RE.test(normalizedStatus)) {
+    return 'compacted';
+  }
+  if (LIFECYCLE_COMPACTING_RE.test(normalizedStatus)) {
+    return 'compacting';
+  }
+  if (LIFECYCLE_FLUSH_DONE_RE.test(normalizedStatus)) {
+    return 'maintenance_done';
+  }
+  if (LIFECYCLE_FLUSH_PREPARING_RE.test(normalizedStatus) || LIFECYCLE_FLUSH_RUNNING_RE.test(normalizedStatus)) {
+    return 'maintenance';
+  }
+  return 'idle';
+}
+
+function defaultLifecycleStatusText(signal: LifecycleMaintenanceSignal): string {
+  if (signal === 'compacting') return 'Compacting context…';
+  if (signal === 'compacted') return 'Context compacted';
+  if (signal === 'maintenance') return 'Preparing context maintenance…';
+  if (signal === 'maintenance_done') return 'Context maintenance finished.';
+  return '🧠 Agent is thinking…';
 }
 
 export function ChatStateProvider({ children }: { children: React.ReactNode }) {
@@ -727,15 +899,18 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const [activeToolName, setActiveToolName] = useState<string | null>(null);
   const [thinkingContent, setThinkingContent] = useState<string>('');
   const [startupReady, setStartupReady] = useState(false);
+  const [directGatewayBootstrapReady, setDirectGatewayBootstrapReady] = useState(false);
+  const [directGatewayDemanded, setDirectGatewayDemanded] = useState(false);
   // Graduated streaming segments — when a tool call starts, current accumulated text
   // gets "graduated" into a segment so it renders as a finalized bubble. This matches
   // the OpenClaw web UI v2 pattern where thoughts don't disappear on tool transitions.
   const [streamSegments, setStreamSegments] = useState<Array<{text: string; ts: number}>>([]);
   const streamSegmentsRef = useRef<Array<{text: string; ts: number}>>([]);
   useEffect(() => { streamSegmentsRef.current = streamSegments; }, [streamSegments]);
-  const [pendingApproval, setPendingApproval] = useState<ExecApprovalRequest | null>(null);
+  const [pendingApprovals, setPendingApprovals] = useState<ExecApprovalRequest[]>([]);
   const [wsConnected, setWsConnected] = useState(false);
   const [compactionPhase, setCompactionPhase] = useState<'idle' | 'compacting' | 'compacted'>('idle');
+  const [sessionTelemetry, setSessionTelemetry] = useState<OpenClawSessionTelemetry | null>(null);
   const compactionPhaseRef = useRef<'idle' | 'compacting' | 'compacted'>('idle');
 
   // Session controls state (thinking/fast mode)
@@ -750,6 +925,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const streamWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const STREAM_TIMEOUT_MS = 180_000;
   const compactionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sessionTelemetryRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toolCounterRef = useRef(0);
   const hasRealToolEventsRef = useRef(false);
   const sessionControlsMetadataPromiseRef = useRef<Promise<void> | null>(null);
@@ -787,6 +963,50 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => { modelRef.current = selectedModel; }, [selectedModel]);
   useEffect(() => { messageQueueRef.current = messageQueue; }, [messageQueue]);
 
+  const applySessionTelemetry = useCallback((sessionInfo: any) => {
+    const next = extractOpenClawSessionTelemetry(sessionInfo, deriveSessionModel(sessionInfo));
+    setSessionTelemetry((prev) => {
+      if (!prev && !next) return prev;
+      if (!prev || !next) return next;
+      if (
+        prev.contextTokens === next.contextTokens
+        && prev.totalTokens === next.totalTokens
+        && prev.pressureRatio === next.pressureRatio
+        && prev.compactionCount === next.compactionCount
+        && prev.model === next.model
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, [deriveSessionModel]);
+
+  const refreshSessionTelemetry = useCallback(async (sessionKey?: string) => {
+    const targetSession = typeof sessionKey === 'string' && sessionKey.trim() ? sessionKey.trim() : sessionRef.current;
+    if (!startupReady || providerRef.current !== 'OPENCLAW' || !targetSession || !targetSession.startsWith('agent:')) {
+      setSessionTelemetry(null);
+      return;
+    }
+
+    try {
+      const data = await gatewayAPI.sessionInfo(targetSession, { silent: true });
+      applySessionTelemetry(data?.session);
+    } catch (err) {
+      console.warn('[ChatState] Failed to refresh session telemetry:', err);
+    }
+  }, [applySessionTelemetry, startupReady]);
+
+  const scheduleSessionTelemetryRefresh = useCallback((delayMs = 0, sessionKey?: string) => {
+    if (sessionTelemetryRefreshTimerRef.current) {
+      clearTimeout(sessionTelemetryRefreshTimerRef.current);
+      sessionTelemetryRefreshTimerRef.current = null;
+    }
+    sessionTelemetryRefreshTimerRef.current = setTimeout(() => {
+      sessionTelemetryRefreshTimerRef.current = null;
+      void refreshSessionTelemetry(sessionKey);
+    }, Math.max(0, delayMs));
+  }, [refreshSessionTelemetry]);
+
   const ensureSessionControlsMetadataLoaded = useCallback(async () => {
     if (!startupReady || provider !== 'OPENCLAW' || !session || !session.startsWith('agent:')) return;
     if (sessionControlsMetadataLoaded) return;
@@ -804,6 +1024,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
       if (sessionInfoResult.status === 'fulfilled') {
         const data = sessionInfoResult.value;
+        applySessionTelemetry(data?.session);
         const actualModel = deriveSessionModel(data?.session);
         if (actualModel) {
           setSelectedModelRaw((prev) => (prev === actualModel ? prev : actualModel));
@@ -844,7 +1065,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     } finally {
       sessionControlsMetadataPromiseRef.current = null;
     }
-  }, [startupReady, provider, session, sessionControlsMetadataLoaded, deriveSessionModel]);
+  }, [startupReady, provider, session, sessionControlsMetadataLoaded, deriveSessionModel, applySessionTelemetry]);
 
   useEffect(() => {
     setSessionControlsMetadataLoaded(false);
@@ -853,7 +1074,23 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setFastModeEnabled(false);
     setCompactionModelOverrideState('');
     setCompactionModelError(null);
-  }, [provider, session]);
+    if (provider !== 'OPENCLAW' || !session || !session.startsWith('agent:') || !startupReady) {
+      setSessionTelemetry(null);
+      if (sessionTelemetryRefreshTimerRef.current) {
+        clearTimeout(sessionTelemetryRefreshTimerRef.current);
+        sessionTelemetryRefreshTimerRef.current = null;
+      }
+      return;
+    }
+    scheduleSessionTelemetryRefresh(0, session);
+  }, [provider, session, scheduleSessionTelemetryRefresh, startupReady]);
+
+  useEffect(() => () => {
+    if (sessionTelemetryRefreshTimerRef.current) {
+      clearTimeout(sessionTelemetryRefreshTimerRef.current);
+      sessionTelemetryRefreshTimerRef.current = null;
+    }
+  }, []);
 
   const normalizeAgentError = useCallback((err: unknown, fallback = 'Agent request failed') => {
     const raw = err instanceof Error ? err.message : String(err || '').trim();
@@ -882,7 +1119,16 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           const hasVisibleSnapshotText = typeof data.content === 'string'
             && data.content.length > 0
             && !isControlOnlyAssistantContent(data.content);
-          const shouldSurfaceStream = Boolean(data.toolName) || hasVisibleSnapshotText || Boolean(streamingAssistantIdRef.current);
+          const statusText = typeof data.statusText === 'string' ? data.statusText.trim() : '';
+          const hasStatusSignal = Boolean(statusText)
+            || data.compactionPhase === 'compacting'
+            || data.compactionPhase === 'compacted';
+          const phase = data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking';
+          const fallbackStatus = data.toolName
+            ? `Using ${data.toolName}…`
+            : phase === 'streaming'
+              ? 'Still responding…'
+              : 'Still working…';
 
           if (useDirectGateway && currentProvider === 'OPENCLAW') {
             directClientRef.current?.connect();
@@ -890,16 +1136,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             wsManagerRef.current.reconnect();
           }
 
-          if (!shouldSurfaceStream) {
-            clearActiveStreamState();
-            return;
-          }
-
+          // If the backend still considers the run active, keep the rail alive even
+          // when the agent is quiet. Quiet tool/research/codegen periods are normal.
           directClientRef.current?.setActiveStreamSession(currentSession);
           setIsRunning(true);
-          setStreamingPhase(data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking');
+          setStreamingPhase(phase);
           setActiveToolName(data.toolName || null);
-          setStatusText(data.toolName ? `Using ${data.toolName}…` : 'Still working…');
+          setStatusText(statusText || fallbackStatus);
+          applyCompactionSnapshotState(data.compactionPhase);
           if (hasVisibleSnapshotText) {
             const safeText = sanitizeAssistantContent(data.content);
             assembledRef.current = safeText;
@@ -977,26 +1221,62 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  const applyCompactionState = useCallback((phase: 'start' | 'end') => {
+  const applyCompactionState = useCallback((update: {
+    phase: 'start' | 'end';
+    content?: string | null;
+    completed?: boolean;
+    maintenanceKind?: 'compaction' | 'maintenance';
+  } | 'start' | 'end') => {
     if (providerRef.current !== 'OPENCLAW') return;
+
+    const phase = typeof update === 'string' ? update : update.phase;
+    const content = typeof update === 'string' ? '' : String(update.content || '').trim();
+    const completed = typeof update === 'string' ? phase === 'end' : update.completed !== false;
+    const maintenanceKind = typeof update === 'string' ? 'compaction' : (update.maintenanceKind || 'compaction');
+
     if (phase === 'start') {
       if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
       compactionPhaseRef.current = 'compacting';
       setCompactionPhase('compacting');
       setThinkingContent('');
-      appendSystemNotice('Context compaction started.');
+      appendSystemNotice(content || (maintenanceKind === 'maintenance' ? 'Context maintenance started.' : 'Compacting context…'));
       return;
     }
-    compactionPhaseRef.current = 'compacted';
-    setCompactionPhase('compacted');
-    appendSystemNotice('Context compaction finished.');
-    if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
-    compactionTimerRef.current = setTimeout(() => {
-      compactionPhaseRef.current = 'idle';
-      setCompactionPhase('idle');
-      compactionTimerRef.current = null;
-    }, 3000);
+
+    if (completed && maintenanceKind === 'compaction') {
+      compactionPhaseRef.current = 'compacted';
+      setCompactionPhase('compacted');
+      appendSystemNotice(content || 'Context compacted');
+      if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
+      compactionTimerRef.current = setTimeout(() => {
+        compactionPhaseRef.current = 'idle';
+        setCompactionPhase('idle');
+        compactionTimerRef.current = null;
+      }, 3000);
+      return;
+    }
+
+    compactionPhaseRef.current = 'idle';
+    setCompactionPhase('idle');
+    appendSystemNotice(content || 'Context maintenance finished.');
   }, [appendSystemNotice]);
+
+  const applyCompactionSnapshotState = useCallback((phase?: unknown) => {
+    if (phase !== 'idle' && phase !== 'compacting' && phase !== 'compacted') return;
+    if (compactionTimerRef.current) {
+      clearTimeout(compactionTimerRef.current);
+      compactionTimerRef.current = null;
+    }
+    compactionPhaseRef.current = phase;
+    setCompactionPhase(phase);
+    if (phase === 'compacted') {
+      compactionTimerRef.current = setTimeout(() => {
+        compactionPhaseRef.current = 'idle';
+        setCompactionPhase('idle');
+        compactionTimerRef.current = null;
+      }, 3000);
+    }
+  }, []);
 
   const mergeStreamText = useCallback((incoming?: string, opts?: { replace?: boolean }) => {
     const chunk = typeof incoming === 'string' ? incoming : '';
@@ -1080,7 +1360,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setStatusText(null);
     setThinkingContent('');
     setActiveToolName(null);
-  }, [clearStreamWatchdog]);
+    applyCompactionSnapshotState('idle');
+  }, [applyCompactionSnapshotState, clearStreamWatchdog]);
 
   const applyOpenClawActiveStreamSnapshot = useCallback((snapshot: any, options?: {
     statusTextWhenNoTool?: string | null;
@@ -1090,42 +1371,70 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const snapshotContent = typeof snapshot.content === 'string' && !isControlOnlyAssistantContent(snapshot.content)
       ? sanitizeAssistantContent(snapshot.content)
       : '';
+    const snapshotToolCalls = normalizeToolCalls(snapshot.toolCalls, 'running') || [];
+    const rawStatusText = typeof snapshot.statusText === 'string' ? snapshot.statusText.trim() : '';
     let assistantId = streamingAssistantIdRef.current;
-    const shouldMaterializeBubble = Boolean(snapshotContent) || Boolean(snapshot.toolName) || Boolean(assistantId);
-    if (!shouldMaterializeBubble) {
+    const hasStatusSignal = Boolean(rawStatusText)
+      || snapshot.compactionPhase === 'compacting'
+      || snapshot.compactionPhase === 'compacted';
+    const hasActivePhaseSignal = snapshot.phase === 'tool'
+      || snapshot.phase === 'thinking'
+      || snapshot.phase === 'streaming'
+      || Boolean(snapshot.runId);
+    const shouldHydrateLiveState = Boolean(snapshotContent)
+      || Boolean(snapshot.toolName)
+      || snapshotToolCalls.length > 0
+      || hasStatusSignal
+      || hasActivePhaseSignal
+      || Boolean(assistantId);
+    if (!shouldHydrateLiveState) {
       return false;
     }
+    const shouldMaterializeBubble = Boolean(snapshotContent)
+      || Boolean(snapshot.toolName)
+      || snapshotToolCalls.length > 0
+      || Boolean(assistantId);
 
     isStreamActiveRef.current = true;
     streamTransportRef.current = options?.source || 'portal';
     directClientRef.current?.setActiveStreamSession(sessionRef.current || null);
+    const snapshotPhase = snapshot.phase === 'tool' ? 'tool' : snapshot.phase === 'streaming' ? 'streaming' : 'thinking';
+    const fallbackStatusText = snapshot.toolName
+      ? `Using ${snapshot.toolName}…`
+      : rawStatusText || options?.statusTextWhenNoTool || (snapshotPhase === 'streaming' ? 'Still responding…' : 'Still working…');
     setIsRunning(true);
-    setStreamingPhase(snapshot.phase === 'tool' ? 'tool' : snapshot.phase === 'streaming' ? 'streaming' : 'thinking');
+    setStreamingPhase(snapshotPhase);
     setActiveToolName(snapshot.toolName || null);
-    setStatusText(snapshot.toolName ? `Using ${snapshot.toolName}…` : ((snapshot.statusText || options?.statusTextWhenNoTool) ?? null));
-    const snapshotCompaction = snapshot.compactionPhase;
-    if (snapshotCompaction === 'compacting' || snapshotCompaction === 'compacted' || snapshotCompaction === 'idle') {
-      compactionPhaseRef.current = snapshotCompaction;
-      setCompactionPhase(snapshotCompaction);
-    }
+    setStatusText(fallbackStatusText);
+    applyCompactionSnapshotState(snapshot.compactionPhase);
     if (snapshot.provenance) setLastProvenance(String(snapshot.provenance));
     if (snapshotContent) {
       mergeStreamText(snapshotContent, { replace: true });
     }
-    assistantId = ensureStreamingAssistantBubble({
-      idPrefix: 'stream-resume',
-      content: snapshotContent || '',
-    }).assistantId;
-    if (snapshot.model && assistantId) {
-      setMessages(prev => prev.map(m => (
-        m.id === assistantId
-          ? { ...m, model: normalizeProviderModel(providerRef.current, String(snapshot.model)) }
-          : m
-      )));
+    if (snapshotToolCalls.length > 0) {
+      hasRealToolEventsRef.current = true;
+      toolCounterRef.current = Math.max(toolCounterRef.current, snapshotToolCalls.length);
+    }
+    if (shouldMaterializeBubble) {
+      assistantId = ensureStreamingAssistantBubble({
+        idPrefix: 'stream-resume',
+        content: snapshotContent || '',
+      }).assistantId;
+    }
+    if (assistantId) {
+      setMessages(prev => prev.map(m => {
+        if (m.id !== assistantId) return m;
+        return {
+          ...m,
+          content: snapshotContent || m.content,
+          toolCalls: snapshotToolCalls.length > 0 ? snapshotToolCalls : (m.toolCalls || []),
+          model: snapshot.model ? normalizeProviderModel(providerRef.current, String(snapshot.model)) : m.model,
+        };
+      }));
     }
     resetStreamWatchdog();
     return true;
-  }, [ensureStreamingAssistantBubble, mergeStreamText, resetStreamWatchdog]);
+  }, [applyCompactionSnapshotState, ensureStreamingAssistantBubble, mergeStreamText, resetStreamWatchdog]);
 
   const hydrateActiveStream = useCallback(async (
     sessionKey: string,
@@ -1173,6 +1482,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       if (isStreamActiveRef.current) return true;
       debugLog('[ChatState] Active stream found during history load — hydrating');
+      setDirectGatewayDemanded(true);
       applyOpenClawActiveStreamSnapshot(data, { statusTextWhenNoTool: 'Reconnecting to stream…' });
       if (options?.reconnect !== false && manager?.isConnected()) {
         manager.send({ type: 'reconnect', session: sessionKey, provider: prov });
@@ -1382,6 +1692,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (data?.sessionKey && data.sessionKey !== sessionRef.current && !alwaysPassthroughTypes.includes(data.type)) {
       return;
     }
+    if (data?.type && ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'done', 'stream_resume', 'stream_ended', 'run_resumed', 'compaction_start', 'compaction_end'].includes(data.type)) {
+      setWsConnected(true);
+    }
     // Temp debug: log tool-related events to diagnose missing tool cards
     if (data.type && (data.type.startsWith('tool') || data.type === 'text' || data.type === 'done')) {
       console.log(`[ChatState] WS event: type=${data.type} assistantId=${streamingAssistantIdRef.current || 'NULL'} toolName=${data.toolName || '-'} contentLen=${(data.content||'').length}`);
@@ -1450,11 +1763,21 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         break;
       }
       case 'compaction_start': {
-        applyCompactionState('start');
+        applyCompactionState({
+          phase: 'start',
+          content: typeof data.content === 'string' ? data.content : null,
+          maintenanceKind: data.maintenanceKind === 'maintenance' ? 'maintenance' : 'compaction',
+        });
         break;
       }
       case 'compaction_end': {
-        applyCompactionState('end');
+        applyCompactionState({
+          phase: 'end',
+          content: typeof data.content === 'string' ? data.content : null,
+          completed: data.completed !== false,
+          maintenanceKind: data.maintenanceKind === 'maintenance' ? 'maintenance' : 'compaction',
+        });
+        scheduleSessionTelemetryRefresh(250);
         break;
       }
       case 'tool_start': {
@@ -1644,6 +1967,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             }));
           }
         }
+        scheduleSessionTelemetryRefresh(400);
         break;
       }
       case 'error': {
@@ -1677,12 +2001,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       case 'exec_approval': {
         const approval = data.approval as ExecApprovalRequest;
-        if (approval?.id) { setPendingApproval(approval); setStatusText('\u23f3 Waiting for command approval\u2026'); }
+        if (approval?.id) {
+          setPendingApprovals((prev) => upsertExecApproval(prev, approval));
+          setStatusText('\u23f3 Waiting for command approval\u2026');
+        }
         break;
       }
       case 'exec_approval_resolved': {
         const resolved = data.resolved;
-        if (resolved?.id) setPendingApproval(prev => (prev?.id === resolved.id ? null : prev));
+        if (resolved?.id) setPendingApprovals((prev) => removeExecApproval(prev, resolved.id));
         break;
       }
       case 'stream_resume': {
@@ -1723,7 +2050,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'keepalive':
         break;
     }
-  }, [applyOpenClawActiveStreamSnapshot, ensureStreamingAssistantBubble, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyCompactionState, mergeStreamText, upsertStreamingAssistant]);
+  }, [applyOpenClawActiveStreamSnapshot, ensureStreamingAssistantBubble, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyCompactionState, mergeStreamText, scheduleSessionTelemetryRefresh, upsertStreamingAssistant]);
 
   // Keep handleWsEvent in a ref so the WS handler always calls the latest version
   const handleWsEventRef = useRef(handleWsEvent);
@@ -1735,6 +2062,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
    */
   const handleDirectGatewayEvent = useCallback((evt: GatewayEvent) => {
     const isStreamEvent = evt.event === 'chat' || evt.event === 'agent';
+    if (isStreamEvent) {
+      setWsConnected(true);
+    }
     if (streamTransportRef.current === 'portal' && isStreamActiveRef.current && isStreamEvent) {
       return;
     }
@@ -1925,6 +2255,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               }));
             }
           }
+          scheduleSessionTelemetryRefresh(400);
           break;
         }
         case 'aborted': {
@@ -2097,13 +2428,58 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         const data = payload.data as any;
         const compactionSignal = String(data?.phase || data?.status || '').toLowerCase();
         if (compactionSignal === 'start' || compactionSignal === 'started' || compactionSignal === 'compacting') {
-          applyCompactionState('start');
+          applyCompactionState({
+            phase: 'start',
+            content: typeof data?.statusText === 'string' ? data.statusText : 'Compacting context…',
+            maintenanceKind: 'compaction',
+          });
         } else if (compactionSignal === 'end' || compactionSignal === 'completed' || compactionSignal === 'compacted') {
-          applyCompactionState('end');
+          applyCompactionState({
+            phase: 'end',
+            content: data?.completed === false ? 'Context maintenance finished.' : 'Context compacted',
+            completed: data?.completed !== false,
+            maintenanceKind: data?.completed === false ? 'maintenance' : 'compaction',
+          });
+          scheduleSessionTelemetryRefresh(250);
+        }
+      } else if (payload.stream === 'lifecycle') {
+        const data = payload.data as any;
+        const lifecyclePhase = String(data?.phase || data?.status || '').toLowerCase();
+        const lifecycleStatusText = extractLifecycleStatusText(data);
+        const lifecycleSignal = inferLifecycleMaintenanceSignal(lifecyclePhase, lifecycleStatusText);
+
+        if (payload.runId) {
+          currentRunIdRef.current = payload.runId;
+          directClientRef.current?.setActiveStreamSession(sessionRef.current || null);
+        }
+
+        if (lifecycleSignal === 'compacting') {
+          applyCompactionState({
+            phase: 'start',
+            content: lifecycleStatusText || defaultLifecycleStatusText(lifecycleSignal),
+            maintenanceKind: 'compaction',
+          });
+        } else if (lifecycleSignal === 'compacted') {
+          applyCompactionState({
+            phase: 'end',
+            content: lifecycleStatusText || defaultLifecycleStatusText(lifecycleSignal),
+            completed: true,
+            maintenanceKind: 'compaction',
+          });
+          scheduleSessionTelemetryRefresh(250);
+        }
+
+        if (lifecyclePhase === 'started' || lifecyclePhase === 'running' || lifecyclePhase === 'start' || lifecycleSignal !== 'idle') {
+          isStreamActiveRef.current = true;
+          streamTransportRef.current = 'direct';
+          setIsRunning(true);
+          setStreamingPhase('thinking');
+          setStatusText(lifecycleStatusText || defaultLifecycleStatusText(lifecycleSignal));
+          resetStreamWatchdog();
         }
       }
     }
-  }, [ensureStreamingAssistantBubble, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState]);
+  }, [ensureStreamingAssistantBubble, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState, scheduleSessionTelemetryRefresh]);
 
   // WS setup — runs once on mount, survives entire app lifetime
   // Handler registration MUST happen in the same effect that creates the manager,
@@ -2165,18 +2541,38 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Only bootstrap the optional direct gateway transport after something has
+  // actually asked for it, such as an active stream resume or a user-initiated run.
+  // That keeps idle Agent Chat opens from spending a post-startup health probe and
+  // direct WS setup before the page has delivered any user value.
+  useEffect(() => {
+    setDirectGatewayBootstrapReady(false);
+    if (!useDirectGateway || provider !== 'OPENCLAW' || !startupReady || !directGatewayDemanded) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setDirectGatewayBootstrapReady(true);
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [directGatewayDemanded, provider, startupReady, useDirectGateway]);
+
   // Direct gateway client setup for OPENCLAW provider
   // When useDirectGateway is enabled and provider is OPENCLAW, use the direct
   // gateway connection instead of the portal WS middleman.
+  // Defer this until the initial history load finishes and the route has had a
+  // moment to settle so direct transport metadata does not compete with first open.
   // Gate on gateway health check first to avoid reconnect loops on fresh installs.
   useEffect(() => {
     // Only create direct client when:
     // 1. Feature flag is enabled
     // 2. Provider is OPENCLAW
-    if (!useDirectGateway || provider !== 'OPENCLAW') {
+    // 3. Initial history bootstrap has completed
+    // 4. Post-startup idle deferral has elapsed
+    if (!useDirectGateway || provider !== 'OPENCLAW' || !startupReady || !directGatewayBootstrapReady) {
       // Disconnect existing direct client if switching away from OPENCLAW
+      // or while a new session is still bootstrapping.
       if (directClientRef.current) {
-        debugLog('[ChatState] Disconnecting direct gateway client (provider changed)');
+        debugLog('[ChatState] Disconnecting direct gateway client (provider changed or startup deferred)');
         directClientRef.current.disconnect();
         directClientRef.current = null;
       }
@@ -2258,7 +2654,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         directClientRef.current = null;
       }
     };
-  }, [provider, handleDirectGatewayEvent, useDirectGateway]);
+  }, [directGatewayBootstrapReady, provider, handleDirectGatewayEvent, startupReady, useDirectGateway]);
 
   // Fresh page loads can race transport/session setup. Give OpenClaw a short retry window
   // to detect an already-active stream so second-device reopen reliably attaches mid-turn.
@@ -2316,12 +2712,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (isStreamActiveRef.current) {
-        if (usingDirectGateway) {
-          resetStreamWatchdog();
-        } else {
-          manager?.send({ type: 'reconnect', session: currentSession, provider: currentProvider });
-          resetStreamWatchdog();
+        try {
+          await loadHistoryInternal(currentSession, currentProvider, { force: true });
+        } catch (err) {
+          console.warn('[ChatState] Visibility active-stream sync failed:', err);
         }
+        if (!usingDirectGateway) {
+          manager?.send({ type: 'reconnect', session: currentSession, provider: currentProvider });
+        }
+        resetStreamWatchdog();
         return;
       }
       try {
@@ -2379,7 +2778,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     try {
       const response = await client.post('/gateway/exec-approval/resolve', { approvalId, decision });
       if (response.data?.ok) {
-        setPendingApproval(null);
+        setPendingApprovals((prev) => removeExecApproval(prev, approvalId));
         setStatusText(decision === 'deny' ? '\u274c Command denied' : '\u2705 Command approved');
         setTimeout(() => setStatusText(null), 2000);
         return;
@@ -2395,7 +2794,24 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const dismissApproval = useCallback(() => { setPendingApproval(null); }, []);
+  const dismissApproval = useCallback((approvalId?: string) => {
+    setPendingApprovals((prev) => {
+      if (!prev.length) return prev;
+      return approvalId ? removeExecApproval(prev, approvalId) : prev.slice(1);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!pendingApprovals.length) return;
+
+    const pruneExpired = () => {
+      setPendingApprovals((prev) => pruneExpiredExecApprovals(prev));
+    };
+
+    pruneExpired();
+    const interval = setInterval(pruneExpired, 500);
+    return () => clearInterval(interval);
+  }, [pendingApprovals.length]);
 
   const clearQueue = useCallback(() => {
     setMessageQueue([]);
@@ -2497,6 +2913,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setIsRunning(true);
     isStreamActiveRef.current = true;
     resetStreamWatchdog();
+
+    if (useDirectGateway && providerRef.current === 'OPENCLAW') {
+      setDirectGatewayDemanded(true);
+    }
 
     // For OPENCLAW with direct gateway enabled, use the direct client
     const directClient = directClientRef.current;
@@ -2706,7 +3126,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             streamingAssistantIdRef.current = null;
             directClientRef.current?.setActiveStreamSession(null);
           } else if (evt.type === 'exec_approval') {
-            if (evt.approval?.id) { setPendingApproval(evt.approval); setStatusText('\u23f3 Waiting for command approval\u2026'); }
+            if (evt.approval?.id) {
+              setPendingApprovals((prev) => upsertExecApproval(prev, evt.approval));
+              setStatusText('\u23f3 Waiting for command approval\u2026');
+            }
           }
         } catch { /* ignore parse errors */ }
       }
@@ -2852,7 +3275,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     streamSegments,
     compactionPhase,
     wsConnected,
-    pendingApproval,
+    pendingApproval: pendingApprovals[0] || null,
+    pendingApprovals,
+    pendingApprovalCount: pendingApprovals.length,
     resolveApproval,
     dismissApproval,
     provider,
@@ -2883,6 +3308,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     compactionModelError,
     sessionControlsSupported,
     ensureSessionControlsMetadataLoaded,
+    sessionTelemetry,
   };
 
   return (

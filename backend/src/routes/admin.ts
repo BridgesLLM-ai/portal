@@ -24,6 +24,7 @@ import {
 import { ACTIVE_STATUS, canAccessPortal, isOwnerRole } from '../utils/authz';
 import { buildPortalUrl } from '../utils/portalUrl';
 import { configureDomainAndHttps, getCodingToolsStatus, getPublicIp, installCodingTool, updateEnvFile } from '../utils/serverSetup';
+import { isReservedSystemMailboxUsername } from '../utils/reservedMailboxUsernames';
 import dns from 'dns/promises';
 import fs from 'fs';
 import { getUpdateStatus } from '../services/telemetryService';
@@ -45,6 +46,22 @@ async function isNotificationEnabled(key: string): Promise<boolean> {
   return raw?.value !== 'false';
 }
 
+async function createUniqueUsername(baseName: string, email: string): Promise<string> {
+  const fromName = baseName.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
+  const fromEmail = email.split('@')[0].toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
+  const base = fromName || fromEmail || 'user';
+
+  let candidate = base;
+  let suffix = 1;
+  while (true) {
+    if (!isReservedSystemMailboxUsername(candidate)) {
+      const existing = await prisma.user.findUnique({ where: { username: candidate } });
+      if (!existing) return candidate;
+    }
+    suffix += 1;
+    candidate = `${base}${suffix}`.slice(0, 30);
+  }
+}
 
 async function waitForStalwartJmap(timeoutMs = 45000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
@@ -282,6 +299,10 @@ router.patch('/users/:id', requireOwner, async (req: Request, res: Response, nex
   try {
     const { id } = req.params;
     const data = updateUserSchema.parse(req.body);
+
+    if (data.username && isReservedSystemMailboxUsername(data.username)) {
+      throw new AppError(400, `Username '${data.username}' is reserved for system use. Choose a different username.`);
+    }
 
     // Check user exists
     const existing = await prisma.user.findUnique({ where: { id } });
@@ -523,7 +544,7 @@ router.get('/self-update/log', requireOwner, async (req: Request, res: Response,
  * GET /api/admin/registration-requests
  * List registration requests (filter by status)
  */
-router.get('/registration-requests', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/registration-requests', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const status = req.query.status as string;
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
@@ -538,6 +559,16 @@ router.get('/registration-requests', async (req: Request, res: Response, next: N
         skip,
         take: limit,
         orderBy: { requestedAt: 'desc' },
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          message: true,
+          status: true,
+          requestedAt: true,
+          reviewedAt: true,
+          reviewedBy: true,
+        },
       }),
       prisma.registrationRequest.count({ where }),
     ]);
@@ -592,10 +623,11 @@ router.post('/registration-requests/:id/approve', requireOwner, async (req: Requ
       approvedUserId = updatedUser.id;
       approvedUsername = updatedUser.username;
     } else {
+      const approvedUsernameCandidate = await createUniqueUsername(request.name, request.email);
       const createdUser = await prisma.user.create({
         data: {
           email: request.email,
-          username: request.name.toLowerCase().replace(/[^a-z0-9]/g, '') || request.email.split('@')[0],
+          username: approvedUsernameCandidate,
           passwordHash: request.passwordHash || await hashPassword(crypto.randomUUID()),
           role: 'USER',
           accountStatus: 'ACTIVE',

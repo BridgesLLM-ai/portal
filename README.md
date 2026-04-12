@@ -76,91 +76,13 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
-### v3.24.1 (April 9, 2026)
-- **Gateway restart recovery is less fragile** — explicit reconnects now clear stale backoff state so Agent Chat does not sit around waiting on an old reconnect timer after the gateway comes back.
-- **Portal skill installs stop re-copying themselves for no reason** — unchanged managed skill payloads are detected by hash and left alone.
-- **Installer updates repair the gateway service more decisively** — the shipped update path now rewrites the OpenClaw gateway systemd unit and retries a clean loopback boot when stale processes are in the way.
-
-### v3.23.10 (April 9, 2026)
-- **The fake steering pill is gone** — the purple follow-up pill under the composer was removed instead of advertising a `/steer` path that does not reliably work.
-- **Agent Chat wording is honest now** — the running-state UI now says "live note" instead of pretending it can always steer the active turn.
-- **The bundled OpenClaw compatibility helper is tougher** — the shipped patch script now handles the current OpenClaw bundle shapes instead of only the earlier dist layout.
-
-### v3.23.9 (April 9, 2026)
-- **Session controls got a serious stability pass** — main chat and project chat now carry fast mode, thinking controls, and recovered session state more reliably instead of dropping into stale UI nonsense.
-- **Model switching and project model persistence are more reliable** — the portal preserves intended project models, normalizes session-reported model IDs, and fixes several stale-model / switch-looked-like-it-failed paths.
-- **Session switching and long-run recovery are tougher** — yielded runs, hidden resumes, stale interrupted bubbles, reconnect state, and stale public-settings cache behavior were all tightened up.
-- **OpenClaw compatibility hotfix is explicit now** — admins can inspect and apply the older long-run relay patch directly from Settings or Agent Chat instead of doing hidden server-side edits.
-- **The hotfix helper is bundled, and reload fallback is safer** — fresh installs include the patch script, and if `openclaw gateway restart` only reports a disabled service, the portal now signals the live gateway process so the hotfix still takes effect.
-
-### v3.23.8 (April 7, 2026)
-- **Project chat survives renames** — per-project assistant and session identity is now stable, so renaming a project no longer strands its AI chat state.
-- **Large files degrade gracefully** — text files over 10MB now open in read-only preview mode instead of failing outright.
-- **Project chat got session controls** — slash-command autocomplete and session controls are now available directly from the project chat UI.
-- **Tasks tab is stabilized** — the Agent Tools Tasks view now uses a single cached gateway fetch instead of hammering the gateway with per-task history lookups.
-- **Project ZIP exports are cleaner** — internal agent-state files are stripped from clean and stripped downloads.
-
-### v3.23.7 (April 7, 2026)
-- **Project AI chat is far more dependable** — first-open model selection, per-project session routing, history recovery, and rapid project switching all got a real stability pass.
-- **Agent chats recover better** — reloads, reconnects, attachment handoff, active stream recovery, and fallback abort behavior are all more reliable.
-- **Files and links behave better** — attachment access across refreshes and split-host setups is fixed, and chat file links resolve more cleanly.
-- **Tasks feel cleaner** — long-running work, summaries, and related session controls load with less friction.
-- **Security got tighter** — AI file helpers, share-link mutations, signed tool URLs, and browser direct-gateway exposure were all hardened in this pass.
-
-### v3.23.6 (April 5, 2026)
-- **Mobile Safari / 2FA login is hardened** — when login enters the 2FA step, the portal now explicitly clears stale auth cookies so an old session cannot immediately trigger a bogus refresh failure.
-- **Broken refresh tokens now clean up after themselves** — invalid or expired refresh/logout paths actively expire the browser auth cookies instead of leaving a poisoned session behind.
-- **Unauthenticated restore races are blocked** — the frontend only attempts cookie-based session recovery during explicit restore-session probes and never while 2FA is pending, so the generic `login failed` collapse stops happening on mobile.
-
-### v3.23.5 (April 5, 2026)
-- **Claude (OpenClaw) setup is back on the sane path** — the failed Claude CLI bridge detour is gone, so Anthropic/OpenClaw setup is once again the normal setup-token flow.
-- **Anthropic billing is now explicit in the UI** — Claude setup surfaces now show a hard Extra Usage warning, explain that a bundle may be required, and link straight to Claude usage settings.
-- **Project chat no longer gets stuck after a missing final completion event** — `stream_ended` is now treated as terminal so hanging spinners clear properly.
-
-### v3.23.4 (April 5, 2026)
-- **Claude subscription setup actually works from the portal now** — the server Claude Code login is imported into OpenClaw as Anthropic OAuth, the default stays on canonical `anthropic/...` model IDs, and the bad `claude-cli/...` runtime mismatch is no longer surfaced to users.
-- **Model picker labels are finally unambiguous** — OpenClaw chat selectors now show clearer provider/runtime badges and canonical model IDs, so duplicate-looking Sonnet/Opus entries stop being a guessing game.
-- **Session/model switching and stuck-wait states are hardened** — project chat now repatches stale sessions onto the intended model, and both main/project chat stop spinning forever when the stream ends without a final `done` event.
-
-### v3.23.3 (April 4, 2026)
-- **Claude subscription setup now prefers server Claude CLI** — admins are guided to log into Claude Code on the server first, then connect OpenClaw to the local `claude-cli/...` runtime instead of defaulting people toward API-key billing.
-- **OpenClaw Anthropic bridge added** — the portal can now switch OpenClaw over to Claude CLI-backed Anthropic auth from the UI and keep the chosen Claude model aligned.
-- **Claude provider status is more honest** — the AI Providers page now recognizes Claude CLI-backed Anthropic setups, labels them correctly, and cleans them up properly if removed.
-
-### v3.23.2 (April 4, 2026)
-- **Claude Code OAuth fix** — Agent Chat now strips conflicting inherited Anthropic API keys when Claude Code is already logged in on the server, fixing the bogus `Invalid API key · Fix external API key` failure after successful OAuth setup.
-- **Native provider session hardening** — switching from OpenClaw into Claude/Codex/Gemini no longer reuses foreign session IDs, so native provider history loads and first messages start cleanly instead of failing against stale `main`, `new-*`, or `agent:*` session keys.
-
-### v3.23.1 (April 2, 2026)
-- **Agent Chat crash hotfix** — fixes `model.split is not a function` crashes caused by structured OpenClaw model configs leaking into the portal UI.
-- **Backend model normalization** — portal gateway responses now normalize structured model objects into stable string IDs before returning them to the frontend.
-- **UI hardening** — Agent Chat, Agent Tools, Usage, and Terminal status views now safely render model labels even when upstream model data is not a plain string.
-
-### v3.23.0 (April 2, 2026)
-- **Background Tasks page + Agent Tools tab** — view running and recent subagents/cron jobs with status, duration, summaries, and failures.
-- **Project chat reconnect hardening** — fixes stale assistant text and phantom partial bubbles after reconnects, tab sleep, and tool/thinking transitions.
-- Fix Tasks API path regression (`/api/api/gateway/tasks` → `/api/gateway/tasks`).
-
-
-### v3.22.0 (April 1, 2026)
-- **OpenClaw gateway compatibility update** (2026.3.31) — improved exec approvals, provider error recovery, background task flows
-- Remove unused analytics/installer subdomain routes (dead config causing TLS cert errors)
-- Close public analytics dashboard exposure — now portal-auth only
-
-### v3.21.0 (March 31, 2026)
-- **Remote Desktop clipboard & mobile keyboard** — floating toolbar with clipboard paste (Read/Paste/Type modes) and mobile soft keyboard support. Copy-paste and type into your VNC session from any device.
-
-### v3.20.1 (March 29, 2026)
-- Fix Claude Code native login on headless servers (direct PKCE OAuth flow)
-- Fix Codex read-only sessions — now launches with full `workspace-write` sandbox
-- Fix Gemini native auth detection
-- Project chat inherits gateway default model correctly
-
-### v3.20.0 (March 29, 2026)
-- **Security:** Remove XSS vector from markdown renderer (rehype-raw)
-- **Critical:** Fix installer destroying portal on update when using non-default database config
-- Fix Anthropic API key persistence, stale "Agent is thinking" indicator, missed messages after phone lock
-- Fix code preview dark mode, auto-detect bare HTML responses
+### v3.25.0 (April 12, 2026)
+- **Agent Chat and project chat finally act like the same product**: both surfaces now share the same status rail, project chat lost the stray inline stop button, misleading thought-process pills are gone, live run status copy is clearer, and project chat gained proper run-resume, approval, reconnect, model-persistence, and live metadata handling.
+- **Auth, setup, reinstall, and password flows got a serious hardening pass**: protected deep links preserve their destination, password policy is enforced consistently across setup and recovery flows, reinstall/reset/password-change paths revoke old sessions correctly, and signed-out pollers stop hammering protected endpoints.
+- **Permission boundaries are more truthful**: non-admin users no longer get unusable exec-approval prompts, dashboard reconnect/update controls respect role boundaries, Feature Readiness is exposed to `SUB_ADMIN`, and Tasks, Files, Projects, Apps, and Terminal routes now align with the access the UI actually promises.
+- **Cold-open performance is materially better across the app**: Agent Chats, Dashboard, Projects, Files, Mail, and Settings all shed real startup work through route lazy-loading, deferred charts and history fetches, demand-driven direct-gateway bootstrap, and bounded thumbnail loading.
+- **Operational polish is much better**: gateway/auth restart noise is deduped, background task rows are less spammy, setup and admin copy are cleaner, and several empty states and settings controls now read like finished product instead of debug leftovers.
+- **OpenClaw compatibility and release packaging are tougher**: the bundled compatibility helper now patches current OpenClaw bundle shapes, the release tarball no longer risks shipping the placeholder Prisma DB, and the public release path is documented around the actual dev-container SOP.
 
 See the full [CHANGELOG](CHANGELOG.md) for all releases.
 

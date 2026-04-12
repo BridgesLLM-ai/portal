@@ -7,14 +7,14 @@ description: 'Comprehensive guide for operating the BridgesLLM Portal — a self
 
 Self-hosted AI platform running on a VPS. Stack: React+Vite frontend, Express+Prisma backend, PostgreSQL, Caddy reverse proxy.
 
-**Portal backend**: `http://127.0.0.1:3000` (internal) → `https://<domain>/` (public via Caddy)
+**Portal backend**: `http://127.0.0.1:4001` (internal) → `https://<domain>/` (public via Caddy)
 **OpenClaw gateway**: `http://127.0.0.1:18789`
 **Service**: `bridgesllm-product.service`
 
 ## Architecture Overview
 
 ```
-Caddy (HTTPS) → Express backend (:3000)
+Caddy (HTTPS) → Express backend (:4001)
                  ├── React SPA (frontend)
                  ├── PostgreSQL (Prisma ORM)
                  ├── OpenClaw gateway (RPC + WebSocket)
@@ -27,7 +27,7 @@ Caddy (HTTPS) → Express backend (:3000)
 
 | Feature | Page Route | Backend Route | Reference |
 |---------|-----------|---------------|-----------|
-| Dashboard | `/dashboard` | `/api/system-stats` | — |
+| Dashboard | `/dashboard` | `/api/system/stats` | — |
 | Agent Chat | `/agent-chats` | `/api/gateway/ws` | [agent-chat.md](references/agent-chat.md) |
 | Agent Tools | `/agent-tools` | `/api/agent-tools`, `/api/skills` | [agent-chat.md](references/agent-chat.md) |
 | Remote Desktop | `/desktop` | `/api/remote-desktop` | [remote-desktop.md](references/remote-desktop.md) |
@@ -37,7 +37,7 @@ Caddy (HTTPS) → Express backend (:3000)
 | Terminal | `/terminal` | `/api/terminal` | — |
 | Apps | `/apps` | `/api/apps` | [files-and-projects.md](references/files-and-projects.md) |
 | Automations | `/agent-tools` (tab) | `/api/automations` | [automations.md](references/automations.md) |
-| Settings | `/settings` | `/api/settings-public` | — |
+| Settings | `/settings` | `/api/settings/public` | — |
 | Admin | `/admin` | `/api/admin` | [admin.md](references/admin.md) |
 
 ## File System Layout
@@ -107,10 +107,11 @@ When debugging portal issues:
 2. **`console`** — read JavaScript errors
 3. **`evaluate 'document.querySelector(...)'`** — inspect DOM state
 4. Read backend logs: `journalctl -u bridgesllm-product -n 50 --no-pager`
-5. Fix source in `/opt/bridgesllm/portal/`
-6. Build: `cd backend && npm run build` or `cd frontend && npm run build`
-7. Restart: `systemctl restart bridgesllm-product`
-8. Verify fix in shared browser
+5. Fix source in `/root/bridgesllm-product/` first, not in the deployed runtime tree
+6. If validation needs deployment, copy only the validated build output into `/opt/bridgesllm/portal/` deliberately
+7. Build: `cd backend && npm run build` or `cd frontend && npm run build`
+8. Restart only when the backend changed: `systemctl restart bridgesllm-product`
+9. Verify fix in shared browser
 
 ## Quick Reference — Common Operations
 
@@ -139,5 +140,6 @@ cd /opt/bridgesllm/portal/frontend && npm run build
 ### Check service health
 ```bash
 systemctl is-active bridgesllm-product
-curl -s http://127.0.0.1:3000/api/system-stats/ | head -c 200
+curl -s http://127.0.0.1:4001/health
+curl -s http://127.0.0.1:4001/api/system/stats | head -c 200
 ```

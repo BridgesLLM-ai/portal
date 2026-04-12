@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useDropzone } from 'react-dropzone';
@@ -8,7 +8,6 @@ import { smartUpload, formatBytes, formatSpeed, formatTime, UploadProgress, Uplo
 import { useUploadStore } from '../stores/uploadStore';
 import ConfirmDialog from '../components/ConfirmDialog';
 import { useThumbnails } from '../hooks/useThumbnail';
-import MediaViewer from '../components/MediaViewer';
 import sounds from '../utils/sounds';
 import {
   Upload, File as FileIcon, Folder, Trash2, Download,
@@ -72,6 +71,8 @@ function getDisplayName(file: FileEntry): string {
   // Strip the timestamp suffix for cleaner display
   return name.replace(/-\d{13}-\d+(?=\.[^.]+$)/, '');
 }
+
+const LazyMediaViewer = lazy(() => import('../components/MediaViewer'));
 
 const MIME_FILTERS = [
   { label: 'All', value: '' },
@@ -290,10 +291,6 @@ export default function FilesPage() {
   const [projectDirectories, setProjectDirectories] = useState<string[]>([]);
   const [loadingDirs, setLoadingDirs] = useState(false);
   const [moveFile, setMoveFile] = useState(false);
-  
-  // Secure thumbnail loading (blob URLs instead of query token)
-  const imageFileIds = files.filter(f => f.mimeType?.startsWith('image/')).map(f => f.id);
-  const thumbnails = useThumbnails(imageFileIds);
   
   const uploadIdRef = useRef(0);
 
@@ -688,6 +685,26 @@ export default function FilesPage() {
     return true;
   });
 
+  const visibleThumbnailLimit = viewMode === 'grid' ? 24 : 40;
+  const visibleImageFileIds = useMemo(
+    () => filtered
+      .filter(file => file.mimeType?.startsWith('image/'))
+      .slice(0, visibleThumbnailLimit)
+      .map(file => file.id),
+    [filtered, visibleThumbnailLimit]
+  );
+  const [thumbnailStartupReady, setThumbnailStartupReady] = useState(false);
+
+  useEffect(() => {
+    setThumbnailStartupReady(false);
+    const timer = window.setTimeout(() => {
+      setThumbnailStartupReady(true);
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [files, search, mimeFilter, viewMode]);
+
+  const thumbnails = useThumbnails(thumbnailStartupReady ? visibleImageFileIds : []);
+
   const totalSize = files.reduce((sum, f) => sum + Number(f.size), 0);
 
   return (
@@ -816,10 +833,10 @@ export default function FilesPage() {
         <div className="space-y-2">
           <Upload size={28} className={`mx-auto transition-colors ${isDragActive ? 'text-emerald-400' : 'text-slate-500'}`} />
           <p className="text-slate-300 text-sm sm:text-base">
-            {isDragActive ? 'Drop files here...' : 'Tap to browse or drag & drop'}
+            {isDragActive ? 'Drop files here...' : 'Browse files or drag and drop'}
           </p>
           <p className="text-[11px] text-slate-600 hidden sm:block">
-            Up to 500MB • Large files automatically chunked • Pause/resume supported
+            Up to 500MB per file • Large uploads are chunked automatically • Pause and resume supported
           </p>
         </div>
       </div>
@@ -832,7 +849,7 @@ export default function FilesPage() {
       ) : filtered.length === 0 ? (
         <div className="text-center py-20 text-slate-500">
           <Folder size={48} className="mx-auto mb-3 opacity-50" />
-          <p>{search || mimeFilter ? 'No files match your filter' : 'No files yet. Upload something!'}</p>
+          <p>{search || mimeFilter ? 'No files match your filters' : 'No files yet. Upload a file to get started.'}</p>
         </div>
       ) : viewMode === 'grid' ? (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
@@ -1004,20 +1021,22 @@ export default function FilesPage() {
       {/* Media Viewer */}
       <AnimatePresence>
         {preview && (
-          <MediaViewer
-            file={preview}
-            files={filtered}
-            onClose={() => {
-              setPreview(null);
-              clearPreviewSearchParams();
-            }}
-            onNavigate={setPreview}
-            onDelete={(id) => { requestDelete(id); }}
-            onRename={(f) => startRename(f)}
-            onCopyToProject={(f) => startCopyToProject(f)}
-            downloadUrl={(id) => filesAPI.download(id)}
-            copyAIUrl={copyAIUrl}
-          />
+          <Suspense fallback={null}>
+            <LazyMediaViewer
+              file={preview}
+              files={filtered}
+              onClose={() => {
+                setPreview(null);
+                clearPreviewSearchParams();
+              }}
+              onNavigate={setPreview}
+              onDelete={(id) => { requestDelete(id); }}
+              onRename={(f) => startRename(f)}
+              onCopyToProject={(f) => startCopyToProject(f)}
+              downloadUrl={(id) => filesAPI.download(id)}
+              copyAIUrl={copyAIUrl}
+            />
+          </Suspense>
         )}
       </AnimatePresence>
 

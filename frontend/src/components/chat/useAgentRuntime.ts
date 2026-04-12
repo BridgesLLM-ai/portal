@@ -122,7 +122,7 @@ export function useAgentRuntime(options: {
     // Always tell assistant-ui the thread is "not running" so the Send button
     // stays enabled during streaming (FYI / message-queue mode). Our sendMessage()
     // queues follow-up messages when a stream is active and drains them on done.
-    // Visual streaming indicators (thinking bubble, status text, stop button) are
+    // Visual streaming indicators (status rail, stop button) are
     // driven by ctx.isRunning independently.
     isRunning: false,
     messages: ctx.messages,
@@ -150,6 +150,8 @@ export function useAgentRuntime(options: {
     thinkingContent: ctx.thinkingContent,
     streamSegments: ctx.streamSegments,
     pendingApproval: ctx.pendingApproval,
+    pendingApprovals: ctx.pendingApprovals,
+    pendingApprovalCount: ctx.pendingApprovalCount,
     resolveApproval: ctx.resolveApproval,
     dismissApproval: ctx.dismissApproval,
     wsConnected: ctx.wsConnected,

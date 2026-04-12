@@ -11,11 +11,13 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   Bot, X, Trash2, Send, Loader2, ChevronRight, ChevronDown,
   Wrench, Sparkles, StopCircle, Paperclip, Copy, Check, Code2, Radio,
-  Clock, Mic, MicOff, XCircle, CheckCircle2, RotateCcw
+  Mic, MicOff, XCircle, CheckCircle2, RotateCcw
 } from 'lucide-react';
 import MarkdownRenderer from './MarkdownRenderer';
 import SlashCommandMenu from './SlashCommandMenu';
+import { ExecApprovalModal } from './ExecApprovalModal';
 import client from '../../api/client';
+import { authAPI } from '../../api/auth';
 import { gatewayAPI } from '../../api/endpoints';
 import { useIsMobile } from '../../hooks/useIsMobile';
 import {
@@ -35,8 +37,14 @@ import {
   normalizeModelId,
 } from '../../utils/modelId';
 import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../utils/slashCommands';
+import ComposerStatusBadge from './ComposerStatusBadge';
+import {
+  pruneExpiredExecApprovals,
+  removeExecApproval,
+  upsertExecApproval,
+} from '../../utils/execApprovalQueue';
 
-import type { ToolCall, ChatMessage, StreamingPhase } from '../../contexts/ChatStateProvider';
+import type { ToolCall, ChatMessage, StreamingPhase, ExecApprovalRequest } from '../../contexts/ChatStateProvider';
 
 /* ═══ Types ═══ */
 
@@ -137,8 +145,30 @@ function createLocalWsManager(url: string): LocalWsManager {
       }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       ws = null;
+
+      const isAuthFailure = event.code === 4001 || event.code === 4003 ||
+        event.reason?.toLowerCase().includes('unauthorized') ||
+        event.reason?.toLowerCase().includes('forbidden') ||
+        event.reason?.toLowerCase().includes('expired');
+
+      if (isAuthFailure && !intentionallyClosed) {
+        authAPI.refresh()
+          .then(() => {
+            reconnectAttempts = 0;
+            scheduleReconnect();
+          })
+          .catch((err) => {
+            console.warn('[project-ws] token refresh failed, stopping reconnect:', err);
+            intentionallyClosed = true;
+            for (const cb of disconnectCallbacks) {
+              try { cb(); } catch (callbackErr) { console.error('[project-ws] disconnect callback error:', callbackErr); }
+            }
+          });
+        return;
+      }
+
       if (!intentionallyClosed) {
         for (const cb of disconnectCallbacks) {
           try { cb(); } catch (err) { console.error('[project-ws] disconnect callback error:', err); }
@@ -427,58 +457,6 @@ function ToolResultPill({ message }: { message: ChatMessage }) {
   );
 }
 
-function ThinkingBlock({ content, isActive }: { content?: string; isActive: boolean }) {
-  const [expanded, setExpanded] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
-  const startRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (isActive) {
-      startRef.current = Date.now();
-      setElapsed(0);
-      const iv = setInterval(() => {
-        if (startRef.current) setElapsed(Math.floor((Date.now() - startRef.current) / 1000));
-      }, 1000);
-      return () => clearInterval(iv);
-    }
-    startRef.current = null;
-  }, [isActive]);
-
-  if (!isActive && !content) return null;
-
-  return (
-    <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} transition={{ duration: 0.2 }} className="mb-2">
-      <button
-        onClick={() => content && !isActive && setExpanded(!expanded)}
-        className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-violet-500/[0.08] border border-violet-500/[0.15] hover:bg-violet-500/[0.12] transition-colors w-full text-left"
-      >
-        <div className={isActive ? 'animate-thinking-pulse' : ''}><Sparkles size={12} className="text-violet-400" /></div>
-        <span className="text-[10px] text-violet-300 font-medium flex-1">{isActive ? 'Thinking…' : 'Thought process'}</span>
-        {isActive && (
-          <>
-            <span className="text-[10px] text-violet-400/60 font-mono tabular-nums">{elapsed}s</span>
-            <span className="flex gap-0.5 ml-1">
-              <span className="w-1 h-1 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '0ms' }} />
-              <span className="w-1 h-1 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '150ms' }} />
-              <span className="w-1 h-1 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '300ms' }} />
-            </span>
-          </>
-        )}
-        {content && !isActive && <ChevronRight size={10} className={`text-violet-400 transition-transform ${expanded ? 'rotate-90' : ''}`} />}
-      </button>
-      <AnimatePresence>
-        {expanded && content && (
-          <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.15 }} className="overflow-hidden">
-            <div className="mt-1 px-2.5 py-2 rounded-lg bg-violet-500/[0.04] border border-violet-500/[0.08] text-[10px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere] [word-break:break-word] max-w-full min-w-0 max-h-[150px] overflow-auto">
-              {content}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </motion.div>
-  );
-}
-
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   const handleCopy = useCallback(() => {
@@ -654,6 +632,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const [activeToolName, setActiveToolName] = useState<string | null>(null);
   const [statusText, setStatusText] = useState<string | null>(null);
   const [thinkingContent, setThinkingContent] = useState<string>('');
+  const [pendingApprovals, setPendingApprovals] = useState<ExecApprovalRequest[]>([]);
+  const pendingApproval = pendingApprovals[0] || null;
   const [compactionPhase, setCompactionPhase] = useState<'idle' | 'compacting' | 'compacted'>('idle');
   const compactionPhaseRef = useRef<'idle' | 'compacting' | 'compacted'>('idle');
   const [wsConnected, setWsConnected] = useState(false);
@@ -697,6 +677,23 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       }
       return [...prev, { id: nextId(), role: 'system', content, createdAt: new Date(now) }];
     });
+  }, []);
+
+  const applyCompactionSnapshotState = useCallback((phase?: unknown) => {
+    if (phase !== 'idle' && phase !== 'compacting' && phase !== 'compacted') return;
+    if (compactionTimerRef.current) {
+      clearTimeout(compactionTimerRef.current);
+      compactionTimerRef.current = null;
+    }
+    compactionPhaseRef.current = phase;
+    setCompactionPhase(phase);
+    if (phase === 'compacted') {
+      compactionTimerRef.current = setTimeout(() => {
+        compactionPhaseRef.current = 'idle';
+        setCompactionPhase('idle');
+        compactionTimerRef.current = null;
+      }, 3000);
+    }
   }, []);
 
   // Scroll
@@ -773,18 +770,27 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       ? Array.from(new Set(data.models.map((m: any) => canonicalizePortalModelId(String(m?.id || '').trim())).filter(Boolean)))
       : [];
     setAvailableModels(models);
-    // If no model selected or selected model isn't available, pick the first one
+    // If no model selected or selected model isn't available, pick the first discovered option
     setSelectedModel(prev => {
       if (prev && models.includes(prev)) return prev;
-      return models[0] || prev || '';
+      return prev || models[0] || '';
     });
     return models;
   }, []);
 
   useEffect(() => {
-    loadAvailableModels().catch((err) => {
-      console.error('[ProjectChatPanel] Failed to load models:', err);
-    });
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      loadAvailableModels().catch((err) => {
+        if (!cancelled) {
+          console.error('[ProjectChatPanel] Failed to load models:', err);
+        }
+      });
+    }, 1200);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [loadAvailableModels]);
 
   // Mark session as active for auto-restore
@@ -896,42 +902,53 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     const snapshotContent = typeof snapshot.content === 'string' && !isControlOnlyAssistantContent(snapshot.content)
       ? sanitizeAssistantContent(snapshot.content)
       : '';
-    const shouldMaterializeBubble = Boolean(snapshotContent) || Boolean(snapshot.toolName) || Boolean(streamingAssistantIdRef.current);
-    if (!shouldMaterializeBubble) {
+    const rawStatusText = typeof snapshot.statusText === 'string' ? snapshot.statusText.trim() : '';
+    const hasStatusSignal = Boolean(rawStatusText)
+      || snapshot.compactionPhase === 'compacting'
+      || snapshot.compactionPhase === 'compacted';
+    const shouldHydrateLiveState = Boolean(snapshotContent)
+      || Boolean(snapshot.toolName)
+      || hasStatusSignal
+      || Boolean(streamingAssistantIdRef.current);
+    if (!shouldHydrateLiveState) {
       return false;
     }
+    const shouldMaterializeBubble = Boolean(snapshotContent) || Boolean(snapshot.toolName) || Boolean(streamingAssistantIdRef.current);
 
     isStreamActiveRef.current = true;
     suppressLiveBubbleContentRef.current = true;
     setIsRunning(true);
     setStreamingPhase(resumePhase);
     setActiveToolName(snapshot.toolName || null);
-    setStatusText(snapshot.toolName ? `Using ${snapshot.toolName}…` : (snapshot.statusText || 'Reconnecting to stream…'));
+    setStatusText(snapshot.toolName ? `Using ${snapshot.toolName}…` : (rawStatusText || 'Reconnecting to stream…'));
     setConnectionNotice(null);
 
-    const snapshotCompaction = snapshot.compactionPhase;
-    if (snapshotCompaction === 'compacting' || snapshotCompaction === 'compacted' || snapshotCompaction === 'idle') {
-      compactionPhaseRef.current = snapshotCompaction;
-      setCompactionPhase(snapshotCompaction);
-    }
+    applyCompactionSnapshotState(snapshot.compactionPhase);
 
-    const assistantId = ensureStreamingAssistant(snapshotContent || undefined);
-    resumeSeededContentRef.current = resumePhase === 'streaming' && snapshotContent.length > 0;
+    const assistantId = shouldMaterializeBubble ? ensureStreamingAssistant(snapshotContent || undefined) : null;
+    resumeSeededContentRef.current = shouldMaterializeBubble && resumePhase === 'streaming' && snapshotContent.length > 0;
     assembledRef.current = snapshotContent;
     lastSegmentStartRef.current = 0;
     lastRawTextLenRef.current = snapshotContent.length;
 
-    if (assistantId && snapshot.model) {
-      const normalizedModel = canonicalizePortalModelId(String(snapshot.model));
+    if (assistantId && (snapshot.model || snapshot.provenance)) {
+      const normalizedModel = canonicalizePortalModelId(String(snapshot.model || ''));
+      const normalizedProvenance = typeof snapshot.provenance === 'string' ? snapshot.provenance : undefined;
       setMessages(prev => prev.map(m => (
-        m.id === assistantId ? { ...m, model: normalizedModel || m.model } : m
+        m.id === assistantId
+          ? {
+              ...m,
+              model: normalizedModel || m.model,
+              provenance: normalizedProvenance || m.provenance,
+            }
+          : m
       )));
     }
 
     manager?.send({ type: 'reconnect', session: expectedSession, provider: 'OPENCLAW' });
     resetWatchdog();
     return true;
-  }, [ensureStreamingAssistant, isStaleSessionLoad, resetWatchdog]);
+  }, [applyCompactionSnapshotState, ensureStreamingAssistant, isStaleSessionLoad, resetWatchdog]);
 
   const loadHistorySnapshot = useCallback(async (
     session: string,
@@ -1028,6 +1045,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       setStreamingPhase('idle');
       setStatusText(null);
       setActiveToolName(null);
+      applyCompactionSnapshotState('idle');
       streamingAssistantIdRef.current = null;
     }
 
@@ -1047,7 +1065,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     }
 
     return false;
-  }, [applyActiveStreamSnapshot, clearWatchdog, isStaleSessionLoad, loadHistorySnapshot]);
+  }, [applyActiveStreamSnapshot, applyCompactionSnapshotState, clearWatchdog, isStaleSessionLoad, loadHistorySnapshot]);
 
   const appendThinkingChunk = useCallback((assistantId: string | null, chunk: string) => {
     if (!chunk) return;
@@ -1060,9 +1078,51 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     ));
   }, []);
 
+  const resolveApproval = useCallback(async (
+    approvalId: string,
+    decision: 'allow-once' | 'deny' | 'allow-always',
+  ) => {
+    try {
+      const response = await client.post('/gateway/exec-approval/resolve', { approvalId, decision });
+      if (response.data?.ok) {
+        setPendingApprovals((prev) => removeExecApproval(prev, approvalId));
+        setStatusText(decision === 'deny' ? '❌ Command denied' : '✅ Command approved');
+        setTimeout(() => setStatusText(null), 2000);
+        return;
+      }
+      setStatusText('⚠️ Approval did not complete');
+      setTimeout(() => setStatusText(null), 3000);
+      throw new Error('Approval did not complete');
+    } catch (err: any) {
+      console.error('[ProjectChatPanel] Failed to resolve approval:', err);
+      setStatusText(`⚠️ Approval failed${err?.response?.data?.error ? `: ${err.response.data.error}` : ''}`);
+      setTimeout(() => setStatusText(null), 4000);
+      throw err;
+    }
+  }, []);
+
+  const dismissApproval = useCallback((approvalId?: string) => {
+    setPendingApprovals((prev) => {
+      if (!prev.length) return prev;
+      return approvalId ? removeExecApproval(prev, approvalId) : prev.slice(1);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!pendingApprovals.length) return;
+
+    const pruneExpired = () => {
+      setPendingApprovals((prev) => pruneExpiredExecApprovals(prev));
+    };
+
+    pruneExpired();
+    const interval = setInterval(pruneExpired, 500);
+    return () => clearInterval(interval);
+  }, [pendingApprovals.length]);
+
   // ── WS Event Handler ──
   const handleWsEvent = useCallback((data: any) => {
-    const passthrough = ['connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended'];
+    const passthrough = ['connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended', 'run_resumed', 'exec_approval', 'exec_approval_resolved'];
     const autoCreateBubbleTypes = ['text', 'tool_start', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
     const waitForVisibleStreamTypes = ['status', 'thinking', 'done', 'error'];
     if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOnlyAssistantContent(data.content)) {
@@ -1082,8 +1142,21 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
     switch (data.type) {
       case 'session': {
-        if (data.provenance) {
-          // No-op for project chat — we already know the session
+        const normalizedModel = canonicalizePortalModelId(String(data.model || ''));
+        const normalizedProvenance = typeof data.provenance === 'string' ? data.provenance : undefined;
+        if (normalizedModel) {
+          setSelectedModel(prev => prev === normalizedModel ? prev : normalizedModel);
+        }
+        if (assistantId && (normalizedModel || normalizedProvenance)) {
+          setMessages(prev => prev.map(m => (
+            m.id === assistantId
+              ? {
+                  ...m,
+                  model: normalizedModel || m.model,
+                  provenance: normalizedProvenance || m.provenance,
+                }
+              : m
+          )));
         }
         break;
       }
@@ -1280,6 +1353,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setStreamingPhase('idle');
         setIsRunning(false);
         setThinkingContent('');
+        setPendingApprovals([]);
         if (compactionPhaseRef.current === 'compacting') {
           compactionPhaseRef.current = 'idle';
           setCompactionPhase('idle');
@@ -1310,10 +1384,26 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setStreamingPhase('idle');
         setThinkingContent('');
         setIsRunning(false);
+        setPendingApprovals([]);
         isStreamActiveRef.current = false;
         streamingAssistantIdRef.current = null;
         resumeSeededContentRef.current = false;
         suppressLiveBubbleContentRef.current = false;
+        break;
+      }
+      case 'exec_approval': {
+        const approval = data.approval as ExecApprovalRequest;
+        if (approval?.id) {
+          setPendingApprovals((prev) => upsertExecApproval(prev, approval));
+          setStatusText('⏳ Waiting for command approval…');
+        }
+        break;
+      }
+      case 'exec_approval_resolved': {
+        const resolved = data.resolved;
+        if (resolved?.id) {
+          setPendingApprovals((prev) => removeExecApproval(prev, resolved.id));
+        }
         break;
       }
       case 'stream_resume': {
@@ -1365,11 +1455,23 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setWsConnected(true);
         setConnectionNotice(null);
         break;
+      case 'run_resumed': {
+        if (!streamingAssistantIdRef.current) {
+          break;
+        }
+        isStreamActiveRef.current = true;
+        setIsRunning(true);
+        setStreamingPhase('thinking');
+        setStatusText('🧠 Agent is thinking…');
+        resetWatchdog();
+        break;
+      }
       case 'stream_ended':
         setIsRunning(false);
         setStreamingPhase('idle');
         setStatusText(null);
         setThinkingContent('');
+        setPendingApprovals([]);
         setActiveToolName(null);
         clearWatchdog();
         finalizeStreamingAssistant();
@@ -1396,19 +1498,12 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setWsConnected(false);
         setConnectionNotice('Connecting to project agent…');
 
-        let preferredModel = modelRef.current;
-        if (!preferredModel) {
-          const discoveredModels = availableModels.length > 0 ? availableModels : await loadAvailableModels();
-          preferredModel = canonicalizePortalModelId(modelRef.current || discoveredModels[0] || '');
-          if (preferredModel && preferredModel !== modelRef.current) {
-            modelRef.current = preferredModel;
-            setSelectedModel(preferredModel);
-          }
-        }
+        const preferredModel = canonicalizePortalModelId(modelRef.current || '');
 
-        const { data } = await client.post(`/projects/${projectName}/assistant/ensure-session`, {
-          model: preferredModel,
-        });
+        const { data } = await client.post(
+          `/projects/${projectName}/assistant/ensure-session`,
+          preferredModel ? { model: preferredModel } : {}
+        );
         if (cancelled || historyGenRef.current !== myGen) return;
 
         const { sessionKey: sk, agentId: aid, model: m } = data;
@@ -1596,6 +1691,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     setIsRunning(false);
     setStreamingPhase('idle');
     setStatusText(null);
+    setPendingApprovals([]);
     compactionPhaseRef.current = 'idle';
     setCompactionPhase('idle');
     if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
@@ -1619,6 +1715,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       setThinkingContent('');
       setStreamingPhase('idle');
       setIsRunning(false);
+      setPendingApprovals([]);
       isStreamActiveRef.current = false;
       streamingAssistantIdRef.current = null;
       assembledRef.current = '';
@@ -1863,7 +1960,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         try {
           setSelectedModel(nextModel);
           modelRef.current = nextModel;
-          localStorage.setItem(`project-chat-model-${projectName}`, nextModel);
+          localStorage.setItem(`agent-model-${projectName}`, nextModel);
           await client.post(`/projects/${encodeURIComponent(projectName)}/assistant/ensure-session`, { model: nextModel });
           appendSystemMessage(`Model switched to ${nextModel}`);
         } catch (err: any) {
@@ -2150,35 +2247,6 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         </div>
       )}
 
-      {/* Compaction indicator */}
-      <AnimatePresence>
-        {compactionPhase !== 'idle' && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: 'auto' }}
-            exit={{ opacity: 0, height: 0 }}
-            transition={{ duration: 0.2 }}
-            className="flex justify-center py-1 border-b border-blue-500/10"
-          >
-            {compactionPhase === 'compacting' ? (
-              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-500/[0.08] border border-blue-500/20 text-blue-300 text-[10px] font-medium">
-                <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-                </svg>
-                Compacting context…
-              </div>
-            ) : (
-              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/[0.08] border border-emerald-500/20 text-emerald-300 text-[10px] font-medium">
-                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M20 6L9 17l-5-5" />
-                </svg>
-                Context compaction successful
-              </div>
-            )}
-          </motion.div>
-        )}
-      </AnimatePresence>
-
       {/* Messages */}
       <div ref={scrollRef} className="flex-1 overflow-auto" onScroll={handleScroll}>
         {isLoadingHistory && messages.length > 0 && (
@@ -2244,18 +2312,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                 );
                 const visibleContent = suppressCurrentBubbleText ? '' : msg.content;
                 const hasContent = !!visibleContent;
-                const thinkingContent = msg.thinkingContent;
                 const modelLabel = msg.model ? modelDisplayName(msg.model) : '';
                 const timeLabel = msg.createdAt ? msg.createdAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
 
                 return (
                   <div key={msg.id} className="px-3 py-1.5 group">
-                    {/* Thinking block — hidden during active streaming (status bar shows it) */}
-                    <AnimatePresence>
-                      {thinkingContent && !isCurrentlyStreaming && (
-                        <ThinkingBlock content={thinkingContent} isActive={false} />
-                      )}
-                    </AnimatePresence>
 
                     {/* Tool call pills */}
                     {toolCalls.length > 0 && (
@@ -2351,37 +2412,29 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         )}
       </AnimatePresence>
 
-      {/* Pinned status bar */}
+      {/* Stream status rail */}
       <AnimatePresence>
-        {isRunning && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: 'auto' }}
-            exit={{ opacity: 0, height: 0 }}
-            transition={{ duration: 0.2 }}
-          >
-            <div className="flex items-center justify-center gap-2 px-3 py-1.5 bg-violet-500/[0.06] border-t border-violet-500/[0.12]">
-              <div className="flex gap-0.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '0ms' }} />
-                <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '150ms' }} />
-                <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '300ms' }} />
-              </div>
-              <span className="text-[10px] text-violet-300/80 font-medium">
-                {statusText || (streamingPhase === 'tool' ? `Using ${activeToolName || 'tool'}…` : streamingPhase === 'streaming' ? 'Responding…' : 'Thinking…')}
-              </span>
-              <button
-                onClick={cancelStream}
-                className="ml-2 p-1 rounded hover:bg-red-500/20 text-red-400/60 hover:text-red-400 transition-colors"
-                title="Stop generation"
-              >
-                <StopCircle size={12} />
-              </button>
-            </div>
-          </motion.div>
+        {(isRunning || compactionPhase !== 'idle' || (!wsConnected && Boolean(connectionNotice))) && (
+          <ComposerStatusBadge
+            phase={isRunning ? streamingPhase : 'idle'}
+            toolName={activeToolName}
+            statusText={statusText}
+            showConnectionLost={!wsConnected && Boolean(connectionNotice)}
+            compactionPhase={compactionPhase}
+          />
         )}
       </AnimatePresence>
 
       {/* Composer */}
+      {pendingApproval && (
+        <ExecApprovalModal
+          approval={pendingApproval}
+          queueCount={pendingApprovals.length}
+          onResolve={resolveApproval}
+          onDismiss={dismissApproval}
+        />
+      )}
+
       <div className={`border-t transition-colors duration-300 flex-shrink-0 ${
         isRunning ? 'border-amber-500/20 bg-[#0a0a14]/50' : 'border-white/5 bg-[#0a0a14]/30'
       }`}>

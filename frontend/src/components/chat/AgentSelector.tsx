@@ -9,6 +9,7 @@ import { createPortal } from 'react-dom';
 import { ChevronDown, Check, Users, Radio, Loader2, History, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import client from '../../api/client';
+import { useAuthStore } from '../../contexts/AuthContext';
 import { getShortModelLabel } from '../../utils/modelId';
 
 /* ─── Mobile Bottom Sheet wrapper ───────────────────────────────────────── */
@@ -263,14 +264,19 @@ function AvatarCircle({
 
 function SessionDropdown({
   sessions,
+  loading = false,
+  open,
+  onOpenChange,
   onViewSession,
   providerLabel,
 }: {
   sessions: GatewaySession[];
+  loading?: boolean;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   onViewSession: (sessionKey: string) => void;
   providerLabel: string;
 }) {
-  const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -280,14 +286,12 @@ function SessionDropdown({
     if (isMobile) return;
     function handleClick(e: MouseEvent) {
       if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
+        onOpenChange(false);
       }
     }
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
-  }, [open]);
-
-  if (sessions.length === 0) return null;
+  }, [open, onOpenChange]);
 
   const activeSessions = sessions.filter(s => s.status === 'active');
   const otherSessions = sessions.filter(s => s.status !== 'active');
@@ -295,12 +299,12 @@ function SessionDropdown({
   return (
     <div ref={ref} className="relative">
       <button
-        onClick={() => setOpen(!open)}
+        onClick={() => onOpenChange(!open)}
         className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] text-xs text-slate-500 hover:text-slate-300 transition-colors"
         title={`${providerLabel} sessions`}
       >
         <History size={12} />
-        <span className="hidden sm:inline tabular-nums">{sessions.length}</span>
+        <span className="hidden sm:inline tabular-nums">{loading && sessions.length === 0 ? '…' : sessions.length}</span>
         {activeSessions.length > 0 && (
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
         )}
@@ -312,7 +316,7 @@ function SessionDropdown({
 
       <DropdownSheet
         open={open}
-        onClose={() => setOpen(false)}
+        onClose={() => onOpenChange(false)}
         desktopClass="absolute top-full right-0 mt-1.5 w-64 rounded-xl bg-[#1A1F3A] border border-white/[0.08] shadow-2xl shadow-black/50 overflow-hidden z-50"
       >
         <div className="max-h-[320px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
@@ -321,10 +325,23 @@ function SessionDropdown({
               <Radio size={10} className="text-emerald-400" />
               {providerLabel} Sessions
               <span className="ml-auto text-[9px] bg-emerald-500/15 text-emerald-400 px-1.5 py-0.5 rounded-full font-medium tabular-nums">
-                {sessions.length}
+                {loading && sessions.length === 0 ? '…' : sessions.length}
               </span>
             </div>
           </div>
+
+          {loading && sessions.length === 0 && (
+            <div className="px-4 py-6 text-xs text-slate-500 flex items-center gap-2">
+              <Loader2 size={12} className="animate-spin text-slate-500" />
+              <span>Loading sessions…</span>
+            </div>
+          )}
+
+          {!loading && sessions.length === 0 && (
+            <div className="px-4 py-6 text-xs text-slate-500">
+              No recent sessions yet.
+            </div>
+          )}
 
           {activeSessions.length > 0 && (
             <div>
@@ -333,7 +350,7 @@ function SessionDropdown({
                 return (
                   <button
                     key={key || `active-${idx}`}
-                    onClick={() => { onViewSession(key); setOpen(false); }}
+                    onClick={() => { onViewSession(key); onOpenChange(false); }}
                     className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-slate-300 hover:text-white hover:bg-white/[0.06] transition-colors"
                   >
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
@@ -358,7 +375,7 @@ function SessionDropdown({
             return (
               <button
                 key={key || `other-${idx}`}
-                onClick={() => { onViewSession(key); setOpen(false); }}
+                onClick={() => { onViewSession(key); onOpenChange(false); }}
                 className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-slate-500 hover:text-slate-300 hover:bg-white/[0.04] transition-colors"
               >
                 <span className="w-1.5 h-1.5 rounded-full bg-slate-600 flex-shrink-0" />
@@ -391,11 +408,14 @@ export default function AgentSelector({
   assistantName,
   defaultOpenClawAgentId,
 }: AgentSelectorProps) {
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [agents, setAgents] = useState<OpenClawAgent[]>([]);
   const [sessions, setSessions] = useState<GatewaySession[]>([]);
   const [open, setOpen] = useState(false);
+  const [sessionsOpen, setSessionsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
   const [agentsLoading, setAgentsLoading] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -498,17 +518,21 @@ export default function AgentSelector({
     return () => { cancelled = true; };
   }, [open]);
 
-  // Keep the session list warm independently of the agent dropdown so the
-  // dedicated session picker keeps working even after the dropdown closes.
+  // Fetch session lists only when the session picker is opened.
+  // The chat header stays usable without this metadata, so we avoid paying
+  // for hidden session-list requests on every Agent Chat page open.
   useEffect(() => {
     const selectedProvider = providers.find((p) => p.name === value);
     const supportsSessionList = value === 'OPENCLAW' || selectedProvider?.capabilities?.supportsSessionList === true;
-    if (!supportsSessionList) {
+    if (!supportsSessionList || !isAuthenticated) {
       setSessions([]);
+      setSessionsLoading(false);
       return;
     }
+    if (!sessionsOpen) return;
     let cancelled = false;
     async function fetchSessions() {
+      if (!cancelled) setSessionsLoading(true);
       try {
         const params: Record<string, string> = {};
         if (value === 'OPENCLAW') {
@@ -516,17 +540,22 @@ export default function AgentSelector({
         } else {
           params.provider = value;
         }
-        const { data } = await client.get('/gateway/sessions', { params });
+        const { data } = await client.get('/gateway/sessions', {
+          params,
+          _silent: true,
+        } as any);
         const list = data.sessions || [];
         if (!cancelled) setSessions(Array.isArray(list) ? list : Object.values(list));
       } catch {
         if (!cancelled) setSessions([]);
+      } finally {
+        if (!cancelled) setSessionsLoading(false);
       }
     }
     void fetchSessions();
     const interval = setInterval(fetchSessions, 30000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [value, agentId, providers]);
+  }, [value, agentId, providers, sessionsOpen, isAuthenticated]);
 
   // Close on click outside (desktop only — mobile uses backdrop onClick)
   useEffect(() => {
@@ -771,6 +800,9 @@ export default function AgentSelector({
       {(value === 'OPENCLAW' || providers.find((p) => p.name === value)?.capabilities?.supportsSessionList) && onViewSession && (
         <SessionDropdown
           sessions={sessions}
+          loading={sessionsLoading}
+          open={sessionsOpen}
+          onOpenChange={setSessionsOpen}
           onViewSession={handleSessionClick}
           providerLabel={displayLabel}
         />

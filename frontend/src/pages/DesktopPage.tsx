@@ -26,29 +26,6 @@ type DesktopConfigState =
   | { kind: 'unconfigured' }
   | { kind: 'invalid'; reason: string };
 
-type BrowserPage = {
-  targetId: string;
-  title: string;
-  url: string;
-};
-
-type BrowserStatusResponse = {
-  running: boolean;
-  pages: BrowserPage[];
-  error?: string;
-};
-
-type StreamStatusMessage = {
-  type?: string;
-  running?: boolean;
-  pages?: BrowserPage[];
-  targetId?: string | null;
-  title?: string;
-  url?: string;
-  message?: string;
-  error?: string;
-};
-
 const normalizePrefix = (value: string): string => {
   const cleaned = value.trim();
   if (!cleaned) return '';
@@ -86,20 +63,7 @@ export default function DesktopPage() {
   const nextPlayTimeRef = useRef(0);
   const audioConfigRef = useRef({ sampleRate: 44100, channels: 2 });
 
-  const [browserLoading, setBrowserLoading] = useState(true);
-  const [browserRunning, setBrowserRunning] = useState(false);
-  const [browserPages, setBrowserPages] = useState<BrowserPage[]>([]);
-  const [selectedTargetId, setSelectedTargetId] = useState<string | null>(null);
-  const [currentTitle, setCurrentTitle] = useState('');
-  const [currentUrl, setCurrentUrl] = useState('');
-  const [browserError, setBrowserError] = useState<string | null>(null);
   const [openingInDesktop, setOpeningInDesktop] = useState(false);
-  const [socketConnected, setSocketConnected] = useState(false);
-  const [lastFrameAt, setLastFrameAt] = useState<number | null>(null);
-  const [frameUrl, setFrameUrl] = useState<string | null>(null);
-  const browserWsRef = useRef<WebSocket | null>(null);
-  const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const pendingTargetRef = useRef<string | null>(null);
 
   useEffect(() => {
     audioVolumeRef.current = audioVolume;
@@ -108,17 +72,6 @@ export default function DesktopPage() {
   useEffect(() => {
     audioEnabledRef.current = audioEnabled;
   }, [audioEnabled]);
-
-  const selectedPage = useMemo(() => {
-    return browserPages.find((page) => page.targetId === selectedTargetId) || browserPages[0] || null;
-  }, [browserPages, selectedTargetId]);
-
-  const browserActivityCount = browserPages.length;
-  const browserHasActivity = browserActivityCount > 0;
-
-  const cleanupFrameUrl = useCallback((url: string | null) => {
-    if (url) URL.revokeObjectURL(url);
-  }, []);
 
   const getOrCreateAudioContext = useCallback((): AudioContext | null => {
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
@@ -330,12 +283,13 @@ export default function DesktopPage() {
     const loadSettings = async () => {
       setConfigLoading(true);
       try {
-        const apiUrl = import.meta.env.VITE_API_URL || '';
-        const res = await fetch(`${apiUrl}/settings/public`);
-        if (!res.ok) throw new Error('Failed to load settings');
-        const data = await res.json();
-        setRemoteDesktopUrl((data.remoteDesktopUrl || '').trim());
-        setAllowedPrefixesRaw((data.remoteDesktopAllowedPathPrefixes || '/novnc,/vnc').trim());
+        const { data } = await client.get('/remote-desktop/status');
+        const configuredUrl = String(data?.diagnostics?.configuredUrl || '').trim();
+        const allowedPrefixes = Array.isArray(data?.diagnostics?.allowedPrefixes)
+          ? data.diagnostics.allowedPrefixes.join(',')
+          : '/novnc,/vnc';
+        setRemoteDesktopUrl(configuredUrl);
+        setAllowedPrefixesRaw((allowedPrefixes || '/novnc,/vnc').trim());
       } catch {
         setRemoteDesktopUrl('');
         setAllowedPrefixesRaw('/novnc,/vnc');
@@ -379,12 +333,7 @@ export default function DesktopPage() {
     setSetupRunning(true);
     setSetupResult(null);
     try {
-      const apiUrl = import.meta.env.VITE_API_URL || '';
-      const res = await fetch(`${apiUrl}/remote-desktop/auto-setup`, {
-        method: 'POST',
-        credentials: 'include',
-      });
-      const data = await res.json();
+      const { data } = await client.post('/remote-desktop/auto-setup');
       if (data?.ok) {
         setSetupResult({ ok: true, message: 'Remote Desktop setup complete! Reloading...' });
         setTimeout(() => window.location.reload(), 2000);
@@ -411,10 +360,7 @@ export default function DesktopPage() {
 
       setHealthStatus('loading');
       try {
-        const apiUrl = import.meta.env.VITE_API_URL || '';
-        const res = await fetch(`${apiUrl}/remote-desktop/status`, { credentials: 'include' });
-        if (!res.ok) throw new Error(`Status check failed (${res.status})`);
-        const data = await res.json();
+        const { data } = await client.get('/remote-desktop/status');
         if (cancelled) return;
 
         const checks = data?.diagnostics?.checks;
@@ -441,120 +387,6 @@ export default function DesktopPage() {
       window.clearInterval(interval);
     };
   }, [configState]);
-
-  const loadBrowserStatus = useCallback(async (keepSelection = true) => {
-    try {
-      const { data } = await client.get<BrowserStatusResponse>('/agent-browser/status', { _silent: true } as any);
-      const nextPages = data.pages || [];
-      setBrowserRunning(Boolean(data.running));
-      setBrowserPages(nextPages);
-      setBrowserError(data.running ? null : (data.error || null));
-
-      const nextTarget = keepSelection
-        ? nextPages.find((page) => page.targetId === (pendingTargetRef.current || selectedTargetId))?.targetId
-        : null;
-      const fallbackTarget = nextTarget || nextPages[0]?.targetId || null;
-      setSelectedTargetId(fallbackTarget);
-
-      const currentPage = nextPages.find((page) => page.targetId === fallbackTarget) || nextPages[0];
-      setCurrentTitle(currentPage?.title || '');
-      setCurrentUrl(currentPage?.url || '');
-    } catch (err: any) {
-      setBrowserRunning(false);
-      setBrowserPages([]);
-      setCurrentTitle('');
-      setCurrentUrl('');
-      setBrowserError(err?.response?.data?.error || err?.message || 'Failed to load agent browser status');
-    } finally {
-      setBrowserLoading(false);
-    }
-  }, [selectedTargetId]);
-
-  const connectBrowserStream = useCallback(() => {
-    if (browserWsRef.current) {
-      browserWsRef.current.close();
-      browserWsRef.current = null;
-    }
-
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${window.location.host}/api/agent-browser/stream`);
-    ws.binaryType = 'blob';
-
-    ws.onopen = () => {
-      setSocketConnected(true);
-      setBrowserError(null);
-      const targetId = pendingTargetRef.current || selectedTargetId;
-      if (targetId) {
-        ws.send(JSON.stringify({ targetId }));
-      }
-    };
-
-    ws.onmessage = (event) => {
-      if (typeof event.data === 'string') {
-        try {
-          const message = JSON.parse(event.data) as StreamStatusMessage;
-          if (message.type === 'error') {
-            setBrowserError(message.error || 'Agent browser stream error');
-            return;
-          }
-
-          if (typeof message.running === 'boolean') setBrowserRunning(message.running);
-          if (Array.isArray(message.pages)) setBrowserPages(message.pages);
-          if (typeof message.targetId === 'string' || message.targetId === null) {
-            setSelectedTargetId(message.targetId);
-          }
-          if (typeof message.title === 'string') setCurrentTitle(message.title);
-          if (typeof message.url === 'string') setCurrentUrl(message.url);
-          if (message.error) setBrowserError(message.error);
-          else if (message.message) setBrowserError(message.message);
-          else setBrowserError(null);
-        } catch {
-          setBrowserError('Received invalid browser stream metadata');
-        }
-        return;
-      }
-
-      const objectUrl = URL.createObjectURL(event.data);
-      setFrameUrl((previous) => {
-        cleanupFrameUrl(previous);
-        return objectUrl;
-      });
-      setLastFrameAt(Date.now());
-    };
-
-    ws.onclose = () => {
-      setSocketConnected(false);
-    };
-
-    ws.onerror = () => {
-      setSocketConnected(false);
-      setBrowserError('Live stream connection failed');
-    };
-
-    browserWsRef.current = ws;
-  }, [cleanupFrameUrl, selectedTargetId]);
-
-  useEffect(() => {
-    void loadBrowserStatus(false);
-    connectBrowserStream();
-
-    refreshTimerRef.current = setInterval(() => {
-      void loadBrowserStatus(true);
-    }, 5000);
-
-    return () => {
-      if (refreshTimerRef.current) clearInterval(refreshTimerRef.current);
-      if (browserWsRef.current) browserWsRef.current.close();
-      cleanupFrameUrl(frameUrl);
-    };
-  }, []);
-
-  useEffect(() => {
-    const ws = browserWsRef.current;
-    const targetId = pendingTargetRef.current || selectedTargetId;
-    if (!ws || ws.readyState !== WebSocket.OPEN || !targetId) return;
-    ws.send(JSON.stringify({ targetId }));
-  }, [selectedTargetId]);
 
   const setupTimeout = (ms: number) => {
     if (timeoutRef.current) clearTimeout(timeoutRef.current);
@@ -661,38 +493,19 @@ export default function DesktopPage() {
     };
   }, [postViewportToIframe, configState.kind]);
 
-  const handleSelectPage = (targetId: string) => {
-    pendingTargetRef.current = targetId;
-    setSelectedTargetId(targetId);
-    const nextPage = browserPages.find((page) => page.targetId === targetId);
-    if (nextPage) {
-      setCurrentTitle(nextPage.title);
-      setCurrentUrl(nextPage.url);
-    }
-    if (browserWsRef.current?.readyState === WebSocket.OPEN) {
-      browserWsRef.current.send(JSON.stringify({ targetId }));
-    }
-  };
-
   const openCurrentBrowserInDesktop = useCallback(async () => {
     setOpeningInDesktop(true);
     try {
-      await client.post('/agent-browser/open-in-desktop', { url: currentUrl || selectedPage?.url || '' });
-      setBrowserError(null);
+      await client.post('/agent-browser/open-in-desktop');
       setTimeout(() => postViewportToIframe('open-shared-browser'), 500);
-    } catch (err: any) {
-      setBrowserError(err?.response?.data?.error || err?.message || 'Failed to open browser in Remote Desktop');
+    } catch (err) {
+      console.error('[Desktop] Failed to open shared Chrome in Remote Desktop:', err);
     } finally {
       setOpeningInDesktop(false);
     }
-  }, [currentUrl, selectedPage?.url, postViewportToIframe]);
+  }, [postViewportToIframe]);
 
   const configUrl = configState.kind === 'ok' ? configState.url.toString() : '';
-  const browserStatusTone = !browserRunning
-    ? 'text-amber-300 bg-amber-500/10 border-amber-500/20'
-    : socketConnected
-      ? 'text-emerald-300 bg-emerald-500/10 border-emerald-500/20'
-      : 'text-sky-300 bg-sky-500/10 border-sky-500/20';
 
   return (
     <motion.div
@@ -706,7 +519,7 @@ export default function DesktopPage() {
           <Monitor size={16} className="text-emerald-400 flex-shrink-0" />
           <div className="min-w-0">
             <div className="text-sm font-semibold text-white">Remote Desktop</div>
-            <div className="text-[11px] text-slate-500">Shared workspace with embedded browser controls</div>
+            <div className="text-[11px] text-slate-500">Shared graphical workspace on your server</div>
           </div>
         </div>
 

@@ -158,6 +158,35 @@ function preventTraversal(filePath: string, baseDir: string): boolean {
   return resolved.startsWith(path.resolve(baseDir));
 }
 
+function isPathWithin(baseDir: string, candidatePath: string): boolean {
+  const resolvedBase = path.resolve(baseDir);
+  const resolvedCandidate = path.resolve(candidatePath);
+  return resolvedCandidate === resolvedBase || resolvedCandidate.startsWith(`${resolvedBase}${path.sep}`);
+}
+
+function getContainedProjectPath(ownerId: string, projectName: string): string {
+  const projectsRoot = path.join(process.env.PORTAL_ROOT || '/portal', 'projects', ownerId);
+  const resolvedProjectPath = path.resolve(path.join(projectsRoot, projectName));
+
+  if (!isPathWithin(projectsRoot, resolvedProjectPath)) {
+    throw new Error('Project path traversal detected');
+  }
+
+  return resolvedProjectPath;
+}
+
+function getContainedProjectDestination(projectDir: string, destinationPath: unknown, fileName: string): string {
+  const safeFileName = path.basename(fileName);
+  const relativeDestination = typeof destinationPath === 'string' ? destinationPath : '';
+  const resolvedDestination = path.resolve(projectDir, relativeDestination, safeFileName);
+
+  if (!isPathWithin(projectDir, resolvedDestination)) {
+    throw new Error('Destination path traversal detected');
+  }
+
+  return resolvedDestination;
+}
+
 async function logActivity(userId: string, action: string, resource: string, resourceId?: string, req?: Request) {
   await prisma.activityLog.create({
     data: {
@@ -395,7 +424,7 @@ router.get('/:id/direct-content', async (req: Request, res: Response) => {
 });
 
 // GET /api/files/:id/content - AI-accessible file content (inline, no download header)
-router.get('/:id/content', authenticateToken, async (req: Request, res: Response) => {
+router.get('/:id/content', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const file = await prisma.file.findFirst({
@@ -428,7 +457,7 @@ router.get('/:id/content', authenticateToken, async (req: Request, res: Response
 });
 
 // GET /api/files/:id/download
-router.get('/:id/download', authenticateToken, async (req: Request, res: Response) => {
+router.get('/:id/download', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const file = await prisma.file.findFirst({
@@ -460,7 +489,7 @@ router.get('/:id/download', authenticateToken, async (req: Request, res: Respons
 });
 
 // GET /api/files/:id/thumbnail - Generate/serve thumbnail for images
-router.get('/:id/thumbnail', authenticateToken, async (req: Request, res: Response) => {
+router.get('/:id/thumbnail', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const file = await prisma.file.findFirst({
@@ -490,7 +519,7 @@ router.get('/:id/thumbnail', authenticateToken, async (req: Request, res: Respon
 });
 
 // DELETE /api/files/:id
-router.delete('/:id', authenticateToken, async (req: Request, res: Response) => {
+router.delete('/:id', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const file = await prisma.file.findFirst({
@@ -520,7 +549,7 @@ router.delete('/:id', authenticateToken, async (req: Request, res: Response) => 
 });
 
 // Batch delete
-router.post('/batch-delete', authenticateToken, async (req: Request, res: Response) => {
+router.post('/batch-delete', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { ids } = req.body;
@@ -553,7 +582,7 @@ router.post('/batch-delete', authenticateToken, async (req: Request, res: Respon
 });
 
 // PATCH /:id/rename - Rename a file
-router.patch('/:id/rename', authenticateToken, async (req: Request, res: Response) => {
+router.patch('/:id/rename', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { id } = req.params;
@@ -620,7 +649,7 @@ router.patch('/:id/rename', authenticateToken, async (req: Request, res: Respons
 });
 
 // POST /:id/copy-to-project - Copy file to a project
-router.post('/:id/copy-to-project', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:id/copy-to-project', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const { id } = req.params;
@@ -646,18 +675,29 @@ router.post('/:id/copy-to-project', authenticateToken, async (req: Request, res:
       return;
     }
 
+    let projectDir: string;
+    try {
+      projectDir = getContainedProjectPath(ownerId, projectName);
+    } catch {
+      res.status(403).json({ error: 'Path traversal detected' });
+      return;
+    }
+
     // Verify project exists and user owns it
-    const projectDir = path.join(process.env.PORTAL_ROOT || '/portal', 'projects', ownerId, projectName);
     if (!fs.existsSync(projectDir)) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
 
     // Determine destination path in project
-    const fileName = file.originalName || path.basename(file.path);
-    const destPath = destinationPath 
-      ? path.join(projectDir, destinationPath, fileName)
-      : path.join(projectDir, fileName);
+    const fileName = path.basename(file.originalName || file.path);
+    let destPath: string;
+    try {
+      destPath = getContainedProjectDestination(projectDir, destinationPath, fileName);
+    } catch {
+      res.status(403).json({ error: 'Path traversal detected' });
+      return;
+    }
 
     // Ensure destination directory exists
     const destDir = path.dirname(destPath);

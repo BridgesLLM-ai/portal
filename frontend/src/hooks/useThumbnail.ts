@@ -52,30 +52,46 @@ export function useThumbnails(fileIds: string[]): Record<string, string> {
   useEffect(() => {
     const blobUrls: Record<string, string> = {};
     let cancelled = false;
+    const queue = [...fileIds];
+    const concurrency = 4;
 
-    async function fetchAll() {
-      await Promise.all(
-        fileIds.map(async (fileId) => {
-          try {
-            const response = await client.get(`/files/${fileId}/thumbnail`, {
-              responseType: 'blob',
-            });
-            
-            if (cancelled) return;
-            
-            const blobUrl = URL.createObjectURL(response.data);
-            blobUrls[fileId] = blobUrl;
-            
-            // Update state incrementally as thumbnails load
-            setThumbnails(prev => ({ ...prev, [fileId]: blobUrl }));
-          } catch (error) {
-            console.error(`Failed to load thumbnail for ${fileId}:`, error);
-          }
-        })
-      );
+    setThumbnails((prev) => {
+      const next: Record<string, string> = {};
+      for (const fileId of fileIds) {
+        if (prev[fileId]) next[fileId] = prev[fileId];
+      }
+      return next;
+    });
+
+    async function fetchOne(fileId: string) {
+      try {
+        const response = await client.get(`/files/${fileId}/thumbnail`, {
+          responseType: 'blob',
+        });
+
+        if (cancelled) return;
+
+        const blobUrl = URL.createObjectURL(response.data);
+        blobUrls[fileId] = blobUrl;
+
+        setThumbnails(prev => {
+          if (prev[fileId] === blobUrl) return prev;
+          return { ...prev, [fileId]: blobUrl };
+        });
+      } catch (error) {
+        console.error(`Failed to load thumbnail for ${fileId}:`, error);
+      }
     }
 
-    fetchAll();
+    async function worker() {
+      while (!cancelled) {
+        const fileId = queue.shift();
+        if (!fileId) return;
+        await fetchOne(fileId);
+      }
+    }
+
+    void Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, () => worker()));
 
     return () => {
       cancelled = true;

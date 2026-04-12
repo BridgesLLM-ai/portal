@@ -282,6 +282,8 @@ export default function LoginPage() {
   const [mounted, setMounted] = useState(false);
   const { login, signup, completeTwoFactor, cancelTwoFactor, twoFactorPending, twoFactorPendingToken, twoFactorMethod, isLoading, error, clearError } = useAuthStore();
   const navigate = useNavigate();
+  const searchParams = new URLSearchParams(window.location.search);
+  const passwordChanged = searchParams.get('password') === 'changed';
 
   useEffect(() => { setMounted(true); }, []);
 
@@ -557,6 +559,20 @@ export default function LoginPage() {
                   </motion.div>
 
                   <AnimatePresence>
+                    {passwordChanged && !error && (
+                      <motion.div
+                        initial={{ opacity: 0, height: 0 }}
+                        animate={{ opacity: 1, height: 'auto' }}
+                        exit={{ opacity: 0, height: 0 }}
+                        className="text-emerald-300 text-sm rounded-xl px-4 py-2.5 overflow-hidden"
+                        style={{
+                          background: 'rgba(16,185,129,0.08)',
+                          border: '1px solid rgba(16,185,129,0.15)',
+                        }}
+                      >
+                        Your password was changed successfully. For safety, all active sessions were signed out. Sign in again with your new password.
+                      </motion.div>
+                    )}
                     {error && (
                       <motion.div
                         initial={{ opacity: 0, height: 0 }}

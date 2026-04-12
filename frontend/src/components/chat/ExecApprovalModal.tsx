@@ -14,11 +14,12 @@ import type { ExecApprovalRequest } from './useAgentRuntime';
 
 interface ExecApprovalModalProps {
   approval: ExecApprovalRequest;
+  queueCount?: number;
   onResolve: (approvalId: string, decision: 'allow-once' | 'deny' | 'allow-always') => void | Promise<void>;
-  onDismiss: () => void;
+  onDismiss: (approvalId: string) => void;
 }
 
-export function ExecApprovalModal({ approval, onResolve, onDismiss }: ExecApprovalModalProps) {
+export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismiss }: ExecApprovalModalProps) {
   const [timeLeft, setTimeLeft] = useState<number>(0);
   const [isClosing, setIsClosing] = useState(false);
   const [isResolving, setIsResolving] = useState(false);
@@ -43,9 +44,9 @@ export function ExecApprovalModal({ approval, onResolve, onDismiss }: ExecApprov
   const handleDismiss = useCallback(() => {
     setIsClosing(true);
     setTimeout(() => {
-      onDismiss();
+      onDismiss(approval.id);
     }, 200);
-  }, [onDismiss]);
+  }, [approval.id, onDismiss]);
 
   const handleDecision = useCallback((decision: 'allow-once' | 'deny' | 'allow-always') => {
     if (isResolving) return;
@@ -120,7 +121,9 @@ export function ExecApprovalModal({ approval, onResolve, onDismiss }: ExecApprov
                 </div>
                 <div className="flex-1">
                   <h2 className="text-lg font-semibold text-white">Command Approval Required</h2>
-                  <p className="text-sm text-white/60">The agent wants to run a command</p>
+                  <p className="text-sm text-white/60">
+                    The agent wants to run a command{queueCount > 1 ? `, 1 of ${queueCount} pending` : ''}
+                  </p>
                 </div>
                 {/* Countdown timer */}
                 <div className="flex items-center gap-2 px-3 py-1.5 bg-white/5 rounded-full">
@@ -185,6 +188,21 @@ export function ExecApprovalModal({ approval, onResolve, onDismiss }: ExecApprov
                   <div className="flex items-center gap-3 text-sm">
                     <span className="text-white/50">Agent:</span>
                     <span className="text-white/80">{approval.request.agentId}</span>
+                  </div>
+                )}
+
+                {approval.request.sessionKey && (
+                  <div className="flex items-center gap-3 text-sm">
+                    <span className="text-white/50">Session:</span>
+                    <code className="px-2 py-1 bg-white/5 rounded-md font-mono text-white/80 break-all">
+                      {approval.request.sessionKey}
+                    </code>
+                  </div>
+                )}
+
+                {queueCount > 1 && (
+                  <div className="rounded-xl border border-amber-400/15 bg-amber-500/10 px-3 py-2 text-sm text-amber-200">
+                    {queueCount - 1} more approval{queueCount - 1 === 1 ? '' : 's'} waiting behind this one.
                   </div>
                 )}
 

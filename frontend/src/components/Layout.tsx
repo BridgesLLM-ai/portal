@@ -25,6 +25,7 @@ const navItems = [
   { to: '/agent-tools', icon: Wrench, label: 'Agent Tools', interactiveOnly: true, adminOnly: true },
   { to: '/mail', icon: Mail, label: 'Mail', interactiveOnly: true },
   { to: '/projects', icon: Rocket, label: 'Projects', interactiveOnly: true },
+  { to: '/apps', icon: Globe, label: 'Apps', interactiveOnly: true },
   { to: '/files', icon: FolderOpen, label: 'Files', interactiveOnly: true },
   { to: '/terminal', icon: Terminal, label: 'Terminal', interactiveOnly: true, adminOnly: true },
   { to: '/desktop', icon: Monitor, label: 'Remote Desktop', interactiveOnly: true, adminOnly: true },
@@ -273,7 +274,7 @@ export default function Layout() {
                 <TerminalPage />
               </Suspense>
             )}
-            {!isTerminalRoute && <Outlet />}
+            <Outlet />
           </ErrorBoundary>
         </main>
       </div>

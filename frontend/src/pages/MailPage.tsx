@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
 import { ChevronDown, Mail, Settings as SettingsIcon, X, Copy, Check, Eye, EyeOff, Loader2 } from 'lucide-react';
@@ -6,13 +6,24 @@ import { useIsMobile } from '../hooks/useIsMobile';
 import { apiFetch, fetchMailAccounts, type MailAccount } from '../components/mail/api';
 import MailSidebar from '../components/mail/MailSidebar';
 import EmailList from '../components/mail/EmailList';
-import EmailDetail from '../components/mail/EmailDetail';
-import ComposeModal from '../components/mail/ComposeModal';
 import type { MailboxInfo, EmailSummary, ComposeState } from '../components/mail/types';
+
+const LazyEmailDetail = lazy(() => import('../components/mail/EmailDetail'));
+const LazyComposeModal = lazy(() => import('../components/mail/ComposeModal'));
 
 // ── Main Mail Page ────────────────────────────────────────────
 
 const PAGE_SIZE = 50;
+const ACTIVE_MAIL_ACCOUNT_STORAGE_KEY = 'mail-active-account';
+
+function getCachedActiveMailAccount(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    return window.sessionStorage.getItem(ACTIVE_MAIL_ACCOUNT_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
 
 export default function MailPage() {
   const isMobile = useIsMobile();
@@ -32,10 +43,11 @@ export default function MailPage() {
   
   // Account management
   const [accounts, setAccounts] = useState<MailAccount[]>([]);
-  const [activeAccount, setActiveAccount] = useState<string>('');
+  const [activeAccount, setActiveAccount] = useState<string>(() => getCachedActiveMailAccount());
   const [hasMailbox, setHasMailbox] = useState<boolean>(true);
   const [noMailbox, setNoMailbox] = useState<boolean>(false);
   const [accountDropdownOpen, setAccountDropdownOpen] = useState(false);
+  const [accountsResolved, setAccountsResolved] = useState(false);
 
   // Setup guide and forwarding modals
   const [showSetupGuide, setShowSetupGuide] = useState(false);
@@ -55,30 +67,48 @@ export default function MailPage() {
 
   // Load accounts
   useEffect(() => {
+    let cancelled = false;
     fetchMailAccounts().then(({ accounts: accts, hasMailbox: has }) => {
+      if (cancelled) return;
       setAccounts(accts);
       setHasMailbox(has);
 
       const primaryPersonal = accts.find(a => a.isPrimary);
-      const currentStillExists = accts.some(a => a.id === activeAccount);
+      const nextAccount = primaryPersonal?.id
+        || (!has && accts.find(a => a.id === 'support')?.id)
+        || accts[0]?.id
+        || '';
 
-      if (!currentStillExists) {
-        if (primaryPersonal) {
-          setActiveAccount(primaryPersonal.id);
-        } else if (!has && accts.length > 0) {
-          const supportAcct = accts.find(a => a.id === 'support');
-          if (supportAcct) setActiveAccount('support');
-        } else if (accts[0]) {
-          setActiveAccount(accts[0].id);
-        }
-      }
-    }).catch(() => {});
+      setActiveAccount(prev => {
+        if (prev && accts.some(a => a.id === prev)) return prev;
+        return nextAccount;
+      });
+      setAccountsResolved(true);
+    }).catch(() => {
+      if (cancelled) return;
+      setAccountsResolved(true);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      if (activeAccount) window.sessionStorage.setItem(ACTIVE_MAIL_ACCOUNT_STORAGE_KEY, activeAccount);
+      else window.sessionStorage.removeItem(ACTIVE_MAIL_ACCOUNT_STORAGE_KEY);
+    } catch {
+      // Ignore storage failures.
+    }
   }, [activeAccount]);
 
   // Load mailboxes
   const loadMailboxes = useCallback(() => {
-    apiFetch('/mailboxes', { account: activeAccount })
+    if (!activeAccount && !accountsResolved) return;
+    apiFetch('/mailboxes', { account: activeAccount || undefined })
       .then((data) => {
+        if (!accountsResolved && activeAccount && accounts.length > 0 && !accounts.some((acct) => acct.id === activeAccount)) {
+          return;
+        }
         if (data.error === 'no_mailbox') {
           setNoMailbox(true);
           setMailboxes([]);
@@ -90,27 +120,33 @@ export default function MailPage() {
         setError('');
       })
       .catch((err: any) => {
+        if (!accountsResolved && activeAccount) return;
         const msg = err?.response?.data?.error || err?.message || 'Failed to connect to mail server';
         setError(msg);
         setMailboxes([]);
       });
-  }, [activeAccount]);
+  }, [accountsResolved, activeAccount, accounts]);
 
-  useEffect(() => { loadMailboxes(); }, [loadMailboxes]);
+  useEffect(() => {
+    if (!activeAccount && !accountsResolved) return;
+    loadMailboxes();
+  }, [accountsResolved, activeAccount, loadMailboxes]);
 
   // Auto-refresh mailbox counts every 30s
   useEffect(() => {
+    if (!activeAccount && !accountsResolved) return;
     const timer = setInterval(loadMailboxes, 30000);
     return () => clearInterval(timer);
-  }, [loadMailboxes]);
+  }, [accountsResolved, activeAccount, loadMailboxes]);
 
   // Load emails
   const loadEmails = useCallback(async (role?: string, pageNum?: number) => {
+    if (!activeAccount && !accountsResolved) return;
     setLoading(true);
     setError('');
     try {
       const position = (pageNum ?? page) * PAGE_SIZE;
-      const data = await apiFetch(`/messages?mailboxRole=${role || activeMailbox}&limit=${PAGE_SIZE}&position=${position}`, { account: activeAccount });
+      const data = await apiFetch(`/messages?mailboxRole=${role || activeMailbox}&limit=${PAGE_SIZE}&position=${position}`, { account: activeAccount || undefined });
       if (data.error === 'no_mailbox') {
         setNoMailbox(true);
         setEmails([]);
@@ -121,15 +157,23 @@ export default function MailPage() {
         setTotal(data.total || 0);
       }
     } catch (err: any) {
+      if (!accountsResolved && activeAccount) {
+        setLoading(false);
+        setRefreshing(false);
+        return;
+      }
       setError(err.message);
       setEmails([]);
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [activeMailbox, page, activeAccount]);
+  }, [accountsResolved, activeMailbox, page, activeAccount]);
 
-  useEffect(() => { loadEmails(); }, [activeMailbox, page, loadEmails]);
+  useEffect(() => {
+    if (!activeAccount && !accountsResolved) return;
+    loadEmails();
+  }, [accountsResolved, activeAccount, activeMailbox, page, loadEmails]);
 
   const handleRefresh = () => {
     setRefreshing(true);
@@ -347,15 +391,17 @@ export default function MailPage() {
                 transition={{ type: 'spring', damping: 28, stiffness: 300 }}
                 className="absolute inset-0 z-10 bg-[#080B20]"
               >
-                <EmailDetail
-                  emailId={selectedId!}
-                  onBack={() => setSelectedId(null)}
-                  onRefresh={handleRefresh}
-                  mailboxes={mailboxes}
-                  onCompose={setComposeState}
-                  isMobile={isMobile}
-                  account={activeAccount}
-                />
+                <Suspense fallback={null}>
+                  <LazyEmailDetail
+                    emailId={selectedId!}
+                    onBack={() => setSelectedId(null)}
+                    onRefresh={handleRefresh}
+                    mailboxes={mailboxes}
+                    onCompose={setComposeState}
+                    isMobile={isMobile}
+                    account={activeAccount}
+                  />
+                </Suspense>
               </motion.div>
             )}
           </AnimatePresence>
@@ -363,15 +409,17 @@ export default function MailPage() {
       ) : (
         <>
           {showDetail ? (
-            <EmailDetail
-              emailId={selectedId!}
-              onBack={() => setSelectedId(null)}
-              onRefresh={handleRefresh}
-              mailboxes={mailboxes}
-              onCompose={setComposeState}
-              isMobile={isMobile}
-              account={activeAccount}
-            />
+            <Suspense fallback={null}>
+              <LazyEmailDetail
+                emailId={selectedId!}
+                onBack={() => setSelectedId(null)}
+                onRefresh={handleRefresh}
+                mailboxes={mailboxes}
+                onCompose={setComposeState}
+                isMobile={isMobile}
+                account={activeAccount}
+              />
+            </Suspense>
           ) : (
             <EmailList
               emails={emails}
@@ -401,14 +449,17 @@ export default function MailPage() {
       {/* Compose Modal */}
       <AnimatePresence>
         {composeState && (
-          <ComposeModal
-            onClose={() => setComposeState(null)}
-            onSent={handleRefresh}
-            composeState={composeState}
-            mailboxes={mailboxes}
-            isMobile={isMobile}
-            account={activeAccount}
-          />
+          <Suspense fallback={null}>
+            <LazyComposeModal
+              onClose={() => setComposeState(null)}
+              onSent={handleRefresh}
+              composeState={composeState}
+              mailboxes={mailboxes}
+              isMobile={isMobile}
+              account={activeAccount}
+              accountEmail={currentAccount?.email}
+            />
+          </Suspense>
         )}
       </AnimatePresence>
 

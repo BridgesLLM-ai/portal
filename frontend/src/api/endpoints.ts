@@ -35,8 +35,10 @@ export const appsAPI = {
     const { data } = await client.get(`/apps/${id}`);
     return data;
   },
-  create: async (payload: { name: string; description?: string }) => {
-    const { data } = await client.post('/apps', payload);
+  create: async (formData: FormData) => {
+    const { data } = await client.post('/apps', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
     return data;
   },
   update: async (id: string, payload: any) => {
@@ -70,6 +72,52 @@ export const metricsAPI = {
   },
   history: async (hours?: number): Promise<Metrics[]> => {
     const { data } = await client.get('/metrics/history', { params: { hours } });
+    return data;
+  },
+};
+
+export interface SystemStats {
+  timestamp: string;
+  hostname: string;
+  platform: string;
+  arch: string;
+  uptime: number;
+  cpu: {
+    overall: number;
+    perCore: { core: number; usage: number }[];
+  };
+  memory: {
+    total: number;
+    used: number;
+    free: number;
+    available: number;
+    buffers: number;
+    cached: number;
+    buffCache: number;
+    usagePercent: number;
+  };
+  loadAverage: {
+    '1min': number;
+    '5min': number;
+    '15min': number;
+  };
+  disk: Array<{
+    mount: string;
+    total: number;
+    used: number;
+    available: number;
+    usagePercent: number;
+  }>;
+  processes: number;
+  docker?: {
+    available: boolean;
+    containers: any[];
+  };
+}
+
+export const systemStatsAPI = {
+  latest: async (): Promise<SystemStats> => {
+    const { data } = await client.get('/system/stats');
     return data;
   },
 };
@@ -593,10 +641,8 @@ export const automationsAPI = {
 };
 
 export const skillsAPI = {
-  list: async (agentId?: string) => {
-    const params: Record<string, string> = {};
-    if (agentId) params.agent = agentId;
-    const { data } = await client.get('/skills', { params });
+  list: async () => {
+    const { data } = await client.get('/skills');
     return data;
   },
   search: async (query: string, limit = 20) => {

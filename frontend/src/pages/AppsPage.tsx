@@ -1,14 +1,10 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useDropzone } from 'react-dropzone';
-import Editor from '@monaco-editor/react';
-import { marked } from 'marked';
-import DOMPurify from 'dompurify';
 import { projectsAPI, aiAPI, alertsAPI } from '../api/endpoints';
 import { extractError, logError } from '../utils/errorHelpers';
 import ConfirmDialog from '../components/ConfirmDialog';
-import ProjectChatPanel from '../components/chat/ProjectChatPanel';
 import { useIsMobile } from '../hooks/useIsMobile';
 import MobileOverflowMenu, { MenuAction } from '../components/mobile/MobileOverflowMenu';
 import sounds from '../utils/sounds';
@@ -24,14 +20,13 @@ import {
   PanelLeftClose, PanelLeft, Command, Lock, Shield, Edit3,
   Image, Film, Music, Volume2, ZoomIn, ZoomOut, RotateCw, Mic, MicOff, Bell, GripVertical, Move, Mail, SendHorizonal
 } from 'lucide-react';
-import { Document, Page, pdfjs } from 'react-pdf';
-import 'react-pdf/dist/Page/AnnotationLayer.css';
-import 'react-pdf/dist/Page/TextLayer.css';
-
-pdfjs.GlobalWorkerOptions.workerSrc = new URL(
-  'pdfjs-dist/build/pdf.worker.min.mjs',
-  import.meta.url,
-).toString();
+const LazyMonacoEditor = lazy(() => import('../components/projects/LazyMonacoEditor'));
+const LazyProjectPdfViewer = lazy(() => import('../components/projects/ProjectPdfViewer'));
+const LazyProjectExcelViewer = lazy(() => import('../components/projects/ProjectExcelViewer'));
+const LazyProjectTextPreviewViewer = lazy(() => import('../components/projects/ProjectTextPreviewViewer'));
+const LazyProjectBinaryViewer = lazy(() => import('../components/projects/ProjectBinaryViewer'));
+const LazyMarkdownPreviewFrame = lazy(() => import('../components/projects/MarkdownPreviewFrame'));
+const LazyProjectChatPanel = lazy(() => import('../components/chat/ProjectChatPanel'));
 
 // --- Types ---
 interface TreeEntry { name: string; type: 'file' | 'directory'; path: string; size?: number; gitStatus?: string; }
@@ -46,6 +41,8 @@ interface EnhancedCommit {
 }
 interface ShareLink { id: string; token: string; isActive: boolean; isPublic: boolean; currentUses: number; maxUses: number | null; expiresAt: string | null; createdAt: string; }
 interface ActivityEntry { id: string; action: string; resource: string; resourceId?: string; severity: string; createdAt: string; }
+
+const LAST_SELECTED_PROJECT_KEY = 'projects-last-selected';
 
 // --- Helpers ---
 function getFileIcon(name: string) {
@@ -241,304 +238,6 @@ function ProjectVideoViewer({ src, name }: { src: string; name: string }) {
   );
 }
 
-function ProjectPdfViewer({ src }: { src: string }) {
-  const [numPages, setNumPages] = useState(0);
-  const [error, setError] = useState<string | null>(null);
-  const [pdfData, setPdfData] = useState<{ data: Uint8Array } | null>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [containerWidth, setContainerWidth] = useState(800);
-
-  useEffect(() => {
-    let cancelled = false;
-    fetch(src, { credentials: 'include' })
-      .then(res => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.arrayBuffer();
-      })
-      .then(buf => { if (!cancelled) setPdfData({ data: new Uint8Array(buf) }); })
-      .catch(err => { if (!cancelled) setError(err.message || 'Failed to load PDF'); });
-    return () => { cancelled = true; };
-  }, [src]);
-
-  useEffect(() => {
-    if (!containerRef.current) return;
-    const ro = new ResizeObserver(entries => {
-      for (const entry of entries) setContainerWidth(entry.contentRect.width);
-    });
-    ro.observe(containerRef.current);
-    setContainerWidth(containerRef.current.clientWidth);
-    return () => ro.disconnect();
-  }, []);
-
-  if (!pdfData && !error) {
-    return (
-      <div className="flex-1 flex items-center justify-center">
-        <Loader2 size={24} className="animate-spin text-slate-500" />
-        <span className="ml-2 text-sm text-slate-500">Loading PDF…</span>
-      </div>
-    );
-  }
-  if (error) {
-    return (
-      <div className="flex-1 flex flex-col items-center justify-center gap-2">
-        <AlertCircle size={24} className="text-red-400" />
-        <span className="text-red-400 text-sm">{error}</span>
-      </div>
-    );
-  }
-
-  return (
-    <div ref={containerRef} className="flex-1 overflow-auto bg-[#2a2a2a]">
-      <Document
-        file={pdfData}
-        onLoadSuccess={({ numPages: n }) => setNumPages(n)}
-        onLoadError={(err) => setError(err.message || 'Failed to render PDF')}
-        loading={
-          <div className="flex items-center justify-center py-12">
-            <Loader2 size={24} className="animate-spin text-slate-500" />
-            <span className="ml-2 text-sm text-slate-500">Rendering pages…</span>
-          </div>
-        }
-      >
-        {numPages > 0 && Array.from({ length: numPages }, (_, i) => (
-          <div key={i} className="flex justify-center py-2">
-            <Page
-              pageNumber={i + 1}
-              width={Math.min(containerWidth - 32, 1200)}
-              renderTextLayer={true}
-              renderAnnotationLayer={true}
-            />
-          </div>
-        ))}
-      </Document>
-      {numPages > 0 && (
-        <div className="sticky bottom-0 text-center py-2 bg-[#2a2a2a]/90 backdrop-blur-sm text-xs text-slate-500">
-          {numPages} page{numPages !== 1 ? 's' : ''}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ProjectTextPreviewViewer({ src, name }: { src: string; name: string }) {
-  const [loaded, setLoaded] = useState(false);
-  const [error, setError] = useState(false);
-
-  return (
-    <div className="flex-1 flex flex-col bg-white overflow-hidden">
-      {!loaded && !error && (
-        <div className="flex-1 flex items-center justify-center gap-3 bg-[#0a0e1a] text-slate-400">
-          <Loader2 size={22} className="animate-spin" />
-          <div className="text-sm">
-            <div className="text-slate-200">Loading preview…</div>
-            <div className="text-xs text-slate-500">This file is too large for inline editing, so it is opening read-only.</div>
-          </div>
-        </div>
-      )}
-      {error ? (
-        <div className="flex-1 flex flex-col items-center justify-center gap-3 bg-[#0a0e1a] text-slate-400">
-          <AlertCircle size={24} className="text-red-400" />
-          <div className="text-center">
-            <div className="text-sm text-slate-200">Could not load text preview</div>
-            <div className="text-xs text-slate-500">Try downloading {name} instead.</div>
-          </div>
-          <a href={src} download className="px-4 py-2 rounded-lg bg-emerald-500/20 text-emerald-300 text-sm hover:bg-emerald-500/30 inline-flex items-center gap-2">
-            <Download size={14} /> Download
-          </a>
-        </div>
-      ) : (
-        <iframe
-          title={`${name} preview`}
-          src={src}
-          className={`flex-1 w-full border-0 ${loaded ? 'block' : 'hidden'}`}
-          onLoad={() => setLoaded(true)}
-          onError={() => { setError(true); setLoaded(false); }}
-        />
-      )}
-    </div>
-  );
-}
-
-function ProjectBinaryViewer({ name, src }: { name: string; src: string }) {
-  return (
-    <div className="flex-1 flex items-center justify-center text-slate-500">
-      <div className="text-center">
-        <FileQuestion size={48} className="mx-auto mb-3 opacity-30" />
-        <p className="text-sm font-medium text-slate-300 mb-1">{name}</p>
-        <p className="text-xs mb-4">Binary file — cannot be previewed</p>
-        <a href={src} download className="px-4 py-2 rounded-lg bg-emerald-500/20 text-emerald-300 text-sm hover:bg-emerald-500/30 inline-flex items-center gap-2">
-          <Download size={14} /> Download
-        </a>
-      </div>
-    </div>
-  );
-}
-
-// ─── Excel parsing (direct import, no worker) ──────────────
-import * as XLSX from 'xlsx';
-
-const APPS_INITIAL_ROWS = 500;
-const APPS_LOAD_MORE = 500;
-
-function parseExcelBufferApps(buf: ArrayBuffer, sheetIndex: number, maxRows: number = 5000) {
-  const wb = XLSX.read(buf, { type: 'array' });
-  const sheetNames = wb.SheetNames;
-  const sheet = wb.Sheets[sheetNames[sheetIndex]];
-  const range = sheet['!ref'] ? XLSX.utils.decode_range(sheet['!ref']) : null;
-  const totalRows = range ? range.e.r + 1 : 0;
-  if (range && range.e.r >= maxRows) {
-    range.e.r = maxRows - 1;
-    sheet['!ref'] = XLSX.utils.encode_range(range);
-  }
-  const data = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' }) as any[][];
-  return { sheetNames, data, totalRows, sheetIndex };
-}
-
-function ProjectExcelViewer({ src, name }: { src: string; name: string }) {
-  const [sheetNames, setSheetNames] = useState<string[]>([]);
-  const [activeSheet, setActiveSheet] = useState(0);
-  const [data, setData] = useState<any[][]>([]);
-  const [totalRows, setTotalRows] = useState(0);
-  const [visibleRows, setVisibleRows] = useState(APPS_INITIAL_ROWS);
-  const [loading, setLoading] = useState(true);
-  const [parsing, setParsing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [fileSize, setFileSize] = useState(0);
-  const [sizeWarningAccepted, setSizeWarningAccepted] = useState(false);
-  const bufferRef = useRef<ArrayBuffer | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    async function fetchFile() {
-      try {
-        setLoading(true); setError(null);
-        const resp = await fetch(src, { credentials: 'include' });
-        const buf = await resp.arrayBuffer();
-        if (cancelled) return;
-        setFileSize(buf.byteLength);
-        if (buf.byteLength > 20 * 1024 * 1024) {
-          setError(`File is too large (${(buf.byteLength / 1024 / 1024).toFixed(1)}MB). Please download it instead.`);
-          setLoading(false); return;
-        }
-        bufferRef.current = buf;
-        if (buf.byteLength > 5 * 1024 * 1024 && !sizeWarningAccepted) { setLoading(false); return; }
-        parseSheet(buf, 0);
-      } catch (e: any) {
-        if (!cancelled) { setError(e.message); setLoading(false); }
-      }
-    }
-    fetchFile();
-    return () => { cancelled = true; };
-  }, [src, sizeWarningAccepted]);
-
-  function parseSheet(buf: ArrayBuffer, sheetIndex: number) {
-    setParsing(true); setError(null); setVisibleRows(APPS_INITIAL_ROWS);
-    try {
-      const result = parseExcelBufferApps(buf, sheetIndex, 5000);
-      setSheetNames(result.sheetNames); setData(result.data);
-      setTotalRows(result.totalRows); setActiveSheet(result.sheetIndex);
-    } catch (err: any) {
-      setError(err.message || 'Failed to parse Excel file');
-    } finally {
-      setParsing(false); setLoading(false);
-    }
-  }
-
-  function handleSheetChange(i: number) {
-    if (bufferRef.current && i !== activeSheet) parseSheet(bufferRef.current, i);
-  }
-
-  if (!loading && fileSize > 5 * 1024 * 1024 && !sizeWarningAccepted && !error) {
-    return (
-      <div className="flex-1 flex items-center justify-center bg-[#1e1e1e]">
-        <div className="text-center space-y-3 p-6 max-w-sm">
-          <AlertCircle size={32} className="text-amber-400 mx-auto" />
-          <p className="text-amber-300 text-sm font-medium">Large File Warning</p>
-          <p className="text-slate-400 text-xs">This file is {(fileSize / 1024 / 1024).toFixed(1)}MB. Previewing may be slow.</p>
-          <button onClick={() => setSizeWarningAccepted(true)}
-            className="px-4 py-1.5 text-xs bg-amber-500/20 text-amber-300 border border-amber-500/30 rounded hover:bg-amber-500/30 transition-colors">
-            Load Preview Anyway
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (loading || parsing) return (
-    <div className="flex-1 flex flex-col items-center justify-center gap-2">
-      <Loader2 size={24} className="animate-spin text-slate-500" />
-      <span className="text-xs text-slate-500">{parsing ? 'Parsing spreadsheet…' : 'Loading file…'}</span>
-    </div>
-  );
-  if (error) return (
-    <div className="flex-1 flex flex-col items-center justify-center gap-2 p-4 text-center">
-      <AlertCircle size={20} className="text-red-400" />
-      <span className="text-red-400 text-sm">{error}</span>
-    </div>
-  );
-
-  const displayData = data.slice(0, visibleRows + 1);
-  const hasMore = data.length > visibleRows + 1 || totalRows > data.length;
-
-  return (
-    <div className="flex-1 flex flex-col bg-[#1e1e1e] overflow-hidden">
-      <div className="flex items-center justify-between px-3 py-1 border-b border-white/5 bg-black/20 text-[10px] text-slate-500 shrink-0">
-        <span>{totalRows.toLocaleString()} rows · {sheetNames.length} sheet{sheetNames.length !== 1 ? 's' : ''}</span>
-        {totalRows > APPS_INITIAL_ROWS && <span className="text-amber-400/70">Showing first {Math.min(visibleRows, data.length - 1).toLocaleString()} rows</span>}
-      </div>
-      {sheetNames.length > 1 && (
-        <div className="flex items-center gap-1 px-3 py-1.5 border-b border-white/5 bg-black/30 overflow-x-auto shrink-0">
-          {sheetNames.map((sn, i) => (
-            <button key={sn} onClick={() => handleSheetChange(i)}
-              className={`px-3 py-1 text-xs rounded transition-colors whitespace-nowrap ${i === activeSheet ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'text-slate-400 hover:bg-white/10 hover:text-white'}`}>
-              {sn}
-            </button>
-          ))}
-        </div>
-      )}
-      <div className="flex-1 overflow-auto">
-        {displayData.length === 0 ? (
-          <div className="flex items-center justify-center h-full text-slate-500 text-sm">Empty sheet</div>
-        ) : (
-          <>
-            <table className="w-full text-xs text-slate-300 border-collapse">
-              <thead className="sticky top-0 z-10">
-                <tr>
-                  <th className="bg-[#2a2a2a] border border-white/10 px-2 py-1.5 text-slate-500 font-normal text-center w-10">#</th>
-                  {(displayData[0] || []).map((_: any, ci: number) => (
-                    <th key={ci} className="bg-[#2a2a2a] border border-white/10 px-3 py-1.5 text-left font-semibold text-slate-200 whitespace-nowrap">
-                      {String(displayData[0][ci] ?? '')}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {displayData.slice(1).map((row, ri) => (
-                  <tr key={ri} className="hover:bg-white/[0.03]">
-                    <td className="bg-[#252525] border border-white/10 px-2 py-1 text-slate-500 text-center tabular-nums">{ri + 2}</td>
-                    {(displayData[0] || []).map((_: any, ci: number) => (
-                      <td key={ci} className="border border-white/10 px-3 py-1 whitespace-nowrap">{String(row[ci] ?? '')}</td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {hasMore && (
-              <div className="flex items-center justify-center py-3 border-t border-white/5">
-                <button onClick={() => setVisibleRows(v => v + APPS_LOAD_MORE)}
-                  className="px-4 py-1.5 text-xs bg-white/5 text-slate-400 rounded hover:bg-white/10 hover:text-white transition-colors">
-                  Load more rows
-                </button>
-              </div>
-            )}
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// --- Agent Chat Helpers ---
 function getToolEmoji(toolName: string): string {
   const t = toolName.toLowerCase().replace(/_/g, '');
   if (t.includes('search') || t.includes('web')) return '🔍';
@@ -668,6 +367,7 @@ export default function AppsPage() {
   // Progress notification state for deploy/install flow
   const [progressNotification, setProgressNotification] = useState<ProgressNotificationProps | null>(null);
   const installEventSourceRef = useRef<EventSource | null>(null);
+  const projectRestoreAttempted = useRef(false);
 
   // Create dialog
   const [showCreate, setShowCreate] = useState(false);
@@ -810,6 +510,9 @@ export default function AppsPage() {
 
   const selectProject = async (name: string) => {
     setSelectedProject(name);
+    try {
+      localStorage.setItem(LAST_SELECTED_PROJECT_KEY, name);
+    } catch {}
     setOpenFile(null);
     setOpenMedia(null);
     setModified(false);
@@ -840,6 +543,21 @@ export default function AppsPage() {
       // Note: Node CLI detection requires checking package.json contents, handled server-side
     } catch (err) { showErrorToast(err, `Loading project "${name}"`); }
   };
+
+  useEffect(() => {
+    if (loading || selectedProject || projectRestoreAttempted.current) return;
+    projectRestoreAttempted.current = true;
+    try {
+      const lastSelected = localStorage.getItem(LAST_SELECTED_PROJECT_KEY);
+      if (!lastSelected) return;
+      const stillExists = projects.some(project => project.name === lastSelected);
+      if (!stillExists) {
+        localStorage.removeItem(LAST_SELECTED_PROJECT_KEY);
+        return;
+      }
+      void selectProject(lastSelected);
+    } catch {}
+  }, [loading, projects, selectedProject]);
 
   const refreshTree = async () => {
     if (!selectedProject) return;
@@ -1221,7 +939,10 @@ export default function AppsPage() {
         localStorage.setItem(`agent-active-${result.name}`, 'true');
         localStorage.removeItem(`agent-active-${renamingProject}`);
       }
-      if (selectedProject === renamingProject) setSelectedProject(result.name);
+      if (selectedProject === renamingProject) {
+        setSelectedProject(result.name);
+        localStorage.setItem(LAST_SELECTED_PROJECT_KEY, result.name);
+      }
       await loadProjects();
       showToast(`Renamed to "${result.name}"`);
     } catch (err) { showErrorToast(err, 'Renaming project'); }
@@ -1233,7 +954,11 @@ export default function AppsPage() {
     if (pendingDelete.kind === 'project') {
       try {
         await projectsAPI.delete(pendingDelete.name);
-        if (selectedProject === pendingDelete.name) { setSelectedProject(null); setOpenFile(null); }
+        if (selectedProject === pendingDelete.name) {
+          setSelectedProject(null);
+          setOpenFile(null);
+          localStorage.removeItem(LAST_SELECTED_PROJECT_KEY);
+        }
         await loadProjects();
         showToast('Project deleted');
       } catch (err) { showErrorToast(err, `Deleting project "${pendingDelete.name}"`); }
@@ -2138,7 +1863,8 @@ export default function AppsPage() {
 
   // Monaco editor component (reused for normal and fullscreen)
   const editorElement = openFile && (
-    <Editor
+    <Suspense fallback={<div className="h-full w-full flex items-center justify-center text-slate-500 bg-[#0a0e1a]"><Loader2 size={20} className="animate-spin" /></div>}>
+      <LazyMonacoEditor
       height="100%"
       language={openFile.language}
       value={editorContent}
@@ -2160,7 +1886,8 @@ export default function AppsPage() {
         cursorBlinking: 'smooth',
         bracketPairColorization: { enabled: true },
       }}
-    />
+      />
+    </Suspense>
   );
 
   return (
@@ -2636,10 +2363,10 @@ export default function AppsPage() {
                 {openMedia.category === 'image' && <ProjectImageViewer src={openMedia.url} name={openMedia.path.split('/').pop() || ''} />}
                 {openMedia.category === 'audio' && <ProjectAudioViewer src={openMedia.url} name={openMedia.path.split('/').pop() || ''} />}
                 {openMedia.category === 'video' && <ProjectVideoViewer src={openMedia.url} name={openMedia.path.split('/').pop() || ''} />}
-                {openMedia.category === 'pdf' && <ProjectPdfViewer src={openMedia.url} />}
-                {openMedia.category === 'excel' && <ProjectExcelViewer src={openMedia.url} name={openMedia.path.split('/').pop() || ''} />}
-                {openMedia.category === 'text' && <ProjectTextPreviewViewer src={openMedia.url} name={openMedia.path.split('/').pop() || ''} />}
-                {openMedia.category === 'binary' && <ProjectBinaryViewer name={openMedia.path.split('/').pop() || ''} src={openMedia.url} />}
+                {openMedia.category === 'pdf' && <Suspense fallback={<div className="flex-1 flex items-center justify-center text-slate-500"><Loader2 size={20} className="animate-spin" /></div>}><LazyProjectPdfViewer src={openMedia.url} /></Suspense>}
+                {openMedia.category === 'excel' && <Suspense fallback={<div className="flex-1 flex items-center justify-center text-slate-500"><Loader2 size={20} className="animate-spin" /></div>}><LazyProjectExcelViewer src={openMedia.url} name={openMedia.path.split('/').pop() || ''} /></Suspense>}
+                {openMedia.category === 'text' && <Suspense fallback={<div className="flex-1 flex items-center justify-center text-slate-500"><Loader2 size={20} className="animate-spin" /></div>}><LazyProjectTextPreviewViewer src={openMedia.url} name={openMedia.path.split('/').pop() || ''} /></Suspense>}
+                {openMedia.category === 'binary' && <Suspense fallback={<div className="flex-1 flex items-center justify-center text-slate-500"><Loader2 size={20} className="animate-spin" /></div>}><LazyProjectBinaryViewer name={openMedia.path.split('/').pop() || ''} src={openMedia.url} /></Suspense>}
               </div>
             </>
           ) : openFile ? (
@@ -2660,131 +2387,9 @@ export default function AppsPage() {
                 </div>
                 {showPreview && (
                   <div className="w-1/2 border-l border-white/5 bg-white overflow-auto">
-                    <iframe
-                      srcDoc={(() => {
-                        if (openFile.language === 'html') {
-                          return editorContent;
-                        } else if (openFile.language === 'markdown') {
-                          // Configure marked for GFM
-                          marked.setOptions({
-                            gfm: true,
-                            breaks: true,
-                          });
-                          const rawHtml = marked.parse(editorContent) as string;
-                          const safeHtml = DOMPurify.sanitize(rawHtml);
-                          
-                          return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica', 'Arial', sans-serif;
-      line-height: 1.6;
-      color: #e2e8f0;
-      background: #0a0a0a;
-      padding: 3rem;
-      max-width: 56rem;
-      margin: 0 auto;
-    }
-    h1, h2, h3, h4, h5, h6 { font-weight: 700; color: #fff; margin-top: 2rem; margin-bottom: 1rem; }
-    h1 { font-size: 2.25rem; border-bottom: 2px solid rgba(255,255,255,0.1); padding-bottom: 0.5rem; }
-    h2 { font-size: 1.875rem; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 0.5rem; margin-top: 3rem; }
-    h3 { font-size: 1.5rem; margin-top: 2rem; }
-    h4 { font-size: 1.25rem; }
-    h5 { font-size: 1.125rem; }
-    h6 { font-size: 1rem; }
-    p { margin-bottom: 1rem; color: #cbd5e1; }
-    a { color: #60a5fa; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    strong { font-weight: 600; color: #fff; }
-    em { font-style: italic; }
-    code {
-      background: rgba(255,255,255,0.05);
-      color: #34d399;
-      padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
-      font-family: 'Courier New', monospace;
-      font-size: 0.875em;
-    }
-    pre {
-      background: #0d1117;
-      border: 1px solid rgba(255,255,255,0.1);
-      border-radius: 0.5rem;
-      padding: 1rem;
-      overflow-x: auto;
-      margin: 1rem 0;
-    }
-    pre code {
-      background: none;
-      color: #e2e8f0;
-      padding: 0;
-    }
-    blockquote {
-      border-left: 4px solid rgba(96, 165, 250, 0.3);
-      background: rgba(96, 165, 250, 0.05);
-      padding: 0.5rem 1rem;
-      margin: 1rem 0;
-      font-style: normal;
-      color: #cbd5e1;
-    }
-    ul, ol { margin: 1rem 0; padding-left: 2rem; color: #cbd5e1; }
-    li { margin: 0.5rem 0; }
-    li::marker { color: #64748b; }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin: 1rem 0;
-      border: 1px solid rgba(255,255,255,0.1);
-      border-radius: 0.5rem;
-      overflow: hidden;
-    }
-    thead {
-      background: rgba(255,255,255,0.05);
-      border-bottom: 1px solid rgba(255,255,255,0.1);
-    }
-    th {
-      padding: 0.75rem 1rem;
-      text-align: left;
-      font-weight: 600;
-      color: #fff;
-    }
-    td {
-      padding: 0.75rem 1rem;
-      border-top: 1px solid rgba(255,255,255,0.05);
-    }
-    img {
-      max-width: 100%;
-      height: auto;
-      border-radius: 0.5rem;
-      border: 1px solid rgba(255,255,255,0.1);
-      margin: 1rem 0;
-    }
-    hr {
-      border: none;
-      border-top: 1px solid rgba(255,255,255,0.1);
-      margin: 2rem 0;
-    }
-    input[type="checkbox"] {
-      margin-right: 0.5rem;
-      accent-color: #34d399;
-    }
-  </style>
-</head>
-<body>
-  ${safeHtml}
-</body>
-</html>`;
-                        } else {
-                          return `<pre style="padding:16px;font-family:monospace;white-space:pre-wrap;background:#1a1a2e;color:#e2e8f0;margin:0;min-height:100vh">${editorContent.replace(/</g, '&lt;')}</pre>`;
-                        }
-                      })()}
-                      className="w-full h-full border-0"
-                      sandbox="allow-scripts"
-                      title="Preview"
-                    />
+                    <Suspense fallback={<div className="w-full h-full flex items-center justify-center text-slate-500 bg-[#0a0a0a]"><Loader2 size={20} className="animate-spin" /></div>}>
+                      <LazyMarkdownPreviewFrame language={openFile.language} content={editorContent} />
+                    </Suspense>
                   </div>
                 )}
               </div>
@@ -2795,7 +2400,7 @@ export default function AppsPage() {
                 <Rocket size={48} className="mx-auto mb-4 opacity-20" />
                 <p className="text-sm font-medium mb-1">{selectedProject ? 'Select a file to edit or preview' : 'Select or create a project'}</p>
                 <p className="text-xs text-slate-600">
-                  {selectedProject ? 'Click any file in the tree to open it' : 'Choose from the sidebar or click New'}
+                  {selectedProject ? 'Choose a file from the sidebar to open it.' : 'Choose a project from the sidebar or create a new one.'}
                 </p>
                 {selectedProject && (
                   <div className="mt-4 flex items-center justify-center gap-3 text-[10px] text-slate-600">
@@ -3421,11 +3026,13 @@ export default function AppsPage() {
         {/* Agent Chat Panel — WebSocket streaming */}
         <AnimatePresence>
           {agentChatOpen && selectedProject && (
-            <ProjectChatPanel
-              key={`project-agent-chat:${selectedProject}`}
-              projectName={selectedProject}
-              onClose={closeAgentChat}
-            />
+            <Suspense fallback={null}>
+              <LazyProjectChatPanel
+                key={`project-agent-chat:${selectedProject}`}
+                projectName={selectedProject}
+                onClose={closeAgentChat}
+              />
+            </Suspense>
           )}
         </AnimatePresence>
       </div>

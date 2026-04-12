@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Settings, Database, User, ShieldCheck, Palette, Mail, Bot, Server, Cpu,
   Save, Loader2, Eye, EyeOff, Sun, Moon, Monitor, Check, X, Send,
@@ -13,11 +14,16 @@ import client from '../api/client';
 import { gatewayAPI, type CompatibilityHotfixStatus } from '../api/endpoints';
 import { agentRuntimeAPI, AgentRuntimeStatus } from '../api/agentRuntime';
 import { authAPI, TwoFactorSetupResponse, TwoFactorStatusResponse } from '../api/auth';
-import BackupsTab from '../components/settings/BackupsTab';
-import AiProviderSetup from '../components/ai-setup/AiProviderSetup';
-import ImagePickerCropper from '../components/ImagePickerCropper';
 import sounds from '../utils/sounds';
-import { QRCodeSVG } from 'qrcode.react';
+import { DEFAULT_REGISTRATION_MODE } from '../utils/securityDefaults';
+
+const LazyBackupsTab = lazy(() => import('../components/settings/BackupsTab'));
+const LazyAiProviderSetup = lazy(() => import('../components/ai-setup/AiProviderSetup'));
+const LazyImagePickerCropper = lazy(() => import('../components/ImagePickerCropper'));
+const LazyQRCodeSVG = lazy(async () => {
+  const mod = await import('qrcode.react');
+  return { default: mod.QRCodeSVG };
+});
 
 // ── Toast system (local to settings) ──────────────────────────────────
 
@@ -62,19 +68,19 @@ interface TabDef {
   id: TabId;
   label: string;
   icon: typeof Settings;
-  adminOnly: boolean;
+  access: 'all' | 'elevated' | 'owner';
 }
 
 const allTabs: TabDef[] = [
-  { id: 'general', label: 'General', icon: Palette, adminOnly: true },
-  { id: 'email', label: 'Email', icon: Mail, adminOnly: true },
-  { id: 'security', label: 'Security', icon: ShieldCheck, adminOnly: true },
-  { id: 'agents', label: 'Agents', icon: Bot, adminOnly: true },
-  { id: 'system', label: 'System', icon: Server, adminOnly: true },
-  { id: 'ai-providers', label: 'AI Providers', icon: Cpu, adminOnly: true },
-  { id: 'readiness', label: 'Feature Readiness', icon: Wrench, adminOnly: true },
-  { id: 'backups', label: 'Backups', icon: Database, adminOnly: true },
-  { id: 'profile', label: 'Profile', icon: User, adminOnly: false },
+  { id: 'general', label: 'General', icon: Palette, access: 'owner' },
+  { id: 'email', label: 'Email', icon: Mail, access: 'owner' },
+  { id: 'security', label: 'Security', icon: ShieldCheck, access: 'owner' },
+  { id: 'agents', label: 'Agents', icon: Bot, access: 'owner' },
+  { id: 'system', label: 'System', icon: Server, access: 'owner' },
+  { id: 'ai-providers', label: 'AI Providers', icon: Cpu, access: 'owner' },
+  { id: 'readiness', label: 'Feature Readiness', icon: Wrench, access: 'elevated' },
+  { id: 'backups', label: 'Backups', icon: Database, access: 'owner' },
+  { id: 'profile', label: 'Profile', icon: User, access: 'all' },
 ];
 
 const ACCENT_PRESETS = [
@@ -130,6 +136,13 @@ function FieldLabel({ label, description }: { label: string; description?: strin
   );
 }
 
+function getSettingDraft(settings: Record<string, string>, drafts: Record<string, string>, key: string, fallback = ''): string {
+  if (Object.prototype.hasOwnProperty.call(drafts, key)) {
+    return drafts[key] ?? '';
+  }
+  return settings[key] ?? fallback;
+}
+
 function TextInput({ value, onChange, placeholder, type = 'text' }: {
   value: string; onChange: (v: string) => void; placeholder?: string; type?: string;
 }) {
@@ -170,10 +183,12 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: 
 
 // ── General Tab ───────────────────────────────────────────────────────
 
-function GeneralTab({ settings, updateSetting, setSettingValue, onSave, isDirty, addToast }: {
+function GeneralTab({ settings, draftSettings, updateSetting, setSettingValue, setDraftSettingValue, onSave, isDirty, addToast }: {
   settings: Record<string, string>;
+  draftSettings: Record<string, string>;
   updateSetting: (k: string, v: string) => void;
   setSettingValue: (k: string, v: string) => void;
+  setDraftSettingValue: (k: string, v: string) => void;
   onSave: () => void;
   isDirty: boolean;
   addToast: (type: 'success' | 'error', msg: string) => void;
@@ -215,7 +230,16 @@ function GeneralTab({ settings, updateSetting, setSettingValue, onSave, isDirty,
   }, []);
 
   useEffect(() => {
-    loadDomainStatus();
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (!cancelled) {
+        void loadDomainStatus();
+      }
+    }, 1200);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [loadDomainStatus]);
 
   const handleCheckDomainDns = async () => {
@@ -271,6 +295,20 @@ function GeneralTab({ settings, updateSetting, setSettingValue, onSave, isDirty,
     }
   };
 
+  const handleSave = () => {
+    if (!settings['appearance.portalName']?.trim()) {
+      addToast('error', 'Portal name cannot be empty');
+      return;
+    }
+
+    if (!settings['appearance.assistantName']?.trim()) {
+      addToast('error', 'Assistant display name cannot be empty');
+      return;
+    }
+
+    onSave();
+  };
+
   return (
     <div>
       <SectionCard title="Portal Identity">
@@ -278,8 +316,11 @@ function GeneralTab({ settings, updateSetting, setSettingValue, onSave, isDirty,
           <div>
             <FieldLabel label="Portal Name" description="Displayed in the header and browser tab" />
             <TextInput
-              value={settings['appearance.portalName'] || 'Bridges Portal'}
-              onChange={v => updateSetting('appearance.portalName', v)}
+              value={getSettingDraft(settings, draftSettings, 'appearance.portalName', 'Bridges Portal')}
+              onChange={v => {
+                setDraftSettingValue('appearance.portalName', v);
+                updateSetting('appearance.portalName', v);
+              }}
               placeholder="Bridges Portal"
             />
           </div>
@@ -287,7 +328,7 @@ function GeneralTab({ settings, updateSetting, setSettingValue, onSave, isDirty,
             <FieldLabel label="Portal Logo" description="Upload and crop the logo shown across the portal" />
             <div className="flex items-center gap-3">
               {settings['appearance.logoUrl'] ? <img src={settings['appearance.logoUrl']} alt="Portal logo" className="w-10 h-10 rounded-lg object-cover border border-white/10" /> : <div className="w-10 h-10 rounded-lg bg-white/5 border border-white/10" />}
-              <button onClick={() => setLogoEditorOpen(true)} className="px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-sm text-slate-200 hover:bg-white/[0.08]">Upload / Crop</button>
+              <button onClick={() => setLogoEditorOpen(true)} className="px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-sm text-slate-200 hover:bg-white/[0.08]">Upload and Crop</button>
             </div>
             <div className="mt-2">
               <TextInput
@@ -320,8 +361,11 @@ function GeneralTab({ settings, updateSetting, setSettingValue, onSave, isDirty,
           <div>
             <FieldLabel label="Assistant Display Name" description="Shown in chat and sidebar identity areas" />
             <TextInput
-              value={settings['appearance.assistantName'] || 'Assistant'}
-              onChange={v => updateSetting('appearance.assistantName', v)}
+              value={getSettingDraft(settings, draftSettings, 'appearance.assistantName', 'Assistant')}
+              onChange={v => {
+                setDraftSettingValue('appearance.assistantName', v);
+                updateSetting('appearance.assistantName', v);
+              }}
               placeholder="Assistant"
             />
           </div>
@@ -347,35 +391,39 @@ function GeneralTab({ settings, updateSetting, setSettingValue, onSave, isDirty,
             </div>
           </div>
 
-          <ImagePickerCropper
-            isOpen={logoEditorOpen}
-            onClose={() => setLogoEditorOpen(false)}
-            onSaved={(url) => updateSetting('appearance.logoUrl', url ? url.split('?')[0] : '')}
-            currentImageUrl={settings['appearance.logoUrl'] || null}
-            uploadEndpoint="/admin/appearance/logo"
-            deleteEndpoint="/admin/appearance/logo"
-            fieldName="image"
-            title="Edit Portal Logo"
-            shape="square"
-            responseKey="logoUrl"
-          />
+          <Suspense fallback={null}>
+            <LazyImagePickerCropper
+              isOpen={logoEditorOpen}
+              onClose={() => setLogoEditorOpen(false)}
+              onSaved={(url) => updateSetting('appearance.logoUrl', url ? url.split('?')[0] : '')}
+              currentImageUrl={settings['appearance.logoUrl'] || null}
+              uploadEndpoint="/admin/appearance/logo"
+              deleteEndpoint="/admin/appearance/logo"
+              fieldName="image"
+              title="Edit Portal Logo"
+              shape="square"
+              responseKey="logoUrl"
+            />
+          </Suspense>
 
           {agentEditorOpen && (
-            <ImagePickerCropper
-              isOpen={Boolean(agentEditorOpen)}
-              onClose={() => setAgentEditorOpen(null)}
-              onSaved={(url) => {
-                if (!agentEditorOpen) return;
-                updateSetting(`appearance.agentAvatar.${agentEditorOpen}`, url ? url.split('?')[0] : '');
-              }}
-              currentImageUrl={settings[`appearance.agentAvatar.${agentEditorOpen}`] || null}
-              uploadEndpoint={`/admin/appearance/agent-avatar/${agentEditorOpen}`}
-              deleteEndpoint={`/admin/appearance/agent-avatar/${agentEditorOpen}`}
-              fieldName="image"
-              title={`Edit ${agentEditorOpen.replace('_CODE', '')} Avatar`}
-              shape="circle"
-              responseKey="avatarUrl"
-            />
+            <Suspense fallback={null}>
+              <LazyImagePickerCropper
+                isOpen={Boolean(agentEditorOpen)}
+                onClose={() => setAgentEditorOpen(null)}
+                onSaved={(url) => {
+                  if (!agentEditorOpen) return;
+                  updateSetting(`appearance.agentAvatar.${agentEditorOpen}`, url ? url.split('?')[0] : '');
+                }}
+                currentImageUrl={settings[`appearance.agentAvatar.${agentEditorOpen}`] || null}
+                uploadEndpoint={`/admin/appearance/agent-avatar/${agentEditorOpen}`}
+                deleteEndpoint={`/admin/appearance/agent-avatar/${agentEditorOpen}`}
+                fieldName="image"
+                title={`Edit ${agentEditorOpen.replace('_CODE', '')} Avatar`}
+                shape="circle"
+                responseKey="avatarUrl"
+              />
+            </Suspense>
           )}
 
         </div>
@@ -502,7 +550,7 @@ function GeneralTab({ settings, updateSetting, setSettingValue, onSave, isDirty,
       </SectionCard>
 
       <div className="flex justify-end">
-        <SaveButton onClick={onSave} isDirty={isDirty} />
+        <SaveButton onClick={handleSave} isDirty={isDirty} />
       </div>
     </div>
   );
@@ -766,11 +814,11 @@ function SecurityTab({ settings, updateSetting, onSave, isDirty, addToast }: {
                   key={mode}
                   onClick={() => updateSetting('security.registrationMode', mode)}
                   className={`px-4 py-2 rounded-lg text-sm font-medium capitalize transition-all border ${
-                    (settings['security.registrationMode'] || settings['registrationMode'] || 'approval') === mode
+                    (settings['security.registrationMode'] || settings['registrationMode'] || DEFAULT_REGISTRATION_MODE) === mode
                       ? ''
                       : 'text-slate-400 bg-white/[0.03] border-white/[0.06] hover:bg-white/[0.06]'
                   }`}
-                  style={(settings['security.registrationMode'] || settings['registrationMode'] || 'approval') === mode ? {
+                  style={(settings['security.registrationMode'] || settings['registrationMode'] || DEFAULT_REGISTRATION_MODE) === mode ? {
                     background: 'var(--accent-bg)',
                     color: 'var(--accent)',
                     borderColor: 'var(--accent-border)',
@@ -895,7 +943,9 @@ function AgentsTab({ settings, updateSetting, onSave, isDirty }: {
           <p className="text-sm text-slate-400">
             Connect cloud providers, complete remote sign-in flows, and choose which models are available to your agents.
           </p>
-          <AiProviderSetup mode="settings" apiBase="/ai-setup" />
+          <Suspense fallback={null}>
+            <LazyAiProviderSetup mode="settings" apiBase="/ai-setup" />
+          </Suspense>
         </div>
       </SectionCard>
 
@@ -1296,9 +1346,10 @@ function SystemTab({ settings, updateSetting, onSave, isDirty, addToast }: {
                   <button
                     onClick={handleApplyCompatibilityHotfix}
                     disabled={compatHotfixApplying || !compatHotfixStatus.supported}
-                    className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-black hover:bg-amber-400 disabled:opacity-50"
+                    className="inline-flex min-h-[40px] items-center gap-2 rounded-xl border border-amber-200/70 bg-gradient-to-r from-amber-300 via-amber-400 to-amber-500 px-4 py-2 text-sm font-semibold text-slate-950 shadow-[0_10px_24px_rgba(245,158,11,0.28)] transition-all hover:-translate-y-0.5 hover:from-amber-200 hover:via-amber-300 hover:to-amber-400 hover:shadow-[0_14px_28px_rgba(245,158,11,0.36)] focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-200/90 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0A0E27] disabled:translate-y-0 disabled:cursor-not-allowed disabled:border-white/[0.08] disabled:bg-white/[0.06] disabled:bg-none disabled:text-slate-500 disabled:shadow-none"
                   >
-                    {compatHotfixApplying ? 'Applying + restarting…' : compatHotfixStatus.applied ? 'Reapply hotfix + restart' : 'Apply hotfix + restart'}
+                    {compatHotfixApplying ? <Loader2 size={15} className="animate-spin" /> : <Wrench size={15} />}
+                    <span>{compatHotfixApplying ? 'Applying and restarting…' : compatHotfixStatus.applied ? 'Reapply and restart' : 'Apply and restart'}</span>
                   </button>
                 </div>
               </>
@@ -2153,7 +2204,9 @@ function TwoFactorSection({ addToast }: { addToast: (type: 'success' | 'error', 
           </p>
           <div className="flex justify-center py-4">
             <div className="p-4 bg-white rounded-xl">
-              <QRCodeSVG value={setupData.otpauthUrl!} size={180} />
+              <Suspense fallback={<div className="h-[180px] w-[180px] rounded bg-slate-100 dark:bg-white/5" />}>
+                <LazyQRCodeSVG value={setupData.otpauthUrl!} size={180} />
+              </Suspense>
             </div>
           </div>
           <div className="space-y-2">
@@ -2381,7 +2434,8 @@ function TwoFactorSection({ addToast }: { addToast: (type: 'success' | 'error', 
 }
 
 function ProfileTab({ addToast }: { addToast: (type: 'success' | 'error', msg: string) => void }) {
-  const { user } = useAuthStore();
+  const { user, silentLogout } = useAuthStore();
+  const navigate = useNavigate();
   const [username, setUsername] = useState(user?.username || '');
   const [email, setEmail] = useState(user?.email || '');
   const [profileDirty, setProfileDirty] = useState(false);
@@ -2431,8 +2485,10 @@ function ProfileTab({ addToast }: { addToast: (type: 'success' | 'error', msg: s
       setCurrentPassword('');
       setNewPassword('');
       setConfirmPassword('');
+      silentLogout();
       sounds.success();
-      addToast('success', 'Password changed successfully');
+      navigate('/login?password=changed', { replace: true });
+      return;
     } catch (err: any) {
       sounds.error();
       addToast('error', err.response?.data?.error || 'Failed to change password');
@@ -2623,12 +2679,19 @@ export default function SettingsPage() {
   const { user } = useAuthStore();
   const isAdmin = isElevated(user);
   const isOwner = isOwnerRole(user?.role);
-  const tabs = allTabs.filter(t => !t.adminOnly || isOwner);
-  const [activeTab, setActiveTab] = useState<TabId>(isOwner ? 'general' : 'profile');
+  const tabs = allTabs.filter((tab) => {
+    if (tab.access === 'all') return true;
+    if (tab.access === 'elevated') return isAdmin;
+    return isOwner;
+  });
+  const defaultTab: TabId = isOwner ? 'general' : isAdmin ? 'readiness' : 'profile';
+  const [activeTab, setActiveTab] = useState<TabId>(defaultTab);
   const { toasts, add: addToast } = useToasts();
 
   // Admin settings state
   const [settings, setSettings] = useState<Record<string, string>>({});
+  const [draftSettings, setDraftSettings] = useState<Record<string, string>>({});
+  const draftSettingsRef = useRef<Record<string, string>>({});
   const [settingsLoading, setSettingsLoading] = useState(false);
 
   // Track dirty state per tab
@@ -2646,13 +2709,31 @@ export default function SettingsPage() {
     });
   }, []);
 
+  useEffect(() => {
+    draftSettingsRef.current = draftSettings;
+  }, [draftSettings]);
+
+  useEffect(() => {
+    if (!tabs.some((tab) => tab.id === activeTab)) {
+      setActiveTab(defaultTab);
+    }
+  }, [activeTab, defaultTab, tabs]);
+
   // Load admin settings
   useEffect(() => {
     if (!isOwner) return;
     setSettingsLoading(true);
     adminAPI.getSettings()
       .then(data => {
-        setSettings(data);
+        setSettings((prev) => {
+          const next = { ...data };
+          for (const key of Object.keys(draftSettingsRef.current)) {
+            if (Object.prototype.hasOwnProperty.call(prev, key)) {
+              next[key] = prev[key];
+            }
+          }
+          return next;
+        });
       })
       .catch(() => addToast('error', 'Failed to load settings'))
       .finally(() => setSettingsLoading(false));
@@ -2666,6 +2747,13 @@ export default function SettingsPage() {
       }
       const updated = await adminAPI.updateSettings(payload);
       setSettings(prev => ({ ...prev, ...updated }));
+      setDraftSettings((prev) => {
+        const next = { ...prev };
+        for (const key of keys) {
+          delete next[key];
+        }
+        return next;
+      });
       markClean(tab);
       sounds.success();
       addToast('success', 'Settings saved');
@@ -2682,6 +2770,10 @@ export default function SettingsPage() {
 
   const setSettingValue = useCallback((key: string, value: string) => {
     setSettings(prev => ({ ...prev, [key]: value }));
+  }, []);
+
+  const setDraftSettingValue = useCallback((key: string, value: string) => {
+    setDraftSettings(prev => ({ ...prev, [key]: value }));
   }, []);
 
   return (
@@ -2736,8 +2828,10 @@ export default function SettingsPage() {
               {activeTab === 'general' && (
                 <GeneralTab
                   settings={settings}
+                  draftSettings={draftSettings}
                   updateSetting={(k, v) => updateSetting(k, v, 'general')}
                   setSettingValue={setSettingValue}
+                  setDraftSettingValue={setDraftSettingValue}
                   onSave={() => saveSettings([
                     'appearance.portalName', 'appearance.logoUrl', 'appearance.assistantName',
                     'appearance.agentAvatar.OPENCLAW', 'appearance.agentAvatar.CLAUDE_CODE', 'appearance.agentAvatar.CODEX',
@@ -2800,7 +2894,9 @@ export default function SettingsPage() {
               )}
               {activeTab === 'ai-providers' && (
                 <div className="space-y-5">
-                  <AiProviderSetup mode="settings" apiBase="/ai-setup" />
+                  <Suspense fallback={null}>
+                    <LazyAiProviderSetup mode="settings" apiBase="/ai-setup" />
+                  </Suspense>
                   <SectionCard title="Local Models (Ollama)">
                     <OllamaTab
                       settings={settings}
@@ -2818,12 +2914,14 @@ export default function SettingsPage() {
               )}
               {activeTab === 'readiness' && <FeatureReadinessTab />}
               {activeTab === 'backups' && (
-                <BackupsTab
-                  backupPath={settings['system.backupPath'] || '/opt/bridgesllm/backups'}
-                  onBackupPathChange={(v) => updateSetting('system.backupPath', v, 'backups')}
-                  onSaveBackupPath={() => saveSettings(['system.backupPath'], 'backups')}
-                  backupPathDirty={dirtyTabs.has('backups')}
-                />
+                <Suspense fallback={null}>
+                  <LazyBackupsTab
+                    backupPath={settings['system.backupPath'] || '/opt/bridgesllm/backups'}
+                    onBackupPathChange={(v) => updateSetting('system.backupPath', v, 'backups')}
+                    onSaveBackupPath={() => saveSettings(['system.backupPath'], 'backups')}
+                    backupPathDirty={dirtyTabs.has('backups')}
+                  />
+                </Suspense>
               )}
               {activeTab === 'profile' && <ProfileTab addToast={addToast} />}
             </>

@@ -426,6 +426,22 @@ function extractText(content: any): string {
   return extractSanitizedText(content);
 }
 
+function isHiddenHistoryArtifactText(text: string): boolean {
+  const normalized = String(text || '').trim();
+  if (!normalized) return false;
+
+  return [
+    /^System \(untrusted\):/i,
+    /^An async command you ran earlier has completed\./i,
+    /^Read HEARTBEAT\.md if it exists/i,
+    /^HEARTBEAT_OK$/i,
+    /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i,
+    /Handle the result internally\./i,
+    /Sender \(untrusted metadata\):/i,
+    /Conversation info \(untrusted metadata\):/i,
+  ].some((pattern) => pattern.test(normalized));
+}
+
 function humanizeSessionKey(sessionKey: string, sessionId: string): string {
   if (sessionKey === 'agent:main:main' || sessionId === 'main') return 'Main session';
 
@@ -753,7 +769,8 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
 
         if (role === 'user') {
           const text = extractText(content);
-          return text ? { id: entry.id, role: 'user', content: text, timestamp: entry.timestamp } : null;
+          if (!text || isHiddenHistoryArtifactText(text)) return null;
+          return { id: entry.id, role: 'user', content: text, timestamp: entry.timestamp };
         }
 
         if (role === 'assistant') {
@@ -785,7 +802,7 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
                 const position = !lastToolSeen ? 'before' : 
                                  (toolCount === toolCalls.length ? 'after' : 'between');
                 const segmentText = extractSanitizedText(block.text);
-                if (segmentText) {
+                if (segmentText && !isHiddenHistoryArtifactText(segmentText)) {
                   segments.push({ text: segmentText, position });
                 }
               }
@@ -797,7 +814,7 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
               .map(b => b.text!)
               .join('\n');
             const text = extractSanitizedText(allText);
-            if (!text || isControlOnlyAssistantText(text)) return null;
+            if (!text || isControlOnlyAssistantText(text) || isHiddenHistoryArtifactText(text)) return null;
 
             return {
               id: entry.id,
@@ -812,7 +829,7 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
           }
 
           const text = extractText(content);
-          if (!text || isControlOnlyAssistantText(text)) return null;
+          if (!text || isControlOnlyAssistantText(text) || isHiddenHistoryArtifactText(text)) return null;
           return { id: entry.id, role: 'assistant', content: text, model: executedModel, timestamp: entry.timestamp };
         }
 
@@ -1321,8 +1338,36 @@ async function fetchTasksSnapshot() {
     return kind === 'subagent' || kind === 'cron' || key.includes(':subagent:') || key.includes(':cron:');
   });
 
-  const tasks = taskSessions.map((s: any) => ({
-    id: s.key || s.sessionKey || s.id || 'unknown',
+  const collapseKeyForTaskSession = (session: any) => {
+    const key = String(session?.key || session?.sessionKey || '');
+    const cronRunMatch = key.match(/^(agent:[^:]+:cron:[^:]+):run:[^:]+$/);
+    if (cronRunMatch) return cronRunMatch[1];
+    return key;
+  };
+
+  const collapsedTaskSessions = new Map<string, any>();
+  for (const session of taskSessions) {
+    const collapseKey = collapseKeyForTaskSession(session);
+    const existing = collapsedTaskSessions.get(collapseKey);
+    if (!existing) {
+      collapsedTaskSessions.set(collapseKey, session);
+      continue;
+    }
+
+    const existingStatus = String(existing?.status || '').toLowerCase();
+    const sessionStatus = String(session?.status || '').toLowerCase();
+    const existingRunning = !existing?.endedAt && existingStatus !== 'done' && existingStatus !== 'error';
+    const sessionRunning = !session?.endedAt && sessionStatus !== 'done' && sessionStatus !== 'error';
+    const existingTime = Number(existing?.endedAt || existing?.updatedAt || existing?.startedAt || 0);
+    const sessionTime = Number(session?.endedAt || session?.updatedAt || session?.startedAt || 0);
+
+    if ((!existingRunning && sessionRunning) || (existingRunning === sessionRunning && sessionTime >= existingTime)) {
+      collapsedTaskSessions.set(collapseKey, session);
+    }
+  }
+
+  const tasks = Array.from(collapsedTaskSessions.values()).map((s: any) => ({
+    id: collapseKeyForTaskSession(s) || s.key || s.sessionKey || s.id || 'unknown',
     name: s.displayName || s.origin?.label || s.key?.split(':').pop() || 'Task',
     status: s.status === 'done' ? 'done' : s.status === 'error' ? 'failed' : s.endedAt ? 'done' : 'running',
     model: normalizeGatewayModelId(s.model) || s.modelProvider || 'unknown',
@@ -1347,7 +1392,7 @@ async function fetchTasksSnapshot() {
 }
 
 // GET /api/gateway/tasks — Query OpenClaw gateway for task/subagent state
-router.get('/tasks', authenticateToken, requireApproved, async (_req: Request, res: Response) => {
+router.get('/tasks', requireAdmin, async (_req: Request, res: Response) => {
   const now = Date.now();
   if (tasksRouteCache && now - tasksRouteCache.at < TASKS_ROUTE_CACHE_TTL_MS) {
     res.json(tasksRouteCache.payload);
@@ -1882,15 +1927,19 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
       ? (() => {
           const info = streamEventBus.getStreamStatus(sessionKey);
           if (!info) return { active: false };
+          const latestText = info.phase === 'streaming'
+            ? (info.latestText || streamEventBus.getLatestText(sessionKey) || '')
+            : '';
           return {
             active: true,
             phase: info.phase,
             toolName: info.toolName || null,
+            toolCalls: Array.isArray(info.toolCalls) ? info.toolCalls : [],
             statusText: info.statusText || null,
             provenance: info.provenance || null,
             model: info.model || null,
             compactionPhase: info.compactionPhase || 'idle',
-            content: info.latestText || streamEventBus.getLatestText(sessionKey) || '',
+            content: latestText,
             runId: info.runId || null,
           };
         })()
@@ -2069,9 +2118,29 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         });
 
         let sawTerminalEvent = false;
+        const deniedApprovalIds = new Set<string>();
         streamUnsub = streamEventBus.subscribe(sessionId, (evt: StreamEvent) => {
           if (!sseAlive || sseFinished) return;
           gotRealStatus = true;
+          const runtimeEvt = evt as any;
+          if (runtimeEvt.type === 'exec_approval' && runtimeEvt.approval) {
+            const approval = runtimeEvt.approval as ExecApprovalRequest;
+            if (!isElevatedRole(req.user?.role)) {
+              if (approval?.id && !deniedApprovalIds.has(approval.id)) {
+                deniedApprovalIds.add(approval.id);
+                void denyExecApprovalForUnauthorizedUser(approval, req.user);
+              }
+              try {
+                sseWrite(`data: ${JSON.stringify({
+                  type: 'status',
+                  content: 'Command approval is only available to portal admins. This request was denied automatically.',
+                })}\n\n`);
+              } catch {
+                sseAlive = false;
+              }
+              return;
+            }
+          }
           try {
             sseWrite(`data: ${JSON.stringify(evt)}\n\n`);
           } catch {
@@ -2292,11 +2361,17 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
   }
   const info = streamEventBus.getStreamStatus(sessionKey);
   if (info) {
-    // Double-check: if last event was >90s ago, the stream is probably stale
-    // (e.g., done event was missed). Report inactive to avoid stuck UI.
+    // Long-running tool/research/codegen work can legitimately go quiet for a while.
+    // Keep tool/thinking snapshots alive much longer than text streaming so the UI
+    // does not hide the rail mid-run just because the agent is busy.
     const lastEvent = (info as any).lastEventAt || info.startedAt;
-    if (lastEvent && (Date.now() - lastEvent) > 180_000) {
-      debugLog(`[stream-status] StreamEventBus has entry but lastEvent=${new Date(lastEvent).toISOString()} is stale — reporting inactive`);
+    const staleCutoffMs = info.phase === 'tool'
+      ? 15 * 60_000
+      : info.phase === 'thinking'
+        ? 10 * 60_000
+        : 180_000;
+    if (lastEvent && (Date.now() - lastEvent) > staleCutoffMs) {
+      debugLog(`[stream-status] StreamEventBus has entry but lastEvent=${new Date(lastEvent).toISOString()} exceeded cutoff=${staleCutoffMs}ms for phase=${info.phase} — reporting inactive`);
       streamEventBus.clearStream(sessionKey);
       res.json({ active: false });
       return;
@@ -2308,6 +2383,7 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
       active: true,
       phase: info.phase,
       toolName: info.toolName || null,
+      toolCalls: Array.isArray(info.toolCalls) ? info.toolCalls : [],
       statusText: info.statusText || null,
       provenance: info.provenance || null,
       model: info.model || null,
@@ -2316,6 +2392,7 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
       runId: info.runId || null,
       content: content || undefined,
       lastEventAt: lastEvent,
+      staleAfterMs: staleCutoffMs,
     });
   } else {
     // StreamEventBus has no active stream — but the gateway might still be running
@@ -2476,15 +2553,13 @@ function initApprovalWsBroadcast() {
     for (const c of portalWsClients) {
       if (c.readyState !== WebSocket.OPEN) continue;
       const user = (c as any).__portalUser as JwtPayload | undefined;
-      if (!user) continue;
+      if (!user || !isElevatedRole(user.role)) continue;
       if (sessionKey) {
         try {
           assertGatewaySessionAccess(sessionKey, user);
         } catch {
           continue;
         }
-      } else if (!isElevatedRole(user.role)) {
-        continue;
       }
       try { c.send(msg); } catch {}
     }
@@ -2534,6 +2609,7 @@ function attachBrowserWsToSessionStream(params: {
   sendResume?: boolean;
   keepSubscriptionAfterDone?: boolean;
   onEvent?: (evt: StreamEvent) => void;
+  shouldForwardEvent?: (evt: StreamEvent) => boolean;
 }): boolean {
   const {
     ws,
@@ -2542,6 +2618,7 @@ function attachBrowserWsToSessionStream(params: {
     sendResume = false,
     keepSubscriptionAfterDone = true,
     onEvent,
+    shouldForwardEvent,
   } = params;
 
   const status = streamInfo ?? streamEventBus.getTrackedStream(sessionKey);
@@ -2564,6 +2641,9 @@ function attachBrowserWsToSessionStream(params: {
   let unsubscribed = false;
   const unsub = streamEventBus.subscribe(sessionKey, (evt: StreamEvent) => {
     onEvent?.(evt);
+    if (shouldForwardEvent?.(evt) === false) {
+      return;
+    }
     wsSend(ws, { ...evt, sessionKey });
     if (evt.type === 'error') {
       runWsStreamCleanup(ws, sessionKey);
@@ -2784,12 +2864,27 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       // the agent resumes with a NEW runId when the sub-agent completes. If we
       // unsubscribe on 'done', the resumed run's events are never forwarded.
       // The subscription stays alive until the browser WS closes.
+      const deniedApprovalIds = new Set<string>();
       attachBrowserWsToSessionStream({
         ws,
         sessionKey: sessionId,
         keepSubscriptionAfterDone: true,
         onEvent: (evt: StreamEvent) => {
         gotRealStatus = true;
+        const runtimeEvt = evt as any;
+        if (runtimeEvt.type === 'exec_approval' && runtimeEvt.approval && !isElevatedRole(user.role)) {
+          const approval = runtimeEvt.approval as ExecApprovalRequest;
+          if (approval?.id && !deniedApprovalIds.has(approval.id)) {
+            deniedApprovalIds.add(approval.id);
+            void denyExecApprovalForUnauthorizedUser(approval, user);
+          }
+          wsSend(ws, {
+            type: 'status',
+            content: 'Command approval is only available to portal admins. This request was denied automatically.',
+            sessionKey: sessionId,
+          });
+          return;
+        }
         if (evt.type === 'done') {
           // Stop keepalive during idle gap, but do NOT unsub — agent may resume
           if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
@@ -2807,6 +2902,10 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
           // Hard error — clean up fully
           if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
         }
+        },
+        shouldForwardEvent: (evt: StreamEvent) => {
+          const runtimeEvt = evt as any;
+          return !(runtimeEvt.type === 'exec_approval' && !isElevatedRole(user.role));
         },
       });
 
@@ -2963,6 +3062,18 @@ async function handleWsExecApproval(ws: WebSocket, msg: any, user?: JwtPayload) 
  * When a browser WS reconnects after a disconnect, it sends { type: 'reconnect', session }
  * to re-subscribe to an active stream.
  */
+async function denyExecApprovalForUnauthorizedUser(approval: ExecApprovalRequest, user?: JwtPayload): Promise<void> {
+  if (!approval?.id || !user || isElevatedRole(user.role)) return;
+  try {
+    const result = await sendApprovalDecision(approval.id, 'deny');
+    if (!result.ok) {
+      console.warn(`[gateway] Failed to auto-deny exec approval ${approval.id} for unauthorized user ${user.userId}: ${result.error || 'unknown error'}`);
+    }
+  } catch (err: any) {
+    console.warn(`[gateway] Failed to auto-deny exec approval ${approval.id} for unauthorized user ${user.userId}: ${err?.message || String(err)}`);
+  }
+}
+
 function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtPayload): void {
   const sessionKey = resolveOpenClawSessionKey(msg.session, user);
   if (!sessionKey) {
@@ -3087,8 +3198,14 @@ const ALLOWED_GATEWAY_METHODS = new Set([
   'chat.send',
   'chat.abort',
   'chat.history',
-  'chat.inject',
 ]);
+
+function isDirectGatewayMethodAllowed(method: unknown, user: JwtPayload): boolean {
+  if (typeof method !== 'string') return false;
+  if (ALLOWED_GATEWAY_METHODS.has(method)) return true;
+  if (method === 'chat.inject') return isElevatedRole(user.role);
+  return false;
+}
 
 /**
  * Handle a direct WebSocket proxy connection.
@@ -3267,8 +3384,9 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       return;
     }
 
-    // Enforce method allowlist — reject anything not explicitly allowed
-    if (frame.type === 'req' && frame.method && !ALLOWED_GATEWAY_METHODS.has(frame.method)) {
+    // Enforce method allowlist — reject anything not explicitly allowed for this user.
+    // chat.inject stays admin-only to match the portal WS/HTTP injection paths.
+    if (frame.type === 'req' && frame.method && !isDirectGatewayMethodAllowed(frame.method, user)) {
       browserWs.send(JSON.stringify({
         type: 'res',
         id: frame.id,

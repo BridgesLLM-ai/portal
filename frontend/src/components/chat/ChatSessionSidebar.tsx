@@ -8,6 +8,7 @@ import { useState, useEffect } from 'react';
 import { Plus, MessageSquare, RefreshCw } from 'lucide-react';
 import { motion } from 'framer-motion';
 import client from '../../api/client';
+import { useAuthStore } from '../../contexts/AuthContext';
 
 interface SessionInfo {
   key?: string;
@@ -94,15 +95,24 @@ export default function ChatSessionSidebar({
   onNewChat,
   provider,
 }: ChatSessionSidebarProps) {
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [loading, setLoading] = useState(true);
 
   const fetchSessions = async () => {
+    if (!isAuthenticated) {
+      setSessions([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
       const params: Record<string, string> = {};
       if (provider) params.provider = provider;
-      const { data } = await client.get('/gateway/sessions', { params });
+      const { data } = await client.get('/gateway/sessions', {
+        params,
+        _silent: true,
+      } as any);
       const list = data.sessions || [];
       setSessions(Array.isArray(list) ? list : Object.values(list));
     } catch {
@@ -114,7 +124,7 @@ export default function ChatSessionSidebar({
 
   useEffect(() => {
     fetchSessions();
-  }, [provider]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [provider, isAuthenticated]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const getSessionId = (s: SessionInfo) => s.key || s.sessionId || s.id || '';
 

@@ -9,6 +9,7 @@ import {
   ChevronLeft, ChevronRight, Search, Loader2
 } from 'lucide-react';
 import sounds from '../utils/sounds';
+import { DEFAULT_REGISTRATION_MODE } from '../utils/securityDefaults';
 
 type Tab = 'users' | 'pending' | 'settings';
 
@@ -40,7 +41,7 @@ export default function AdminPage() {
         </div>
         <div>
           <h1 className="text-xl font-bold text-white">Admin Panel</h1>
-          <p className="text-xs text-slate-400">Manage users, approvals, and system settings</p>
+          <p className="text-xs text-slate-400">Manage users, approvals, and access controls</p>
         </div>
       </div>
 
@@ -501,7 +502,7 @@ function SettingsTab() {
             <label
               key={opt.value}
               className={`flex items-start gap-3 p-3 rounded-lg cursor-pointer transition-colors border
-                ${((settings['security.registrationMode'] || settings.registrationMode || 'closed')) === opt.value
+                ${((settings['security.registrationMode'] || settings.registrationMode || DEFAULT_REGISTRATION_MODE)) === opt.value
                   ? 'bg-emerald-500/5 border-emerald-500/20'
                   : 'bg-white/[0.02] border-white/5 hover:border-white/10'
                 }`}
@@ -510,7 +511,7 @@ function SettingsTab() {
                 type="radio"
                 name="registrationMode"
                 value={opt.value}
-                checked={((settings['security.registrationMode'] || settings.registrationMode || 'closed')) === opt.value}
+                checked={((settings['security.registrationMode'] || settings.registrationMode || DEFAULT_REGISTRATION_MODE)) === opt.value}
                 onChange={() => setSettings(s => ({ ...s, registrationMode: opt.value, 'security.registrationMode': opt.value }))}
                 className="mt-0.5 accent-emerald-500"
               />

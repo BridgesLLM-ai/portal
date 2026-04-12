@@ -3,13 +3,14 @@ import path from 'path';
 import fs from 'fs';
 import { spawn } from 'child_process';
 import jwt from 'jsonwebtoken';
-import { authenticateToken, requireAdmin } from '../middleware/auth';
+import { authenticateToken } from '../middleware/auth';
+import { requireOwner } from '../middleware/requireAdmin';
 import { prisma } from '../config/database';
 import { config } from '../config/env';
 
 const router = Router();
 
-router.use(authenticateToken, requireAdmin);
+router.use(authenticateToken, requireOwner);
 
 const BACKUP_DIRS: Record<string, string> = {
   daily: '/root/backups/daily',

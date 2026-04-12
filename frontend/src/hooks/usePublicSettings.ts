@@ -6,8 +6,6 @@ export interface PublicSettings {
   logoUrl?: string;
   theme?: 'dark' | 'light' | 'system';
   accentColor?: string;
-  defaultOpenClawAgentId?: string;
-  visibleBrowserOpenClawAgentId?: string;
   useDirectGateway?: boolean;
   agentAvatars?: Record<string, string>;
   subAgentAvatars?: Record<string, string>;

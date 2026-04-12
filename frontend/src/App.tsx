@@ -8,8 +8,6 @@ import { usePublicSettings } from './hooks/usePublicSettings';
 import Layout from './components/Layout';
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
-import FilesPage from './pages/FilesPage';
-import AgentChatPage from './pages/AgentChatPage';
 import SetupWizardPage from './pages/SetupWizardPage';
 import LandingPage from './pages/LandingPage';
 import DocsPage from './pages/DocsPage';
@@ -17,16 +15,32 @@ import ForgotPasswordPage from './pages/ForgotPasswordPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
 
 const DesktopPage = lazy(() => import('./pages/DesktopPage'));
+const AppsLibraryPage = lazy(() => import('./pages/AppsLibraryPage'));
 const AppsPage = lazy(() => import('./pages/AppsPage'));
+const FilesPage = lazy(() => import('./pages/FilesPage'));
+const AgentChatPage = lazy(() => import('./pages/AgentChatPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const AdminPage = lazy(() => import('./pages/AdminPage'));
 const MailPage = lazy(() => import('./pages/MailPage'));
 const AgentToolsPage = lazy(() => import('./pages/AgentToolsPage'));
 const TasksPage = lazy(() => import('./pages/TasksPage'));
 
+function buildLoginRedirectTarget(location: ReturnType<typeof useLocation>) {
+  const target = `${location.pathname}${location.search}${location.hash}`;
+  if (!target || target === '/' || target === '/login') {
+    return '/login';
+  }
+  return `/login?redirect=${encodeURIComponent(target)}`;
+}
+
+function LoginRedirect() {
+  const location = useLocation();
+  return <Navigate to={buildLoginRedirectTarget(location)} replace />;
+}
+
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuthStore();
-  return isAuthenticated ? <>{children}</> : <Navigate to="/login" replace />;
+  return isAuthenticated ? <>{children}</> : <LoginRedirect />;
 }
 
 function InteractiveRoute({ children }: { children: React.ReactNode }) {
@@ -41,6 +55,18 @@ function AdminRoute({ children }: { children: React.ReactNode }) {
 
 function RouteFallback() {
   return <div className="h-full w-full bg-theme-bg" />;
+}
+
+function BootstrapFallback() {
+  return (
+    <div className="flex min-h-dvh items-center justify-center bg-theme-bg px-6 text-center text-theme-text">
+      <div>
+        <div className="mx-auto mb-4 h-10 w-10 animate-spin rounded-full border-2 border-emerald-500/30 border-t-emerald-400" />
+        <p className="text-sm font-medium text-slate-200">Checking your portal session…</p>
+        <p className="mt-2 text-xs text-slate-400">If you are signed out, we will send you to login.</p>
+      </div>
+    </div>
+  );
 }
 
 function LegacyAgentToolsRedirect({ tab }: { tab: 'automations' | 'usage' | 'skills' }) {
@@ -58,13 +84,22 @@ export default function App() {
   const [needsSetup, setNeedsSetup] = useState<boolean>(false);
   const [isReinstall, setIsReinstall] = useState<boolean>(false);
   const publicSettings = usePublicSettings();
+  const setupModeActive = needsSetup || isReinstall;
 
   useEffect(() => {
+    let cancelled = false;
+    const bootstrapFailoverTimer = window.setTimeout(() => {
+      if (!cancelled) {
+        setSetupChecked(true);
+      }
+    }, 4000);
+
     const bootstrap = async () => {
       try {
         const res = await fetch('/api/setup/status');
         if (res.ok) {
           const data = await res.json();
+          if (cancelled) return;
           setNeedsSetup(Boolean(data.needsSetup));
           setIsReinstall(Boolean(data.isReinstall));
 
@@ -77,11 +112,22 @@ export default function App() {
         // ignore setup-check failure and continue normal restore flow
       }
 
-      await restoreSession();
-      setSetupChecked(true);
+      try {
+        await restoreSession();
+      } finally {
+        window.clearTimeout(bootstrapFailoverTimer);
+        if (!cancelled) {
+          setSetupChecked(true);
+        }
+      }
     };
 
-    bootstrap();
+    void bootstrap();
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(bootstrapFailoverTimer);
+    };
   }, [restoreSession]);
 
 
@@ -109,7 +155,7 @@ export default function App() {
   }, [isAuthenticated]);
 
   if (!setupChecked) {
-    return null;
+    return <BootstrapFallback />;
   }
 
   return (
@@ -118,7 +164,7 @@ export default function App() {
         <Route
           path="/login"
           element={
-            needsSetup ? (
+            setupModeActive ? (
               <Navigate to="/setup" replace />
             ) : isAuthenticated ? (
               <Navigate to="/dashboard" replace />
@@ -130,7 +176,7 @@ export default function App() {
         <Route
           path="/forgot-password"
           element={
-            needsSetup ? (
+            setupModeActive ? (
               <Navigate to="/setup" replace />
             ) : isAuthenticated ? (
               <Navigate to="/dashboard" replace />
@@ -142,7 +188,7 @@ export default function App() {
         <Route
           path="/reset-password"
           element={
-            needsSetup ? (
+            setupModeActive ? (
               <Navigate to="/setup" replace />
             ) : isAuthenticated ? (
               <Navigate to="/dashboard" replace />
@@ -154,12 +200,12 @@ export default function App() {
         <Route
           path="/"
           element={
-            needsSetup ? (
+            setupModeActive ? (
               <Navigate to="/setup" replace />
             ) : isAuthenticated ? (
               <Navigate to="/dashboard" replace />
             ) : (
-              <Navigate to="/login" replace />
+              <LoginRedirect />
             )
           }
         />
@@ -170,7 +216,7 @@ export default function App() {
         <Route
           path="/docs"
           element={
-            needsSetup ? (
+            setupModeActive ? (
               <Navigate to="/setup" replace />
             ) : isAuthenticated ? (
               <Navigate to="/dashboard" replace />
@@ -182,21 +228,25 @@ export default function App() {
         <Route
           path="/"
           element={
-            <ProtectedRoute>
-              <ChatStateProvider>
-                <Layout />
-              </ChatStateProvider>
-            </ProtectedRoute>
+            setupModeActive ? (
+              <Navigate to="/setup" replace />
+            ) : (
+              <ProtectedRoute>
+                <ChatStateProvider>
+                  <Layout />
+                </ChatStateProvider>
+              </ProtectedRoute>
+            )
           }
         >
           <Route path="dashboard" element={<DashboardPage />} />
-          <Route path="files" element={<InteractiveRoute><FilesPage /></InteractiveRoute>} />
+          <Route path="files" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><FilesPage /></Suspense></InteractiveRoute>} />
           {/* Terminal is rendered persistently in Layout.tsx — this route just prevents fallback */}
           <Route path="terminal" element={<AdminRoute><div /></AdminRoute>} />
           <Route path="desktop" element={<AdminRoute><Suspense fallback={<RouteFallback />}><DesktopPage /></Suspense></AdminRoute>} />
-          <Route path="apps" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><AppsPage /></Suspense></InteractiveRoute>} />
+          <Route path="apps" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><AppsLibraryPage /></Suspense></InteractiveRoute>} />
           <Route path="projects" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><AppsPage /></Suspense></InteractiveRoute>} />
-          <Route path="agent-chats" element={<AdminRoute><AgentChatPage /></AdminRoute>} />
+          <Route path="agent-chats" element={<AdminRoute><Suspense fallback={<RouteFallback />}><AgentChatPage /></Suspense></AdminRoute>} />
           <Route path="agent-tools" element={<AdminRoute><Suspense fallback={<RouteFallback />}><AgentToolsPage /></Suspense></AdminRoute>} />
           <Route path="tasks" element={<AdminRoute><Suspense fallback={<RouteFallback />}><TasksPage /></Suspense></AdminRoute>} />
           {/* Backward compatibility redirects */}
@@ -209,9 +259,9 @@ export default function App() {
         </Route>
         <Route
           path="/setup"
-          element={(needsSetup || isReinstall) ? <SetupWizardPage /> : <Navigate to={isAuthenticated ? '/dashboard' : '/login'} replace />}
+          element={setupModeActive ? <SetupWizardPage /> : <Navigate to={isAuthenticated ? '/dashboard' : '/login'} replace />}
         />
-        <Route path="*" element={<Navigate to={isAuthenticated ? "/dashboard" : "/login"} replace />} />
+        <Route path="*" element={setupModeActive ? <Navigate to="/setup" replace /> : isAuthenticated ? <Navigate to="/dashboard" replace /> : <LoginRedirect />} />
       </Routes>
     </BrowserRouter>
   );

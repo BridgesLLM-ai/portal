@@ -2,6 +2,31 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.0] — 2026-04-12
+
+### Improved
+- **Agent Chat and project chat status behavior is finally consistent**: the shared `ComposerStatusBadge` rail now drives both chat surfaces, project chat no longer renders its own stray inline stop control, and reconnect, compaction, queue, and lifecycle messaging follow the same presentation rules in both places.
+- **Project chat became a first-class agent surface**: resumed runs are surfaced correctly, exec approvals resolve with the same queue-aware modal flow used in main Agent Chats, auth refresh is attempted before reconnect after auth-failure closes, pending approvals are cleared on abort/reset/finalize paths, slash-command model changes persist to the same restored key, and live model/provenance metadata is applied before the terminal `done` event.
+- **Auth and setup flows are more coherent end to end**: protected deep links preserve their redirect target through unauthenticated fallthrough, setup/reinstall UI now tells the truth about password requirements, reinstall mode is treated as a first-class route gate, and post-setup handoff retries cleanly across the backend restart window instead of trapping users on a completion spinner.
+- **Admin and operator surfaces are more truthful**: Dashboard gateway reconnect and update UI now respect viewer role, Feature Readiness is available to `SUB_ADMIN`, General settings inputs keep draft state while temporarily blank, and several route descriptions and empty states were rewritten to read like finished product rather than internal tooling.
+- **Cold-open responsiveness improved across the app**: Agent Chats, Dashboard, Projects, Files, Mail, and Settings all shed real first-open work through page-boundary lazy loading, deferred charts/models/session-history fetches, demand-driven direct-gateway bootstrap, and bounded thumbnail concurrency.
+
+### Fixed
+- **Misleading thought-process chrome is gone**: the redundant per-turn `ThinkingBlock`, `Internal monologue`, and `Thought process` UI was removed from both main and project chat, leaving the status rail as the single truthful in-turn state surface.
+- **Non-admin approval dead-ends were closed**: normal users no longer open a reconnecting admin-only approvals stream, non-admin `exec_approval` requests are auto-denied server-side instead of surfacing unusable prompts, and project chat now actually exposes approval state to elevated users who can act on it.
+- **Authenticated background polling is quieter and safer**: assistant-status, Ollama status, and session-list pollers now stop promptly when auth is gone, and repeated missing-token or invalid-token backend warnings are deduped instead of flooding logs every few seconds.
+- **Password and session cleanup now matches user expectations**: reinstall reset, password reset, and authenticated password change all revoke prior sessions and clear stale auth cookies so the user-visible handoff matches the actual security behavior.
+- **Registration, account identity, and setup defaults are more reliable**: the fallback registration mode is consistently `approval`, email identity handling is case-insensitive across login/reset/registration/profile checks, and reserved mailbox names like `support` and `noreply` can no longer leak into ordinary user-account paths.
+- **Dashboard and status recovery are more honest during reconnects**: stream-status hydration now keeps status-only and compaction-only active snapshots alive across reconnects, lifecycle maintenance text is preserved instead of being collapsed to generic thinking copy, and stale pre-tool assistant text is no longer rehydrated as if it were fresh live output.
+
+### Security
+- **Route access now matches the UI contract more closely**: background tasks are admin-only, interactive Files/Projects/Apps routes require approved interactive users, terminal deep links now resolve through the real admin gate, and direct-gateway `chat.inject` was tightened back down to elevated users only.
+- **Public and shared data exposure is tighter**: `GET /api/settings/public` no longer carries internal operational config, reinstall status exposes a masked owner hint instead of raw identity, and release packaging excludes the placeholder Prisma database and other internal-only artifacts.
+
+### Maintenance
+- **OpenClaw compatibility hotfixing is tougher on current installs**: the bundled `scripts/patch-openclaw-long-run-relay-hotfix.sh` now resolves hashed bundle filenames and patches both older and current OpenClaw dist shapes, including the direct-webchat heartbeat relay fallback and heartbeat-specific `persistedLastTo` preservation branch the portal still depends on.
+- **Release packaging is safer**: `scripts/build-release.sh` now explicitly excludes `backend/prisma/dev.db`, copies the freshly built tarball and installer to the marketing site, and keeps the release path aligned with the actual hosted install artifacts.
+
 ## [3.24.1] — 2026-04-09
 
 ### Fixed

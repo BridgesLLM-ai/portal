@@ -219,13 +219,12 @@ function SkillCard({ skill, installedNames: _installedNames, onUninstall }: Skil
 /* ─── Content Props ─────────────────────────────────────── */
 
 interface SkillsContentProps {
-  agentId?: string;
   showHeader?: boolean;
 }
 
 /* ─── Embeddable Content Component ──────────────────────── */
 
-export function SkillsContent({ agentId, showHeader = false }: SkillsContentProps) {
+export function SkillsContent({ showHeader = false }: SkillsContentProps) {
   const [skills, setSkills] = useState<Skill[]>([]);
   const [plugins, setPlugins] = useState<PluginEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -249,7 +248,7 @@ export function SkillsContent({ agentId, showHeader = false }: SkillsContentProp
     setError(null);
     try {
       const [skillData, pluginData] = await Promise.all([
-        skillsAPI.list(agentId),
+        skillsAPI.list(),
         skillsAPI.listPlugins(),
       ]);
       setSkills(skillData.skills || []);
@@ -342,7 +341,7 @@ export function SkillsContent({ agentId, showHeader = false }: SkillsContentProp
   useEffect(() => {
     fetchSkills();
     loadExplore('trending');
-  }, [agentId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Filter skills
   const filteredSkills = useMemo(() => {

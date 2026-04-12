@@ -3,6 +3,7 @@ import { z } from 'zod';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { config } from '../config/env';
+import { SECURITY_DEFAULTS } from '../config/settings.schema';
 import rateLimit from 'express-rate-limit';
 import { prisma } from '../config/database';
 import { hashPassword, comparePassword, validatePasswordStrength } from '../utils/password';
@@ -32,6 +33,7 @@ import {
 } from '../utils/auth-tracking';
 import { buildPortalUrl } from '../utils/portalUrl';
 import { clearAuthCookies, setAuthCookies } from '../utils/authCookies';
+import { isReservedSystemMailboxUsername } from '../utils/reservedMailboxUsernames';
 import { generateSecret as otpGenerateSecret, generateURI as otpGenerateURI, verify as otpVerify, NobleCryptoPlugin, ScureBase32Plugin } from 'otplib';
 import * as QRCode from 'qrcode';
 
@@ -153,15 +155,19 @@ function generateBackupCodes(count = 8, length = 8): string[] {
   return codes;
 }
 
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
 // Validation schemas
 const signupSchema = z.object({
-  email: z.string().email('Invalid email'),
+  email: z.string().email('Invalid email').transform(normalizeEmail),
   username: z.string().min(3, 'Username must be at least 3 characters').max(50),
   password: z.string().min(8, 'Password must be at least 8 characters'),
 });
 
 const loginSchema = z.object({
-  email: z.string().email('Invalid email'),
+  email: z.string().email('Invalid email').transform(normalizeEmail),
   password: z.string(),
 });
 
@@ -183,9 +189,10 @@ async function getSettingValue(key: string): Promise<string | null> {
 async function getRegistrationMode(): Promise<'open' | 'approval' | 'closed'> {
   const scoped = await getSettingValue('security.registrationMode');
   const legacy = await getSettingValue('registrationMode');
-  const mode = (scoped || legacy || 'closed').toLowerCase();
+  const fallback = SECURITY_DEFAULTS.registrationMode;
+  const mode = (scoped || legacy || fallback).toLowerCase();
   if (mode === 'open' || mode === 'approval' || mode === 'closed') return mode;
-  return 'closed';
+  return fallback;
 }
 
 async function getSessionDurationHours(): Promise<number> {
@@ -277,7 +284,9 @@ router.post('/login', authLimiter, async (req: Request, res: Response, next: Nex
     }
 
     // Find user
-    const user = await prisma.user.findUnique({ where: { email } });
+    const user = await prisma.user.findFirst({
+      where: { email: { equals: email, mode: 'insensitive' } },
+    });
 
     if (!user) {
       const { blocked } = recordFailedAttempt(meta.ip, maxLoginAttempts);
@@ -598,7 +607,7 @@ router.post('/logout', async (req: Request, res: Response, next: NextFunction) =
 // ── Forgot Password ─────────────────────────────────────────────────────
 
 const forgotPasswordSchema = z.object({
-  email: z.string().email('Invalid email'),
+  email: z.string().email('Invalid email').transform(normalizeEmail),
 });
 
 /**
@@ -613,7 +622,9 @@ router.post('/forgot-password', forgotPasswordLimiter, async (req: Request, res:
     // Always respond with the same message regardless of whether user exists
     const successMessage = 'If an account exists with that email, you will receive a password reset link.';
 
-    const user = await prisma.user.findUnique({ where: { email } });
+    const user = await prisma.user.findFirst({
+      where: { email: { equals: email, mode: 'insensitive' } },
+    });
 
     if (user) {
       // Generate raw token and hash it for storage
@@ -727,6 +738,11 @@ router.post('/reset-password', authLimiter, async (req: Request, res: Response, 
       where: { userId: matchedToken.userId },
     });
 
+    // If the reset link is opened in a browser that still carries old auth
+    // cookies, clear them now so the client lands on a clean sign-in state
+    // instead of briefly looking authenticated until the next refresh fails.
+    clearAuthCookies(req, res);
+
     // Send confirmation email
     await sendPasswordChangedEmail({
       email: matchedToken.user.email,
@@ -757,7 +773,7 @@ router.post('/reset-password', authLimiter, async (req: Request, res: Response, 
 
 const registerSchema = z.object({
   name: z.string().min(2, 'Name must be at least 2 characters').max(100),
-  email: z.string().email('Invalid email'),
+  email: z.string().email('Invalid email').transform(normalizeEmail),
   password: z.string().min(8, 'Password must be at least 8 characters'),
   message: z.string().max(1000).optional(),
 });
@@ -772,6 +788,11 @@ const registerSchema = z.object({
 router.post('/register', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, email, password, message } = registerSchema.parse(req.body);
+    const requestedUsername = name.toLowerCase().replace(/[^a-z0-9_-]/g, '') || email.split('@')[0];
+
+    if (isReservedSystemMailboxUsername(requestedUsername)) {
+      throw new AppError(400, `Username '${requestedUsername}' is reserved for system use. Choose a different username.`);
+    }
 
     // Get registration mode from settings
     const mode = await getRegistrationMode();
@@ -822,14 +843,16 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
     }
 
     // Check if email already in use
-    const existingUser = await prisma.user.findUnique({ where: { email } });
+    const existingUser = await prisma.user.findFirst({
+      where: { email: { equals: email, mode: 'insensitive' } },
+    });
     if (existingUser) {
       throw new AppError(409, 'An account with this email already exists');
     }
 
     const existingRequest = await prisma.registrationRequest.findFirst({
       where: {
-        email,
+        email: { equals: email, mode: 'insensitive' },
         status: 'PENDING',
       },
       orderBy: { requestedAt: 'desc' },
@@ -844,7 +867,7 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
       const user = await prisma.user.create({
         data: {
           email,
-          username: name.toLowerCase().replace(/[^a-z0-9_-]/g, '') || email.split('@')[0],
+          username: requestedUsername,
           passwordHash,
           role: 'USER',
           accountStatus: ACTIVE_STATUS,
@@ -970,7 +993,7 @@ router.get('/registration-mode', async (_req: Request, res: Response) => {
 
 const updateProfileSchema = z.object({
   username: z.string().min(2).max(100).optional(),
-  email: z.string().email().optional(),
+  email: z.string().email().transform(normalizeEmail).optional(),
 });
 
 /**
@@ -982,9 +1005,15 @@ router.put('/me', authenticateToken, async (req: Request, res: Response, next: N
     if (!req.user) throw new AppError(401, 'Not authenticated');
     const data = updateProfileSchema.parse(req.body);
 
+    if (data.username && isReservedSystemMailboxUsername(data.username)) {
+      throw new AppError(400, `Username '${data.username}' is reserved for system use. Choose a different username.`);
+    }
+
     // Check email uniqueness if changing
     if (data.email) {
-      const existing = await prisma.user.findUnique({ where: { email: data.email } });
+      const existing = await prisma.user.findFirst({
+        where: { email: { equals: data.email, mode: 'insensitive' } },
+      });
       if (existing && existing.id !== req.user.userId) {
         throw new AppError(409, 'Email already in use');
       }
@@ -1048,16 +1077,29 @@ router.post('/change-password', authenticateToken, async (req: Request, res: Res
     const valid = await comparePassword(currentPassword, user.passwordHash);
     if (!valid) throw new AppError(401, 'Current password is incorrect');
 
+    const strength = validatePasswordStrength(newPassword);
+    if (!strength.valid) {
+      throw new AppError(400, strength.errors.join('. '));
+    }
+
     const newHash = await hashPassword(newPassword);
     await prisma.user.update({
       where: { id: req.user.userId },
       data: { passwordHash: newHash },
     });
 
+    // A password change should invalidate all existing sessions immediately,
+    // including the current browser session, so stale refresh tokens cannot
+    // keep running on other devices after the credential change.
+    await prisma.session.deleteMany({
+      where: { userId: req.user.userId },
+    });
+    clearAuthCookies(req, res);
+
     // Send password changed confirmation email (non-blocking)
     sendPasswordChangedEmail({ email: user.email, username: user.username }).catch(() => {});
 
-    res.json({ success: true, message: 'Password changed successfully' });
+    res.json({ success: true, message: 'Password changed successfully. Please sign in again.' });
   } catch (error) {
     next(error);
   }

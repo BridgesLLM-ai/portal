@@ -34,6 +34,11 @@ const CLIENT_MODE = 'backend';
 const GATEWAY_ROLE = 'operator';
 const GATEWAY_SCOPES = ['operator.admin', 'operator.approvals'];
 
+function isExpectedGatewayReconnectError(error: unknown): boolean {
+  const message = String((error as any)?.message || error || '').trim();
+  return /ECONNREFUSED|connect ECONNREFUSED|socket hang up|ETIMEDOUT|ECONNRESET/i.test(message);
+}
+
 function extractGatewayMessageModel(payload: any): string | null {
   const message = payload?.message;
   const candidates = [
@@ -57,6 +62,79 @@ function extractGatewayMessageModel(payload: any): string | null {
     }
   }
   return null;
+}
+
+const LIFECYCLE_CONTROL_TOKENS = new Set([
+  'start',
+  'started',
+  'running',
+  'end',
+  'ended',
+  'complete',
+  'completed',
+  'error',
+  'failed',
+  'idle',
+  'compacting',
+  'compacted',
+]);
+
+const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/i;
+const LIFECYCLE_FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context)\b/i;
+const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance complete(?:d)?)\b/i;
+const LIFECYCLE_COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction in progress)\b/i;
+const LIFECYCLE_COMPACTED_RE = /\b(context compacted|compaction complete(?:d)?)\b/i;
+
+type LifecycleMaintenanceSignal = 'idle' | 'maintenance' | 'maintenance_done' | 'compacting' | 'compacted';
+
+function extractLifecycleStatusText(data: any): string | null {
+  const candidates = [
+    data?.statusText,
+    data?.message,
+    data?.text,
+    data?.content,
+    data?.detail,
+    data?.description,
+    data?.status,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const next = candidate.trim();
+    if (!next) continue;
+    if (LIFECYCLE_CONTROL_TOKENS.has(next.toLowerCase())) continue;
+    return next;
+  }
+
+  return null;
+}
+
+function inferLifecycleMaintenanceSignal(phase: string, statusText: string | null): LifecycleMaintenanceSignal {
+  const normalizedPhase = String(phase || '').trim().toLowerCase();
+  const normalizedStatus = String(statusText || '').trim();
+
+  if (normalizedPhase === 'compacted' || normalizedPhase === 'compaction_end' || normalizedPhase === 'compaction_completed') {
+    return 'compacted';
+  }
+  if (normalizedPhase === 'compacting' || normalizedPhase === 'compaction_start' || normalizedPhase === 'compaction_started') {
+    return 'compacting';
+  }
+  if (!normalizedStatus) {
+    return 'idle';
+  }
+  if (LIFECYCLE_COMPACTED_RE.test(normalizedStatus)) {
+    return 'compacted';
+  }
+  if (LIFECYCLE_COMPACTING_RE.test(normalizedStatus)) {
+    return 'compacting';
+  }
+  if (LIFECYCLE_FLUSH_DONE_RE.test(normalizedStatus)) {
+    return 'maintenance_done';
+  }
+  if (LIFECYCLE_FLUSH_PREPARING_RE.test(normalizedStatus) || LIFECYCLE_FLUSH_RUNNING_RE.test(normalizedStatus)) {
+    return 'maintenance';
+  }
+  return 'idle';
 }
 
 export interface ExecApprovalRequest {
@@ -195,9 +273,20 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
     ).toLowerCase();
     debugLog(`COMPACTION event: sessionKey="${sessionKey}" phase="${compPhase}"`);
     if (compPhase === 'start' || compPhase === 'started' || compPhase === 'compacting') {
-      streamEventBus.publish(sessionKey, { type: 'compaction_start', content: 'Compacting context…' });
+      streamEventBus.publish(sessionKey, {
+        type: 'compaction_start',
+        content: 'Compacting context…',
+        maintenanceKind: 'compaction',
+      });
     } else if (compPhase === 'end' || compPhase === 'completed' || compPhase === 'compacted') {
-      streamEventBus.publish(sessionKey, { type: 'compaction_end', content: 'Context compacted' });
+      const completed = data.completed !== false;
+      streamEventBus.publish(sessionKey, {
+        type: 'compaction_end',
+        content: completed ? 'Context compacted' : 'Context maintenance finished.',
+        completed,
+        willRetry: data.willRetry === true,
+        maintenanceKind: completed ? 'compaction' : 'maintenance',
+      });
     }
     return;
   }
@@ -322,6 +411,8 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
 
   if (stream === 'lifecycle') {
     const phase = typeof data.phase === 'string' ? data.phase : '';
+    const lifecycleStatusText = extractLifecycleStatusText(data);
+    const lifecycleSignal = inferLifecycleMaintenanceSignal(phase, lifecycleStatusText);
 
     if (phase === 'end') {
       // lifecycle.end fires at the END of each agent run segment — including after tool calls.
@@ -336,10 +427,27 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
       activeRunIds.delete(sessionKey);
       assistantLastSeenTextMap.delete(sessionKey);
       lastToolPhaseBySession.delete(sessionKey);
-    } else if (phase === 'started' || phase === 'running') {
-      streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking' });
-      streamEventBus.publish(sessionKey, { type: 'thinking', content: '🧠 Agent is thinking…' });
-      streamEventBus.publish(sessionKey, { type: 'status', content: '🧠 Agent is thinking…' });
+    } else if (lifecycleSignal === 'compacting') {
+      const status = lifecycleStatusText || 'Compacting context…';
+      streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking', statusText: status, compactionPhase: 'compacting' });
+      streamEventBus.publish(sessionKey, { type: 'compaction_start', content: status, maintenanceKind: 'compaction' });
+    } else if (lifecycleSignal === 'compacted') {
+      const status = lifecycleStatusText || 'Context compacted';
+      streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking', statusText: status, compactionPhase: 'compacted' });
+      streamEventBus.publish(sessionKey, { type: 'compaction_end', content: status, completed: true, maintenanceKind: 'compaction' });
+    } else if (lifecycleSignal === 'maintenance') {
+      const status = lifecycleStatusText || 'Preparing context maintenance…';
+      streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking', statusText: status, compactionPhase: 'compacting' });
+      streamEventBus.publish(sessionKey, { type: 'status', content: status, maintenanceKind: 'maintenance' });
+    } else if (lifecycleSignal === 'maintenance_done') {
+      const status = lifecycleStatusText || 'Context maintenance finished.';
+      streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking', statusText: status, compactionPhase: 'idle' });
+      streamEventBus.publish(sessionKey, { type: 'status', content: status, maintenanceKind: 'maintenance' });
+    } else if (phase === 'started' || phase === 'running' || phase === 'start') {
+      const status = lifecycleStatusText || '🧠 Agent is thinking…';
+      streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking', statusText: status });
+      streamEventBus.publish(sessionKey, { type: 'thinking', content: status });
+      streamEventBus.publish(sessionKey, { type: 'status', content: status });
     }
     return;
   }
@@ -361,12 +469,12 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
   // Process these regardless of subscribers.
   if (state === 'compacting' || state === 'compaction_start' || state === 'compaction_started') {
     debugLog(`COMPACTION via chat event: sessionKey="${sessionKey}" state="${state}"`);
-    streamEventBus.publish(sessionKey, { type: 'compaction_start', content: 'Compacting context…' });
+    streamEventBus.publish(sessionKey, { type: 'compaction_start', content: 'Compacting context…', maintenanceKind: 'compaction' });
     return;
   }
   if (state === 'compacted' || state === 'compaction_end' || state === 'compaction_completed') {
     debugLog(`COMPACTION END via chat event: sessionKey="${sessionKey}" state="${state}"`);
-    streamEventBus.publish(sessionKey, { type: 'compaction_end', content: 'Context compacted' });
+    streamEventBus.publish(sessionKey, { type: 'compaction_end', content: 'Context compacted', completed: true, maintenanceKind: 'compaction' });
     return;
   }
 
@@ -709,6 +817,10 @@ function connect(): void {
   });
 
   ws.on('error', (err: any) => {
+    if (isExpectedGatewayReconnectError(err)) {
+      console.warn(`[PersistentGatewayWs] Gateway unavailable during connect/reconnect: ${err.message}`);
+      return;
+    }
     console.error(`[PersistentGatewayWs] WebSocket error: ${err.message}`);
   });
 

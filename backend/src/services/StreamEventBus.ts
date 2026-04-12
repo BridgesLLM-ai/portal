@@ -13,13 +13,27 @@ export interface StreamEvent {
   toolArgs?: unknown;
   toolResult?: string;
   provenance?: string;
+  completed?: boolean;
+  willRetry?: boolean;
+  maintenanceKind?: 'compaction' | 'maintenance';
   [key: string]: unknown;
+}
+
+export interface StreamToolCall {
+  id: string;
+  name: string;
+  arguments?: unknown;
+  result?: string;
+  startedAt: number;
+  endedAt?: number;
+  status: 'running' | 'done';
 }
 
 export interface StreamInfo {
   active: boolean;
   phase: 'thinking' | 'tool' | 'streaming';
   toolName?: string;
+  toolCalls?: StreamToolCall[];
   statusText?: string;
   provenance?: string;
   model?: string;
@@ -159,14 +173,42 @@ class StreamEventBus {
       } else if (event.type === 'tool_start') {
         info.toolName = typeof event.toolName === 'string' && event.toolName.trim() ? event.toolName.trim() : info.toolName;
         info.statusText = info.toolName ? `Using ${info.toolName}…` : info.statusText;
+        const toolName = info.toolName || 'tool';
+        const existingCalls = Array.isArray(info.toolCalls) ? info.toolCalls : [];
+        info.toolCalls = [
+          ...existingCalls,
+          {
+            id: `tool-${now}-${existingCalls.length + 1}`,
+            name: toolName,
+            arguments: event.toolArgs,
+            startedAt: now,
+            status: 'running',
+          },
+        ];
       } else if (event.type === 'tool_end') {
         info.statusText = undefined;
+        const existingCalls = Array.isArray(info.toolCalls) ? [...info.toolCalls] : [];
+        for (let i = existingCalls.length - 1; i >= 0; i--) {
+          if (existingCalls[i].status === 'running') {
+            existingCalls[i] = {
+              ...existingCalls[i],
+              endedAt: now,
+              result: typeof event.toolResult === 'string' ? event.toolResult : undefined,
+              status: 'done',
+            };
+            break;
+          }
+        }
+        info.toolCalls = existingCalls;
       } else if (event.type === 'compaction_start') {
         info.compactionPhase = 'compacting';
         info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : 'Compacting context…';
       } else if (event.type === 'compaction_end') {
-        info.compactionPhase = 'compacted';
-        info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : 'Context compacted';
+        const completed = event.completed !== false && event.maintenanceKind !== 'maintenance';
+        info.compactionPhase = completed ? 'compacted' : 'idle';
+        info.statusText = typeof event.content === 'string' && event.content.trim()
+          ? event.content.trim()
+          : (completed ? 'Context compacted' : 'Context maintenance finished.');
       } else if (event.type === 'run_resumed') {
         info.statusText = 'Resuming stream…';
       }
@@ -251,6 +293,7 @@ class StreamEventBus {
       if (wasDormant) {
         existing.startedAt = info.startedAt || Date.now();
         existing.latestText = this.latestText.get(sessionKey) || '';
+        existing.toolCalls = [];
         delete existing.lastDoneAt;
       }
       existing.lastEventAt = Date.now();
@@ -259,6 +302,7 @@ class StreamEventBus {
         active: true,
         phase: info.phase,
         toolName: info.toolName,
+        toolCalls: Array.isArray(info.toolCalls) ? [...info.toolCalls] : [],
         statusText: info.statusText,
         provenance: info.provenance,
         model: info.model,
@@ -279,6 +323,7 @@ class StreamEventBus {
       this.activeStreams.set(sessionKey, {
         active: true,
         phase: 'thinking',
+        toolCalls: [],
         statusText: info?.statusText || 'Thinking…',
         provenance: info?.provenance,
         model: info?.model,
@@ -296,6 +341,7 @@ class StreamEventBus {
         current.phase = 'thinking';
         current.startedAt = Date.now();
         current.toolName = undefined;
+        current.toolCalls = [];
         current.statusText = info?.statusText || 'Thinking…';
         current.compactionPhase = info?.compactionPhase || 'idle';
         current.latestText = this.latestText.get(sessionKey) || '';
@@ -331,6 +377,7 @@ class StreamEventBus {
       active: false,
       phase: 'thinking',
       toolName: info?.toolName,
+      toolCalls: [],
       statusText: info?.statusText,
       provenance: info?.provenance,
       model: info?.model,
