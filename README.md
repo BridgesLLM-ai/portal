@@ -76,6 +76,10 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.1 (April 13, 2026)
+- **Installer and updater users now get the OpenClaw compatibility helper fix too**: the bundled long-run relay hotfix script now resolves the real current hashed OpenClaw bundles, patches the right `get-reply` file, and keeps installer/update artifacts aligned with the live production compatibility fix instead of leaving the repair stranded in source only.
+- **This is a clean patch release for distribution parity**: public GitHub source, hosted installer, and hosted tarball now all ship the same helper refresh under a proper new version instead of silently changing bits behind `3.25.0`.
+
 ### v3.25.0 (April 12, 2026)
 - **Agent Chat and project chat finally act like the same product**: both surfaces now share the same status rail, project chat lost the stray inline stop button, misleading thought-process pills are gone, live run status copy is clearer, and project chat gained proper run-resume, approval, reconnect, model-persistence, and live metadata handling.
 - **Auth, setup, reinstall, and password flows got a serious hardening pass**: protected deep links preserve their destination, password policy is enforced consistently across setup and recovery flows, reinstall/reset/password-change paths revoke old sessions correctly, and signed-out pollers stop hammering protected endpoints.

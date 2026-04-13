@@ -2,6 +2,14 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.1] — 2026-04-13
+
+### Fixed
+- **Installer and updater release parity for the OpenClaw relay hotfix helper is restored**: `scripts/patch-openclaw-long-run-relay-hotfix.sh` now reliably targets the real hashed `heartbeat-runner-*` and `get-reply-*` bundles in current OpenClaw installs instead of the wrong stub or old reply filename, so installer and in-place update users receive the same long-run webchat relay / heartbeat `persistedLastTo` compatibility fix that production needed.
+
+### Maintenance
+- **This patch release exists to ship the helper refresh through the normal public release channel**: installer downloads, hosted `portal.tar.gz`, and source release metadata are now aligned again instead of leaving the fix stranded only in GitHub source.
+
 ## [3.25.0] — 2026-04-12
 
 ### Improved
