@@ -11,15 +11,16 @@ import sys
 
 root = Path(sys.argv[1])
 prefix = sys.argv[2]
-matches = sorted(root.glob(f"{prefix}*.js"))
+matches = list(root.glob(f"{prefix}*.js"))
 if not matches:
     raise SystemExit(f"bundle not found for prefix {prefix!r} in {root}")
+matches.sort(key=lambda p: (p.stat().st_size, p.name), reverse=True)
 print(matches[0])
 PY
 }
 
 HEARTBEAT_RUNNER="$(resolve_bundle heartbeat-runner-)"
-REPLY_FILE="$(resolve_bundle reply-)"
+GET_REPLY_FILE="$(resolve_bundle get-reply-)"
 
 python3 - "$HEARTBEAT_RUNNER" <<'PY'
 from pathlib import Path
@@ -30,7 +31,8 @@ old_detector = 'return lower.includes("exec finished");'
 new_detector = 'return lower.includes("exec finished") || lower.includes("exec completed");'
 current_old_detector = 'return normalizeLowercaseStringOrEmpty(evt).includes("exec finished");'
 current_new_detector = 'return normalizeLowercaseStringOrEmpty(evt).includes("exec finished") || normalizeLowercaseStringOrEmpty(evt).includes("exec completed");'
-if new_detector in text or current_new_detector in text:
+regex_detector = 'return /^exec finished(?::|\\s*\\()/.test(normalized) || /^exec (completed|failed) \\([a-z0-9_-]{1,64}, (code -?\\d+|signal [^)]+)\\)( :: .*)?$/.test(normalized);'
+if new_detector in text or current_new_detector in text or regex_detector in text:
     print(f"detector already patched: {p}")
 elif old_detector in text:
     text = text.replace(old_detector, new_detector, 1)
@@ -57,7 +59,7 @@ else:
 p.write_text(text)
 PY
 
-python3 - "$REPLY_FILE" <<'PY'
+python3 - "$GET_REPLY_FILE" <<'PY'
 from pathlib import Path
 import sys
 p = Path(sys.argv[1])
@@ -79,6 +81,6 @@ else:
 PY
 
 grep -n "exec finished\|exec completed\|isDirectWebchatSession\|canRelayToUser" "$HEARTBEAT_RUNNER"
-grep -n 'normalizedIncomingTo === "heartbeat" && params.persistedLastTo' "$REPLY_FILE"
+grep -n 'normalizedIncomingTo === "heartbeat" && params.persistedLastTo' "$GET_REPLY_FILE"
 
 echo "Hotfix complete. Restart OpenClaw gateway for changes to take effect."
