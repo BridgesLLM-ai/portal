@@ -76,6 +76,10 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.2 (April 14, 2026)
+- **OpenClaw compatibility hotfix status works again on current installs**: the portal now inspects the real hashed `heartbeat-runner-*` and `get-reply-*` bundles, recognizes the newer upstream exec-completion detector, and stops falsely calling modern OpenClaw builds unsupported when the relay hotfix can still be applied safely.
+- **This patch release fixes public release parity, not just local production knowledge**: the source tree, installer artifacts, and hosted download now all ship the same compatibility behavior instead of depending on a private manual workaround, and the public source export again contains the lazy project viewer components needed for a clean frontend build.
+
 ### v3.25.1 (April 13, 2026)
 - **Installer and updater users now get the OpenClaw compatibility helper fix too**: the bundled long-run relay hotfix script now resolves the real current hashed OpenClaw bundles, patches the right `get-reply` file, and keeps installer/update artifacts aligned with the live production compatibility fix instead of leaving the repair stranded in source only.
 - **This is a clean patch release for distribution parity**: public GitHub source, hosted installer, and hosted tarball now all ship the same helper refresh under a proper new version instead of silently changing bits behind `3.25.0`.

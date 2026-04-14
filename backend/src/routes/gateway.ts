@@ -66,13 +66,18 @@ const OPENCLAW_DIST_DIR = '/usr/lib/node_modules/openclaw/dist';
 const PORTAL_ROOT = path.resolve(__dirname, '../../..');
 const OPENCLAW_COMPAT_HOTFIX_SCRIPT = path.join(PORTAL_ROOT, 'scripts', 'patch-openclaw-long-run-relay-hotfix.sh');
 
-function resolveOpenClawDistBundle(prefix: string): string | null {
+function resolveOpenClawDistBundle(prefix: string | string[]): string | null {
   try {
     if (!existsSync(OPENCLAW_DIST_DIR)) return null;
-    const match = readdirSync(OPENCLAW_DIST_DIR)
-      .filter((name) => name.startsWith(prefix) && name.endsWith('.js'))
-      .sort()[0];
-    return match ? path.join(OPENCLAW_DIST_DIR, match) : null;
+    const prefixes = Array.isArray(prefix) ? prefix : [prefix];
+    const matches = readdirSync(OPENCLAW_DIST_DIR)
+      .filter((name) => name.endsWith('.js') && prefixes.some((candidate) => name.startsWith(candidate)))
+      .map((name) => path.join(OPENCLAW_DIST_DIR, name))
+      .sort((a, b) => {
+        const sizeDiff = statSync(b).size - statSync(a).size;
+        return sizeDiff !== 0 ? sizeDiff : path.basename(a).localeCompare(path.basename(b));
+      });
+    return matches[0] || null;
   } catch {
     return null;
   }
@@ -80,13 +85,13 @@ function resolveOpenClawDistBundle(prefix: string): string | null {
 
 function getOpenClawCompatibilityHotfixStatus() {
   const heartbeatRunnerPath = resolveOpenClawDistBundle('heartbeat-runner-');
-  const replyBundlePath = resolveOpenClawDistBundle('reply-');
+  const replyBundlePath = resolveOpenClawDistBundle(['get-reply-', 'reply-']);
   const scriptExists = existsSync(OPENCLAW_COMPAT_HOTFIX_SCRIPT);
   const issues: string[] = [];
 
   if (!scriptExists) issues.push('Portal hotfix script is not installed.');
   if (!heartbeatRunnerPath) issues.push('Could not locate the OpenClaw heartbeat runner bundle.');
-  if (!replyBundlePath) issues.push('Could not locate the OpenClaw reply bundle.');
+  if (!replyBundlePath) issues.push('Could not locate the OpenClaw get-reply bundle.');
 
   const heartbeatText = heartbeatRunnerPath && existsSync(heartbeatRunnerPath)
     ? readFileSync(heartbeatRunnerPath, 'utf8')
@@ -95,7 +100,9 @@ function getOpenClawCompatibilityHotfixStatus() {
     ? readFileSync(replyBundlePath, 'utf8')
     : '';
 
-  const detectorPatched = heartbeatText.includes('return lower.includes("exec finished") || lower.includes("exec completed");');
+  const detectorPatched = heartbeatText.includes('return lower.includes("exec finished") || lower.includes("exec completed");')
+    || heartbeatText.includes('return normalizeLowercaseStringOrEmpty(evt).includes("exec finished") || normalizeLowercaseStringOrEmpty(evt).includes("exec completed");')
+    || heartbeatText.includes('return /^exec finished(?::|\\s*\\()/.test(normalized) || /^exec (completed|failed) \\([a-z0-9_-]{1,64}, (code -?\\d+|signal [^)]+)\\)( :: .*)?$/.test(normalized);');
   const relayPatched = heartbeatText.includes('const isDirectWebchatSession =')
     && heartbeatText.includes('delivery.channel === "none" && isDirectWebchatSession');
   const replyPatched = replyText.includes('normalizedIncomingTo === "heartbeat" && params.persistedLastTo');

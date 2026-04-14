@@ -2,6 +2,14 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.2] — 2026-04-14
+
+### Fixed
+- **Portal compatibility hotfix status/apply works again on current OpenClaw installs**: the admin checker now inspects the real hashed `heartbeat-runner-*` and `get-reply-*` bundles instead of stale stub targets, recognizes the current exec-completion detector shape already shipped upstream, and stops falsely reporting modern OpenClaw builds as unsupported when the long-run relay hotfix can still be applied safely.
+
+### Maintenance
+- **This patch release keeps the public release path honest**: current portal builds, hosted installer artifacts, and the public GitHub export now all reflect the same compatibility-fix behavior instead of requiring private manual knowledge to recover newer OpenClaw installs, and the public source export once again includes the lazily loaded project viewer components needed for a clean frontend build.
+
 ## [3.25.1] — 2026-04-13
 
 ### Fixed
