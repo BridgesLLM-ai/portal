@@ -409,6 +409,10 @@ export const gatewayAPI = {
     });
     return data;
   },
+  createSession: async (session: string, provider = 'OPENCLAW') => {
+    const { data } = await client.post('/gateway/session-create', { session, provider });
+    return data;
+  },
   patchSessionModel: async (session: string, model: string, provider = 'OPENCLAW') => {
     const { data } = await client.post('/gateway/session-model', { session, model, provider });
     return data;

@@ -297,7 +297,7 @@ export default function LoginPage() {
     if (redirect) {
       console.warn('[Security] Blocked open redirect attempt:', redirect);
     }
-    navigate('/dashboard');
+    window.location.assign('/dashboard');
   };
 
   const handleSubmit = async (e: React.FormEvent) => {

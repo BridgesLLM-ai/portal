@@ -203,6 +203,28 @@ export async function patchSessionModel(sessionKey: string, model: string): Prom
 }
 
 /**
+ * Create or materialize an OpenClaw session entry so session metadata can be
+ * patched before the first message is sent.
+ */
+export async function createSession(sessionKey: string, agentId?: string): Promise<{ ok: boolean; key?: string; error?: string }> {
+  console.log(`[Gateway RPC] Creating session: key=${sessionKey}${agentId ? ` agent=${agentId}` : ''}`);
+
+  const params: Record<string, any> = { key: sessionKey };
+  if (agentId) params.agentId = agentId;
+
+  const result = await gatewayRpcCall('sessions.create', params);
+
+  if (result.ok) {
+    const key = typeof result.data?.key === 'string' ? result.data.key.trim() : sessionKey;
+    console.log(`[Gateway RPC] Session created: key=${key}`);
+    return { ok: true, key };
+  }
+
+  console.error(`[Gateway RPC] Failed to create session: ${result.error}`);
+  return { ok: false, error: String(result.error) };
+}
+
+/**
  * Get the current session info including active model.
  */
 export async function getSessionInfo(sessionKey: string): Promise<{ ok: boolean; data?: any; error?: string }> {

@@ -38,6 +38,8 @@ import {
 } from '../../utils/modelId';
 import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../utils/slashCommands';
 import ComposerStatusBadge from './ComposerStatusBadge';
+import ToolGlyph from './ToolGlyph';
+import { getToolPresentation, getToolStatusText, getToolSummary, isCompactionNotice, resolveToolName } from '../../utils/toolPresentation';
 import {
   pruneExpiredExecApprovals,
   removeExecApproval,
@@ -249,10 +251,19 @@ function nextId() {
   return 'pmsg-' + Date.now() + '-' + (++msgCounter);
 }
 
+function getLastRunningToolCall(toolCalls: ToolCall[] | undefined): ToolCall | null {
+  if (!Array.isArray(toolCalls)) return null;
+  for (let i = toolCalls.length - 1; i >= 0; i--) {
+    if (toolCalls[i]?.status === 'running') return toolCalls[i];
+  }
+  return null;
+}
+
 function parseHistoryMessage(m: any): ChatMessage | null {
   const rawContent = m.content || '';
+  const rawThinkingContent = typeof m.thinkingContent === 'string' ? sanitizeAssistantContent(m.thinkingContent) : '';
   const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
-  if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(rawContent)) {
+  if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(rawContent) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
     return null;
   }
 
@@ -265,6 +276,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
     createdAt: new Date(m.timestamp || Date.now()),
     provenance: m.provenance,
     model: typeof m.model === 'string' ? m.model : undefined,
+    thinkingContent: rawThinkingContent || undefined,
   };
   if (m.toolCalls) {
     msg.toolCalls = m.toolCalls.map((tc: any) => ({
@@ -318,44 +330,6 @@ function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
   return deduped;
 }
 
-/* ═══ Tool Summary ═══ */
-
-function getToolSummary(tool: ToolCall): string {
-  const args = tool.arguments;
-  if (!args) return tool.name;
-  const name = tool.name.toLowerCase();
-
-  if (name === 'read' || name === 'read_file') {
-    const p = args.path || args.file_path || args.filePath;
-    if (p) return `Read ${String(p).split('/').slice(-2).join('/')}`;
-  }
-  if (name === 'write' || name === 'write_file') {
-    const p = args.path || args.file_path || args.filePath;
-    if (p) return `Write ${String(p).split('/').slice(-2).join('/')}`;
-  }
-  if (name === 'edit' || name === 'edit_file') {
-    const p = args.path || args.file_path || args.filePath;
-    if (p) return `Edit ${String(p).split('/').slice(-2).join('/')}`;
-  }
-  if (name === 'exec' || name === 'execute' || name === 'bash' || name === 'shell') {
-    const cmd = args.command || args.cmd;
-    if (cmd) {
-      const short = String(cmd).length > 50 ? String(cmd).substring(0, 47) + '…' : String(cmd);
-      return `Run \`${short}\``;
-    }
-  }
-  if (name === 'web_search' || name === 'search') {
-    const q = args.query;
-    if (q) return `Search "${String(q).substring(0, 40)}"`;
-  }
-  if (name === 'web_fetch' || name === 'fetch') {
-    const u = args.url;
-    if (u) { try { return `Fetch ${new URL(String(u)).hostname}`; } catch { return 'Fetch URL'; } }
-  }
-  if (name === 'image') return 'Analyze image';
-  return tool.name;
-}
-
 /* ═══ Sub-components ═══ */
 
 function ToolCallPill({ tool }: { tool: ToolCall }) {
@@ -363,6 +337,7 @@ function ToolCallPill({ tool }: { tool: ToolCall }) {
   const duration = tool.endedAt ? ((tool.endedAt - tool.startedAt) / 1000).toFixed(1) : null;
   const hasDetails = !!(tool.result || tool.arguments);
   const summary = getToolSummary(tool);
+  const presentation = getToolPresentation(tool.name);
 
   return (
     <motion.div
@@ -374,15 +349,16 @@ function ToolCallPill({ tool }: { tool: ToolCall }) {
       <div className="flex flex-col items-center max-w-sm w-full">
         <button
           onClick={() => hasDetails && setExpanded(!expanded)}
-          className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/[0.04] border border-white/[0.07] hover:bg-white/[0.07] transition-colors text-[10px] text-slate-400"
+          className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full border transition-colors text-[10px] text-slate-400 ${presentation.surfaceClass}`}
         >
+          <span className={`inline-flex h-4 w-4 items-center justify-center rounded-full border ${presentation.iconBadgeClass}`}>
+            <ToolGlyph toolName={tool.name} size={10} className={presentation.iconClass} />
+          </span>
+          <span className="text-slate-200">{summary}</span>
           {tool.status === 'running' ? (
-            <Loader2 size={10} className="text-amber-400 animate-spin" />
-          ) : (
-            <Wrench size={10} className="text-emerald-400" />
-          )}
-          <span className="text-slate-300">{summary}</span>
-          {duration && <span className="text-slate-600">· {duration}s</span>}
+            <Loader2 size={9} className={`animate-spin ${presentation.iconClass}`} />
+          ) : null}
+          {duration && <span className="text-slate-500">· {duration}s</span>}
           {hasDetails && (
             <ChevronRight size={9} className={`text-slate-600 transition-transform ${expanded ? 'rotate-90' : ''}`} />
           )}
@@ -632,6 +608,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const [activeToolName, setActiveToolName] = useState<string | null>(null);
   const [statusText, setStatusText] = useState<string | null>(null);
   const [thinkingContent, setThinkingContent] = useState<string>('');
+  const thinkingContentRef = useRef('');
+  useEffect(() => { thinkingContentRef.current = thinkingContent; }, [thinkingContent]);
   const [pendingApprovals, setPendingApprovals] = useState<ExecApprovalRequest[]>([]);
   const pendingApproval = pendingApprovals[0] || null;
   const [compactionPhase, setCompactionPhase] = useState<'idle' | 'compacting' | 'compacted'>('idle');
@@ -667,6 +645,19 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const sessionKeyRef = useRef<string | null>(null);
   const historyGenRef = useRef(0);
   const modelRef = useRef(selectedModel);
+
+  useEffect(() => {
+    const activeAssistantId = streamingAssistantIdRef.current;
+    if (!activeAssistantId || streamingPhase !== 'tool') return;
+    const activeMessage = messages.find((message) => message.id === activeAssistantId);
+    const runningToolCall = getLastRunningToolCall(activeMessage?.toolCalls);
+    if (runningToolCall?.name) {
+      const runningToolName = resolveToolName(runningToolCall.name);
+      if (runningToolName && runningToolName !== activeToolName) {
+        setActiveToolName(runningToolName);
+      }
+    }
+  }, [messages, streamingPhase, activeToolName]);
 
   const appendSystemNotice = useCallback((content: string) => {
     const now = Date.now();
@@ -839,7 +830,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       console.warn('[ProjectChat] Stream watchdog: no activity for 60s');
       const cid = streamingAssistantIdRef.current;
       const ft = assembledRef.current.substring(lastSegmentStartRef.current);
-      const shouldHideTurn = !ft.trim() && !hasRealToolEventsRef.current;
+      const shouldHideTurn = !ft.trim() && !hasRealToolEventsRef.current && !thinkingContentRef.current.trim();
       isStreamActiveRef.current = false;
       setIsRunning(false);
       setStreamingPhase('idle');
@@ -902,25 +893,38 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     const snapshotContent = typeof snapshot.content === 'string' && !isControlOnlyAssistantContent(snapshot.content)
       ? sanitizeAssistantContent(snapshot.content)
       : '';
+    const snapshotToolCalls: ToolCall[] = Array.isArray(snapshot.toolCalls)
+      ? snapshot.toolCalls.map((toolCall: any) => ({
+          id: toolCall.id || nextId(),
+          name: toolCall.name,
+          arguments: toolCall.arguments,
+          startedAt: typeof toolCall.startedAt === 'number' ? toolCall.startedAt : Date.now(),
+          endedAt: typeof toolCall.endedAt === 'number' ? toolCall.endedAt : undefined,
+          status: toolCall.status === 'running' || toolCall.status === 'error' ? toolCall.status : 'done',
+        }))
+      : [];
+    const runningToolCall = getLastRunningToolCall(snapshotToolCalls);
+    const snapshotToolNameCandidate = snapshot.toolName || snapshot.name || runningToolCall?.name || null;
+    const snapshotToolName = snapshotToolNameCandidate ? resolveToolName(snapshotToolNameCandidate) : null;
     const rawStatusText = typeof snapshot.statusText === 'string' ? snapshot.statusText.trim() : '';
     const hasStatusSignal = Boolean(rawStatusText)
       || snapshot.compactionPhase === 'compacting'
       || snapshot.compactionPhase === 'compacted';
     const shouldHydrateLiveState = Boolean(snapshotContent)
-      || Boolean(snapshot.toolName)
+      || Boolean(snapshotToolName)
       || hasStatusSignal
       || Boolean(streamingAssistantIdRef.current);
     if (!shouldHydrateLiveState) {
       return false;
     }
-    const shouldMaterializeBubble = Boolean(snapshotContent) || Boolean(snapshot.toolName) || Boolean(streamingAssistantIdRef.current);
+    const shouldMaterializeBubble = Boolean(snapshotContent) || Boolean(snapshotToolName) || Boolean(streamingAssistantIdRef.current);
 
     isStreamActiveRef.current = true;
     suppressLiveBubbleContentRef.current = true;
     setIsRunning(true);
     setStreamingPhase(resumePhase);
-    setActiveToolName(snapshot.toolName || null);
-    setStatusText(snapshot.toolName ? `Using ${snapshot.toolName}…` : (rawStatusText || 'Reconnecting to stream…'));
+    setActiveToolName(snapshotToolName || null);
+    setStatusText(snapshotToolName ? getToolStatusText(snapshotToolName, rawStatusText) : (rawStatusText || 'Reconnecting to stream…'));
     setConnectionNotice(null);
 
     applyCompactionSnapshotState(snapshot.compactionPhase);
@@ -931,7 +935,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     lastSegmentStartRef.current = 0;
     lastRawTextLenRef.current = snapshotContent.length;
 
-    if (assistantId && (snapshot.model || snapshot.provenance)) {
+    if (assistantId && (snapshot.model || snapshot.provenance || snapshotToolCalls.length > 0)) {
       const normalizedModel = canonicalizePortalModelId(String(snapshot.model || ''));
       const normalizedProvenance = typeof snapshot.provenance === 'string' ? snapshot.provenance : undefined;
       setMessages(prev => prev.map(m => (
@@ -940,6 +944,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
               ...m,
               model: normalizedModel || m.model,
               provenance: normalizedProvenance || m.provenance,
+              toolCalls: snapshotToolCalls.length > 0 ? snapshotToolCalls : (m.toolCalls || []),
             }
           : m
       )));
@@ -1123,7 +1128,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   // ── WS Event Handler ──
   const handleWsEvent = useCallback((data: any) => {
     const passthrough = ['connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended', 'run_resumed', 'exec_approval', 'exec_approval_resolved'];
-    const autoCreateBubbleTypes = ['text', 'tool_start', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
+    const autoCreateBubbleTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
     const waitForVisibleStreamTypes = ['status', 'thinking', 'done', 'error'];
     if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOnlyAssistantContent(data.content)) {
       return;
@@ -1181,14 +1186,13 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         compactionPhaseRef.current = 'compacting';
         setCompactionPhase('compacting');
         setStatusText('Compacting context…');
-        appendSystemNotice('Context compaction started.');
         if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
         break;
       }
       case 'compaction_end': {
         compactionPhaseRef.current = 'compacted';
         setCompactionPhase('compacted');
-        appendSystemNotice('Context compaction finished.');
+        appendSystemNotice('Context compacted');
         if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
         compactionTimerRef.current = setTimeout(() => { compactionPhaseRef.current = 'idle'; setCompactionPhase('idle'); compactionTimerRef.current = null; }, 3000);
         setStatusText(null);
@@ -1197,17 +1201,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       case 'tool_start': {
         clearResumeSeededContent(assistantId);
         hasRealToolEventsRef.current = true;
-        const toolName = (data.toolName || data.content || 'tool').replace(/^Using tool:\s*/i, '').replace(/^[^\s]+\s+Using tool:\s*/i, '').trim();
+        const toolName = resolveToolName(data.toolName, data.name, data.content, 'tool');
         if (assembledRef.current && assembledRef.current.trim().length > 0) {
-          console.log('[CASCADE-DIAG] tool_start graduation:', {
-            oldSegStartRef: lastSegmentStartRef.current,
-            assembledLen: assembledRef.current.length,
-            rawTextLen: lastRawTextLenRef.current,
-            newSegStartRef: lastRawTextLenRef.current,
-          });
           lastSegmentStartRef.current = lastRawTextLenRef.current;
         }
-        setStatusText(data.content || 'Using tool…');
+        setStatusText(getToolStatusText(toolName, data.content));
         setStreamingPhase('tool');
         setActiveToolName(toolName);
         const toolId = 'tool-' + (++toolCounterRef.current);
@@ -1221,9 +1219,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       }
       case 'tool_end': {
         lastSegmentStartRef.current = lastRawTextLenRef.current;
-        setStatusText(null);
-        setActiveToolName(null);
         const toolResult = data.toolResult || data.content || 'Completed';
+        let nextRunningToolName: string | null = null;
         setMessages(prev => prev.map(m => {
           if (m.id !== assistantId) return m;
           const calls = [...(m.toolCalls || [])];
@@ -1233,13 +1230,24 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
               break;
             }
           }
+          const nextRunningTool = getLastRunningToolCall(calls);
+          nextRunningToolName = nextRunningTool ? resolveToolName(nextRunningTool.name) : null;
           return { ...m, toolCalls: calls };
         }));
+        if (nextRunningToolName) {
+          setStreamingPhase('tool');
+          setActiveToolName(nextRunningToolName);
+          setStatusText(getToolStatusText(nextRunningToolName));
+        } else {
+          setStreamingPhase(assembledRef.current ? 'streaming' : 'thinking');
+          setStatusText(null);
+          setActiveToolName(null);
+        }
         break;
       }
       case 'tool_used': {
         if (hasRealToolEventsRef.current) break;
-        const tn = data.content || 'tool';
+        const tn = resolveToolName(data.toolName, data.name, data.content, 'tool');
         setMessages(prev => {
           const exists = prev.some(m =>
             m.role === 'assistant' && (m.toolCalls || []).some(
@@ -1254,32 +1262,47 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             : m
           );
         });
+        setStreamingPhase('tool');
+        setActiveToolName(tn);
+        setStatusText(getToolStatusText(tn));
         break;
       }
       case 'toolCall': {
         clearResumeSeededContent(assistantId);
         const tid = 'tool-' + (++toolCounterRef.current);
         setStreamingPhase('tool');
-        setActiveToolName(data.name);
-        setStatusText('Using tool: ' + data.name);
+        const toolName = resolveToolName(data.toolName, data.name, 'tool');
+        setActiveToolName(toolName);
+        setStatusText(getToolStatusText(toolName));
         setMessages(prev => prev.map(m =>
           m.id === assistantId
-            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: data.id || tid, name: data.name, arguments: data.arguments, startedAt: Date.now(), status: 'running' as const }] }
+            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: data.id || tid, name: toolName, arguments: data.arguments, startedAt: Date.now(), status: 'running' as const }] }
             : m
         ));
         break;
       }
       case 'toolResult': {
         lastSegmentStartRef.current = lastRawTextLenRef.current;
-        setStatusText(null);
-        setActiveToolName(null);
+        const resolvedToolName = resolveToolName(data.toolName, data.name, data.content, 'tool');
+        let nextRunningToolName: string | null = null;
         setMessages(prev => prev.map(m => {
           if (m.id !== assistantId) return m;
           const calls = [...(m.toolCalls || [])];
-          const idx = calls.findIndex(c => c.id === data.toolCallId || c.name === data.toolName);
+          const idx = calls.findIndex(c => c.id === data.toolCallId || c.name === resolvedToolName);
           if (idx >= 0) calls[idx] = { ...calls[idx], endedAt: Date.now(), result: data.content, status: 'done' };
+          const nextRunningTool = getLastRunningToolCall(calls);
+          nextRunningToolName = nextRunningTool ? resolveToolName(nextRunningTool.name) : null;
           return { ...m, toolCalls: calls };
         }));
+        if (nextRunningToolName) {
+          setStreamingPhase('tool');
+          setActiveToolName(nextRunningToolName);
+          setStatusText(getToolStatusText(nextRunningToolName));
+        } else {
+          setStreamingPhase(assembledRef.current ? 'streaming' : 'thinking');
+          setStatusText(null);
+          setActiveToolName(null);
+        }
         break;
       }
       case 'segment_break': {
@@ -1305,25 +1328,6 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         lastRawTextLenRef.current = fullText.length;
         const st = fullText.substring(lastSegmentStartRef.current);
 
-        if (thinkingContent && st && st.includes(thinkingContent.slice(0, 50))) {
-          console.warn('[CASCADE-DIAG] ⚠️ THINKING LEAK: thinking text found inside text blocks!', {
-            thinkingLen: thinkingContent.length,
-            textLen: st.length,
-            rawTextLen: fullText.length,
-          });
-        }
-
-        if (lastSegmentStartRef.current > 0 || fullText.length > 500) {
-          console.log('[CASCADE-DIAG] delta:', {
-            segStartRef: lastSegmentStartRef.current,
-            fullTextLen: fullText.length,
-            slicedLen: st.length,
-            rawTextLen: fullText.length,
-            sanitizedLen: safeChunk.length,
-            replace: data.replace === true,
-          });
-        }
-
         resumeSeededContentRef.current = false;
         suppressLiveBubbleContentRef.current = false;
         assembledRef.current = fullText;
@@ -1348,7 +1352,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             : (typeof data?.model === 'string' ? data.model : '')
         );
         const cid = streamingAssistantIdRef.current;
-        const shouldHideTurn = !fc.trim() && !hasRealToolEventsRef.current;
+        const shouldHideTurn = !fc.trim() && !hasRealToolEventsRef.current && !thinkingContentRef.current.trim();
         setStatusText(null);
         setStreamingPhase('idle');
         setIsRunning(false);
@@ -1412,7 +1416,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         const resumeContent = typeof data.content === 'string' && !isControlOnlyAssistantContent(data.content)
           ? sanitizeAssistantContent(data.content)
           : '';
-        const shouldMaterializeBubble = Boolean(streamingAssistantIdRef.current) || Boolean(data.toolName) || Boolean(resumeContent);
+        const resumeToolName = resolveToolName(data.toolName, data.name, data.content);
+        const shouldMaterializeBubble = Boolean(streamingAssistantIdRef.current) || Boolean(resumeToolName) || Boolean(resumeContent);
         if (!shouldMaterializeBubble) {
           break;
         }
@@ -1425,24 +1430,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         isStreamActiveRef.current = true;
         setIsRunning(true);
         setStreamingPhase(resumePhase);
-        setActiveToolName(data.toolName || null);
-        setStatusText(data.toolName ? `Using ${data.toolName}…` : null);
+        setActiveToolName(resumeToolName || null);
+        setStatusText(resumeToolName ? getToolStatusText(resumeToolName) : null);
         if (resumePhase === 'streaming' && typeof data.content === 'string' && !isControlOnlyAssistantContent(data.content)) {
           resumeSeededContentRef.current = true;
           const safeChunk = sanitizeAssistantContent(data.content);
           const fullText = mergeAssistantStream(assembledRef.current, safeChunk, { replace: true });
           lastRawTextLenRef.current = fullText.length;
           const st = fullText.substring(lastSegmentStartRef.current);
-          if (lastSegmentStartRef.current > 0 || fullText.length > 500) {
-            console.log('[CASCADE-DIAG] delta:', {
-              segStartRef: lastSegmentStartRef.current,
-              fullTextLen: fullText.length,
-              slicedLen: st.length,
-              rawTextLen: fullText.length,
-              sanitizedLen: safeChunk.length,
-              replace: true,
-            });
-          }
           assembledRef.current = fullText;
           const cid = streamingAssistantIdRef.current;
           setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: st } : m));
@@ -1461,8 +1456,8 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         }
         isStreamActiveRef.current = true;
         setIsRunning(true);
-        setStreamingPhase('thinking');
-        setStatusText('🧠 Agent is thinking…');
+        setStreamingPhase(activeToolName ? 'tool' : 'thinking');
+        setStatusText(activeToolName ? getToolStatusText(activeToolName) : '🧠 Agent is thinking…');
         resetWatchdog();
         break;
       }
@@ -1479,7 +1474,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       case 'keepalive':
         break;
     }
-  }, [clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent, finalizeStreamingAssistant]);
+  }, [activeToolName, clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent, finalizeStreamingAssistant]);
 
   const handleWsEventRef = useRef(handleWsEvent);
   useEffect(() => { handleWsEventRef.current = handleWsEvent; }, [handleWsEvent]);
@@ -2287,7 +2282,16 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
               }
 
               if (msg.role === 'system') {
-                return (
+                return isCompactionNotice(msg.content) ? (
+                  <div key={msg.id} className="px-3 py-1.5">
+                    <div className="mx-auto inline-flex max-w-[90%] items-center gap-2 rounded-full border border-sky-400/20 bg-sky-500/10 px-3 py-1.5 text-center text-[10px] tracking-wide text-sky-200 shadow-lg shadow-sky-500/5">
+                      <span className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-sky-400/20 bg-sky-400/10">
+                        <Radio size={9} className="text-sky-300" />
+                      </span>
+                      {msg.content}
+                    </div>
+                  </div>
+                ) : (
                   <div key={msg.id} className="px-3 py-1.5">
                     <div className="mx-auto max-w-[90%] rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-center text-[10px] tracking-wide text-slate-400">
                       {msg.content}
@@ -2311,9 +2315,15 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                   || !!statusText
                 );
                 const visibleContent = suppressCurrentBubbleText ? '' : msg.content;
+                const visibleThinkingContent = (isCurrentlyStreaming && thinkingContent.trim())
+                  ? thinkingContent
+                  : (msg.thinkingContent || '');
+                const hasThinkingContent = !!visibleThinkingContent.trim();
                 const hasContent = !!visibleContent;
                 const modelLabel = msg.model ? modelDisplayName(msg.model) : '';
                 const timeLabel = msg.createdAt ? msg.createdAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
+                const showMessageBubble = hasContent || (isCurrentlyStreaming && !hasThinkingContent);
+                const showMeta = hasThinkingContent || hasContent || toolCalls.length > 0;
 
                 return (
                   <div key={msg.id} className="px-3 py-1.5 group">
@@ -2325,62 +2335,65 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                       </div>
                     )}
 
-                    {/* Message content */}
-                    {(hasContent || isCurrentlyStreaming) && (
+                    {(hasThinkingContent || showMessageBubble) && (
                       <div className="flex gap-2 items-start">
                         <div className="w-5 h-5 rounded-full bg-emerald-500/20 flex items-center justify-center flex-shrink-0 mt-0.5 text-[8px] font-bold text-emerald-400">
                           AI
                         </div>
                         <div className="flex-1 min-w-0 max-w-[90%]">
-                          <div
-                            className={`rounded-2xl rounded-bl-sm px-3 py-2 transition-all duration-500 ${
-                              hasContent && visibleContent.startsWith('⚠️')
-                                ? 'bg-red-500/10 border border-red-500/20'
-                                : isCurrentlyStreaming
-                                  ? 'border border-dashed bg-[var(--accent-bg-subtle)]'
-                                  : 'bg-white/[0.06] border border-solid border-white/[0.08]'
-                            }`}
-                            style={isCurrentlyStreaming && !(hasContent && visibleContent.startsWith('⚠️'))
-                              ? { borderColor: 'var(--accent-border-hover)', boxShadow: '0 0 12px var(--accent-shadow), inset 0 0 0 1px var(--accent-bg)' }
-                              : undefined
-                            }
-                          >
-                            {hasContent && visibleContent.startsWith('⚠️') ? (
-                              <div className="flex items-start gap-1.5">
-                                <XCircle size={12} className="text-red-400 flex-shrink-0 mt-0.5" />
-                                <div className="text-[11px] text-red-300">{visibleContent.replace(/^⚠️\s*/, '')}</div>
+                          {hasThinkingContent && (
+                            <div className="mb-1.5 rounded-2xl rounded-bl-sm border border-violet-400/15 bg-violet-500/[0.08] px-3 py-2 shadow-lg shadow-black/10">
+                              <div className="mb-1 flex items-center gap-1.5 text-[9px] font-medium uppercase tracking-wide text-violet-200/75">
+                                <Sparkles size={10} className="text-violet-300/75" />
+                                <span>thinking</span>
+                                {isCurrentlyStreaming && !hasContent ? <span className="h-1 w-1 rounded-full bg-violet-300/70 animate-pulse" /> : null}
                               </div>
-                            ) : (
-                              <>
-                                <div
-                                  className={`flex items-center gap-1.5 mb-1 transition-all duration-300 overflow-hidden ${
-                                    isCurrentlyStreaming ? 'max-h-5 opacity-100' : 'max-h-0 opacity-0 pointer-events-none'
-                                  }`}
-                                  aria-hidden={!isCurrentlyStreaming}
-                                >
-                                  <span className="text-[9px] font-medium tracking-wide uppercase" style={{ color: 'var(--accent-light)', opacity: 0.7 }}>thinking</span>
-                                  <span className="w-1 h-1 rounded-full animate-pulse" style={{ backgroundColor: 'var(--accent-light)', opacity: 0.5 }} />
+                              <div className={`text-[11px] leading-relaxed ${isCurrentlyStreaming && !hasContent ? 'streaming-cursor' : ''}`}>
+                                <MarkdownRenderer content={visibleThinkingContent} isStreaming={isCurrentlyStreaming && !hasContent} />
+                              </div>
+                            </div>
+                          )}
+
+                          {showMessageBubble && (
+                            <div
+                              className={`rounded-2xl rounded-bl-sm px-3 py-2 transition-all duration-500 ${
+                                hasContent && visibleContent.startsWith('⚠️')
+                                  ? 'bg-red-500/10 border border-red-500/20'
+                                  : isCurrentlyStreaming
+                                    ? 'border border-dashed bg-[var(--accent-bg-subtle)]'
+                                    : 'bg-white/[0.06] border border-solid border-white/[0.08]'
+                              }`}
+                              style={isCurrentlyStreaming && !(hasContent && visibleContent.startsWith('⚠️'))
+                                ? { borderColor: 'var(--accent-border-hover)', boxShadow: '0 0 12px var(--accent-shadow), inset 0 0 0 1px var(--accent-bg)' }
+                                : undefined
+                              }
+                            >
+                              {hasContent && visibleContent.startsWith('⚠️') ? (
+                                <div className="flex items-start gap-1.5">
+                                  <XCircle size={12} className="text-red-400 flex-shrink-0 mt-0.5" />
+                                  <div className="text-[11px] text-red-300">{visibleContent.replace(/^⚠️\s*/, '')}</div>
                                 </div>
+                              ) : (
                                 <div className={`text-[11px] leading-relaxed ${isCurrentlyStreaming ? 'streaming-cursor' : ''}`}>
                                   <MarkdownRenderer content={visibleContent} isStreaming={isCurrentlyStreaming} />
                                 </div>
-                              </>
-                            )}
-                          </div>
-                          {/* Footer + actions */}
-                          <div className="flex items-center gap-2 mt-1 ml-1 min-h-[16px]">
-                            {msg.provenance ? <span className="text-[10px] text-slate-500 italic truncate">{msg.provenance}</span> : null}
-                            {modelLabel ? <span className="text-[10px] text-slate-500 truncate">• {modelLabel}</span> : null}
-                            {timeLabel ? <span className="text-[10px] text-slate-600 truncate">• {timeLabel}</span> : null}
-                            <div className="flex items-center gap-1 ml-auto opacity-0 group-hover:opacity-100 transition-opacity">
-                              {hasContent && <CopyButton text={msg.content} />}
+                              )}
                             </div>
-                          </div>
+                          )}
+
+                          {showMeta && (
+                            <div className="flex items-center gap-2 mt-1 ml-1 min-h-[16px]">
+                              {msg.provenance ? <span className="text-[10px] text-slate-500 italic truncate">{msg.provenance}</span> : null}
+                              {modelLabel ? <span className="text-[10px] text-slate-500 truncate">• {modelLabel}</span> : null}
+                              {timeLabel ? <span className="text-[10px] text-slate-600 truncate">• {timeLabel}</span> : null}
+                              <div className="flex items-center gap-1 ml-auto opacity-0 group-hover:opacity-100 transition-opacity">
+                                {hasContent && <CopyButton text={msg.content} />}
+                              </div>
+                            </div>
+                          )}
                         </div>
                       </div>
                     )}
-
-                    {/* Loading indicator removed — the unified bubble above now handles empty streaming state via the "thinking" label */}
                   </div>
                 );
               }

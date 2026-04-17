@@ -2,6 +2,31 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.3] — 2026-04-17
+
+### Improved
+- **Agent Chat and project chat finally reconcile live state with history correctly**: pending user turns and the active assistant bubble now survive history reloads, post-turn reconciliation waits for the gateway to catch up, and reloads restore separate thinking, tool, text, and compaction phases instead of flattening them into one stale transcript.
+- **Live tool activity is much easier to follow**: main chat, project chat, and the composer status rail now share tool-specific icons, labels, and status copy, and running tools stay visible during compaction or maintenance instead of being overwritten by fake generic “thinking” states.
+- **Fresh OpenClaw sessions behave like real sessions earlier**: synthetic `new-*` portal sessions are materialized on demand, session-model patching can create the concrete OpenClaw session before first send, session-control loading states are more honest, and model discovery now reads the live OpenClaw config directly instead of shelling out through a brittle CLI path.
+- **Projects regained richer public-safe file viewers**: the lazily loaded Monaco/text, Markdown/HTML preview, PDF, spreadsheet, and binary-file viewer components are back in the public source tree, which restores clean public builds and broadens in-browser preview coverage.
+- **Gemini subscription setup is a first-class path now**: the provider catalog now includes Google Gemini account OAuth with guided instructions, and the OAuth prompt automation is more tolerant of Gemini’s evolving CLI prompt order.
+
+### Fixed
+- **The post-turn stale-history race behind disappearing or duplicated assistant turns is closed**: a just-finished local turn is no longer immediately overwritten by stale gateway history, which fixes the refresh-only chat-state regression that showed up most painfully in live OpenClaw runs.
+- **Streaming merge logic no longer eats letters or spaces while deduping replay noise**: small token deltas are preserved, while large repeated suffix or cumulative chunks are still de-duplicated safely.
+- **Fresh-session model drift and 404s are fixed**: the portal now normalizes `portal-*` session slugs consistently and can create concrete OpenClaw sessions before reading info or patching models, stopping `new-*` session keys from silently failing session-info and model requests.
+- **Deploys stop serving stale hashed frontend bundles longer than they should**: the production SPA HTML cache now refreshes its source snapshot before computing the cache key, so deep links stop clinging to old bundle filenames after a deploy.
+- **Login, auth, and setup handoff are sturdier**: post-login navigation can force a clean reload when needed, provider setup completion now refreshes surrounding settings state, and auth parsing prefers explicit Bearer headers over stale cookies.
+- **Remote Desktop access is tighter and less foot-gunny**: raw websockify is loopback-only, audio proxy ports are configurable, noVNC and audio routes require elevated portal auth, and readiness/docs now reflect the real loopback-only expectation.
+- **Gateway restart fallback is safer on hosts without usable user-systemd**: when `openclaw gateway restart` cannot manage the service, the portal falls back to restarting the system service or signaling the live gateway so runtime compatibility fixes actually take effect.
+
+### Security
+- **Public release/export safety got stricter**: the GitHub export script now blocks dirty working trees by default and scans for beta or staging infrastructure markers before anything can be pushed publicly.
+
+### Maintenance
+- **Regression coverage was added for tool-phase maintenance snapshots**: `StreamEventBus` now has direct tests for keeping a running tool visible while compaction or maintenance events arrive.
+
+
 ## [3.25.2] — 2026-04-14
 
 ### Fixed

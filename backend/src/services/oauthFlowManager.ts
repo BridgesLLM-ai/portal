@@ -79,7 +79,8 @@ function updateSessionFromOutput(session: OAuthSession) {
 
   if (session.provider === 'google-gemini-cli') {
     // Auto-confirm trust folder prompt (option 1 = "Trust folder")
-    if (!session.sentInitialConfirm && /Do you trust the files in this folder\?/i.test(text)) {
+    if (!(session as any).__trustFolderConfirmed && /Do you trust the files in this folder\?/i.test(text)) {
+      (session as any).__trustFolderConfirmed = true;
       session.sentInitialConfirm = true;
       console.log('[NativeCLI] Gemini trust-folder prompt detected, auto-confirming...');
       setTimeout(() => {
@@ -87,9 +88,12 @@ function updateSessionFromOutput(session: OAuthSession) {
       }, 500);
     }
 
-    // Auto-confirm the Google OAuth caution prompt
-    if (session.sentInitialConfirm && /Continue with Google Gemini CLI OAuth\?/i.test(text) && !(session as any).__oauthConfirmed) {
+    // Auto-confirm the Google OAuth caution prompt.
+    // Gemini can now surface this prompt even when the trust-folder prompt never appears,
+    // so gating on sentInitialConfirm leaves the default selection on "No" and the PTY exits.
+    if (/Continue with Google Gemini CLI OAuth\?/i.test(text) && !(session as any).__oauthConfirmed) {
       (session as any).__oauthConfirmed = true;
+      session.sentInitialConfirm = true;
       console.log('[NativeCLI] Google OAuth caution prompt detected, auto-confirming...');
       setTimeout(() => {
         session.process.write('\u001b[D');  // left-arrow to select "Yes"

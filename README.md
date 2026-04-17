@@ -76,6 +76,14 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.3 (April 17, 2026)
+- **Live chat-state reconciliation is finally honest**: Agent Chat and project chat now preserve pending user turns and the active assistant bubble while history reloads, delay post-turn reconciliation until the gateway catches up, and restore separate thinking, tool, text, and compaction phases on refresh instead of flattening them into stale garbage.
+- **Tool activity is much clearer while a run is in flight**: the composer rail, main chat, and project chat now share tool-specific glyphs and status copy, and running tools stay visible during maintenance or compaction instead of being replaced by a fake generic thinking message.
+- **Fresh OpenClaw sessions and model controls are more reliable**: `new-*` portal sessions can be materialized on demand before model patching, session-control loading states are more truthful, and model discovery now reads the live OpenClaw config instead of relying on brittle CLI scraping.
+- **Projects regained richer public-safe preview coverage**: Markdown/HTML, PDF, spreadsheet, text, Monaco, and binary-file viewers are back in the public source tree, which fixes clean public builds and improves in-browser file previews.
+- **Ops and release hardening kept pace**: Remote Desktop is locked tighter behind elevated auth and loopback-only websockify, Gemini account OAuth is a first-class setup path, gateway restart fallback is safer on hosts without user-systemd, and the public export script now blocks dirty trees plus beta/staging contamination before a push can happen.
+
+
 ### v3.25.2 (April 14, 2026)
 - **OpenClaw compatibility hotfix status works again on current installs**: the portal now inspects the real hashed `heartbeat-runner-*` and `get-reply-*` bundles, recognizes the newer upstream exec-completion detector, and stops falsely calling modern OpenClaw builds unsupported when the relay hotfix can still be applied safely.
 - **This patch release fixes public release parity, not just local production knowledge**: the source tree, installer artifacts, and hosted download now all ship the same compatibility behavior instead of depending on a private manual workaround, and the public source export again contains the lazy project viewer components needed for a clean frontend build.

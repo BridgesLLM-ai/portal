@@ -37,7 +37,7 @@ import { isElevated, isOwner } from '../../utils/authz';
 import { agentToolsAPI, AgentTool } from '../../api/agentTools';
 import { gatewayAPI, type CompatibilityHotfixStatus } from '../../api/endpoints';
 import SlashCommandMenu from './SlashCommandMenu';
-import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../utils/slashCommands';
+import { findSlashCommand, matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../utils/slashCommands';
 import { mergeExecApprovalQueues } from '../../utils/execApprovalQueue';
 import { executeSlashCommand } from '../../utils/slashCommandExecutor';
 import client from '../../api/client';
@@ -53,6 +53,8 @@ import {
   getShortModelLabel,
 } from '../../utils/modelId';
 import ComposerStatusBadge from './ComposerStatusBadge';
+import ToolGlyph from './ToolGlyph';
+import { getToolPresentation, getToolSummary, isCompactionNotice } from '../../utils/toolPresentation';
 
 /* ─── Per-agent identity ────────────────────────────────────────────────── */
 
@@ -175,7 +177,7 @@ const OPENCLAW_MODEL_FALLBACK = [
   'anthropic/claude-opus-4-6', 'anthropic/claude-sonnet-4-6', 'anthropic/claude-sonnet-4-5',
   'anthropic/claude-haiku-4-5', 'anthropic/claude-opus-4-5',
   'google/gemini-2.5-flash', 'google/gemini-2.5-pro',
-  'openai-codex/gpt-5.1', 'openai-codex/gpt-5.2', 'openai-codex/gpt-5.3-codex', 'openai-codex/gpt-5.4',
+  'openai-codex/gpt-5.1', 'openai-codex/gpt-5.2', 'openai-codex/gpt-5.3-codex', 'openai-codex/gpt-5.4', 'openai-codex/gpt-5.4-mini',
   'openrouter/moonshotai/kimi-k2', 'openrouter/moonshotai/kimi-k2.5',
   'openrouter/deepseek/deepseek-v3.2', 'openrouter/meta-llama/llama-4-maverick',
 ];
@@ -305,6 +307,7 @@ function ModelPicker({
   value,
   onChange,
   models,
+  loading = false,
   supportsCustomModelInput = true,
   modelCatalogKind = 'dynamic',
   disabled = false,
@@ -314,6 +317,7 @@ function ModelPicker({
   value: string;
   onChange: (model: string) => void;
   models: string[];
+  loading?: boolean;
   supportsCustomModelInput?: boolean;
   modelCatalogKind?: 'none' | 'declared' | 'dynamic';
   disabled?: boolean;
@@ -355,14 +359,21 @@ function ModelPicker({
         title={disabled ? 'Finish or abort the current response before switching models' : (value || 'Default model')}
       >
         {/* Icon-only on mobile, text on desktop */}
-        <Code2 size={13} className="sm:hidden flex-shrink-0" />
+        {loading ? <Loader2 size={13} className="sm:hidden flex-shrink-0 animate-spin" /> : <Code2 size={13} className="sm:hidden flex-shrink-0" />}
         <div className="hidden sm:flex items-center gap-1.5 min-w-0 max-w-[220px]">
+          {loading ? <Loader2 size={12} className="flex-shrink-0 animate-spin text-violet-300" /> : null}
           {value ? <ModelMeta modelId={value} compact /> : <span className="truncate max-w-[120px]">Default model</span>}
         </div>
         <ChevronDown size={12} className={`transition-transform ${open ? 'rotate-180' : ''} hidden sm:block`} />
       </button>
       <ModelPickerDropdown open={open} onClose={() => { setOpen(false); setCustom(false); }}>
         <div className="p-1 max-h-80 overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
+          {loading && (
+            <div className="px-3 py-2 text-[11px] text-slate-400 border-b border-white/[0.06] flex items-center gap-2">
+              <Loader2 size={12} className="animate-spin text-violet-300" />
+              Loading models…
+            </div>
+          )}
           {isCustomOnlyCatalog && (
             <div className="px-3 py-2 text-[11px] text-slate-500 border-b border-white/[0.06]">
               This provider does not publish a model catalog here. Enter the exact model ID manually.
@@ -604,6 +615,7 @@ function supportsOpenClawFastModeModel(model?: string | null): boolean {
 }
 
 interface SessionControlsProps {
+  loading?: boolean;
   thinkingLevel: ThinkingLevel;
   fastModeEnabled: boolean;
   compactionModelOverride: string;
@@ -635,6 +647,7 @@ interface SessionControlsProps {
 }
 
 function SessionControls({
+  loading = false,
   thinkingLevel,
   fastModeEnabled,
   compactionModelOverride,
@@ -735,6 +748,13 @@ function SessionControls({
             </div>
 
             <div className="p-2.5 space-y-2">
+              {loading && (
+                <div className="flex items-center gap-2 rounded-lg border border-white/[0.08] bg-white/[0.03] px-2.5 py-2 text-[11px] text-slate-300">
+                  <Loader2 size={12} className="animate-spin text-violet-300" />
+                  Loading live session controls…
+                </div>
+              )}
+
               <div className="p-2 rounded-lg bg-white/[0.02] space-y-2">
                 <div className="flex items-center gap-2">
                   <Sparkles size={14} className={localThinking !== 'off' ? 'text-violet-400' : 'text-slate-500'} />
@@ -749,7 +769,7 @@ function SessionControls({
                   max={visibleThinkingLevels.length - 1}
                   step={1}
                   value={Math.max(0, thinkingIndex)}
-                  disabled={disabled || !sessionControlsSupported}
+                  disabled={disabled || loading || !sessionControlsSupported}
                   onChange={(e) => {
                     // Update visual position immediately (local state via parent)
                     const idx = Number(e.target.value);
@@ -787,7 +807,7 @@ function SessionControls({
                     onClick={() => {
                       onToggleFastMode();
                     }}
-                    disabled={disabled || !sessionControlsSupported || !fastModeSupported}
+                    disabled={disabled || loading || !sessionControlsSupported || !fastModeSupported}
                     className={`relative w-10 h-5 rounded-full transition-colors ${
                       fastModeEnabled ? 'bg-amber-500' : 'bg-white/[0.12]'
                     } disabled:opacity-50`}
@@ -818,7 +838,7 @@ function SessionControls({
                   <select
                     value={heartbeatModel}
                     onChange={(e) => onSetHeartbeatModel(e.target.value)}
-                    disabled={disabled || heartbeatModelLoading || effectiveHeartbeatModels.length === 0}
+                    disabled={disabled || loading || heartbeatModelLoading || effectiveHeartbeatModels.length === 0}
                     className="w-full rounded-lg border border-white/[0.08] bg-[#141A43] px-2 py-1.5 text-xs text-slate-200 disabled:opacity-50"
                   >
                     <option value="">Default</option>
@@ -847,7 +867,7 @@ function SessionControls({
                 <select
                   value={compactionModelOverride}
                   onChange={(e) => onSetCompactionModelOverride(e.target.value)}
-                  disabled={disabled || compactionModelLoading || compactionModelOptionsLoading || effectiveCompactionModels.length === 0}
+                  disabled={disabled || loading || compactionModelLoading || compactionModelOptionsLoading || effectiveCompactionModels.length === 0}
                   className="w-full rounded-lg border border-white/[0.08] bg-[#141A43] px-2 py-1.5 text-xs text-slate-200 disabled:opacity-50"
                 >
                   <option value="">{compactionModelOptionsLoading ? 'Loading models…' : 'Default'}</option>
@@ -925,7 +945,7 @@ function SessionControls({
 
 /* ─── Agent Settings Drawer (providers + tools) ───────────────────────── */
 
-function AgentSettingsDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
+function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete }: { open: boolean; onClose: () => void; onAiProviderSetupComplete?: () => void }) {
   const { user } = useAuthStore();
   const isAdmin = isElevated(user);
   const [tools, setTools] = useState<AgentTool[]>([]);
@@ -1003,7 +1023,7 @@ function AgentSettingsDrawer({ open, onClose }: { open: boolean; onClose: () => 
 
               {/* ─── AI Providers ─── */}
               {isAdmin && (
-                <AiProviderSetup mode="settings" apiBase="/ai-setup" compact />
+                <AiProviderSetup mode="settings" apiBase="/ai-setup" compact onComplete={onAiProviderSetupComplete} />
               )}
 
               {/* ─── Coding Tools (collapsed) ─── */}
@@ -1071,105 +1091,12 @@ function AgentSettingsDrawer({ open, onClose }: { open: boolean; onClose: () => 
 
 /* ─── Fix #6: Tool Call as centered iMessage system notification pill ───── */
 
-/** Build a human-readable summary of what a tool call is doing */
-function getToolSummary(tool: ToolCall): string {
-  const args = tool.arguments;
-  if (!args) return tool.name;
-
-  const name = tool.name.toLowerCase();
-
-  // File operations
-  if (name === 'read' || name === 'read_file') {
-    const p = args.path || args.file_path || args.filePath;
-    if (p) {
-      const short = String(p).split('/').slice(-2).join('/');
-      return `Read ${short}`;
-    }
-  }
-  if (name === 'write' || name === 'write_file') {
-    const p = args.path || args.file_path || args.filePath;
-    if (p) {
-      const short = String(p).split('/').slice(-2).join('/');
-      return `Write ${short}`;
-    }
-  }
-  if (name === 'edit' || name === 'edit_file') {
-    const p = args.path || args.file_path || args.filePath;
-    if (p) {
-      const short = String(p).split('/').slice(-2).join('/');
-      return `Edit ${short}`;
-    }
-  }
-
-  // Shell
-  if (name === 'exec' || name === 'execute' || name === 'bash' || name === 'shell') {
-    const cmd = args.command || args.cmd;
-    if (cmd) {
-      const short = String(cmd).length > 60 ? String(cmd).substring(0, 57) + '…' : String(cmd);
-      return `Run \`${short}\``;
-    }
-  }
-
-  // Search
-  if (name === 'web_search' || name === 'search') {
-    const q = args.query;
-    if (q) return `Search "${String(q).substring(0, 50)}"`;
-  }
-  if (name === 'web_fetch' || name === 'fetch') {
-    const u = args.url;
-    if (u) {
-      try { return `Fetch ${new URL(String(u)).hostname}`; } catch { return `Fetch URL`; }
-    }
-  }
-
-  // Memory
-  if (name === 'memory_search') {
-    const q = args.query;
-    if (q) return `Search memory: "${String(q).substring(0, 40)}"`;
-  }
-  if (name === 'memory_get') {
-    const p = args.path;
-    if (p) return `Read memory: ${String(p).split('/').pop()}`;
-  }
-
-  // Browser
-  if (name === 'browser') {
-    const a = args.action;
-    if (a) return `Browser: ${a}`;
-  }
-
-  // Image analysis
-  if (name === 'image') {
-    return 'Analyze image';
-  }
-
-  // Sessions / sub-agents
-  if (name === 'sessions_spawn') {
-    const agent = args.agentId;
-    return agent ? `Spawn ${agent}` : 'Spawn sub-agent';
-  }
-  if (name === 'sessions_send') {
-    return 'Message sub-agent';
-  }
-
-  // TTS
-  if (name === 'tts') return 'Generate speech';
-
-  // Message
-  if (name === 'message') {
-    const a = args.action;
-    return a ? `Message: ${a}` : 'Send message';
-  }
-
-  // Fallback: tool name
-  return tool.name;
-}
-
 function ToolCallBlock({ tool }: { tool: ToolCall }) {
   const [expanded, setExpanded] = useState(false);
   const duration = tool.endedAt ? ((tool.endedAt - tool.startedAt) / 1000).toFixed(1) : null;
   const hasDetails = !!(tool.result || tool.arguments);
   const summary = getToolSummary(tool);
+  const presentation = getToolPresentation(tool.name);
 
   return (
     <motion.div
@@ -1181,18 +1108,19 @@ function ToolCallBlock({ tool }: { tool: ToolCall }) {
       <div className="flex flex-col items-center max-w-md w-full">
         <button
           onClick={() => hasDetails && setExpanded(!expanded)}
-          className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-white/[0.04] border border-white/[0.07] hover:bg-white/[0.07] transition-colors text-[11px] text-slate-400"
+          className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full border transition-colors text-[11px] text-slate-400 ${presentation.surfaceClass}`}
         >
-          {tool.status === 'running' ? (
-            <Loader2 size={11} className="text-amber-400 animate-spin" />
-          ) : (
-            <Wrench size={11} className="text-emerald-400" />
-          )}
-          <span className="text-slate-300">
+          <span className={`inline-flex h-5 w-5 items-center justify-center rounded-full border ${presentation.iconBadgeClass}`}>
+            <ToolGlyph toolName={tool.name} size={11} className={presentation.iconClass} />
+          </span>
+          <span className="text-slate-200">
             {summary}
           </span>
+          {tool.status === 'running' ? (
+            <Loader2 size={10} className={`animate-spin ${presentation.iconClass}`} />
+          ) : null}
           {duration && (
-            <span className="text-slate-600">· {duration}s</span>
+            <span className="text-slate-500">· {duration}s</span>
           )}
           {hasDetails && (
             <ChevronRight size={10} className={`text-slate-600 transition-transform ${expanded ? 'rotate-90' : ''}`} />
@@ -1785,12 +1713,36 @@ const UserBubble = React.memo(function UserBubble({ message, avatarUrl, username
 
 /* ─── Assistant Message Bubble ──────────────────────────────────────────── */
 
+const AssistantThinkingBubble = React.memo(function AssistantThinkingBubble({
+  content,
+  isStreaming,
+}: {
+  content: string;
+  isStreaming: boolean;
+}) {
+  if (!content.trim()) return null;
+
+  return (
+    <div className="mb-2 rounded-2xl rounded-bl-sm border border-violet-400/15 bg-violet-500/[0.08] px-4 py-2.5 shadow-lg shadow-black/10">
+      <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-violet-200/75">
+        <Sparkles size={11} className="text-violet-300/75" />
+        <span>thinking</span>
+        {isStreaming ? <span className="h-1 w-1 rounded-full bg-violet-300/70 animate-pulse" /> : null}
+      </div>
+      <div className={isStreaming ? 'streaming-cursor text-slate-300/95' : 'text-slate-300/95'}>
+        <MarkdownRenderer content={content} isStreaming={isStreaming} />
+      </div>
+    </div>
+  );
+});
+
 const AssistantBubble = React.memo(function AssistantBubble({
   agent,
   message,
   avatarUrl,
   isLast,
   isStreaming,
+  liveThinkingContent,
   onRetry,
 }: {
   agent: AgentIdentity;
@@ -1798,6 +1750,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
   avatarUrl?: string;
   isLast: boolean;
   isStreaming: boolean;
+  liveThinkingContent?: string;
   onRetry?: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
@@ -1806,6 +1759,10 @@ const AssistantBubble = React.memo(function AssistantBubble({
   const toolCalls = message.toolCalls || [];
   const isCurrentlyStreaming = isLast && isStreaming;
   const hasContent = !!message.content;
+  const visibleThinkingContent = (typeof liveThinkingContent === 'string' && liveThinkingContent.trim())
+    ? liveThinkingContent
+    : (message.thinkingContent || '');
+  const hasThinkingContent = !!visibleThinkingContent.trim();
 
   return (
     <div
@@ -1821,6 +1778,9 @@ const AssistantBubble = React.memo(function AssistantBubble({
         )}
       </div>
       <div className="flex-1 min-w-0 max-w-[80%]">
+        {hasThinkingContent && (
+          <AssistantThinkingBubble content={visibleThinkingContent} isStreaming={isCurrentlyStreaming && !hasContent} />
+        )}
 
         {/* Tool call pills — centered system notifications */}
         {toolCalls.length > 0 && (
@@ -1832,7 +1792,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
         )}
 
         {/* Message content */}
-        {(hasContent || isCurrentlyStreaming) && (
+        {(hasContent || (isCurrentlyStreaming && !hasThinkingContent)) && (
           <div
             className={`rounded-2xl rounded-bl-sm px-4 py-2.5 transition-all duration-500 ${
               hasContent && message.content.startsWith('⚠️')
@@ -1852,20 +1812,9 @@ const AssistantBubble = React.memo(function AssistantBubble({
                 <div className="text-sm text-red-300">{message.content.replace(/^⚠️\s*/, '')}</div>
               </div>
             ) : (
-              <>
-                <div
-                  className={`flex items-center gap-1.5 mb-1.5 transition-all duration-300 overflow-hidden ${
-                    isCurrentlyStreaming ? 'max-h-6 opacity-100' : 'max-h-0 opacity-0 pointer-events-none'
-                  }`}
-                  aria-hidden={!isCurrentlyStreaming}
-                >
-                  <span className="text-[10px] font-medium tracking-wide uppercase" style={{ color: 'var(--accent-light)', opacity: 0.7 }}>thinking</span>
-                  <span className="w-1 h-1 rounded-full animate-pulse" style={{ backgroundColor: 'var(--accent-light)', opacity: 0.5 }} />
-                </div>
-                <div className={isCurrentlyStreaming ? 'streaming-cursor text-slate-300/95' : undefined}>
-                  <MarkdownRenderer content={message.content} isStreaming={isCurrentlyStreaming} />
-                </div>
-              </>
+              <div className={isCurrentlyStreaming ? 'streaming-cursor text-slate-300/95' : undefined}>
+                <MarkdownRenderer content={message.content} isStreaming={isCurrentlyStreaming} />
+              </div>
             )}
           </div>
         )}
@@ -1952,6 +1901,14 @@ interface SlashMatchState {
   query: string;
   selectedIndex: number;
   matches: SlashCommand[];
+}
+
+function normalizeSlashCategory(raw?: string | null): SlashCommand['category'] {
+  const value = String(raw || '').trim().toLowerCase();
+  if (value === 'session') return 'Session';
+  if (value === 'model') return 'Model';
+  if (value === 'export') return 'Export';
+  return 'Debug';
 }
 
 const CATEGORY_ICONS: Record<string, string> = {
@@ -2077,9 +2034,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const sessionControlsSupported = chatState.sessionControlsSupported;
   const ensureSessionControlsMetadataLoaded = chatState.ensureSessionControlsMetadataLoaded;
   const sessionTelemetry = chatState.sessionTelemetry;
+  const sessionAvailability = chatState.sessionAvailability;
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [providerModels, setProviderModels] = useState<Record<string, string[]>>({ OPENCLAW: OPENCLAW_MODEL_FALLBACK });
+  const [providerModelsLoading, setProviderModelsLoading] = useState<Record<string, boolean>>({});
   const [compactionAvailableModels, setCompactionAvailableModels] = useState<string[]>(OPENCLAW_MODEL_FALLBACK);
   const [compactionModelOptionsLoading, setCompactionModelOptionsLoading] = useState(false);
   const [providerCatalog, setProviderCatalog] = useState<Record<string, {
@@ -2107,6 +2066,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const [compatibilityHotfixLoading, setCompatibilityHotfixLoading] = useState(false);
   const [compatibilityHotfixApplying, setCompatibilityHotfixApplying] = useState(false);
   const [compatibilityHotfixMessage, setCompatibilityHotfixMessage] = useState<string | null>(null);
+  const [sessionControlsLoading, setSessionControlsLoading] = useState(false);
 
   useEffect(() => {
     if (deferGatewayMetadata || provider === 'OPENCLAW') return;
@@ -2282,6 +2242,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const ensureProviderModelsLoaded = useCallback(async (targetProvider: string) => {
     const cachedModels = providerModelsCache.get(targetProvider);
     if (cachedModels) {
+      setProviderModelsLoading((prev) => ({ ...prev, [targetProvider]: false }));
       setProviderModels((prev) => ({
         ...prev,
         [targetProvider]: cachedModels.models,
@@ -2300,6 +2261,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       }
       return cachedModels.models;
     }
+
+    setProviderModelsLoading((prev) => ({ ...prev, [targetProvider]: true }));
 
     try {
       const { provider: providerName, models, capabilities } = await gatewayAPI.models(targetProvider);
@@ -2328,8 +2291,17 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         return OPENCLAW_MODEL_FALLBACK;
       }
       throw error;
+    } finally {
+      setProviderModelsLoading((prev) => ({ ...prev, [targetProvider]: false }));
     }
   }, []);
+
+  const handleAiProviderSetupComplete = useCallback(() => {
+    providerModelsCache.clear();
+    providerCommandsCache.clear();
+    void ensureProviderModelsLoaded('OPENCLAW');
+    void ensureProviderModelsLoaded('GEMINI');
+  }, [ensureProviderModelsLoaded]);
 
   useEffect(() => {
     const cachedModels = providerModelsCache.get(provider);
@@ -2395,6 +2367,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       }
     : {});
   const availableModels = providerModels[provider] || [];
+  const currentProviderModelsLoading = providerModelsLoading[provider] === true;
   const canSelectModel = providerMeta.capabilities?.supportsModelSelection === true;
   const supportsCustomModelInput = providerMeta.capabilities?.supportsCustomModelInput !== false;
   const modelCatalogKind = (providerMeta.capabilities?.modelCatalogKind === 'declared' || providerMeta.capabilities?.modelCatalogKind === 'none' || providerMeta.capabilities?.modelCatalogKind === 'dynamic')
@@ -2721,9 +2694,16 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const agent = getAgent(provider);
   const providerSlashCommands = providerMeta.slashCommands || [];
+  const providerSlashSuggestions = useMemo<SlashCommand[]>(() => providerSlashCommands.map((command) => ({
+    command: command.command,
+    description: command.description,
+    category: normalizeSlashCategory(command.category),
+    argsHint: command.argsHint,
+    executeLocal: false,
+  })), [providerSlashCommands]);
   const streamIsStale = isRunning && !wsConnected;
   const showConnectionLost = streamIsStale;
-  const idleConnectionStatus = provider === 'OPENCLAW' && !isRunning && queueCount === 0
+  const idleConnectionStatus = provider === 'OPENCLAW' && !isRunning && queueCount === 0 && sessionAvailability === 'present'
     ? (wsConnected ? 'Connected' : 'Disconnected')
     : null;
   const contextSummary = useMemo(() => (
@@ -2759,15 +2739,34 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     setSlashMatch({ isOpen: false, query: '', selectedIndex: 0, matches: [] });
   }, [provider]);
 
+  const buildNewSessionKey = useCallback(() => {
+    if (provider === 'OPENCLAW' && isOwner(user)) {
+      const targetAgentId = (agentId && agentId.trim()) ? agentId.trim() : 'main';
+      return `agent:${targetAgentId}:new-${Date.now()}`;
+    }
+    return `new-${Date.now()}`;
+  }, [agentId, provider, user]);
+
   const refreshSlashAutocomplete = useCallback((value: string) => {
-    const matches = matchSlashCommands(value);
+    const localMatches = matchSlashCommands(value);
+    const lower = value.trim().toLowerCase();
+    const providerMatches = !lower.startsWith('/')
+      ? []
+      : providerSlashSuggestions.filter((command) => command.command.toLowerCase().startsWith(lower));
+    const seen = new Set<string>();
+    const matches = [...localMatches, ...providerMatches].filter((command) => {
+      const key = command.command.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
     setSlashMatch({
       isOpen: value.trim().startsWith('/') && matches.length > 0,
       query: value.trim(),
       selectedIndex: 0,
       matches,
     });
-  }, []);
+  }, [providerSlashSuggestions]);
 
   const applySlashCommand = useCallback((command: SlashCommand) => {
     const textarea = composerInputRef.current;
@@ -2784,17 +2783,44 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     });
   }, []);
 
+  const startNewSession = useCallback(async () => {
+    const nextSession = buildNewSessionKey();
+    let resolvedSessionKey = nextSession;
+
+    if (provider === 'OPENCLAW') {
+      try {
+        const created = await gatewayAPI.createSession(nextSession, provider);
+        const createdKey = typeof created?.key === 'string' ? created.key.trim() : '';
+        if (createdKey) resolvedSessionKey = createdKey;
+      } catch (err) {
+        console.warn('[ChatInterface] Failed to pre-create OpenClaw session:', err);
+      }
+    }
+
+    chatState.clearMessages();
+    resolvedSessionRef.current = null;
+    chatState.setSession(resolvedSessionKey);
+    setPendingAttachments([]);
+  }, [buildNewSessionKey, chatState, provider]);
+
   const maybeExecuteSlashCommand = useCallback(async () => {
     const textarea = composerInputRef.current;
     if (!textarea) return false;
-    const parsed = parseSlashCommand(textarea.value);
-    if (!parsed || !parsed.command.executeLocal) return false;
+    const rawValue = textarea.value;
+    const command = findSlashCommand(rawValue);
+    if (!command || !command.executeLocal) return false;
+
+    const providerCommand = providerSlashCommands.find((entry) => {
+      const localCommand = command.command.toLowerCase();
+      const advertised = String(entry.command || '').trim().toLowerCase();
+      return advertised === localCommand || command.aliases?.includes(advertised);
+    });
+    if (provider === 'OPENCLAW' && providerCommand) return false;
+
+    const parsed = parseSlashCommand(rawValue);
+    if (!parsed) return false;
     await executeSlashCommand(parsed.command, parsed.args, chatState, {
-      onNewSession: async () => {
-        chatState.clearMessages();
-        chatState.setSession(`new-${Date.now()}`);
-        setPendingAttachments([]);
-      },
+      onNewSession: startNewSession,
     });
     const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
     nativeInputValueSetter?.call(textarea, '');
@@ -2802,7 +2828,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     setSlashMatch({ isOpen: false, query: '', selectedIndex: 0, matches: [] });
     textarea.style.height = 'auto';
     return true;
-  }, [chatState]);
+  }, [chatState, provider, providerSlashCommands, startNewSession]);
 
   // Fix #3: Speech recognition
   const handleTranscript = useCallback((text: string) => {
@@ -2900,16 +2926,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     if (isRunning) {
       await chatState.cancelStream();
     }
-    clearMessages();
-    resolvedSessionRef.current = null;
-
-    const shouldReuseCanonicalMain = provider === 'OPENCLAW'
-      && (!agentId || agentId === 'main')
-      && isOwner(user);
-
-    setSession(shouldReuseCanonicalMain ? 'main' : 'new-' + Date.now());
-    setPendingAttachments([]);
-  }, [isRunning, chatState, clearMessages, setSession, provider, agentId, user]);
+    await startNewSession();
+  }, [isRunning, chatState, startNewSession]);
 
   const handleSelectSession = useCallback(
     (sessionId: string) => {
@@ -3057,6 +3075,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   value={selectedModel}
                   onChange={handleModelChange}
                   models={availableModels}
+                  loading={currentProviderModelsLoading}
                   supportsCustomModelInput={supportsCustomModelInput}
                   modelCatalogKind={modelCatalogKind}
                   disabled={isRunning}
@@ -3064,6 +3083,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 />
               )}
               <SessionControls
+                loading={sessionControlsLoading || currentProviderModelsLoading}
                 thinkingLevel={thinkingLevel}
                 fastModeEnabled={fastModeEnabled}
                 compactionModelOverride={compactionModelOverride}
@@ -3089,8 +3109,9 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 compactionModelOptionsLoading={compactionModelOptionsLoading}
                 sessionControlsSupported={sessionControlsSupported}
                 onPanelOpen={() => {
-                  void ensureSessionControlsMetadataLoaded();
-                  void loadProviderCommands(provider, { force: true });
+                  setSessionControlsLoading(true);
+                  void ensureSessionControlsMetadataLoaded().finally(() => setSessionControlsLoading(false));
+                  void loadProviderCommands(provider);
                   void ensureProviderModelsLoaded(provider);
                   void loadHeartbeatModel();
                   void loadCompatibilityHotfixStatus();
@@ -3263,7 +3284,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                             {(() => {
                               const toolCalls = msg.toolCalls || [];
                               const isLiveTimeline = idx === messages.length - 1 && streamSegments.length > 0;
-                              const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0 && toolCalls.length > 0;
+                              const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0;
                               
                               if (!isLiveTimeline && !hasHistorySegments) return null;
                               
@@ -3285,7 +3306,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                       message={{
                                         id: `seg-${item.segIdx}`,
                                         role: 'assistant' as const,
-                                        content: item.seg.text,
+                                        content: item.seg.kind === 'thinking' ? '' : item.seg.text,
+                                        thinkingContent: item.seg.kind === 'thinking' ? item.seg.text : undefined,
                                         createdAt: new Date(item.ts),
                                       }}
                                       agent={agent}
@@ -3313,7 +3335,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                         message={{
                                           id: `hist-before-${msg.id}-${i}`,
                                           role: 'assistant' as const,
-                                          content: seg.text,
+                                          content: seg.kind === 'thinking' ? '' : seg.text,
+                                          thinkingContent: seg.kind === 'thinking' ? seg.text : undefined,
                                           createdAt: msg.createdAt,
                                         }}
                                         agent={agent}
@@ -3332,48 +3355,97 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                               }
                             })()}
                             {/* Current/final bubble — shows live text OR historical content after tools */}
-                            <AssistantBubble
-                              message={(() => {
-                                const isLiveTimeline = idx === messages.length - 1 && streamSegments.length > 0;
-                                const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0 && (msg.toolCalls || []).length > 0;
-                                if (isLiveTimeline || hasHistorySegments) {
-                                  // Tools already rendered in timeline above
-                                  return { ...msg, toolCalls: undefined, segments: undefined };
-                                }
-                                return msg;
-                              })()}
-                              agent={agent}
-                              avatarUrl={agentAvatars[agent.providerName]}
-                              isLast={idx === messages.length - 1}
-                              isStreaming={isRunning}
-                              onRetry={
-                                idx === messages.length - 1 && lastUserMessage
-                                  ? () => {
-                                      if (composerInputRef.current) {
-                                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                                          window.HTMLTextAreaElement.prototype,
-                                          'value',
-                                        )?.set;
-                                        nativeInputValueSetter?.call(
-                                          composerInputRef.current,
-                                          lastUserMessage.content,
-                                        );
-                                        composerInputRef.current.dispatchEvent(
-                                          new Event('input', { bubbles: true }),
-                                        );
-                                        composerInputRef.current.focus();
-                                      }
-                                    }
-                                  : undefined
+                            {(() => {
+                              const isLiveTimeline = idx === messages.length - 1 && streamSegments.length > 0;
+                              const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0;
+                              const renderedBeforeSegments = isLiveTimeline
+                                ? streamSegments
+                                : (msg.segments || []).filter((segment) => segment.position === 'before');
+                              const bubbleMessage = (isLiveTimeline || hasHistorySegments)
+                                ? { ...msg, toolCalls: undefined, segments: undefined }
+                                : msg;
+                              const bubbleContent = bubbleMessage.content?.trim() || '';
+                              const bubbleThinking = bubbleMessage.thinkingContent?.trim() || '';
+                              const lastRenderedTextSegment = [...renderedBeforeSegments]
+                                .reverse()
+                                .find((segment) => segment.kind !== 'thinking' && segment.text.trim());
+                              const lastRenderedThinkingSegment = [...renderedBeforeSegments]
+                                .reverse()
+                                .find((segment) => segment.kind === 'thinking' && segment.text.trim());
+                              const bubbleContentDuplicatesTimeline = Boolean(bubbleContent)
+                                && lastRenderedTextSegment?.text.trim() === bubbleContent;
+                              const bubbleThinkingDuplicatesTimeline = Boolean(bubbleThinking)
+                                && lastRenderedThinkingSegment?.text.trim() === bubbleThinking;
+                              const liveThinkingValue = idx === messages.length - 1 ? thinkingContent : undefined;
+                              const liveThinkingText = liveThinkingValue?.trim() || '';
+                              const liveThinkingAlreadyRendered = Boolean(liveThinkingText)
+                                && lastRenderedThinkingSegment?.text.trim() === liveThinkingText;
+                              const effectiveBubbleMessage = (bubbleContentDuplicatesTimeline || bubbleThinkingDuplicatesTimeline)
+                                ? {
+                                    ...bubbleMessage,
+                                    content: bubbleContentDuplicatesTimeline ? '' : bubbleMessage.content,
+                                    thinkingContent: bubbleThinkingDuplicatesTimeline ? undefined : bubbleMessage.thinkingContent,
+                                  }
+                                : bubbleMessage;
+                              const effectiveLiveThinkingContent = liveThinkingAlreadyRendered ? undefined : liveThinkingValue;
+                              const hasVisibleBubble = Boolean(
+                                effectiveBubbleMessage.content?.trim()
+                                || effectiveBubbleMessage.thinkingContent?.trim()
+                                || effectiveLiveThinkingContent?.trim()
+                                || (effectiveBubbleMessage.toolCalls || []).length > 0,
+                              );
+                              if (!hasVisibleBubble && (isLiveTimeline || hasHistorySegments)) {
+                                return null;
                               }
-                            />
+                              return (
+                                <AssistantBubble
+                                  message={effectiveBubbleMessage}
+                                  agent={agent}
+                                  avatarUrl={agentAvatars[agent.providerName]}
+                                  isLast={idx === messages.length - 1}
+                                  isStreaming={isRunning}
+                                  liveThinkingContent={effectiveLiveThinkingContent}
+                                  onRetry={
+                                    idx === messages.length - 1 && lastUserMessage
+                                      ? () => {
+                                          if (composerInputRef.current) {
+                                            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                                              window.HTMLTextAreaElement.prototype,
+                                              'value',
+                                            )?.set;
+                                            nativeInputValueSetter?.call(
+                                              composerInputRef.current,
+                                              lastUserMessage.content,
+                                            );
+                                            composerInputRef.current.dispatchEvent(
+                                              new Event('input', { bubbles: true }),
+                                            );
+                                            composerInputRef.current.focus();
+                                          }
+                                        }
+                                      : undefined
+                                  }
+                                />
+                              );
+                            })()}
                           </>
 ) : msg.role === 'system' ? (
-                          <div className="flex justify-center px-4 py-2 max-w-3xl mx-auto w-full">
-                            <div className="max-w-xl rounded-2xl border border-white/[0.08] bg-white/[0.04] px-4 py-3 text-[12px] text-slate-300 whitespace-pre-wrap">
-                              {msg.content}
+                          isCompactionNotice(msg.content) ? (
+                            <div className="flex justify-center px-4 py-2 max-w-3xl mx-auto w-full">
+                              <div className="inline-flex max-w-xl items-center gap-2 rounded-full border border-sky-400/20 bg-sky-500/10 px-4 py-2 text-[11px] text-sky-200 whitespace-pre-wrap shadow-lg shadow-sky-500/5">
+                                <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-sky-400/20 bg-sky-400/10">
+                                  <Layers3 size={11} className="text-sky-300" />
+                                </span>
+                                <span>{msg.content}</span>
+                              </div>
                             </div>
-                          </div>
+                          ) : (
+                            <div className="flex justify-center px-4 py-2 max-w-3xl mx-auto w-full">
+                              <div className="max-w-xl rounded-2xl border border-white/[0.08] bg-white/[0.04] px-4 py-3 text-[12px] text-slate-300 whitespace-pre-wrap">
+                                {msg.content}
+                              </div>
+                            </div>
+                          )
                         ) : null /* toolResult messages are rendered inline in the preceding assistant bubble's ToolCallBlock pills */}
                       </React.Fragment>
                     );
@@ -3641,7 +3713,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
           />
         )}
 
-        <AgentSettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+        <AgentSettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} onAiProviderSetupComplete={handleAiProviderSetupComplete} />
 
         {/* Exec Approval Modal */}
         {pendingApproval && (

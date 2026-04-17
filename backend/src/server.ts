@@ -263,8 +263,12 @@ const novncWsProxy = createProxyMiddleware({
   },
 } as any);
 
-// Remote Desktop Audio WebSocket proxy → audio proxy on port 4714
-const audioWsTarget = process.env.RD_AUDIO_TARGET || 'http://127.0.0.1:4714';
+// Remote Desktop Audio WebSocket proxy → audio proxy on a configurable localhost port
+const audioWsPort = (() => {
+  const raw = Number(process.env.RD_AUDIO_PORT || 4714);
+  return Number.isFinite(raw) && raw > 0 ? raw : 4714;
+})();
+const audioWsTarget = process.env.RD_AUDIO_TARGET || `http://127.0.0.1:${audioWsPort}`;
 const audioWsProxy = createProxyMiddleware({
   target: audioWsTarget,
   ws: true,
@@ -310,13 +314,13 @@ app.use('/share', captureRawBody);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-// Auth-gated noVNC — portal JWT required (after cookieParser so req.cookies is available)
+// Admin-gated noVNC — portal JWT required and elevated role only
 // WebSocket proxies must be registered BEFORE the static handler to avoid path conflicts
-app.use('/novnc/websockify', authenticateToken, novncWsProxy);
-app.use('/novnc/audio', authenticateToken, audioWsProxy);
+app.use('/novnc/websockify', authenticateToken, requireAdmin, novncWsProxy);
+app.use('/novnc/audio', authenticateToken, requireAdmin, audioWsProxy);
 
 // Serve noVNC static files directly (version-pinned, cache-busting headers)
-app.use('/novnc', authenticateToken, express.static(path.join(__dirname, '../../static/novnc'), {
+app.use('/novnc', authenticateToken, requireAdmin, express.static(path.join(__dirname, '../../static/novnc'), {
   setHeaders: (res) => {
     res.setHeader('Cache-Control', 'no-cache, must-revalidate');
     res.setHeader('Pragma', 'no-cache');
@@ -726,6 +730,13 @@ if (config.nodeEnv === 'production') {
   const buildAbsoluteUrl = (req: express.Request, pathname: string) => `${req.protocol}://${req.get('host')}${pathname}`;
 
   const renderSpaHtml = async (req: express.Request) => {
+    // IMPORTANT: refresh the source HTML/cache state BEFORE computing the
+    // request cache key. Otherwise a deploy can leave htmlByRequestUrl keyed
+    // against the previous index.html mtime, which makes deep links keep
+    // serving stale hashed bundle references until some other uncached route
+    // happens to refresh the source snapshot.
+    const sourceHtml = getSpaSourceHtml();
+
     const rows = await prisma.systemSetting.findMany({
       where: {
         key: {
@@ -768,7 +779,6 @@ if (config.nodeEnv === 'production') {
     const cached = spaRenderCache.htmlByRequestUrl.get(requestCacheKey);
     if (cached) return cached;
 
-    const sourceHtml = getSpaSourceHtml();
     const metaTags = [
       `<meta property="og:title" content="${escapeHtml(siteName)}" />`,
       `<meta property="og:description" content="${escapeHtml(siteDescription)}" />`,
@@ -922,7 +932,7 @@ const startServer = async () => {
           where: { id: payload.userId },
           select: { id: true, role: true, accountStatus: true, isActive: true },
         } as any).then((user) => {
-          if (!user || !canUseInteractivePortal(user.role, (user as any).accountStatus, user.isActive)) {
+          if (!user || !canAccessPortal((user as any).accountStatus, user.isActive) || !isElevatedRole(user.role)) {
             socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
             socket.destroy();
             return;
@@ -958,7 +968,7 @@ const startServer = async () => {
           where: { id: payload.userId },
           select: { id: true, role: true, accountStatus: true, isActive: true },
         } as any).then((user) => {
-          if (!user || !canUseInteractivePortal(user.role, (user as any).accountStatus, user.isActive)) {
+          if (!user || !canAccessPortal((user as any).accountStatus, user.isActive) || !isElevatedRole(user.role)) {
             socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
             socket.destroy();
             return;

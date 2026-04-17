@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.2"
+readonly VERSION="3.25.3"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -1753,7 +1753,7 @@ Requires=bridges-rd-xtigervnc.service
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/python3 /usr/bin/websockify 6080 127.0.0.1:5901
+ExecStart=/usr/bin/python3 /usr/bin/websockify 127.0.0.1:6080 127.0.0.1:5901
 Restart=always
 RestartSec=3
 

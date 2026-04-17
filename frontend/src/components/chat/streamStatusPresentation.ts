@@ -1,3 +1,5 @@
+import { getToolDisplayName, getToolPresentation, getToolStatusText } from '../../utils/toolPresentation';
+
 export type StreamPhase = 'idle' | 'thinking' | 'tool' | 'streaming';
 
 export interface StreamStatusPresentation {
@@ -22,6 +24,13 @@ const FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|queued|pe
 const FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context)\b/;
 const FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance complete(?:d)?)\b/;
 
+function normalizeStatusText(statusText?: string | null): string {
+  const raw = String(statusText || '').trim();
+  if (!raw) return '';
+  const withoutLeadingDecorators = raw.replace(/^[^\p{L}\p{N}]+/u, '').trim();
+  return withoutLeadingDecorators.replace(/^using tool:\s*/i, 'Using ').trim();
+}
+
 export function getStreamStatusPresentation({
   phase,
   toolName,
@@ -37,9 +46,19 @@ export function getStreamStatusPresentation({
   compactionPhase?: 'idle' | 'compacting' | 'compacted';
   queueCount?: number;
 }): StreamStatusPresentation | null {
-  const rawStatus = (statusText || '').trim();
+  const rawStatus = normalizeStatusText(statusText);
   const normalizedStatus = rawStatus.toLowerCase();
   const queueSize = queueCount || 0;
+  const connectedLike = CONNECTED_RE.test(normalizedStatus);
+  const maintenanceLike = compactionPhase === 'compacting'
+    || compactionPhase === 'compacted'
+    || COMPACTING_RE.test(normalizedStatus)
+    || COMPACTED_RE.test(normalizedStatus)
+    || FLUSH_RUNNING_RE.test(normalizedStatus)
+    || FLUSH_DONE_RE.test(normalizedStatus)
+    || FLUSH_PREPARING_RE.test(normalizedStatus)
+    || CONTEXT_PRESSURE_RE.test(normalizedStatus);
+  const displayStatus = phase === 'idle' ? rawStatus : (connectedLike ? '' : rawStatus);
 
   const tones = {
     active: {
@@ -72,7 +91,7 @@ export function getStreamStatusPresentation({
   let tone: StreamStatusPresentation = {
     ...tones.active,
     icon: null,
-    label: rawStatus || (phase === 'tool' ? `Using ${toolName || 'tool'}…` : phase === 'streaming' ? 'Responding…' : 'Thinking…'),
+    label: displayStatus || (phase === 'tool' ? `Using ${toolName || 'tool'}…` : phase === 'streaming' ? 'Responding…' : 'Thinking…'),
     detail: null,
     bounce: true,
     showQueueMeta: false,
@@ -82,62 +101,8 @@ export function getStreamStatusPresentation({
     tone = {
       ...tones.reconnecting,
       icon: 'refresh',
-      label: 'Reconnecting…',
-      detail: null,
-      bounce: false,
-      showQueueMeta: false,
-    };
-  } else if (CONNECTED_RE.test(normalizedStatus)) {
-    tone = {
-      ...tones.connected,
-      icon: 'check',
-      label: rawStatus || 'Connected',
-      detail: null,
-      bounce: false,
-      showQueueMeta: false,
-    };
-  } else if (compactionPhase === 'compacting' || COMPACTING_RE.test(normalizedStatus)) {
-    tone = {
-      ...tones.info,
-      icon: 'spinner',
-      label: rawStatus || 'Compacting context… this may take a moment',
-      detail: 'The run is still active. No need to resend your message.',
-      bounce: false,
-      showQueueMeta: false,
-    };
-  } else if (compactionPhase === 'compacted' || COMPACTED_RE.test(normalizedStatus)) {
-    tone = {
-      ...tones.info,
-      icon: 'check',
-      label: rawStatus || 'Context compacted',
-      detail: 'The agent should continue shortly.',
-      bounce: false,
-      showQueueMeta: false,
-    };
-  } else if (FLUSH_RUNNING_RE.test(normalizedStatus)) {
-    tone = {
-      ...tones.info,
-      icon: 'spinner',
-      label: rawStatus || 'Refreshing conversation context…',
-      detail: 'The run is still active. No need to resend your message.',
-      bounce: false,
-      showQueueMeta: false,
-    };
-  } else if (FLUSH_DONE_RE.test(normalizedStatus)) {
-    tone = {
-      ...tones.info,
-      icon: 'check',
-      label: rawStatus || 'Context maintenance finished.',
-      detail: 'The agent should continue shortly.',
-      bounce: false,
-      showQueueMeta: false,
-    };
-  } else if (FLUSH_PREPARING_RE.test(normalizedStatus) || CONTEXT_PRESSURE_RE.test(normalizedStatus)) {
-    tone = {
-      ...tones.reconnecting,
-      icon: 'clock',
-      label: rawStatus || 'Preparing context maintenance…',
-      detail: 'The run is still active. The agent is making room so it can keep going.',
+      label: 'Connection lost, reconnecting to the live stream…',
+      detail: 'The run is still active. Tool calls stay visible while we resync.',
       bounce: false,
       showQueueMeta: false,
     };
@@ -145,7 +110,7 @@ export function getStreamStatusPresentation({
     tone = {
       ...tones.reconnecting,
       icon: APPROVAL_RE.test(normalizedStatus) ? 'clock' : 'refresh',
-      label: rawStatus || `${queueSize} queued follow-up${queueSize === 1 ? '' : 's'}`,
+      label: displayStatus || `${queueSize} queued follow-up${queueSize === 1 ? '' : 's'}`,
       detail: null,
       bounce: false,
       showQueueMeta: false,
@@ -154,7 +119,75 @@ export function getStreamStatusPresentation({
     tone = {
       ...tones.error,
       icon: 'error',
-      label: rawStatus,
+      label: displayStatus || rawStatus,
+      detail: null,
+      bounce: false,
+      showQueueMeta: false,
+    };
+  } else if (phase === 'tool') {
+    const toolLabel = toolName ? getToolPresentation(toolName).label : 'Tool';
+    const toolDisplayName = toolName ? getToolDisplayName(toolName) : 'tool';
+    const toolStatusText = maintenanceLike ? null : displayStatus;
+    tone = {
+      ...tones.active,
+      icon: null,
+      label: toolName ? getToolStatusText(toolName, toolStatusText) : (toolStatusText || `Using ${toolLabel}…`),
+      detail: maintenanceLike
+        ? `${toolDisplayName} is still running while context maintenance completes.`
+        : (toolName ? `${toolDisplayName} is running right now.` : 'Tool call in progress.'),
+      bounce: false,
+      showQueueMeta: false,
+    };
+  } else if (compactionPhase === 'compacting' || COMPACTING_RE.test(normalizedStatus)) {
+    tone = {
+      ...tones.info,
+      icon: 'spinner',
+      label: displayStatus || 'Compacting context…',
+      detail: 'The run is still active. Tool calls stay visible while the context is compacted.',
+      bounce: false,
+      showQueueMeta: false,
+    };
+  } else if (compactionPhase === 'compacted' || COMPACTED_RE.test(normalizedStatus)) {
+    tone = {
+      ...tones.info,
+      icon: 'check',
+      label: displayStatus || 'Context compacted',
+      detail: 'Context maintenance finished. The agent should continue shortly.',
+      bounce: false,
+      showQueueMeta: false,
+    };
+  } else if (FLUSH_RUNNING_RE.test(normalizedStatus)) {
+    tone = {
+      ...tones.info,
+      icon: 'spinner',
+      label: displayStatus || 'Context maintenance in progress…',
+      detail: 'The run is still active. Tool calls stay visible while memory is flushed.',
+      bounce: false,
+      showQueueMeta: false,
+    };
+  } else if (FLUSH_DONE_RE.test(normalizedStatus)) {
+    tone = {
+      ...tones.info,
+      icon: 'check',
+      label: displayStatus || 'Context maintenance finished.',
+      detail: 'The agent should continue shortly.',
+      bounce: false,
+      showQueueMeta: false,
+    };
+  } else if (FLUSH_PREPARING_RE.test(normalizedStatus) || CONTEXT_PRESSURE_RE.test(normalizedStatus)) {
+    tone = {
+      ...tones.reconnecting,
+      icon: 'clock',
+      label: displayStatus || 'Preparing context maintenance…',
+      detail: 'The run is still active. The agent is making room so it can keep going.',
+      bounce: false,
+      showQueueMeta: false,
+    };
+  } else if (phase === 'idle' && connectedLike) {
+    tone = {
+      ...tones.connected,
+      icon: 'check',
+      label: rawStatus || 'Connected',
       detail: null,
       bounce: false,
       showQueueMeta: false,
@@ -172,7 +205,7 @@ export function getStreamStatusPresentation({
     return null;
   }
 
-  tone.showQueueMeta = queueSize > 0 && !(phase === 'idle' && !showConnectionLost && compactionPhase === 'idle' && !CONNECTED_RE.test(normalizedStatus));
+  tone.showQueueMeta = queueSize > 0 && !(phase === 'idle' && !showConnectionLost && compactionPhase === 'idle' && !connectedLike);
 
   return tone;
 }

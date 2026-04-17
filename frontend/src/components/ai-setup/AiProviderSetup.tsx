@@ -89,6 +89,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
 
   const handleComplete = async () => {
     await loadStatus(true);
+    onComplete?.();
     // Don't auto-advance the wizard — let user add more providers first
   };
 

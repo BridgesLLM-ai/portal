@@ -36,6 +36,7 @@ export interface GatewayEventPayload {
     status?: 'start' | 'started' | 'end' | 'completed' | 'compacted';
     toolCallId?: string;
     name?: string;
+    toolName?: string;
     args?: unknown;
     result?: unknown;
     partialResult?: unknown;
@@ -54,6 +55,11 @@ export interface GatewayEvent {
 export interface GatewayChatMessage {
   id?: string;
   messageId?: string;
+  __openclaw?: {
+    kind?: string;
+    id?: string;
+    [key: string]: any;
+  };
   role: string;
   content: Array<{ type: string; text?: string; [key: string]: any }> | string;
   timestamp?: number;
@@ -368,15 +374,16 @@ export class OpenClawGatewayClient {
 
 
   private sendReconnectFrame(): void {
-    const sessionKey = this.activeRunSessionKey;
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !sessionKey) {
-      return;
-    }
+    // Intentionally a no-op for the direct gateway proxy.
+    // /api/gateway/direct only forwards JSON-RPC request frames to the gateway,
+    // so custom browser-side reconnect frames are ignored there.
+    // Active stream recovery is handled by the React layer via
+    // gateway-native history + /gateway/stream-status reconciliation.
+  }
 
-    try {
-      this.ws.send(JSON.stringify({ type: 'reconnect', session: sessionKey }));
-    } catch (error) {
-      console.warn('[OpenClawGatewayClient] Failed to send reconnect frame:', error);
+  requestStreamResume(sessionKey?: string | null): void {
+    if (typeof sessionKey === 'string' && sessionKey.trim()) {
+      this.activeRunSessionKey = sessionKey.trim();
     }
   }
 
@@ -427,21 +434,23 @@ export class OpenClawGatewayClient {
 
   /**
    * Send a chat message to the gateway.
-   * Returns the runId (from idempotencyKey) for tracking the response.
+   * Returns the real gateway runId from the `chat.send` acknowledgement when available.
    */
-  async sendMessage(sessionKey: string, message: string): Promise<string> {
+  async sendMessage(sessionKey: string, message: string): Promise<string | null> {
     this.currentSessionKey = sessionKey;
     this.activeRunSessionKey = sessionKey;
     const idempotencyKey = clientRandomId();
 
-    await this.request('chat.send', {
+    const result = await this.request<{ runId?: string; status?: string }>('chat.send', {
       sessionKey,
       message,
       deliver: false,
       idempotencyKey,
     });
 
-    return idempotencyKey;
+    return typeof result?.runId === 'string' && result.runId.trim()
+      ? result.runId.trim()
+      : null;
   }
 
 

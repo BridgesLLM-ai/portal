@@ -32,6 +32,14 @@ done
 
 echo "→ Preparing public export from $SRC_ROOT"
 
+if [[ "${EXPORT_ALLOW_DIRTY:-0}" != "1" ]]; then
+  if ! git -C "$SRC_ROOT" diff --quiet || ! git -C "$SRC_ROOT" diff --cached --quiet || [[ -n "$(git -C "$SRC_ROOT" ls-files --others --exclude-standard)" ]]; then
+    echo "[BLOCKED] Source repo has uncommitted or untracked changes." >&2
+    echo "          Commit/stash them first, or set EXPORT_ALLOW_DIRTY=1 for an intentional override." >&2
+    exit 1
+  fi
+fi
+
 rm -rf "$TMP_ROOT"
 mkdir -p "$TMP_ROOT"
 
@@ -64,7 +72,7 @@ rsync -a \
   `# Runtime data` \
   --exclude='.data' \
   --exclude='backend/.data' \
-  --exclude='projects' \
+  --exclude='/projects/' \
   --exclude='uploads' \
   --exclude='assets/avatars' \
   --exclude='assets/branding' \
@@ -145,7 +153,7 @@ backend/.ssh/
 
 # Runtime data
 .data/
-projects/
+/projects/
 uploads/
 assets/avatars/
 assets/branding/
@@ -178,6 +186,29 @@ while IFS= read -r secret_hit; do
   echo "[BLOCKED] Possible hardcoded API key: $secret_hit" >&2
   scan_hit=true
 done < <(grep -rn "${_SK_ANT}\|${_SK_PROJ}" "$TMP_ROOT" --include='*.ts' --include='*.sh' --include='*.json' --include='*.js' 2>/dev/null || true)
+
+# Scan for beta/staging infrastructure markers that should never ship in the public source export
+echo "→ Scanning for beta/staging contamination markers..."
+beta_markers=(
+  'beta.''bridgesllm.com'
+  '/opt/bridgesllm''-beta'
+  '/root/.openclaw''-beta'
+  'bridgesllm''-beta.service'
+  'openclaw-gateway''-beta.service'
+  'BETA_''DOMAIN'
+  'BETA_''ROOT'
+  'BETA_''PORT'
+  'BETA_''GATEWAY_PORT'
+  'BETA_''AUDIO_PORT'
+)
+for marker in "${beta_markers[@]}"; do
+  while IFS= read -r beta_hit; do
+    [[ -z "$beta_hit" ]] && continue
+    [[ "$beta_hit" == *"export-public-github.sh"* ]] && continue
+    echo "[BLOCKED] Beta-only marker leaked into export: $beta_hit" >&2
+    scan_hit=true
+  done < <(grep -rnF -- "$marker" "$TMP_ROOT" --include='*.ts' --include='*.tsx' --include='*.js' --include='*.json' --include='*.md' --include='*.sh' 2>/dev/null || true)
+done
 
 if [[ "$scan_hit" == true ]]; then
   echo "✗ Export blocked. Remove sensitive files/patterns before pushing." >&2

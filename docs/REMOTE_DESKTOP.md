@@ -5,13 +5,13 @@
 ```
 Browser (Portal UI)
   │
-  ├─ /api/remote-desktop/status   → Portal Backend (3001) → host checks (5901/6080)
+  ├─ /api/remote-desktop/status   → Portal Backend (3001) → host checks (127.0.0.1:5901 / 127.0.0.1:6080)
   │
-  └─ /novnc/* (iframe)            → Portal Backend (3001) → noVNC/websockify (6080)
-                                                  │
-                                                  └─ VNC loopback (127.0.0.1:5901)
-                                                         │
-                                                         └─ Xvfb :1 + XFCE session
+  └─ /novnc/* (iframe, admin auth) → Portal Backend (3001) → noVNC/websockify (127.0.0.1:6080 only)
+                                                   │
+                                                   └─ VNC loopback (127.0.0.1:5901)
+                                                          │
+                                                          └─ Xtigervnc :1 + XFCE session
 ```
 
 ## Components
@@ -19,8 +19,8 @@ Browser (Portal UI)
 | Component | Service | Port | Restart |
 |---|---|---|---|
 | Portal backend | docker `portal` container | 3001 | unless-stopped |
-| noVNC/websockify | `bridges-rd-websockify.service` | 6080 | always |
-| VNC/XFCE stack | `bridges-rd-vnc.service` | 5901 | always |
+| noVNC/websockify | `bridges-rd-websockify.service` | 127.0.0.1:6080 only | always |
+| VNC/XFCE stack | `bridges-rd-xtigervnc.service` | 127.0.0.1:5901 only | always |
 
 ## Installer behavior
 
@@ -30,7 +30,8 @@ Browser (Portal UI)
 - Creates and enables self-healing systemd units:
   - `/etc/systemd/system/bridges-rd-vnc.service`
   - `/etc/systemd/system/bridges-rd-websockify.service`
-- Performs health checks for both 5901 and 6080
+- Performs health checks for loopback-only 5901 and 6080
+- Keeps raw websockify loopback-only so Remote Desktop must pass through portal auth instead of a public port
 - Seeds portal settings:
   - `remoteDesktop.url=/novnc/vnc.html?autoconnect=1&reconnect=1&resize=remote`
   - `remoteDesktop.allowedPathPrefixes=/novnc,/vnc,/guacamole`
@@ -52,11 +53,11 @@ Frontend:
 systemctl is-active bridges-rd-vnc.service
 systemctl is-active bridges-rd-websockify.service
 
-# Ports listening
-ss -ltn | grep -E ':5901|:6080'
+# Ports listening (must stay loopback-only)
+ss -ltn | grep -E '127.0.0.1:5901|127.0.0.1:6080'
 
-# noVNC reachable
-curl -I http://127.0.0.1:6080/vnc.html
+# websockify reachable only on loopback
+curl -I http://127.0.0.1:6080
 
 # Backend readiness route (with auth cookie/token)
 curl -s http://127.0.0.1:3001/api/remote-desktop/status

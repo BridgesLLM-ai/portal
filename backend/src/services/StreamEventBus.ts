@@ -50,7 +50,17 @@ type StreamCallback = (event: StreamEvent) => void;
 
 type GlobalCallback = (sessionKey: string, event: StreamEvent) => void;
 
-class StreamEventBus {
+function getLastRunningToolCall(toolCalls?: StreamToolCall[]): StreamToolCall | null {
+  if (!Array.isArray(toolCalls)) return null;
+  for (let i = toolCalls.length - 1; i >= 0; i--) {
+    if (toolCalls[i]?.status === 'running') {
+      return toolCalls[i];
+    }
+  }
+  return null;
+}
+
+export class StreamEventBus {
   /** sessionKey → set of subscriber callbacks */
   private listeners = new Map<string, Set<StreamCallback>>();
 
@@ -72,9 +82,10 @@ class StreamEventBus {
   }
 
   constructor() {
-    // Prune dormant entries older than 1 hour every 15 minutes
+    // Prune dormant entries older than 1 hour every 15 minutes.
+    // unref() keeps tests and short-lived scripts from hanging on this housekeeping timer.
     const ONE_HOUR = 60 * 60 * 1000;
-    setInterval(() => {
+    const pruneTimer = setInterval(() => {
       const now = Date.now();
       for (const [sessionKey, info] of this.streams) {
         const subs = this.listeners.get(sessionKey);
@@ -86,6 +97,7 @@ class StreamEventBus {
         }
       }
     }, 15 * 60 * 1000);
+    pruneTimer.unref?.();
   }
 
 
@@ -135,6 +147,7 @@ class StreamEventBus {
   publish(sessionKey: string, event: StreamEvent): void {
     const info = this.activeStreams.get(sessionKey);
     const now = Date.now();
+    const runningToolCall = info ? getLastRunningToolCall(info.toolCalls) : null;
     if (info) {
       info.lastEventAt = now;
       if (typeof event.provenance === 'string' && event.provenance.trim()) {
@@ -167,9 +180,13 @@ class StreamEventBus {
       }
     } else if (info) {
       if (event.type === 'thinking') {
-        info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : 'Thinking…';
+        if (!runningToolCall) {
+          info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : 'Thinking…';
+        }
       } else if (event.type === 'status') {
-        info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : info.statusText;
+        if (!runningToolCall) {
+          info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : info.statusText;
+        }
       } else if (event.type === 'tool_start') {
         info.toolName = typeof event.toolName === 'string' && event.toolName.trim() ? event.toolName.trim() : info.toolName;
         info.statusText = info.toolName ? `Using ${info.toolName}…` : info.statusText;
@@ -202,15 +219,21 @@ class StreamEventBus {
         info.toolCalls = existingCalls;
       } else if (event.type === 'compaction_start') {
         info.compactionPhase = 'compacting';
-        info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : 'Compacting context…';
+        if (!runningToolCall) {
+          info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : 'Compacting context…';
+        }
       } else if (event.type === 'compaction_end') {
         const completed = event.completed !== false && event.maintenanceKind !== 'maintenance';
         info.compactionPhase = completed ? 'compacted' : 'idle';
-        info.statusText = typeof event.content === 'string' && event.content.trim()
-          ? event.content.trim()
-          : (completed ? 'Context compacted' : 'Context maintenance finished.');
+        if (!runningToolCall) {
+          info.statusText = typeof event.content === 'string' && event.content.trim()
+            ? event.content.trim()
+            : (completed ? 'Context compacted' : 'Context maintenance finished.');
+        }
       } else if (event.type === 'run_resumed') {
-        info.statusText = 'Resuming stream…';
+        if (!runningToolCall) {
+          info.statusText = 'Resuming stream…';
+        }
       }
     }
 
@@ -282,11 +305,20 @@ class StreamEventBus {
     const existing = this.activeStreams.get(sessionKey);
     if (existing) {
       const wasDormant = existing.active === false;
+      const runningToolCall = getLastRunningToolCall(existing.toolCalls);
+      const nextPhase = runningToolCall && info.phase !== 'tool' ? 'tool' : info.phase;
+      const shouldPreserveToolStatus = Boolean(runningToolCall) && info.phase !== 'tool';
       existing.active = true;
-      existing.phase = info.phase;
+      existing.phase = nextPhase;
       if ('toolName' in info) existing.toolName = info.toolName;
+      if (!existing.toolName && runningToolCall?.name) {
+        existing.toolName = runningToolCall.name;
+      }
       if ('runId' in info) existing.runId = info.runId;
-      if ('statusText' in info) existing.statusText = info.statusText;
+      if ('statusText' in info && !shouldPreserveToolStatus) existing.statusText = info.statusText;
+      if (shouldPreserveToolStatus && !existing.statusText && existing.toolName) {
+        existing.statusText = `Using ${existing.toolName}…`;
+      }
       if ('provenance' in info) existing.provenance = info.provenance;
       if ('model' in info) existing.model = info.model;
       if ('compactionPhase' in info) existing.compactionPhase = info.compactionPhase;
@@ -298,9 +330,10 @@ class StreamEventBus {
       }
       existing.lastEventAt = Date.now();
     } else {
+      const runningToolCall = getLastRunningToolCall(Array.isArray(info.toolCalls) ? info.toolCalls : []);
       this.activeStreams.set(sessionKey, {
         active: true,
-        phase: info.phase,
+        phase: runningToolCall && info.phase !== 'tool' ? 'tool' : info.phase,
         toolName: info.toolName,
         toolCalls: Array.isArray(info.toolCalls) ? [...info.toolCalls] : [],
         statusText: info.statusText,

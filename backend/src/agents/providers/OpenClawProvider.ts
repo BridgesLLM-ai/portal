@@ -283,9 +283,10 @@ export class OpenClawProvider implements AgentProvider {
 
   async startSession(userId: string, config?: AgentSessionConfig): Promise<AgentSessionId> {
     const slug = String(config?.metadata?.sessionSlug || '').trim();
-    const sessionKey = slug.startsWith('portal-')
-      ? `agent:main:${slug}`
-      : `agent:main:portal-${userId}`;
+    const resolvedSlug = slug
+      ? (slug.startsWith('portal-') ? slug : `portal-${slug}`)
+      : `portal-${userId}`;
+    const sessionKey = `agent:main:${resolvedSlug}`;
 
     if (config?.model) {
       await patchSessionModel(sessionKey, config.model);

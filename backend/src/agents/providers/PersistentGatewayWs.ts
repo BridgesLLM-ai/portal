@@ -254,6 +254,11 @@ function getToolIcon(name: string): string {
  * Handle `agent` events from the gateway.
  * Shape: { runId, sessionKey, stream: 'assistant'|'tool'|'lifecycle'|'compaction', seq, data }
  */
+function hasRunningToolCall(sessionKey: string): boolean {
+  const tracked = streamEventBus.getTrackedStream(sessionKey);
+  return Boolean(tracked?.toolCalls?.some((toolCall) => toolCall?.status === 'running'));
+}
+
 function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   if (!payload) return;
 
@@ -356,6 +361,10 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
       ? data.text
       : (typeof data.delta === 'string' ? data.delta : (typeof data.content === 'string' ? data.content : ''));
     if (thinkingText) {
+      if (hasRunningToolCall(sessionKey)) {
+        debugLog(`Ignoring thinking event while tool is active for ${sessionKey}`);
+        return;
+      }
       streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking' });
       streamEventBus.publish(sessionKey, { type: 'thinking', content: thinkingText });
     }
@@ -444,10 +453,16 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
       streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking', statusText: status, compactionPhase: 'idle' });
       streamEventBus.publish(sessionKey, { type: 'status', content: status, maintenanceKind: 'maintenance' });
     } else if (phase === 'started' || phase === 'running' || phase === 'start') {
-      const status = lifecycleStatusText || '🧠 Agent is thinking…';
-      streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking', statusText: status });
-      streamEventBus.publish(sessionKey, { type: 'thinking', content: status });
-      streamEventBus.publish(sessionKey, { type: 'status', content: status });
+      if (hasRunningToolCall(sessionKey)) {
+        debugLog(`Ignoring lifecycle.${phase} while tool is active for ${sessionKey}`);
+        return;
+      }
+      if (lifecycleStatusText) {
+        streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking', statusText: lifecycleStatusText });
+        streamEventBus.publish(sessionKey, { type: 'status', content: lifecycleStatusText });
+      } else {
+        streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking' });
+      }
     }
     return;
   }

@@ -662,7 +662,7 @@ export async function runRemoteDesktopAutoSetup(): Promise<{ ok: boolean; steps:
 
     // Step 4: Write launcher scripts (Xtigervnc managed directly by systemd + shared Chrome)
     const webLauncher = '/usr/local/bin/bridges-rd-websockify-launcher.sh';
-    const webScript = '#!/usr/bin/env bash\nset -euo pipefail\n# WebSocket-only mode — static files served by Express\nexec websockify 6080 127.0.0.1:5901\n';
+    const webScript = '#!/usr/bin/env bash\nset -euo pipefail\n# WebSocket-only mode — static files served by Express\n# Bind loopback only so raw websockify never bypasses portal auth.\nexec websockify 127.0.0.1:6080 127.0.0.1:5901\n';
     fs.writeFileSync(webLauncher, webScript, { mode: 0o755 });
 
     const sharedChromeLauncher = '/usr/local/bin/bridges-rd-shared-chrome.sh';

@@ -15,7 +15,10 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { spawn, ChildProcess } from 'child_process';
 import http from 'http';
 
-const AUDIO_PORT = 4714;
+const AUDIO_PORT = (() => {
+  const raw = Number(process.env.RD_AUDIO_PORT || 4714);
+  return Number.isFinite(raw) && raw > 0 ? raw : 4714;
+})();
 const SAMPLE_RATE = 44100;
 const CHANNELS = 2;
 const FORMAT = 's16le';

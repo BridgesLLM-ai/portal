@@ -48,11 +48,11 @@ export const FEATURE_READINESS_MATRIX: FeatureReadinessDef[] = [
     checks: [
       {
         id: 'novncPort',
-        label: 'Websockify listener on port 6080',
+        label: 'Websockify listener on loopback port 6080',
         type: 'command',
         required: true,
-        command: 'systemctl is-active --quiet bridges-rd-websockify.service && ss -ltn | grep -q ":6080" && echo "bridges-rd-websockify.service active; port 6080 listening"',
-        remediation: 'Ensure bridges-rd-websockify.service is active and listening on 6080. A plain HTTP GET returning 405 from websockify is normal and does not indicate failure.',
+        command: 'systemctl is-active --quiet bridges-rd-websockify.service && ss -ltn | grep -q "127.0.0.1:6080" && echo "bridges-rd-websockify.service active; 127.0.0.1:6080 listening"',
+        remediation: 'Ensure bridges-rd-websockify.service is active and bound to 127.0.0.1:6080 only. Raw websockify must never listen on a public interface because portal auth is the intended security boundary.',
       },
       {
         id: 'vncPort',

@@ -11,7 +11,7 @@ import { listProviderModels } from '../agents/providerModels';
 import { getProviderCommandCatalog } from '../agents/providerCommandCatalog';
 import { resolveExecApproval, ExecApprovalRequest } from '../agents/providers/OpenClawProvider';
 import { appendNativeMessage, loadNativeSession, updateNativeSessionModel } from '../agents/providers/NativeSessionStore';
-import { gatewayRpcCall, patchSessionModel, getSessionInfo, isGatewayTransportError, chatSend } from '../utils/openclawGatewayRpc';
+import { gatewayRpcCall, patchSessionModel, getSessionInfo, isGatewayTransportError, chatSend, createSession } from '../utils/openclawGatewayRpc';
 import {
   sendApprovalDecision,
   injectChatMessage,
@@ -133,6 +133,25 @@ function restartOpenClawGatewayBySignal(): string {
   return `Gateway restart fallback sent via SIGUSR1 to PID ${pid}.`;
 }
 
+function hasSystemOpenClawGatewayService(): boolean {
+  return [
+    '/etc/systemd/system/openclaw-gateway.service',
+    '/lib/systemd/system/openclaw-gateway.service',
+    '/usr/lib/systemd/system/openclaw-gateway.service',
+  ].some((servicePath) => existsSync(servicePath));
+}
+
+async function restartOpenClawGatewayBySystemService(): Promise<string> {
+  const restartRun = await execFileText('systemctl', ['restart', 'openclaw-gateway'], 45000);
+  await new Promise((resolve) => setTimeout(resolve, 3000));
+  const output = [restartRun.stdout, restartRun.stderr].filter(Boolean).join('\n').trim();
+  return output || 'Restarted openclaw-gateway via systemd system service.';
+}
+
+function isOpenClawGatewayServiceUnavailable(detail: string): boolean {
+  return /Gateway service disabled\.|systemd user services are unavailable|systemd not installed|systemctl is-enabled unavailable|Failed to connect to bus: No medium found/i.test(detail);
+}
+
 async function restartOpenClawGateway(): Promise<string> {
   const systemdAvailable = existsSync('/run/systemd/system') && existsSync('/bin/systemctl');
   if (!systemdAvailable) {
@@ -141,18 +160,27 @@ async function restartOpenClawGateway(): Promise<string> {
     return signalMessage;
   }
 
-  const cliRun = await execFileText('openclaw', ['gateway', 'restart'], 45000);
-  const cliOutput = [cliRun.stdout, cliRun.stderr].filter(Boolean).join('\n').trim();
-  const serviceUnavailable = /Gateway service disabled\.|systemd user services are unavailable|systemd not installed/i.test(cliOutput);
+  try {
+    const cliRun = await execFileText('openclaw', ['gateway', 'restart'], 45000);
+    const cliOutput = [cliRun.stdout, cliRun.stderr].filter(Boolean).join('\n').trim();
 
-  if (serviceUnavailable) {
+    if (isOpenClawGatewayServiceUnavailable(cliOutput)) {
+      if (hasSystemOpenClawGatewayService()) return await restartOpenClawGatewayBySystemService();
+      const signalMessage = restartOpenClawGatewayBySignal();
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      return [cliOutput, signalMessage].filter(Boolean).join('\n');
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    return cliOutput;
+  } catch (err: any) {
+    const detail = String(err?.message || err || '').trim();
+    if (!isOpenClawGatewayServiceUnavailable(detail)) throw err;
+    if (hasSystemOpenClawGatewayService()) return await restartOpenClawGatewayBySystemService();
     const signalMessage = restartOpenClawGatewayBySignal();
     await new Promise((resolve) => setTimeout(resolve, 3000));
-    return [cliOutput, signalMessage].filter(Boolean).join('\n');
+    return [detail, signalMessage].filter(Boolean).join('\n');
   }
-
-  await new Promise((resolve) => setTimeout(resolve, 3000));
-  return cliOutput;
 }
 
 async function execFileText(command: string, args: string[], timeout: number): Promise<{ stdout: string; stderr: string }> {
@@ -195,8 +223,9 @@ function resolveOpenClawSessionKey(rawSession: unknown, user?: Pick<JwtPayload, 
   if (session.startsWith('agent:')) return session;
 
   const isOwnerMainAlias = isOwnerRole(user?.role)
-    && (!session || session === 'main' || session.startsWith('new-'));
+    && (!session || session === 'main');
   if (isOwnerMainAlias) return 'agent:main:main';
+  if (session.startsWith('new-')) return `agent:main:portal-${session}`;
 
   return session;
 }
@@ -748,14 +777,41 @@ async function readSessionMessages(sessionId: string, limit = 100, sessionsDir =
  * Enhanced history reader — includes tool calls and tool results from JSONL.
  */
 function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
-  return readRecentSessionMessages({
+  const messages = readRecentSessionMessages({
     sessionId,
     limit,
     sessionsDir,
     parseLine: (line) => {
       try {
         const entry = JSON.parse(line);
+        if (entry.type === 'compaction') {
+          const compactionMeta = typeof entry.__openclaw === 'object' && entry.__openclaw
+            ? entry.__openclaw
+            : {};
+          return {
+            id: entry.id,
+            role: 'system',
+            content: 'Context compacted',
+            timestamp: entry.timestamp,
+            __openclaw: {
+              ...compactionMeta,
+              kind: 'compaction',
+              id: compactionMeta.id || entry.id,
+            },
+          };
+        }
+
         if (entry.type !== 'message' || !entry.message) return null;
+        const compactionMeta = entry.message?.__openclaw ?? entry.__openclaw;
+        if (compactionMeta?.kind === 'compaction') {
+          return {
+            id: entry.id,
+            role: 'system',
+            content: 'Context compacted',
+            timestamp: entry.timestamp,
+            __openclaw: compactionMeta,
+          };
+        }
         const role = entry.message.role;
         const content = entry.message.content;
         const executedModel = normalizeGatewayModelId(
@@ -783,19 +839,22 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
         if (role === 'assistant') {
           if (Array.isArray(content)) {
             const toolCalls: any[] = [];
+            const thinkingBlocks: string[] = [];
             // Track text blocks and where tool calls appear so we can separate
             // narration (text before tools) from the final response (text after tools).
             const allBlocks: { type: 'text' | 'tool'; text?: string }[] = [];
             for (const block of content) {
               if (block.type === 'text' && block.text) {
                 allBlocks.push({ type: 'text', text: block.text });
+              } else if (block.type === 'thinking' && (typeof block.thinking === 'string' || typeof block.text === 'string')) {
+                thinkingBlocks.push(typeof block.thinking === 'string' ? block.thinking : block.text);
               } else if (block.type === 'toolCall' && block.name) {
                 toolCalls.push({ id: block.id, name: block.name, arguments: block.arguments });
                 allBlocks.push({ type: 'tool' });
               }
             }
             const hasToolCalls = toolCalls.length > 0;
-            
+
             // Build segments array: all text blocks with their position relative to tools.
             // This allows the frontend to reconstruct the streaming timeline on history load.
             const segments: { text: string; position: 'before' | 'after' | 'between' }[] = [];
@@ -806,7 +865,7 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
                 lastToolSeen = true;
                 toolCount++;
               } else if (block.type === 'text' && block.text) {
-                const position = !lastToolSeen ? 'before' : 
+                const position = !lastToolSeen ? 'before' :
                                  (toolCount === toolCalls.length ? 'after' : 'between');
                 const segmentText = extractSanitizedText(block.text);
                 if (segmentText && !isHiddenHistoryArtifactText(segmentText)) {
@@ -814,20 +873,26 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
                 }
               }
             }
-            
+
             // For display content, join all text blocks (streaming shows them inline anyway)
             const allText = allBlocks
               .filter(b => b.type === 'text')
               .map(b => b.text!)
               .join('\n');
             const text = extractSanitizedText(allText);
-            if (!text || isControlOnlyAssistantText(text) || isHiddenHistoryArtifactText(text)) return null;
+            const thinkingContent = extractSanitizedText(thinkingBlocks.join('\n'));
+            const hasVisibleText = Boolean(text)
+              && !isControlOnlyAssistantText(text)
+              && !isHiddenHistoryArtifactText(text);
+            const hasVisibleThinking = Boolean(thinkingContent) && !isHiddenHistoryArtifactText(thinkingContent);
+            if (!hasVisibleText && !hasVisibleThinking && !hasToolCalls) return null;
 
             return {
               id: entry.id,
               role: 'assistant',
-              content: text,
+              content: hasVisibleText ? text : '',
               model: executedModel,
+              thinkingContent: hasVisibleThinking ? thinkingContent : undefined,
               toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
               // Include segments for frontend to reconstruct graduated timeline
               segments: hasToolCalls && segments.length > 0 ? segments : undefined,
@@ -857,7 +922,166 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
       }
     },
   });
+
+  return hydrateHistoryToolCalls(messages);
 }
+
+function toHistoryTimestampMs(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return Date.now();
+}
+
+function buildHistoryToolCallFromResult(toolResult: any, fallbackBaseId: string, index: number) {
+  const ts = toHistoryTimestampMs(toolResult?.timestamp);
+  const toolName = typeof toolResult?.toolName === 'string' && toolResult.toolName.trim()
+    ? toolResult.toolName.trim()
+    : 'tool';
+
+  return {
+    id: typeof toolResult?.toolCallId === 'string' && toolResult.toolCallId.trim()
+      ? toolResult.toolCallId
+      : `${fallbackBaseId}-tool-${index + 1}`,
+    name: toolName,
+    arguments: undefined,
+    startedAt: ts,
+    endedAt: ts,
+    status: 'done',
+    result: typeof toolResult?.content === 'string' ? toolResult.content : '',
+  };
+}
+
+function mergePendingToolResultsIntoAssistant(assistant: any, pendingToolResults: any[]): any {
+  const existingToolCalls = Array.isArray(assistant?.toolCalls) ? [...assistant.toolCalls] : [];
+  const fallbackBaseId = assistant?.id || pendingToolResults[0]?.id || 'history';
+
+  for (let index = 0; index < pendingToolResults.length; index += 1) {
+    const toolResult = pendingToolResults[index];
+    const synthesized = buildHistoryToolCallFromResult(toolResult, fallbackBaseId, index);
+
+    const matchIndex = existingToolCalls.findIndex((toolCall: any) => {
+      if (!toolCall || typeof toolCall !== 'object') return false;
+      if (toolResult?.toolCallId && toolCall.id === toolResult.toolCallId) return true;
+      return toolResult?.toolName
+        && toolCall.name === toolResult.toolName
+        && !toolCall.result;
+    });
+
+    if (matchIndex >= 0) {
+      existingToolCalls[matchIndex] = {
+        ...existingToolCalls[matchIndex],
+        startedAt: typeof existingToolCalls[matchIndex].startedAt === 'number'
+          ? existingToolCalls[matchIndex].startedAt
+          : synthesized.startedAt,
+        endedAt: synthesized.endedAt,
+        status: 'done',
+        result: synthesized.result,
+      };
+      continue;
+    }
+
+    existingToolCalls.push(synthesized);
+  }
+
+  if (existingToolCalls.length === 0) return assistant;
+
+  return {
+    ...assistant,
+    toolCalls: existingToolCalls,
+  };
+}
+
+function synthesizeAssistantFromPendingToolResults(pendingToolResults: any[]): any {
+  const lastResult = pendingToolResults[pendingToolResults.length - 1];
+  const fallbackBaseId = lastResult?.id || `history-tool-${Date.now()}`;
+
+  return {
+    id: `synthetic-${fallbackBaseId}`,
+    role: 'assistant',
+    content: '',
+    timestamp: lastResult?.timestamp,
+    toolCalls: pendingToolResults.map((toolResult: any, index: number) => (
+      buildHistoryToolCallFromResult(toolResult, fallbackBaseId, index)
+    )),
+  };
+}
+
+function hydrateHistoryToolCalls(messages: any[]): any[] {
+  const hydrated: any[] = [];
+  let pendingToolResults: any[] = [];
+
+  const flushPendingToolResults = () => {
+    if (pendingToolResults.length === 0) return;
+    hydrated.push(synthesizeAssistantFromPendingToolResults(pendingToolResults));
+    pendingToolResults = [];
+  };
+
+  for (const message of messages) {
+    if (!message) continue;
+
+    if (message.role === 'toolResult') {
+      pendingToolResults.push(message);
+      continue;
+    }
+
+    if (message.role === 'assistant' && pendingToolResults.length > 0) {
+      hydrated.push(mergePendingToolResultsIntoAssistant(message, pendingToolResults));
+      pendingToolResults = [];
+      continue;
+    }
+
+    flushPendingToolResults();
+    hydrated.push(message);
+  }
+
+  flushPendingToolResults();
+  return hydrated;
+}
+
+function augmentDirectHistoryPayload(payload: any, sessionKey: string, limit = 200): any {
+  if (!payload || !Array.isArray(payload.messages) || !sessionKey) return payload;
+
+  try {
+    const sessionsDir = resolveSessionsDir(sessionKey);
+    const fileId = resolveSessionFileId(sessionKey, sessionsDir);
+    if (!fileId) return payload;
+
+    const enhancedMessages = readSessionMessagesEnhanced(fileId, limit, sessionsDir);
+    const compactionMessages = enhancedMessages
+      .filter((message) => message?.role === 'system' && (message?.__openclaw?.kind === 'compaction' || message?.content === 'Context compacted'))
+      .map((message) => ({
+        id: message.id,
+        role: 'system',
+        content: 'Context compacted',
+        timestamp: message.timestamp,
+        __openclaw: message.__openclaw || { kind: 'compaction', id: message.id },
+      }));
+
+    if (compactionMessages.length === 0) return payload;
+
+    const seenIds = new Set<string>();
+    const combined = [...payload.messages, ...compactionMessages]
+      .filter((message) => {
+        const messageId = typeof message?.id === 'string' ? message.id : '';
+        if (messageId && seenIds.has(messageId)) return false;
+        if (messageId) seenIds.add(messageId);
+        return true;
+      })
+      .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
+
+    return {
+      ...payload,
+      messages: combined.slice(-Math.max(limit, 1)),
+    };
+  } catch (err) {
+    console.warn('[gateway-direct] Failed to augment chat.history payload:', err);
+    return payload;
+  }
+}
+
 
 /** Resolve a session key to its JSONL file id */
 function resolveSessionFileId(sessionKey: string, sessionsDir = SESSIONS_DIR): string | null {
@@ -1429,7 +1653,13 @@ router.get('/session-info', authenticateToken, async (req: Request, res: Respons
   try {
     const sessionKey = resolveOpenClawSessionKey(req.query.session as string, req.user);
     assertGatewaySessionAccess(sessionKey, req.user!);
-    const result = await getSessionInfo(sessionKey);
+    let result = await getSessionInfo(sessionKey);
+    if ((!result.ok || !result.data) && sessionKey.includes(':new-')) {
+      const created = await createSession(sessionKey);
+      if (created.ok) {
+        result = await getSessionInfo(created.key || sessionKey);
+      }
+    }
     if (!result.ok) {
       // Distinguish gateway transport failures (timeout, WS error) from "session not found"
       const status = isGatewayTransportError(result.error) ? 502 : 404;
@@ -1440,6 +1670,38 @@ router.get('/session-info', authenticateToken, async (req: Request, res: Respons
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 500;
     res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to get session info', detail: err.message });
+  }
+});
+
+router.post('/session-create', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const providerName = (typeof req.body?.provider === 'string' ? req.body.provider.trim().toUpperCase() : 'OPENCLAW') as AgentProviderName;
+    if (providerName !== 'OPENCLAW') {
+      res.status(400).json({ error: 'Session creation only supported for OPENCLAW provider' });
+      return;
+    }
+
+    const rawSession = typeof req.body?.session === 'string' ? req.body.session.trim() : '';
+    if (!rawSession) {
+      res.status(400).json({ error: 'session required' });
+      return;
+    }
+
+    const sessionKey = resolveOpenClawSessionKey(rawSession, req.user);
+    assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
+
+    const created = await createSession(sessionKey);
+    if (!created.ok) {
+      const status = isGatewayTransportError(created.error) ? 502 : 400;
+      res.status(status).json({ error: created.error || 'Failed to create session' });
+      return;
+    }
+
+    const info = await getSessionInfo(created.key || sessionKey);
+    res.json({ ok: true, key: created.key || sessionKey, session: info.ok ? info.data : null });
+  } catch (err: any) {
+    const status = err?.message === 'Admin access required' ? 403 : 500;
+    res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to create session', detail: err.message });
   }
 });
 
@@ -1467,7 +1729,13 @@ router.post('/session-model', authenticateToken, requireApproved, async (req: Re
         return;
       }
 
-      const info = await getSessionInfo(sessionKey);
+      let info = await getSessionInfo(sessionKey);
+      if ((!info.ok || !info.data) && sessionKey.includes(':new-')) {
+        const created = await createSession(sessionKey);
+        if (created.ok) {
+          info = await getSessionInfo(created.key || sessionKey);
+        }
+      }
       if (!info.ok || !info.data) {
         const status = isGatewayTransportError(info.error) ? 502 : 404;
         res.status(status).json({ error: info.error || 'Session not found' });
@@ -1977,7 +2245,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     if (provider.providerName === 'OPENCLAW') {
       const useCanonicalMainSession = isOwnerRole(req.user!.role)
         && (!agentId || agentId === 'main')
-        && (!clientSession || clientSession === 'main' || clientSession.startsWith('new-'));
+        && (!clientSession || clientSession === 'main');
       if (agentId && agentId !== 'main') {
         // Same sub-agent session resolution as the WS path
         const agentPrefix = `agent:${agentId}:`;
@@ -1985,8 +2253,10 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
           sessionId = clientSession;
         } else {
           let sessionName: string;
-          if (!clientSession || clientSession.startsWith('new-')) {
+          if (!clientSession) {
             sessionName = 'main';
+          } else if (clientSession.startsWith('new-')) {
+            sessionName = `portal-${clientSession}`;
           } else if (clientSession.startsWith('agent:')) {
             const parts = clientSession.split(':');
             sessionName = parts.length >= 3 ? parts.slice(2).join(':') : 'main';
@@ -2369,14 +2639,15 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
   const info = streamEventBus.getStreamStatus(sessionKey);
   if (info) {
     // Long-running tool/research/codegen work can legitimately go quiet for a while.
-    // Keep tool/thinking snapshots alive much longer than text streaming so the UI
+    // Keep tool/maintenance snapshots alive much longer than text streaming so the UI
     // does not hide the rail mid-run just because the agent is busy.
     const lastEvent = (info as any).lastEventAt || info.startedAt;
-    const staleCutoffMs = info.phase === 'tool'
-      ? 15 * 60_000
-      : info.phase === 'thinking'
-        ? 10 * 60_000
-        : 180_000;
+    const hasRunningTool = Array.isArray(info.toolCalls) && info.toolCalls.some((toolCall: any) => toolCall?.status === 'running');
+    const staleCutoffMs = info.phase === 'streaming'
+      ? 180_000
+      : (hasRunningTool || info.phase === 'tool' || info.compactionPhase === 'compacting')
+        ? 15 * 60_000
+        : 10 * 60_000;
     if (lastEvent && (Date.now() - lastEvent) > staleCutoffMs) {
       debugLog(`[stream-status] StreamEventBus has entry but lastEvent=${new Date(lastEvent).toISOString()} exceeded cutoff=${staleCutoffMs}ms for phase=${info.phase} — reporting inactive`);
       streamEventBus.clearStream(sessionKey);
@@ -2640,6 +2911,11 @@ function attachBrowserWsToSessionStream(params: {
       sessionKey,
       phase: status.phase,
       toolName: status.toolName || null,
+      toolCalls: Array.isArray(status.toolCalls) ? status.toolCalls : [],
+      statusText: status.statusText || null,
+      provenance: status.provenance || null,
+      model: status.model || null,
+      compactionPhase: status.compactionPhase || 'idle',
       runId: status.runId || null,
       content: latestText || undefined,
     });
@@ -2733,7 +3009,7 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
     if (isOpenClawProvider) {
       const useCanonicalMainSession = isOwnerRole(user.role)
         && (!agentId || agentId === 'main')
-        && (!clientSession || clientSession === 'main' || clientSession.startsWith('new-'));
+        && (!clientSession || clientSession === 'main');
       if (agentId && agentId !== 'main') {
         // If clientSession is already a fully-qualified agent: key for this agent, reuse it directly.
         // This prevents the cascading session bug where e.g. 'agent:parity:main' gets wrapped
@@ -2744,8 +3020,10 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
         } else {
           // Extract just the session name, stripping any stale agent: prefix from a different agent
           let sessionName: string;
-          if (!clientSession || clientSession.startsWith('new-')) {
+          if (!clientSession) {
             sessionName = 'main';
+          } else if (clientSession.startsWith('new-')) {
+            sessionName = `portal-${clientSession}`;
           } else if (clientSession.startsWith('agent:')) {
             // Session key from a different agent — extract the trailing name part
             const parts = clientSession.split(':');
@@ -3255,6 +3533,7 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
 
   // Track browser→gateway id mapping so we can convert string IDs back to numeric
   const idMap = new Map<string, number>(); // gateway string ID → browser numeric ID
+  const requestMeta = new Map<string, { method?: string; sessionKey?: string; limit?: number }>();
 
   gatewayWs.on('message', (data: Buffer | string) => {
     if (browserClosed) return;
@@ -3285,6 +3564,11 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
 
       if (msg.type === 'res' && typeof msg.id === 'string' && idMap.has(msg.id)) {
         const gatewayId = msg.id;
+        const meta = requestMeta.get(gatewayId);
+        if (msg.ok && meta?.method === 'chat.history' && meta.sessionKey) {
+          msg.payload = augmentDirectHistoryPayload(msg.payload, meta.sessionKey, meta.limit || 200);
+        }
+        requestMeta.delete(gatewayId);
         msg.id = idMap.get(gatewayId)!;
         idMap.delete(gatewayId);
         browserWs.send(JSON.stringify(msg));
@@ -3366,6 +3650,9 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       if (typeof frame.id === 'number') {
         idMap.set(stringId, frame.id);
       }
+      requestMeta.set(stringId, {
+        method: 'connect',
+      });
 
       const fullFrame = {
         type: 'req',
@@ -3417,15 +3704,38 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       const stringId = String(frame.id);
       frame.id = stringId;
       idMap.set(stringId, numericId);
+      requestMeta.set(stringId, {
+        method: frame.method,
+        sessionKey: typeof frame.params?.sessionKey === 'string'
+          ? frame.params.sessionKey
+          : (typeof frame.params?.session === 'string' ? frame.params.session : undefined),
+        limit: typeof frame.params?.limit === 'number' && Number.isFinite(frame.params.limit)
+          ? frame.params.limit
+          : undefined,
+      });
       try {
         gatewayWs.send(JSON.stringify(frame));
       } catch (err: any) {
+        requestMeta.delete(stringId);
         debugLog('[gateway-direct] Failed to forward to gateway:', err.message);
       }
     } else {
+      const stringId = typeof frame.id === 'string' ? frame.id : undefined;
+      if (stringId) {
+        requestMeta.set(stringId, {
+          method: frame.method,
+          sessionKey: typeof frame.params?.sessionKey === 'string'
+            ? frame.params.sessionKey
+            : (typeof frame.params?.session === 'string' ? frame.params.session : undefined),
+          limit: typeof frame.params?.limit === 'number' && Number.isFinite(frame.params.limit)
+            ? frame.params.limit
+            : undefined,
+        });
+      }
       try {
         gatewayWs.send(JSON.stringify(frame));
       } catch (err: any) {
+        if (stringId) requestMeta.delete(stringId);
         debugLog('[gateway-direct] Failed to forward to gateway:', err.message);
       }
     }

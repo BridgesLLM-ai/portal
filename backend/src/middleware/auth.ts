@@ -34,13 +34,22 @@ function logAuthFailure(kind: 'Missing token' | 'Invalid token', req: Request) {
   authFailureLogState.set(key, current);
 }
 
-function getTokenFromRequest(req: Request): string | undefined {
+function getBearerToken(req: Request): string | undefined {
   const authHeader = req.headers['authorization'];
-  let token = authHeader && authHeader.split(' ')[1];
-  if (!token && req.cookies?.accessToken) {
-    token = req.cookies.accessToken;
+  if (typeof authHeader !== 'string') return undefined;
+  if (!authHeader.startsWith('Bearer ')) return undefined;
+  return authHeader.slice(7).trim() || undefined;
+}
+
+function getTokenFromRequest(req: Request): string | undefined {
+  const bearerToken = getBearerToken(req);
+  if (bearerToken) {
+    return bearerToken;
   }
-  return token;
+  if (req.cookies?.accessToken) {
+    return req.cookies.accessToken;
+  }
+  return undefined;
 }
 
 async function loadAuthorizedUser(payload: JwtPayload) {
@@ -176,8 +185,7 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction): v
  * Optional authentication (doesn't fail if token is invalid)
  */
 export function optionalAuth(req: Request, res: Response, next: NextFunction): void {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+  const token = getTokenFromRequest(req);
 
   if (token) {
     const payload = verifyAccessToken(token);

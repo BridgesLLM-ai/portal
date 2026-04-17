@@ -1,10 +1,10 @@
-import { execFileSync, execSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import path from 'path';
 import { prisma } from '../config/database';
 import { config } from '../config/env';
+import { readOpenClawConfig } from '../services/openclawConfigManager';
 import type { AgentProviderName } from './AgentProvider.interface';
-import { buildOpenClawCliEnv, normalizePortalModelId } from '../utils/openclawCli';
+import { normalizePortalModelId } from '../utils/openclawCli';
 
 export interface ProviderModelDescriptor {
   id: string;
@@ -50,44 +50,39 @@ const DECLARED_MODELS: Partial<Record<AgentProviderName, ProviderModelDescriptor
   GEMINI: declaredModels(GEMINI_DECLARED_FALLBACK, 'gemini'),
 };
 
-function safeExecFile(command: string, args: string[]): string | null {
-  try {
-    return execFileSync(command, args, {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: buildOpenClawCliEnv(),
-      timeout: 8000,
-      maxBuffer: 1024 * 1024 * 8,
-    }).trim();
-  } catch {
-    return null;
-  }
-}
-
 function listOpenClawModels(): ProviderModelDescriptor[] {
-  try {
-    const output = execSync('openclaw config get agents.defaults.models 2>/dev/null', {
-      timeout: 8000,
-      encoding: 'utf-8',
-      env: buildOpenClawCliEnv(),
+  const openclawConfig = readOpenClawConfig();
+  const deduped = new Map<string, ProviderModelDescriptor>();
+
+  const addModel = (id: unknown, alias?: unknown) => {
+    const normalizedId = normalizePortalModelId(typeof id === 'string' ? id : '');
+    if (!normalizedId || deduped.has(normalizedId)) return;
+    const cleanAlias = typeof alias === 'string' && alias.trim() ? alias.trim() : null;
+    deduped.set(normalizedId, {
+      id: normalizedId,
+      alias: cleanAlias,
+      provider: normalizedId.split('/')[0] || 'other',
+      displayName: cleanAlias || normalizedId.split('/').slice(1).join('/') || normalizedId,
+      source: 'dynamic' as const,
     });
-    const raw: Record<string, { alias?: string }> = JSON.parse(output.trim());
-    const deduped = new Map<string, ProviderModelDescriptor>();
-    for (const [id, cfg] of Object.entries(raw)) {
-      const normalizedId = normalizePortalModelId(id);
-      if (!normalizedId || deduped.has(normalizedId)) continue;
-      deduped.set(normalizedId, {
-        id: normalizedId,
-        alias: cfg.alias || null,
-        provider: normalizedId.split('/')[0] || 'other',
-        displayName: cfg.alias || normalizedId.split('/').slice(1).join('/') || normalizedId,
-        source: 'dynamic' as const,
-      });
+  };
+
+  const modelRegistry = openclawConfig?.agents?.defaults?.models;
+  if (modelRegistry && typeof modelRegistry === 'object' && !Array.isArray(modelRegistry)) {
+    for (const [id, cfg] of Object.entries(modelRegistry)) {
+      const alias = cfg && typeof cfg === 'object' && 'alias' in cfg ? (cfg as any).alias : null;
+      addModel(id, alias);
     }
-    return Array.from(deduped.values());
-  } catch {
-    return [];
   }
+
+  addModel(openclawConfig?.agents?.defaults?.model?.primary);
+
+  const fallbacks = openclawConfig?.agents?.defaults?.model?.fallbacks;
+  if (Array.isArray(fallbacks)) {
+    for (const id of fallbacks) addModel(id);
+  }
+
+  return Array.from(deduped.values());
 }
 
 function listGeminiDeclaredModels(): ProviderModelDescriptor[] {

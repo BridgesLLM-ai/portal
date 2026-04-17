@@ -1,6 +1,8 @@
 import { motion } from 'framer-motion';
 import { CheckCircle2, Clock, Loader2, RefreshCw, XCircle } from 'lucide-react';
+import ToolGlyph from './ToolGlyph';
 import { getStreamStatusPresentation, type StreamPhase } from './streamStatusPresentation';
+import { getToolPresentation } from '../../utils/toolPresentation';
 
 export interface ComposerContextSummary {
   text: string;
@@ -52,6 +54,8 @@ export default function ComposerStatusBadge({
     showQueueMeta: false,
   };
 
+  const toolPresentation = phase === 'tool' ? getToolPresentation(toolName || 'tool') : null;
+
   const icon = effectiveTone.icon === 'refresh'
     ? <RefreshCw size={12} className={`animate-spin ${effectiveTone.text}`} />
     : effectiveTone.icon === 'check'
@@ -72,7 +76,7 @@ export default function ComposerStatusBadge({
       transition={{ duration: 0.2 }}
     >
       <div className={`flex items-center justify-center gap-2.5 px-4 py-1.5 border-t ${effectiveTone.bg}`}>
-        {effectiveTone.bounce ? (
+        {effectiveTone.bounce && !toolPresentation ? (
           <div className="flex gap-0.5 self-start pt-0.5">
             <span className={`w-1.5 h-1.5 rounded-full ${effectiveTone.dot} animate-bounce`} style={{ animationDelay: '0ms' }} />
             <span className={`w-1.5 h-1.5 rounded-full ${effectiveTone.dot} animate-bounce`} style={{ animationDelay: '150ms' }} />
@@ -80,8 +84,11 @@ export default function ComposerStatusBadge({
           </div>
         ) : (
           <div className="flex items-center gap-2 self-start pt-0.5">
-            <span className={`w-1.5 h-1.5 rounded-full ${effectiveTone.dot}`} />
-            {icon}
+            {toolPresentation ? (
+              <span className={`inline-flex h-5 w-5 items-center justify-center rounded-full border ${toolPresentation.iconBadgeClass}`}>
+                <ToolGlyph toolName={toolName || 'tool'} size={11} className={toolPresentation.iconClass} />
+              </span>
+            ) : icon}
           </div>
         )}
         <div className="min-w-0 flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-center">

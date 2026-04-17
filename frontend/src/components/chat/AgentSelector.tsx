@@ -265,6 +265,7 @@ function AvatarCircle({
 function SessionDropdown({
   sessions,
   loading = false,
+  hasLoaded = false,
   open,
   onOpenChange,
   onViewSession,
@@ -272,6 +273,7 @@ function SessionDropdown({
 }: {
   sessions: GatewaySession[];
   loading?: boolean;
+  hasLoaded?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onViewSession: (sessionKey: string) => void;
@@ -295,6 +297,7 @@ function SessionDropdown({
 
   const activeSessions = sessions.filter(s => s.status === 'active');
   const otherSessions = sessions.filter(s => s.status !== 'active');
+  const countLabel = loading && sessions.length === 0 ? '…' : hasLoaded ? String(sessions.length) : '—';
 
   return (
     <div ref={ref} className="relative">
@@ -304,7 +307,7 @@ function SessionDropdown({
         title={`${providerLabel} sessions`}
       >
         <History size={12} />
-        <span className="hidden sm:inline tabular-nums">{loading && sessions.length === 0 ? '…' : sessions.length}</span>
+        <span className="hidden sm:inline tabular-nums">{countLabel}</span>
         {activeSessions.length > 0 && (
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
         )}
@@ -325,7 +328,7 @@ function SessionDropdown({
               <Radio size={10} className="text-emerald-400" />
               {providerLabel} Sessions
               <span className="ml-auto text-[9px] bg-emerald-500/15 text-emerald-400 px-1.5 py-0.5 rounded-full font-medium tabular-nums">
-                {loading && sessions.length === 0 ? '…' : sessions.length}
+                {countLabel}
               </span>
             </div>
           </div>
@@ -416,6 +419,7 @@ export default function AgentSelector({
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [agentsLoading, setAgentsLoading] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -527,6 +531,7 @@ export default function AgentSelector({
     if (!supportsSessionList || !isAuthenticated) {
       setSessions([]);
       setSessionsLoading(false);
+      setSessionsLoaded(false);
       return;
     }
     if (!sessionsOpen) return;
@@ -545,9 +550,15 @@ export default function AgentSelector({
           _silent: true,
         } as any);
         const list = data.sessions || [];
-        if (!cancelled) setSessions(Array.isArray(list) ? list : Object.values(list));
+        if (!cancelled) {
+          setSessions(Array.isArray(list) ? list : Object.values(list));
+          setSessionsLoaded(true);
+        }
       } catch {
-        if (!cancelled) setSessions([]);
+        if (!cancelled) {
+          setSessions([]);
+          setSessionsLoaded(true);
+        }
       } finally {
         if (!cancelled) setSessionsLoading(false);
       }
@@ -801,6 +812,7 @@ export default function AgentSelector({
         <SessionDropdown
           sessions={sessions}
           loading={sessionsLoading}
+          hasLoaded={sessionsLoaded}
           open={sessionsOpen}
           onOpenChange={setSessionsOpen}
           onViewSession={handleSessionClick}

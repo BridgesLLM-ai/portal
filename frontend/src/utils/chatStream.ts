@@ -71,15 +71,25 @@ export function mergeAssistantStream(
   if (!current) return chunk;
   if (chunk === current) return current;
   if (chunk.startsWith(current)) return chunk;
-  if (current.endsWith(chunk)) return current;
-  if (current.includes(chunk)) return current;
 
-  const maxOverlap = Math.min(current.length, chunk.length);
-  for (let overlap = maxOverlap; overlap > 0; overlap--) {
-    if (current.slice(-overlap) === chunk.slice(0, overlap)) {
-      return current + chunk.slice(overlap);
+  // Some transports occasionally resend a large suffix or a cumulative snapshot
+  // without setting `replace`. Only apply de-duplication heuristics to sizeable
+  // chunks, otherwise single-character/token deltas like "l" or " " get eaten
+  // and words lose letters/spaces while streaming.
+  const smartDedupeMinChars = 8;
+  if (chunk.length >= smartDedupeMinChars) {
+    if (current.startsWith(chunk) || current.endsWith(chunk) || current.includes(chunk)) {
+      return current;
+    }
+
+    const maxOverlap = Math.min(current.length, chunk.length);
+    for (let overlap = maxOverlap; overlap >= smartDedupeMinChars; overlap--) {
+      if (current.slice(-overlap) === chunk.slice(0, overlap)) {
+        return current + chunk.slice(overlap);
+      }
     }
   }
+
   return current + chunk;
 }
 
@@ -94,17 +104,25 @@ export function mergeThinkingStream(
   if (!current) return chunk;
   if (chunk === current) return current;
   if (chunk.startsWith(current)) return chunk;
-  if (current.startsWith(chunk)) return current;
 
-  const maxOverlap = Math.min(current.length, chunk.length);
-  for (let overlap = maxOverlap; overlap > 0; overlap--) {
-    if (current.slice(-overlap) === chunk.slice(0, overlap)) {
-      return current + chunk.slice(overlap);
+  const smartDedupeMinChars = 8;
+  if (chunk.length >= smartDedupeMinChars) {
+    if (current.startsWith(chunk) || current.endsWith(chunk) || current.includes(chunk)) {
+      return current;
+    }
+
+    const maxOverlap = Math.min(current.length, chunk.length);
+    for (let overlap = maxOverlap; overlap >= smartDedupeMinChars; overlap--) {
+      if (current.slice(-overlap) === chunk.slice(0, overlap)) {
+        return current + chunk.slice(overlap);
+      }
     }
   }
 
   return current + chunk;
 }
+
+const GENERIC_THINKING_PLACEHOLDER_RE = /^(?:🧠\s*)?agent is thinking(?:\.|…){0,3}$/i;
 
 export function extractThinkingChunk(
   eventType: string | undefined,
@@ -113,10 +131,12 @@ export function extractThinkingChunk(
 ): string {
   const text = typeof content === 'string' ? content : '';
   if (!text) return '';
-  if (eventType === 'thinking') return text;
-  if (eventType !== 'status') return '';
 
   const cleaned = text.trim().toLowerCase();
+  if (!cleaned || GENERIC_THINKING_PLACEHOLDER_RE.test(cleaned)) return '';
+
+  if (eventType === 'thinking') return text;
+  if (eventType !== 'status') return '';
   if (!cleaned) return '';
   if (
     cleaned.includes('using tool') ||

@@ -19,7 +19,7 @@ backend/.ssh/
 
 # Runtime data
 .data/
-projects/
+/projects/
 uploads/
 assets/avatars/
 assets/branding/
