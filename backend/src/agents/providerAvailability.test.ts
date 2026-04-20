@@ -7,7 +7,7 @@ describe('providerAvailability', () => {
     expect(provider.capabilities.adapterKey).toBe('openclaw');
     expect(provider.capabilities.supportsInTurnSteering).toBe(true);
     expect(provider.capabilities.supportsQueuedFollowUps).toBe(false);
-    expect(provider.capabilities.followUpMode).toBe('in_turn_inject');
+    expect(provider.capabilities.followUpMode).toBe('interrupt_and_send');
   });
 
   test.each(['CLAUDE_CODE', 'CODEX', 'GEMINI'] as const)('%s exposes queued native-cli follow-up semantics', (name) => {

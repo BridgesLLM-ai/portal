@@ -43,7 +43,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
       icon: <Folder size={16} />,
       action: () => navigate('/projects'),
       category: 'navigation',
-      keywords: ['code', 'repos'],
+      keywords: ['code', 'repos', 'deploy', 'share', 'hosted', 'apps'],
     },
     {
       id: 'nav-files',
@@ -52,14 +52,6 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
       action: () => navigate('/files'),
       category: 'navigation',
       keywords: ['browse', 'explorer'],
-    },
-    {
-      id: 'nav-apps',
-      label: 'Go to Apps',
-      icon: <Rocket size={16} />,
-      action: () => navigate('/apps'),
-      category: 'navigation',
-      keywords: ['deploy', 'library', 'uploads'],
     },
     ...(isElevated(user)
       ? [{

@@ -9,6 +9,7 @@ import { completeNativeCliFlow, completeOAuthFlow, getClaudeSetupToken, getOAuth
 import {
   AUTH_PROFILES_PATH,
   CONFIG_PATH,
+  MODELS_JSON_PATH,
   getDefaultModel,
   getFallbackModels,
   getProviderStatuses,
@@ -19,6 +20,8 @@ import {
 import { listGatewayModels } from '../utils/openclawGatewayRpc';
 import {
   buildOpenClawCliEnv,
+  canonicalizeProviderModelId,
+  extractJsonFromCliOutput,
   normalizePortalModelId,
   repairClaudeSubscriptionConfig,
 } from '../utils/openclawCli';
@@ -111,10 +114,8 @@ function runOpenClaw(args: string[], timeout = 30000) {
     encoding: 'utf8',
     env: buildOpenClawCliEnv(),
   });
-  // OpenClaw sometimes prints diagnostic messages to stdout before JSON output.
-  // Strip any non-JSON prefix lines (e.g. "[agents/model-providers] ...")
-  if (args.includes('--json') && raw.includes('{')) {
-    return raw.slice(raw.indexOf('{'));
+  if (args.includes('--json')) {
+    return extractJsonFromCliOutput(raw);
   }
   return raw;
 }
@@ -125,39 +126,50 @@ function runOpenClaw(args: string[], timeout = 30000) {
  */
 function registerProviderModels(provider: string) {
   try {
-    const output = runOpenClaw(['models', 'list', '--all', '--provider', provider, '--json'], 15000);
-    const data = JSON.parse(output);
-    const models: string[] = Array.from(new Set((data.models || [])
-      .map((m: any) => normalizePortalModelId(m.key || m.id))
+    const output = runOpenClaw(['models', 'list', '--all', '--provider', provider, '--json'], 60000);
+    const parsed = JSON.parse(output);
+    const discovered = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed?.models)
+        ? parsed.models
+        : [];
+    const models: string[] = Array.from(new Set(discovered
+      .map((model: any) => canonicalizeProviderModelId(provider, model?.key || model?.id || model?.model || model?.name || ''))
       .filter(Boolean)));
     if (!models.length) {
       console.log(`[AI-Setup] No models discovered for ${provider}`);
       return;
     }
 
-    // Get currently configured fallbacks to avoid duplicates
     const currentFallbacksRaw = runOpenClaw(['models', 'fallbacks', 'list', '--json'], 10000);
     let currentFallbacks: string[] = [];
     try {
-      const parsed = JSON.parse(currentFallbacksRaw);
-      currentFallbacks = (parsed.fallbacks || parsed || []).map((f: any) => typeof f === 'string' ? f : f.model || f.id || '').filter(Boolean);
-    } catch { /* ignore parse errors */ }
+      const parsedFallbacks = JSON.parse(currentFallbacksRaw);
+      const fallbackItems = Array.isArray(parsedFallbacks)
+        ? parsedFallbacks
+        : Array.isArray(parsedFallbacks?.fallbacks)
+          ? parsedFallbacks.fallbacks
+          : [];
+      currentFallbacks = Array.from(new Set(fallbackItems
+        .map((item: any) => canonicalizeProviderModelId(provider, typeof item === 'string' ? item : item?.model || item?.id || ''))
+        .filter(Boolean)));
+    } catch {
+      currentFallbacks = [];
+    }
 
-    // Also check what's already default
-    const currentDefault = getDefaultModel();
-
-    const toAdd = models.filter((m) => m !== currentDefault && !currentFallbacks.includes(m));
+    const currentDefault = canonicalizeProviderModelId(provider, getDefaultModel() || '');
+    const toAdd = models.filter((modelId) => modelId !== currentDefault && !currentFallbacks.includes(modelId));
     if (!toAdd.length) {
       console.log(`[AI-Setup] All ${provider} models already configured`);
       return;
     }
 
-    for (const model of toAdd) {
+    for (const modelId of toAdd) {
       try {
-        runOpenClaw(['models', 'fallbacks', 'add', model], 10000);
-        console.log(`[AI-Setup] Added fallback: ${model}`);
+        runOpenClaw(['models', 'fallbacks', 'add', modelId], 10000);
+        console.log(`[AI-Setup] Added fallback: ${modelId}`);
       } catch (err: any) {
-        console.warn(`[AI-Setup] Failed to add fallback ${model}: ${err.message}`);
+        console.warn(`[AI-Setup] Failed to add fallback ${modelId}: ${err.message}`);
       }
     }
     console.log(`[AI-Setup] Registered ${toAdd.length} models for ${provider}`);
@@ -233,17 +245,29 @@ function buildSaveCommand(provider: string, apiKey: string): string[] {
   return [...commonArgs, '--auth-choice', meta.onboardAuthChoice, `--${meta.onboardKeyFlag}`, apiKey];
 }
 
-function normalizeModelPayload(models: any[]): any[] {
+export function normalizeModelPayload(models: any[], providerHint?: string | null): any[] {
   return models.map((model) => {
-    if (typeof model === 'string') return { id: model, name: model };
-    const canonicalId = normalizePortalModelId(model.key || model.id || model.model || model.name || '');
-    return {
+    if (typeof model === 'string') {
+      const rawId = String(model || '').trim();
+      const provider = rawId.includes('/') ? null : providerHint || null;
+      const canonicalId = canonicalizeProviderModelId(provider, rawId);
+      return canonicalId ? {
+        id: canonicalId,
+        name: canonicalId,
+        provider: canonicalId.includes('/') ? canonicalId.split('/')[0] : undefined,
+      } : null;
+    }
+
+    const rawId = model?.key || model?.id || model?.model || model?.name || '';
+    const provider = model?.provider || model?.modelProvider || (String(rawId).includes('/') ? null : providerHint || null);
+    const canonicalId = canonicalizeProviderModelId(provider, rawId);
+    return canonicalId ? {
       id: canonicalId,
-      name: model.name || model.id || model.model || model.key || canonicalId || '',
-      provider: model.provider || model.modelProvider || (typeof canonicalId === 'string' && canonicalId.includes('/') ? canonicalId.split('/')[0] : undefined),
+      name: model?.name || model?.id || model?.model || model?.key || canonicalId,
+      provider: provider || (canonicalId.includes('/') ? canonicalId.split('/')[0] : undefined),
       raw: model,
-    };
-  }).filter((model) => model.id);
+    } : null;
+  }).filter(Boolean);
 }
 
 export function createAiSetupRouter(): Router {
@@ -364,6 +388,7 @@ export function createAiSetupRouter(): Router {
     }
 
     const { provider, apiKey, setDefault, model } = parsed.data;
+    const normalizedModel = canonicalizeProviderModelId(provider, model || '');
     const validation = await validateApiKey(provider, apiKey);
     if (!validation.valid) {
       res.status(400).json(validation);
@@ -376,14 +401,13 @@ export function createAiSetupRouter(): Router {
       // so we bypass it entirely and write to the same files OpenClaw reads at runtime.
       const { profileId: savedProfileId } = saveProviderApiKey(provider, apiKey);
 
-      if (setDefault && model) {
-        try { runOpenClaw(['models', 'set', model], 10000); } catch {
-          // Fall back to direct config write if CLI fails
+      if (setDefault && normalizedModel) {
+        try { runOpenClaw(['models', 'set', normalizedModel], 10000); } catch {
           const config = readOpenClawConfig();
           if (!config.agents) config.agents = {};
           if (!config.agents.defaults) config.agents.defaults = {};
           if (!config.agents.defaults.model) config.agents.defaults.model = {};
-          config.agents.defaults.model.primary = model;
+          config.agents.defaults.model.primary = normalizedModel;
           const fs = require('fs');
           fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
         }
@@ -392,7 +416,7 @@ export function createAiSetupRouter(): Router {
       await restartGateway();
       registerProviderModels(provider);
 
-      res.json({ success: true, profileId: savedProfileId, model: model || null });
+      res.json({ success: true, profileId: savedProfileId, model: normalizedModel || null });
     } catch (error: any) {
       res.status(500).json({ success: false, error: error?.message || 'Failed to save API key' });
     }
@@ -415,10 +439,6 @@ export function createAiSetupRouter(): Router {
 
     try {
       const result = await pasteCodeToClaudeSession(sessionId, code);
-      if (result.success) {
-        await restartGateway();
-        registerProviderModels('anthropic');
-      }
       res.json(result);
     } catch (error: any) {
       console.error('[Claude] paste-code error:', error.message);
@@ -446,6 +466,7 @@ export function createAiSetupRouter(): Router {
 
       // Restart gateway to pick up the new profile
       await restartGateway();
+      registerProviderModels('anthropic');
       res.json({ success: true });
     } catch (error: any) {
       console.error('[Claude] complete error:', error.message);
@@ -468,7 +489,7 @@ export function createAiSetupRouter(): Router {
 
       runOpenClaw(['models', 'auth', 'paste-token', '--provider', provider, '--token', token], 30000);
 
-      const normalizedModel = normalizePortalModelId(model || '');
+      const normalizedModel = canonicalizeProviderModelId(provider, model || '');
       if (setDefault && normalizedModel) {
         runOpenClaw(['models', 'set', normalizedModel], 10000);
         repairClaudeSubscriptionConfig(normalizedModel);
@@ -535,14 +556,14 @@ export function createAiSetupRouter(): Router {
     try {
       const rpcResult = await listGatewayModels();
       if (rpcResult.ok) {
-        let models = normalizeModelPayload(rpcResult.models || []);
+        let models = normalizeModelPayload(rpcResult.models || [], providerFilter);
         if (providerFilter) models = models.filter((model) => model.id.startsWith(`${providerFilter}/`) || model.provider === providerFilter);
         res.json({ models });
         return;
       }
 
-      const cliModels = JSON.parse(runOpenClaw(['models', 'list', '--json'], 15000));
-      let models = normalizeModelPayload(Array.isArray(cliModels) ? cliModels : cliModels.models || []);
+      const cliModels = JSON.parse(runOpenClaw(['models', 'list', '--json'], 60000));
+      let models = normalizeModelPayload(Array.isArray(cliModels) ? cliModels : cliModels.models || [], providerFilter);
       if (providerFilter) models = models.filter((model) => model.id.startsWith(`${providerFilter}/`) || model.provider === providerFilter);
       res.json({ models });
     } catch (error: any) {
@@ -565,6 +586,7 @@ export function createAiSetupRouter(): Router {
     try {
       const authProfiles = readJsonWithFallback<any>(AUTH_PROFILES_PATH, { version: 2, profiles: {} });
       const openclawConfig = readJsonWithFallback<any>(CONFIG_PATH, {});
+      const modelsJson = readJsonWithFallback<any>(MODELS_JSON_PATH, { providers: {} });
       const profileIds = Object.keys(authProfiles.profiles || {}).filter((profileId) => authProfiles.profiles[profileId]?.provider === providerId);
 
       for (const profileId of profileIds) {
@@ -576,7 +598,12 @@ export function createAiSetupRouter(): Router {
       for (const [profileId, profile] of Object.entries<any>(configProfiles)) {
         if (profile?.provider === providerId) delete configProfiles[profileId];
       }
-      if (openclawConfig?.auth) openclawConfig.auth.profiles = configProfiles;
+      if (openclawConfig?.auth) {
+        openclawConfig.auth.profiles = configProfiles;
+        if (openclawConfig.auth.order && typeof openclawConfig.auth.order === 'object') {
+          delete openclawConfig.auth.order[providerId];
+        }
+      }
 
       const defaultModel = openclawConfig?.agents?.defaults?.model?.primary;
       const removeClaudeCliRefs = providerId === 'anthropic';
@@ -605,11 +632,19 @@ export function createAiSetupRouter(): Router {
         }
       }
 
+      if (modelsJson?.providers && typeof modelsJson.providers === 'object') {
+        delete modelsJson.providers[providerId];
+      }
+      if (openclawConfig?.models?.providers && typeof openclawConfig.models.providers === 'object') {
+        delete openclawConfig.models.providers[providerId];
+      }
+
       if (typeof authProfiles.version !== 'number') {
         authProfiles.version = 1;
       }
       atomicWriteJson(AUTH_PROFILES_PATH, authProfiles);
       atomicWriteJson(CONFIG_PATH, openclawConfig);
+      atomicWriteJson(MODELS_JSON_PATH, modelsJson);
       await restartGateway();
       res.json({ success: true });
     } catch (error: any) {

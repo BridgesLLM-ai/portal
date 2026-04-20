@@ -29,7 +29,7 @@ export interface GatewayEventPayload {
   errorMessage?: string;
   // Agent events (tool calls, etc.)
   seq?: number;
-  stream?: 'tool' | 'compaction' | 'lifecycle';
+  stream?: 'tool' | 'item' | 'compaction' | 'lifecycle';
   ts?: number;
   data?: {
     phase?: 'start' | 'update' | 'result' | 'end';
@@ -455,7 +455,8 @@ export class OpenClawGatewayClient {
 
 
   /**
-   * Inject an FYI / steer note into an active run without starting a new turn.
+   * Inject an assistant-side transcript note without starting a new turn.
+   * This does NOT steer the running agent.
    */
   async injectMessage(sessionKey: string, text: string): Promise<void> {
     this.currentSessionKey = sessionKey;
@@ -466,6 +467,26 @@ export class OpenClawGatewayClient {
         content: [{ type: 'input_text', text }],
       },
     });
+  }
+
+  /**
+   * Interrupt an active run and send a real user steering message.
+   */
+  async steerSession(sessionKey: string, message: string): Promise<{ runId: string | null; interruptedActiveRun: boolean }> {
+    this.currentSessionKey = sessionKey;
+    this.activeRunSessionKey = sessionKey;
+    const idempotencyKey = clientRandomId();
+
+    const result = await this.request<{ runId?: string; interruptedActiveRun?: boolean }>('sessions.steer', {
+      key: sessionKey,
+      message,
+      idempotencyKey,
+    });
+
+    return {
+      runId: typeof result?.runId === 'string' && result.runId.trim() ? result.runId.trim() : null,
+      interruptedActiveRun: result?.interruptedActiveRun === true,
+    };
   }
 
   /**

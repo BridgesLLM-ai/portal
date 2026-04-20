@@ -25,6 +25,7 @@ import {
   mergeThinkingStream,
   sanitizeAssistantContent,
   sanitizeAssistantChunk,
+  stripOpenClawReplyTags,
 } from '../utils/chatStream';
 import {
   OpenClawGatewayClient,
@@ -300,6 +301,64 @@ function nextId() {
   return 'msg-' + Date.now() + '-' + (++msgCounter);
 }
 
+const HISTORY_ENVELOPE_TIMESTAMP_RE = /\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}\s+[A-Z]{2,4}\]\s*/;
+
+function stripHistoryEnvelope(text: string): string {
+  if (!text) return text;
+  const match = text.match(HISTORY_ENVELOPE_TIMESTAMP_RE);
+  if (match && match.index !== undefined) {
+    const beforeTimestamp = text.substring(0, match.index);
+    if (
+      beforeTimestamp.includes('Conversation info (untrusted metadata)')
+      || beforeTimestamp.includes('Sender (untrusted metadata)')
+    ) {
+      return text.substring(match.index + match[0].length).trim();
+    }
+  }
+  return text;
+}
+
+function sanitizeHistoryMessageText(text: string): string {
+  return stripOpenClawReplyTags(stripHistoryEnvelope(text || ''))
+    .replace(/\r\n/g, '\n')
+    .trim();
+}
+
+function isHiddenHistoryArtifactText(text: string): boolean {
+  const normalized = String(text || '').trim();
+  if (!normalized) return false;
+
+  return [
+    /^System \(untrusted\):/i,
+    /^An async command you ran earlier has completed\./i,
+    /^Read HEARTBEAT\.md if it exists/i,
+    /^HEARTBEAT_OK$/i,
+    /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i,
+    /Handle the result internally\./i,
+    /Sender \(untrusted metadata\):/i,
+    /Conversation info \(untrusted metadata\):/i,
+  ].some((pattern) => pattern.test(normalized));
+}
+
+function summarizeHiddenHistoryArtifactText(text: string): string | null {
+  const normalized = String(text || '').trim();
+  if (!normalized) return null;
+
+  if (/<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i.test(normalized) && /\[Internal task completion event\]/i.test(normalized)) {
+    const sourceMatch = normalized.match(/^source:\s*(.+)$/im);
+    const source = sourceMatch?.[1]?.trim().toLowerCase() || '';
+    if (source === 'subagent') return 'Delegated task completed';
+    if (source) return 'Background task completed';
+    return 'Background work completed';
+  }
+
+  if (/^An async command you ran earlier has completed\./i.test(normalized)) {
+    return 'Earlier async command completed';
+  }
+
+  return null;
+}
+
 const MODEL_STORAGE_PREFIX = 'agentChats.lastModel.';
 const CHAT_HISTORY_OMITTED_PLACEHOLDER = '[chat.history omitted: message too large]';
 
@@ -356,11 +415,26 @@ function parseHistoryMessage(m: any): ChatMessage | null {
     };
   }
 
-  const rawContent = m.content || '';
+  const rawContent = typeof m.content === 'string' ? m.content : '';
+  const sanitizedHistoryText = sanitizeHistoryMessageText(rawContent);
   const rawThinkingContent = typeof m.thinkingContent === 'string' ? sanitizeAssistantContent(m.thinkingContent) : '';
   const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
   if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(rawContent) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
     return null;
+  }
+  if (m.role === 'assistant' && !isTruncationPlaceholder && isHiddenHistoryArtifactText(sanitizedHistoryText) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
+    return null;
+  }
+  if ((m.role === 'user' || m.role === 'system') && isHiddenHistoryArtifactText(sanitizedHistoryText)) {
+    const summary = summarizeHiddenHistoryArtifactText(sanitizedHistoryText);
+    if (!summary) return null;
+    return {
+      id: m.id || nextId(),
+      role: 'system',
+      content: summary,
+      createdAt: new Date(m.timestamp || Date.now()),
+      provenance: 'hidden-history-artifact',
+    };
   }
 
   const msg: ChatMessage = {
@@ -368,7 +442,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
     role: isTruncationPlaceholder ? 'system' : m.role,
     content: isTruncationPlaceholder
       ? 'Earlier assistant output was omitted from history because the message was too large.'
-      : (m.role === 'assistant' ? sanitizeAssistantContent(rawContent) : rawContent),
+      : (m.role === 'assistant' ? sanitizeAssistantContent(rawContent) : sanitizedHistoryText),
     createdAt: new Date(m.timestamp || Date.now()),
     provenance: m.provenance,
     model: typeof m.model === 'string' ? m.model : undefined,
@@ -393,13 +467,16 @@ function parseHistoryMessage(m: any): ChatMessage | null {
  * Gateway format: { role, content: [{type: "text", text: "..."}, ...] }
  */
 function extractTextFromGatewayMessage(msg: GatewayChatMessage): string {
-  if (typeof msg.content === 'string') return msg.content;
-  if (!Array.isArray(msg.content)) return '';
+  const rawText = typeof msg.content === 'string'
+    ? msg.content
+    : Array.isArray(msg.content)
+      ? msg.content
+          .filter((block) => block.type === 'text' && typeof block.text === 'string')
+          .map((block) => block.text!)
+          .join('\n')
+      : '';
 
-  return msg.content
-    .filter((block) => block.type === 'text' && typeof block.text === 'string')
-    .map((block) => block.text!)
-    .join('\n');
+  return sanitizeHistoryMessageText(rawText);
 }
 
 /**
@@ -471,6 +548,11 @@ function toConcreteOpenClawSessionKey(rawSession: string, rawAgentId?: string | 
   return sessionKey;
 }
 
+function normalizeRunId(rawRunId: unknown): string | null {
+  const runId = typeof rawRunId === 'string' ? rawRunId.trim() : '';
+  return runId || null;
+}
+
 /**
  * Map a gateway message to our ChatMessage format.
  */
@@ -488,7 +570,24 @@ function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage | null {
   const toolCalls = extractToolCallsFromGatewayMessage(msg);
   const thinking = extractThinkingFromGatewayMessage(msg);
   const isTruncationPlaceholder = msg.role === 'assistant' && text === CHAT_HISTORY_OMITTED_PLACEHOLDER;
-  if (msg.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(text)) {
+  if (msg.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(text) && !thinking && !toolCalls?.length) {
+    return null;
+  }
+  if (msg.role === 'assistant' && !isTruncationPlaceholder && isHiddenHistoryArtifactText(text) && !thinking && !toolCalls?.length) {
+    return null;
+  }
+  if ((msg.role === 'user' || msg.role === 'system') && isHiddenHistoryArtifactText(text)) {
+    const summary = summarizeHiddenHistoryArtifactText(text);
+    if (!summary) return null;
+    return {
+      id: msg.id || msg.messageId || `gw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      role: 'system',
+      content: summary,
+      createdAt: new Date(msg.timestamp || Date.now()),
+      provenance: 'hidden-history-artifact',
+    };
+  }
+  if (!text && msg.role !== 'assistant' && msg.role !== 'toolResult') {
     return null;
   }
 
@@ -499,6 +598,7 @@ function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage | null {
       ? 'Earlier assistant output was omitted from history because the message was too large.'
       : (msg.role === 'assistant' ? sanitizeAssistantContent(text) : text),
     createdAt: new Date(msg.timestamp || Date.now()),
+    provenance: typeof (msg as any).provenance === 'string' ? (msg as any).provenance : undefined,
     model: typeof (msg as any).model === 'string' ? (msg as any).model : undefined,
     toolCalls,
     thinkingContent: thinking,
@@ -599,9 +699,24 @@ function mergeLoadedHistoryWithLocalMessages(
     .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 
   for (const localMessage of localTail) {
-    if (!alreadyRepresented(localMessage)) {
-      merged.push(localMessage);
+    if (alreadyRepresented(localMessage)) continue;
+
+    const delegatedArtifactIndex = localMessage.role === 'user' && localMessage.pendingAck
+      ? merged.findIndex((candidate) => {
+          if (candidate.role !== 'system' || candidate.provenance !== 'hidden-history-artifact') return false;
+          return candidate.createdAt.getTime() >= localMessage.createdAt.getTime();
+        })
+      : -1;
+
+    if (delegatedArtifactIndex >= 0) {
+      merged.splice(delegatedArtifactIndex, 0, {
+        ...localMessage,
+        pendingAck: false,
+      });
+      continue;
     }
+
+    merged.push(localMessage);
   }
 
   return dedupeHistoryMessages(merged);
@@ -747,11 +862,38 @@ export function useChatState(): ChatStateContextValue {
 
 /* ═══ Provider Component ═══ */
 
+const LEGACY_SESSION_STORAGE_KEY = 'agent-chat-session';
+const SESSION_STORAGE_PREFIX = 'agent-chat-session:';
+
+function getProviderSessionStorageKey(provider: string): string {
+  return `${SESSION_STORAGE_PREFIX}${String(provider || 'OPENCLAW').trim().toUpperCase() || 'OPENCLAW'}`;
+}
+
 function normalizeInitialSession(provider: string, session: string): string {
   const p = String(provider || '').trim().toUpperCase();
   const s = String(session || '').trim() || 'main';
   if (p === 'OPENCLAW' && s === 'main') return 'agent:main:main';
+  if (p !== 'OPENCLAW' && s.startsWith('agent:')) return 'main';
   return s;
+}
+
+function readStoredSession(provider: string): string {
+  if (typeof window === 'undefined') return normalizeInitialSession(provider, 'main');
+  const providerScoped = localStorage.getItem(getProviderSessionStorageKey(provider));
+  if (providerScoped && providerScoped.trim()) {
+    return normalizeInitialSession(provider, providerScoped);
+  }
+  const legacy = localStorage.getItem(LEGACY_SESSION_STORAGE_KEY) || 'main';
+  return normalizeInitialSession(provider, legacy);
+}
+
+function persistStoredSession(provider: string, session: string): string {
+  const normalized = normalizeInitialSession(provider, session);
+  if (typeof window !== 'undefined') {
+    localStorage.setItem(getProviderSessionStorageKey(provider), normalized);
+    localStorage.setItem(LEGACY_SESSION_STORAGE_KEY, normalized);
+  }
+  return normalized;
 }
 
 const LIFECYCLE_CONTROL_TOKENS = new Set([
@@ -919,10 +1061,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   );
   const [session, setSessionRaw] = useState(() => {
     const storedProvider = localStorage.getItem('agent-chat-provider') || 'OPENCLAW';
-    const storedSession = localStorage.getItem('agent-chat-session') || 'main';
-    const normalized = normalizeInitialSession(storedProvider, storedSession);
-    if (normalized !== storedSession) localStorage.setItem('agent-chat-session', normalized);
-    return normalized;
+    return readStoredSession(storedProvider);
   });
   const [agentId, setAgentIdRaw] = useState<string | undefined>(
     () => localStorage.getItem('agent-chat-agentId') || undefined,
@@ -943,6 +1082,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const setProvider = useCallback((p: string) => {
     localStorage.setItem('agent-chat-provider', p);
     setProviderRaw(p);
+    const nextSession = readStoredSession(p);
+    sessionRef.current = nextSession;
+    setSessionRaw(nextSession);
     const stored = normalizeProviderModel(p, localStorage.getItem(MODEL_STORAGE_PREFIX + p) || '');
     // Same guard, but only for OpenClaw. Native providers legitimately use bare IDs.
     if (stored && p === 'OPENCLAW' && !stored.includes('/')) {
@@ -953,8 +1095,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
   const setSession = useCallback((s: string) => {
-    const normalized = normalizeInitialSession(providerRef.current, s);
-    localStorage.setItem('agent-chat-session', normalized);
+    const normalized = persistStoredSession(providerRef.current, s);
+    sessionRef.current = normalized;
     setSessionRaw(normalized);
   }, []);
   const setAgentId = useCallback((a: string | undefined) => {
@@ -972,9 +1114,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const normalized = normalizeInitialSession(provider, session);
     if (normalized !== session) {
-      localStorage.setItem('agent-chat-session', normalized);
+      persistStoredSession(provider, normalized);
+      sessionRef.current = normalized;
       setSessionRaw(normalized);
+      return;
     }
+    persistStoredSession(provider, session);
   }, [provider, session]);
 
   const deriveSessionModel = useCallback((sessionInfo: any): string => {
@@ -1094,6 +1239,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const directClientRef = useRef<OpenClawGatewayClient | null>(null);
   const streamTransportRef = useRef<'portal' | 'direct' | null>(null);
   const currentRunIdRef = useRef<string | null>(null);
+  const lastTerminalRunIdRef = useRef<string | null>(null);
+  const suppressedRunIdsRef = useRef<Map<string, number>>(new Map());
   const streamingAssistantIdRef = useRef<string | null>(null);
   const activeStreamToolCallsRef = useRef<ToolCall[]>([]);
   const activeToolNameRef = useRef<string | null>(null);
@@ -1112,6 +1259,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // generation simply discards its result, eliminating race conditions.
   const historyGenRef = useRef(0);
   const loadHistoryInternalRef = useRef<((sessionKey: string, prov?: string, options?: { force?: boolean; refreshActiveSnapshot?: boolean }) => Promise<boolean>) | null>(null);
+  const lastForegroundReconcileAtRef = useRef(0);
   // Throttle refs for streaming text updates — batch text deltas to reduce re-renders
   const textThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingTextUpdateRef = useRef<string | null>(null);
@@ -1525,6 +1673,35 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const markRunIdSuppressed = useCallback((rawRunId?: string | null) => {
+    const runId = normalizeRunId(rawRunId);
+    if (!runId) return;
+    const now = Date.now();
+    const expiresAt = now + 120_000;
+    const suppressed = suppressedRunIdsRef.current;
+    for (const [key, expiry] of suppressed.entries()) {
+      if (expiry <= now) suppressed.delete(key);
+    }
+    suppressed.set(runId, expiresAt);
+  }, []);
+
+  const isRunIdSuppressed = useCallback((rawRunId?: string | null) => {
+    const runId = normalizeRunId(rawRunId);
+    if (!runId) return false;
+    const now = Date.now();
+    const suppressed = suppressedRunIdsRef.current;
+    for (const [key, expiry] of suppressed.entries()) {
+      if (expiry <= now) suppressed.delete(key);
+    }
+    return suppressed.has(runId);
+  }, []);
+
+  const clearSuppressedRunId = useCallback((rawRunId?: string | null) => {
+    const runId = normalizeRunId(rawRunId);
+    if (!runId) return;
+    suppressedRunIdsRef.current.delete(runId);
+  }, []);
+
   const applyCompactionState = useCallback((update: {
     phase: 'start' | 'end';
     content?: string | null;
@@ -1539,28 +1716,40 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const maintenanceKind = typeof update === 'string' ? 'compaction' : (update.maintenanceKind || 'compaction');
 
     if (phase === 'start') {
+      const noticeText = content || (maintenanceKind === 'maintenance' ? 'Context maintenance in progress…' : 'Compacting context…');
       if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
       compactionPhaseRef.current = 'compacting';
       setCompactionPhase('compacting');
+      setStatusText(noticeText);
       setThinkingContent('');
       return;
     }
 
     if (completed && maintenanceKind === 'compaction') {
+      const noticeText = content || 'Context compacted';
       compactionPhaseRef.current = 'compacted';
       setCompactionPhase('compacted');
-      appendSystemNotice(content || 'Context compacted');
+      setStatusText(noticeText);
+      appendSystemNotice(noticeText);
       if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
       compactionTimerRef.current = setTimeout(() => {
         compactionPhaseRef.current = 'idle';
         setCompactionPhase('idle');
+        setStatusText((prev) => (prev === noticeText ? null : prev));
         compactionTimerRef.current = null;
       }, 3000);
       return;
     }
 
+    const noticeText = content || 'Context maintenance finished.';
     compactionPhaseRef.current = 'idle';
     setCompactionPhase('idle');
+    setStatusText(noticeText);
+    if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
+    compactionTimerRef.current = setTimeout(() => {
+      setStatusText((prev) => (prev === noticeText ? null : prev));
+      compactionTimerRef.current = null;
+    }, 3000);
   }, [appendSystemNotice]);
 
   const applyCompactionSnapshotState = useCallback((phase?: unknown) => {
@@ -1571,10 +1760,16 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
     compactionPhaseRef.current = phase;
     setCompactionPhase(phase);
+    if (phase === 'compacting') {
+      setStatusText('Compacting context…');
+    }
     if (phase === 'compacted') {
+      const noticeText = 'Context compacted';
+      setStatusText(noticeText);
       compactionTimerRef.current = setTimeout(() => {
         compactionPhaseRef.current = 'idle';
         setCompactionPhase('idle');
+        setStatusText((prev) => (prev === noticeText ? null : prev));
         compactionTimerRef.current = null;
       }, 3000);
     }
@@ -1780,9 +1975,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         : snapshot.phase === 'streaming'
           ? 'streaming'
           : 'thinking';
+    const compactionStatusText = snapshot.compactionPhase === 'compacting'
+      ? (rawStatusText || 'Compacting context…')
+      : snapshot.compactionPhase === 'compacted'
+        ? (rawStatusText || 'Context compacted')
+        : '';
     const fallbackStatusText = snapshotToolName
-      ? getToolStatusText(snapshotToolName, rawStatusText)
-      : rawStatusText || options?.statusTextWhenNoTool || (snapshotPhase === 'streaming' ? 'Still responding…' : 'Still working…');
+      ? getToolStatusText(snapshotToolName, rawStatusText || compactionStatusText || null)
+      : compactionStatusText || rawStatusText || options?.statusTextWhenNoTool || (snapshotPhase === 'streaming' ? 'Still responding…' : 'Still working…');
     setIsRunning(true);
     setSessionAvailability('present');
     setStreamingPhase(snapshotPhase);
@@ -1854,9 +2054,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       const manager = wsManagerRef.current;
       if (!data?.active) {
-        if (options?.reconnect !== false && manager?.isConnected()) {
-          manager.send({ type: 'reconnect', session: sessionKey, provider: prov });
-        }
         if (options?.clearIfInactive && isStreamActiveRef.current) {
           debugLog('[ChatState] Active-stream snapshot is idle — clearing stale stream UI');
           clearActiveStreamState();
@@ -1913,7 +2110,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       if (resolvedSessionKey && resolvedSessionKey !== sessionRef.current) {
         sessionRef.current = resolvedSessionKey;
         setSessionRaw(resolvedSessionKey);
-        localStorage.setItem('agent-chat-session', resolvedSessionKey);
+        persistStoredSession(prov || providerRef.current, resolvedSessionKey);
       }
       const targetSessionKey = resolvedSessionKey || sessionKey;
       const [result, streamStatusResult] = await Promise.all([
@@ -1946,6 +2143,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         try {
           debugLog('loading history via direct gateway');
           loaded = await loadViaDirect();
+          if (loaded.length === 0 && !(historyActiveStream?.active)) {
+            debugLog('direct gateway history was empty; falling back to HTTP history');
+            loaded = await loadViaHttp();
+          }
         } catch (err) {
           console.warn('[ChatState] Direct gateway history failed; falling back to HTTP', err);
           loaded = await loadViaHttp();
@@ -2055,7 +2256,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     activeStreamToolCallsRef.current = [];
     // Keep current messages visible until the target session history resolves.
     setSessionRaw(sessionKey);
-    localStorage.setItem('agent-chat-session', sessionKey);
+    persistStoredSession(providerRef.current, sessionKey);
     // Force-load history bypassing the isStreamActive guard
     await loadHistoryInternal(sessionKey, providerRef.current, { force: true });
   }, [loadHistoryInternal]);
@@ -2092,24 +2293,82 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
   }, [session, provider, loadHistoryInternal]);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const reconcileForegroundState = () => {
+      const currentSession = sessionRef.current;
+      const currentProvider = providerRef.current;
+      if (currentProvider !== 'OPENCLAW' || !currentSession) return;
+      const now = Date.now();
+      if (now - lastForegroundReconcileAtRef.current < 1500) return;
+      lastForegroundReconcileAtRef.current = now;
+      void loadHistoryInternalRef.current?.(currentSession, currentProvider, { force: true, refreshActiveSnapshot: true });
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        reconcileForegroundState();
+      }
+    };
+
+    window.addEventListener('focus', reconcileForegroundState);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.removeEventListener('focus', reconcileForegroundState);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, []);
+
   // WS event handler — processes events even when chat page is unmounted
   const handleWsEvent = useCallback((data: any) => {
-    // When the direct gateway client is connected, it handles all streaming events
-    // (chat, agent) directly. The Socket.IO/WS path should NOT also process them,
-    // otherwise the browser receives the same text twice causing stutter/cascade.
-    if (directClientRef.current?.isConnected && streamTransportRef.current === 'direct') {
-      // Still allow non-streaming events (session, exec_approval, connected, keepalive)
-      const directHandledTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'done', 'stream_resume', 'stream_ended', 'run_resumed'];
-      if (directHandledTypes.includes(data?.type)) {
-        return; // Direct gateway already handling this
-      }
-    }
-
     // Session events with a new sessionId should update our ref IMMEDIATELY,
     // before the React state update queues. This prevents subsequent events
     // (that arrive before the useEffect fires) from being dropped.
     if (data?.type === 'session' && data.sessionId) {
       sessionRef.current = data.sessionId;
+    }
+
+    const incomingPortalRunId = normalizeRunId(data?.runId);
+    if (incomingPortalRunId && isRunIdSuppressed(incomingPortalRunId)) {
+      if (data?.type === 'done' || data?.type === 'error' || data?.type === 'stream_ended') {
+        clearSuppressedRunId(incomingPortalRunId);
+      }
+      debugLog('[ChatState] Ignoring suppressed portal run event', {
+        type: data?.type,
+        runId: incomingPortalRunId,
+      });
+      return;
+    }
+
+    // When the direct gateway client is connected, it handles all streaming events
+    // (chat, agent) directly. The Socket.IO/WS path should NOT also process them,
+    // otherwise the browser receives the same text twice causing stutter/cascade.
+    if (directClientRef.current?.isConnected && streamTransportRef.current === 'direct') {
+      const isPortalTerminalEvent = data?.type === 'done' || data?.type === 'stream_ended';
+      if (isPortalTerminalEvent && !isStreamActiveRef.current && !streamingAssistantIdRef.current) {
+        if (!incomingPortalRunId || lastTerminalRunIdRef.current === incomingPortalRunId) {
+          return;
+        }
+      }
+      // Still allow non-streaming events (session, exec_approval, connected, keepalive)
+      const directHandledTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'stream_resume', 'run_resumed'];
+      if (directHandledTypes.includes(data?.type)) {
+        return; // Direct gateway already handling this
+      }
+    }
+    const portalStreamTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'done', 'error', 'stream_resume', 'stream_ended', 'run_resumed'];
+    if (incomingPortalRunId && portalStreamTypes.includes(data?.type)) {
+      if (!currentRunIdRef.current || !isStreamActiveRef.current) {
+        currentRunIdRef.current = incomingPortalRunId;
+      } else if (currentRunIdRef.current !== incomingPortalRunId) {
+        debugLog('[ChatState] Ignoring portal event for stale run', {
+          type: data?.type,
+          expectedRunId: currentRunIdRef.current,
+          incomingRunId: incomingPortalRunId,
+        });
+        return;
+      }
     }
 
     // Filter events by session key. Allow events that match our current session,
@@ -2164,7 +2423,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (data.sessionId) {
           setSessionAvailability('present');
           setSessionRaw(data.sessionId);
-          localStorage.setItem('agent-chat-session', data.sessionId);
+          persistStoredSession(providerRef.current, data.sessionId);
         }
         if (data.provenance) setLastProvenance(data.provenance);
         if (data.model) {
@@ -2375,6 +2634,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'done': {
         clearStreamWatchdog();
         clearPendingTextRender();
+        lastTerminalRunIdRef.current = incomingPortalRunId || currentRunIdRef.current;
 
         const rawFinal = typeof data.content === 'string' ? data.content : '';
         const hasVisibleFinal = rawFinal.length > 0 && !isControlOnlyAssistantContent(rawFinal);
@@ -2443,6 +2703,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'error': {
         clearStreamWatchdog();
         clearPendingTextRender();
+        lastTerminalRunIdRef.current = incomingPortalRunId || currentRunIdRef.current;
         if (compactionTimerRef.current) {
           clearTimeout(compactionTimerRef.current);
           compactionTimerRef.current = null;
@@ -2496,6 +2757,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'stream_ended': {
         clearStreamWatchdog();
         clearPendingTextRender();
+        lastTerminalRunIdRef.current = incomingPortalRunId || currentRunIdRef.current;
         setStatusText(null);
         setStreamingPhase('idle');
         setThinkingContent('');
@@ -2517,7 +2779,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'keepalive':
         break;
     }
-  }, [applyOpenClawActiveStreamSnapshot, ensureStreamingAssistantBubble, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, mergeStreamText, scheduleSessionTelemetryRefresh, setLiveRunPhase, upsertStreamingAssistant]);
+  }, [applyOpenClawActiveStreamSnapshot, clearSuppressedRunId, ensureStreamingAssistantBubble, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, mergeStreamText, scheduleSessionTelemetryRefresh, setLiveRunPhase, upsertStreamingAssistant]);
 
   // Keep handleWsEvent in a ref so the WS handler always calls the latest version
   const handleWsEventRef = useRef(handleWsEvent);
@@ -2534,10 +2796,32 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const payloadSession = typeof payload?.sessionKey === 'string'
       ? resolveOpenClawSessionKey(payload.sessionKey)
       : '';
-    const incomingRunId = typeof payload?.runId === 'string' && payload.runId.trim()
-      ? payload.runId.trim()
-      : null;
+    const incomingRunId = normalizeRunId(payload?.runId);
     const expectedRunId = currentRunIdRef.current;
+    const isDirectTerminalEvent = evt.event === 'chat' && (payload?.state === 'final' || payload?.state === 'aborted' || payload?.state === 'error');
+    if (incomingRunId && isRunIdSuppressed(incomingRunId)) {
+      if (isDirectTerminalEvent) {
+        clearSuppressedRunId(incomingRunId);
+      }
+      debugLog('[ChatState] Ignoring suppressed direct run event', {
+        event: evt.event,
+        state: payload?.state,
+        runId: incomingRunId,
+      });
+      return;
+    }
+    const effectiveTerminalRunId = incomingRunId || expectedRunId;
+
+    if (isDirectTerminalEvent && !isStreamActiveRef.current && !streamingAssistantIdRef.current) {
+      if (!effectiveTerminalRunId || lastTerminalRunIdRef.current === effectiveTerminalRunId) {
+        debugLog('[ChatState] Ignoring duplicate direct terminal event', {
+          event: evt.event,
+          state: payload?.state,
+          runId: effectiveTerminalRunId,
+        });
+        return;
+      }
+    }
 
     if (isStreamEvent) {
       setWsConnected(true);
@@ -2649,6 +2933,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         case 'final': {
           clearStreamWatchdog();
           clearPendingTextRender();
+          lastTerminalRunIdRef.current = incomingRunId || currentRunIdRef.current;
 
           const finalTextBlocks = Array.isArray(payload.message?.content)
             ? payload.message.content
@@ -2729,6 +3014,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         case 'aborted': {
           clearStreamWatchdog();
           clearPendingTextRender();
+          lastTerminalRunIdRef.current = incomingRunId || currentRunIdRef.current;
 
           const cid = streamingAssistantIdRef.current;
           const currentText = assembledRef.current;
@@ -2755,6 +3041,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         case 'error': {
           clearStreamWatchdog();
           clearPendingTextRender();
+          lastTerminalRunIdRef.current = incomingRunId || currentRunIdRef.current;
           if (compactionTimerRef.current) {
             clearTimeout(compactionTimerRef.current);
             compactionTimerRef.current = null;
@@ -2786,9 +3073,19 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
     } else if (evt.event === 'agent') {
       const payload = evt.payload;
+      const rawData = payload.data as any;
+      const normalizedToolData = payload.stream === 'tool' && rawData
+        ? rawData
+        : (payload.stream === 'item' && rawData?.kind === 'tool'
+            ? {
+                ...rawData,
+                phase: rawData.phase === 'end' ? 'result' : rawData.phase,
+                result: rawData.result ?? rawData.partialResult ?? rawData.statusText ?? rawData.meta,
+              }
+            : null);
 
-      if (payload.stream === 'tool' && payload.data) {
-        const data = payload.data;
+      if (normalizedToolData) {
+        const data = normalizedToolData;
         let assistantId = streamingAssistantIdRef.current;
 
         switch (data.phase) {
@@ -2958,7 +3255,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
       }
     }
-  }, [ensureStreamingAssistantBubble, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase]);
+  }, [clearSuppressedRunId, ensureStreamingAssistantBubble, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase]);
 
   // WS setup — runs once on mount, survives entire app lifetime
   // Handler registration MUST happen in the same effect that creates the manager,
@@ -3096,7 +3393,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           if (currentSession && currentSession !== sessionRef.current) {
             sessionRef.current = currentSession;
             setSessionRaw(currentSession);
-            localStorage.setItem('agent-chat-session', currentSession);
+            persistStoredSession(currentProvider, currentSession);
           }
           if (currentSession) {
             directClient.setCurrentSession(currentSession);
@@ -3312,40 +3609,24 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const normalized = String(text || '').trim();
     if (!normalized) return;
 
-    const shouldInjectIntoActiveTurn = providerRef.current === 'OPENCLAW' && isStreamActiveRef.current;
-    if (shouldInjectIntoActiveTurn) {
-      try {
-        const targetSession = resolveOpenClawSessionKey(sessionRef.current || 'main');
-        const directClient = directClientRef.current;
-        if (useDirectGateway && directClient?.isConnected) {
-          await directClient.injectMessage(targetSession, normalized);
-        } else {
-          const manager = wsManagerRef.current;
-          if (manager && manager.isConnected()) {
-            const sent = manager.send({ type: 'inject', session: targetSession, text: normalized });
-            if (!sent) {
-              await client.post('/gateway/chat/inject', { session: targetSession, text: normalized });
-            }
-          } else {
-            await client.post('/gateway/chat/inject', { session: targetSession, text: normalized });
-          }
-        }
-
-        setMessages(prev => [...prev, {
-          id: nextId(),
-          role: 'system',
-          content: `Live note sent to running OpenClaw turn: ${normalized}`, 
-          createdAt: new Date(),
-          provenance: 'live-steer',
-        }]);
-        setStatusText('Live note sent to running OpenClaw turn');
-        setTimeout(() => setStatusText((curr) => curr === 'Live note sent to running OpenClaw turn' ? null : curr), 2200);
-      } catch (err: any) {
-        console.error('[ChatState] Failed to inject note into active OpenClaw turn:', err);
-        setStatusText(`⚠️ ${normalizeAgentError(err, 'Live steer failed')}`);
-        setTimeout(() => setStatusText(null), 4000);
+    const shouldSteerActiveTurn = providerRef.current === 'OPENCLAW' && isStreamActiveRef.current;
+    const interruptedRunId = shouldSteerActiveTurn ? currentRunIdRef.current : null;
+    if (shouldSteerActiveTurn) {
+      if (interruptedRunId) {
+        markRunIdSuppressed(interruptedRunId);
       }
-      return;
+      const interruptedAssistantId = streamingAssistantIdRef.current;
+      const interruptedText = assembledRef.current;
+      clearActiveStreamState();
+      if (interruptedAssistantId) {
+        setMessages(prev => prev.map((message) => {
+          if (message.id !== interruptedAssistantId) return message;
+          if (interruptedText.trim()) {
+            return { ...message, content: `${interruptedText}\n\n*(interrupted by steering message)*` };
+          }
+          return { ...message, content: message.content || '*(interrupted by steering message)*' };
+        }));
+      }
     }
 
     const shouldQueue = isStreamActiveRef.current || (!isQueueDrainActiveRef.current && messageQueueRef.current.length > 0);
@@ -3417,15 +3698,24 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (currentSession !== sessionRef.current) {
           sessionRef.current = currentSession;
           setSessionRaw(currentSession);
-          localStorage.setItem('agent-chat-session', currentSession);
+          persistStoredSession(providerRef.current, currentSession);
         }
         debugLog('[ChatState] Sending via direct gateway to session:', currentSession);
-        const runId = await directClient.sendMessage(currentSession, normalized);
+        const steerResult = shouldSteerActiveTurn
+          ? await directClient.steerSession(currentSession, normalized)
+          : null;
+        const runId = shouldSteerActiveTurn
+          ? steerResult?.runId || null
+          : await directClient.sendMessage(currentSession, normalized);
+        if (interruptedRunId && runId && interruptedRunId === runId) {
+          clearSuppressedRunId(interruptedRunId);
+        }
         currentRunIdRef.current = runId;
-        debugLog('[ChatState] Direct send initiated, runId:', runId || '(pending)');
+        debugLog('[ChatState] Direct send initiated, runId:', runId || '(pending)', 'steered:', shouldSteerActiveTurn);
         // Events will come through handleDirectGatewayEvent
       } catch (err: any) {
         console.error('[ChatState] Direct gateway send failed:', err);
+        clearSuppressedRunId(interruptedRunId);
         setMessages(prev => prev.map(m =>
           m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(err, 'Send failed') } : m
         ));
@@ -3440,6 +3730,30 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
     // Send via WS (portal middleman path for non-OPENCLAW or when direct gateway unavailable)
     const manager = wsManagerRef.current;
+    if (shouldSteerActiveTurn && providerRef.current === 'OPENCLAW') {
+      try {
+        streamTransportRef.current = 'portal';
+        const currentSession = resolveOpenClawSessionKey(sessionRef.current || 'main') || 'main';
+        const { data } = await client.post('/gateway/session-steer', {
+          session: currentSession,
+          message: normalized,
+        });
+        currentRunIdRef.current = typeof data?.runId === 'string' ? data.runId : null;
+        debugLog('[ChatState] Portal steer initiated, runId:', currentRunIdRef.current || '(pending)');
+      } catch (err: any) {
+        clearSuppressedRunId(interruptedRunId);
+        setMessages(prev => prev.map(m =>
+          m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(err, 'Steer failed') } : m
+        ));
+        setIsRunning(false);
+        setStreamingPhase('idle');
+        isStreamActiveRef.current = false;
+        streamTransportRef.current = null;
+        streamingAssistantIdRef.current = null;
+      }
+      return;
+    }
+
     if (manager && manager.isConnected()) {
       streamTransportRef.current = 'portal';
       const payload: Record<string, unknown> = {
@@ -3481,7 +3795,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         streamingAssistantIdRef.current = null;
       }
     }
-  }, [normalizeAgentError, resetStreamWatchdog, resolveOpenClawSessionKey, useDirectGateway]);
+  }, [clearActiveStreamState, clearSuppressedRunId, markRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, resolveOpenClawSessionKey, useDirectGateway]);
 
   const drainNextQueuedMessage = useCallback(() => {
     if (isStreamActiveRef.current || isQueueDrainActiveRef.current) return;
@@ -3551,7 +3865,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             if (evt.sessionId) {
               setSessionAvailability('present');
               setSessionRaw(evt.sessionId);
-              localStorage.setItem('agent-chat-session', evt.sessionId);
+              persistStoredSession(providerRef.current, evt.sessionId);
             }
             if (evt.provenance) setLastProvenance(evt.provenance);
           } else if (evt.type === 'text') {
@@ -3829,10 +4143,20 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         await directClient.abortRun(currentSession, runId || undefined);
       } else {
         const manager = wsManagerRef.current;
+        const runId = currentRunIdRef.current;
         if (manager && manager.isConnected()) {
-          manager.send({ type: 'abort', session: sessionRef.current, provider: providerRef.current });
+          manager.send({
+            type: 'abort',
+            session: sessionRef.current,
+            provider: providerRef.current,
+            ...(runId ? { runId } : {}),
+          });
         } else {
-          await client.post('/gateway/chat/abort', { session: sessionRef.current, provider: providerRef.current });
+          await client.post('/gateway/chat/abort', {
+            session: sessionRef.current,
+            provider: providerRef.current,
+            ...(runId ? { runId } : {}),
+          });
         }
       }
     } catch (err) {

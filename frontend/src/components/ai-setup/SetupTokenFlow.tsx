@@ -27,6 +27,8 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
   const [pasteCode, setPasteCode] = useState('');
   const [manualToken, setManualToken] = useState('');
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [statusOutput, setStatusOutput] = useState<string | null>(null);
+  const [completingStartedAt, setCompletingStartedAt] = useState<number | null>(null);
 
   const normalizeModelForSelector = React.useCallback((modelId: string | null | undefined) => {
     const normalized = canonicalizePortalModelId(modelId || '');
@@ -55,26 +57,76 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
     });
   }, [apiBase, normalizeModelForSelector, provider]);
 
-  // Poll for auto-completion
-  const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
-  React.useEffect(() => {
-    if (step === 'waiting' && sessionId) {
-      pollRef.current = setInterval(async () => {
-        try {
-          const { data } = await client.get(`${apiBase}/oauth/status/${sessionId}`);
-          if (data?.status === 'complete') {
-            if (pollRef.current) clearInterval(pollRef.current);
-            completeFlow();
-          }
-        } catch {
-          // ignore poll errors
-        }
-      }, 3000);
+  const finalizeClaudeSetup = React.useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const { data } = await client.post(`${apiBase}/claude/complete`, { sessionId });
+      if (data.success) {
+        setStep('model');
+        setCompletingStartedAt(null);
+      } else {
+        setError(data.error || 'Failed to capture setup token');
+        setStep('error');
+        setCompletingStartedAt(null);
+      }
+    } catch (err: any) {
+      setError(err?.response?.data?.error || err?.message || 'Failed to complete Claude setup');
+      setStep('error');
+      setCompletingStartedAt(null);
     }
+  }, [apiBase, sessionId]);
+
+  // Poll Claude setup status so the UI does not look frozen while the CLI finishes.
+  const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
+  const finalizeInFlightRef = React.useRef(false);
+  React.useEffect(() => {
+    if (!sessionId || (step !== 'waiting' && step !== 'completing')) return;
+
+    const pollOnce = async () => {
+      try {
+        const { data } = await client.get(`${apiBase}/oauth/status/${sessionId}`);
+        const output = typeof data?.output === 'string' ? data.output.trim() : '';
+        setStatusOutput(output || null);
+
+        if (data?.status === 'error') {
+          setError(data?.error || 'Claude setup failed');
+          setStep('error');
+          setCompletingStartedAt(null);
+          return;
+        }
+
+        if (step === 'waiting' && data?.status === 'complete' && !finalizeInFlightRef.current) {
+          finalizeInFlightRef.current = true;
+          await finalizeClaudeSetup();
+          finalizeInFlightRef.current = false;
+          return;
+        }
+
+        if (step === 'completing' && completingStartedAt && Date.now() - completingStartedAt > 180000) {
+          setError('Timed out waiting for Claude Code to return the setup token after the pasted code. Try the code once more, or use manual token paste.');
+          setStep('error');
+          setCompletingStartedAt(null);
+        }
+      } catch {
+        // ignore poll errors
+      }
+    };
+
+    void pollOnce();
+    pollRef.current = setInterval(() => { void pollOnce(); }, 2000);
     return () => {
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      finalizeInFlightRef.current = false;
     };
-  }, [step, sessionId]);
+  }, [apiBase, completingStartedAt, finalizeClaudeSetup, sessionId, step]);
+
+  React.useEffect(() => {
+    if (step !== 'completing' || !sessionId || finalizeInFlightRef.current) return;
+    finalizeInFlightRef.current = true;
+    void finalizeClaudeSetup().finally(() => {
+      finalizeInFlightRef.current = false;
+    });
+  }, [finalizeClaudeSetup, sessionId, step]);
 
   const startAutomated = async () => {
     setLoading(true);
@@ -91,6 +143,8 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
       }
       setSessionId(data.sessionId);
       setAuthUrl(data.authUrl || null);
+      setStatusOutput(null);
+      setCompletingStartedAt(null);
       if (data.authUrl) {
         try {
           const win = window.open(data.authUrl, '_blank', 'noopener,noreferrer');
@@ -122,7 +176,8 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
     try {
       const { data } = await client.post(`${apiBase}/claude/paste-code`, { sessionId, code: pasteCode.trim() });
       if (data.success) {
-        setStep('model');
+        setCompletingStartedAt(Date.now());
+        setStep('completing');
       } else {
         setError(data.error || 'Failed to complete sign-in');
       }
@@ -130,23 +185,6 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
       setError(err?.response?.data?.error || err?.message || 'Failed to submit code');
     } finally {
       setLoading(false);
-    }
-  };
-
-  const completeFlow = async () => {
-    if (!sessionId) return;
-    setStep('completing');
-    try {
-      const { data } = await client.post(`${apiBase}/claude/complete`, { sessionId });
-      if (data.success) {
-        setStep('model');
-      } else {
-        setError(data.error || 'Failed to capture setup token');
-        setStep('error');
-      }
-    } catch (err: any) {
-      setError(err?.response?.data?.error || err?.message || 'Failed to complete Claude setup');
-      setStep('error');
     }
   };
 
@@ -404,7 +442,16 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
           {step === 'completing' ? (
             <div className="space-y-5 py-8 text-center">
               <Loader2 className="mx-auto h-8 w-8 animate-spin text-emerald-400" />
-              <p className="text-sm text-slate-400">Sign-in detected — saving credentials…</p>
+              <div className="space-y-2">
+                <p className="text-sm text-slate-400">Sign-in detected — finishing the Claude setup-token handshake…</p>
+                <p className="text-xs text-slate-500">This can take a bit after you paste the authorization code. The screen should not stay silent forever now.</p>
+              </div>
+              {statusOutput ? (
+                <div className="rounded-xl border border-slate-800 bg-slate-950/80 p-4 text-left">
+                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Claude status</div>
+                  <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-slate-300">{statusOutput}</pre>
+                </div>
+              ) : null}
             </div>
           ) : null}
 

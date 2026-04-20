@@ -63,10 +63,13 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
     setSaveError(null);
     try {
       const { data } = await client.post(`${apiBase}/validate-key`, { provider: provider.id, apiKey });
-      setValidation(data);
+      const normalizedModels: string[] = Array.from(new Set((data?.models || []).filter((modelId: unknown): modelId is string => typeof modelId === 'string' && modelId.trim().length > 0)));
+      setValidation({ ...data, models: normalizedModels });
       if (data.valid) {
-        if (!selectedModel && selectableModels[0]?.id) {
-          setSelectedModel(selectableModels[0].id);
+        if (!selectedModel) {
+          const balancedDetected = normalizedModels.find((modelId) => provider.defaultModels.some((entry) => entry.id === modelId && entry.tier === 'balanced'));
+          const preferredModel: string | null = balancedDetected || normalizedModels[0] || provider.defaultModels.find((m) => m.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null;
+          if (preferredModel) setSelectedModel(preferredModel);
         }
         setStep('model');
       }

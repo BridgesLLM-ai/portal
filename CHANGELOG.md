@@ -2,6 +2,14 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.4] — 2026-04-19
+
+### Improved
+- **Portal installs and updates now auto-apply the bundled OpenClaw compatibility hotfix when needed**: the installer no longer leaves the temporary relay and Gemini patch layer buried in Settings, so fresh installs and normal update runs can come up with the same compatibility markers the portal depends on without extra manual cleanup.
+
+### Maintenance
+- **The bundled compatibility helper now ships the Gemini-aware patch path through the normal release channel**: current release artifacts carry the same hashed-bundle relay fix, heartbeat `persistedLastTo` preservation, Gemini CLI `stream-json`/`--yolo` patching, and Gemini runtime tool-event wiring that were already validated on the test box.
+
 ## [3.25.3] — 2026-04-17
 
 ### Improved

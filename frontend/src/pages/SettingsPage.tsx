@@ -202,6 +202,7 @@ function GeneralTab({ settings, draftSettings, updateSetting, setSettingValue, s
   const [domainDnsLoading, setDomainDnsLoading] = useState(false);
   const [domainConfigureLoading, setDomainConfigureLoading] = useState(false);
   const [domainDnsResult, setDomainDnsResult] = useState<{ domain: string; resolves: boolean; pointsToUs: boolean; resolvedIps: string[]; expectedIp: string; message: string } | null>(null);
+  const isLocalPortalOrigin = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
   const { theme, setTheme, accentColor, setAccentColor } = useTheme();
   const currentTheme = settings['appearance.theme'] || theme;
   const currentAccent = settings['appearance.accentColor'] || accentColor;
@@ -499,6 +500,12 @@ function GeneralTab({ settings, draftSettings, updateSetting, setSettingValue, s
 
       <SectionCard title="Domain & HTTPS">
         <div className="space-y-4">
+          {isLocalPortalOrigin && (
+            <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-100">
+              <p className="font-medium text-amber-200">Local Windows / WSL beta</p>
+              <p className="mt-2">This portal is running on localhost right now. Public hosting, custom-domain HTTPS, and internet-facing share links are VPS features for now.</p>
+            </div>
+          )}
           {domainLoading ? (
             <div className="flex items-center gap-2 text-sm text-slate-400">
               <Loader2 size={16} className="animate-spin" /> Loading domain status...
@@ -883,13 +890,17 @@ function SecurityTab({ settings, updateSetting, onSave, isDirty, addToast }: {
 
 // ── Agents Tab ────────────────────────────────────────────────────────
 
-function AgentsTab({ settings, updateSetting, onSave, isDirty }: {
+function AgentsTab({ settings, updateSetting, onSave, isDirty, addToast }: {
   settings: Record<string, string>;
   updateSetting: (k: string, v: string) => void;
   onSave: () => void;
   isDirty: boolean;
+  addToast: (type: 'success' | 'error', msg: string) => void;
 }) {
   const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
+  const [compactionNoticeEnabled, setCompactionNoticeEnabled] = useState(false);
+  const [compactionNoticeLoading, setCompactionNoticeLoading] = useState(true);
+  const [compactionNoticeSaving, setCompactionNoticeSaving] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -905,6 +916,39 @@ function AgentsTab({ settings, updateSetting, onSave, isDirty }: {
     const interval = setInterval(loadStatus, 15000);
     return () => { cancelled = true; clearInterval(interval); };
   }, []);
+
+  const loadCompactionNoticeSetting = useCallback(async () => {
+    setCompactionNoticeLoading(true);
+    try {
+      const data = await gatewayAPI.getConfigPath('agents.defaults.compaction.notifyUser');
+      setCompactionNoticeEnabled(data?.value === true);
+    } catch (err: any) {
+      setCompactionNoticeEnabled(false);
+      addToast('error', err?.response?.data?.error || 'Failed to load OpenClaw compaction notice setting');
+    } finally {
+      setCompactionNoticeLoading(false);
+    }
+  }, [addToast]);
+
+  useEffect(() => {
+    void loadCompactionNoticeSetting();
+  }, [loadCompactionNoticeSetting]);
+
+  const handleCompactionNoticeToggle = useCallback(async (enabled: boolean) => {
+    if (compactionNoticeLoading || compactionNoticeSaving) return;
+    const previous = compactionNoticeEnabled;
+    setCompactionNoticeEnabled(enabled);
+    setCompactionNoticeSaving(true);
+    try {
+      await gatewayAPI.patchConfigPath('agents.defaults.compaction.notifyUser', enabled);
+      addToast('success', enabled ? 'OpenClaw compaction notices enabled' : 'OpenClaw compaction notices disabled');
+    } catch (err: any) {
+      setCompactionNoticeEnabled(previous);
+      addToast('error', err?.response?.data?.error || 'Failed to update OpenClaw compaction notice setting');
+    } finally {
+      setCompactionNoticeSaving(false);
+    }
+  }, [addToast, compactionNoticeEnabled, compactionNoticeLoading, compactionNoticeSaving]);
 
   const enabledStr = settings['agents.enabledProviders'] || '["OPENCLAW"]';
   let enabledProviders: string[] = [];
@@ -1006,6 +1050,27 @@ function AgentsTab({ settings, updateSetting, onSave, isDirty }: {
               placeholder="18789"
               type="number"
             />
+          </div>
+        </div>
+      </SectionCard>
+
+      <SectionCard title="OpenClaw Runtime">
+        <div className="space-y-3">
+          <Toggle
+            checked={compactionNoticeEnabled}
+            onChange={(enabled) => { void handleCompactionNoticeToggle(enabled); }}
+            label="Show compaction notices in OpenClaw chats"
+          />
+          <p className="text-sm text-slate-400">
+            Flips <code className="text-xs text-slate-300">agents.defaults.compaction.notifyUser</code> so OpenClaw can emit a visible “Compacting context…” notice when auto-compaction starts.
+          </p>
+          <div className="flex items-center gap-2 text-xs text-slate-500">
+            {(compactionNoticeLoading || compactionNoticeSaving) && <Loader2 size={12} className="animate-spin" />}
+            {compactionNoticeLoading
+              ? 'Loading current OpenClaw compaction notice setting…'
+              : compactionNoticeSaving
+                ? 'Updating OpenClaw runtime setting…'
+                : 'Applies immediately to OpenClaw. No portal Save click needed.'}
           </div>
         </div>
       </SectionCard>
@@ -1298,7 +1363,7 @@ function SystemTab({ settings, updateSetting, onSave, isDirty, addToast }: {
         <SectionCard title="OpenClaw Compatibility Hotfix">
           <div className="space-y-3">
             <p className="text-sm text-slate-400">
-              Optional temporary patch for the long-run OpenClaw exec relay bug on older installs. Applying it patches the installed OpenClaw runtime files and restarts the OpenClaw gateway.
+              Installer and updater runs usually auto-apply this temporary OpenClaw patch now. Use this fallback if OpenClaw was upgraded separately or this install is still missing the relay and Gemini compatibility markers. Applying it patches the installed OpenClaw runtime files and restarts the OpenClaw gateway.
             </p>
 
             {compatHotfixLoading ? (
@@ -1311,12 +1376,16 @@ function SystemTab({ settings, updateSetting, onSave, isDirty, addToast }: {
                   <div className="flex items-center gap-2 text-sm font-medium">
                     {compatHotfixStatus.applied ? <CheckCircle2 size={16} className="text-emerald-400" /> : <AlertCircle size={16} className="text-amber-300" />}
                     <span className={compatHotfixStatus.applied ? 'text-emerald-300' : 'text-amber-200'}>
-                      {compatHotfixStatus.applied ? 'Hotfix present in the installed OpenClaw bundle' : 'Hotfix not applied'}
+                      {compatHotfixStatus.applied ? 'Compatibility patches present in the installed OpenClaw bundle' : 'Compatibility patches not applied'}
                     </span>
                   </div>
                   <div className="mt-2 space-y-1 text-xs text-slate-300">
                     <div>Heartbeat bundle: <span className="font-mono text-slate-400">{compatHotfixStatus.heartbeatRunner || 'missing'}</span></div>
                     <div>Reply bundle: <span className="font-mono text-slate-400">{compatHotfixStatus.replyBundle || 'missing'}</span></div>
+                    <div>Execute runtime: <span className="font-mono text-slate-400">{compatHotfixStatus.executeRuntime || 'missing'}</span></div>
+                    <div>Gemini CLI backend: <span className="font-mono text-slate-400">{compatHotfixStatus.geminiCliBackend || 'missing'}</span></div>
+                    <div>Relay patches: <span className="text-slate-400">detector {compatHotfixStatus.detectorPatched ? '✓' : '✗'}, relay {compatHotfixStatus.relayPatched ? '✓' : '✗'}, reply {compatHotfixStatus.replyPatched ? '✓' : '✗'}</span></div>
+                    <div>Gemini patches: <span className="text-slate-400">cli {compatHotfixStatus.geminiCliPatched ? '✓' : '✗'}, yolo {compatHotfixStatus.geminiCliYoloPatched ? '✓' : '✗'}, runtime {compatHotfixStatus.geminiRuntimePatched ? '✓' : '✗'}</span></div>
                     {compatHotfixStatus.note && <div className="text-slate-400">{compatHotfixStatus.note}</div>}
                   </div>
                 </div>
@@ -1349,7 +1418,7 @@ function SystemTab({ settings, updateSetting, onSave, isDirty, addToast }: {
                     className="inline-flex min-h-[40px] items-center gap-2 rounded-xl border border-amber-200/70 bg-gradient-to-r from-amber-300 via-amber-400 to-amber-500 px-4 py-2 text-sm font-semibold text-slate-950 shadow-[0_10px_24px_rgba(245,158,11,0.28)] transition-all hover:-translate-y-0.5 hover:from-amber-200 hover:via-amber-300 hover:to-amber-400 hover:shadow-[0_14px_28px_rgba(245,158,11,0.36)] focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-200/90 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0A0E27] disabled:translate-y-0 disabled:cursor-not-allowed disabled:border-white/[0.08] disabled:bg-white/[0.06] disabled:bg-none disabled:text-slate-500 disabled:shadow-none"
                   >
                     {compatHotfixApplying ? <Loader2 size={15} className="animate-spin" /> : <Wrench size={15} />}
-                    <span>{compatHotfixApplying ? 'Applying and restarting…' : compatHotfixStatus.applied ? 'Reapply and restart' : 'Apply and restart'}</span>
+                    <span>{compatHotfixApplying ? 'Applying and restarting…' : compatHotfixStatus.applied ? 'Reapply compatibility patches and restart' : 'Apply compatibility patches and restart'}</span>
                   </button>
                 </div>
               </>
@@ -2879,6 +2948,7 @@ export default function SettingsPage() {
                     'runners.shell.enabled', 'runners.shell.binaryPath', 'runners.shell.workingDirectory'
                   ], 'agents')}
                   isDirty={dirtyTabs.has('agents')}
+                  addToast={addToast}
                 />
               )}
               {activeTab === 'system' && (

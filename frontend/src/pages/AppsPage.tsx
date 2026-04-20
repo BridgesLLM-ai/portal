@@ -348,6 +348,7 @@ export default function AppsPage() {
   // Core state
   const navigate = useNavigate();
   const isMobile = useIsMobile();
+  const isLocalPortalOrigin = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
@@ -2794,9 +2795,16 @@ export default function AppsPage() {
                 <button onClick={() => setActivePanel(null)} className="text-slate-500 hover:text-white p-0.5"><X size={14} /></button>
               </div>
               <div className="flex-1 overflow-auto p-3 space-y-4">
+                {isLocalPortalOrigin && (
+                  <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-3 text-[11px] text-amber-100">
+                    <div className="text-[10px] text-amber-300 uppercase font-medium mb-2 flex items-center gap-1"><AlertCircle size={10} /> Local beta disclaimer</div>
+                    <p>This Windows / WSL path is currently <strong className="text-amber-50">experimental, untested in the field, and still under development</strong>. URLs and <code className="rounded bg-black/20 px-1 py-0.5 text-[10px]">/share/...</code> links created here point back to this machine, not a public VPS.</p>
+                    <p className="mt-2 text-amber-200/90">Public hosting, stable external share links, and custom-domain HTTPS are VPS features for now.</p>
+                  </div>
+                )}
                 {currentProject?.deployedUrl && (
                   <div className="bg-emerald-500/5 border border-emerald-500/10 rounded-lg p-3">
-                    <div className="text-[10px] text-emerald-400 uppercase font-medium mb-2 flex items-center gap-1"><Globe size={10} /> Live URL</div>
+                    <div className="text-[10px] text-emerald-400 uppercase font-medium mb-2 flex items-center gap-1"><Globe size={10} /> {isLocalPortalOrigin ? 'Local URL' : 'Live URL'}</div>
                     <div className="flex items-center gap-2">
                       <code className="flex-1 text-[11px] text-emerald-300 bg-black/30 px-2 py-1.5 rounded truncate">
                         {window.location.origin}{currentProject.deployedUrl}

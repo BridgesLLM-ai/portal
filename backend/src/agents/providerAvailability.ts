@@ -10,7 +10,7 @@ import {
 
 export type ProviderModelSelectionMode = 'none' | 'session' | 'launch';
 export type ProviderModelCatalogKind = 'none' | 'dynamic' | 'declared';
-export type ProviderFollowUpMode = 'in_turn_inject' | 'queued_follow_up';
+export type ProviderFollowUpMode = 'interrupt_and_send' | 'queued_follow_up';
 export type ProviderAdapterFamily = 'openclaw-gateway' | 'native-cli';
 
 export interface ProviderCapabilitySummary {
@@ -81,7 +81,7 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
       supportsExecApproval: true,
       supportsInTurnSteering: true,
       supportsQueuedFollowUps: false,
-      followUpMode: 'in_turn_inject',    },
+      followUpMode: 'interrupt_and_send',    },
   },
   CLAUDE_CODE: {
     native: true,

@@ -236,7 +236,7 @@ interface ProviderCapabilities {
   modelCatalogKind?: string;
   supportsInTurnSteering?: boolean;
   supportsQueuedFollowUps?: boolean;
-  followUpMode?: 'in_turn_inject' | 'queued_follow_up' | string;
+  followUpMode?: 'interrupt_and_send' | 'queued_follow_up' | string;
 }
 
 /* ─── Model Picker Dropdown ─────────────────────────────────────────────── */
@@ -890,16 +890,16 @@ function SessionControls({
                     <Wrench size={14} className={compatibilityHotfixStatus?.applied ? 'text-emerald-400' : 'text-amber-400'} />
                     <div className="min-w-0 flex-1">
                       <div className="text-xs font-medium text-white">Compatibility Hotfix</div>
-                      <div className="text-[10px] text-slate-500">Optional OpenClaw runtime patch for the long-run exec relay bug. Applying it restarts the gateway.</div>
+                      <div className="text-[10px] text-slate-500">Installer/update usually auto-applies this OpenClaw relay and Gemini compatibility patch. Use this fallback after a separate OpenClaw upgrade or if the expected markers are missing. Applying it restarts the gateway.</div>
                     </div>
                   </div>
                   <div className={`rounded border px-2 py-1 text-[10px] leading-relaxed ${compatibilityHotfixStatus?.applied ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200' : 'border-amber-500/20 bg-amber-500/10 text-amber-200'}`}>
                     {compatibilityHotfixLoading
                       ? 'Checking current hotfix status…'
                       : compatibilityHotfixStatus?.applied
-                        ? 'Hotfix already present in the installed OpenClaw bundle.'
+                        ? 'Compatibility patches already present in the installed OpenClaw bundle.'
                         : compatibilityHotfixStatus?.supported
-                          ? 'Hotfix not applied on this install.'
+                          ? 'Compatibility patches not applied on this install.'
                           : (compatibilityHotfixStatus?.issues?.[0] || 'This install does not expose the expected OpenClaw bundle layout.')}
                   </div>
                   {compatibilityHotfixMessage && (
@@ -2377,8 +2377,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const providerLabel = getAgent(provider).name;
   const liveSteerEnabled = providerMeta.capabilities?.supportsInTurnSteering === true;
   const runningComposerPlaceholder = liveSteerEnabled
-    ? 'OpenClaw is working, send a live note for this turn…'
-    : 'Agent is working — queue a follow-up message…';
+    ? 'OpenClaw is working, send a steering message for this turn…'
+    : 'Agent is working, queue a follow-up message…';
   const providerCommandCount = providerMeta.slashCommands?.length || 0;
   const providerCommandStatus = providerMeta.slashCommandsLoaded
     ? `${providerCommandCount} provider command${providerCommandCount === 1 ? '' : 's'}`
@@ -2624,7 +2624,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   }, [deferGatewayMetadata, isLoadingHistory, messages.length]);
 
   const sendButtonTitle = isRunning
-    ? (liveSteerEnabled ? 'Send live note to running turn' : 'Queue follow-up after current turn')
+    ? (liveSteerEnabled ? 'Interrupt and steer the running turn' : 'Queue follow-up after current turn')
     : `Send message to ${providerLabel}`;
 
   // Global exec approval listener (works even when no chat stream is active)
@@ -3061,6 +3061,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 agentId={agentId}
                 onChange={handleSelectAgent}
                 onViewSession={handleViewGatewaySession}
+                currentSessionKey={session}
                 agentAvatars={agentAvatars}
                 subAgentAvatars={subAgentAvatars}
                 assistantName={assistantName}
@@ -3482,20 +3483,22 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
             </AnimatePresence>
 
             {/* Compaction indicator */}
-            <AnimatePresence>
-              {(provider === 'OPENCLAW' || showConnectionLost || compactionPhase !== 'idle' || isRunning || queueCount > 0 || Boolean(contextSummary)) && (
-                <ComposerStatusBadge
-                  phase={isRunning ? streamingPhase : 'idle'}
-                  toolName={activeToolName}
-                  statusText={statusText || idleConnectionStatus}
-                  showConnectionLost={showConnectionLost}
-                  compactionPhase={compactionPhase}
-                  queueCount={queueCount}
-                  onClearQueue={queueCount > 0 ? clearQueue : undefined}
-                  contextSummary={contextSummary}
-                />
-              )}
-            </AnimatePresence>
+            <div className={provider === 'OPENCLAW' ? 'min-h-[40px]' : undefined}>
+              <AnimatePresence initial={false}>
+                {(provider === 'OPENCLAW' || showConnectionLost || compactionPhase !== 'idle' || isRunning || queueCount > 0 || Boolean(contextSummary)) && (
+                  <ComposerStatusBadge
+                    phase={isRunning ? streamingPhase : 'idle'}
+                    toolName={activeToolName}
+                    statusText={statusText || idleConnectionStatus}
+                    showConnectionLost={showConnectionLost}
+                    compactionPhase={compactionPhase}
+                    queueCount={queueCount}
+                    onClearQueue={queueCount > 0 ? clearQueue : undefined}
+                    contextSummary={contextSummary}
+                  />
+                )}
+              </AnimatePresence>
+            </div>
 
             {/* Composer */}
             <div className={`border-t transition-colors duration-300 ${

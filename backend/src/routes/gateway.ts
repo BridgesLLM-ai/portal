@@ -15,6 +15,7 @@ import { gatewayRpcCall, patchSessionModel, getSessionInfo, isGatewayTransportEr
 import {
   sendApprovalDecision,
   injectChatMessage,
+  steerSessionMessage,
   onApprovalRequest,
   onApprovalResolved,
   isConnected as isPersistentWsConnected,
@@ -28,7 +29,12 @@ import { buildSignedDevice, getOrCreateDeviceKeys } from '../utils/deviceIdentit
 import { prisma } from '../config/database';
 import { getOpenClawApiUrl } from '../config/openclaw';
 import { shouldIsolateUser } from '../utils/workspaceScope';
-import { extractTextFromContent as extractSanitizedText, isControlOnlyAssistantText } from '../utils/chatText';
+import {
+  extractTextFromContent as extractSanitizedText,
+  isControlOnlyAssistantText,
+  stripEnvelope,
+  stripOpenClawReplyTags,
+} from '../utils/chatText';
 import { canAccessPortal, canUseInteractivePortal, isElevatedRole, isOwnerRole } from '../utils/authz';
 import { hasGatewayToken, getGatewayToken } from '../utils/gatewayToken';
 import { getOpenClawWsUrl } from '../config/openclaw';
@@ -65,6 +71,11 @@ const GATEWAY_URL = getOpenClawApiUrl();
 const OPENCLAW_DIST_DIR = '/usr/lib/node_modules/openclaw/dist';
 const PORTAL_ROOT = path.resolve(__dirname, '../../..');
 const OPENCLAW_COMPAT_HOTFIX_SCRIPT = path.join(PORTAL_ROOT, 'scripts', 'patch-openclaw-long-run-relay-hotfix.sh');
+const GEMINI_CLI_TMP_DIR = path.join(process.env.HOME || '/root', '.gemini', 'tmp');
+const GEMINI_CLI_PROVIDER = 'google-gemini-cli';
+const GEMINI_CLI_TRANSCRIPT_INDEX_TTL_MS = 30000;
+
+let geminiCliTranscriptIndexCache: { at: number; index: Map<string, string> } | null = null;
 
 function resolveOpenClawDistBundle(prefix: string | string[]): string | null {
   try {
@@ -86,18 +97,24 @@ function resolveOpenClawDistBundle(prefix: string | string[]): string | null {
 function getOpenClawCompatibilityHotfixStatus() {
   const heartbeatRunnerPath = resolveOpenClawDistBundle('heartbeat-runner-');
   const replyBundlePath = resolveOpenClawDistBundle(['get-reply-', 'reply-']);
+  const executeRuntimePath = resolveOpenClawDistBundle('execute.runtime-');
+  const geminiCliBackendPath = existsSync(path.join(OPENCLAW_DIST_DIR, 'extensions/google/cli-backend.js'))
+    ? path.join(OPENCLAW_DIST_DIR, 'extensions/google/cli-backend.js')
+    : null;
   const scriptExists = existsSync(OPENCLAW_COMPAT_HOTFIX_SCRIPT);
   const issues: string[] = [];
-
-  if (!scriptExists) issues.push('Portal hotfix script is not installed.');
-  if (!heartbeatRunnerPath) issues.push('Could not locate the OpenClaw heartbeat runner bundle.');
-  if (!replyBundlePath) issues.push('Could not locate the OpenClaw get-reply bundle.');
 
   const heartbeatText = heartbeatRunnerPath && existsSync(heartbeatRunnerPath)
     ? readFileSync(heartbeatRunnerPath, 'utf8')
     : '';
   const replyText = replyBundlePath && existsSync(replyBundlePath)
     ? readFileSync(replyBundlePath, 'utf8')
+    : '';
+  const executeRuntimeText = executeRuntimePath && existsSync(executeRuntimePath)
+    ? readFileSync(executeRuntimePath, 'utf8')
+    : '';
+  const geminiCliBackendText = geminiCliBackendPath && existsSync(geminiCliBackendPath)
+    ? readFileSync(geminiCliBackendPath, 'utf8')
     : '';
 
   const detectorPatched = heartbeatText.includes('return lower.includes("exec finished") || lower.includes("exec completed");')
@@ -106,16 +123,37 @@ function getOpenClawCompatibilityHotfixStatus() {
   const relayPatched = heartbeatText.includes('const isDirectWebchatSession =')
     && heartbeatText.includes('delivery.channel === "none" && isDirectWebchatSession');
   const replyPatched = replyText.includes('normalizedIncomingTo === "heartbeat" && params.persistedLastTo');
+  const geminiCliPatched = geminiCliBackendText.includes('jsonlDialect: "gemini-stream-json"')
+    && geminiCliBackendText.includes('"--output-format",\n\t\t\t\t"stream-json",');
+  const geminiCliYoloPatched = geminiCliBackendText.includes('"--yolo",');
+  const geminiRuntimePatched = executeRuntimeText.includes('function isGeminiCliProvider(providerId) {')
+    && executeRuntimeText.includes('function parseGeminiCliStreamingRecord(params) {')
+    && executeRuntimeText.includes('onToolEvent: (event) => {');
+  const relaySupported = Boolean(heartbeatRunnerPath) && Boolean(replyBundlePath);
+  const geminiSupported = Boolean(executeRuntimePath) && Boolean(geminiCliBackendPath);
+
+  if (!scriptExists) issues.push('Portal hotfix script is not installed.');
+  if (!relaySupported && !geminiSupported) issues.push('Could not locate the OpenClaw runtime bundles targeted by the compatibility hotfix.');
+  if ((heartbeatRunnerPath || replyBundlePath) && !relaySupported) issues.push('Could not locate both relay hotfix bundles (heartbeat runner and get-reply).');
+  if ((executeRuntimePath || geminiCliBackendPath) && !geminiSupported) issues.push('Could not locate both Gemini CLI hotfix targets (execute runtime and google cli backend).');
 
   return {
     scriptExists,
-    supported: scriptExists && Boolean(heartbeatRunnerPath) && Boolean(replyBundlePath),
-    applied: detectorPatched && relayPatched && replyPatched,
+    supported: scriptExists && issues.length === 0 && (relaySupported || geminiSupported),
+    applied: (relaySupported ? detectorPatched && relayPatched && replyPatched : true)
+      && (geminiSupported ? geminiCliPatched && geminiCliYoloPatched && geminiRuntimePatched : true),
+    relaySupported,
+    geminiSupported,
     detectorPatched,
     relayPatched,
     replyPatched,
+    geminiCliPatched,
+    geminiCliYoloPatched,
+    geminiRuntimePatched,
     heartbeatRunner: heartbeatRunnerPath ? path.basename(heartbeatRunnerPath) : null,
     replyBundle: replyBundlePath ? path.basename(replyBundlePath) : null,
+    executeRuntime: executeRuntimePath ? path.basename(executeRuntimePath) : null,
+    geminiCliBackend: geminiCliBackendPath ? path.relative(OPENCLAW_DIST_DIR, geminiCliBackendPath) : null,
     issues,
   };
 }
@@ -462,6 +500,309 @@ function extractText(content: any): string {
   return extractSanitizedText(content);
 }
 
+function sanitizeHistoryText(text: string): string {
+  return stripOpenClawReplyTags(stripEnvelope(text || '')).replace(/\r\n/g, '\n').trim();
+}
+
+function normalizeGeminiModelId(rawModel: unknown): string | undefined {
+  const normalized = normalizeGatewayModelId(rawModel);
+  if (!normalized) return undefined;
+  if (normalized.includes('/')) return normalized;
+  return `${GEMINI_CLI_PROVIDER}/${normalized}`;
+}
+
+function resolveSessionRegistryEntry(sessionKey: string, sessionsDir = SESSIONS_DIR): any | null {
+  const sessionsFile = path.join(sessionsDir, 'sessions.json');
+  if (!existsSync(sessionsFile)) return null;
+
+  try {
+    const data = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
+    const sessions = (Array.isArray(data.sessions) && data.sessions.length === 0) ? data : (data.sessions || data);
+    if (typeof sessions === 'object' && !Array.isArray(sessions)) {
+      return sessions[sessionKey] || null;
+    }
+    if (Array.isArray(sessions)) {
+      return sessions.find((session: any) => session?.key === sessionKey || session?.id === sessionKey) || null;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function resolveGeminiCliBindingSessionId(entry: any): string | null {
+  const bindingSessionId = typeof entry?.cliSessionBindings?.[GEMINI_CLI_PROVIDER]?.sessionId === 'string'
+    ? entry.cliSessionBindings[GEMINI_CLI_PROVIDER].sessionId.trim()
+    : '';
+  if (bindingSessionId) return bindingSessionId;
+
+  const legacySessionId = typeof entry?.cliSessionIds?.[GEMINI_CLI_PROVIDER] === 'string'
+    ? entry.cliSessionIds[GEMINI_CLI_PROVIDER].trim()
+    : '';
+  return legacySessionId || null;
+}
+
+function walkGeminiCliTranscriptFiles(dirPath: string, results: string[], depth = 0): void {
+  if (depth > 6 || !existsSync(dirPath)) return;
+
+  let entries: any[] = [];
+  try {
+    entries = readdirSync(dirPath, { withFileTypes: true }) as any[];
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    const fullPath = path.join(dirPath, entry.name);
+    if (entry.isDirectory?.()) {
+      walkGeminiCliTranscriptFiles(fullPath, results, depth + 1);
+      continue;
+    }
+    if (!entry.isFile?.() || !entry.name.endsWith('.json')) continue;
+    if (!fullPath.includes(`${path.sep}chats${path.sep}`)) continue;
+    results.push(fullPath);
+  }
+}
+
+function getGeminiCliTranscriptIndex(): Map<string, string> {
+  const now = Date.now();
+  if (geminiCliTranscriptIndexCache && (now - geminiCliTranscriptIndexCache.at) < GEMINI_CLI_TRANSCRIPT_INDEX_TTL_MS) {
+    return geminiCliTranscriptIndexCache.index;
+  }
+
+  const index = new Map<string, string>();
+  const files: string[] = [];
+  walkGeminiCliTranscriptFiles(GEMINI_CLI_TMP_DIR, files);
+
+  for (const filePath of files) {
+    try {
+      const raw = readFileSync(filePath, 'utf-8');
+      if (!raw.includes('"sessionId"')) continue;
+      const parsed = JSON.parse(raw);
+      const sessionId = typeof parsed?.sessionId === 'string' ? parsed.sessionId.trim() : '';
+      if (!sessionId) continue;
+
+      const existing = index.get(sessionId);
+      if (!existing) {
+        index.set(sessionId, filePath);
+        continue;
+      }
+
+      try {
+        const existingMtime = statSync(existing).mtimeMs;
+        const nextMtime = statSync(filePath).mtimeMs;
+        if (nextMtime >= existingMtime) index.set(sessionId, filePath);
+      } catch {
+        index.set(sessionId, filePath);
+      }
+    } catch {
+      // ignore malformed/non-session files
+    }
+  }
+
+  geminiCliTranscriptIndexCache = { at: now, index };
+  return index;
+}
+
+function resolveGeminiCliTranscriptPath(cliSessionId: string): string | null {
+  if (!cliSessionId) return null;
+  return getGeminiCliTranscriptIndex().get(cliSessionId) || null;
+}
+
+function extractGeminiCliText(content: unknown): string {
+  if (typeof content === 'string') return sanitizeHistoryText(content);
+  if (Array.isArray(content)) {
+    const joined = content
+      .map((part: any) => typeof part?.text === 'string' ? part.text : '')
+      .filter(Boolean)
+      .join('\n');
+    return sanitizeHistoryText(joined);
+  }
+  return '';
+}
+
+function extractGeminiCliToolResult(rawResult: unknown): string {
+  const parts: string[] = [];
+
+  const pushValue = (value: unknown) => {
+    if (typeof value === 'string') {
+      const normalized = value.trim();
+      if (normalized) parts.push(normalized);
+      return;
+    }
+    if (value && typeof value === 'object') {
+      try {
+        parts.push(JSON.stringify(value, null, 2));
+      } catch {
+        // ignore unserializable objects
+      }
+    }
+  };
+
+  if (Array.isArray(rawResult)) {
+    for (const entry of rawResult) {
+      const response = entry?.functionResponse?.response;
+      if (response && typeof response === 'object' && typeof response.output === 'string') {
+        pushValue(response.output);
+        continue;
+      }
+      pushValue(response);
+      pushValue(entry?.text);
+    }
+  } else {
+    pushValue(rawResult);
+  }
+
+  return parts.join('\n\n').trim();
+}
+
+function readGeminiCliImportedMessages(cliSessionId: string, limit = 200): any[] {
+  const transcriptPath = resolveGeminiCliTranscriptPath(cliSessionId);
+  if (!transcriptPath) return [];
+
+  try {
+    const parsed = JSON.parse(readFileSync(transcriptPath, 'utf-8'));
+    const rawMessages = Array.isArray(parsed?.messages) ? parsed.messages : [];
+    const importedMessages: any[] = [];
+
+    for (const message of rawMessages) {
+      const type = typeof message?.type === 'string' ? message.type.trim().toLowerCase() : '';
+      const timestamp = message?.timestamp;
+      const messageId = typeof message?.id === 'string' ? message.id : `gemini-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+      if (type === 'user') {
+        const text = extractGeminiCliText(message?.content);
+        if (!text || isHiddenHistoryArtifactText(text)) continue;
+        importedMessages.push({
+          id: messageId,
+          role: 'user',
+          content: text,
+          timestamp,
+          provenance: 'gemini-cli-import',
+        });
+        continue;
+      }
+
+      if (type !== 'gemini' && type !== 'model') continue;
+
+      const content = extractGeminiCliText(message?.content);
+      const thinkingContent = sanitizeHistoryText(
+        Array.isArray(message?.thoughts)
+          ? message.thoughts
+              .map((thought: any) => typeof thought?.description === 'string'
+                ? thought.description
+                : (typeof thought?.text === 'string' ? thought.text : ''))
+              .filter(Boolean)
+              .join('\n\n')
+          : '',
+      );
+      const toolCalls = Array.isArray(message?.toolCalls)
+        ? message.toolCalls
+            .map((toolCall: any) => {
+              const toolName = typeof toolCall?.name === 'string' ? toolCall.name.trim() : '';
+              if (!toolName) return null;
+              const endedAt = toHistoryTimestampMs(toolCall?.timestamp || timestamp);
+              return {
+                id: typeof toolCall?.id === 'string' && toolCall.id.trim() ? toolCall.id : `${messageId}-tool-${toolName}`,
+                name: toolName,
+                arguments: toolCall?.args,
+                startedAt: endedAt,
+                endedAt,
+                result: extractGeminiCliToolResult(toolCall?.result),
+                status: String(toolCall?.status || '').toLowerCase() === 'error' ? 'error' : 'done',
+              };
+            })
+            .filter(Boolean)
+        : [];
+
+      if (!content && !thinkingContent && toolCalls.length === 0) continue;
+      if (content && isHiddenHistoryArtifactText(content)) continue;
+
+      importedMessages.push({
+        id: messageId,
+        role: 'assistant',
+        content,
+        timestamp,
+        model: normalizeGeminiModelId(message?.model),
+        thinkingContent: thinkingContent || undefined,
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        provenance: 'gemini-cli-import',
+      });
+    }
+
+    return importedMessages.slice(-limit);
+  } catch {
+    return [];
+  }
+}
+
+function hasMeaningfulConversationTurns(messages: any[]): boolean {
+  return messages.some((message) => {
+    if (!message || typeof message !== 'object') return false;
+    if (message.role === 'user' && typeof message.content === 'string' && message.content.trim()) return true;
+    if (message.role !== 'assistant') return false;
+    if (Array.isArray(message.toolCalls) && message.toolCalls.length > 0) return true;
+    if (typeof message.thinkingContent === 'string' && message.thinkingContent.trim()) return true;
+    if (typeof message.content !== 'string') return false;
+    const normalized = message.content.trim();
+    return Boolean(normalized) && !/^Model set to /i.test(normalized);
+  });
+}
+
+function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
+  const fileId = resolveSessionFileId(sessionKey, sessionsDir);
+  const localMessages = fileId ? readSessionMessagesEnhanced(fileId, limit, sessionsDir) : [];
+  if (hasMeaningfulConversationTurns(localMessages)) return localMessages;
+
+  const sessionEntry = resolveSessionRegistryEntry(sessionKey, sessionsDir);
+  const geminiCliSessionId = resolveGeminiCliBindingSessionId(sessionEntry);
+  if (!geminiCliSessionId) return localMessages;
+
+  const importedMessages = readGeminiCliImportedMessages(geminiCliSessionId, limit);
+  if (importedMessages.length === 0) return localMessages;
+
+  const combined = [...localMessages, ...importedMessages]
+    .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
+
+  return combined.slice(-Math.max(limit, 1));
+}
+
+function summarizeSessionLabelFromMessages(params: { sessionKey: string; sessionId: string; messages: any[] }) {
+  const { sessionKey, sessionId, messages } = params;
+  const fallbackTitle = humanizeSessionKey(sessionKey, sessionId);
+
+  let firstUserText = '';
+  let firstUserRawText = '';
+  let assistantPreview = '';
+
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue;
+    const role = typeof message.role === 'string' ? message.role : '';
+    const rawText = typeof message.content === 'string' ? message.content : extractText(message.content);
+    const text = sanitizeHistoryText(rawText).replace(/\s+/g, ' ').trim();
+    if (!text && !rawText) continue;
+    if (!firstUserText && role === 'user') {
+      firstUserText = text;
+      firstUserRawText = rawText;
+    }
+    if (!assistantPreview && role === 'assistant' && text && !/^Model set to /i.test(text)) assistantPreview = text;
+    if (firstUserText && assistantPreview) break;
+  }
+
+  const senderLabel = extractSenderLabel(firstUserRawText);
+  const cleanedPrompt = cleanSessionTitleCandidate(firstUserText);
+  const titleSource = cleanedPrompt || senderLabel || fallbackTitle;
+
+  return {
+    title: titleSource.length > 72 ? `${titleSource.slice(0, 69).trimEnd()}…` : titleSource,
+    preview: assistantPreview
+      ? (assistantPreview.length > 120 ? `${assistantPreview.slice(0, 117).trimEnd()}…` : assistantPreview)
+      : undefined,
+    isMainSession: sessionKey === 'agent:main:main' || sessionId === 'main',
+  };
+}
+
 function isHiddenHistoryArtifactText(text: string): boolean {
   const normalized = String(text || '').trim();
   if (!normalized) return false;
@@ -476,6 +817,25 @@ function isHiddenHistoryArtifactText(text: string): boolean {
     /Sender \(untrusted metadata\):/i,
     /Conversation info \(untrusted metadata\):/i,
   ].some((pattern) => pattern.test(normalized));
+}
+
+function summarizeHiddenHistoryArtifactText(text: string): string | null {
+  const normalized = String(text || '').trim();
+  if (!normalized) return null;
+
+  if (/<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i.test(normalized) && /\[Internal task completion event\]/i.test(normalized)) {
+    const sourceMatch = normalized.match(/^source:\s*(.+)$/im);
+    const source = sourceMatch?.[1]?.trim().toLowerCase() || '';
+    if (source === 'subagent') return 'Delegated task completed';
+    if (source) return 'Background task completed';
+    return 'Background work completed';
+  }
+
+  if (/^An async command you ran earlier has completed\./i.test(normalized)) {
+    return 'Earlier async command completed';
+  }
+
+  return null;
 }
 
 function humanizeSessionKey(sessionKey: string, sessionId: string): string {
@@ -832,7 +1192,18 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
 
         if (role === 'user') {
           const text = extractText(content);
-          if (!text || isHiddenHistoryArtifactText(text)) return null;
+          if (!text) return null;
+          if (isHiddenHistoryArtifactText(text)) {
+            const summary = summarizeHiddenHistoryArtifactText(text);
+            if (!summary) return null;
+            return {
+              id: entry.id,
+              role: 'system',
+              content: summary,
+              provenance: 'hidden-history-artifact',
+              timestamp: entry.timestamp,
+            };
+          }
           return { id: entry.id, role: 'user', content: text, timestamp: entry.timestamp };
         }
 
@@ -1222,8 +1593,8 @@ router.get('/compatibility-hotfix', authenticateToken, requireAdmin, async (_req
       ok: true,
       ...status,
       note: status.applied
-        ? 'Portal compatibility hotfix is already present in the installed OpenClaw bundles.'
-        : 'Optional temporary patch for long-run exec relay issues on older OpenClaw builds. Applying it will restart the OpenClaw gateway.',
+        ? 'Portal compatibility hotfixes are already present in the installed OpenClaw bundles.'
+        : 'Installer/update usually auto-apply this temporary patch on affected installs. Use it as a fallback after a separate OpenClaw upgrade or if the compatibility markers are missing; it will restart the OpenClaw gateway.',
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to inspect compatibility hotfix status', detail: err.message });
@@ -1379,7 +1750,21 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
               // keep metadata-derived timestamps if file read fails
             }
 
-            const summary = summarizeSessionLabel({ sessionKey, sessionId, lines });
+            let summary = summarizeSessionLabel({ sessionKey, sessionId, lines });
+            if (!summary.preview || summary.title === humanizeSessionKey(sessionKey, sessionId) || summary.title === 'Portal Backend RPC') {
+              const importedMessages = readSessionMessagesEnhancedForSessionKey(sessionKey, 20, sessionsDir);
+              if (importedMessages.length > 0) {
+                const importedSummary = summarizeSessionLabelFromMessages({ sessionKey, sessionId, messages: importedMessages });
+                if (importedSummary.preview || importedSummary.title !== humanizeSessionKey(sessionKey, sessionId)) {
+                  summary = importedSummary;
+                }
+                const importedLastMessage = importedMessages[importedMessages.length - 1];
+                const importedLastActivityAt = toHistoryTimestampMs(importedLastMessage?.timestamp);
+                if (Number.isFinite(importedLastActivityAt) && importedLastActivityAt > 0) {
+                  lastActivityAt = Math.max(Number(lastActivityAt || 0), importedLastActivityAt);
+                }
+              }
+            }
             sessions.push({
               key: sessionKey,
               sessionId,
@@ -2180,18 +2565,18 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
       }
     }
 
-    // OPENCLAW (and default): resolve directly from JSONL
+    // OPENCLAW (and default): resolve directly from JSONL, with Gemini CLI import fallback
     const sessionsDir = resolveSessionsDir(sessionKey);
     const fileId = resolveSessionFileId(sessionKey, sessionsDir);
-    if (!fileId) {
+    const sessionId = fileId || sessionKey;
+    let messages = enhanced
+      ? readSessionMessagesEnhancedForSessionKey(sessionKey, limit, sessionsDir)
+      : await readSessionMessages(sessionId, limit, sessionsDir);
+
+    if (!fileId && messages.length === 0) {
       res.json({ messages: [] });
       return;
     }
-
-    const sessionId = fileId;
-    let messages = enhanced
-      ? readSessionMessagesEnhanced(sessionId, limit, sessionsDir)
-      : await readSessionMessages(sessionId, limit, sessionsDir);
 
     if (afterId) {
       const idx = messages.findIndex((m: any) => m.id === afterId);
@@ -2684,21 +3069,23 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
         const sess = sessResult.data;
         const chatState = typeof sess.chatState === 'string' ? sess.chatState : '';
         if (chatState === 'streaming' || chatState === 'thinking' || chatState === 'tool') {
-          // Check if the run is genuinely active — if lastActivity is older than 60s
-          // and we have no stream events, this is almost certainly a stale state.
+          // This fallback is only used when StreamEventBus has no live snapshot, for example
+          // after a browser refresh while direct-gateway streaming is in progress. Be conservative:
+          // stale gateway chatState otherwise leaves the UI stuck in a fake running state.
           const lastActivity = typeof sess.lastActivity === 'number' ? sess.lastActivity : 0;
-          const staleCutoff = Date.now() - 180_000; // 3 minutes
+          const staleCutoff = Date.now() - 30_000; // 30s
           if (lastActivity && lastActivity < staleCutoff) {
-            debugLog(`[stream-status] Gateway reports chatState=${chatState} but lastActivity=${new Date(lastActivity).toISOString()} is stale — reporting inactive`);
+            debugLog(`[stream-status] Gateway reports chatState=${chatState} but lastActivity=${new Date(lastActivity).toISOString()} is stale for fallback mode — reporting inactive`);
             res.json({ active: false });
             return;
           }
-          debugLog(`[stream-status] StreamEventBus empty but gateway reports chatState=${chatState} — reporting active`);
+          debugLog(`[stream-status] StreamEventBus empty but gateway reports chatState=${chatState} with recent activity — reporting active`);
           res.json({
             active: true,
             phase: chatState === 'tool' ? 'tool' : chatState === 'streaming' ? 'streaming' : 'thinking',
             toolName: null,
-            startedAt: Date.now(),
+            startedAt: lastActivity || Date.now(),
+            lastEventAt: lastActivity || undefined,
             runId: typeof sess.runId === 'string' ? sess.runId : null,
           });
           return;
@@ -2760,6 +3147,23 @@ router.post('/chat/inject', authenticateToken, requireApproved, async (req: Requ
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 500;
     res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to inject chat message', detail: err.message });
+  }
+});
+
+router.post('/session-steer', authenticateToken, requireApproved, async (req: Request, res: Response): Promise<void> => {
+  const sessionKey = resolveOpenClawSessionKey(req.body?.session, req.user);
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  if (!message) {
+    res.status(400).json({ error: 'message required' });
+    return;
+  }
+  try {
+    assertGatewaySessionAccess(sessionKey, req.user!);
+    const result = await steerSessionMessage(sessionKey, message);
+    res.json({ ok: true, sessionKey, ...result });
+  } catch (err: any) {
+    const status = err?.message === 'Admin access required' ? 403 : 500;
+    res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to steer session', detail: err.message });
   }
 });
 
@@ -2902,23 +3306,27 @@ function attachBrowserWsToSessionStream(params: {
   const status = streamInfo ?? streamEventBus.getTrackedStream(sessionKey);
   if (!status) return false;
 
-  if (sendResume && status.active) {
-    const latestText = status.phase === 'streaming'
-      ? streamEventBus.getLatestText(sessionKey)
-      : '';
-    wsSend(ws, {
-      type: 'stream_resume',
-      sessionKey,
-      phase: status.phase,
-      toolName: status.toolName || null,
-      toolCalls: Array.isArray(status.toolCalls) ? status.toolCalls : [],
-      statusText: status.statusText || null,
-      provenance: status.provenance || null,
-      model: status.model || null,
-      compactionPhase: status.compactionPhase || 'idle',
-      runId: status.runId || null,
-      content: latestText || undefined,
-    });
+  if (sendResume) {
+    if (status.active) {
+      const latestText = status.phase === 'streaming'
+        ? streamEventBus.getLatestText(sessionKey)
+        : '';
+      wsSend(ws, {
+        type: 'stream_resume',
+        sessionKey,
+        phase: status.phase,
+        toolName: status.toolName || null,
+        toolCalls: Array.isArray(status.toolCalls) ? status.toolCalls : [],
+        statusText: status.statusText || null,
+        provenance: status.provenance || null,
+        model: status.model || null,
+        compactionPhase: status.compactionPhase || 'idle',
+        runId: status.runId || null,
+        content: latestText || undefined,
+      });
+    } else {
+      wsSend(ws, { type: 'stream_ended', sessionKey });
+    }
   }
 
   let unsubscribed = false;
@@ -2927,7 +3335,11 @@ function attachBrowserWsToSessionStream(params: {
     if (shouldForwardEvent?.(evt) === false) {
       return;
     }
-    wsSend(ws, { ...evt, sessionKey });
+    const activeStream = streamEventBus.getTrackedStream(sessionKey);
+    const runId = typeof evt.runId === 'string' && evt.runId.trim()
+      ? evt.runId.trim()
+      : (typeof activeStream?.runId === 'string' && activeStream.runId.trim() ? activeStream.runId.trim() : undefined);
+    wsSend(ws, { ...evt, sessionKey, ...(runId ? { runId } : {}) });
     if (evt.type === 'error') {
       runWsStreamCleanup(ws, sessionKey);
       return;
@@ -2957,8 +3369,8 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
 
   try {
     assertGatewaySessionAccess(sessionKey, user, { providerName });
-    // Try provider abstraction
-    if (providerName) {
+    // Try provider abstraction for non-OpenClaw providers only.
+    if (providerName && providerName !== 'OPENCLAW') {
       try {
         const provider = AgentRegistry.get(providerName);
         const messages = await provider.getHistory(sessionKey);
@@ -2967,11 +3379,11 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
       } catch {}
     }
 
-    // JSONL-based enhanced history
+    // JSONL-based enhanced history with Gemini CLI import fallback
     const sessionsDir = resolveSessionsDir(sessionKey);
     const fileId = resolveSessionFileId(sessionKey, sessionsDir);
     const sessionId = fileId || sessionKey;
-    const messages = readSessionMessagesEnhanced(sessionId, msg.limit || 200, sessionsDir);
+    const messages = readSessionMessagesEnhancedForSessionKey(sessionKey, msg.limit || 200, sessionsDir);
     wsSend(ws, { type: 'history', messages, sessionId, requestId });
 
     // After sending history, check if there's an active stream on this session.
@@ -3374,22 +3786,29 @@ function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtP
   }
 
   const streamInfo = streamEventBus.getTrackedStream(sessionKey);
-  if (streamInfo) {
-    attachBrowserWsToSessionStream({
-      ws,
-      sessionKey,
-      streamInfo,
-      sendResume: true,
-      keepSubscriptionAfterDone: true,
-      onEvent: (evt: StreamEvent) => {
-        if (evt.type === 'text') debugLog(`[Gateway] RECONNECT→browser TEXT: len=${(evt.content||'').length} "${(evt.content||'').substring(0, 40)}..."`);
-      },
-    });
-    debugLog(`[gateway-ws] Client reconnected to ${streamInfo.active ? 'active' : 'dormant'} stream: ${sessionKey}`);
-  } else {
-    // No tracked stream
+  if (!streamInfo) {
     wsSend(ws, { type: 'stream_ended' });
+    return;
   }
+
+  if (!streamInfo.active) {
+    runWsStreamCleanup(ws, sessionKey);
+    wsSend(ws, { type: 'stream_ended', sessionKey });
+    debugLog(`[gateway-ws] Ignoring reconnect for dormant stream: ${sessionKey}`);
+    return;
+  }
+
+  attachBrowserWsToSessionStream({
+    ws,
+    sessionKey,
+    streamInfo,
+    sendResume: true,
+    keepSubscriptionAfterDone: true,
+    onEvent: (evt: StreamEvent) => {
+      if (evt.type === 'text') debugLog(`[Gateway] RECONNECT→browser TEXT: len=${(evt.content||'').length} "${(evt.content||'').substring(0, 40)}..."`);
+    },
+  });
+  debugLog(`[gateway-ws] Client reconnected to active stream: ${sessionKey}`);
 }
 
 /* ─── WS connection handler ────────────────────────────────────────────── */
@@ -3475,14 +3894,22 @@ const DIRECT_PROXY_DEVICE_KEYS = getOrCreateDeviceKeys();
 const DIRECT_PROXY_CLIENT_ID = 'gateway-client';
 const DIRECT_PROXY_CLIENT_MODE = 'backend';
 const DIRECT_PROXY_ROLE = 'operator';
-const DIRECT_PROXY_SCOPES = ['operator.read', 'operator.write'];
+const DIRECT_PROXY_BASE_SCOPES = ['operator.read', 'operator.write'];
 const DIRECT_PROXY_PROTOCOL = 3;
+
+function getDirectProxyScopes(user: JwtPayload): string[] {
+  if (isElevatedRole(user.role)) {
+    return [...DIRECT_PROXY_BASE_SCOPES, 'operator.approvals', 'operator.admin'];
+  }
+  return [...DIRECT_PROXY_BASE_SCOPES];
+}
 
 const ALLOWED_GATEWAY_METHODS = new Set([
   'connect',
   'chat.send',
   'chat.abort',
   'chat.history',
+  'sessions.steer',
 ]);
 
 function isDirectGatewayMethodAllowed(method: unknown, user: JwtPayload): boolean {
@@ -3620,6 +4047,7 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
     if (frame.type === 'req' && frame.method === 'connect') {
       debugLog('[gateway-direct] Intercepting connect request to build full signed connect frame');
       const nonce = frame.params?.nonce;
+      const directProxyScopes = getDirectProxyScopes(user);
       const fullParams: Record<string, unknown> = {
         auth: { token: getGatewayToken() },
         client: {
@@ -3635,12 +4063,12 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
           clientId: DIRECT_PROXY_CLIENT_ID,
           clientMode: DIRECT_PROXY_CLIENT_MODE,
           role: DIRECT_PROXY_ROLE,
-          scopes: DIRECT_PROXY_SCOPES,
+          scopes: directProxyScopes,
           token: getGatewayToken(),
           nonce,
         }),
         role: DIRECT_PROXY_ROLE,
-        scopes: DIRECT_PROXY_SCOPES,
+        scopes: directProxyScopes,
         caps: ['tool-events'],
         minProtocol: DIRECT_PROXY_PROTOCOL,
         maxProtocol: DIRECT_PROXY_PROTOCOL,
@@ -3881,7 +4309,13 @@ export default router;
 function normalizeRequestedModel(providerName: AgentProviderName, rawModel: string): string {
   const model = String(rawModel || '').trim();
   if (!model) return '';
-  if (providerName === 'OPENCLAW' || providerName === 'OLLAMA' || providerName === 'GEMINI') return normalizePortalModelId(model);
+  if (providerName === 'OPENCLAW' || providerName === 'OLLAMA') return normalizePortalModelId(model);
+  if (providerName === 'GEMINI') {
+    const normalized = normalizePortalModelId(model).replace(/^models\//, '');
+    if (normalized.startsWith('google-gemini-cli/')) return normalized.slice('google-gemini-cli/'.length);
+    if (normalized.startsWith('google/')) return normalized.slice('google/'.length);
+    return normalized;
+  }
 
   const parts = model.split('/').filter(Boolean);
   if (parts.length < 2) return model;

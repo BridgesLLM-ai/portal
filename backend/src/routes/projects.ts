@@ -81,6 +81,8 @@ const DEPLOY_DIR = process.env.APPS_ROOT || '/var/www/bridgesllm-apps';
 const PROJECT_IDENTITY_FILENAME = '.portal-project.json';
 const PROJECT_EDIT_MAX_BYTES = 10 * 1024 * 1024;
 const PROJECT_RAW_MAX_BYTES = 100 * 1024 * 1024;
+const PROJECT_AGENT_GIT_NAME = process.env.PORTAL_PROJECT_AGENT_GIT_NAME || 'Assistant AI';
+const PROJECT_AGENT_GIT_EMAIL = process.env.PORTAL_PROJECT_AGENT_GIT_EMAIL || process.env.GIT_AUTHOR_EMAIL || 'admin@localhost';
 fs.mkdirSync(PROJECTS_DIR, { recursive: true });
 fs.mkdirSync(DEPLOY_DIR, { recursive: true });
 
@@ -142,19 +144,73 @@ function getProjectSessionId(userId: string, stableSlug: string) {
   return `portal-${userId}-${stableSlug}`;
 }
 
+const TRANSIENT_PROJECT_STATE_FILES = new Set([
+  '.agent-session.json',
+  '.assistant-session.json',
+  '.marcus-session.json',
+  '.agent-history.json',
+  '.assistant-history.json',
+  '.marcus-history.json',
+  '.agent-memory.md',
+  '.assistant-memory.md',
+  '.marcus-memory.md',
+  '.marcus-pending-commit',
+]);
+
 function projectHasLocalAssistantState(projectDir: string): boolean {
-  const markers = [
-    '.agent-session.json',
-    '.assistant-session.json',
-    '.marcus-session.json',
-    '.agent-history.json',
-    '.assistant-history.json',
-    '.marcus-history.json',
-    '.agent-memory.md',
-    '.assistant-memory.md',
-    '.marcus-memory.md',
-  ];
-  return markers.some((marker) => fs.existsSync(path.join(projectDir, marker)));
+  return Array.from(TRANSIENT_PROJECT_STATE_FILES).some((marker) => fs.existsSync(path.join(projectDir, marker)));
+}
+
+function normalizeGitPorcelainPath(rawPath: string): string {
+  const trimmed = rawPath.trim();
+  const renameIndex = trimmed.indexOf('->');
+  if (renameIndex >= 0) return trimmed.slice(renameIndex + 2).trim();
+  return trimmed;
+}
+
+function listDirtyProjectPaths(projectDir: string, opts: { cwd: string; timeout: number; encoding: 'utf-8' }) {
+  const statusOutput = execSync('git status --porcelain -uall', { ...opts, maxBuffer: 2 * 1024 * 1024 });
+  return statusOutput
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => normalizeGitPorcelainPath(line.substring(3)))
+    .filter(Boolean);
+}
+
+async function withTransientProjectStateShelved<T>(projectDir: string, fn: () => Promise<T>, opts?: { timeout?: number }): Promise<T> {
+  const execOpts = { cwd: projectDir, timeout: opts?.timeout || 30000, encoding: 'utf-8' as const };
+  const dirtyPaths = listDirtyProjectPaths(projectDir, execOpts);
+  const blockingPaths = Array.from(new Set(dirtyPaths.filter((filePath) => !TRANSIENT_PROJECT_STATE_FILES.has(path.basename(filePath)))));
+  if (blockingPaths.length > 0) {
+    const preview = blockingPaths.slice(0, 6).join(', ');
+    const suffix = blockingPaths.length > 6 ? ` (+${blockingPaths.length - 6} more)` : '';
+    throw new Error(`Working tree has uncommitted changes: ${preview}${suffix}`);
+  }
+
+  const transientPaths = Array.from(new Set(dirtyPaths.filter((filePath) => TRANSIENT_PROJECT_STATE_FILES.has(path.basename(filePath)))));
+  let stashed = false;
+  const stashMessage = 'portal-transient-project-state';
+
+  if (transientPaths.length > 0) {
+    const escapedPaths = transientPaths.map(shellEscape).join(' ');
+    execSync(`git stash push -u -m ${shellEscape(stashMessage)} -- ${escapedPaths}`, execOpts);
+    stashed = true;
+  }
+
+  try {
+    return await fn();
+  } catch (error) {
+    try { execSync('git revert --abort', execOpts); } catch {}
+    throw error;
+  } finally {
+    if (stashed) {
+      try {
+        execSync('git stash pop --index', execOpts);
+      } catch (restoreError) {
+        console.warn(`[projects] Failed to restore transient project state for ${projectDir}:`, restoreError);
+      }
+    }
+  }
 }
 
 async function projectHasLegacyAssistantState(userId: string, stableSlug: string): Promise<boolean> {
@@ -200,7 +256,10 @@ async function ensureProjectAssistantIdentity(
 
 async function updateProjectAgentBindIfPresent(userId: string, stableSlug: string, projectDirName: string) {
   const agentId = getProjectAgentId(userId, stableSlug);
-  const expectedBind = `${PROJECTS_DIR}/${userId}/${projectDirName}:/home/user/project:rw`;
+  const expectedWorkspace = `/root/.openclaw/sandboxes/${agentId}-workspace`;
+  const expectedBind = `${PROJECTS_DIR}/${userId}/${projectDirName}:/workspace/project:rw`;
+  const expectedWorkdir = '/workspace';
+  const expectedWorkspaceAccess = 'rw';
   const configResult = await gatewayRpcCall('config.get', {});
   if (!configResult.ok) return;
 
@@ -209,18 +268,41 @@ async function updateProjectAgentBindIfPresent(userId: string, stableSlug: strin
   const index = agents.findIndex((agent: any) => agent?.id === agentId);
   if (index === -1) return;
 
+  const currentWorkspace = agents[index]?.workspace;
+  const currentWorkdir = agents[index]?.sandbox?.docker?.workdir;
+  const currentWorkspaceAccess = agents[index]?.sandbox?.workspaceAccess;
   const currentBinds = agents[index]?.sandbox?.docker?.binds;
-  if (Array.isArray(currentBinds) && currentBinds.length === 1 && currentBinds[0] === expectedBind) return;
+  const currentAllowReserved = agents[index]?.sandbox?.docker?.dangerouslyAllowReservedContainerTargets;
+  if (
+    currentWorkspace === expectedWorkspace
+    && currentWorkdir === expectedWorkdir
+    && currentWorkspaceAccess === expectedWorkspaceAccess
+    && Array.isArray(currentBinds)
+    && currentBinds.length === 1
+    && currentBinds[0] === expectedBind
+    && currentAllowReserved === true
+  ) return;
 
   const updatedAgent = {
     ...agents[index],
+    workspace: expectedWorkspace,
     sandbox: {
       ...agents[index]?.sandbox,
+      workspaceAccess: expectedWorkspaceAccess,
       docker: {
         ...agents[index]?.sandbox?.docker,
+        workdir: expectedWorkdir,
         dangerouslyAllowExternalBindSources: true,
+        dangerouslyAllowReservedContainerTargets: true,
         binds: [expectedBind],
       },
+    },
+    tools: {
+      ...agents[index]?.tools,
+      allow: ['group:runtime', 'web_search', 'web_fetch', 'image'],
+      deny: ['browser', 'canvas', 'nodes', 'message', 'tts', 'cron', 'gateway', 'group:fs'],
+      elevated: { enabled: false },
+      exec: { security: 'full' },
     },
   };
   const updatedList = [...agents];
@@ -262,6 +344,29 @@ function getProjectPath(userId: string, projectName: string) {
   const resolved = path.resolve(projectDir);
   if (!resolved.startsWith(path.resolve(userDir))) throw new Error('Path traversal');
   return resolved;
+}
+
+function ensureProjectGitIdentity(projectDir: string) {
+  const opts = { cwd: projectDir, timeout: 10000, encoding: 'utf-8' as const };
+  try {
+    execSync('git rev-parse --git-dir', opts);
+  } catch {
+    return;
+  }
+
+  try {
+    const currentName = execSync('git config --local --get user.name || true', opts).trim();
+    if (!currentName) {
+      execSync(`git config --local user.name ${shellEscape(PROJECT_AGENT_GIT_NAME)}`, opts);
+    }
+  } catch {}
+
+  try {
+    const currentEmail = execSync('git config --local --get user.email || true', opts).trim();
+    if (!currentEmail) {
+      execSync(`git config --local user.email ${shellEscape(PROJECT_AGENT_GIT_EMAIL)}`, opts);
+    }
+  } catch {}
 }
 
 async function getScopedOwnerId(req: Request): Promise<string> {
@@ -964,16 +1069,14 @@ router.post('/:name/git', authenticateToken, requireApproved, async (req: Reques
           return;
         }
         try {
-          // Verify commit exists
-          execSync(`git cat-file -t ${hash}`, opts);
-          // Get commit message for logging
-          const commitMsg = execSync(`git log -1 --format="%s" ${hash}`, opts).trim();
-          // Perform revert
-          const result = execSync(`git revert ${hash} --no-edit`, opts);
-          // Get the new commit hash
-          const newHash = execSync('git rev-parse HEAD', opts).trim();
+          const revertResult = await withTransientProjectStateShelved(projectDir, async () => {
+            execSync(`git cat-file -t ${hash}`, opts);
+            const commitMsg = execSync(`git log -1 --format="%s" ${hash}`, opts).trim();
+            const output = execSync(`git revert ${hash} --no-edit`, opts).toString().trim();
+            const newHash = execSync('git rev-parse HEAD', opts).trim();
+            return { output, commitMsg, newHash };
+          }, { timeout: 30000 });
           
-          // Log activity
           const app = await prisma.app.findFirst({ where: { userId: ownerId, name: req.params.name } });
           await prisma.activityLog.create({
             data: {
@@ -982,18 +1085,18 @@ router.post('/:name/git', authenticateToken, requireApproved, async (req: Reques
               resource: 'project',
               resourceId: app?.id,
               severity: 'INFO',
-              metadata: { projectName: req.params.name, revertedHash: hash, revertedMessage: commitMsg, newHash },
+              metadata: { projectName: req.params.name, revertedHash: hash, revertedMessage: revertResult.commitMsg, newHash: revertResult.newHash },
             },
           });
           
-          res.json({ output: result.toString().trim(), newHash, revertedMessage: commitMsg });
+          res.json({ output: revertResult.output, newHash: revertResult.newHash, revertedMessage: revertResult.commitMsg });
         } catch (e: any) {
           const errorOutput = e.stdout?.toString() || e.stderr?.toString() || e.message;
-          // Check for conflict
           if (errorOutput.includes('CONFLICT') || errorOutput.includes('conflict')) {
-            // Abort the failed revert
             try { execSync('git revert --abort', opts); } catch {}
             res.status(409).json({ error: 'Revert failed due to conflicts. The revert has been aborted.', details: errorOutput });
+          } else if (errorOutput.includes('Working tree has uncommitted changes:')) {
+            res.status(409).json({ error: 'Revert blocked by uncommitted project changes.', details: errorOutput, hint: 'Commit, discard, or move the listed files before reverting. Portal session scratch files are ignored automatically now.' });
           } else {
             res.status(500).json({ error: 'Revert failed', details: errorOutput });
           }
@@ -3081,72 +3184,106 @@ function getModelDisplayName(model: string): string {
 }
 
 async function autoCommitProjectChanges(projectDir: string, userId: string, projectName: string, summary?: string, model?: string) {
+  const opts = { cwd: projectDir, timeout: 15000, encoding: 'utf-8' as const };
+  let transientShelved = false;
+  const transientStashMessage = 'portal-transient-project-state';
+
   try {
-    const opts = { cwd: projectDir, timeout: 15000, encoding: 'utf-8' as const };
     // Ensure git repo exists
     try { execSync('git rev-parse --git-dir', opts); } catch {
       execSync('git init', opts);
       execSync(`git config user.email ${shellEscape(process.env.GIT_AUTHOR_EMAIL || 'admin@localhost')}`, opts);
       execSync('git config user.name "Assistant AI"', opts);
     }
-    // Check for changes
-    const status = execSync('git status --porcelain', opts).trim();
-    if (!status) return null; // nothing to commit
-    
-    // Build commit message from changed files
-    const changedFiles = status.split('\n').map(l => l.substring(3).trim()).filter(Boolean);
-    
-    // Generate descriptive commit message if no summary provided
+
+    const initialStatus = execSync('git status --porcelain -uall', opts).trim();
+    if (!initialStatus) return null;
+
+    const initialPaths = Array.from(new Set(
+      initialStatus
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => normalizeGitPorcelainPath(line.substring(3)))
+        .filter(Boolean)
+    ));
+    const transientPaths = initialPaths.filter((filePath) => TRANSIENT_PROJECT_STATE_FILES.has(path.basename(filePath)));
+
+    if (transientPaths.length > 0) {
+      try {
+        const escapedPaths = transientPaths.map(shellEscape).join(' ');
+        execSync(`git stash push -u -m ${shellEscape(transientStashMessage)} -- ${escapedPaths}`, opts);
+        transientShelved = true;
+      } catch (stashError: any) {
+        console.warn('[Agent] Failed to shelve transient project state before auto-commit:', stashError?.message || stashError);
+      }
+    }
+
+    const status = execSync('git status --porcelain -uall', opts).trim();
+    if (!status) return null;
+
+    const changedFiles = Array.from(new Set(
+      status
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => normalizeGitPorcelainPath(line.substring(3)))
+        .filter(Boolean)
+        .filter((filePath) => !TRANSIENT_PROJECT_STATE_FILES.has(path.basename(filePath)))
+    ));
+    if (!changedFiles.length) return null;
+
+    execSync('git add .', opts);
+
+    const stagedNames = execSync('git diff --cached --name-only', { ...opts, timeout: 5000 }).trim();
+    const stagedFiles = stagedNames.split('\n').map((line) => line.trim()).filter(Boolean);
+    if (!stagedFiles.length) return null;
+
     let commitMsg = summary ? `Assistant: ${summary}` : '';
-    
     if (!summary) {
-      // Analyze diff to generate better commit message
       try {
         const diff = execSync('git diff --cached --stat', { ...opts, timeout: 5000 }).trim();
         const diffLines = diff.split('\n').filter(Boolean);
-        
-        // Parse file changes and stats
         const fileChanges: { file: string; added: number; removed: number }[] = [];
         for (const line of diffLines) {
           const match = line.match(/^\s*(.+?)\s+\|\s+(\d+)\s+([+-]+)/);
           if (match) {
-            const [, file, changes, plusMinus] = match;
+            const [, file, _changes, plusMinus] = match;
             const added = (plusMinus.match(/\+/g) || []).length;
             const removed = (plusMinus.match(/-/g) || []).length;
             fileChanges.push({ file: file.trim(), added, removed });
           }
         }
-        
-        // Generate descriptive message
+
         if (fileChanges.length === 1) {
           const fc = fileChanges[0];
           const action = fc.added > 0 && fc.removed === 0 ? 'Added' : fc.removed > 0 && fc.added === 0 ? 'Removed' : 'Updated';
           commitMsg = `Assistant: ${action} ${fc.file}`;
-        } else if (fileChanges.length <= 3) {
-          const fileList = fileChanges.map(fc => fc.file).join(', ');
+        } else if (fileChanges.length > 1 && fileChanges.length <= 3) {
+          const fileList = fileChanges.map((fc) => fc.file).join(', ');
           commitMsg = `Assistant: Updated ${fileList}`;
-        } else {
+        } else if (fileChanges.length > 3) {
           const totalAdded = fileChanges.reduce((sum, fc) => sum + fc.added, 0);
           const totalRemoved = fileChanges.reduce((sum, fc) => sum + fc.removed, 0);
           commitMsg = `Assistant: Updated ${fileChanges.length} files (+${totalAdded}/-${totalRemoved})`;
         }
       } catch {
-        // Fallback to simple file list
-        commitMsg = `Assistant update: ${changedFiles.slice(0, 5).join(', ')}${changedFiles.length > 5 ? ` (+${changedFiles.length - 5} more)` : ''}`;
+        // ignore and fall back below
+      }
+
+      if (!commitMsg) {
+        commitMsg = `Assistant update: ${stagedFiles.slice(0, 5).join(', ')}${stagedFiles.length > 5 ? ` (+${stagedFiles.length - 5} more)` : ''}`;
       }
     }
-    
-    // Use model-attributed author name (shell-escaped to prevent injection)
+
     const authorName = model ? `Assistant AI (${getModelDisplayName(model)})` : 'Assistant AI';
     const authorEmail = process.env.GIT_AUTHOR_EMAIL || 'admin@localhost';
     const authorArg = `--author=${shellEscape(`${authorName} <${authorEmail}>`)}`;
-    
-    execSync('git add .', opts);
+
     execSync(`git commit ${authorArg} -m ${shellEscape(commitMsg)}`, opts);
     const hash = execSync('git rev-parse --short HEAD', opts).trim();
     const branch = execSync('git rev-parse --abbrev-ref HEAD', opts).trim();
-    // Get lines added/removed
-    let linesAdded = 0, linesRemoved = 0;
+
+    let linesAdded = 0;
+    let linesRemoved = 0;
     try {
       const statLine = execSync('git diff HEAD~1 --shortstat', { ...opts, timeout: 5000 }).trim();
       const addM = statLine.match(/(\d+) insertion/);
@@ -3154,9 +3291,9 @@ async function autoCommitProjectChanges(projectDir: string, userId: string, proj
       linesAdded = addM ? parseInt(addM[1]) : 0;
       linesRemoved = delM ? parseInt(delM[1]) : 0;
     } catch {}
+
     console.log(`[Agent] Auto-commit ${hash}: ${commitMsg}`);
-    
-    // Log activity
+
     try {
       const app = await prisma.app.findFirst({ where: { userId, name: projectName } });
       await prisma.activityLog.create({
@@ -3166,15 +3303,23 @@ async function autoCommitProjectChanges(projectDir: string, userId: string, proj
           resource: 'project',
           resourceId: app?.id,
           severity: 'INFO',
-          metadata: { projectName, hash, message: commitMsg, filesChanged: changedFiles.length, branch, linesAdded, linesRemoved },
+          metadata: { projectName, hash, message: commitMsg, filesChanged: stagedFiles.length, branch, linesAdded, linesRemoved },
         },
       });
     } catch {}
-    
-    return { hash, message: commitMsg, filesChanged: changedFiles.length };
+
+    return { hash, message: commitMsg, filesChanged: stagedFiles.length };
   } catch (err: any) {
     console.error('[Agent] Auto-commit error:', err.message);
     return null;
+  } finally {
+    if (transientShelved) {
+      try {
+        execSync('git stash pop --index', opts);
+      } catch (restoreError) {
+        console.warn('[Agent] Failed to restore transient project state after auto-commit:', restoreError);
+      }
+    }
   }
 }
 
@@ -3203,34 +3348,18 @@ async function ensureProjectAgent(
   projectDirName: string,
 ): Promise<{ agentId: string; created: boolean }> {
   const agentId = getProjectAgentId(userId, stableSlug);
-  
+
+  const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
   // Fast path: already known from this process lifetime
   if (knownAgentIds.has(agentId)) {
+    await updateProjectAgentBindIfPresent(userId, stableSlug, projectDirName);
     syncProjectAgentRuntimeFiles(agentId);
     return { agentId, created: false };
   }
-  
-  // Check config for existing agent
-  const configResult = await gatewayRpcCall('config.get', {});
-  if (!configResult.ok) {
-    console.error('[ensureProjectAgent] config.get failed:', configResult.error);
-    // Fall back to generic portal agent
-    knownAgentIds.add('portal');
-    return { agentId: 'portal', created: false };
-  }
-  
-  const config = configResult.data?.config || configResult.data?.parsed || {};
-  const agents: any[] = config?.agents?.list || [];
-  
-  if (agents.some((a: any) => a.id === agentId)) {
-    knownAgentIds.add(agentId);
-    syncProjectAgentRuntimeFiles(agentId);
-    return { agentId, created: false };
-  }
-  
-  // Agent doesn't exist — create it via config.patch
-  console.log(`[ensureProjectAgent] Creating agent: ${agentId} for project dir: ${projectDirName}`);
-  
+
+  console.log(`[ensureProjectAgent] Ensuring agent: ${agentId} for project dir: ${projectDirName}`);
+
   // Create a minimal project-specific AGENTS.md for the sandbox workspace
   const agentWorkspaceDir = `/root/.openclaw/sandboxes/${agentId}-workspace`;
   if (!fs.existsSync(agentWorkspaceDir)) {
@@ -3240,85 +3369,112 @@ async function ensureProjectAgent(
 
 You are a coding assistant sandboxed to a specific project.
 
-## Your project files are at: /home/user/project/
+## The real project files are at: /workspace/project/
 
-**ALWAYS start by exploring /home/user/project/ to understand the project.**
+**ALWAYS start by exploring /workspace/project/ to understand the project.**
 
-Do NOT look at /work/SOUL.md, /work/USER.md, or other files in /work — those are irrelevant system files.
-Your workspace is /work but your PROJECT is at /home/user/project/.
+Do NOT modify files in /workspace unless you explicitly need scratch space.
+Do NOT look at unrelated files outside /workspace/project/.
+Your default shell starts in /workspace, so for project work you must \`cd /workspace/project\` first or set exec workdir to \`/workspace/project\`.
+Git commits in this repo should use the preconfigured local assistant identity.
 
 ## On first interaction:
-1. Run \`ls -la /home/user/project/\` to see the project structure
-2. Read key files (README, package.json, index.html, etc.)
-3. Read \`.agent-memory.md\` in the project dir for past context
+1. Run \`pwd\` and \`ls -la /workspace/project\` to confirm the project structure
+2. Read key files with shell commands from /workspace/project (README, package.json, index.html, etc.)
+3. Read \`.agent-memory.md\` in /workspace/project for past context
 4. Then respond to the user's request
 
 ## Tools available:
-- Read, Write, Edit — file operations
-- exec — shell commands (git, npm, node, etc.)
+- exec — shell commands (git, npm, node, ls, grep, cat, sed, python, etc.)
 - web_search, web_fetch — internet research
 - image — analyze images
 
-## Memory:
-- Update \`/home/user/project/.agent-memory.md\` with important findings
+## Important:
+- File edits inside the project must happen through shell commands while working in /workspace/project
+- Never write project files into /workspace root by accident
+- Update \`/workspace/project/.agent-memory.md\` with important findings when useful
 `;
   fs.writeFileSync(path.join(agentWorkspaceDir, 'AGENTS.md'), projectAgentsMd, 'utf-8');
-  
+
   const newAgent = {
     id: agentId,
     workspace: agentWorkspaceDir,
     sandbox: {
       mode: "all",
-      workspaceAccess: "none",
+      workspaceAccess: "rw",
       scope: "session",
       docker: {
         image: "openclaw-sandbox:bookworm-slim",
-        workdir: "/work",
+        workdir: "/workspace",
         network: "bridge",
         dangerouslyAllowExternalBindSources: true,
+        dangerouslyAllowReservedContainerTargets: true,
         binds: [
-          `${PROJECTS_DIR}/${userId}/${projectDirName}:/home/user/project:rw`
+          `${PROJECTS_DIR}/${userId}/${projectDirName}:/workspace/project:rw`
         ]
       }
     },
     tools: {
-      allow: ["group:fs", "group:runtime", "web_search", "web_fetch", "image"],
-      deny: ["browser", "canvas", "nodes", "message", "tts", "cron", "gateway"],
+      allow: ["group:runtime", "web_search", "web_fetch", "image"],
+      deny: ["browser", "canvas", "nodes", "message", "tts", "cron", "gateway", "group:fs"],
       elevated: { enabled: false },
       exec: { security: "full" }
     }
   };
-  
-  const updatedList = [...agents, newAgent];
-  
-  const baseHash = configResult.data?.hash || '';
-  const patchResult = await gatewayRpcCall('config.patch', {
-    raw: JSON.stringify({ agents: { list: updatedList } }),
-    baseHash,
-  }, 15000);
-  
-  if (!patchResult.ok) {
-    console.error(`[ensureProjectAgent] config.patch failed: ${patchResult.error}`);
-    // Fall back to generic portal agent
-    return { agentId: 'portal', created: false };
+
+  let lastError = 'gateway unavailable';
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const configResult = await gatewayRpcCall('config.get', {}, 10000);
+    if (!configResult.ok) {
+      lastError = `config.get failed: ${configResult.error}`;
+      console.warn(`[ensureProjectAgent] ${lastError} (attempt ${attempt + 1}/8)`);
+      await wait(2000);
+      continue;
+    }
+
+    const config = configResult.data?.config || configResult.data?.parsed || {};
+    const agents: any[] = config?.agents?.list || [];
+
+    if (agents.some((a: any) => a.id === agentId)) {
+      knownAgentIds.add(agentId);
+      await updateProjectAgentBindIfPresent(userId, stableSlug, projectDirName);
+      syncProjectAgentRuntimeFiles(agentId);
+      return { agentId, created: false };
+    }
+
+    const updatedList = [...agents, newAgent];
+    const baseHash = configResult.data?.hash || '';
+    const patchResult = await gatewayRpcCall('config.patch', {
+      raw: JSON.stringify({ agents: { list: updatedList } }),
+      baseHash,
+    }, 15000);
+
+    if (!patchResult.ok) {
+      lastError = `config.patch failed: ${patchResult.error}`;
+      console.warn(`[ensureProjectAgent] ${lastError} (attempt ${attempt + 1}/8)`);
+      await wait(3000);
+      continue;
+    }
+
+    console.log(`[ensureProjectAgent] Agent ${agentId} created successfully. Waiting for gateway reload...`);
+    for (let i = 0; i < 15; i++) {
+      await wait(2000);
+      try {
+        const check = await gatewayRpcCall('sessions.list', { agentId }, 5000);
+        if (check.ok) {
+          console.log(`[ensureProjectAgent] Gateway ready after ${(i + 1) * 2}s`);
+          break;
+        }
+      } catch {}
+    }
+
+    knownAgentIds.add(agentId);
+    syncProjectAgentRuntimeFiles(agentId);
+    return { agentId, created: true };
   }
-  
-  console.log(`[ensureProjectAgent] Agent ${agentId} created successfully. Waiting for gateway reload...`);
-  // Gateway restarts after config.patch — poll until ready instead of fixed sleep
-  for (let i = 0; i < 15; i++) {
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    try {
-      const check = await gatewayRpcCall('sessions.list', { agentId }, 5000);
-      if (check.ok) {
-        console.log(`[ensureProjectAgent] Gateway ready after ${(i + 1) * 2}s`);
-        break;
-      }
-    } catch {}
-  }
-  
-  knownAgentIds.add(agentId);
-  syncProjectAgentRuntimeFiles(agentId);
-  return { agentId, created: true };
+
+  throw new Error(`[ensureProjectAgent] Failed to ensure dedicated project agent ${agentId}: ${lastError}`);
 }
 
 /**
@@ -3332,6 +3488,7 @@ async function getOrCreateSession(
   projectName: string,
 ): Promise<{ sessionKey: string; agentId: string; needsInit: boolean; stableSlug: string; sessionId: string }> {
   const identity = await ensureProjectAssistantIdentity(projectDir, userId, projectName);
+  ensureProjectGitIdentity(projectDir);
 
   // Phase 2: Get or create a dedicated agent for this project
   const projectDirName = path.basename(projectDir);
@@ -3430,7 +3587,8 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
     if (needsInit) {
       const assistantName = await getAssistantName();
       const projectType = detectProjectType(projectDir);
-      const sandboxProjectDir = agentId === 'portal' ? `/home/user/projects/${name}/` : `/home/user/project/`;
+      const isDedicatedProjectAgent = agentId !== 'portal';
+      const sandboxProjectDir = isDedicatedProjectAgent ? `/workspace/project/` : `/home/user/projects/${name}/`;
 
       // Initialize project memory if missing
       const memoryPath = path.join(projectDir, '.agent-memory.md');
@@ -3438,22 +3596,22 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
         fs.writeFileSync(memoryPath, `# Project Memory — ${name}\n\n## Overview\n(Describe what this project does)\n`, 'utf-8');
       }
 
+      const fileOpsGuidance = isDedicatedProjectAgent
+        ? `**Project File Operations:**\n- Use exec tool for project file reads and writes. Start from /workspace/project or set workdir to /workspace/project before editing.\n- Use shell commands like cat, sed, python, node, perl, tee, or here-docs to inspect and modify files.\n- Never write project files into /workspace root by accident.\n- All real project paths should be under ${sandboxProjectDir}`
+        : `**File Operations:**\n- Use Read tool with file_path to read files. For large files (>1MB), use offset (line number) and limit (max lines) to read in chunks.\n- Use Write tool to create/overwrite files.\n- Use Edit tool for surgical find-and-replace edits.\n- All paths should be absolute: ${sandboxProjectDir}filename.ext`;
+
       const initMessage = `[PORTAL PROJECT CONTEXT]
 You are ${assistantName}, an AI coding assistant working on the project "${name}".
 Project Type: ${projectType}
 Project Directory (inside sandbox): ${sandboxProjectDir}
 
-**CRITICAL: You are sandboxed to this project directory. You have full tool access within the sandbox:**
+**CRITICAL: You are sandboxed to this project directory.**
 
-**File Operations:**
-- Use Read tool with file_path to read files. For large files (>1MB), use offset (line number) and limit (max lines) to read in chunks.
-- Use Write tool to create/overwrite files.
-- Use Edit tool for surgical find-and-replace edits.
-- All paths should be absolute: ${sandboxProjectDir}filename.ext
+${fileOpsGuidance}
 
 **Commands:**
 - Use exec tool to run shell commands (git, npm, node, ls, grep, find, etc.)
-- Set workdir to ${sandboxProjectDir} or cd there first
+- ${isDedicatedProjectAgent ? 'Your default shell starts in /workspace, so cd /workspace/project first or set workdir to /workspace/project.' : `Set workdir to ${sandboxProjectDir} or cd there first`}
 - Examples: exec git status, exec npm install, exec ls -la
 
 **Internet:**
@@ -3476,7 +3634,9 @@ Hello! I'm ready to help with this project. What would you like to work on?`;
 
       const sandboxSystemMessage = {
         role: 'system' as const,
-        content: `You are ${assistantName}, an AI coding assistant sandboxed to ${sandboxProjectDir}. You have full tool access (Read, Write, Edit, exec, web_search, web_fetch). The sandbox is enforced at the container level - you cannot escape it. Use tools to explore files intelligently instead of having everything embedded in prompts.`
+        content: isDedicatedProjectAgent
+          ? `You are ${assistantName}, an AI coding assistant sandboxed to ${sandboxProjectDir}. Use exec for project file reads and writes, and always work from /workspace/project when touching project files. The sandbox is enforced at the container level - you cannot escape it.`
+          : `You are ${assistantName}, an AI coding assistant sandboxed to ${sandboxProjectDir}. You have full tool access (Read, Write, Edit, exec, web_search, web_fetch). The sandbox is enforced at the container level - you cannot escape it. Use tools to explore files intelligently instead of having everything embedded in prompts.`
       };
 
       // Fire-and-forget init
@@ -3666,6 +3826,29 @@ router.post('/:name/assistant/reset', authenticateToken, async (req: Request, re
   } catch (error) {
     console.error('[Agent Reset] Error:', error);
     res.status(500).json({ error: 'Failed to reset session' });
+  }
+});
+
+// POST /api/projects/:name/assistant/auto-commit - Commit project changes after a completed WS agent run
+router.post('/:name/assistant/auto-commit', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const ownerId = await getScopedOwnerId(req);
+    const { name } = req.params;
+    const projectDir = getProjectPath(ownerId, name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+
+    const summary = typeof req.body?.summary === 'string' && req.body.summary.trim()
+      ? req.body.summary.trim()
+      : undefined;
+    const selectedModel = typeof req.body?.model === 'string' && req.body.model.trim()
+      ? normalizePortalModelId(req.body.model.trim())
+      : undefined;
+
+    const commit = await autoCommitProjectChanges(projectDir, ownerId, name, summary, selectedModel);
+    res.json({ success: true, committed: !!commit, commit });
+  } catch (error) {
+    console.error('[Agent Auto-Commit] Error:', error);
+    res.status(500).json({ error: 'Failed to auto-commit project changes' });
   }
 });
 
@@ -3940,8 +4123,9 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
     } catch {}
     const modelChanged = previousModel && previousModel !== selectedModel;
     
-    // Phase 2: project-specific agents mount to /home/user/project/, legacy to /home/user/projects/{name}/
-    const sandboxProjectDir = agentId === 'portal' ? `/home/user/projects/${name}/` : `/home/user/project/`;
+    // Phase 2: dedicated project agents work in /workspace/project/, legacy portal fallback uses /home/user/projects/{name}/
+    const isDedicatedProjectAgent = agentId !== 'portal';
+    const sandboxProjectDir = isDedicatedProjectAgent ? `/workspace/project/` : `/home/user/projects/${name}/`;
     let fullMessage = message;
     const assistantName = await getAssistantName();
 
@@ -3953,22 +4137,22 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
       }
       const projectType = detectProjectType(projectDir);
 
+      const fileOpsGuidance = isDedicatedProjectAgent
+        ? `**Project File Operations:**\n- Use exec tool for project file reads and writes. Start from /workspace/project or set workdir to /workspace/project before editing.\n- Use shell commands like cat, sed, python, node, perl, tee, or here-docs to inspect and modify files.\n- Never write project files into /workspace root by accident.\n- All real project paths should be under ${sandboxProjectDir}`
+        : `**File Operations:**\n- Use Read tool with file_path to read files. For large files (>1MB), use offset (line number) and limit (max lines) to read in chunks.\n- Use Write tool to create/overwrite files.\n- Use Edit tool for surgical find-and-replace edits.\n- All paths should be absolute: ${sandboxProjectDir}filename.ext`;
+
       fullMessage = `[PORTAL PROJECT CONTEXT]
 You are ${assistantName}, an AI coding assistant working on the project "${name}".
 Project Type: ${projectType}
 Project Directory (inside sandbox): ${sandboxProjectDir}
 
-**CRITICAL: You are sandboxed to this project directory. You have full tool access within the sandbox:**
+**CRITICAL: You are sandboxed to this project directory.**
 
-**File Operations:**
-- Use Read tool with file_path to read files. For large files (>1MB), use offset (line number) and limit (max lines) to read in chunks.
-- Use Write tool to create/overwrite files.
-- Use Edit tool for surgical find-and-replace edits.
-- All paths should be absolute: ${sandboxProjectDir}filename.ext
+${fileOpsGuidance}
 
 **Commands:**
 - Use exec tool to run shell commands (git, npm, node, ls, grep, find, etc.)
-- Set workdir to ${sandboxProjectDir} or cd there first
+- ${isDedicatedProjectAgent ? 'Your default shell starts in /workspace, so cd /workspace/project first or set workdir to /workspace/project.' : `Set workdir to ${sandboxProjectDir} or cd there first`}
 - Examples: exec git status, exec npm install, exec ls -la
 
 **Internet:**
@@ -3990,7 +4174,9 @@ ${message}`;
 
     const sandboxSystemMessage = {
       role: 'system' as const,
-      content: `You are ${assistantName}, an AI coding assistant sandboxed to ${sandboxProjectDir}. You have full tool access (Read, Write, Edit, exec, web_search, web_fetch). The sandbox is enforced at the container level - you cannot escape it. Use tools to explore files intelligently instead of having everything embedded in prompts. Running as model: ${selectedModel}`
+      content: isDedicatedProjectAgent
+        ? `You are ${assistantName}, an AI coding assistant sandboxed to ${sandboxProjectDir}. Use exec for project file reads and writes, and always work from /workspace/project when touching project files. The sandbox is enforced at the container level - you cannot escape it. Running as model: ${selectedModel}`
+        : `You are ${assistantName}, an AI coding assistant sandboxed to ${sandboxProjectDir}. You have full tool access (Read, Write, Edit, exec, web_search, web_fetch). The sandbox is enforced at the container level - you cannot escape it. Use tools to explore files intelligently instead of having everything embedded in prompts. Running as model: ${selectedModel}`
     };
 
     // Save user message to DB immediately (before sending)

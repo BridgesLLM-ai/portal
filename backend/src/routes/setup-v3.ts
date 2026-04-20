@@ -478,6 +478,7 @@ router.get('/system-info', requireSetupPending, requireSetupToken, async (_req: 
       osName,
       components,
       currentDomain: getDomain(),
+      installProfile: process.env.INSTALL_PROFILE || 'server',
     });
   } catch (error) {
     next(error);

@@ -5,7 +5,6 @@ import {
   FolderOpen,
   Terminal,
   Monitor,
-  AppWindow,
   Menu,
   X,
   LogOut,
@@ -19,7 +18,6 @@ const navItems = [
   { path: '/files', label: 'Files', icon: FolderOpen },
   { path: '/terminal', label: 'Terminal', icon: Terminal },
   { path: '/desktop', label: 'Remote Desktop', icon: Monitor },
-  { path: '/apps', label: 'Apps', icon: AppWindow },
 ];
 
 export default function Drawer({ children }: { children: React.ReactNode }) {

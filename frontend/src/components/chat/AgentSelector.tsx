@@ -148,6 +148,8 @@ interface AgentSelectorProps {
   agentId?: string;
   onChange: (selection: AgentSelection) => void;
   onViewSession?: (sessionKey: string) => void;
+  currentSessionKey?: string;
+  currentSessionLabel?: string;
   agentAvatars?: Record<string, string>;
   subAgentAvatars?: Record<string, string>;
   assistantName?: string;
@@ -217,6 +219,8 @@ function getSessionLabel(s: GatewaySession): string {
   if (!key) return 'Unknown';
 
   if (!key.includes(':')) {
+    if (key === 'main') return 'Main session';
+    if (key.startsWith('new-')) return 'New chat';
     return key.length > 24 ? `${key.slice(0, 24)}…` : key;
   }
 
@@ -270,6 +274,8 @@ function SessionDropdown({
   onOpenChange,
   onViewSession,
   providerLabel,
+  currentSessionKey,
+  currentSessionLabel,
 }: {
   sessions: GatewaySession[];
   loading?: boolean;
@@ -278,6 +284,8 @@ function SessionDropdown({
   onOpenChange: (open: boolean) => void;
   onViewSession: (sessionKey: string) => void;
   providerLabel: string;
+  currentSessionKey?: string;
+  currentSessionLabel?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -298,16 +306,32 @@ function SessionDropdown({
   const activeSessions = sessions.filter(s => s.status === 'active');
   const otherSessions = sessions.filter(s => s.status !== 'active');
   const countLabel = loading && sessions.length === 0 ? '…' : hasLoaded ? String(sessions.length) : '—';
+  const matchedCurrentSession = currentSessionKey
+    ? sessions.find((session) => (session.key || session.sessionId || session.id || '') === currentSessionKey)
+    : null;
+  const fallbackCurrentLabel = currentSessionKey
+    ? getSessionLabel({ key: currentSessionKey })
+    : '';
+  const headerLabel = typeof currentSessionLabel === 'string' && currentSessionLabel.trim()
+    ? currentSessionLabel.trim()
+    : matchedCurrentSession
+      ? getSessionLabel(matchedCurrentSession)
+      : (fallbackCurrentLabel || (hasLoaded ? 'History' : 'Chat history'));
 
   return (
     <div ref={ref} className="relative">
       <button
         onClick={() => onOpenChange(!open)}
-        className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] text-xs text-slate-500 hover:text-slate-300 transition-colors"
+        className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] text-xs text-slate-500 hover:text-slate-300 transition-colors min-w-0 max-w-[180px]"
         title={`${providerLabel} sessions`}
       >
         <History size={12} />
-        <span className="hidden sm:inline tabular-nums">{countLabel}</span>
+        <span className="hidden sm:inline truncate">{headerLabel}</span>
+        {hasLoaded && (
+          <span className="hidden sm:inline tabular-nums rounded-full bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-slate-400">
+            {countLabel}
+          </span>
+        )}
         {activeSessions.length > 0 && (
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
         )}
@@ -406,6 +430,8 @@ export default function AgentSelector({
   agentId,
   onChange,
   onViewSession,
+  currentSessionKey,
+  currentSessionLabel,
   agentAvatars = {},
   subAgentAvatars = {},
   assistantName,
@@ -534,7 +560,8 @@ export default function AgentSelector({
       setSessionsLoaded(false);
       return;
     }
-    if (!sessionsOpen) return;
+    const shouldFetchSessions = sessionsOpen || Boolean(currentSessionKey);
+    if (!shouldFetchSessions) return;
     let cancelled = false;
     async function fetchSessions() {
       if (!cancelled) setSessionsLoading(true);
@@ -566,7 +593,7 @@ export default function AgentSelector({
     void fetchSessions();
     const interval = setInterval(fetchSessions, 30000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [value, agentId, providers, sessionsOpen, isAuthenticated]);
+  }, [value, agentId, providers, sessionsOpen, currentSessionKey, isAuthenticated]);
 
   // Close on click outside (desktop only — mobile uses backdrop onClick)
   useEffect(() => {
@@ -817,6 +844,8 @@ export default function AgentSelector({
           onOpenChange={setSessionsOpen}
           onViewSession={handleSessionClick}
           providerLabel={displayLabel}
+          currentSessionKey={currentSessionKey}
+          currentSessionLabel={currentSessionLabel}
         />
       )}
     </div>

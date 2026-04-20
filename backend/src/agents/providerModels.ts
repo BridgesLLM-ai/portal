@@ -15,11 +15,11 @@ export interface ProviderModelDescriptor {
 }
 
 const GEMINI_DECLARED_FALLBACK = [
+  'gemini-3-flash-preview',
   'gemini-3.1-pro-preview',
   'gemini-3-pro-preview',
-  'gemini-2.5-pro',
   'gemini-2.5-flash',
-  'gemini-3-flash-preview',
+  'gemini-2.5-pro',
 ];
 
 function toTitleCase(value: string): string {
@@ -80,6 +80,13 @@ function listOpenClawModels(): ProviderModelDescriptor[] {
   const fallbacks = openclawConfig?.agents?.defaults?.model?.fallbacks;
   if (Array.isArray(fallbacks)) {
     for (const id of fallbacks) addModel(id);
+  }
+
+  const hasConfiguredGeminiCli = Array.from(deduped.keys()).some((id) => id.startsWith('google-gemini-cli/'));
+  if (hasConfiguredGeminiCli) {
+    for (const id of GEMINI_DECLARED_FALLBACK) {
+      addModel(`google-gemini-cli/${id}`);
+    }
   }
 
   return Array.from(deduped.values());

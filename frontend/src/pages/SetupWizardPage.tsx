@@ -51,6 +51,7 @@ interface SystemInfoResponse {
   cpus: number;
   osName: string;
   currentDomain?: string;
+  installProfile?: 'local' | 'server';
   components: Record<string, { installed: boolean; running?: boolean; version?: string }>;
 }
 
@@ -971,13 +972,28 @@ export default function SetupWizardPage() {
   );
 
   const renderDomain = () => {
+    const hostname = window.location.hostname;
+    const isLocalInstall = systemInfo?.installProfile === 'local' || hostname === 'localhost' || hostname === '127.0.0.1';
     // If we're already on HTTPS, domain is already configured
     const alreadyOnHttps = window.location.protocol === 'https:';
     const currentDomain = alreadyOnHttps ? window.location.hostname : '';
 
     return (
     <StepShell stepKey={step}>
-      {alreadyOnHttps ? (
+      {isLocalInstall ? (
+        <div className="space-y-4">
+          <div>
+            <h2 className="text-2xl font-bold text-white">Domain &amp; HTTPS</h2>
+            <p className="mt-2 text-slate-400">This install is running in local beta mode.</p>
+          </div>
+          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-100">
+            <p className="font-semibold text-amber-200">Local Windows / WSL beta</p>
+            <p className="mt-2">This Windows path is still <strong className="text-amber-50">experimental, untested in the field, and under active development</strong>. This portal is intentionally staying on <span className="font-mono text-amber-50">localhost</span> right now.</p>
+            <p className="mt-2">Public domains, automatic HTTPS, stable external project share links, and email DNS setup are VPS features and are not implemented in the Windows beta path yet.</p>
+            <p className="mt-2 text-amber-200/90">Use this install to test the product on your own machine. If you want a real public URL people can visit from the internet, deploy the portal on a Linux VPS.</p>
+          </div>
+        </div>
+      ) : alreadyOnHttps ? (
         <div className="space-y-4">
           <div>
             <h2 className="text-2xl font-bold text-white">Domain &amp; HTTPS</h2>

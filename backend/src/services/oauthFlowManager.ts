@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as http from 'http';
 import { createHash, randomBytes } from 'crypto';
 import { execSync } from 'child_process';
-import { readAuthProfiles, saveProviderApiKey } from './openclawConfigManager';
+import { readAuthProfiles, saveProviderToken } from './openclawConfigManager';
 
 export type OAuthFlowStatus = 'starting' | 'awaiting_callback' | 'polling_device' | 'processing' | 'complete' | 'error';
 
@@ -29,6 +29,8 @@ export interface OAuthSession {
   profileKeyBefore: string[];
   sentInitialConfirm?: boolean;
   extraEnv?: Record<string, string>;
+  capturedToken?: string | null;
+  lastOutputAt?: number;
 }
 
 const sessions = new Map<string, OAuthSession>();
@@ -57,6 +59,25 @@ function safeReadJson(filePath: string): any | null {
 
 function stripAnsi(value: string) {
   return value.replace(ANSI_REGEX, '');
+}
+
+function extractClaudeSetupToken(text: string): string | null {
+  const compact = text.replace(/[\r\n\t ]+/g, '');
+  const match = compact.match(/(sk-ant-oat01-[A-Za-z0-9_\-/.+=]{20,})/);
+  return match?.[1]?.trim() || null;
+}
+
+function maybeCaptureClaudeSetupToken(session: OAuthSession) {
+  if (session.provider !== 'anthropic') return null;
+  const token = extractClaudeSetupToken(session.cleanOutput);
+  if (!token) return null;
+  if (session.capturedToken !== token) {
+    session.capturedToken = token;
+    session.status = 'complete';
+    session.completedAt = Date.now();
+    console.log(`[Claude] Token detected in PTY output: ${token.slice(0, 20)}... (${token.length} chars)`);
+  }
+  return token;
 }
 
 function readProviderProfileIds(provider: string) {
@@ -228,6 +249,8 @@ function attachPtyParsing(session: OAuthSession) {
   session.process.onData((chunk: string) => {
     session.output += chunk;
     session.cleanOutput += stripAnsi(chunk);
+    session.lastOutputAt = Date.now();
+    maybeCaptureClaudeSetupToken(session);
     updateSessionFromOutput(session);
   });
 
@@ -280,6 +303,8 @@ export async function startOAuthFlow(provider: string, options?: { googleProject
     profileKeyBefore: readProviderProfileIds(provider),
     sentInitialConfirm: false,
     extraEnv: Object.keys(extraEnv).length ? extraEnv : undefined,
+    capturedToken: null,
+    lastOutputAt: Date.now(),
   };
 
   sessions.set(id, session);
@@ -315,6 +340,8 @@ export async function startDeviceCodeFlow(provider: 'github-copilot') {
     completedAt: null,
     profileKeyBefore: readProviderProfileIds('github-copilot'),
     sentInitialConfirm: false,
+    capturedToken: null,
+    lastOutputAt: Date.now(),
   };
 
   sessions.set(id, session);
@@ -467,7 +494,41 @@ function findClaudeBin(): string {
   }
 }
 
+function cleanupStaleClaudeSetupTokenProcesses() {
+  try {
+    const output = execSync("ps -eo pid=,ppid=,etimes=,args= | grep '[c]laude setup-token'", {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (!output) return;
+
+    for (const line of output.split('\n')) {
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+      if (!match) continue;
+      const [, pidRaw, ppidRaw, etimesRaw, args] = match;
+      if (!args.includes('claude setup-token')) continue;
+
+      const pid = Number(pidRaw);
+      const ppid = Number(ppidRaw);
+      const etimes = Number(etimesRaw);
+      if (!Number.isFinite(pid) || pid <= 0) continue;
+
+      if (ppid === 1 || etimes > 600) {
+        try {
+          process.kill(pid, 'SIGTERM');
+          console.log(`[Claude] Cleaned up stale setup-token process pid=${pid} ppid=${ppid} age=${etimes}s`);
+        } catch (err: any) {
+          console.warn(`[Claude] Failed to clean up stale setup-token pid=${pid}: ${err.message}`);
+        }
+      }
+    }
+  } catch {
+    // ignore cleanup lookup failures
+  }
+}
+
 export async function startClaudeSetupTokenFlow() {
+  cleanupStaleClaudeSetupTokenProcesses();
   const id = createSessionId();
   const claudeBin = findClaudeBin();
   console.log(`[Claude] Starting setup-token flow, binary=${claudeBin}`);
@@ -499,6 +560,8 @@ export async function startClaudeSetupTokenFlow() {
     completedAt: null,
     profileKeyBefore: readProviderProfileIds('anthropic'),
     sentInitialConfirm: false,
+    capturedToken: null,
+    lastOutputAt: Date.now(),
   };
 
   sessions.set(id, session);
@@ -507,6 +570,8 @@ export async function startClaudeSetupTokenFlow() {
   proc.onData((chunk: string) => {
     session.output += chunk;
     session.cleanOutput += stripAnsi(chunk);
+    session.lastOutputAt = Date.now();
+    maybeCaptureClaudeSetupToken(session);
 
     // Check for Claude auth URL
     const text = session.cleanOutput;
@@ -529,12 +594,9 @@ export async function startClaudeSetupTokenFlow() {
       console.log(`[Claude] Last 500 chars: ${session.cleanOutput.slice(-500)}`);
 
       if (exitCode === 0 && !setupToken) {
-        // Extract token by matching the sk-ant-oat01- prefix directly.
-        // The PTY output has \r padding and collapsed spaces that break line-based regexes.
-        const text = session.cleanOutput;
-        const m = text.match(/(sk-ant-oat01-[A-Za-z0-9_\-/.+=]{20,})/);
-        if (m?.[1]) {
-          setupToken = m[1].trim();
+        setupToken = session.capturedToken || extractClaudeSetupToken(session.cleanOutput);
+        if (setupToken) {
+          session.capturedToken = setupToken;
           console.log(`[Claude] Token captured on exit: ${setupToken.slice(0, 20)}... (${setupToken.length} chars)`);
           // Save immediately — don't wait for frontend to ask
           saveClaudeToken(setupToken);
@@ -589,90 +651,24 @@ export async function pasteCodeToClaudeSession(sessionId: string, code: string):
 
   console.log(`[Claude] Pasting auth code (${code.length} chars) to PTY...`);
 
-  // Write the code to the PTY stdin
   try {
+    session.status = 'processing';
+    session.error = null;
     session.process.write(`${code}\r`);
   } catch (err: any) {
     return { success: false, error: `PTY write failed: ${err.message}` };
   }
 
-  // Wait for completion (token printed + exit, or profile created)
-  const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
-    const started = Date.now();
-    const timer = setInterval(() => {
-      // Check if new auth profile appeared (saved by onExit handler or earlier iteration)
-      const currentProfiles = readProviderProfileIds('anthropic');
-      const newProfile = currentProfiles.find((id) => !session.profileKeyBefore.includes(id));
-      if (newProfile) {
-        clearInterval(timer);
-        session.status = 'complete';
-        session.completedAt = Date.now();
-        console.log(`[Claude] New profile detected: ${newProfile}`);
-        resolve({ success: true });
-        return;
-      }
+  // Give Claude a brief moment to reject obviously bad state, but do not block
+  // the request on full token generation. The frontend completes that via /claude/complete.
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  maybeCaptureClaudeSetupToken(session);
 
-      if (session.status === 'error') {
-        clearInterval(timer);
-        resolve({ success: false, error: session.error || 'Claude setup failed' });
-        return;
-      }
+  if (session.error) {
+    return { success: false, error: session.error || 'Claude setup failed' };
+  }
 
-      // If session completed (exit 0) but no profile saved yet, try to extract and save token
-      if (session.status === 'complete') {
-        // Give a brief window for the onExit handler to save — then check
-        const profilesNow = readProviderProfileIds('anthropic');
-        const savedProfile = profilesNow.find((id) => !session.profileKeyBefore.includes(id));
-        if (savedProfile) {
-          clearInterval(timer);
-          resolve({ success: true });
-          return;
-        }
-        // onExit may not have matched the token — fall through to our extraction below
-      }
-
-      // Check output for token patterns — Claude CLI prints tokens in various formats:
-      // - "Setup token (expires ...): <token>"
-      // - "export CLAUDE_CODE_OAUTH_TOKEN=<token>"
-      // - "Store this token securely..." followed by a long token string
-      const text = session.cleanOutput;
-      // Bulletproof token extraction: match the sk-ant-oat01- prefix directly.
-      // PTY output has \r characters and space-padding that break line-based regexes,
-      // but the token itself is always a contiguous string starting with sk-ant-oat01-.
-      const tokenMatch = text.match(/(sk-ant-oat01-[A-Za-z0-9_\-/.+=]{20,})/);
-      if (tokenMatch?.[1]) {
-        clearInterval(timer);
-        const token = tokenMatch[1].trim();
-        console.log(`[Claude] Token captured: ${token.slice(0, 20)}... (${token.length} chars), saving...`);
-        saveClaudeToken(token).then((saveResult) => {
-          if (saveResult.success) {
-            session.status = 'complete';
-            session.completedAt = Date.now();
-          }
-          resolve(saveResult);
-        });
-        return;
-      }
-
-      if (Date.now() - started > 60000) {
-        clearInterval(timer);
-        // Final check: did the token get saved by onExit while we were waiting?
-        const finalProfiles = readProviderProfileIds('anthropic');
-        const finalProfile = finalProfiles.find((id) => !session.profileKeyBefore.includes(id));
-        if (finalProfile) {
-          session.status = 'complete';
-          session.completedAt = Date.now();
-          resolve({ success: true });
-        } else if (session.status === 'complete') {
-          resolve({ success: false, error: 'Claude completed but the token could not be extracted from the output. Try using an API key instead.' });
-        } else {
-          resolve({ success: false, error: 'Timed out waiting for Claude to process the code.' });
-        }
-      }
-    }, 500);
-  });
-
-  return result;
+  return { success: true };
 }
 
 export async function getClaudeSetupToken(sessionId: string): Promise<{ success: boolean; token?: string; error?: string }> {
@@ -683,24 +679,35 @@ export async function getClaudeSetupToken(sessionId: string): Promise<{ success:
   const tokenPromise = (session as any)._tokenPromise as Promise<string | null> | undefined;
   if (!tokenPromise) return { success: false, error: 'No token promise found' };
 
-  // Wait up to 120s for the token (user might take a while to complete browser auth)
-  const token = await Promise.race([
-    tokenPromise,
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), 120000)),
-  ]);
+  const started = Date.now();
+  while (Date.now() - started < 180000) {
+    const liveToken = session.capturedToken || extractClaudeSetupToken(session.cleanOutput);
+    if (liveToken) {
+      session.capturedToken = liveToken;
+      return { success: true, token: liveToken };
+    }
 
-  if (token) {
-    return { success: true, token };
-  }
+    const token = await Promise.race([
+      tokenPromise,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 1000)),
+    ]);
+    if (token) {
+      session.capturedToken = token;
+      return { success: true, token };
+    }
 
-  // Check if the session already completed (exit code 0) but we didn't find the token format
-  if (session.status === 'complete') {
-    // Maybe the token was printed in a format we didn't recognize — give the raw output
-    return { success: false, error: 'Claude completed but the token format was not recognized. Check the raw output.' };
-  }
+    if (session.status === 'error') {
+      return { success: false, error: session.error || 'Claude setup-token failed' };
+    }
 
-  if (session.status === 'error') {
-    return { success: false, error: session.error || 'Claude setup-token failed' };
+    if (session.status === 'complete') {
+      const completedToken = session.capturedToken || extractClaudeSetupToken(session.cleanOutput);
+      if (completedToken) {
+        session.capturedToken = completedToken;
+        return { success: true, token: completedToken };
+      }
+      return { success: false, error: 'Claude completed but the token could not be extracted from the output.' };
+    }
   }
 
   return { success: false, error: 'Timed out waiting for Claude browser sign-in' };
@@ -710,7 +717,7 @@ export async function saveClaudeToken(token: string) {
   try {
     // Write directly to auth-profiles.json, openclaw.json, and models.json.
     // The 'openclaw models auth paste-token' CLI is unreliable on fresh installs.
-    saveProviderApiKey('anthropic', token);
+    saveProviderToken('anthropic', token);
     console.log(`[Claude] Token saved directly to auth files (${token.length} chars)`);
     return { success: true };
   } catch (err: any) {

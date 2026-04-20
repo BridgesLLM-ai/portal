@@ -60,6 +60,65 @@ export function normalizePortalModelId(rawModel: string | null | undefined): str
   return mapped;
 }
 
+export function canonicalizeProviderModelId(providerId: string | null | undefined, rawModel: string | null | undefined): string {
+  const provider = String(providerId || '').trim();
+  let model = String(rawModel || '').trim();
+  if (!model) return '';
+
+  if (model.startsWith('models/')) {
+    model = model.slice('models/'.length);
+  }
+
+  const normalized = normalizePortalModelId(model);
+  if (!provider) return normalized;
+  if (!normalized) return '';
+  if (normalized.startsWith(`${provider}/`)) return normalized;
+
+  if (provider === 'openrouter') {
+    return normalized.startsWith('openrouter/') ? normalized : `openrouter/${normalized}`;
+  }
+
+  if (provider === 'google' || provider === 'google-gemini-cli') {
+    if (normalized.startsWith('google/') || normalized.startsWith('google-gemini-cli/')) {
+      return normalized;
+    }
+    if (normalized.startsWith('gemini-')) return `${provider}/${normalized}`;
+  }
+
+  if (!normalized.includes('/')) {
+    return `${provider}/${normalized}`;
+  }
+
+  return `${provider}/${normalized}`;
+}
+
+export function extractJsonFromCliOutput(rawOutput: string): string {
+  const raw = String(rawOutput || '');
+  const trimmed = raw.trim();
+  if (!trimmed) return trimmed;
+
+  try {
+    JSON.parse(trimmed);
+    return trimmed;
+  } catch {
+    // Keep scanning.
+  }
+
+  const lines = raw.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const candidate = lines.slice(i).join('\n').trim();
+    if (!candidate) continue;
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {
+      // Keep scanning until we find a valid JSON suffix.
+    }
+  }
+
+  return trimmed;
+}
+
 export function normalizePortalModelList(models: string[] | null | undefined): string[] {
   if (!Array.isArray(models)) return [];
   const seen = new Set<string>();

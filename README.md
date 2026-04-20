@@ -35,6 +35,22 @@ curl -fsSL https://bridgesllm.ai/install.sh | sudo bash
 - 35 GB free disk space
 - Root or sudo access
 
+### Windows test drive (WSL 2 beta)
+
+BridgesLLM Portal is still **VPS-first**, but Windows users can now test it locally through **WSL 2** before renting a server.
+
+**Important:** this Windows / WSL path is still **experimental, currently untested in the field, and under active development**. Treat it as a local product preview, not a production deployment target.
+
+Use this once Ubuntu WSL is installed:
+
+```powershell
+wsl -d Ubuntu -u root -- bash -lc "curl -fsSL https://bridgesllm.ai/install.sh | bash -s -- --local"
+```
+
+Then open `http://localhost:4001` in Windows and skip domain + HTTPS in the setup wizard. Public hosting, custom domains, and internet-facing share links remain VPS features in this beta path.
+
+See [docs/WINDOWS_WSL_BETA.md](docs/WINDOWS_WSL_BETA.md) for the full reasoning, caveats, and references.
+
 ## 📺 See It in Action
 
 Visit [bridgesllm.ai](https://bridgesllm.ai) for live video demos of every feature.
@@ -75,6 +91,10 @@ Everything configured in-browser. Domain, SSL, providers, users — no CLI exper
 One-click updates from the browser. Admin dashboard with user management, storage monitoring, and session controls.
 
 ## 🆕 Recent Changes
+
+### v3.25.4 (April 19, 2026)
+- **Portal installs and updates now auto-apply the compatibility hotfix when needed**: the temporary OpenClaw relay and Gemini patch layer is no longer buried in Settings for normal install/update flows, so affected installs come up in the compatible state automatically.
+- **Release artifacts now carry the full Gemini-aware helper**: the bundled hotfix script patches the hashed relay bundles plus the Gemini CLI/runtime compatibility markers that the validated test-box path still depends on.
 
 ### v3.25.3 (April 17, 2026)
 - **Live chat-state reconciliation is finally honest**: Agent Chat and project chat now preserve pending user turns and the active assistant bubble while history reloads, delay post-turn reconciliation until the gateway catches up, and restore separate thinking, tool, text, and compaction phases on refresh instead of flattening them into stale garbage.
@@ -170,7 +190,7 @@ Best path: click the **Update** button in the portal dashboard. Or from SSH:
 curl -fsSL https://bridgesllm.ai/install.sh | sudo bash -s -- --update
 ```
 
-The update flow updates the portal and checks installed dependencies, including OpenClaw, so you usually do **not** need to update OpenClaw separately first.
+The update flow updates the portal and checks installed dependencies, including OpenClaw, so you usually do **not** need to update OpenClaw separately first. On affected installs it also auto-reapplies the temporary portal compatibility hotfix, so the relay and Gemini compatibility markers do not stay stranded behind a buried Settings button.
 
 Updates preserve your data, projects, and configuration.
 
@@ -178,6 +198,9 @@ Updates preserve your data, projects, and configuration.
 
 ### Can I install BridgesLLM Portal on a VPS that already has OpenClaw?
 Yes. The installer detects an existing OpenClaw installation and uses it. If OpenClaw is not already present, the installer installs it for you.
+
+### Can I try it on Windows before buying a VPS?
+Yes, in beta form through WSL 2. The local beta path is experimental, currently untested in the field, and meant for hands-on testing on `http://localhost:4001`, not as the main production deployment model. See [docs/WINDOWS_WSL_BETA.md](docs/WINDOWS_WSL_BETA.md).
 
 ### Do I need API keys for every provider?
 No. Codex and Gemini support account sign-in flows. Claude uses the guided setup-token flow and currently requires Anthropic Extra Usage for OpenClaw-driven requests. Key-based providers still use API keys, and Ollama is local.

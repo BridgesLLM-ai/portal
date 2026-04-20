@@ -15,7 +15,6 @@ import ForgotPasswordPage from './pages/ForgotPasswordPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
 
 const DesktopPage = lazy(() => import('./pages/DesktopPage'));
-const AppsLibraryPage = lazy(() => import('./pages/AppsLibraryPage'));
 const AppsPage = lazy(() => import('./pages/AppsPage'));
 const FilesPage = lazy(() => import('./pages/FilesPage'));
 const AgentChatPage = lazy(() => import('./pages/AgentChatPage'));
@@ -244,7 +243,7 @@ export default function App() {
           {/* Terminal is rendered persistently in Layout.tsx — this route just prevents fallback */}
           <Route path="terminal" element={<AdminRoute><div /></AdminRoute>} />
           <Route path="desktop" element={<AdminRoute><Suspense fallback={<RouteFallback />}><DesktopPage /></Suspense></AdminRoute>} />
-          <Route path="apps" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><AppsLibraryPage /></Suspense></InteractiveRoute>} />
+          <Route path="apps" element={<Navigate to="/projects" replace />} />
           <Route path="projects" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><AppsPage /></Suspense></InteractiveRoute>} />
           <Route path="agent-chats" element={<AdminRoute><Suspense fallback={<RouteFallback />}><AgentChatPage /></Suspense></AdminRoute>} />
           <Route path="agent-tools" element={<AdminRoute><Suspense fallback={<RouteFallback />}><AgentToolsPage /></Suspense></AdminRoute>} />

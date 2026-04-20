@@ -236,12 +236,12 @@ export function resolveToolName(...candidates: unknown[]): string {
 export function getToolPresentation(name: string): ToolPresentation {
   const canonical = canonicalToolName(name);
 
-  if (canonical === 'read' || canonical === 'read_file') return TOOL_PRESENTATIONS.read;
+  if (canonical === 'read' || canonical === 'read_file' || canonical === 'list_directory') return TOOL_PRESENTATIONS.read;
   if (canonical === 'write' || canonical === 'write_file') return TOOL_PRESENTATIONS.write;
-  if (canonical === 'edit' || canonical === 'edit_file' || canonical === 'patch' || canonical === 'apply_patch') return TOOL_PRESENTATIONS.edit;
+  if (canonical === 'edit' || canonical === 'edit_file' || canonical === 'patch' || canonical === 'apply_patch' || canonical === 'replace') return TOOL_PRESENTATIONS.edit;
   if (canonical === 'process') return TOOL_PRESENTATIONS.process;
-  if (canonical === 'exec' || canonical === 'execute' || canonical === 'bash' || canonical === 'shell') return TOOL_PRESENTATIONS.exec;
-  if (canonical === 'search' || canonical === 'web_search' || canonical === 'search_query' || canonical === 'image_query' || canonical === 'find' || canonical === 'finance' || canonical === 'sports' || canonical === 'time') return TOOL_PRESENTATIONS.search;
+  if (canonical === 'exec' || canonical === 'execute' || canonical === 'bash' || canonical === 'shell' || canonical === 'run_shell_command') return TOOL_PRESENTATIONS.exec;
+  if (canonical === 'search' || canonical === 'web_search' || canonical === 'search_query' || canonical === 'image_query' || canonical === 'find' || canonical === 'finance' || canonical === 'sports' || canonical === 'time' || canonical === 'grep_search' || canonical === 'glob') return TOOL_PRESENTATIONS.search;
   if (canonical === 'web_fetch' || canonical === 'fetch' || canonical === 'open' || canonical === 'click' || canonical === 'screenshot') return TOOL_PRESENTATIONS.fetch;
   if (canonical === 'browser' || canonical === 'canvas' || canonical === 'nodes') return TOOL_PRESENTATIONS.browser;
   if (canonical === 'gateway' || canonical === 'cron') return TOOL_PRESENTATIONS.gateway;
@@ -275,6 +275,11 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
     return short ? `Read ${short}` : 'Read file';
   }
 
+  if (canonical === 'list_directory') {
+    const short = shortPath(args?.dir_path || args?.path || args?.directory);
+    return short ? `List ${short}` : 'List directory';
+  }
+
   if (canonical === 'write' || canonical === 'write_file') {
     const short = shortPath(args?.path || args?.file_path || args?.filePath);
     return short ? `Write ${short}` : 'Write file';
@@ -283,6 +288,11 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
   if (canonical === 'edit' || canonical === 'edit_file') {
     const short = shortPath(args?.path || args?.file_path || args?.filePath);
     return short ? `Edit ${short}` : 'Edit file';
+  }
+
+  if (canonical === 'replace') {
+    const short = shortPath(args?.file_path || args?.path || args?.filePath);
+    return short ? `Replace in ${short}` : 'Replace text';
   }
 
   if (canonical === 'apply_patch' || canonical === 'patch') {
@@ -298,6 +308,15 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
     return 'Run command';
   }
 
+  if (canonical === 'run_shell_command') {
+    const command = args?.command || args?.cmd;
+    if (typeof command === 'string' && command.trim()) {
+      const short = command.trim().length > 60 ? `${command.trim().slice(0, 57)}…` : command.trim();
+      return `Run ${short}`;
+    }
+    return 'Run shell command';
+  }
+
   if (canonical === 'process') {
     const action = typeof args?.action === 'string' ? args.action : null;
     return action ? `Process ${action}` : 'Inspect process';
@@ -306,6 +325,16 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
   if (canonical === 'search' || canonical === 'web_search' || canonical === 'search_query' || canonical === 'image_query') {
     const query = getSearchQuery(args);
     return query ? `Search “${query.slice(0, 48)}${query.length > 48 ? '…' : ''}”` : 'Search web';
+  }
+
+  if (canonical === 'grep_search') {
+    const query = typeof args?.query === 'string' ? args.query.trim() : '';
+    return query ? `Search “${query.slice(0, 48)}${query.length > 48 ? '…' : ''}”` : 'Search files';
+  }
+
+  if (canonical === 'glob') {
+    const pattern = typeof args?.pattern === 'string' ? args.pattern.trim() : '';
+    return pattern ? `Match ${pattern}` : 'Match files';
   }
 
   if (canonical === 'finance') {

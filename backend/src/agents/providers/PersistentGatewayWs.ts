@@ -259,6 +259,12 @@ function hasRunningToolCall(sessionKey: string): boolean {
   return Boolean(tracked?.toolCalls?.some((toolCall) => toolCall?.status === 'running'));
 }
 
+function shouldProcessTrackedSessionEvent(sessionKey: string): boolean {
+  return streamEventBus.hasSubscribers(sessionKey)
+    || Boolean(streamEventBus.getTrackedStream(sessionKey))
+    || activeRunIds.has(sessionKey);
+}
+
 function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   if (!payload) return;
 
@@ -296,8 +302,10 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
     return;
   }
 
-  // Only process other events for sessions that have active subscribers
-  if (!streamEventBus.hasSubscribers(sessionKey)) return;
+  // Process session events while a run is actively being tracked, even if the
+  // last browser subscriber dropped. Otherwise queued async follow-up completions
+  // can miss their terminal chat.final and leave stream-status stuck active.
+  if (!shouldProcessTrackedSessionEvent(sessionKey)) return;
 
   // Filter by runId: if we have an active run for this session, ignore events from other runs.
   // This prevents replayed/stale events from interfering.
@@ -493,8 +501,10 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     return;
   }
 
-  // Only process other events for sessions that have active subscribers
-  if (!streamEventBus.hasSubscribers(sessionKey)) return;
+  // Process session events while a run is actively being tracked, even if the
+  // last browser subscriber dropped. Otherwise queued async follow-up completions
+  // can miss their terminal chat.final and leave stream-status stuck active.
+  if (!shouldProcessTrackedSessionEvent(sessionKey)) return;
 
   const runId = typeof payload.runId === 'string' ? payload.runId : undefined;
 
@@ -1027,6 +1037,51 @@ export async function injectChatMessage(sessionKey: string, text: string): Promi
       clearTimeout(timeoutTimer);
       pendingResponses.delete(requestId);
       reject(new Error(`Failed to send chat.inject: ${err.message}`));
+    }
+  });
+}
+
+export async function steerSessionMessage(sessionKey: string, text: string): Promise<{ runId?: string; interruptedActiveRun?: boolean }> {
+  if (!singletonWs || singletonWs.readyState !== WebSocket.OPEN) {
+    throw new Error('Persistent WebSocket not connected');
+  }
+  if (!isAuthenticated) {
+    throw new Error('Persistent WebSocket not authenticated');
+  }
+
+  const requestId = nextId();
+
+  return new Promise((resolve, reject) => {
+    const timeoutTimer = setTimeout(() => {
+      pendingResponses.delete(requestId);
+      reject(new Error('sessions.steer RPC timeout'));
+    }, 30000);
+
+    pendingResponses.set(requestId, {
+      resolve: (payload: any) => {
+        clearTimeout(timeoutTimer);
+        resolve(payload && typeof payload === 'object' ? payload : {});
+      },
+      reject: (err: Error) => {
+        clearTimeout(timeoutTimer);
+        reject(err);
+      },
+    });
+
+    try {
+      singletonWs!.send(JSON.stringify({
+        type: 'req',
+        id: requestId,
+        method: 'sessions.steer',
+        params: {
+          key: sessionKey,
+          message: text,
+        },
+      }));
+    } catch (err: any) {
+      clearTimeout(timeoutTimer);
+      pendingResponses.delete(requestId);
+      reject(new Error(`Failed to send sessions.steer: ${err.message}`));
     }
   });
 }

@@ -220,6 +220,10 @@ export const projectsAPI = {
     const { data } = await client.post(`/projects/${name}/git`, { action: 'revert', hash });
     return data;
   },
+  autoCommit: async (name: string, payload?: { model?: string; summary?: string }) => {
+    const { data } = await client.post(`/projects/${name}/assistant/auto-commit`, payload || {});
+    return data;
+  },
   deploy: async (name: string) => {
     const { data } = await client.post(`/projects/${name}/deploy`);
     return data;
@@ -376,11 +380,18 @@ export interface CompatibilityHotfixStatus {
   applied: boolean;
   supported: boolean;
   scriptExists: boolean;
+  relaySupported?: boolean;
+  geminiSupported?: boolean;
   detectorPatched: boolean;
   relayPatched: boolean;
   replyPatched: boolean;
+  geminiCliPatched?: boolean;
+  geminiCliYoloPatched?: boolean;
+  geminiRuntimePatched?: boolean;
   heartbeatRunner: string | null;
   replyBundle: string | null;
+  executeRuntime?: string | null;
+  geminiCliBackend?: string | null;
   issues: string[];
   note?: string;
 }

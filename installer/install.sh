@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.3"
+readonly VERSION="3.25.4"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -38,6 +38,7 @@ UPDATE_MODE=false
 UNINSTALL_MODE=false
 SKIP_OLLAMA=false
 SKIP_OPENCLAW=false
+INSTALL_PROFILE="server"
 
 # Generated during install
 DB_PASSWORD=""
@@ -60,6 +61,7 @@ PACKAGE_MANAGER_LONG_WAIT_SECONDS=1800
 OS_ID=""
 OS_VERSION=""
 APT_AVAILABLE=false
+IS_WSL=false
 
 # ═══════════════════════════════════════════════════════════════
 # Terminal styling
@@ -951,6 +953,62 @@ for raw in Path(file_path).read_text().splitlines():
 PY2
 }
 
+detect_wsl() {
+  [[ -n "${WSL_DISTRO_NAME:-}" || -n "${WSL_INTEROP:-}" ]] && return 0
+  grep -qiE '(microsoft|wsl)' /proc/sys/kernel/osrelease 2>/dev/null && return 0
+  grep -qiE '(microsoft|wsl)' /proc/version 2>/dev/null && return 0
+  return 1
+}
+
+detect_runtime_profile() {
+  if detect_wsl; then
+    IS_WSL=true
+    INSTALL_PROFILE="local"
+  fi
+}
+
+use_local_profile() {
+  [[ "${INSTALL_PROFILE}" == "local" ]]
+}
+
+systemd_ready() {
+  command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]
+}
+
+portal_primary_origin() {
+  if use_local_profile; then
+    echo "http://localhost:4001"
+  elif [[ -n "$DOMAIN" ]]; then
+    echo "https://${DOMAIN}"
+  elif [[ -n "${PUBLIC_IP}" && "${PUBLIC_IP}" != "0.0.0.0" ]]; then
+    echo "http://${PUBLIC_IP}"
+  else
+    echo "http://127.0.0.1:4001"
+  fi
+}
+
+portal_cors_origins() {
+  if use_local_profile; then
+    echo "http://localhost:4001,http://127.0.0.1:4001"
+  elif [[ -n "$DOMAIN" ]]; then
+    echo "https://${DOMAIN},https://www.${DOMAIN}"
+  else
+    echo "http://${PUBLIC_IP}"
+  fi
+}
+
+portal_setup_url() {
+  if use_local_profile; then
+    printf 'http://localhost:4001/setup?token=%s\n' "${SETUP_TOKEN}"
+  elif [[ -n "$DOMAIN" ]]; then
+    printf 'https://%s/setup?token=%s\n' "${DOMAIN}" "${SETUP_TOKEN}"
+  elif [[ -n "${PUBLIC_IP}" && "${PUBLIC_IP}" != "0.0.0.0" ]]; then
+    printf 'http://%s/setup?token=%s\n' "${PUBLIC_IP}" "${SETUP_TOKEN}"
+  else
+    printf 'http://<server-ip>/setup?token=%s\n' "${SETUP_TOKEN}"
+  fi
+}
+
 write_caddy_config() {
   if [[ -n "$DOMAIN" ]]; then
     cat > /etc/caddy/Caddyfile <<CADDYEOF
@@ -1015,6 +1073,7 @@ Usage:
 
 Options:
   --domain DOMAIN   Pre-set domain (enables HTTPS immediately)
+  --local           Experimental local install profile for Windows / WSL testing (used automatically on WSL)
   --skip-ollama     Don't install Ollama
   --skip-openclaw   Don't install OpenClaw
   --update          Update existing installation
@@ -1034,6 +1093,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --domain)         DOMAIN="${2:-}"; shift 2 ;;
+      --local)          INSTALL_PROFILE="local"; shift ;;
       --skip-ollama)    SKIP_OLLAMA=true; shift ;;
       --skip-openclaw)  SKIP_OPENCLAW=true; shift ;;
       --update)         UPDATE_MODE=true; shift ;;
@@ -1091,35 +1151,62 @@ preflight() {
   print_kv "CPUs" "${cpus}" "$WHITE"
   print_kv "RAM" "${mem_mb} MB" "$WHITE"
   print_kv "Disk free" "${disk_gb} GB" "$WHITE"
+  if use_local_profile; then
+    print_kv "Profile" "Local beta (WSL / localhost, experimental)" "$GREEN"
+  else
+    print_kv "Profile" "Server / VPS" "$WHITE"
+  fi
   print_kv "Uptime" "${uptime_min} min" "$WHITE"
   echo ""
 
-  if (( uptime_min < 20 )); then
+  if use_local_profile && ! systemd_ready; then
+    fail "WSL detected but systemd is not running. Enable systemd for your Ubuntu WSL distro, restart WSL, then rerun the installer. See docs/WINDOWS_WSL_BETA.md"
+  fi
+
+  if use_local_profile && [[ -n "$DOMAIN" ]]; then
+    warn "Ignoring --domain in local beta mode. Use the localhost setup path, then skip domain + HTTPS in the wizard."
+    DOMAIN=""
+  fi
+
+  if ! use_local_profile && (( uptime_min < 20 )); then
     warn "Fresh VPS detected. First-boot package tasks may still be running in the background."
     info "If package setup pauses later, the installer will now show what it is waiting on and continue automatically."
   fi
 
   # Ports
   local blocked=""
-  for port in 80 443; do
-    if ss -tlnp "sport = :${port}" 2>/dev/null | grep -q ":${port}"; then
-      blocked+=" $port"
+  if use_local_profile; then
+    if ss -tlnp "sport = :4001" 2>/dev/null | grep -q ":4001"; then
+      blocked=" 4001"
     fi
-  done
-  [[ -z "$blocked" ]] && ok "Ports 80, 443 available" || warn "Ports${blocked} in use — Caddy will take them over"
+    [[ -z "$blocked" ]] && ok "Port 4001 available for local access" || warn "Port${blocked} in use — another local portal or web app may already be running"
+  else
+    for port in 80 443; do
+      if ss -tlnp "sport = :${port}" 2>/dev/null | grep -q ":${port}"; then
+        blocked+=" $port"
+      fi
+    done
+    [[ -z "$blocked" ]] && ok "Ports 80, 443 available" || warn "Ports${blocked} in use — Caddy will take them over"
+  fi
 
   # Internet
   curl -fsSL --max-time 10 https://www.google.com &>/dev/null || fail "No internet connectivity"
 
-  # Public IP
-  PUBLIC_IP=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || \
-              curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null || \
-              echo "")
-  if [[ -n "$PUBLIC_IP" ]]; then
-    print_kv "Public IP" "${PUBLIC_IP}" "$GREEN"
+  # Public IP / local access
+  if use_local_profile; then
+    PUBLIC_IP="127.0.0.1"
+    print_kv "Access URL" "http://localhost:4001" "$GREEN"
+    info "WSL local mode serves the portal directly on localhost so Windows users can test before moving to a VPS. This path is experimental, still untested in the field, and under active development."
   else
-    warn "Could not detect public IP"
-    PUBLIC_IP="0.0.0.0"
+    PUBLIC_IP=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || \
+                curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null || \
+                echo "")
+    if [[ -n "$PUBLIC_IP" ]]; then
+      print_kv "Public IP" "${PUBLIC_IP}" "$GREEN"
+    else
+      warn "Could not detect public IP"
+      PUBLIC_IP="0.0.0.0"
+    fi
   fi
 
   if $APT_AVAILABLE; then
@@ -1179,7 +1266,9 @@ install_system_packages() {
   fi
 
   # Caddy
-  if command -v caddy &>/dev/null; then
+  if use_local_profile; then
+    info "Skipping Caddy in local beta mode — portal will be served directly on http://localhost:4001"
+  elif command -v caddy &>/dev/null; then
     ok "Caddy web server"
   else
     run "apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https"
@@ -1213,8 +1302,12 @@ install_system_packages() {
   fi
 
   # UFW
-  command -v ufw &>/dev/null || run "apt-get install -y -qq ufw"
-  ok "Firewall (UFW)"
+  if use_local_profile; then
+    info "Skipping UFW in local beta mode — Windows/WSL networking stays local by default"
+  else
+    command -v ufw &>/dev/null || run "apt-get install -y -qq ufw"
+    ok "Firewall (UFW)"
+  fi
 
   # Remote Desktop packages (VNC + XFCE desktop + PulseAudio)
   local rd_pkgs=(tigervnc-standalone-server novnc websockify xfce4 xfce4-goodies xfce4-terminal dbus-x11 x11-utils xterm firefox pulseaudio pulseaudio-utils librsvg2-common)
@@ -1438,8 +1531,10 @@ build_portal() {
   fi
 
   # Write .env.production
-  local cors_origin="http://${PUBLIC_IP}"
-  [[ -n "$DOMAIN" ]] && cors_origin="https://${DOMAIN},https://www.${DOMAIN}"
+  local cors_origin
+  cors_origin="$(portal_cors_origins)"
+  local portal_url
+  portal_url="$(portal_primary_origin)"
 
   cat > "${PORTAL_DIR}/backend/.env.production" << ENVEOF
 # Generated by BridgesLLM installer v${VERSION} — $(date)
@@ -1458,6 +1553,8 @@ UPLOAD_DIR=${INSTALL_ROOT}/uploads
 CORS_ORIGIN=${cors_origin}
 PUBLIC_IP=${PUBLIC_IP}
 DOMAIN=${DOMAIN}
+PORTAL_URL=${portal_url}
+INSTALL_PROFILE=${INSTALL_PROFILE}
 
 OPENCLAW_API_URL=http://127.0.0.1:18789
 OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_TOKEN}
@@ -1528,12 +1625,16 @@ SVCEOF
   systemctl enable bridgesllm-product >> "$LOG_FILE" 2>&1
   ok "Portal service created"
 
-  # Caddy
-  write_caddy_config
-  caddy validate --config /etc/caddy/Caddyfile >> "$LOG_FILE" 2>&1 || fail "Caddy configuration is invalid"
-  systemctl enable caddy >> "$LOG_FILE" 2>&1
-  systemctl restart caddy >> "$LOG_FILE" 2>&1
-  ok "Web server configured"
+  # Caddy / direct local access
+  if use_local_profile; then
+    ok "Direct local access configured ${DIM}(http://localhost:4001)${NC}"
+  else
+    write_caddy_config
+    caddy validate --config /etc/caddy/Caddyfile >> "$LOG_FILE" 2>&1 || fail "Caddy configuration is invalid"
+    systemctl enable caddy >> "$LOG_FILE" 2>&1
+    systemctl restart caddy >> "$LOG_FILE" 2>&1
+    ok "Web server configured"
+  fi
 
   # OpenClaw gateway service (if installed)
   if ! $SKIP_OPENCLAW && command -v openclaw &>/dev/null; then
@@ -1567,12 +1668,16 @@ OCSVCEOF
   fi
 
   # Firewall
-  ufw allow 22/tcp >> "$LOG_FILE" 2>&1
-  ufw allow 80/tcp >> "$LOG_FILE" 2>&1
-  ufw allow 443/tcp >> "$LOG_FILE" 2>&1
-  ufw deny 4001/tcp >> "$LOG_FILE" 2>&1
-  ufw --force enable >> "$LOG_FILE" 2>&1 || true
-  ok "Firewall configured"
+  if use_local_profile; then
+    ok "Firewall skipped in local mode"
+  else
+    ufw allow 22/tcp >> "$LOG_FILE" 2>&1
+    ufw allow 80/tcp >> "$LOG_FILE" 2>&1
+    ufw allow 443/tcp >> "$LOG_FILE" 2>&1
+    ufw deny 4001/tcp >> "$LOG_FILE" 2>&1
+    ufw --force enable >> "$LOG_FILE" 2>&1 || true
+    ok "Firewall configured"
+  fi
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -1810,12 +1915,49 @@ ensure_openclaw_gateway_boots_cleanly() {
   return 1
 }
 
+auto_apply_openclaw_compatibility_hotfix() {
+  if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
+    return 0
+  fi
+
+  local hotfix_script="${PORTAL_DIR}/scripts/patch-openclaw-long-run-relay-hotfix.sh"
+  local openclaw_dist="/usr/lib/node_modules/openclaw/dist"
+
+  if [[ ! -f "${hotfix_script}" ]]; then
+    warn "Bundled OpenClaw compatibility hotfix script is missing. Skipping auto-apply."
+    return 0
+  fi
+
+  if [[ ! -d "${openclaw_dist}" ]]; then
+    warn "OpenClaw runtime directory not found at ${openclaw_dist}. Skipping compatibility auto-apply."
+    return 0
+  fi
+
+  chmod 755 "${hotfix_script}" 2>/dev/null || true
+
+  if ! spin "Applying OpenClaw compatibility hotfix (if needed)" "bash '${hotfix_script}' '${openclaw_dist}'"; then
+    warn "OpenClaw compatibility hotfix failed. Continuing install/update; check ${LOG_FILE} and Settings → Compatibility Hotfix."
+    return 0
+  fi
+
+  if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
+    if ! spin "Restarting OpenClaw gateway after compatibility hotfix" "systemctl restart openclaw-gateway"; then
+      warn "OpenClaw gateway restart after compatibility hotfix failed. Continuing install/update; check ${LOG_FILE}."
+      return 0
+    fi
+    sleep 3
+  fi
+
+  ok "OpenClaw compatibility hotfix checked"
+}
+
 start_portal() {
   step_header "Starting portal"
   CURRENT_STEP="startup"
 
   # Start OpenClaw gateway first (portal connects to it)
   if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
+    auto_apply_openclaw_compatibility_hotfix
     ensure_openclaw_gateway_boots_cleanly || true
     sleep 3  # Let gateway fully initialize and write its config
 
@@ -1866,15 +2008,7 @@ print_success() {
   CURRENT_STEP_NUM=$((CURRENT_STEP_NUM + 1))
 
   local url
-  if [[ -n "$DOMAIN" ]]; then
-    url="https://${DOMAIN}/setup?token=${SETUP_TOKEN}"
-  else
-    if [[ -n "${PUBLIC_IP}" && "${PUBLIC_IP}" != "0.0.0.0" ]]; then
-      url="http://${PUBLIC_IP}/setup?token=${SETUP_TOKEN}"
-    else
-      url="http://<server-ip>/setup?token=${SETUP_TOKEN}"
-    fi
-  fi
+  url="$(portal_setup_url)"
 
   local elapsed
   elapsed="$(elapsed_since_start)"
@@ -1912,7 +2046,11 @@ print_success() {
   echo -e "  ${DIM}${BULLET}${NC} Docker ${docker_ver}  ${DIM}${BULLET}${NC} Ollama ${ollama_ver}  ${DIM}${BULLET}${NC} OpenClaw ${openclaw_ver}"
   echo ""
 
-  if [[ -z "$DOMAIN" ]]; then
+  if use_local_profile; then
+    echo -e "  ${DIM}This beta path is for local Windows / WSL testing and is still experimental / untested.${NC}"
+    echo -e "  ${DIM}In the wizard, skip domain + HTTPS for now and use localhost access.${NC}"
+    echo -e "  ${DIM}Public hosting, custom domains, and external share links remain VPS features for now.${NC}"
+  elif [[ -z "$DOMAIN" ]]; then
     echo -e "  ${DIM}You'll set up a domain and HTTPS in the setup wizard.${NC}"
   fi
   echo -e "  ${DIM}Log: ${LOG_FILE}${NC}"
@@ -1955,6 +2093,9 @@ do_update() {
   if [[ -f "${PORTAL_DIR}/backend/.env.production" ]]; then
     existing_db_url="$(grep '^DATABASE_URL=' "${PORTAL_DIR}/backend/.env.production" | sed 's/^DATABASE_URL=//' | tr -d '"' || true)"
     DB_PASSWORD=$(echo "${existing_db_url}" | sed -n 's#.*://[^:]*:\([^@]*\)@.*#\1#p' || true)
+    local existing_install_profile
+    existing_install_profile="$(read_env_value "${PORTAL_DIR}/backend/.env.production" "INSTALL_PROFILE" || true)"
+    [[ -n "${existing_install_profile}" ]] && INSTALL_PROFILE="${existing_install_profile}"
   fi
 
   # Download update — always prefer the tarball over local fallback dir.
@@ -1996,6 +2137,8 @@ do_update() {
     grep -q '^INSTALL_ROOT=' "${env_file}" || echo "INSTALL_ROOT=${INSTALL_ROOT}" >> "${env_file}"
     grep -q '^APPS_ROOT=' "${env_file}" || echo "APPS_ROOT=${INSTALL_ROOT}/apps" >> "${env_file}"
     grep -q '^UPLOAD_DIR=' "${env_file}" || echo "UPLOAD_DIR=${INSTALL_ROOT}/uploads" >> "${env_file}"
+    grep -q '^INSTALL_PROFILE=' "${env_file}" || echo "INSTALL_PROFILE=${INSTALL_PROFILE}" >> "${env_file}"
+    grep -q '^PORTAL_URL=' "${env_file}" || echo "PORTAL_URL=$(portal_primary_origin)" >> "${env_file}"
     if [[ -n "${TELEMETRY_INSTALL_ID}" ]]; then
       if grep -q '^TELEMETRY_INSTALL_ID=' "${env_file}"; then
         sed -i "s|^TELEMETRY_INSTALL_ID=.*|TELEMETRY_INSTALL_ID=${TELEMETRY_INSTALL_ID}|" "${env_file}"
@@ -2149,6 +2292,7 @@ do_uninstall() {
 
 main() {
   parse_args "$@"
+  detect_runtime_profile
 
   # Uninstall mode
   if $UNINSTALL_MODE; then

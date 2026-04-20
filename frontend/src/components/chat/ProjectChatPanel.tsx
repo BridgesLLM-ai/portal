@@ -18,7 +18,7 @@ import SlashCommandMenu from './SlashCommandMenu';
 import { ExecApprovalModal } from './ExecApprovalModal';
 import client from '../../api/client';
 import { authAPI } from '../../api/auth';
-import { gatewayAPI } from '../../api/endpoints';
+import { gatewayAPI, projectsAPI } from '../../api/endpoints';
 import { useIsMobile } from '../../hooks/useIsMobile';
 import {
   extractThinkingChunk,
@@ -27,6 +27,7 @@ import {
   mergeThinkingStream,
   sanitizeAssistantContent,
   sanitizeAssistantChunk,
+  stripOpenClawReplyTags,
 } from '../../utils/chatStream';
 import {
   canonicalizePortalModelId,
@@ -246,9 +247,66 @@ function getWsUrl(): string {
 
 let msgCounter = 0;
 const CHAT_HISTORY_OMITTED_PLACEHOLDER = '[chat.history omitted: message too large]';
+const HISTORY_ENVELOPE_TIMESTAMP_RE = /\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}\s+[A-Z]{2,4}\]\s*/;
 
 function nextId() {
   return 'pmsg-' + Date.now() + '-' + (++msgCounter);
+}
+
+function stripHistoryEnvelope(text: string): string {
+  if (!text) return text;
+  const match = text.match(HISTORY_ENVELOPE_TIMESTAMP_RE);
+  if (match && match.index !== undefined) {
+    const beforeTimestamp = text.substring(0, match.index);
+    if (
+      beforeTimestamp.includes('Conversation info (untrusted metadata)')
+      || beforeTimestamp.includes('Sender (untrusted metadata)')
+    ) {
+      return text.substring(match.index + match[0].length).trim();
+    }
+  }
+  return text;
+}
+
+function sanitizeHistoryMessageText(text: string): string {
+  return stripOpenClawReplyTags(stripHistoryEnvelope(text || ''))
+    .replace(/\r\n/g, '\n')
+    .trim();
+}
+
+function isHiddenHistoryArtifactText(text: string): boolean {
+  const normalized = String(text || '').trim();
+  if (!normalized) return false;
+
+  return [
+    /^System \(untrusted\):/i,
+    /^An async command you ran earlier has completed\./i,
+    /^Read HEARTBEAT\.md if it exists/i,
+    /^HEARTBEAT_OK$/i,
+    /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i,
+    /Handle the result internally\./i,
+    /Sender \(untrusted metadata\):/i,
+    /Conversation info \(untrusted metadata\):/i,
+  ].some((pattern) => pattern.test(normalized));
+}
+
+function summarizeHiddenHistoryArtifactText(text: string): string | null {
+  const normalized = String(text || '').trim();
+  if (!normalized) return null;
+
+  if (/<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i.test(normalized) && /\[Internal task completion event\]/i.test(normalized)) {
+    const sourceMatch = normalized.match(/^source:\s*(.+)$/im);
+    const source = sourceMatch?.[1]?.trim().toLowerCase() || '';
+    if (source === 'subagent') return 'Delegated task completed';
+    if (source) return 'Background task completed';
+    return 'Background work completed';
+  }
+
+  if (/^An async command you ran earlier has completed\./i.test(normalized)) {
+    return 'Earlier async command completed';
+  }
+
+  return null;
 }
 
 function getLastRunningToolCall(toolCalls: ToolCall[] | undefined): ToolCall | null {
@@ -260,11 +318,26 @@ function getLastRunningToolCall(toolCalls: ToolCall[] | undefined): ToolCall | n
 }
 
 function parseHistoryMessage(m: any): ChatMessage | null {
-  const rawContent = m.content || '';
+  const rawContent = typeof m.content === 'string' ? m.content : '';
+  const sanitizedHistoryText = sanitizeHistoryMessageText(rawContent);
   const rawThinkingContent = typeof m.thinkingContent === 'string' ? sanitizeAssistantContent(m.thinkingContent) : '';
   const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
   if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(rawContent) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
     return null;
+  }
+  if (m.role === 'assistant' && !isTruncationPlaceholder && isHiddenHistoryArtifactText(sanitizedHistoryText) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
+    return null;
+  }
+  if ((m.role === 'user' || m.role === 'system') && isHiddenHistoryArtifactText(sanitizedHistoryText)) {
+    const summary = summarizeHiddenHistoryArtifactText(sanitizedHistoryText);
+    if (!summary) return null;
+    return {
+      id: m.id || nextId(),
+      role: 'system',
+      content: summary,
+      createdAt: new Date(m.timestamp || Date.now()),
+      provenance: 'hidden-history-artifact',
+    };
   }
 
   const msg: ChatMessage = {
@@ -272,7 +345,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
     role: isTruncationPlaceholder ? 'system' : m.role,
     content: isTruncationPlaceholder
       ? 'Earlier assistant output was omitted from history because the message was too large.'
-      : (m.role === 'assistant' ? sanitizeAssistantContent(rawContent) : rawContent),
+      : (m.role === 'assistant' ? sanitizeAssistantContent(rawContent) : sanitizedHistoryText),
     createdAt: new Date(m.timestamp || Date.now()),
     provenance: m.provenance,
     model: typeof m.model === 'string' ? m.model : undefined,
@@ -645,6 +718,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const sessionKeyRef = useRef<string | null>(null);
   const historyGenRef = useRef(0);
   const modelRef = useRef(selectedModel);
+  const pendingAutoCommitRef = useRef(false);
 
   useEffect(() => {
     const activeAssistantId = streamingAssistantIdRef.current;
@@ -670,6 +744,22 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     });
   }, []);
 
+  const requestAutoCommit = useCallback((runModel?: string | null) => {
+    if (!pendingAutoCommitRef.current) return;
+    pendingAutoCommitRef.current = false;
+    const normalizedModel = canonicalizePortalModelId(String(runModel || modelRef.current || '')) || undefined;
+    void projectsAPI.autoCommit(projectName, normalizedModel ? { model: normalizedModel } : {})
+      .then((result) => {
+        const commit = result?.commit;
+        if (result?.committed && commit?.hash) {
+          appendSystemNotice(`Committed ${commit.hash}: ${commit.message || 'Assistant update'}`);
+        }
+      })
+      .catch((err) => {
+        console.warn('[ProjectChatPanel] Auto-commit failed:', err);
+      });
+  }, [appendSystemNotice, projectName]);
+
   const applyCompactionSnapshotState = useCallback((phase?: unknown) => {
     if (phase !== 'idle' && phase !== 'compacting' && phase !== 'compacted') return;
     if (compactionTimerRef.current) {
@@ -678,10 +768,16 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     }
     compactionPhaseRef.current = phase;
     setCompactionPhase(phase);
+    if (phase === 'compacting') {
+      setStatusText('Compacting context…');
+    }
     if (phase === 'compacted') {
+      const noticeText = 'Context compacted';
+      setStatusText(noticeText);
       compactionTimerRef.current = setTimeout(() => {
         compactionPhaseRef.current = 'idle';
         setCompactionPhase('idle');
+        setStatusText((prev) => (prev === noticeText ? null : prev));
         compactionTimerRef.current = null;
       }, 3000);
     }
@@ -924,7 +1020,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     setIsRunning(true);
     setStreamingPhase(resumePhase);
     setActiveToolName(snapshotToolName || null);
-    setStatusText(snapshotToolName ? getToolStatusText(snapshotToolName, rawStatusText) : (rawStatusText || 'Reconnecting to stream…'));
+    const compactionStatusText = snapshot.compactionPhase === 'compacting'
+      ? (rawStatusText || 'Compacting context…')
+      : snapshot.compactionPhase === 'compacted'
+        ? (rawStatusText || 'Context compacted')
+        : '';
+    setStatusText(snapshotToolName
+      ? getToolStatusText(snapshotToolName, rawStatusText || compactionStatusText || null)
+      : (compactionStatusText || rawStatusText || 'Reconnecting to stream…'));
     setConnectionNotice(null);
 
     applyCompactionSnapshotState(snapshot.compactionPhase);
@@ -1036,10 +1139,6 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
     if (data.active) {
       return applyActiveStreamSnapshot(data, currentSession, expectedGen, manager);
-    }
-
-    if (manager?.isConnected()) {
-      manager.send({ type: 'reconnect', session: currentSession, provider: 'OPENCLAW' });
     }
 
     clearWatchdog();
@@ -1376,6 +1475,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             ));
           }
         }
+        requestAutoCommit(model || modelRef.current);
         break;
       }
       case 'error': {
@@ -1384,6 +1484,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             m.id === assistantId ? { ...m, content: '⚠️ ' + (data.content || 'Unknown error') } : m
           ));
         }
+        pendingAutoCommitRef.current = false;
         setStatusText(null);
         setStreamingPhase('idle');
         setThinkingContent('');
@@ -1470,11 +1571,12 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setActiveToolName(null);
         clearWatchdog();
         finalizeStreamingAssistant();
+        requestAutoCommit(modelRef.current);
         break;
       case 'keepalive':
         break;
     }
-  }, [activeToolName, clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent, finalizeStreamingAssistant]);
+  }, [activeToolName, clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent, finalizeStreamingAssistant, requestAutoCommit]);
 
   const handleWsEventRef = useRef(handleWsEvent);
   useEffect(() => { handleWsEventRef.current = handleWsEvent; }, [handleWsEvent]);
@@ -1652,6 +1754,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     const userMsg: ChatMessage = { id: nextId(), role: 'user', content: text, createdAt: new Date() };
     setMessages(prev => [...prev, userMsg]);
 
+    pendingAutoCommitRef.current = true;
     assembledRef.current = '';
     lastSegmentStartRef.current = 0;
     lastRawTextLenRef.current = 0;
@@ -1682,6 +1785,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       manager.send({ type: 'abort', session: sk });
     }
     clearWatchdog();
+    pendingAutoCommitRef.current = false;
     isStreamActiveRef.current = false;
     setIsRunning(false);
     setStreamingPhase('idle');
@@ -1704,6 +1808,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       // Close current WS (kill the stream if active)
       if (isStreamActiveRef.current) cancelStream();
 
+      pendingAutoCommitRef.current = false;
       await client.post(`/projects/${projectName}/assistant/reset`);
       setMessages([]);
       setStatusText(null);

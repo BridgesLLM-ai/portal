@@ -269,6 +269,18 @@ function sendMessageViaPersistentWs(
     sendChatMessage(sessionId, message, idempotencyKey)
       .then(({ runId }) => {
         debugLog(`chat.send accepted: sessionKey=${sessionId} runId=${runId}`);
+        if (runId) {
+          streamEventBus.updateStreamPhase(sessionId, {
+            phase: 'thinking',
+            runId,
+            statusText: 'Thinking…',
+          });
+          streamEventBus.publish(sessionId, {
+            type: 'status',
+            content: 'Thinking…',
+            runId,
+          });
+        }
         resetInactivityTimer();
       })
       .catch((err) => {

@@ -413,6 +413,25 @@ function resolveAppApiTarget(proxiedPath: string, target: string, req: any): str
   return req.protocol + '://' + req.get('host') + target;
 }
 
+function getHostedRequestParts(req: any): string[] {
+  const originalPath = String(req.originalUrl || '').split('?')[0];
+  const baseUrl = typeof req.baseUrl === 'string' ? req.baseUrl : '';
+  const relativePath = baseUrl && originalPath.startsWith(baseUrl)
+    ? originalPath.slice(baseUrl.length)
+    : String(req.path || req.url || '');
+
+  return relativePath
+    .split('/')
+    .filter(Boolean)
+    .map((segment) => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    });
+}
+
 // Hosted apps — API proxy: route /hosted/:deployId/api/* to the real backend.
 app.use('/hosted/:deployId/api/*', browserAuthRedirect, async (req: any, res: any) => {
   const proxiedPath = req.params[0] || '';
@@ -494,7 +513,7 @@ app.use('/hosted', async (req, res, next) => {
 
   try {
     await browserAssetAuth(req, res, async () => {
-      const parts = req.path.split('/').filter(Boolean);
+      const parts = getHostedRequestParts(req);
       if (parts.length < 2) { next(); return; }
       const appId = parts[0];
       const appDir = path.resolve(path.join(HOSTED_APPS_DIR, appId));
@@ -515,7 +534,7 @@ app.use('/hosted', async (req, res, next) => {
     next(error);
   }
 }, browserAuthRedirect, async (req, res, next) => {
-  const parts = req.path.split('/').filter(Boolean);
+  const parts = getHostedRequestParts(req);
   if (parts.length === 0) { res.status(404).send('Not found'); return; }
 
   const appId = parts[0];
@@ -534,17 +553,18 @@ app.use('/hosted', async (req, res, next) => {
     return;
   }
 
-  // Look up app in database to get actual directory path
-  let resolvedAppDir: string;
+  // Prefer a live on-disk deployment directory over stale database paths.
+  const fallbackAppDir = path.resolve(path.join(HOSTED_APPS_DIR, appId));
+  let resolvedAppDir = fallbackAppDir;
   try {
     const appRecord = await prisma.app.findUnique({ where: { id: appId }, select: { zipPath: true } });
-    if (appRecord?.zipPath) {
-      resolvedAppDir = path.resolve(appRecord.zipPath);
-    } else {
-      resolvedAppDir = path.resolve(path.join(HOSTED_APPS_DIR, appId));
-    }
+    const candidateDirs = [
+      appRecord?.zipPath ? path.resolve(appRecord.zipPath) : null,
+      fallbackAppDir,
+    ].filter((value): value is string => Boolean(value));
+    resolvedAppDir = candidateDirs.find((candidate) => fs.existsSync(candidate)) || candidateDirs[0] || fallbackAppDir;
   } catch {
-    resolvedAppDir = path.resolve(path.join(HOSTED_APPS_DIR, appId));
+    resolvedAppDir = fallbackAppDir;
   }
 
   if (!resolvedAppDir.startsWith(path.resolve(HOSTED_APPS_DIR))) {

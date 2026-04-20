@@ -1,4 +1,5 @@
 import { getAiProviderMeta } from '../config/aiProviders';
+import { canonicalizeProviderModelId } from '../utils/openclawCli';
 
 export interface ValidationResult {
   valid: boolean;
@@ -7,20 +8,20 @@ export interface ValidationResult {
   hint?: string;
 }
 
-function extractModelIds(body: any): string[] {
-  if (Array.isArray(body?.data)) {
-    return body.data
+function extractModelIds(providerId: string, body: any): string[] {
+  const rawIds = Array.isArray(body?.data)
+    ? body.data
       .map((item: any) => item?.id || item?.name)
-      .filter((item: unknown): item is string => typeof item === 'string');
-  }
+      .filter((item: unknown): item is string => typeof item === 'string')
+    : Array.isArray(body?.models)
+      ? body.models
+        .map((item: any) => item?.name || item?.id)
+        .filter((item: unknown): item is string => typeof item === 'string')
+      : [];
 
-  if (Array.isArray(body?.models)) {
-    return body.models
-      .map((item: any) => item?.name || item?.id)
-      .filter((item: unknown): item is string => typeof item === 'string');
-  }
-
-  return [];
+  return Array.from(new Set(rawIds
+    .map((modelId) => canonicalizeProviderModelId(providerId, modelId))
+    .filter(Boolean)));
 }
 
 export function mapProviderError(provider: string, statusCode: number | null, errorMessage: string): { userMessage: string; recovery: string } {
@@ -117,7 +118,7 @@ export async function validateApiKey(providerId: string, apiKey: string): Promis
 
     if (response.status === 200) {
       const body = await response.json().catch(() => ({}));
-      return { valid: true, models: extractModelIds(body) };
+      return { valid: true, models: extractModelIds(providerId, body) };
     }
 
     const mappingByStatus: Record<number, ValidationResult> = {
