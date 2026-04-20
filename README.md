@@ -93,8 +93,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 ## 🆕 Recent Changes
 
 ### v3.25.4 (April 19, 2026)
-- **Portal installs and updates now auto-apply the compatibility hotfix when needed**: the temporary OpenClaw relay and Gemini patch layer is no longer buried in Settings for normal install/update flows, so affected installs come up in the compatible state automatically.
-- **Release artifacts now carry the full Gemini-aware helper**: the bundled hotfix script patches the hashed relay bundles plus the Gemini CLI/runtime compatibility markers that the validated test-box path still depends on.
+- **Installer/update compatibility is finally automatic**: normal install and update flows now auto-apply the validated OpenClaw relay + Gemini compatibility patch set when needed instead of burying that repair behind a manual Settings step.
+- **Agent Chat and project chat are more truthful during live OpenClaw runs**: capable runtimes now use real interrupt-and-steer behavior, running turns surface an immediate `Thinking…` state, async follow-ups can finish cleanly even if the browser disconnects, and hidden Portal Backend RPC / heartbeat artifact text is stripped out of restored history.
+- **Project chat works in a saner repo context**: project agents now run against `/workspace/project`, assistant auto-commit is back after successful runs, transient `.agent-*` scratch files are shelved out of git operations, and revert/auto-commit flows stop confusing portal-maintenance state with user work.
+- **AI setup and provider status got a big honesty pass**: Claude setup-token finishing no longer looks frozen, Codex/Gemini native CLI auth is sturdier, provider model IDs/fallbacks are normalized consistently, and provider cleanup removes stale auth/model config together.
+- **Windows / WSL beta messaging now tells the truth**: local installs are labeled as experimental localhost test drives, while public hosting, stable share links, and custom-domain HTTPS remain VPS-first. The release also bundles the Gemini-aware compatibility helper, new AI-setup/OpenClaw parsing tests, and Windows beta notes.
 
 ### v3.25.3 (April 17, 2026)
 - **Live chat-state reconciliation is finally honest**: Agent Chat and project chat now preserve pending user turns and the active assistant bubble while history reloads, delay post-turn reconciliation until the gateway catches up, and restore separate thinking, tool, text, and compaction phases on refresh instead of flattening them into stale garbage.

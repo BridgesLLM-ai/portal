@@ -5,10 +5,23 @@ All notable changes to BridgesLLM Portal are documented here.
 ## [3.25.4] — 2026-04-19
 
 ### Improved
-- **Portal installs and updates now auto-apply the bundled OpenClaw compatibility hotfix when needed**: the installer no longer leaves the temporary relay and Gemini patch layer buried in Settings, so fresh installs and normal update runs can come up with the same compatibility markers the portal depends on without extra manual cleanup.
+- **Installer and updater flows now auto-apply the validated OpenClaw compatibility patch set when needed**: normal install and update runs bring the relay and Gemini runtime markers forward automatically instead of leaving that repair stranded behind a manual Settings action.
+- **Agent Chat and project chat handle active OpenClaw runs more honestly**: supported OpenClaw sessions now use a real interrupt-and-steer path for in-turn follow-ups, immediate `Thinking…` state is surfaced as soon as the run is accepted, tracked runs can finish cleanly even if the last browser subscriber drops, and the current session dropdown/header now labels the actual chat instead of acting like a blind history counter.
+- **History restoration is much cleaner in both main and project chat**: hidden Portal Backend RPC / async completion / heartbeat envelope artifacts are stripped or summarized instead of being replayed as if they were real user-visible conversation.
+- **Project agents are finally back in a sane repo workspace**: project chat now binds the repo into `/workspace/project`, restores automatic assistant commits after successful runs, sets a local git identity if one is missing, and shelves transient `.agent-*` / `.assistant-*` scratch files so auto-commit and revert flows stop tripping over portal-maintenance state.
+- **AI setup and provider state are more truthful across Claude, Codex, Gemini, and key-based providers**: model IDs are canonicalized consistently, fallback-model registration survives current OpenClaw CLI output shapes, provider removal cleans both auth and model config, Claude setup-token flow shows live finishing output instead of looking frozen, Gemini/Codex native CLI auth handling is sturdier, and provider status surfaces now do a better job distinguishing configured, expired, refreshable, and cooldown states.
+- **Windows / WSL local beta messaging is explicit now**: the installer, setup surfaces, Projects/Apps UI, and bundled docs now say plainly that localhost WSL installs are an experimental test-drive path, while public hosting, stable share links, and custom-domain HTTPS remain VPS-first.
+- **Admin/runtime copy and controls are clearer**: Settings and Agent Chat now describe the compatibility action as a fallback after separate OpenClaw upgrades, show both relay and Gemini patch markers, expose an OpenClaw compaction-notice toggle, and recognize more tool aliases in live tool-status presentation.
+
+### Fixed
+- **OpenClaw “live note” ambiguity is gone on capable runtimes**: the portal no longer pretends assistant-side injection is real steering when `sessions.steer` is available, and the UI now says “interrupt and steer” when that is what will actually happen.
+- **Claude setup-token handoff no longer stalls after the auth code paste step**: the backend captures tokens earlier, cleans up stale helper processes, and lets the frontend show progress while Claude finishes instead of leaving the user staring at a silent spinner.
+- **Project git operations are less fragile around assistant scratch state**: revert now ignores transient portal files automatically, dirty-tree errors name the real blocking files, and assistant auto-commit no longer sweeps session metadata into user commits.
+- **Provider model/config cleanup is more complete**: removing a provider now clears the related `models.json` / config state too, which prevents stale defaults and fallback remnants from lingering after auth is removed.
 
 ### Maintenance
-- **The bundled compatibility helper now ships the Gemini-aware patch path through the normal release channel**: current release artifacts carry the same hashed-bundle relay fix, heartbeat `persistedLastTo` preservation, Gemini CLI `stream-json`/`--yolo` patching, and Gemini runtime tool-event wiring that were already validated on the test box.
+- **The bundled compatibility helper now ships the full Gemini-aware patch path through the normal release channel**: current release artifacts carry the hashed-bundle relay fix, heartbeat `persistedLastTo` preservation, Gemini CLI `stream-json` / `--yolo` patching, and Gemini runtime tool-event wiring that were validated during the release audit.
+- **Release coverage and docs were extended to match the new setup/runtime behavior**: 3.25.4 adds focused regression tests for AI-setup model normalization and OpenClaw CLI JSON parsing, plus a bundled `docs/WINDOWS_WSL_BETA.md` reference for the new localhost beta path.
 
 ## [3.25.3] — 2026-04-17
 
