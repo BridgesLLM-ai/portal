@@ -41,10 +41,10 @@ BridgesLLM Portal is still **VPS-first**, but Windows users can now test it loca
 
 **Important:** this Windows / WSL path is still **experimental, currently untested in the field, and under active development**. Treat it as a local product preview, not a production deployment target.
 
-Recommended PowerShell bootstrapper, it checks for WSL/Ubuntu first and installs Ubuntu if missing:
+Recommended Windows Terminal bootstrapper (PowerShell profile), it checks for WSL/Ubuntu first and installs Ubuntu if missing:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/BridgesLLM-ai/portal/main/installer/install-windows.ps1 -UseBasicParsing | iex"
+irm https://raw.githubusercontent.com/BridgesLLM-ai/portal/main/installer/install-windows.ps1 | iex
 ```
 
 If Ubuntu WSL is already ready and you want to skip the bootstrapper, use the direct installer path:

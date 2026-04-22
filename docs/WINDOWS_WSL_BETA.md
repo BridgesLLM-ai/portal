@@ -86,10 +86,10 @@ This is intentionally a **test-drive profile**, not the main production path. It
 
 ### Recommended Windows entrypoint
 
-From **PowerShell**, use the bootstrapper. It checks for WSL/Ubuntu first, installs Ubuntu if missing, then launches the Linux installer in local beta mode:
+From **Windows Terminal** using the default PowerShell profile, use the bootstrapper. It checks for WSL/Ubuntu first, installs Ubuntu if missing, then launches the Linux installer in local beta mode:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/BridgesLLM-ai/portal/main/installer/install-windows.ps1 -UseBasicParsing | iex"
+irm https://raw.githubusercontent.com/BridgesLLM-ai/portal/main/installer/install-windows.ps1 | iex
 ```
 
 Microsoft reference:
