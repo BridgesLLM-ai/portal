@@ -84,20 +84,24 @@ This is intentionally a **test-drive profile**, not the main production path. It
 
 ## Windows user flow
 
-### Prerequisite
+### Recommended Windows entrypoint
 
-Install WSL 2 with Ubuntu first.
+From **PowerShell**, use the bootstrapper. It checks for WSL/Ubuntu first, installs Ubuntu if missing, then launches the Linux installer in local beta mode:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/BridgesLLM-ai/portal/main/installer/install-windows.ps1 -UseBasicParsing | iex"
+```
 
 Microsoft reference:
 - https://learn.microsoft.com/en-us/windows/wsl/install
 - https://learn.microsoft.com/en-us/windows/wsl/systemd
 
-### Recommended command once WSL is ready
+### Direct command once WSL is already ready
 
-From **PowerShell**:
+If Ubuntu WSL is already installed and configured, the direct path is still:
 
 ```powershell
-wsl -d Ubuntu -u root -- bash -lc "curl -fsSL https://bridgesllm.ai/install.sh | bash -s -- --local"
+wsl -u root -- bash -lc "curl -fsSL https://bridgesllm.ai/install.sh | bash -s -- --local"
 ```
 
 Then open:
@@ -164,13 +168,15 @@ References:
 - https://docs.openwebui.com/getting-started/quick-start/
 - https://docs.openwebui.com/roadmap/
 
-## Next likely step
+## PowerShell bootstrapper
 
-If Windows demand is real, the next layer should be a small **PowerShell bootstrapper** that:
+The repo now includes `installer/install-windows.ps1` as the Windows front door.
 
-- checks whether WSL/Ubuntu exists
-- checks whether systemd is enabled
-- launches the Linux installer with `--local`
-- prints the final localhost URL clearly
+Its job is intentionally small:
 
-That would give Windows users a cleaner one-command entrypoint **without** forcing us to build a full native Windows installer yet.
+- checks whether `wsl.exe` is available
+- checks whether an Ubuntu WSL distro exists
+- runs `wsl --install -d Ubuntu` when Ubuntu is missing
+- launches the Linux installer with `--local` once WSL is ready
+
+That gives Windows users a cleaner one-command entrypoint **without** pretending we have a real native Windows server installer yet.

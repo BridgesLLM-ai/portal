@@ -53,6 +53,7 @@ import {
   getShortModelLabel,
 } from '../../utils/modelId';
 import ComposerStatusBadge from './ComposerStatusBadge';
+import CompactionNoticeBlock from './CompactionNoticeBlock';
 import ToolGlyph from './ToolGlyph';
 import { getToolPresentation, getToolSummary, isCompactionNotice } from '../../utils/toolPresentation';
 
@@ -3432,14 +3433,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                           </>
 ) : msg.role === 'system' ? (
                           isCompactionNotice(msg.content) ? (
-                            <div className="flex justify-center px-4 py-2 max-w-3xl mx-auto w-full">
-                              <div className="inline-flex max-w-xl items-center gap-2 rounded-full border border-sky-400/20 bg-sky-500/10 px-4 py-2 text-[11px] text-sky-200 whitespace-pre-wrap shadow-lg shadow-sky-500/5">
-                                <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-sky-400/20 bg-sky-400/10">
-                                  <Layers3 size={11} className="text-sky-300" />
-                                </span>
-                                <span>{msg.content}</span>
-                              </div>
-                            </div>
+                            <CompactionNoticeBlock key={msg.id} content={msg.content} size="default" />
                           ) : (
                             <div className="flex justify-center px-4 py-2 max-w-3xl mx-auto w-full">
                               <div className="max-w-xl rounded-2xl border border-white/[0.08] bg-white/[0.04] px-4 py-3 text-[12px] text-slate-300 whitespace-pre-wrap">

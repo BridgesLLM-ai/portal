@@ -445,5 +445,5 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
 }
 
 export function isCompactionNotice(content: string): boolean {
-  return /\b(context compacted|compaction complete(?:d)?|compacting context|auto-compaction)\b/i.test(content || '');
+  return /\b(context compacted|compaction (?:complete(?:d)?|finished|in progress|started|incomplete|did not complete)|compacting context|context maintenance(?: in progress| finished| complete(?:d)?)?|auto-compaction|preparing context maintenance|preparing compaction)\b/i.test(content || '');
 }

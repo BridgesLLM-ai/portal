@@ -258,14 +258,17 @@ function attachPtyParsing(session: OAuthSession) {
     console.log(`[OAuth] PTY exited: provider=${session.provider} code=${exitCode} status=${session.status} hasAuthUrl=${Boolean(session.authUrl)} outputLen=${session.cleanOutput.length}`);
     console.log(`[OAuth] Last 500 chars of clean output: ${session.cleanOutput.slice(-500)}`);
     if (session.status === 'complete') return;
+    // Gemini/OpenClaw OAuth can exit cleanly right after printing the auth URL and
+    // waiting instructions. That is NOT a successful login yet. Keep the session in
+    // awaiting_callback so the portal can collect the pasted redirect URL and respawn
+    // a fresh PTY during completion.
+    if (session.authUrl && session.status === 'awaiting_callback') {
+      console.log('[OAuth] Process exited after delivering auth URL, keeping session alive for callback completion');
+      return;
+    }
     if (exitCode === 0) {
       session.status = 'complete';
       session.completedAt = Date.now();
-      return;
-    }
-    // If we already got the auth URL and are waiting for callback, don't treat exit as error
-    if (session.authUrl && session.status === 'awaiting_callback') {
-      console.log('[OAuth] Process exited but auth URL was already delivered, keeping session alive');
       return;
     }
     if (!session.error) {

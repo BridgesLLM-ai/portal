@@ -190,7 +190,11 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
 export async function patchSessionModel(sessionKey: string, model: string): Promise<{ ok: boolean; resolved?: { modelProvider: string; model: string }; error?: string }> {
   console.log(`[Gateway RPC] Patching session model: key=${sessionKey} model=${model}`);
   
-  const result = await gatewayRpcCall('sessions.patch', { key: sessionKey, model });
+  // sessions.patch can take noticeably longer than chat.send on a busy gateway,
+  // especially right after auth/profile changes or when materializing a fresh
+  // session. Keep the timeout comfortably above the ~7-10s real-world window
+  // we see in portal logs so model switching does not fail spuriously.
+  const result = await gatewayRpcCall('sessions.patch', { key: sessionKey, model }, 20000);
   
   if (result.ok) {
     const resolved = result.data?.resolved;
@@ -230,7 +234,7 @@ export async function createSession(sessionKey: string, agentId?: string): Promi
 export async function getSessionInfo(sessionKey: string): Promise<{ ok: boolean; data?: any; error?: string }> {
   // Extract agent ID from session key format: "agent:{agentId}:{sessionId}"
   const agentId = sessionKey.startsWith('agent:') ? sessionKey.split(':')[1] : 'portal';
-  const result = await gatewayRpcCall('sessions.list', { agentId });
+  const result = await gatewayRpcCall('sessions.list', { agentId }, 15000);
   
   if (result.ok && result.data?.sessions) {
     const session = result.data.sessions.find((s: any) => s.key === sessionKey);

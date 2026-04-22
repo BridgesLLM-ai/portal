@@ -41,10 +41,16 @@ BridgesLLM Portal is still **VPS-first**, but Windows users can now test it loca
 
 **Important:** this Windows / WSL path is still **experimental, currently untested in the field, and under active development**. Treat it as a local product preview, not a production deployment target.
 
-Use this once Ubuntu WSL is installed:
+Recommended PowerShell bootstrapper, it checks for WSL/Ubuntu first and installs Ubuntu if missing:
 
 ```powershell
-wsl -d Ubuntu -u root -- bash -lc "curl -fsSL https://bridgesllm.ai/install.sh | bash -s -- --local"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/BridgesLLM-ai/portal/main/installer/install-windows.ps1 -UseBasicParsing | iex"
+```
+
+If Ubuntu WSL is already ready and you want to skip the bootstrapper, use the direct installer path:
+
+```powershell
+wsl -u root -- bash -lc "curl -fsSL https://bridgesllm.ai/install.sh | bash -s -- --local"
 ```
 
 Then open `http://localhost:4001` in Windows and skip domain + HTTPS in the setup wizard. Public hosting, custom domains, and internet-facing share links remain VPS features in this beta path.
@@ -91,6 +97,12 @@ Everything configured in-browser. Domain, SSL, providers, users — no CLI exper
 One-click updates from the browser. Admin dashboard with user management, storage monitoring, and session controls.
 
 ## 🆕 Recent Changes
+
+### v3.25.5 (April 22, 2026)
+- **Gemini account setup now lands on the right default model**: the Gemini OAuth flow and default-model picker stay aligned, so a successful sign-in produces a usable provider selection instead of a confusing mismatch.
+- **Compaction notices are reused and deduped more cleanly**: Agent Chat and project chat now share the same compaction notice block, and restored history keeps one truthful compaction notice instead of echoing duplicates.
+- **Windows / WSL local beta installs are easier to find**: the main install hero now gives separate Linux and Windows one-paste commands with dedicated copy buttons, keeping the public release path explicit without internal-only notes.
+- **The installer now has a proper local beta path on WSL**: Windows users can run the localhost profile without Caddy or UFW, which makes the test-drive flow a real first-class entrypoint instead of a hand-waved promise.
 
 ### v3.25.4 (April 19, 2026)
 - **Installer/update compatibility is finally automatic**: normal install and update flows now auto-apply the validated OpenClaw relay + Gemini compatibility patch set when needed instead of burying that repair behind a manual Settings step.

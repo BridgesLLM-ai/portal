@@ -2,6 +2,16 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.5] — 2026-04-22
+
+### Fixed
+- **Gemini OAuth setup now stays aligned with the default-model picker**: finishing Google sign-in no longer leaves the selected Gemini default model in an inconsistent state, so the connected provider is ready to use with the expected model choice.
+- **Compaction notices are rendered through one shared component**: Agent Chat and project chat now reuse the same compaction notice block, and restored history dedupes repeated compaction notices instead of echoing them back at the user.
+
+### Improved
+- **The public install experience is clearer on the marketing site**: the hero install area now presents separate Linux and Windows one-paste commands with dedicated copy buttons, keeping the public-facing release path explicit and free of internal-only notes.
+- **The installer has a real Windows / WSL local beta path**: localhost mode now auto-detects on WSL, skips VPS-only reverse proxy and firewall setup, and gives Windows users a first-class test-drive flow before they rent a server.
+
 ## [3.25.4] — 2026-04-19
 
 ### Improved

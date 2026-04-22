@@ -17,12 +17,12 @@ const CONNECTED_RE = /\b(connected|reconnected|recovered)\b/;
 const APPROVAL_RE = /approval|waiting for command approval/;
 const WAITING_RE = /\b(reconnecting|queued|waiting)\b/;
 const ERROR_RE = /denied|failed|error|disconnected/;
-const COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction in progress)\b/;
-const COMPACTED_RE = /\b(context compacted|compaction complete(?:d)?)\b/;
+const COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction (?:in progress|started))\b/;
+const COMPACTED_RE = /\b(context compacted|compaction (?:complete(?:d)?|finished))\b/;
 const CONTEXT_PRESSURE_RE = /\b(context (?:getting|running) full|context (?:near(?:ing)?|almost) full|approaching (?:the )?context limit|context window (?:is )?(?:near|nearing|almost) full|running out of context|context budget)\b/;
 const FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/;
 const FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context)\b/;
-const FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance complete(?:d)?)\b/;
+const FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance (?:finished|complete(?:d)?)|compaction (?:incomplete|did not complete))\b/;
 
 function normalizeStatusText(statusText?: string | null): string {
   const raw = String(statusText || '').trim();

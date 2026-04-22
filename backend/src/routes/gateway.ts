@@ -500,6 +500,28 @@ function extractText(content: any): string {
   return extractSanitizedText(content);
 }
 
+function defaultCompactionNoticeText(compactionMeta?: any): string {
+  const signal = String(compactionMeta?.phase || compactionMeta?.status || '').trim().toLowerCase();
+  if (signal === 'start' || signal === 'started' || signal === 'compacting' || signal === 'compaction_start') {
+    return 'Compacting context…';
+  }
+  if (compactionMeta?.completed === false || signal === 'incomplete' || signal === 'did_not_complete') {
+    return 'Context maintenance finished.';
+  }
+  return 'Context compacted';
+}
+
+function extractCompactionNoticeText(content: any, compactionMeta?: any): string {
+  const text = extractText(content);
+  return text || defaultCompactionNoticeText(compactionMeta);
+}
+
+function isCompactionNoticeText(text: unknown): boolean {
+  const normalized = typeof text === 'string' ? text.trim() : '';
+  if (!normalized) return false;
+  return /\b(compacting context|context compacted|compaction (?:complete(?:d)?|finished|in progress|started|incomplete|did not complete)|context maintenance(?: in progress| finished| complete(?:d)?)?|auto-compaction|preparing context maintenance|preparing compaction)\b/i.test(normalized);
+}
+
 function sanitizeHistoryText(text: string): string {
   return stripOpenClawReplyTags(stripEnvelope(text || '')).replace(/\r\n/g, '\n').trim();
 }
@@ -766,6 +788,50 @@ function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 20
     .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
 
   return combined.slice(-Math.max(limit, 1));
+}
+
+async function recoverRecentOpenClawAssistantReply(
+  sessionKey: string,
+  startedAtMs: number,
+  options?: { waitMs?: number; pollMs?: number },
+): Promise<{ content: string; model: string | null } | null> {
+  const waitMs = Math.max(500, options?.waitMs ?? 8000);
+  const pollMs = Math.max(200, options?.pollMs ?? 500);
+  const deadline = Date.now() + waitMs;
+  const sessionsDir = resolveSessionsDir(sessionKey);
+  let explicitSessionId = '';
+
+  try {
+    const info = await getSessionInfo(sessionKey);
+    explicitSessionId = typeof info?.data?.sessionId === 'string' ? info.data.sessionId.trim() : '';
+  } catch {}
+
+  while (Date.now() <= deadline) {
+    let messages = readSessionMessagesEnhancedForSessionKey(sessionKey, 30, sessionsDir);
+    if ((!messages || messages.length === 0) && explicitSessionId) {
+      messages = readSessionMessagesEnhanced(explicitSessionId, 30, sessionsDir);
+    }
+    const recovered = [...messages]
+      .reverse()
+      .find((entry) => {
+        if (entry?.role !== 'assistant') return false;
+        const content = typeof entry?.content === 'string' ? entry.content.trim() : '';
+        if (!content) return false;
+        const ts = Date.parse(String(entry?.timestamp || ''));
+        return Number.isFinite(ts) && ts >= (startedAtMs - 1000);
+      });
+
+    if (recovered) {
+      return {
+        content: recovered.content,
+        model: normalizeGatewayModelId(recovered.model) || null,
+      };
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+
+  return null;
 }
 
 function summarizeSessionLabelFromMessages(params: { sessionKey: string; sessionId: string; messages: any[] }) {
@@ -1151,7 +1217,7 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
           return {
             id: entry.id,
             role: 'system',
-            content: 'Context compacted',
+            content: extractCompactionNoticeText(null, compactionMeta),
             timestamp: entry.timestamp,
             __openclaw: {
               ...compactionMeta,
@@ -1167,7 +1233,7 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
           return {
             id: entry.id,
             role: 'system',
-            content: 'Context compacted',
+            content: extractCompactionNoticeText(entry.message.content, compactionMeta),
             timestamp: entry.timestamp,
             __openclaw: compactionMeta,
           };
@@ -1422,11 +1488,11 @@ function augmentDirectHistoryPayload(payload: any, sessionKey: string, limit = 2
 
     const enhancedMessages = readSessionMessagesEnhanced(fileId, limit, sessionsDir);
     const compactionMessages = enhancedMessages
-      .filter((message) => message?.role === 'system' && (message?.__openclaw?.kind === 'compaction' || message?.content === 'Context compacted'))
+      .filter((message) => message?.role === 'system' && (message?.__openclaw?.kind === 'compaction' || isCompactionNoticeText(message?.content)))
       .map((message) => ({
         id: message.id,
         role: 'system',
-        content: 'Context compacted',
+        content: extractCompactionNoticeText(message?.content, message?.__openclaw),
         timestamp: message.timestamp,
         __openclaw: message.__openclaw || { kind: 'compaction', id: message.id },
       }));
@@ -2768,6 +2834,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
       }, 2000);
 
       const senderIdentity = req.user ? { label: req.user.email, userId: req.user.userId } : undefined;
+      const streamStartedAtMs = Date.now();
 
       if (provider.providerName === 'OPENCLAW') {
         // Single-path SSE delivery for OpenClaw: the persistent gateway WS publishes
@@ -2780,6 +2847,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         });
 
         let sawTerminalEvent = false;
+        let pendingStreamError: string | null = null;
         const deniedApprovalIds = new Set<string>();
         streamUnsub = streamEventBus.subscribe(sessionId, (evt: StreamEvent) => {
           if (!sseAlive || sseFinished) return;
@@ -2803,13 +2871,19 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
               return;
             }
           }
+          if (evt.type === 'error') {
+            pendingStreamError = typeof evt.content === 'string' && evt.content.trim()
+              ? evt.content.trim()
+              : 'Agent error';
+            return;
+          }
           try {
             sseWrite(`data: ${JSON.stringify(evt)}\n\n`);
           } catch {
             sseAlive = false;
             return;
           }
-          if (evt.type === 'done' || evt.type === 'error') {
+          if (evt.type === 'done') {
             sawTerminalEvent = true;
             finishSse();
           }
@@ -2836,8 +2910,25 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
           }
         } catch (err: any) {
           const friendlyError = humanizeProviderError(provider.providerName, err?.message || String(err));
+          const shouldAttemptRecovery = Boolean(pendingStreamError || (typeof requestedModel === 'string' && requestedModel.trim()));
+          if (shouldAttemptRecovery) {
+            const recovered = await recoverRecentOpenClawAssistantReply(sessionId, streamStartedAtMs);
+            if (recovered && !sseFinished && sseAlive) {
+              try {
+                sseWrite(`data: ${JSON.stringify({
+                  type: 'done',
+                  content: recovered.content,
+                  provenance,
+                  model: recovered.model,
+                  metadata: { recoveredAfterError: true },
+                })}\n\n`);
+              } catch {}
+              finishSse();
+              return;
+            }
+          }
           if (!sseFinished && sseAlive) {
-            try { sseWrite(`data: ${JSON.stringify({ type: 'error', content: friendlyError })}\n\n`); } catch {}
+            try { sseWrite(`data: ${JSON.stringify({ type: 'error', content: pendingStreamError || friendlyError })}\n\n`); } catch {}
           }
           finishSse();
         }
@@ -2939,17 +3030,37 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
 
     // Non-streaming
     const senderIdentity = req.user ? { label: req.user.email, userId: req.user.userId } : undefined;
-    const result = await (provider as any).sendMessage(sessionId, message, undefined, undefined, undefined, senderIdentity);
-    const resolvedSessionId = typeof result?.metadata?.resolvedSessionId === 'string' && result.metadata.resolvedSessionId.trim()
-      ? result.metadata.resolvedSessionId.trim()
-      : sessionId;
-    res.json({
-      response: result.fullText,
-      model: normalizeGatewayModelId(result.metadata?.model) || null,
-      provider: provider.providerName,
-      provenance,
-      sessionId: resolvedSessionId,
-    });
+    const nonStreamingStartedAtMs = Date.now();
+    try {
+      const result = await (provider as any).sendMessage(sessionId, message, undefined, undefined, undefined, senderIdentity);
+      const resolvedSessionId = typeof result?.metadata?.resolvedSessionId === 'string' && result.metadata.resolvedSessionId.trim()
+        ? result.metadata.resolvedSessionId.trim()
+        : sessionId;
+      res.json({
+        response: result.fullText,
+        model: normalizeGatewayModelId(result.metadata?.model) || null,
+        provider: provider.providerName,
+        provenance,
+        sessionId: resolvedSessionId,
+      });
+      return;
+    } catch (sendErr: any) {
+      if (provider.providerName === 'OPENCLAW' && typeof requestedModel === 'string' && requestedModel.trim()) {
+        const recovered = await recoverRecentOpenClawAssistantReply(sessionId, nonStreamingStartedAtMs);
+        if (recovered) {
+          res.json({
+            response: recovered.content,
+            model: recovered.model,
+            provider: provider.providerName,
+            provenance,
+            sessionId,
+            recoveredAfterError: true,
+          });
+          return;
+        }
+      }
+      throw sendErr;
+    }
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 503;
     const friendlyError = status === 403

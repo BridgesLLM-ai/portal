@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.4"
+readonly VERSION="3.25.5"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -570,6 +570,9 @@ update_dependencies() {
 
   # Ollama (curl | sh is idempotent — always installs latest)
   if command -v ollama &>/dev/null; then
+    if ! command -v zstd &>/dev/null; then
+      spin "Installing zstd (required by Ollama installer)" "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zstd" || true
+    fi
     local current_ollama
     current_ollama="$(ollama --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo 'unknown')"
     spin "Updating Ollama (currently ${current_ollama})"       "curl -fsSL https://ollama.com/install.sh | sh >/dev/null 2>&1" || true
@@ -1215,13 +1218,13 @@ preflight() {
 
   # Core tools — always ensure lsb-release is present (needed by PostgreSQL repo setup)
   local missing=""
-  for cmd in curl git openssl rsync lsb_release; do
+  for cmd in curl git openssl rsync lsb_release zstd; do
     command -v "$cmd" &>/dev/null || missing+=" $cmd"
   done
   if [[ -n "$missing" ]]; then
     $APT_AVAILABLE || fail "Missing:${missing} — and apt is not available"
     info "Installing core tools..."
-    run "apt-get update -qq && apt-get install -y -qq curl git openssl rsync ca-certificates gnupg lsb-release ffmpeg python3-venv"
+    run "apt-get update -qq && apt-get install -y -qq curl git openssl rsync ca-certificates gnupg lsb-release ffmpeg python3-venv zstd"
   fi
 
   ok "System checks passed"
@@ -1361,12 +1364,17 @@ install_ai_tools() {
   # Ollama
   if $SKIP_OLLAMA; then
     info "Skipping Ollama (--skip-ollama)"
-  elif command -v ollama &>/dev/null; then
-    ok "Ollama"
   else
-    spin "Installing Ollama (local AI engine)" "curl -fsSL https://ollama.com/install.sh | sh"
-    run "systemctl enable ollama 2>/dev/null || true"
-    ok "Ollama — models will be configured in the setup wizard"
+    if ! command -v zstd &>/dev/null; then
+      spin "Installing zstd (required by Ollama installer)" "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zstd"
+    fi
+    if command -v ollama &>/dev/null; then
+      ok "Ollama"
+    else
+      spin "Installing Ollama (local AI engine)" "curl -fsSL https://ollama.com/install.sh | sh"
+      run "systemctl enable ollama 2>/dev/null || true"
+      ok "Ollama — models will be configured in the setup wizard"
+    fi
   fi
 
   # OpenClaw

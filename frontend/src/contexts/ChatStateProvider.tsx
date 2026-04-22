@@ -40,7 +40,7 @@ import {
   removeExecApproval,
   upsertExecApproval,
 } from '../utils/execApprovalQueue';
-import { getToolStatusText, resolveToolName } from '../utils/toolPresentation';
+import { getToolStatusText, resolveToolName, isCompactionNotice } from '../utils/toolPresentation';
 
 const DEBUG_CHAT_STATE = import.meta.env.DEV;
 const BUILD_TIME_USE_DIRECT_GATEWAY = import.meta.env.VITE_USE_DIRECT_GATEWAY === 'true';
@@ -405,13 +405,30 @@ function normalizeToolCalls(toolCalls: any, defaultStatus: ToolCall['status'] = 
     });
 }
 
+function defaultCompactionNoticeText(meta?: Record<string, any> | null): string {
+  const signal = String(meta?.phase || meta?.status || '').trim().toLowerCase();
+  if (signal === 'start' || signal === 'started' || signal === 'compacting' || signal === 'compaction_start') {
+    return 'Compacting context…';
+  }
+  if (meta?.completed === false || signal === 'incomplete' || signal === 'did_not_complete') {
+    return 'Context maintenance finished.';
+  }
+  return 'Context compacted';
+}
+
+function resolveCompactionNoticeText(text: string, meta?: Record<string, any> | null): string {
+  const normalized = sanitizeHistoryMessageText(text);
+  return normalized || defaultCompactionNoticeText(meta);
+}
+
 function parseHistoryMessage(m: any): ChatMessage | null {
   if (m?.__openclaw?.kind === 'compaction') {
     return {
       id: m.id || `compaction-${m.__openclaw.id || Date.now()}`,
       role: 'system',
-      content: 'Context compacted',
+      content: resolveCompactionNoticeText(typeof m.content === 'string' ? m.content : '', m.__openclaw),
       createdAt: new Date(m.timestamp || Date.now()),
+      provenance: 'compaction',
     };
   }
 
@@ -444,7 +461,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
       ? 'Earlier assistant output was omitted from history because the message was too large.'
       : (m.role === 'assistant' ? sanitizeAssistantContent(rawContent) : sanitizedHistoryText),
     createdAt: new Date(m.timestamp || Date.now()),
-    provenance: m.provenance,
+    provenance: m.provenance || (m.__openclaw?.kind === 'compaction' ? 'compaction' : undefined),
     model: typeof m.model === 'string' ? m.model : undefined,
     thinkingContent: rawThinkingContent || undefined,
   };
@@ -561,8 +578,9 @@ function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage | null {
     return {
       id: msg.id || msg.messageId || `compaction-${msg.__openclaw.id || Date.now()}`,
       role: 'system',
-      content: 'Context compacted',
+      content: resolveCompactionNoticeText(extractTextFromGatewayMessage(msg), msg.__openclaw),
       createdAt: new Date(msg.timestamp || Date.now()),
+      provenance: 'compaction',
     };
   }
 
@@ -612,6 +630,20 @@ function normalizeHistoryReplayContent(content: string): string {
   return (content || '').replace(/\r\n/g, '\n').trim();
 }
 
+function isEquivalentCompactionNotice(previous: ChatMessage | undefined, next: ChatMessage): boolean {
+  if (!previous || previous.role !== 'system' || next.role !== 'system') return false;
+  if (!(previous.provenance === 'compaction' || next.provenance === 'compaction')) return false;
+  if (!isCompactionNotice(previous.content) || !isCompactionNotice(next.content)) return false;
+
+  const previousContent = normalizeHistoryReplayContent(previous.content);
+  const nextContent = normalizeHistoryReplayContent(next.content);
+  if (!previousContent || previousContent !== nextContent) return false;
+
+  const previousTs = previous.createdAt instanceof Date ? previous.createdAt.getTime() : NaN;
+  const nextTs = next.createdAt instanceof Date ? next.createdAt.getTime() : NaN;
+  return Number.isFinite(previousTs) && Number.isFinite(nextTs) && Math.abs(nextTs - previousTs) <= 30_000;
+}
+
 function isLikelyHistoryReplayDuplicate(previous: ChatMessage | undefined, next: ChatMessage): boolean {
   if (!previous || previous.role !== next.role || next.role !== 'user') return false;
 
@@ -634,6 +666,7 @@ function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
     if (msg.id && seenIds.has(msg.id)) continue;
     const previous = deduped[deduped.length - 1];
     if (isLikelyHistoryReplayDuplicate(previous, msg)) continue;
+    if (isEquivalentCompactionNotice(previous, msg)) continue;
     const ts = msg.createdAt instanceof Date ? msg.createdAt.getTime() : Date.now();
     const signature = `${msg.role}|${Number.isFinite(ts) ? ts : 0}|${msg.content}`;
     if (msg.role === 'assistant' && seenSignatures.has(signature)) continue;
@@ -690,6 +723,7 @@ function mergeLoadedHistoryWithLocalMessages(
       if (candidate.role === 'user' && candidate.pendingAck) {
         return isLikelyCommittedPendingUser(candidate, existing);
       }
+      if (isEquivalentCompactionNotice(existing, candidate)) return true;
       return false;
     });
   };
@@ -913,9 +947,9 @@ const LIFECYCLE_CONTROL_TOKENS = new Set([
 
 const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/i;
 const LIFECYCLE_FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context)\b/i;
-const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance complete(?:d)?)\b/i;
-const LIFECYCLE_COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction in progress)\b/i;
-const LIFECYCLE_COMPACTED_RE = /\b(context compacted|compaction complete(?:d)?)\b/i;
+const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance (?:finished|complete(?:d)?)|compaction (?:incomplete|did not complete))\b/i;
+const LIFECYCLE_COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction (?:in progress|started))\b/i;
+const LIFECYCLE_COMPACTED_RE = /\b(context compacted|compaction (?:complete(?:d)?|finished))\b/i;
 
 type LifecycleMaintenanceSignal = 'idle' | 'maintenance' | 'maintenance_done' | 'compacting' | 'compacted';
 
@@ -1662,14 +1696,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     return sessionKey;
   }, [user]);
 
-  const appendSystemNotice = useCallback((content: string) => {
+  const appendSystemNotice = useCallback((content: string, provenance?: string) => {
     const now = Date.now();
     setMessages(prev => {
       const last = prev[prev.length - 1];
       if (last?.role === 'system' && last.content === content && now - last.createdAt.getTime() < 4000) {
         return prev;
       }
-      return [...prev, { id: nextId(), role: 'system', content, createdAt: new Date(now) }];
+      return [...prev, { id: nextId(), role: 'system', content, createdAt: new Date(now), provenance }];
     });
   }, []);
 
@@ -1730,7 +1764,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       compactionPhaseRef.current = 'compacted';
       setCompactionPhase('compacted');
       setStatusText(noticeText);
-      appendSystemNotice(noticeText);
+      if (!content) appendSystemNotice(noticeText, 'compaction');
       if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
       compactionTimerRef.current = setTimeout(() => {
         compactionPhaseRef.current = 'idle';
@@ -3192,9 +3226,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             maintenanceKind: 'compaction',
           });
         } else if (compactionSignal === 'end' || compactionSignal === 'completed' || compactionSignal === 'compacted') {
+          const compactionStatusText = typeof data?.statusText === 'string' && data.statusText.trim()
+            ? data.statusText
+            : (data?.completed === false ? 'Context maintenance finished.' : 'Context compacted');
           applyCompactionState({
             phase: 'end',
-            content: data?.completed === false ? 'Context maintenance finished.' : 'Context compacted',
+            content: compactionStatusText,
             completed: data?.completed !== false,
             maintenanceKind: data?.completed === false ? 'maintenance' : 'compaction',
           });

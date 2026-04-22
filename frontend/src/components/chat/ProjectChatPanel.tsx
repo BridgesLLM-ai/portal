@@ -39,6 +39,7 @@ import {
 } from '../../utils/modelId';
 import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../utils/slashCommands';
 import ComposerStatusBadge from './ComposerStatusBadge';
+import CompactionNoticeBlock from './CompactionNoticeBlock';
 import ToolGlyph from './ToolGlyph';
 import { getToolPresentation, getToolStatusText, getToolSummary, isCompactionNotice, resolveToolName } from '../../utils/toolPresentation';
 import {
@@ -347,7 +348,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
       ? 'Earlier assistant output was omitted from history because the message was too large.'
       : (m.role === 'assistant' ? sanitizeAssistantContent(rawContent) : sanitizedHistoryText),
     createdAt: new Date(m.timestamp || Date.now()),
-    provenance: m.provenance,
+    provenance: m.provenance || ((m.__openclaw?.kind === 'compaction' || isCompactionNotice(sanitizedHistoryText)) ? 'compaction' : undefined),
     model: typeof m.model === 'string' ? m.model : undefined,
     thinkingContent: rawThinkingContent || undefined,
   };
@@ -377,11 +378,26 @@ function normalizeHistoryReplayContent(content: string): string {
   return (content || '').replace(/\r\n/g, '\n').trim();
 }
 
+function isEquivalentCompactionNotice(previous: ChatMessage | undefined, next: ChatMessage): boolean {
+  if (!previous || previous.role !== 'system' || next.role !== 'system') return false;
+  if (!(previous.provenance === 'compaction' || next.provenance === 'compaction')) return false;
+  if (!isCompactionNotice(previous.content) || !isCompactionNotice(next.content)) return false;
+
+  const previousContent = normalizeHistoryReplayContent(previous.content);
+  const nextContent = normalizeHistoryReplayContent(next.content);
+  if (!previousContent || previousContent !== nextContent) return false;
+
+  const previousTs = previous.createdAt instanceof Date ? previous.createdAt.getTime() : NaN;
+  const nextTs = next.createdAt instanceof Date ? next.createdAt.getTime() : NaN;
+  return Number.isFinite(previousTs) && Number.isFinite(nextTs) && Math.abs(nextTs - previousTs) <= 30_000;
+}
+
 function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
   const deduped: ChatMessage[] = [];
   for (const msg of messages) {
     const previous = deduped[deduped.length - 1];
     if (!previous || previous.role !== 'user' || msg.role !== 'user') {
+      if (isEquivalentCompactionNotice(previous, msg)) continue;
       deduped.push(msg);
       continue;
     }
@@ -733,14 +749,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     }
   }, [messages, streamingPhase, activeToolName]);
 
-  const appendSystemNotice = useCallback((content: string) => {
+  const appendSystemNotice = useCallback((content: string, provenance?: string) => {
     const now = Date.now();
     setMessages(prev => {
       const last = prev[prev.length - 1];
       if (last?.role === 'system' && last.content === content && now - last.createdAt.getTime() < 4000) {
         return prev;
       }
-      return [...prev, { id: nextId(), role: 'system', content, createdAt: new Date(now) }];
+      return [...prev, { id: nextId(), role: 'system', content, createdAt: new Date(now), provenance }];
     });
   }, []);
 
@@ -1282,19 +1298,34 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         break;
       }
       case 'compaction_start': {
+        const noticeText = typeof data.content === 'string' && data.content.trim() ? data.content : 'Compacting context…';
         compactionPhaseRef.current = 'compacting';
         setCompactionPhase('compacting');
-        setStatusText('Compacting context…');
+        setStatusText(noticeText);
         if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
         break;
       }
       case 'compaction_end': {
-        compactionPhaseRef.current = 'compacted';
-        setCompactionPhase('compacted');
-        appendSystemNotice('Context compacted');
+        const completed = data.completed !== false;
+        const noticeText = typeof data.content === 'string' && data.content.trim()
+          ? data.content
+          : (completed ? 'Context compacted' : 'Context maintenance finished.');
         if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
-        compactionTimerRef.current = setTimeout(() => { compactionPhaseRef.current = 'idle'; setCompactionPhase('idle'); compactionTimerRef.current = null; }, 3000);
-        setStatusText(null);
+        if (completed) {
+          compactionPhaseRef.current = 'compacted';
+          setCompactionPhase('compacted');
+          if (!data.content) appendSystemNotice(noticeText, 'compaction');
+        } else {
+          compactionPhaseRef.current = 'idle';
+          setCompactionPhase('idle');
+        }
+        setStatusText(noticeText);
+        compactionTimerRef.current = setTimeout(() => {
+          compactionPhaseRef.current = 'idle';
+          setCompactionPhase('idle');
+          setStatusText((prev) => (prev === noticeText ? null : prev));
+          compactionTimerRef.current = null;
+        }, 3000);
         break;
       }
       case 'tool_start': {
@@ -2388,14 +2419,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
               if (msg.role === 'system') {
                 return isCompactionNotice(msg.content) ? (
-                  <div key={msg.id} className="px-3 py-1.5">
-                    <div className="mx-auto inline-flex max-w-[90%] items-center gap-2 rounded-full border border-sky-400/20 bg-sky-500/10 px-3 py-1.5 text-center text-[10px] tracking-wide text-sky-200 shadow-lg shadow-sky-500/5">
-                      <span className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-sky-400/20 bg-sky-400/10">
-                        <Radio size={9} className="text-sky-300" />
-                      </span>
-                      {msg.content}
-                    </div>
-                  </div>
+                  <CompactionNoticeBlock key={msg.id} content={msg.content} size="compact" />
                 ) : (
                   <div key={msg.id} className="px-3 py-1.5">
                     <div className="mx-auto max-w-[90%] rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-center text-[10px] tracking-wide text-slate-400">

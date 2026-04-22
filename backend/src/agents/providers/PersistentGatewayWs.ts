@@ -32,7 +32,7 @@ let GATEWAY_TOKEN = getGatewayToken();
 const CLIENT_ID = 'gateway-client';
 const CLIENT_MODE = 'backend';
 const GATEWAY_ROLE = 'operator';
-const GATEWAY_SCOPES = ['operator.admin', 'operator.approvals'];
+const GATEWAY_SCOPES = ['operator.admin', 'operator.read', 'operator.approvals'];
 
 function isExpectedGatewayReconnectError(error: unknown): boolean {
   const message = String((error as any)?.message || error || '').trim();

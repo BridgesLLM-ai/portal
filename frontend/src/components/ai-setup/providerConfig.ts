@@ -171,8 +171,9 @@ export const PROVIDERS: ProviderUIConfig[] = [
       { stepNumber: 5, title: 'Paste the full redirect URL back here', detail: 'Return to the portal and paste it to complete sign-in.' },
     ],
     defaultModels: [
-      { id: 'google-gemini-cli/gemini-2.5-pro', name: 'Gemini 2.5 Pro', tier: 'frontier', description: 'Best capability and context window.' },
+      { id: 'google-gemini-cli/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', tier: 'frontier', description: 'Most relevant high-capability Gemini option currently exposed by the OAuth runtime.' },
       { id: 'google-gemini-cli/gemini-2.5-flash', name: 'Gemini 2.5 Flash', tier: 'balanced', description: 'Fast and practical default choice.' },
+      { id: 'google-gemini-cli/gemini-3-flash-preview', name: 'Gemini 3 Flash Preview', tier: 'fast', description: 'Faster preview-tier Gemini option when you want speed over depth.' },
     ],
     onboardingNotes: {
       intro: 'This uses your Google/Gemini account login for Gemini CLI OAuth. It is the subscription-style path, not the Google AI Studio API-key path.',
