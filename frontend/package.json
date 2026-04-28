@@ -20,7 +20,7 @@
     "axios": "^1.13.6",
     "dompurify": "^3.3.3",
     "exceljs": "^4.4.0",
-    "framer-motion": "^10.16.4",
+    "framer-motion": "^12.38.0",
     "lucide-react": "^0.294.0",
     "marked": "^17.0.4",
     "monaco-editor": "^0.55.1",
