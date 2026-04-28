@@ -1253,7 +1253,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const compactionPhaseRef = useRef<'idle' | 'compacting' | 'compacted'>('idle');
 
   // Session controls state (thinking/fast mode)
-  const [thinkingLevel, setThinkingLevelState] = useState<ThinkingLevel>('off');
+  const [thinkingLevel, setThinkingLevelState] = useState<ThinkingLevel>('high');
   const [fastModeEnabled, setFastModeEnabled] = useState(false);
   const [compactionModelOverride, setCompactionModelOverrideState] = useState<string>('');
   const [compactionModelLoading, setCompactionModelLoading] = useState(false);
@@ -1510,7 +1510,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         } else {
           const modelStr = String(actualModel || '').toLowerCase();
           const isAdaptiveDefault = /claude-(opus|sonnet)-4[._-](5|6|7|8|9)|claude-(opus|sonnet)-[5-9]/.test(modelStr);
-          setThinkingLevelState(isAdaptiveDefault ? 'adaptive' : 'off');
+          setThinkingLevelState(isAdaptiveDefault ? 'adaptive' : 'high');
         }
         setFastModeEnabled(Boolean(
           data?.session?.fastMode
@@ -1545,7 +1545,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     setSessionControlsMetadataLoaded(false);
     sessionControlsMetadataPromiseRef.current = null;
-    setThinkingLevelState('off');
+    setThinkingLevelState('high');
     setFastModeEnabled(false);
     setCompactionModelOverrideState('');
     setCompactionModelError(null);

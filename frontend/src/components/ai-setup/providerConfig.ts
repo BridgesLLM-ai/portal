@@ -135,8 +135,8 @@ export const PROVIDERS: ProviderUIConfig[] = [
       { stepNumber: 5, title: 'Paste the redirect URL back here', detail: 'Return to the portal and paste the full callback URL to complete sign-in.' },
     ],
     defaultModels: [
-      { id: 'openai-codex/gpt-5.4', name: 'GPT-5.4 Codex', tier: 'frontier', description: 'Current strongest Codex path.' },
-      { id: 'openai-codex/gpt-5.3-codex', name: 'GPT-5.3 Codex', tier: 'balanced', description: 'Reliable coding default.' },
+      { id: 'openai-codex/gpt-5.4', name: 'GPT-5.4 Codex', tier: 'frontier', description: 'Stable default Codex model.' },
+      { id: 'openai-codex/gpt-5.3-codex', name: 'GPT-5.3 Codex', tier: 'balanced', description: 'Reliable coding fallback.' },
       { id: 'openai-codex/gpt-5.1', name: 'GPT-5.1', tier: 'fast', description: 'Fast fallback option.' },
     ],
     onboardingNotes: {

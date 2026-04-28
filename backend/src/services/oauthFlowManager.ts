@@ -67,6 +67,33 @@ function extractClaudeSetupToken(text: string): string | null {
   return match?.[1]?.trim() || null;
 }
 
+function extractClaudeAuthUrl(text: string): string | null {
+  const lines = text.split(/\r?\n/);
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const currentLine = lines[i];
+    const startIndex = currentLine.indexOf('https://claude.');
+    if (startIndex === -1) continue;
+
+    let candidate = currentLine.slice(startIndex).trim();
+
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const nextLine = lines[j].trim();
+      if (!nextLine) break;
+      if (/^Paste\s*code\s*here/i.test(nextLine) || /^Pastecodehereifprompted>?$/i.test(nextLine)) break;
+      if (!/^[A-Za-z0-9%&=_\-./+:?#]+$/.test(nextLine)) break;
+      candidate += nextLine;
+    }
+
+    const match = candidate.match(/^https:\/\/claude\.(?:ai|com)\/[A-Za-z0-9%&=_\-./+:?#]+/);
+    if (!match) continue;
+
+    return match[0];
+  }
+
+  return null;
+}
+
 function maybeCaptureClaudeSetupToken(session: OAuthSession) {
   if (session.provider !== 'anthropic') return null;
   const token = extractClaudeSetupToken(session.cleanOutput);
@@ -577,12 +604,7 @@ export async function startClaudeSetupTokenFlow() {
     maybeCaptureClaudeSetupToken(session);
 
     // Check for Claude auth URL
-    const text = session.cleanOutput;
-    // Claude URL can be claude.ai or claude.com, path may be /oauth/authorize or /cai/oauth/authorize
-    // PTY may line-wrap long URLs; strip \r\n between URL-safe chars to reassemble
-    const unwrapped = text.replace(/([A-Za-z0-9%&=_\-.+/])[\r\n]+([A-Za-z0-9%&=_\-.+/])/g, '$1$2');
-    const urls = unwrapped.match(/https:\/\/claude\.(ai|com)\/[^\s)">]*oauth\/authorize[^\s)">]*/g);
-    const firstUrl = urls?.[0] ?? null;
+    const firstUrl = extractClaudeAuthUrl(session.cleanOutput);
     if (firstUrl && !session.authUrl) {
       session.authUrl = firstUrl;
       session.status = 'awaiting_callback';

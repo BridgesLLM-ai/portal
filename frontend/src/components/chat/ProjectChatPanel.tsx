@@ -712,7 +712,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
   const [showSessionControls, setShowSessionControls] = useState(false);
-  const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>('off');
+  const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>('high');
   const [fastModeEnabled, setFastModeEnabled] = useState(false);
   const [thinkingPending, setThinkingPending] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -810,7 +810,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   useEffect(() => {
     let cancelled = false;
     if (!sessionKey) {
-      setThinkingLevel('off');
+      setThinkingLevel('high');
       setFastModeEnabled(false);
       return;
     }
@@ -842,7 +842,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         } else {
           const modelStr = String(actualModel || '').toLowerCase();
           const adaptiveDefault = /claude-(opus|sonnet)-4[._-](5|6|7|8|9)|claude-(opus|sonnet)-[5-9]/.test(modelStr);
-          setThinkingLevel(adaptiveDefault ? 'adaptive' : 'off');
+          setThinkingLevel(adaptiveDefault ? 'adaptive' : 'high');
         }
         setFastModeEnabled(Boolean(
           data?.session?.fastMode
@@ -852,7 +852,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       })
       .catch(() => {
         if (!cancelled) {
-          setThinkingLevel('off');
+          setThinkingLevel('high');
           setFastModeEnabled(false);
         }
       });

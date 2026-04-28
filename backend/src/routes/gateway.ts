@@ -95,8 +95,10 @@ function resolveOpenClawDistBundle(prefix: string | string[]): string | null {
 }
 
 function getOpenClawCompatibilityHotfixStatus() {
+  const heartbeatEventsFilterPath = resolveOpenClawDistBundle('heartbeat-events-filter-');
   const heartbeatRunnerPath = resolveOpenClawDistBundle('heartbeat-runner-');
   const replyBundlePath = resolveOpenClawDistBundle(['get-reply-', 'reply-']);
+  const claudeLiveSessionPath = resolveOpenClawDistBundle('claude-live-session-');
   const executeRuntimePath = resolveOpenClawDistBundle('execute.runtime-');
   const geminiCliBackendPath = existsSync(path.join(OPENCLAW_DIST_DIR, 'extensions/google/cli-backend.js'))
     ? path.join(OPENCLAW_DIST_DIR, 'extensions/google/cli-backend.js')
@@ -104,11 +106,18 @@ function getOpenClawCompatibilityHotfixStatus() {
   const scriptExists = existsSync(OPENCLAW_COMPAT_HOTFIX_SCRIPT);
   const issues: string[] = [];
 
-  const heartbeatText = heartbeatRunnerPath && existsSync(heartbeatRunnerPath)
+  const heartbeatDetectorPath = heartbeatEventsFilterPath || heartbeatRunnerPath;
+  const heartbeatDetectorText = heartbeatDetectorPath && existsSync(heartbeatDetectorPath)
+    ? readFileSync(heartbeatDetectorPath, 'utf8')
+    : '';
+  const heartbeatRunnerText = heartbeatRunnerPath && existsSync(heartbeatRunnerPath)
     ? readFileSync(heartbeatRunnerPath, 'utf8')
     : '';
   const replyText = replyBundlePath && existsSync(replyBundlePath)
     ? readFileSync(replyBundlePath, 'utf8')
+    : '';
+  const claudeLiveSessionText = claudeLiveSessionPath && existsSync(claudeLiveSessionPath)
+    ? readFileSync(claudeLiveSessionPath, 'utf8')
     : '';
   const executeRuntimeText = executeRuntimePath && existsSync(executeRuntimePath)
     ? readFileSync(executeRuntimePath, 'utf8')
@@ -117,25 +126,27 @@ function getOpenClawCompatibilityHotfixStatus() {
     ? readFileSync(geminiCliBackendPath, 'utf8')
     : '';
 
-  const detectorPatched = heartbeatText.includes('return lower.includes("exec finished") || lower.includes("exec completed");')
-    || heartbeatText.includes('return normalizeLowercaseStringOrEmpty(evt).includes("exec finished") || normalizeLowercaseStringOrEmpty(evt).includes("exec completed");')
-    || heartbeatText.includes('return /^exec finished(?::|\\s*\\()/.test(normalized) || /^exec (completed|failed) \\([a-z0-9_-]{1,64}, (code -?\\d+|signal [^)]+)\\)( :: .*)?$/.test(normalized);');
-  const relayPatched = heartbeatText.includes('const isDirectWebchatSession =')
-    && heartbeatText.includes('delivery.channel === "none" && isDirectWebchatSession');
+  const detectorPatched = heartbeatDetectorText.includes('return lower.includes("exec finished") || lower.includes("exec completed");')
+    || heartbeatDetectorText.includes('return normalizeLowercaseStringOrEmpty(evt).includes("exec finished") || normalizeLowercaseStringOrEmpty(evt).includes("exec completed");')
+    || heartbeatDetectorText.includes('return /^exec finished(?::|\\s*\\()/.test(normalized) || /^exec (completed|failed) \\([a-z0-9_-]{1,64}, (code -?\\d+|signal [^)]+)\\)( :: .*)?$/.test(normalized);');
+  const relayPatched = heartbeatRunnerText.includes('const isDirectWebchatSession =')
+    && heartbeatRunnerText.includes('delivery.channel === "none" && isDirectWebchatSession');
   const replyPatched = replyText.includes('normalizedIncomingTo === "heartbeat" && params.persistedLastTo');
   const geminiCliPatched = geminiCliBackendText.includes('jsonlDialect: "gemini-stream-json"')
     && geminiCliBackendText.includes('"--output-format",\n\t\t\t\t"stream-json",');
   const geminiCliYoloPatched = geminiCliBackendText.includes('"--yolo",');
-  const geminiRuntimePatched = executeRuntimeText.includes('function isGeminiCliProvider(providerId) {')
-    && executeRuntimeText.includes('function parseGeminiCliStreamingRecord(params) {')
-    && executeRuntimeText.includes('onToolEvent: (event) => {');
+  const geminiParserText = claudeLiveSessionText || executeRuntimeText;
+  const geminiParserPatched = geminiParserText.includes('function isGeminiCliProvider(providerId) {')
+    && geminiParserText.includes('function parseGeminiCliStreamingRecord(params) {');
+  const executeRuntimeWiringPatched = executeRuntimeText.includes('onToolEvent: (event) => {');
+  const geminiRuntimePatched = geminiParserPatched && executeRuntimeWiringPatched;
   const relaySupported = Boolean(heartbeatRunnerPath) && Boolean(replyBundlePath);
   const geminiSupported = Boolean(executeRuntimePath) && Boolean(geminiCliBackendPath);
 
   if (!scriptExists) issues.push('Portal hotfix script is not installed.');
   if (!relaySupported && !geminiSupported) issues.push('Could not locate the OpenClaw runtime bundles targeted by the compatibility hotfix.');
   if ((heartbeatRunnerPath || replyBundlePath) && !relaySupported) issues.push('Could not locate both relay hotfix bundles (heartbeat runner and get-reply).');
-  if ((executeRuntimePath || geminiCliBackendPath) && !geminiSupported) issues.push('Could not locate both Gemini CLI hotfix targets (execute runtime and google cli backend).');
+  if ((claudeLiveSessionPath || executeRuntimePath || geminiCliBackendPath) && !geminiSupported) issues.push('Could not locate the Gemini CLI hotfix targets (execute runtime and google cli backend).');
 
   return {
     scriptExists,

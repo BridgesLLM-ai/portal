@@ -98,6 +98,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.6 (April 28, 2026)
+- **Claude account setup is truthful again**: the AI Setup flow now extracts the real Claude authorize URL instead of gluing the terminal prompt onto the `state` parameter, which fixes broken Anthropic sign-in links in the portal.
+- **OpenClaw compatibility checks keep up with newer upstream bundles**: the portal hotfix status and bundled helper now recognize `heartbeat-events-filter-*` and `claude-live-session-*` drift while still verifying the Gemini tool-wiring path.
+- **OpenClaw chat defaults are saner on non-Claude models**: main chat and project chat now fall back to `high` thinking where adaptive Claude-specific behavior does not apply, and Codex setup copy is clearer about the stable default vs fallback path.
+
 ### v3.25.5 (April 22, 2026)
 - **Gemini account setup now lands on the right default model**: the Gemini OAuth flow and default-model picker stay aligned, so a successful sign-in produces a usable provider selection instead of a confusing mismatch.
 - **Compaction notices are reused and deduped more cleanly**: Agent Chat and project chat now share the same compaction notice block, and restored history keeps one truthful compaction notice instead of echoing duplicates.

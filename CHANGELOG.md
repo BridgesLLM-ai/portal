@@ -2,6 +2,15 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.6] — 2026-04-28
+
+### Fixed
+- **Claude setup-token links are clean again**: the AI Setup backend now extracts the Claude authorize URL without swallowing the trailing terminal prompt, so Anthropic sign-in no longer hands the browser a malformed `state` parameter.
+
+### Improved
+- **Portal/OpenClaw compatibility checks track newer upstream bundle names**: the admin hotfix status path and bundled compatibility helper now recognize `heartbeat-events-filter-*` and `claude-live-session-*` layouts while keeping the Gemini runtime/tool wiring checks intact.
+- **OpenClaw chat defaults are more sensible for non-Claude models**: Agent Chat and project chat now fall back to `high` thinking when Claude-specific adaptive defaults do not apply, and Codex setup copy better explains the stable default versus fallback model options.
+
 ## [3.25.5] — 2026-04-22
 
 ### Fixed
