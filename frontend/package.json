@@ -1,6 +1,6 @@
 {
   "name": "bridgesllm-frontend",
-  "version": "3.25.5",
+  "version": "3.25.7",
   "type": "module",
   "scripts": {
     "dev": "vite",

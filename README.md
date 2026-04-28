@@ -98,6 +98,10 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.7 (April 28, 2026)
+- **The OpenClaw session sidebar stops choking busy portals**: Agent Chat no longer opens large session transcript/checkpoint files just to build the main-session sidebar, which fixes the event-loop stalls that made gateway chat, hosted pages, and shared pages lag or time out on installs with a large OpenClaw session store.
+- **Main-session polling is bounded now**: the portal briefly caches parsed main-session metadata by file stat, so routine session-list refreshes stop re-parsing the whole store over and over on active installs.
+
 ### v3.25.6 (April 28, 2026)
 - **Claude account setup is truthful again**: the AI Setup flow now extracts the real Claude authorize URL instead of gluing the terminal prompt onto the `state` parameter, which fixes broken Anthropic sign-in links in the portal.
 - **OpenClaw compatibility checks keep up with newer upstream bundles**: the portal hotfix status and bundled helper now recognize `heartbeat-events-filter-*` and `claude-live-session-*` drift while still verifying the Gemini tool-wiring path.

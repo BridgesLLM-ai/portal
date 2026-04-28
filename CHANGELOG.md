@@ -2,6 +2,12 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.7] — 2026-04-28
+
+### Fixed
+- **OpenClaw session sidebar no longer stalls the whole portal**: the main Agent Chat sessions list now uses session metadata instead of opening large transcript/checkpoint files just to build sidebar labels and previews, which stops event-loop stalls that were making gateway chat, hosted pages, and shared pages look like they were disconnecting or timing out.
+- **Main-session list polling is bounded instead of re-parsing the world on every refresh**: the parsed OpenClaw main-session registry is now cached briefly by file stat, which keeps admin/session polling from pinning the Node main thread on busy installs.
+
 ## [3.25.6] — 2026-04-28
 
 ### Fixed

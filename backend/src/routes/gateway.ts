@@ -74,8 +74,10 @@ const OPENCLAW_COMPAT_HOTFIX_SCRIPT = path.join(PORTAL_ROOT, 'scripts', 'patch-o
 const GEMINI_CLI_TMP_DIR = path.join(process.env.HOME || '/root', '.gemini', 'tmp');
 const GEMINI_CLI_PROVIDER = 'google-gemini-cli';
 const GEMINI_CLI_TRANSCRIPT_INDEX_TTL_MS = 30000;
+const MAIN_SESSION_LIST_CACHE_TTL_MS = 5000;
 
 let geminiCliTranscriptIndexCache: { at: number; index: Map<string, string> } | null = null;
+let mainSessionListCache: { at: number; mtimeMs: number; size: number; sessions: any[] } | null = null;
 
 function resolveOpenClawDistBundle(prefix: string | string[]): string | null {
   try {
@@ -1793,75 +1795,68 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
       try {
         const cutoffMs = isOwnerRole(req.user!.role) ? 0 : Date.now() - 1440 * 60 * 1000;
         if (existsSync(sessionsFile)) {
-          const raw = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
-          const entries = Object.entries(raw || {});
-          const sessions: any[] = [];
+          const stat = statSync(sessionsFile);
+          if (
+            mainSessionListCache
+            && Date.now() - mainSessionListCache.at < MAIN_SESSION_LIST_CACHE_TTL_MS
+            && mainSessionListCache.mtimeMs === stat.mtimeMs
+            && mainSessionListCache.size === stat.size
+          ) {
+            res.json({ sessions: mainSessionListCache.sessions });
+            return;
+          }
 
-          for (const [sessionKey, meta] of entries as Array<[string, any]>) {
-            const updatedAt = Number(meta?.updatedAt || 0);
-            if (updatedAt && updatedAt < cutoffMs) continue;
+          const raw = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
+          const source = Array.isArray(raw?.sessions) ? raw.sessions : raw;
+          const entries: Array<[string, any]> = Array.isArray(source)
+            ? (source
+                .map((meta: any) => [String(meta?.key || meta?.sessionKey || meta?.sessionId || meta?.id || '').trim(), meta] as [string, any])
+                .filter(([sessionKey]) => Boolean(sessionKey)))
+            : Object.entries(source || {}) as Array<[string, any]>;
+          const sessions: any[] = [];
+          const activeCutoffMs = Date.now() - 5 * 60 * 1000;
+
+          for (const [rawSessionKey, meta] of entries) {
+            const sessionKey = String(rawSessionKey || meta?.key || meta?.sessionKey || '').trim();
+            if (!sessionKey) continue;
 
             const sessionId = String(meta?.sessionId || meta?.id || '').trim();
             if (!sessionId) continue;
 
-            const filePath = meta?.sessionFile
-              || path.join(sessionsDir, `${sessionId}.jsonl`);
+            const createdAt = Number(meta?.sessionStartedAt || meta?.startedAt || meta?.createdAt || meta?.updatedAt || Date.now());
+            const lastActivityAt = Number(meta?.lastInteractionAt || meta?.updatedAt || meta?.endedAt || createdAt || Date.now());
+            if (lastActivityAt && lastActivityAt < cutoffMs) continue;
 
-            let lines: string[] = [];
-            let createdAt = meta?.createdAt || updatedAt || Date.now();
-            let lastActivityAt = updatedAt || createdAt;
+            const fallbackTitle = humanizeSessionKey(sessionKey, sessionId);
+            const label = typeof meta?.label === 'string' ? meta.label.trim() : '';
+            const title = label || fallbackTitle;
+            const previewParts = [
+              typeof meta?.status === 'string' ? meta.status.trim() : '',
+              typeof meta?.model === 'string' ? meta.model.trim() : '',
+            ].filter(Boolean);
 
-            try {
-              if (existsSync(filePath)) {
-                const stat = statSync(filePath);
-                const content = readFileSync(filePath, 'utf-8');
-                lines = content.split('\n').filter((l: string) => l.trim());
-                const firstLine = lines[0];
-                if (firstLine) {
-                  const first = JSON.parse(firstLine);
-                  createdAt = first.timestamp || createdAt || stat.birthtimeMs;
-                }
-                lastActivityAt = stat.mtimeMs || lastActivityAt;
-              }
-            } catch {
-              // keep metadata-derived timestamps if file read fails
-            }
-
-            let summary = summarizeSessionLabel({ sessionKey, sessionId, lines });
-            if (!summary.preview || summary.title === humanizeSessionKey(sessionKey, sessionId) || summary.title === 'Portal Backend RPC') {
-              const importedMessages = readSessionMessagesEnhancedForSessionKey(sessionKey, 20, sessionsDir);
-              if (importedMessages.length > 0) {
-                const importedSummary = summarizeSessionLabelFromMessages({ sessionKey, sessionId, messages: importedMessages });
-                if (importedSummary.preview || importedSummary.title !== humanizeSessionKey(sessionKey, sessionId)) {
-                  summary = importedSummary;
-                }
-                const importedLastMessage = importedMessages[importedMessages.length - 1];
-                const importedLastActivityAt = toHistoryTimestampMs(importedLastMessage?.timestamp);
-                if (Number.isFinite(importedLastActivityAt) && importedLastActivityAt > 0) {
-                  lastActivityAt = Math.max(Number(lastActivityAt || 0), importedLastActivityAt);
-                }
-              }
-            }
             sessions.push({
               key: sessionKey,
               sessionId,
               id: sessionId,
               agentId: 'main',
-              status: lastActivityAt > Date.now() - 5 * 60 * 1000 ? 'active' : 'idle',
+              status: lastActivityAt > activeCutoffMs ? 'active' : 'idle',
               createdAt,
               lastActivityAt,
               updatedAt: lastActivityAt,
-              title: summary.title,
-              preview: summary.preview,
-              isMainSession: summary.isMainSession,
+              title,
+              preview: previewParts.join(' • '),
+              isMainSession: sessionKey === 'agent:main:main',
             });
           }
 
           sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          mainSessionListCache = { at: Date.now(), mtimeMs: stat.mtimeMs, size: stat.size, sessions };
           res.json({ sessions });
           return;
         }
       } catch (err: any) {
+        mainSessionListCache = null;
         // fall through to CLI path
       }
     }
