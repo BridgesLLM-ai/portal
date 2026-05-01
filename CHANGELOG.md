@@ -2,6 +2,14 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.8] — 2026-04-30
+
+### Fixed
+- **Hosted portal updates now ship the current OpenClaw 2026.4.29 compatibility helper**: the public installer and tarball now carry the newer `heartbeat-events-filter-*` / reply-prefix bundle matcher, direct-webchat heartbeat relay preservation, `persistedLastTo` safeguard, and Gemini CLI `stream-json` / tool-event patch path that had already been validated in source.
+
+### Maintenance
+- **OpenClaw 2026.4.29 was re-validated on the test box before release**: after updating the runtime, reapplying the compatibility helper, and restarting the gateway, portal-backed model discovery and chat sends were confirmed healthy again.
+
 ## [3.25.7] — 2026-04-28
 
 ### Fixed

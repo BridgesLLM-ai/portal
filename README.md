@@ -98,6 +98,10 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.8 (April 30, 2026)
+- **Hosted installer/tarball parity is restored for the latest OpenClaw runtime**: the public update path now ships the same OpenClaw 2026.4.29 compatibility helper logic that was already present in source, including the newer reply-prefix heartbeat relay matcher and Gemini CLI patch path.
+- **OpenClaw 2026.4.29 was re-smoked on the test box before release**: after the required manual gateway restart on that host, portal-backed model discovery and a disposable chat send both completed successfully again.
+
 ### v3.25.7 (April 28, 2026)
 - **The OpenClaw session sidebar stops choking busy portals**: Agent Chat no longer opens large session transcript/checkpoint files just to build the main-session sidebar, which fixes the event-loop stalls that made gateway chat, hosted pages, and shared pages lag or time out on installs with a large OpenClaw session store.
 - **Main-session polling is bounded now**: the portal briefly caches parsed main-session metadata by file stat, so routine session-list refreshes stop re-parsing the whole store over and over on active installs.
