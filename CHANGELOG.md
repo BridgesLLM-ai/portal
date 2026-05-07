@@ -2,13 +2,21 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
-## [3.25.8] — 2026-04-30
+## [3.25.9] — 2026-05-06
 
 ### Fixed
-- **Hosted portal updates now ship the current OpenClaw 2026.4.29 compatibility helper**: the public installer and tarball now carry the newer `heartbeat-events-filter-*` / reply-prefix bundle matcher, direct-webchat heartbeat relay preservation, `persistedLastTo` safeguard, and Gemini CLI `stream-json` / tool-event patch path that had already been validated in source.
+- **Gemini-backed Agent Chats keep finished turns after the stream ends**: when local OpenClaw session history lags behind the imported Gemini transcript, the portal now appends the newer transcript tail instead of dropping the completed assistant reply, tool cards, or visible reasoning on refresh.
+- **Fresh OpenClaw `new-*` sessions stay attached to the right chat**: Agent Chat now normalizes portal-created session aliases before history reloads and session lookups, which prevents completed turns from disappearing behind mismatched session keys.
+- **AI account setup is sturdier across Codex, Gemini, and Claude**: the sign-in and setup flows now preserve callback state more carefully, normalize discovered model IDs consistently, and recover provider-auth handoffs more reliably.
 
-### Maintenance
-- **OpenClaw 2026.4.29 was re-validated on the test box before release**: after updating the runtime, reapplying the compatibility helper, and restarting the gateway, portal-backed model discovery and chat sends were confirmed healthy again.
+### Improved
+- **Compatibility Patch status is more truthful on current OpenClaw bundles**: the checker and bundled helper now resolve the imported Gemini CLI backend and newer heartbeat detector variants, which prevents false “patch missing” warnings after a successful apply.
+
+## [3.25.8] — 2026-05-01
+
+### Improved
+- **Hosted updates ship the current OpenClaw compatibility helper**: the public installer and tarball moved forward with the validated relay, reply-routing, and Gemini CLI compatibility fixes instead of relying on a manual follow-up repair.
+- **The public release path was revalidated against current OpenClaw builds**: portal-backed chat and provider discovery were rechecked before shipping the compatibility update so the hosted download stayed aligned with the current runtime.
 
 ## [3.25.7] — 2026-04-28
 

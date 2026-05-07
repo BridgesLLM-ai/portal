@@ -29,7 +29,28 @@ HEARTBEAT_RUNNER="$(resolve_optional_bundle heartbeat-runner-)"
 GET_REPLY_FILE="$(resolve_optional_bundle get-reply- reply-)"
 CLAUDE_LIVE_SESSION="$(resolve_optional_bundle claude-live-session-)"
 EXECUTE_RUNTIME="$(resolve_optional_bundle execute.runtime-)"
-CLI_BACKEND="$ROOT/extensions/google/cli-backend.js"
+CLI_BACKEND_BUNDLE="$(python3 - "$ROOT" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+for candidate in sorted(root.glob('cli-backend-*.js'), key=lambda p: (p.stat().st_size, p.name), reverse=True):
+    try:
+        text = candidate.read_text()
+    except Exception:
+        continue
+    if 'id: "google-gemini-cli"' in text or 'const GEMINI_CLI_DEFAULT_MODEL_REF' in text:
+        print(candidate)
+        break
+PY
+)"
+CLI_BACKEND_WRAPPER="$ROOT/extensions/google/cli-backend.js"
+if [[ -n "$CLI_BACKEND_BUNDLE" ]]; then
+  CLI_BACKEND="$CLI_BACKEND_BUNDLE"
+elif [[ -f "$CLI_BACKEND_WRAPPER" ]]; then
+  CLI_BACKEND="$CLI_BACKEND_WRAPPER"
+else
+  CLI_BACKEND=""
+fi
 HEARTBEAT_DETECTOR_FILE="${HEARTBEAT_EVENTS_FILTER:-$HEARTBEAT_RUNNER}"
 GEMINI_PARSER_TARGET="${CLAUDE_LIVE_SESSION:-$EXECUTE_RUNTIME}"
 
@@ -44,8 +65,8 @@ new_detector = 'return lower.includes("exec finished") || lower.includes("exec c
 current_old_detector = 'return normalizeLowercaseStringOrEmpty(evt).includes("exec finished");'
 current_new_detector = 'return normalizeLowercaseStringOrEmpty(evt).includes("exec finished") || normalizeLowercaseStringOrEmpty(evt).includes("exec completed");'
 regex_detector = 'return /^exec finished(?::|\\s*\\()/.test(normalized) || /^exec (completed|failed) \\([a-z0-9_-]{1,64}, (code -?\\d+|signal [^)]+)\\)( :: .*)?$/.test(normalized);'
-current_regex_detector = 'return /^exec finished(?::|\\s*\\()/.test(normalized) || STRUCTURED_EXEC_COMPLETION_EVENT_RE.test(trimmed);'
-if new_detector in text or current_new_detector in text or regex_detector in text or current_regex_detector in text:
+structured_detector = 'return /^exec finished(?::|\\s*\\()/.test(normalized) || STRUCTURED_EXEC_COMPLETION_EVENT_RE.test(trimmed);'
+if new_detector in text or current_new_detector in text or regex_detector in text or structured_detector in text:
     print(f"detector already patched: {p}")
 elif old_detector in text:
     text = text.replace(old_detector, new_detector, 1)
@@ -71,9 +92,9 @@ old_relay = '\tconst canRelayToUser = Boolean(visibility.showAlerts && delivery.
 new_relay = '\tconst entryDeliveryChannel = entry?.deliveryContext?.channel ?? entry?.lastChannel ?? entry?.origin?.surface ?? entry?.origin?.provider;\n\tconst isDirectWebchatSession = entry?.chatType === "direct" && entryDeliveryChannel === "webchat";\n\tconst canRelayToUser = Boolean(visibility.showAlerts && (delivery.channel !== "none" && (delivery.to || delivery.channel === "webchat" && entry?.chatType === "direct") || delivery.channel === "none" && isDirectWebchatSession));\n\tconst { prompt, hasExecCompletion, hasCronEvents } = resolveHeartbeatRunPrompt({'
 current_relay = '\tconst responsePrefix = resolveEffectiveMessagesConfig(cfg, agentId, {\n\t\tchannel: delivery.channel !== "none" ? delivery.channel : void 0,\n\t\taccountId: delivery.accountId\n\t}).responsePrefix;\n\tconst { prompt, hasExecCompletion, hasCronEvents } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser: Boolean(delivery.channel !== "none" && delivery.to && visibility.showAlerts),\n\t\tworkspaceDir: resolveAgentWorkspaceDir(cfg, agentId),\n\t\tstartedAt,\n\t\theartbeatFileContent: preflight.heartbeatFileContent\n\t});'
 current_relay_new = '\tconst responsePrefix = resolveEffectiveMessagesConfig(cfg, agentId, {\n\t\tchannel: delivery.channel !== "none" ? delivery.channel : void 0,\n\t\taccountId: delivery.accountId\n\t}).responsePrefix;\n\tconst entryDeliveryChannel = entry?.deliveryContext?.channel ?? entry?.lastChannel ?? entry?.origin?.surface ?? entry?.origin?.provider;\n\tconst isDirectWebchatSession = entry?.chatType === "direct" && entryDeliveryChannel === "webchat";\n\tconst { prompt, hasExecCompletion, hasCronEvents } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser: Boolean(visibility.showAlerts && (delivery.channel !== "none" && delivery.to || delivery.channel === "none" && isDirectWebchatSession)),\n\t\tworkspaceDir: resolveAgentWorkspaceDir(cfg, agentId),\n\t\tstartedAt,\n\t\theartbeatFileContent: preflight.heartbeatFileContent\n\t});'
-current_replyprefix_relay = '\tconst replyPrefix = createReplyPrefixContext({\n\t\tcfg,\n\t\tagentId,\n\t\tchannel: delivery.channel !== "none" ? delivery.channel : void 0,\n\t\taccountId: delivery.accountId\n\t});\n\tconst { prompt, hasExecCompletion, hasRelayableExecCompletion, hasCronEvents, hasDueCommitments } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser: Boolean(delivery.channel !== "none" && delivery.to && visibility.showAlerts),\n\t\tworkspaceDir: resolveAgentWorkspaceDir(cfg, agentId),\n\t\tstartedAt,\n\t\theartbeatFileContent: preflight.heartbeatFileContent\n\t});'
-current_replyprefix_relay_new = '\tconst replyPrefix = createReplyPrefixContext({\n\t\tcfg,\n\t\tagentId,\n\t\tchannel: delivery.channel !== "none" ? delivery.channel : void 0,\n\t\taccountId: delivery.accountId\n\t});\n\tconst entryDeliveryChannel = entry?.deliveryContext?.channel ?? entry?.lastChannel ?? entry?.origin?.surface ?? entry?.origin?.provider;\n\tconst isDirectWebchatSession = entry?.chatType === "direct" && entryDeliveryChannel === "webchat";\n\tconst { prompt, hasExecCompletion, hasRelayableExecCompletion, hasCronEvents, hasDueCommitments } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser: Boolean(visibility.showAlerts && (delivery.channel !== "none" && delivery.to || delivery.channel === "none" && isDirectWebchatSession)),\n\t\tworkspaceDir: resolveAgentWorkspaceDir(cfg, agentId),\n\t\tstartedAt,\n\t\theartbeatFileContent: preflight.heartbeatFileContent\n\t});'
-if new_relay in text or current_relay_new in text or current_replyprefix_relay_new in text:
+current_relay_v202655 = '\tconst canRelayToUser = Boolean(delivery.channel !== "none" && delivery.to && visibility.showAlerts);\n\tconst workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n\tconst useHeartbeatResponseToolPrompt = shouldUseHeartbeatResponseToolPrompt({\n\t\tcfg,\n\t\tagentId,\n\t\theartbeat,\n\t\tentry\n\t});\n\tconst { prompt, hasExecCompletion, hasRelayableExecCompletion, hasCronEvents, hasDueCommitments, usesHeartbeatResponseTool } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser,\n\t\tworkspaceDir,\n\t\tstartedAt,\n\t\tdueTasks: dueHeartbeatTasks,'
+current_relay_v202655_new = '\tconst entryDeliveryChannel = entry?.deliveryContext?.channel ?? entry?.lastChannel ?? entry?.origin?.surface ?? entry?.origin?.provider;\n\tconst isDirectWebchatSession = entry?.chatType === "direct" && entryDeliveryChannel === "webchat";\n\tconst canRelayToUser = Boolean(visibility.showAlerts && (delivery.channel !== "none" && delivery.to || delivery.channel === "none" && isDirectWebchatSession));\n\tconst workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n\tconst useHeartbeatResponseToolPrompt = shouldUseHeartbeatResponseToolPrompt({\n\t\tcfg,\n\t\tagentId,\n\t\theartbeat,\n\t\tentry\n\t});\n\tconst { prompt, hasExecCompletion, hasRelayableExecCompletion, hasCronEvents, hasDueCommitments, usesHeartbeatResponseTool } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser,\n\t\tworkspaceDir,\n\t\tstartedAt,\n\t\tdueTasks: dueHeartbeatTasks,'
+if new_relay in text or current_relay_new in text or current_relay_v202655_new in text:
     print(f"relay already patched: {p}")
 elif old_relay in text:
     text = text.replace(old_relay, new_relay, 1)
@@ -81,9 +102,9 @@ elif old_relay in text:
 elif current_relay in text:
     text = text.replace(current_relay, current_relay_new, 1)
     print(f"patched relay routing (current bundle): {p}")
-elif current_replyprefix_relay in text:
-    text = text.replace(current_replyprefix_relay, current_replyprefix_relay_new, 1)
-    print(f"patched relay routing (reply-prefix bundle): {p}")
+elif current_relay_v202655 in text:
+    text = text.replace(current_relay_v202655, current_relay_v202655_new, 1)
+    print(f"patched relay routing (2026.5.5 bundle): {p}")
 else:
     raise SystemExit(f"relay block not found in {p}")
 p.write_text(text)
@@ -117,7 +138,7 @@ else
   echo "skipping reply routing patch: get-reply bundle not found under $ROOT"
 fi
 
-if [[ -f "$CLI_BACKEND" ]]; then
+if [[ -n "$CLI_BACKEND" && -f "$CLI_BACKEND" ]]; then
 python3 - "$CLI_BACKEND" <<'PY'
 from pathlib import Path
 import sys
@@ -158,7 +179,7 @@ p.write_text(text)
 print(f"patched gemini cli backend: {p}")
 PY
 else
-  echo "skipping Gemini CLI backend patch: $CLI_BACKEND not found"
+  echo "skipping Gemini CLI backend patch: backend bundle not found under $ROOT"
 fi
 
 if [[ -n "$GEMINI_PARSER_TARGET" ]]; then
@@ -168,12 +189,11 @@ import sys
 
 p = Path(sys.argv[1])
 text = p.read_text()
-original_text = text
 record_fn = 'isRecord$1' if 'isRecord$1(' in text else 'isRecord'
 
 helper_old = 'function isClaudeCliProvider(providerId) {\n\treturn normalizeLowercaseStringOrEmpty(providerId) === "claude-cli";\n}\nfunction usesClaudeStreamJsonDialect(params) {\n\treturn params.backend.jsonlDialect === "claude-stream-json" || isClaudeCliProvider(params.providerId);\n}\n'
 helper_new = 'function isClaudeCliProvider(providerId) {\n\treturn normalizeLowercaseStringOrEmpty(providerId) === "claude-cli";\n}\nfunction isGeminiCliProvider(providerId) {\n\tconst normalized = normalizeLowercaseStringOrEmpty(providerId);\n\treturn normalized === "google-gemini-cli" || normalized === "gemini-cli";\n}\nfunction usesClaudeStreamJsonDialect(params) {\n\treturn params.backend.jsonlDialect === "claude-stream-json" || isClaudeCliProvider(params.providerId);\n}\nfunction usesGeminiStreamJsonDialect(params) {\n\treturn params.backend.jsonlDialect === "gemini-stream-json" || isGeminiCliProvider(params.providerId);\n}\n'
-parser_block = f'''function parseClaudeCliStreamingDelta(params) {{
+parser_block = fr'''function parseClaudeCliStreamingDelta(params) {{
 	if (!usesClaudeStreamJsonDialect(params)) return null;
 	if (params.parsed.type !== "stream_event" || !{record_fn}(params.parsed.event)) return null;
 	const event = params.parsed.event;
@@ -306,7 +326,7 @@ function createCliJsonlStreamingParser(params) {{
 	}};
 }}
 '''.replace('{record_fn}', record_fn)
-parse_cli_jsonl_block = f'''function parseCliJsonl(raw, backend, providerId) {{
+parse_cli_jsonl_block = fr'''function parseCliJsonl(raw, backend, providerId) {{
 	const lines = raw.split(/\r?\n/g).map((line) => line.trim()).filter(Boolean);
 	if (lines.length === 0) return null;
 	let sessionId;
@@ -380,11 +400,8 @@ text = replace_exact(text, helper_old, helper_new, 'runtime dialect helpers')
 text = replace_between(text, 'function parseClaudeCliStreamingDelta(params) {', 'function parseCliJsonl(raw, backend, providerId) {', parser_block, 'runtime streaming parser block')
 text = replace_between(text, 'function parseCliJsonl(raw, backend, providerId) {', 'function parseCliOutput(params) {', parse_cli_jsonl_block, 'runtime parseCliJsonl block')
 
-if text == original_text:
-    print(f"gemini parser target already patched: {p}")
-else:
-    p.write_text(text)
-    print(f"patched gemini parser target: {p}")
+p.write_text(text)
+print(f"patched gemini parser target: {p}")
 PY
 else
   echo "skipping Gemini parser patch: claude-live-session / execute.runtime bundle not found under $ROOT"
@@ -433,7 +450,7 @@ fi
 if [[ -n "$GET_REPLY_FILE" ]]; then
   grep -n 'normalizedIncomingTo === "heartbeat" && params.persistedLastTo' "$GET_REPLY_FILE"
 fi
-if [[ -f "$CLI_BACKEND" ]]; then
+if [[ -n "$CLI_BACKEND" && -f "$CLI_BACKEND" ]]; then
   grep -n 'stream-json\|gemini-stream-json' "$CLI_BACKEND"
 fi
 if [[ -n "$GEMINI_PARSER_TARGET" ]]; then

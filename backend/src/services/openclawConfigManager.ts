@@ -190,6 +190,27 @@ export function saveProviderToken(provider: string, token: string): { profileId:
   return { profileId };
 }
 
+export function pinProviderAuthProfile(provider: string, profileId: string, mode?: 'api_key' | 'token' | 'oauth') {
+  const config = readOpenClawConfig();
+  if (!config.auth) config.auth = {};
+  if (!config.auth.profiles) config.auth.profiles = {};
+
+  const storedProfile = readAuthProfiles().profiles?.[profileId];
+  const resolvedMode = mode || storedProfile?.type || 'oauth';
+  const existingProfile = config.auth.profiles[profileId] || {};
+
+  config.auth.profiles[profileId] = {
+    ...existingProfile,
+    provider,
+    mode: resolvedMode,
+  };
+
+  if (!config.auth.order) config.auth.order = {};
+  config.auth.order[provider] = [profileId];
+
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+}
+
 export function getProviderStatuses(): ProviderStatus[] {
   const config = readOpenClawConfig();
   const authProfiles = readAuthProfiles();
@@ -202,8 +223,9 @@ export function getProviderStatuses(): ProviderStatus[] {
   const now = Date.now();
 
   return AI_PROVIDERS.map((provider) => {
-    const matchingConfigProfileId = Object.keys(configProfiles).find((profileId) => configProfiles[profileId]?.provider === provider.id) || null;
-    const matchingStoredProfileId = Object.keys(storedProfiles).find((profileId) => storedProfiles[profileId]?.provider === provider.id) || null;
+    const providerAliases = provider.id === 'anthropic' ? new Set(['anthropic', 'claude-cli']) : new Set([provider.id]);
+    const matchingConfigProfileId = Object.keys(configProfiles).find((profileId) => providerAliases.has(configProfiles[profileId]?.provider)) || null;
+    const matchingStoredProfileId = Object.keys(storedProfiles).find((profileId) => providerAliases.has(storedProfiles[profileId]?.provider)) || null;
     const hasRuntimeProviderConfig = Boolean(modelsData?.providers?.[provider.id]);
     const profileId = matchingConfigProfileId && matchingStoredProfileId && matchingConfigProfileId === matchingStoredProfileId
       ? matchingConfigProfileId

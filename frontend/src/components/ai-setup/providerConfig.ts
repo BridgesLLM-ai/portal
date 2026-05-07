@@ -135,9 +135,9 @@ export const PROVIDERS: ProviderUIConfig[] = [
       { stepNumber: 5, title: 'Paste the redirect URL back here', detail: 'Return to the portal and paste the full callback URL to complete sign-in.' },
     ],
     defaultModels: [
-      { id: 'openai-codex/gpt-5.4', name: 'GPT-5.4 Codex', tier: 'frontier', description: 'Stable default Codex model.' },
-      { id: 'openai-codex/gpt-5.3-codex', name: 'GPT-5.3 Codex', tier: 'balanced', description: 'Reliable coding fallback.' },
-      { id: 'openai-codex/gpt-5.1', name: 'GPT-5.1', tier: 'fast', description: 'Fast fallback option.' },
+      { id: 'openai-codex/gpt-5.5', name: 'GPT-5.5 Codex', tier: 'frontier', description: 'Current OpenClaw default Codex model.' },
+      { id: 'openai-codex/gpt-5.4', name: 'GPT-5.4 Codex', tier: 'balanced', description: 'Stable Codex fallback with broad compatibility.' },
+      { id: 'openai-codex/gpt-5.4-mini', name: 'GPT-5.4 Mini', tier: 'fast', description: 'Fastest currently exposed OpenAI Codex option.' },
     ],
     onboardingNotes: {
       intro: 'This connects the portal to your existing paid ChatGPT account. You are not creating an API key and you are not paying per-token through the developer platform.',
@@ -171,9 +171,9 @@ export const PROVIDERS: ProviderUIConfig[] = [
       { stepNumber: 5, title: 'Paste the full redirect URL back here', detail: 'Return to the portal and paste it to complete sign-in.' },
     ],
     defaultModels: [
-      { id: 'google-gemini-cli/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', tier: 'frontier', description: 'Most relevant high-capability Gemini option currently exposed by the OAuth runtime.' },
-      { id: 'google-gemini-cli/gemini-2.5-flash', name: 'Gemini 2.5 Flash', tier: 'balanced', description: 'Fast and practical default choice.' },
-      { id: 'google-gemini-cli/gemini-3-flash-preview', name: 'Gemini 3 Flash Preview', tier: 'fast', description: 'Faster preview-tier Gemini option when you want speed over depth.' },
+      { id: 'google-gemini-cli/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', tier: 'frontier', description: 'Highest-capability Gemini CLI OAuth model currently exposed by OpenClaw.' },
+      { id: 'google-gemini-cli/gemini-3-flash-preview', name: 'Gemini 3 Flash Preview', tier: 'balanced', description: 'Current OpenClaw default Gemini CLI model.' },
+      { id: 'google-gemini-cli/gemini-3.1-flash-lite-preview', name: 'Gemini 3.1 Flash Lite Preview', tier: 'fast', description: 'Fastest light-weight Gemini CLI preview option currently exposed by OpenClaw.' },
     ],
     onboardingNotes: {
       intro: 'This uses your Google/Gemini account login for Gemini CLI OAuth. It is the subscription-style path, not the Google AI Studio API-key path.',
@@ -185,7 +185,7 @@ export const PROVIDERS: ProviderUIConfig[] = [
         'If Google asks you to approve access, continue with the same Google account you want the portal to use.'
       ],
       callbackLabel: 'Paste the full Google localhost redirect URL',
-      callbackExample: 'http://127.0.0.1:1455/auth/callback?code=...&state=...',
+      callbackExample: 'http://localhost:8085/oauth2callback?code=...&state=...',
       afterLoginLabel: 'When Google finishes, copy the entire final localhost URL from the address bar and paste it back here.'
     },
   },

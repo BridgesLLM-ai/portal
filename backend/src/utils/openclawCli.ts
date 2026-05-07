@@ -27,6 +27,27 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'claude-cli/claude-haiku-4-5': 'anthropic/claude-haiku-4-5',
 };
 
+const GOOGLE_MODEL_MAP: Record<string, string> = {
+  'gemini-3-flash': 'gemini-3-flash-preview',
+  'gemini-3.1-pro': 'gemini-3.1-pro-preview',
+  'gemini-3.1-flash': 'gemini-3-flash-preview',
+  'gemini-3.1-flash-preview': 'gemini-3-flash-preview',
+  'google/gemini-3-flash': 'google/gemini-3-flash-preview',
+  'google/gemini-3.1-pro': 'google/gemini-3.1-pro-preview',
+  'google/gemini-3.1-flash': 'google/gemini-3-flash-preview',
+  'google/gemini-3.1-flash-preview': 'google/gemini-3-flash-preview',
+  'google-gemini-cli/gemini-3-flash': 'google-gemini-cli/gemini-3-flash-preview',
+  'google-gemini-cli/gemini-3.1-pro': 'google-gemini-cli/gemini-3.1-pro-preview',
+  'google-gemini-cli/gemini-3.1-flash': 'google-gemini-cli/gemini-3-flash-preview',
+  'google-gemini-cli/gemini-3.1-flash-preview': 'google-gemini-cli/gemini-3-flash-preview',
+};
+
+const OPENAI_CODEX_MODEL_MAP: Record<string, string> = {
+  'gpt-5.4-codex': 'gpt-5.4',
+  'openai-codex/gpt-5.4-codex': 'openai-codex/gpt-5.4',
+  'openai/gpt-5.4-codex': 'openai-codex/gpt-5.4',
+};
+
 function readJson<T>(targetPath: string, fallback: T): T {
   try {
     if (!fs.existsSync(targetPath)) return fallback;
@@ -53,11 +74,54 @@ export function buildOpenClawCliEnv(): NodeJS.ProcessEnv {
 export function normalizePortalModelId(rawModel: string | null | undefined): string {
   const model = String(rawModel || '').trim();
   if (!model) return '';
-  const mapped = CLAUDE_MODEL_MAP[model.toLowerCase()] || model;
+  const lower = model.toLowerCase();
+  const mapped = CLAUDE_MODEL_MAP[lower] || GOOGLE_MODEL_MAP[lower] || OPENAI_CODEX_MODEL_MAP[lower] || model;
   if (mapped.startsWith('claude-cli/')) {
     return `anthropic/${mapped.slice('claude-cli/'.length)}`;
   }
   return mapped;
+}
+
+function translateProviderOwnedAlias(provider: string, normalized: string): string {
+  if (!provider || !normalized) return normalized;
+
+  if (provider === 'google-gemini-cli') {
+    if (normalized.startsWith('google/')) {
+      return `google-gemini-cli/${normalized.slice('google/'.length)}`;
+    }
+    if (!normalized.includes('/') && normalized.startsWith('gemini-')) {
+      return `google-gemini-cli/${normalized}`;
+    }
+  }
+
+  if (provider === 'google') {
+    if (normalized.startsWith('google-gemini-cli/')) {
+      return `google/${normalized.slice('google-gemini-cli/'.length)}`;
+    }
+    if (!normalized.includes('/') && normalized.startsWith('gemini-')) {
+      return `google/${normalized}`;
+    }
+  }
+
+  if (provider === 'openai-codex') {
+    if (normalized.startsWith('openai/')) {
+      return `openai-codex/${normalized.slice('openai/'.length)}`;
+    }
+    if (!normalized.includes('/') && /^(gpt-|o\d|codex)/i.test(normalized)) {
+      return `openai-codex/${normalized}`;
+    }
+  }
+
+  if (provider === 'openai') {
+    if (normalized.startsWith('openai-codex/')) {
+      return `openai/${normalized.slice('openai-codex/'.length)}`;
+    }
+    if (!normalized.includes('/') && /^(gpt-|o\d|codex)/i.test(normalized)) {
+      return `openai/${normalized}`;
+    }
+  }
+
+  return normalized;
 }
 
 export function canonicalizeProviderModelId(providerId: string | null | undefined, rawModel: string | null | undefined): string {
@@ -72,24 +136,33 @@ export function canonicalizeProviderModelId(providerId: string | null | undefine
   const normalized = normalizePortalModelId(model);
   if (!provider) return normalized;
   if (!normalized) return '';
-  if (normalized.startsWith(`${provider}/`)) return normalized;
+
+  const translated = translateProviderOwnedAlias(provider, normalized);
+  if (translated.startsWith(`${provider}/`)) return translated;
 
   if (provider === 'openrouter') {
-    return normalized.startsWith('openrouter/') ? normalized : `openrouter/${normalized}`;
+    return translated.startsWith('openrouter/') ? translated : `openrouter/${translated}`;
   }
 
   if (provider === 'google' || provider === 'google-gemini-cli') {
-    if (normalized.startsWith('google/') || normalized.startsWith('google-gemini-cli/')) {
-      return normalized;
+    if (translated.startsWith('google/') || translated.startsWith('google-gemini-cli/')) {
+      return normalizePortalModelId(translated);
     }
-    if (normalized.startsWith('gemini-')) return `${provider}/${normalized}`;
+    if (translated.startsWith('gemini-')) return normalizePortalModelId(`${provider}/${translated}`);
   }
 
-  if (!normalized.includes('/')) {
-    return `${provider}/${normalized}`;
+  if (provider === 'openai-codex' || provider === 'openai') {
+    if (translated.startsWith('openai/') || translated.startsWith('openai-codex/')) {
+      return normalizePortalModelId(translated);
+    }
+    if (!translated.includes('/')) return normalizePortalModelId(`${provider}/${translated}`);
   }
 
-  return `${provider}/${normalized}`;
+  if (!translated.includes('/')) {
+    return `${provider}/${translated}`;
+  }
+
+  return `${provider}/${translated}`;
 }
 
 export function extractJsonFromCliOutput(rawOutput: string): string {
@@ -181,31 +254,6 @@ export function repairClaudeSubscriptionConfig(preferredModel?: string | null): 
     changed = true;
   }
 
-  if (config?.auth?.profiles?.['anthropic:claude-cli']) {
-    delete config.auth.profiles['anthropic:claude-cli'];
-    changed = true;
-  }
-  const anthropicOrder = Array.isArray(config?.auth?.order?.anthropic) ? config.auth.order.anthropic : null;
-  if (anthropicOrder && anthropicOrder.includes('anthropic:claude-cli')) {
-    config.auth.order.anthropic = anthropicOrder.filter((profileId: string) => profileId !== 'anthropic:claude-cli');
-    changed = true;
-  }
-
-  let authProfilesChanged = false;
-  if (authProfiles?.profiles?.['anthropic:claude-cli']) {
-    delete authProfiles.profiles['anthropic:claude-cli'];
-    authProfilesChanged = true;
-  }
-  if (authProfiles?.lastGood?.anthropic && authProfiles.lastGood.anthropic === 'anthropic:claude-cli') {
-    delete authProfiles.lastGood.anthropic;
-    authProfilesChanged = true;
-  }
-  if (authProfiles?.usageStats?.['anthropic:claude-cli']) {
-    delete authProfiles.usageStats['anthropic:claude-cli'];
-    authProfilesChanged = true;
-  }
-
   if (changed) writeJson(CONFIG_PATH, config);
-  if (authProfilesChanged) writeJson(AUTH_PROFILES_PATH, authProfiles);
-  return { changed: changed || authProfilesChanged, defaultModel: desiredDefault || null };
+  return { changed, defaultModel: desiredDefault || null };
 }

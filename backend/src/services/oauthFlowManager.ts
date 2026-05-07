@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as http from 'http';
 import { createHash, randomBytes } from 'crypto';
 import { execSync } from 'child_process';
-import { readAuthProfiles, saveProviderToken } from './openclawConfigManager';
+import { AUTH_PROFILES_PATH, readAuthProfiles, saveProviderToken } from './openclawConfigManager';
 
 export type OAuthFlowStatus = 'starting' | 'awaiting_callback' | 'polling_device' | 'processing' | 'complete' | 'error';
 
@@ -31,11 +31,15 @@ export interface OAuthSession {
   extraEnv?: Record<string, string>;
   capturedToken?: string | null;
   lastOutputAt?: number;
+  processExited?: boolean;
+  processExitCode?: number;
+  processExitedAt?: number;
 }
 
 const sessions = new Map<string, OAuthSession>();
 const OPENCLAW_BIN = 'openclaw';
 const ANSI_REGEX = /\x1B\[[0-9;?]*[ -\/]*[@-~]|\x1B[@-_]/g;
+const SCREEN_CONTROL_FRAGMENT_REGEX = /\[[0-9;?]*[ -\/]*[@-~]/g;
 
 function createSessionId() {
   return `oauth_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -61,14 +65,27 @@ function stripAnsi(value: string) {
   return value.replace(ANSI_REGEX, '');
 }
 
-function extractClaudeSetupToken(text: string): string | null {
-  const compact = text.replace(/[\r\n\t ]+/g, '');
+export function normalizeTerminalScreenText(value: string): string {
+  return stripAnsi(value)
+    .replace(SCREEN_CONTROL_FRAGMENT_REGEX, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
+}
+
+export function squashPromptText(value: string): string {
+  return normalizeTerminalScreenText(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9:/?._-]+/g, '');
+}
+
+export function extractClaudeSetupToken(text: string): string | null {
+  const compact = normalizeTerminalScreenText(text).replace(/[\r\n\t ]+/g, '');
   const match = compact.match(/(sk-ant-oat01-[A-Za-z0-9_\-/.+=]{20,})/);
   return match?.[1]?.trim() || null;
 }
 
-function extractClaudeAuthUrl(text: string): string | null {
-  const lines = text.split(/\r?\n/);
+export function extractClaudeAuthUrl(text: string): string | null {
+  const lines = normalizeTerminalScreenText(text).split(/\r?\n/);
 
   for (let i = 0; i < lines.length; i += 1) {
     const currentLine = lines[i];
@@ -109,7 +126,58 @@ function maybeCaptureClaudeSetupToken(session: OAuthSession) {
 
 function readProviderProfileIds(provider: string) {
   const authProfiles = readAuthProfiles();
-  return Object.keys(authProfiles.profiles || {}).filter((profileId) => authProfiles.profiles?.[profileId]?.provider === provider);
+  const aliases = provider === 'anthropic' ? new Set(['anthropic', 'claude-cli']) : new Set([provider]);
+  return Object.keys(authProfiles.profiles || {}).filter((profileId) => aliases.has(authProfiles.profiles?.[profileId]?.provider));
+}
+
+function rewriteStoredAuthProfileProvider(profileId: string | null | undefined, provider: string) {
+  if (!profileId) return;
+  const authProfiles = readAuthProfiles();
+  const existing = authProfiles.profiles?.[profileId];
+  if (!existing || existing.provider === provider) return;
+  authProfiles.profiles[profileId] = {
+    ...existing,
+    provider,
+  };
+  fs.writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(authProfiles, null, 2));
+}
+
+function buildPortalOAuthEnv(extraEnv?: Record<string, string>) {
+  return {
+    ...process.env,
+    ...extraEnv,
+    BROWSER: '/bin/false',
+    DISPLAY: '',
+    WAYLAND_DISPLAY: '',
+    SSH_CONNECTION: extraEnv?.SSH_CONNECTION || process.env.SSH_CONNECTION || 'bridgesllm-portal-oauth 127.0.0.1 127.0.0.1 0',
+  } as Record<string, string>;
+}
+
+function buildOAuthLoginArgs(provider: string): string[] {
+  const args = ['models', 'auth', 'login', '--provider', provider];
+  if (provider === 'openai-codex') {
+    args.push('--method', 'oauth');
+  }
+  return args;
+}
+
+function isProviderAuthUrl(provider: string, url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    switch (provider) {
+      case 'openai-codex':
+        return host === 'auth.openai.com';
+      case 'google-gemini-cli':
+        return host === 'accounts.google.com' || host === 'accounts.googleusercontent.com';
+      case 'anthropic':
+      case 'claude-code':
+        return host === 'claude.com' || host === 'claude.ai' || host.endsWith('.claude.com') || host.endsWith('.claude.ai');
+      default:
+        return true;
+    }
+  } catch {
+    return false;
+  }
 }
 
 function spawnOpenClawPty(args: string[], extraEnv?: Record<string, string>) {
@@ -118,16 +186,133 @@ function spawnOpenClawPty(args: string[], extraEnv?: Record<string, string>) {
     cols: 120,
     rows: 40,
     cwd: process.cwd(),
-    env: { ...process.env, ...extraEnv } as Record<string, string>,
+    env: {
+      ...process.env,
+      // Force OpenClaw's remote/manual OAuth path for portal-managed auth sessions.
+      // The portal UI expects a paste-the-redirect flow; letting the CLI drift into
+      // local desktop callback mode on a server is brittle and provider-specific.
+      SSH_CONNECTION: process.env.SSH_CONNECTION || 'portal-oauth 0 0 0',
+      ...extraEnv,
+    } as Record<string, string>,
+  });
+}
+
+function spawnPortalOAuthPty(args: string[], extraEnv?: Record<string, string>) {
+  return pty.spawn(OPENCLAW_BIN, args, {
+    name: 'xterm-256color',
+    cols: 120,
+    rows: 40,
+    cwd: process.cwd(),
+    env: buildPortalOAuthEnv(extraEnv),
+  });
+}
+
+function shellEscape(arg: string): string {
+  return `'${String(arg).replace(/'/g, `'\\''`)}'`;
+}
+
+function runOpenClawViaScript(args: string[], timeoutMs: number, extraEnv?: Record<string, string>): string {
+  const command = [OPENCLAW_BIN, ...args].map(shellEscape).join(' ');
+  try {
+    return execSync(`script -qefc ${shellEscape(command)} /dev/null`, {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        ...extraEnv,
+      },
+      timeout: timeoutMs,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 1024 * 1024 * 8,
+    }) as string;
+  } catch (error: any) {
+    const stdout = typeof error?.stdout === 'string' ? error.stdout : error?.stdout?.toString?.('utf8') || '';
+    const stderr = typeof error?.stderr === 'string' ? error.stderr : error?.stderr?.toString?.('utf8') || '';
+    const combined = `${stdout}\n${stderr}`.trim();
+    throw new Error(combined || error?.message || 'script-wrapped OpenClaw command failed');
+  }
+}
+
+function checkForNewProviderProfile(session: OAuthSession): boolean {
+  const currentProfiles = readProviderProfileIds(session.provider);
+  const newProfile = currentProfiles.find((id) => !session.profileKeyBefore.includes(id));
+  if (!newProfile) return false;
+  session.status = 'complete';
+  session.completedAt = Date.now();
+  return true;
+}
+
+function validateOAuthCallbackForSession(session: OAuthSession, callbackUrl: string): string | null {
+  try {
+    const parsed = new URL(callbackUrl);
+    const state = parsed.searchParams.get('state');
+    if (session.oauthState && state && state !== session.oauthState) {
+      return 'That redirect URL belongs to a different sign-in attempt. Start the sign-in again and paste the newest callback URL.';
+    }
+  } catch {
+    return 'Invalid callback URL.';
+  }
+  return null;
+}
+
+function hasCallbackPastePrompt(session: OAuthSession): boolean {
+  const text = session.cleanOutput;
+  const normalizedText = normalizeTerminalScreenText(text);
+  const squashedText = squashPromptText(text);
+
+  return Boolean(
+    /Paste the authorization code/i.test(normalizedText)
+    || /Paste the redirect URL here/i.test(normalizedText)
+    || /Paste the callback URL here/i.test(normalizedText)
+    || /Paste the full redirect url/i.test(normalizedText)
+    || /Waiting for you to paste the callback URL/i.test(normalizedText)
+    || /Enter the authorization code:/i.test(normalizedText)
+    || squashedText.includes('waitingforyoutopastethecallbackurl')
+    || squashedText.includes('entertheauthorizationcode:')
+  );
+}
+
+function waitForCallbackPastePrompt(session: OAuthSession, timeoutMs: number) {
+  return new Promise<void>((resolve, reject) => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      if (session.error || session.status === 'error') {
+        clearInterval(timer);
+        reject(new Error(session.error || 'Provider login failed before the callback prompt appeared.'));
+        return;
+      }
+
+      if (session.processExited) {
+        clearInterval(timer);
+        reject(new Error('Provider login process exited before the callback prompt was ready. Start the sign-in again.'));
+        return;
+      }
+
+      if (hasCallbackPastePrompt(session)) {
+        clearInterval(timer);
+        resolve();
+        return;
+      }
+
+      if (Date.now() - started > timeoutMs) {
+        clearInterval(timer);
+        reject(new Error('Timed out waiting for the callback prompt. Start the sign-in again.'));
+      }
+    }, 200);
   });
 }
 
 function updateSessionFromOutput(session: OAuthSession) {
   const text = session.cleanOutput;
+  const normalizedText = normalizeTerminalScreenText(text);
+  const squashedText = squashPromptText(text);
 
   if (session.provider === 'google-gemini-cli') {
+    const sawTrustPrompt = squashedText.includes('doyoutrustthefilesinthisfolder?') || squashedText.includes('doyoutrustthefilesinthisfolder');
+    const sawOauthPrompt = squashedText.includes('continuewithgooglegeminiclioauth?') || squashedText.includes('continuewithgooglegeminiclioauth');
+
     // Auto-confirm trust folder prompt (option 1 = "Trust folder")
-    if (!(session as any).__trustFolderConfirmed && /Do you trust the files in this folder\?/i.test(text)) {
+    if (!(session as any).__trustFolderConfirmed && sawTrustPrompt) {
       (session as any).__trustFolderConfirmed = true;
       session.sentInitialConfirm = true;
       console.log('[NativeCLI] Gemini trust-folder prompt detected, auto-confirming...');
@@ -138,8 +323,8 @@ function updateSessionFromOutput(session: OAuthSession) {
 
     // Auto-confirm the Google OAuth caution prompt.
     // Gemini can now surface this prompt even when the trust-folder prompt never appears,
-    // so gating on sentInitialConfirm leaves the default selection on "No" and the PTY exits.
-    if (/Continue with Google Gemini CLI OAuth\?/i.test(text) && !(session as any).__oauthConfirmed) {
+    // and newer TTY renders can draw the prompt as one glyph per line.
+    if (sawOauthPrompt && !(session as any).__oauthConfirmed) {
       (session as any).__oauthConfirmed = true;
       session.sentInitialConfirm = true;
       console.log('[NativeCLI] Google OAuth caution prompt detected, auto-confirming...');
@@ -152,7 +337,7 @@ function updateSessionFromOutput(session: OAuthSession) {
     }
   }
 
-  const urls = text.match(/https?:\/\/[^\s)"'>]+/g) || [];
+  const urls = normalizedText.match(/https?:\/\/[^\s)"'>]+/g) || [];
   for (const url of urls) {
     let hostname = '';
     try {
@@ -175,7 +360,7 @@ function updateSessionFromOutput(session: OAuthSession) {
         session.localPort = parseInt(localUrl.port, 10) || null;
       } catch { /* ignore */ }
     }
-    if (!session.authUrl && !isLocalCallbackUrl && !isGithubDeviceUrl && !isOpenAIDeviceUrl) {
+    if (!session.authUrl && !isLocalCallbackUrl && !isGithubDeviceUrl && !isOpenAIDeviceUrl && isProviderAuthUrl(session.provider, url)) {
       session.authUrl = url;
       // Extract OAuth state parameter for local callback relay
       try {
@@ -195,14 +380,14 @@ function updateSessionFromOutput(session: OAuthSession) {
     /enter (?:the )?code[:\s]+([A-Z0-9-]{6,})/i,
   ];
   for (const pattern of deviceCodePatterns) {
-    const match = text.match(pattern);
+    const match = normalizedText.match(pattern);
     if (match?.[1]) {
       session.deviceCode = match[1];
       break;
     }
   }
 
-  if (session.mode === 'device_code' && (session.deviceCode || session.verificationUrl || /waiting for github authorization/i.test(text))) {
+  if (session.mode === 'device_code' && (session.deviceCode || session.verificationUrl || /waiting for github authorization/i.test(normalizedText))) {
     if (session.status !== 'complete') {
       session.status = 'polling_device';
     }
@@ -210,12 +395,14 @@ function updateSessionFromOutput(session: OAuthSession) {
 
   if (session.mode === 'oauth') {
     const needsCallback =
-      /paste.*redirect url/i.test(text)
-      || /paste.*callback url/i.test(text)
-      || /paste the authorization code/i.test(text)
-      || /paste the full redirect url/i.test(text)
-      || /localhost/i.test(text)
-      || /127\.0\.0\.1/i.test(text)
+      /paste.*redirect url/i.test(normalizedText)
+      || /paste.*callback url/i.test(normalizedText)
+      || /paste the authorization code/i.test(normalizedText)
+      || /paste the full redirect url/i.test(normalizedText)
+      || squashedText.includes('waitingforyoutopastethecallbackurl')
+      || squashedText.includes('entertheauthorizationcode:')
+      || /localhost/i.test(normalizedText)
+      || /127\.0\.0\.1/i.test(normalizedText)
       || Boolean(session.authUrl);
 
     if (needsCallback && session.status !== 'complete') {
@@ -223,7 +410,7 @@ function updateSessionFromOutput(session: OAuthSession) {
     }
   }
 
-  if (/successfully logged in|login complete|authentication complete|provider added|saved profile|setup.token.*generated|token.*saved|successfully authenticated/i.test(text)) {
+  if (/successfully logged in|login complete|authentication complete|provider added|saved profile|setup.token.*generated|token.*saved|successfully authenticated|auth profile:|default model available:/i.test(normalizedText)) {
     session.status = 'complete';
     session.completedAt = Date.now();
   }
@@ -240,21 +427,25 @@ function waitForInitialOutput(session: OAuthSession, timeoutMs: number) {
       }
 
       const text = session.cleanOutput;
+      const normalizedText = normalizeTerminalScreenText(text);
+      const squashedText = squashPromptText(text);
       const oauthReady = session.mode === 'oauth' && (
         Boolean(session.authUrl)
-        || /Open this URL in your LOCAL browser:/i.test(text)
-        || /Paste the authorization code/i.test(text)
-        || /Paste the redirect URL here/i.test(text)
-        || /Waiting for you to paste the callback URL/i.test(text)
-        || /browser didn't open, visit:/i.test(text)
-        || /Enter the authorization code:/i.test(text)  // Gemini headless OAuth
+        || /Open this URL in your LOCAL browser:/i.test(normalizedText)
+        || /Paste the authorization code/i.test(normalizedText)
+        || /Paste the redirect URL here/i.test(normalizedText)
+        || /Waiting for you to paste the callback URL/i.test(normalizedText)
+        || squashedText.includes('waitingforyoutopastethecallbackurl')
+        || squashedText.includes('entertheauthorizationcode:')
+        || /browser didn't open, visit:/i.test(normalizedText)
+        || /Enter the authorization code:/i.test(normalizedText)  // Gemini headless OAuth
       );
 
       const deviceReady = session.mode === 'device_code' && (
         Boolean(session.deviceCode)
         || Boolean(session.verificationUrl)
-        || /github\.com\/login\/device/i.test(text)
-        || /auth\.openai\.com\/codex\/device/i.test(text)
+        || /github\.com\/login\/device/i.test(normalizedText)
+        || /auth\.openai\.com\/codex\/device/i.test(normalizedText)
       );
 
       if (oauthReady || deviceReady) {
@@ -277,25 +468,26 @@ function attachPtyParsing(session: OAuthSession) {
     session.output += chunk;
     session.cleanOutput += stripAnsi(chunk);
     session.lastOutputAt = Date.now();
+    session.processExited = false;
     maybeCaptureClaudeSetupToken(session);
     updateSessionFromOutput(session);
   });
 
   session.process.onExit(({ exitCode }) => {
+    session.processExited = true;
+    session.processExitCode = exitCode;
+    session.processExitedAt = Date.now();
     console.log(`[OAuth] PTY exited: provider=${session.provider} code=${exitCode} status=${session.status} hasAuthUrl=${Boolean(session.authUrl)} outputLen=${session.cleanOutput.length}`);
     console.log(`[OAuth] Last 500 chars of clean output: ${session.cleanOutput.slice(-500)}`);
     if (session.status === 'complete') return;
-    // Gemini/OpenClaw OAuth can exit cleanly right after printing the auth URL and
-    // waiting instructions. That is NOT a successful login yet. Keep the session in
-    // awaiting_callback so the portal can collect the pasted redirect URL and respawn
-    // a fresh PTY during completion.
+    if (checkForNewProviderProfile(session)) return;
     if (session.authUrl && session.status === 'awaiting_callback') {
-      console.log('[OAuth] Process exited after delivering auth URL, keeping session alive for callback completion');
+      console.log('[OAuth] Process exited after delivering auth URL; portal may respawn a fresh PTY when the callback arrives.');
       return;
     }
     if (exitCode === 0) {
-      session.status = 'complete';
-      session.completedAt = Date.now();
+      session.status = 'error';
+      session.error = 'Provider login process exited before authentication finished. Start the sign-in again.';
       return;
     }
     if (!session.error) {
@@ -312,12 +504,14 @@ export async function startOAuthFlow(provider: string, options?: { googleProject
     console.log(`[OAuth] Setting GOOGLE_CLOUD_PROJECT=${options.googleProjectId}`);
   }
 
+  const loginArgs = buildOAuthLoginArgs(provider);
+
   const id = createSessionId();
   const session: OAuthSession = {
     id,
     provider,
     mode: 'oauth',
-    process: spawnOpenClawPty(['models', 'auth', 'login', '--provider', provider], extraEnv),
+    process: spawnPortalOAuthPty(loginArgs, extraEnv),
     authUrl: null,
     callbackHintUrl: null,
     deviceCode: null,
@@ -384,75 +578,131 @@ export async function startDeviceCodeFlow(provider: 'github-copilot') {
   };
 }
 
+export async function importClaudeCliAuthProfile(timeoutMs = 30000) {
+  const profileKeyBefore = readProviderProfileIds('anthropic');
+
+  const finalizeSuccess = (rawOutput: string) => {
+    const profileIds = readProviderProfileIds('anthropic');
+    const createdProfileId = profileIds.find((profileId) => !profileKeyBefore.includes(profileId))
+      || profileIds.find((profileId) => profileId === 'anthropic:claude-cli')
+      || profileIds[0]
+      || null;
+
+    if (createdProfileId === 'anthropic:claude-cli') {
+      rewriteStoredAuthProfileProvider(createdProfileId, 'anthropic');
+    }
+
+    const normalizedOutput = normalizeTerminalScreenText(stripAnsi(rawOutput));
+    const looksSuccessful = Boolean(createdProfileId)
+      && /auth profile:|default model available:|claude cli auth detected/i.test(normalizedOutput);
+
+    if (!looksSuccessful) {
+      const lastOutput = normalizedOutput.trim().split(/\n+/).slice(-12).join('\n').trim();
+      throw new Error(lastOutput || 'Claude CLI auth import finished without producing a reusable Anthropic profile.');
+    }
+
+    return { success: true as const, profileId: createdProfileId, output: normalizedOutput };
+  };
+
+  try {
+    const rawOutput = runOpenClawViaScript(['models', 'auth', 'login', '--provider', 'anthropic', '--method', 'cli'], timeoutMs);
+    return finalizeSuccess(rawOutput);
+  } catch (scriptError: any) {
+    const message = String(scriptError?.message || scriptError || '');
+    if (!/\b(script: not found|ENOENT|Timed out waiting)\b/i.test(message)) {
+      throw scriptError;
+    }
+  }
+
+  const process = spawnOpenClawPty(['models', 'auth', 'login', '--provider', 'anthropic', '--method', 'cli']);
+  let cleanOutput = '';
+
+  return await new Promise<{ success: true; profileId: string | null; output: string }>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try {
+        process.kill();
+      } catch {}
+      reject(new Error('Timed out waiting for Claude CLI auth import to finish.'));
+    }, timeoutMs);
+
+    process.onData((chunk: string) => {
+      cleanOutput += chunk;
+    });
+
+    process.onExit(({ exitCode }) => {
+      clearTimeout(timer);
+      try {
+        const result = finalizeSuccess(cleanOutput);
+        if (exitCode === 0) {
+          resolve(result);
+          return;
+        }
+      } catch (error) {
+        reject(error);
+        return;
+      }
+
+      const normalizedOutput = normalizeTerminalScreenText(stripAnsi(cleanOutput));
+      const lastOutput = normalizedOutput.trim().split(/\n+/).slice(-12).join('\n').trim();
+      reject(new Error(lastOutput || `Claude CLI auth import exited with code ${exitCode}`));
+    });
+  });
+}
+
 export async function completeOAuthFlow(sessionId: string, callbackUrl: string) {
   const session = sessions.get(sessionId);
   if (!session) throw new Error('OAuth session not found');
   if (session.mode !== 'oauth') throw new Error('Session is not waiting for a callback URL');
 
-  session.status = 'processing';
-  session.error = null;
-
-  // Check if the original PTY is still alive by trying to write
-  let ptyAlive = false;
-  try {
-    // node-pty throws if the process is dead
-    session.process.write('');
-    ptyAlive = true;
-  } catch {
-    ptyAlive = false;
+  if (session.status === 'complete' || checkForNewProviderProfile(session)) {
+    return { success: true };
   }
 
-  if (!ptyAlive) {
-    console.log(`[OAuth] PTY dead for ${session.provider}, spawning fresh process to complete flow...`);
-    // Spawn a fresh PTY and feed the callback URL after it's ready
-    const freshProcess = spawnOpenClawPty(['models', 'auth', 'login', '--provider', session.provider], session.extraEnv);
-    session.process = freshProcess;
-    session.output = '';
-    session.cleanOutput = '';
-    session.sentInitialConfirm = false;
+  const callbackValidationError = validateOAuthCallbackForSession(session, callbackUrl);
+  if (callbackValidationError) {
+    return { success: false, error: callbackValidationError };
+  }
 
-    // Re-attach parsing
-    freshProcess.onData((chunk: string) => {
-      session.output += chunk;
-      session.cleanOutput += stripAnsi(chunk);
-      updateSessionFromOutput(session);
-    });
+  if (session.processExited) {
+    return {
+      success: false,
+      error: 'Provider login process exited before the callback URL could be entered. Start the sign-in again.',
+    };
+  }
 
-    freshProcess.onExit(({ exitCode }) => {
-      console.log(`[OAuth] Fresh PTY exited: provider=${session.provider} code=${exitCode} status=${session.status}`);
-      if (session.status === 'complete') return;
-      if (exitCode === 0) {
-        session.status = 'complete';
-        session.completedAt = Date.now();
-        return;
-      }
-      // Check if a new profile was created despite non-zero exit
-      const currentProfiles = readProviderProfileIds(session.provider);
-      const newProfile = currentProfiles.find((id) => !session.profileKeyBefore.includes(id));
-      if (newProfile) {
-        console.log(`[OAuth] New profile detected despite exit code ${exitCode}: ${newProfile}`);
-        session.status = 'complete';
-        session.completedAt = Date.now();
-        return;
-      }
-      if (!session.error) {
-        session.status = 'error';
-        session.error = `Provider login process exited with code ${exitCode}`;
-      }
-    });
+  if (session.error || session.status === 'error') {
+    return {
+      success: false,
+      error: session.error || 'Provider login process exited before the callback URL could be entered. Start the sign-in again.',
+    };
+  }
 
-    // Wait for the fresh PTY to reach the paste prompt
+  if (!hasCallbackPastePrompt(session)) {
     try {
-      await waitForInitialOutput(session, session.provider === 'google-gemini-cli' ? 30000 : 20000);
-      console.log('[OAuth] Fresh PTY ready, feeding callback URL...');
+      await waitForCallbackPastePrompt(session, session.provider === 'google-gemini-cli' ? 30000 : 15000);
+      console.log(`[OAuth] Callback prompt confirmed for provider=${session.provider}; submitting callback URL...`);
     } catch (err: any) {
-      console.error('[OAuth] Fresh PTY failed to reach paste prompt:', err.message);
-      return { success: false, error: `Failed to restart login flow: ${err.message}` };
+      console.error(`[OAuth] Callback prompt did not become ready for provider=${session.provider}:`, err.message);
+      return { success: false, error: err.message || 'Provider login was not ready to accept the callback URL.' };
     }
   }
 
-  // Write the callback URL to the PTY
-  session.process.write(`${callbackUrl}\r`);
+  session.status = 'processing';
+  session.error = null;
+
+  const callbackInput = callbackUrl;
+
+  try {
+    console.log(`[OAuth] Writing callback input for provider=${session.provider} (${callbackInput.length} chars)`);
+    session.process.write(callbackInput);
+    const submitDelayMs = session.provider === 'google-gemini-cli' ? 250 : 100;
+    await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
+    session.process.write('\r');
+  } catch {
+    session.status = 'error';
+    session.error = 'Provider login process exited before the callback URL could be entered. Start the sign-in again.';
+    return { success: false, error: session.error };
+  }
 
   const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
     const started = Date.now();
@@ -467,17 +717,13 @@ export async function completeOAuthFlow(sessionId: string, callbackUrl: string) 
         resolve({ success: false, error: session.error || 'Provider login failed' });
         return;
       }
-      // Also check if a new profile appeared (the CLI might exit with code 0 + "complete" text)
-      const currentProfiles = readProviderProfileIds(session.provider);
-      const newProfile = currentProfiles.find((id) => !session.profileKeyBefore.includes(id));
-      if (newProfile) {
+      if (checkForNewProviderProfile(session)) {
         clearInterval(timer);
-        session.status = 'complete';
-        session.completedAt = Date.now();
         resolve({ success: true });
         return;
       }
-      if (Date.now() - started > 45000) {
+      const timeoutMs = session.provider === 'google-gemini-cli' ? 90000 : 60000;
+      if (Date.now() - started > timeoutMs) {
         clearInterval(timer);
         resolve({ success: false, error: 'Timed out waiting for provider login to finish.' });
       }
@@ -601,6 +847,7 @@ export async function startClaudeSetupTokenFlow() {
     session.output += chunk;
     session.cleanOutput += stripAnsi(chunk);
     session.lastOutputAt = Date.now();
+    session.processExited = false;
     maybeCaptureClaudeSetupToken(session);
 
     // Check for Claude auth URL
@@ -674,12 +921,13 @@ export async function pasteCodeToClaudeSession(sessionId: string, code: string):
   if (!session) return { success: false, error: 'Session not found' };
   if (session.provider !== 'anthropic') return { success: false, error: 'Not a Claude session' };
 
-  console.log(`[Claude] Pasting auth code (${code.length} chars) to PTY...`);
+  const trimmedCode = code.trim();
+  console.log(`[Claude] Pasting auth code (${trimmedCode.length} chars) to PTY...`);
 
   try {
     session.status = 'processing';
     session.error = null;
-    session.process.write(`${code}\r`);
+    session.process.write(`${trimmedCode}\r\n`);
   } catch (err: any) {
     return { success: false, error: `PTY write failed: ${err.message}` };
   }
@@ -696,7 +944,7 @@ export async function pasteCodeToClaudeSession(sessionId: string, code: string):
   return { success: true };
 }
 
-export async function getClaudeSetupToken(sessionId: string): Promise<{ success: boolean; token?: string; error?: string }> {
+export async function getClaudeSetupToken(sessionId: string): Promise<{ success: boolean; token?: string; error?: string; usedCliImport?: boolean }> {
   const session = sessions.get(sessionId);
   if (!session) return { success: false, error: 'Session not found' };
   if (session.provider !== 'anthropic') return { success: false, error: 'Not a Claude session' };
@@ -705,11 +953,34 @@ export async function getClaudeSetupToken(sessionId: string): Promise<{ success:
   if (!tokenPromise) return { success: false, error: 'No token promise found' };
 
   const started = Date.now();
+  let cliImportAttempted = false;
+
+  const maybeImportNativeClaudeAuth = async () => {
+    if (cliImportAttempted) return false;
+    if (!checkCredentialFile(CLAUDE_CREDENTIALS_PATH, ['claudeAiOauth.accessToken'])) return false;
+    cliImportAttempted = true;
+
+    try {
+      console.log('[Claude] Native Claude CLI auth detected during setup-token flow; importing into OpenClaw auth profiles...');
+      await importClaudeCliAuthProfile(30000);
+      session.status = 'complete';
+      session.completedAt = Date.now();
+      return true;
+    } catch (err: any) {
+      console.warn('[Claude] Native Claude CLI auth import failed during setup-token flow:', err?.message || err);
+      return false;
+    }
+  };
+
   while (Date.now() - started < 180000) {
     const liveToken = session.capturedToken || extractClaudeSetupToken(session.cleanOutput);
     if (liveToken) {
       session.capturedToken = liveToken;
       return { success: true, token: liveToken };
+    }
+
+    if (await maybeImportNativeClaudeAuth()) {
+      return { success: true, usedCliImport: true };
     }
 
     const token = await Promise.race([
@@ -730,6 +1001,9 @@ export async function getClaudeSetupToken(sessionId: string): Promise<{ success:
       if (completedToken) {
         session.capturedToken = completedToken;
         return { success: true, token: completedToken };
+      }
+      if (await maybeImportNativeClaudeAuth()) {
+        return { success: true, usedCliImport: true };
       }
       return { success: false, error: 'Claude completed but the token could not be extracted from the output.' };
     }

@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
 import { AlertTriangle, CheckCircle2, ChevronRight, ClipboardPaste, ExternalLink, Loader2, X } from 'lucide-react';
 import client from '../../api/client';
-import ModelSelector from './ModelSelector';
+import ModelSelector, { type SelectableModel } from './ModelSelector';
 import type { ProviderUIConfig } from './providerConfig';
+import { getModelFamilyKey, mergeModelCatalog, pickPreferredModel } from './modelCatalog';
 
 interface OAuthSetupFlowProps {
   provider: ProviderUIConfig;
@@ -43,27 +44,75 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
   const [fatalError, setFatalError] = useState<string | null>(null);
   const [existingDefault, setExistingDefault] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [availableModels, setAvailableModels] = useState<SelectableModel[]>(provider.defaultModels);
+  const [loadingModels, setLoadingModels] = useState(false);
   const [googleProjectId, setGoogleProjectId] = useState('');
 
   // Check if a default model is already configured; only auto-select if not
   React.useEffect(() => {
+    setAvailableModels(provider.defaultModels);
     client.get(`${apiBase}/status`).then(({ data }) => {
       const current = data?.defaultModel || null;
       setExistingDefault(current);
       if (!current) {
-        // No default set yet — auto-select balanced tier for convenience
-        setSelectedModel(
-          provider.defaultModels.find((m) => m.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null,
-        );
+        setSelectedModel(pickPreferredModel(provider.defaultModels));
       }
       // Otherwise leave selectedModel as null so the user has to explicitly choose
-    }).catch(() => {});
+    }).catch(() => {
+      setSelectedModel((current) => current || pickPreferredModel(provider.defaultModels));
+    });
   }, [apiBase, provider]);
+
+  React.useEffect(() => {
+    if (step !== 'model') return;
+
+    let cancelled = false;
+    setLoadingModels(true);
+
+    client.get(`${apiBase}/models`, { params: { provider: provider.id } }).then(({ data }) => {
+      if (cancelled) return;
+      const discovered = Array.isArray(data?.models)
+        ? data.models.map((model: any) => ({
+            id: String(model?.id || '').trim(),
+            name: String(model?.name || model?.id || '').trim() || String(model?.id || '').trim(),
+            description: typeof model?.description === 'string' ? model.description : undefined,
+          })).filter((model: SelectableModel) => Boolean(model.id))
+        : [];
+
+      const merged = mergeModelCatalog(discovered, provider.defaultModels);
+      const nextModels = merged.length ? merged : provider.defaultModels;
+      setAvailableModels(nextModels);
+      setSelectedModel((current) => {
+        const currentFamily = getModelFamilyKey(current || '');
+        const currentMatch = currentFamily
+          ? nextModels.find((model) => getModelFamilyKey(model.id) === currentFamily)
+          : null;
+        if (currentMatch) return currentMatch.id;
+        if (existingDefault) return current;
+        return pickPreferredModel(nextModels);
+      });
+    }).catch(() => {
+      if (cancelled) return;
+      setAvailableModels(provider.defaultModels);
+      setSelectedModel((current) => {
+        if (current) return current;
+        if (existingDefault) return current;
+        return pickPreferredModel(provider.defaultModels);
+      });
+    }).finally(() => {
+      if (!cancelled) setLoadingModels(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [apiBase, existingDefault, provider.defaultModels, provider.id, step]);
 
   const isOpenAI = provider.id === 'openai-codex';
   const isGoogle = provider.id === 'google-gemini-cli';
   const providerLabel = isOpenAI ? 'OpenAI' : 'Google';
   const callbackPort = isOpenAI ? '1455' : '8085';
+  const callbackPathExample = isOpenAI ? `localhost:${callbackPort}/auth/callback?...` : `localhost:${callbackPort}/oauth2callback?...`;
   const nativeCliNote = nativeCliBridgeNote(provider.id);
 
   // Poll for auto-completion (local callback server may catch the redirect directly on VPS)
@@ -404,7 +453,7 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
           {step === 'paste' ? (
             <div className="space-y-4">
               <p className="text-sm text-slate-300">
-                Paste what you copied from the address bar. It starts with <code className="rounded bg-slate-800 px-1.5 py-0.5 text-xs text-emerald-300">localhost:{callbackPort}/</code>
+                Paste what you copied from the address bar. It starts with <code className="rounded bg-slate-800 px-1.5 py-0.5 text-xs text-emerald-300">{callbackPathExample}</code>
               </p>
 
               <textarea
@@ -412,7 +461,7 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                 onChange={(e) => setCallbackUrl(e.target.value)}
                 rows={4}
                 autoFocus
-                placeholder={`localhost:${callbackPort}/...?code=...&state=...`}
+                placeholder={`${callbackPathExample.replace('?...', '?code=...&state=...')}`}
                 className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 font-mono text-sm text-white placeholder-slate-600 outline-none transition focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
               />
 
@@ -453,7 +502,13 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
               <p className="text-sm text-slate-300">
                 Optionally, choose a default model. You can change this anytime in Settings.
               </p>
-              <ModelSelector models={provider.defaultModels} selectedModel={selectedModel} onSelect={setSelectedModel} />
+              {loadingModels ? (
+                <div className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-950/60 px-4 py-3 text-sm text-slate-300">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Loading available models…
+                </div>
+              ) : null}
+              <ModelSelector models={availableModels.length ? availableModels : provider.defaultModels} selectedModel={selectedModel} onSelect={setSelectedModel} />
 
               {error ? (
                 <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">{error}</div>

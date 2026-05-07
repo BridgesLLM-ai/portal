@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
 import { AlertTriangle, CheckCircle2, ClipboardPaste, ExternalLink, Loader2, X } from 'lucide-react';
 import client from '../../api/client';
-import ModelSelector from './ModelSelector';
+import ModelSelector, { type SelectableModel } from './ModelSelector';
 import type { ProviderUIConfig } from './providerConfig';
 import type { ProviderStatus } from './ProviderCard';
 import { canonicalizePortalModelId } from '../../utils/modelId';
+import { getModelFamilyKey, mergeModelCatalog, pickPreferredModel } from './modelCatalog';
 
 interface SetupTokenFlowProps {
   provider: ProviderUIConfig;
@@ -27,6 +28,8 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
   const [pasteCode, setPasteCode] = useState('');
   const [manualToken, setManualToken] = useState('');
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [availableModels, setAvailableModels] = useState<SelectableModel[]>(provider.defaultModels);
+  const [loadingModels, setLoadingModels] = useState(false);
   const [statusOutput, setStatusOutput] = useState<string | null>(null);
   const [completingStartedAt, setCompletingStartedAt] = useState<number | null>(null);
 
@@ -41,21 +44,53 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
   }, []);
 
   React.useEffect(() => {
+    setAvailableModels(provider.defaultModels);
     client.get(`${apiBase}/status`).then(({ data }: { data: any }) => {
       const current = normalizeModelForSelector(data?.defaultModel || null);
-      const supportedCurrent = current && provider.defaultModels.some((model) => model.id === current) ? current : null;
-      setSelectedModel(
-        supportedCurrent
-        || provider.defaultModels.find((m) => m.tier === 'balanced')?.id
-        || provider.defaultModels[0]?.id
-        || null,
-      );
+      const supportedCurrent = current && provider.defaultModels.some((model) => getModelFamilyKey(model.id) === getModelFamilyKey(current)) ? current : null;
+      setSelectedModel(supportedCurrent || pickPreferredModel(provider.defaultModels));
     }).catch(() => {
-      setSelectedModel(
-        provider.defaultModels.find((m) => m.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null,
-      );
+      setSelectedModel(pickPreferredModel(provider.defaultModels));
     });
   }, [apiBase, normalizeModelForSelector, provider]);
+
+  React.useEffect(() => {
+    if (step !== 'model' && step !== 'manual-paste') return;
+
+    let cancelled = false;
+    setLoadingModels(true);
+
+    client.get(`${apiBase}/models`, { params: { provider: provider.id } }).then(({ data }) => {
+      if (cancelled) return;
+      const discovered = Array.isArray(data?.models)
+        ? data.models.map((model: any) => ({
+            id: String(model?.id || '').trim(),
+            name: String(model?.name || model?.id || '').trim() || String(model?.id || '').trim(),
+            description: typeof model?.description === 'string' ? model.description : undefined,
+          })).filter((model: SelectableModel) => Boolean(model.id))
+        : [];
+      const merged = mergeModelCatalog(discovered, provider.defaultModels);
+      const nextModels = merged.length ? merged : provider.defaultModels;
+      setAvailableModels(nextModels);
+      setSelectedModel((current) => {
+        const currentFamily = getModelFamilyKey(current || '');
+        const currentMatch = currentFamily
+          ? nextModels.find((model) => getModelFamilyKey(model.id) === currentFamily)
+          : null;
+        return currentMatch?.id || current || pickPreferredModel(nextModels);
+      });
+    }).catch(() => {
+      if (cancelled) return;
+      setAvailableModels(provider.defaultModels);
+      setSelectedModel((current) => current || pickPreferredModel(provider.defaultModels));
+    }).finally(() => {
+      if (!cancelled) setLoadingModels(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [apiBase, provider.defaultModels, provider.id, step]);
 
   const finalizeClaudeSetup = React.useCallback(async () => {
     if (!sessionId) return;
@@ -139,6 +174,12 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
         // Claude Code not installed — fall back to manual
         setError(data.error || 'Failed to start automated Claude setup');
         setStep('error');
+        return;
+      }
+      if (data.instantComplete) {
+        setStatusOutput(data.method === 'cli-reuse' ? 'Claude CLI auth detected on the server. Reused it for OpenClaw automatically.' : null);
+        setCompletingStartedAt(null);
+        setStep('model');
         return;
       }
       setSessionId(data.sessionId);
@@ -472,7 +513,13 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
               <p className="text-sm text-slate-300">
                 Optionally, choose a default model. You can change this anytime in Settings.
               </p>
-              <ModelSelector models={provider.defaultModels} selectedModel={selectedModel} onSelect={setSelectedModel} />
+              {loadingModels ? (
+                <div className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-950/60 px-4 py-3 text-sm text-slate-300">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Loading available models…
+                </div>
+              ) : null}
+              <ModelSelector models={availableModels.length ? availableModels : provider.defaultModels} selectedModel={selectedModel} onSelect={setSelectedModel} />
 
               {error ? (
                 <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">{error}</div>
@@ -530,7 +577,13 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
               </div>
 
               <div className="text-sm font-medium text-white">Optionally choose a default Claude model:</div>
-              <ModelSelector models={provider.defaultModels} selectedModel={selectedModel} onSelect={setSelectedModel} />
+              {loadingModels ? (
+                <div className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-950/60 px-4 py-3 text-sm text-slate-300">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Loading available models…
+                </div>
+              ) : null}
+              <ModelSelector models={availableModels.length ? availableModels : provider.defaultModels} selectedModel={selectedModel} onSelect={setSelectedModel} />
 
               <button
                 type="button"

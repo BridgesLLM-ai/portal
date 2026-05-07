@@ -96,15 +96,35 @@ function resolveOpenClawDistBundle(prefix: string | string[]): string | null {
   }
 }
 
+function resolveOpenClawExtensionImportedBundle(extensionRelativePath: string, prefix: string | string[]): string | null {
+  try {
+    const extensionPath = path.join(OPENCLAW_DIST_DIR, extensionRelativePath);
+    if (!existsSync(extensionPath)) return null;
+    const text = readFileSync(extensionPath, 'utf8');
+    const prefixes = Array.isArray(prefix) ? prefix : [prefix];
+    for (const candidate of prefixes) {
+      const match = text.match(new RegExp(`${candidate}[^"']+\\.js`));
+      if (!match) continue;
+      const resolved = path.join(OPENCLAW_DIST_DIR, path.basename(match[0]));
+      if (existsSync(resolved)) return resolved;
+    }
+  } catch {
+    // ignore wrapper parse failures
+  }
+  return null;
+}
+
 function getOpenClawCompatibilityHotfixStatus() {
   const heartbeatEventsFilterPath = resolveOpenClawDistBundle('heartbeat-events-filter-');
   const heartbeatRunnerPath = resolveOpenClawDistBundle('heartbeat-runner-');
   const replyBundlePath = resolveOpenClawDistBundle(['get-reply-', 'reply-']);
   const claudeLiveSessionPath = resolveOpenClawDistBundle('claude-live-session-');
   const executeRuntimePath = resolveOpenClawDistBundle('execute.runtime-');
-  const geminiCliBackendPath = existsSync(path.join(OPENCLAW_DIST_DIR, 'extensions/google/cli-backend.js'))
-    ? path.join(OPENCLAW_DIST_DIR, 'extensions/google/cli-backend.js')
-    : null;
+  const geminiCliBackendPath = resolveOpenClawExtensionImportedBundle('extensions/google/cli-backend.js', 'cli-backend-')
+    || resolveOpenClawDistBundle('cli-backend-')
+    || (existsSync(path.join(OPENCLAW_DIST_DIR, 'extensions/google/cli-backend.js'))
+      ? path.join(OPENCLAW_DIST_DIR, 'extensions/google/cli-backend.js')
+      : null);
   const scriptExists = existsSync(OPENCLAW_COMPAT_HOTFIX_SCRIPT);
   const issues: string[] = [];
 
@@ -130,12 +150,14 @@ function getOpenClawCompatibilityHotfixStatus() {
 
   const detectorPatched = heartbeatDetectorText.includes('return lower.includes("exec finished") || lower.includes("exec completed");')
     || heartbeatDetectorText.includes('return normalizeLowercaseStringOrEmpty(evt).includes("exec finished") || normalizeLowercaseStringOrEmpty(evt).includes("exec completed");')
-    || heartbeatDetectorText.includes('return /^exec finished(?::|\\s*\\()/.test(normalized) || /^exec (completed|failed) \\([a-z0-9_-]{1,64}, (code -?\\d+|signal [^)]+)\\)( :: .*)?$/.test(normalized);');
+    || heartbeatDetectorText.includes('return /^exec finished(?::|\\s*\\()/.test(normalized) || /^exec (completed|failed) \\([a-z0-9_-]{1,64}, (code -?\\d+|signal [^)]+)\\)( :: .*)?$/.test(normalized);')
+    || (heartbeatDetectorText.includes('STRUCTURED_EXEC_COMPLETION_EVENT_RE')
+      && heartbeatDetectorText.includes('^exec finished(?::|\\s*\\()'));
   const relayPatched = heartbeatRunnerText.includes('const isDirectWebchatSession =')
     && heartbeatRunnerText.includes('delivery.channel === "none" && isDirectWebchatSession');
   const replyPatched = replyText.includes('normalizedIncomingTo === "heartbeat" && params.persistedLastTo');
   const geminiCliPatched = geminiCliBackendText.includes('jsonlDialect: "gemini-stream-json"')
-    && geminiCliBackendText.includes('"--output-format",\n\t\t\t\t"stream-json",');
+    && geminiCliBackendText.includes('"stream-json"');
   const geminiCliYoloPatched = geminiCliBackendText.includes('"--yolo",');
   const geminiParserText = claudeLiveSessionText || executeRuntimeText;
   const geminiParserPatched = geminiParserText.includes('function isGeminiCliProvider(providerId) {')
@@ -269,8 +291,23 @@ function resolveSessionsDir(sessionKey?: string): string {
   return SESSIONS_DIR;
 }
 
-function resolveOpenClawSessionKey(rawSession: unknown, user?: Pick<JwtPayload, 'role'> | null): string {
+function normalizePortalNewSessionAlias(rawSession: unknown): string {
   const session = typeof rawSession === 'string' ? rawSession.trim() : '';
+  if (!session) return '';
+  if (session.startsWith('portal-new-')) return session.replace(/^portal-/, '');
+  if (!session.startsWith('agent:')) return session;
+
+  const parts = session.split(':');
+  if (parts.length < 3) return session;
+
+  const agentId = parts[1]?.trim() || 'main';
+  const sessionName = parts.slice(2).join(':').trim();
+  if (!sessionName.startsWith('portal-new-')) return session;
+  return `agent:${agentId}:${sessionName.replace(/^portal-/, '')}`;
+}
+
+function resolveOpenClawSessionKey(rawSession: unknown, user?: Pick<JwtPayload, 'role'> | null): string {
+  const session = normalizePortalNewSessionAlias(rawSession);
   if (session.startsWith('agent:')) return session;
 
   const isOwnerMainAlias = isOwnerRole(user?.role)
@@ -594,9 +631,82 @@ function walkGeminiCliTranscriptFiles(dirPath: string, results: string[], depth 
       walkGeminiCliTranscriptFiles(fullPath, results, depth + 1);
       continue;
     }
-    if (!entry.isFile?.() || !entry.name.endsWith('.json')) continue;
+    if (!entry.isFile?.() || (!entry.name.endsWith('.json') && !entry.name.endsWith('.jsonl'))) continue;
     if (!fullPath.includes(`${path.sep}chats${path.sep}`)) continue;
     results.push(fullPath);
+  }
+}
+
+function mergeGeminiCliTranscriptRecord(existing: any, next: any): any {
+  if (!existing) return next;
+  return {
+    ...existing,
+    ...next,
+    timestamp: next?.timestamp || existing?.timestamp,
+    type: next?.type || existing?.type,
+    model: next?.model || existing?.model,
+    content: typeof next?.content === 'string'
+      ? (next.content || existing?.content || '')
+      : (next?.content ?? existing?.content),
+    thoughts: Array.isArray(next?.thoughts) && next.thoughts.length > 0
+      ? next.thoughts
+      : (existing?.thoughts || []),
+    toolCalls: Array.isArray(next?.toolCalls) && next.toolCalls.length > 0
+      ? next.toolCalls
+      : (existing?.toolCalls || []),
+    tokens: next?.tokens || existing?.tokens,
+  };
+}
+
+function loadGeminiCliTranscript(filePath: string): { sessionId: string; messages: any[] } | null {
+  try {
+    const raw = readFileSync(filePath, 'utf-8');
+    if (!raw.trim()) return null;
+
+    if (filePath.endsWith('.jsonl')) {
+      const records = raw
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          try {
+            return JSON.parse(line);
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean) as any[];
+
+      if (records.length === 0) return null;
+
+      const header = records.find((record) => typeof record?.sessionId === 'string');
+      const sessionId = typeof header?.sessionId === 'string' ? header.sessionId.trim() : '';
+      if (!sessionId) return null;
+
+      const order: string[] = [];
+      const byId = new Map<string, any>();
+      for (const record of records) {
+        const type = typeof record?.type === 'string' ? record.type.trim().toLowerCase() : '';
+        if (!type) continue;
+        const id = typeof record?.id === 'string' ? record.id.trim() : '';
+        if (!id) continue;
+        if (!byId.has(id)) order.push(id);
+        byId.set(id, mergeGeminiCliTranscriptRecord(byId.get(id), record));
+      }
+
+      return {
+        sessionId,
+        messages: order.map((id) => byId.get(id)).filter(Boolean),
+      };
+    }
+
+    const parsed = JSON.parse(raw);
+    const sessionId = typeof parsed?.sessionId === 'string' ? parsed.sessionId.trim() : '';
+    if (!sessionId) return null;
+    const messages = Array.isArray(parsed?.messages) ? parsed.messages : [];
+    return { sessionId, messages };
+  } catch {
+    return null;
   }
 }
 
@@ -611,28 +721,22 @@ function getGeminiCliTranscriptIndex(): Map<string, string> {
   walkGeminiCliTranscriptFiles(GEMINI_CLI_TMP_DIR, files);
 
   for (const filePath of files) {
+    const loaded = loadGeminiCliTranscript(filePath);
+    const sessionId = loaded?.sessionId || '';
+    if (!sessionId) continue;
+
+    const existing = index.get(sessionId);
+    if (!existing) {
+      index.set(sessionId, filePath);
+      continue;
+    }
+
     try {
-      const raw = readFileSync(filePath, 'utf-8');
-      if (!raw.includes('"sessionId"')) continue;
-      const parsed = JSON.parse(raw);
-      const sessionId = typeof parsed?.sessionId === 'string' ? parsed.sessionId.trim() : '';
-      if (!sessionId) continue;
-
-      const existing = index.get(sessionId);
-      if (!existing) {
-        index.set(sessionId, filePath);
-        continue;
-      }
-
-      try {
-        const existingMtime = statSync(existing).mtimeMs;
-        const nextMtime = statSync(filePath).mtimeMs;
-        if (nextMtime >= existingMtime) index.set(sessionId, filePath);
-      } catch {
-        index.set(sessionId, filePath);
-      }
+      const existingMtime = statSync(existing).mtimeMs;
+      const nextMtime = statSync(filePath).mtimeMs;
+      if (nextMtime >= existingMtime) index.set(sessionId, filePath);
     } catch {
-      // ignore malformed/non-session files
+      index.set(sessionId, filePath);
     }
   }
 
@@ -697,8 +801,8 @@ function readGeminiCliImportedMessages(cliSessionId: string, limit = 200): any[]
   if (!transcriptPath) return [];
 
   try {
-    const parsed = JSON.parse(readFileSync(transcriptPath, 'utf-8'));
-    const rawMessages = Array.isArray(parsed?.messages) ? parsed.messages : [];
+    const loaded = loadGeminiCliTranscript(transcriptPath);
+    const rawMessages = Array.isArray(loaded?.messages) ? loaded.messages : [];
     const importedMessages: any[] = [];
 
     for (const message of rawMessages) {
@@ -785,10 +889,37 @@ function hasMeaningfulConversationTurns(messages: any[]): boolean {
   });
 }
 
+function getLatestMeaningfulConversationTimestamp(messages: any[]): number {
+  let latest = 0;
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue;
+    const timestampMs = toHistoryTimestampMs(message?.timestamp);
+    if (!timestampMs) continue;
+
+    if (message.role === 'user' && typeof message.content === 'string' && message.content.trim()) {
+      latest = Math.max(latest, timestampMs);
+      continue;
+    }
+
+    if (message.role !== 'assistant') continue;
+    if (Array.isArray(message.toolCalls) && message.toolCalls.length > 0) {
+      latest = Math.max(latest, timestampMs);
+      continue;
+    }
+    if (typeof message.thinkingContent === 'string' && message.thinkingContent.trim()) {
+      latest = Math.max(latest, timestampMs);
+      continue;
+    }
+    if (typeof message.content !== 'string') continue;
+    const normalized = message.content.trim();
+    if (normalized && !/^Model set to /i.test(normalized)) latest = Math.max(latest, timestampMs);
+  }
+  return latest;
+}
+
 function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
   const fileId = resolveSessionFileId(sessionKey, sessionsDir);
   const localMessages = fileId ? readSessionMessagesEnhanced(fileId, limit, sessionsDir) : [];
-  if (hasMeaningfulConversationTurns(localMessages)) return localMessages;
 
   const sessionEntry = resolveSessionRegistryEntry(sessionKey, sessionsDir);
   const geminiCliSessionId = resolveGeminiCliBindingSessionId(sessionEntry);
@@ -797,7 +928,17 @@ function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 20
   const importedMessages = readGeminiCliImportedMessages(geminiCliSessionId, limit);
   if (importedMessages.length === 0) return localMessages;
 
-  const combined = [...localMessages, ...importedMessages]
+  const localLatestTimestamp = getLatestMeaningfulConversationTimestamp(localMessages);
+  if (!hasMeaningfulConversationTurns(localMessages) || !localLatestTimestamp) {
+    const combined = [...localMessages, ...importedMessages]
+      .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
+    return combined.slice(-Math.max(limit, 1));
+  }
+
+  const importedTail = importedMessages.filter((message) => toHistoryTimestampMs(message?.timestamp) > localLatestTimestamp);
+  if (importedTail.length === 0) return localMessages;
+
+  const combined = [...localMessages, ...importedTail]
     .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
 
   return combined.slice(-Math.max(limit, 1));

@@ -554,14 +554,29 @@ function extractThinkingFromGatewayMessage(msg: GatewayChatMessage): string | un
   return thinking || undefined;
 }
 
-function toConcreteOpenClawSessionKey(rawSession: string, rawAgentId?: string | null): string {
+function normalizePortalNewSessionAlias(rawSession: string): string {
   const sessionKey = String(rawSession || '').trim();
+  if (!sessionKey) return '';
+  if (sessionKey.startsWith('portal-new-')) return sessionKey.replace(/^portal-/, '');
+  if (!sessionKey.startsWith('agent:')) return sessionKey;
+
+  const parts = sessionKey.split(':');
+  if (parts.length < 3) return sessionKey;
+
+  const agentId = parts[1]?.trim() || 'main';
+  const sessionName = parts.slice(2).join(':').trim();
+  if (!sessionName.startsWith('portal-new-')) return sessionKey;
+  return `agent:${agentId}:${sessionName.replace(/^portal-/, '')}`;
+}
+
+function toConcreteOpenClawSessionKey(rawSession: string, rawAgentId?: string | null): string {
+  const sessionKey = normalizePortalNewSessionAlias(String(rawSession || '').trim());
   if (!sessionKey) return 'agent:main:main';
   if (sessionKey.startsWith('agent:')) return sessionKey;
 
   const agentKey = String(rawAgentId || '').trim() || 'main';
   if (sessionKey === 'main') return `agent:${agentKey}:main`;
-  if (sessionKey.startsWith('new-')) return `agent:${agentKey}:portal-${sessionKey}`;
+  if (sessionKey.startsWith('new-')) return `agent:${agentKey}:${sessionKey}`;
   return sessionKey;
 }
 
@@ -905,8 +920,10 @@ function getProviderSessionStorageKey(provider: string): string {
 
 function normalizeInitialSession(provider: string, session: string): string {
   const p = String(provider || '').trim().toUpperCase();
-  const s = String(session || '').trim() || 'main';
+  const aliased = normalizePortalNewSessionAlias(String(session || '').trim() || 'main');
+  const s = aliased || 'main';
   if (p === 'OPENCLAW' && s === 'main') return 'agent:main:main';
+  if (p === 'OPENCLAW' && s.startsWith('new-')) return `agent:main:${s}`;
   if (p !== 'OPENCLAW' && s.startsWith('agent:')) return 'main';
   return s;
 }

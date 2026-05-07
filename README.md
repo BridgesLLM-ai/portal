@@ -98,9 +98,15 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
-### v3.25.8 (April 30, 2026)
-- **Hosted installer/tarball parity is restored for the latest OpenClaw runtime**: the public update path now ships the same OpenClaw 2026.4.29 compatibility helper logic that was already present in source, including the newer reply-prefix heartbeat relay matcher and Gemini CLI patch path.
-- **OpenClaw 2026.4.29 was re-smoked on the test box before release**: after the required manual gateway restart on that host, portal-backed model discovery and a disposable chat send both completed successfully again.
+### v3.25.9 (May 6, 2026)
+- **Gemini/OpenClaw turns survive completion now**: when a local session file lags behind the imported Gemini transcript, Agent Chat merges the newer transcript tail instead of dropping the finished assistant reply, tool cards, or visible reasoning after the run ends.
+- **Fresh `new-*` session aliases resolve cleanly across reloads**: the portal now normalizes portal-created OpenClaw session aliases before history reloads and session lookups, which keeps completed turns attached to the right chat.
+- **AI setup is sturdier across Codex, Gemini, and Claude**: sign-in and setup flows now track callback state more carefully, normalize discovered model IDs consistently, and recover provider-auth handoffs more reliably.
+- **Compatibility Patch status keeps up with current OpenClaw bundles**: the checker and bundled helper now find the imported Gemini CLI backend plus newer heartbeat detector variants, so successful compatibility applies stop looking broken.
+
+### v3.25.8 (May 1, 2026)
+- **Hosted updates ship the current OpenClaw compatibility helper**: the public installer and tarball moved forward with the validated relay, reply-routing, and Gemini CLI compatibility fixes instead of relying on a manual follow-up repair.
+- **The public release path was revalidated against current OpenClaw builds**: portal-backed chat and provider discovery were rechecked before shipping the compatibility update so the hosted download stayed aligned with the current runtime.
 
 ### v3.25.7 (April 28, 2026)
 - **The OpenClaw session sidebar stops choking busy portals**: Agent Chat no longer opens large session transcript/checkpoint files just to build the main-session sidebar, which fixes the event-loop stalls that made gateway chat, hosted pages, and shared pages lag or time out on installs with a large OpenClaw session store.

@@ -115,7 +115,11 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     freeTier: 'Included with ChatGPT Plus ($20/mo), Pro ($200/mo), or Team plans',
     description: 'Use your ChatGPT subscription for AI. OpenAI explicitly supports this for external tools.',
     onboardAuthChoice: 'openai-codex',
-    defaultModels: [],
+    defaultModels: [
+      { id: 'openai-codex/gpt-5.5', name: 'GPT-5.5 Codex', tier: 'frontier', description: 'Current OpenClaw default Codex model.' },
+      { id: 'openai-codex/gpt-5.4', name: 'GPT-5.4 Codex', tier: 'balanced', description: 'Stable Codex fallback with broad compatibility.' },
+      { id: 'openai-codex/gpt-5.4-mini', name: 'GPT-5.4 Mini', tier: 'fast', description: 'Fastest currently exposed OpenAI Codex option.' },
+    ],
     setupInstructions: [
       { stepNumber: 1, title: 'You need an active ChatGPT subscription', detail: 'ChatGPT Plus ($20/mo), Pro ($200/mo), or Team. Free accounts do NOT work. If you don\'t have one, subscribe at https://chatgpt.com/ → "Upgrade to Plus".', link: { url: 'https://chatgpt.com/', label: 'Open ChatGPT' } },
       { stepNumber: 2, title: 'Click "Start OpenAI Sign-In" below', detail: 'This opens a new browser tab with OpenAI\'s login page.' },
@@ -140,9 +144,9 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     description: 'Use the Google Gemini subscription/account login flow instead of creating an API key.',
     onboardAuthChoice: 'google-gemini-cli',
     defaultModels: [
-      { id: 'google-gemini-cli/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', tier: 'frontier', description: 'Most relevant high-capability Gemini option currently exposed by the OAuth runtime.' },
-      { id: 'google-gemini-cli/gemini-2.5-flash', name: 'Gemini 2.5 Flash', tier: 'balanced', description: 'Fast and practical default choice.' },
-      { id: 'google-gemini-cli/gemini-3-flash-preview', name: 'Gemini 3 Flash Preview', tier: 'fast', description: 'Faster preview-tier Gemini option when you want speed over depth.' },
+      { id: 'google-gemini-cli/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', tier: 'frontier', description: 'Highest-capability Gemini CLI OAuth model currently exposed by OpenClaw.' },
+      { id: 'google-gemini-cli/gemini-3-flash-preview', name: 'Gemini 3 Flash Preview', tier: 'balanced', description: 'Current OpenClaw default Gemini CLI model.' },
+      { id: 'google-gemini-cli/gemini-3.1-flash-lite-preview', name: 'Gemini 3.1 Flash Lite Preview', tier: 'fast', description: 'Fastest light-weight Gemini CLI preview option currently exposed by OpenClaw.' },
     ],
     setupInstructions: [
       { stepNumber: 1, title: 'Start sign-in here', detail: 'Click the sign-in button here to open the Google Gemini authorization flow in a new tab.' },

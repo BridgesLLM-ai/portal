@@ -653,7 +653,7 @@ router.get('/models/available', authenticateToken, requireApproved, async (_req:
     } else {
       res.json({ 
         models: [
-          { id: 'openai-codex/gpt-5.4', name: 'Codex (5.4)', provider: 'openai-codex' },
+          { id: 'openai/gpt-5.4', name: 'Codex (5.4)', provider: 'openai-codex' },
           { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6', provider: 'anthropic' },
           { id: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', provider: 'anthropic' },
           { id: 'google/gemini-2.5-flash', name: 'Gemini 2.5 Flash', provider: 'google' },
@@ -3175,12 +3175,16 @@ function getModelDisplayName(model: string): string {
     'ollama/qwen3:8b': 'Qwen3 8B',
     'ollama/gemma4:e2b': 'Gemma 4 E2B',
     'ollama/gemma4:e4b': 'Gemma 4 E4B',
+    'openai/gpt-5.1': 'GPT-5.1',
     'openai-codex/gpt-5.1': 'GPT-5.1',
+    'openai/gpt-5.2': 'GPT-5.2',
     'openai-codex/gpt-5.2': 'GPT-5.2',
+    'openai/gpt-5.3-codex': 'Codex (5.3)',
     'openai-codex/gpt-5.3-codex': 'Codex (5.3)',
+    'openai/gpt-5.4': 'Codex (5.4)',
     'openai-codex/gpt-5.4': 'Codex (5.4)',
   };
-  return names[model] || model.replace(/^(anthropic|ollama|openai-codex)\//, '');
+  return names[model] || model.replace(/^(anthropic|ollama|openai-codex|openai)\//, '');
 }
 
 async function autoCommitProjectChanges(projectDir: string, userId: string, projectName: string, summary?: string, model?: string) {
@@ -3571,7 +3575,7 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
       currentSessionModel = normalizePortalModelId(sessionInfo.ok ? String(sessionInfo.data?.model || '') : '');
     } catch {}
 
-    const selectedModel = requestedModel || currentSessionModel || getDefaultModel() || 'openai-codex/gpt-5.4';
+    const selectedModel = requestedModel || currentSessionModel || getDefaultModel() || 'openai/gpt-5.4';
 
     // Patch the session model before any init traffic only when the caller asked
     // for a specific model or when a new/empty session still needs its first
@@ -3726,14 +3730,14 @@ router.get('/:name/assistant/active-model', authenticateToken, async (req: Reque
       result = await getSessionInfo(sessionKey);
     }
     
-    const configuredDefault = getDefaultModel() || 'openai-codex/gpt-5.4';
+    const configuredDefault = getDefaultModel() || 'openai/gpt-5.4';
     const [defaultProvider, ...defaultModelParts] = configuredDefault.split('/');
     const defaultModel = defaultModelParts.join('/') || 'gpt-5.4';
 
     if (result.ok && result.data) {
       const session = result.data;
       // sessions.list returns the resolved model (already merged with override)
-      const provider = session.modelProvider || defaultProvider || 'openai-codex';
+      const provider = session.modelProvider || defaultProvider || 'openai';
       const model = session.model || defaultModel;
       const activeModel = `${provider}/${model}`;
       const isDefault = activeModel === configuredDefault;
@@ -3749,7 +3753,7 @@ router.get('/:name/assistant/active-model', authenticateToken, async (req: Reque
       // Session might not exist yet - return configured gateway default
       res.json({ 
         activeModel: configuredDefault,
-        modelProvider: defaultProvider || 'openai-codex',
+        modelProvider: defaultProvider || 'openai',
         model: defaultModel,
         isOverridden: false,
         sessionKey,
@@ -4095,7 +4099,7 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
     const projectDir = getProjectPath(ownerId, name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
 
-    const selectedModel = normalizePortalModelId(model || '') || getDefaultModel() || 'openai-codex/gpt-5.4';
+    const selectedModel = normalizePortalModelId(model || '') || getDefaultModel() || 'openai/gpt-5.4';
     
     // Get or create session (Phase 2: per-project agent isolation)
     const { sessionKey, agentId, needsInit, stableSlug } = await getOrCreateSession(

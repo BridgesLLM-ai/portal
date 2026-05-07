@@ -5,7 +5,7 @@ import { execFileSync, execSync } from 'child_process';
 import { z } from 'zod';
 import { getAiProviderMeta } from '../config/aiProviders';
 import { validateApiKey } from '../services/aiProviderValidator';
-import { completeNativeCliFlow, completeOAuthFlow, getClaudeSetupToken, getOAuthFlowStatus, pasteCodeToClaudeSession, saveClaudeToken, startClaudeSetupTokenFlow, startDeviceCodeFlow, startNativeCliFlow, startOAuthFlow } from '../services/oauthFlowManager';
+import { completeNativeCliFlow, completeOAuthFlow, getClaudeSetupToken, getOAuthFlowStatus, importClaudeCliAuthProfile, pasteCodeToClaudeSession, saveClaudeToken, startClaudeSetupTokenFlow, startDeviceCodeFlow, startNativeCliFlow, startOAuthFlow } from '../services/oauthFlowManager';
 import {
   AUTH_PROFILES_PATH,
   CONFIG_PATH,
@@ -13,11 +13,13 @@ import {
   getDefaultModel,
   getFallbackModels,
   getProviderStatuses,
+  pinProviderAuthProfile,
   readAuthProfiles,
   readOpenClawConfig,
   saveProviderApiKey,
 } from '../services/openclawConfigManager';
 import { listGatewayModels } from '../utils/openclawGatewayRpc';
+import { getNativeCliAuthStatus } from '../agents/nativeCliAuth';
 import {
   buildOpenClawCliEnv,
   canonicalizeProviderModelId,
@@ -41,11 +43,8 @@ const saveKeySchema = validateKeySchema.extend({
   if (data.setDefault && !data.model) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['model'], message: 'Model is required when setDefault is true' });
   }
-  if (data.model) {
-    const providerPrefix = data.model.split('/')[0];
-    if (providerPrefix !== data.provider) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['model'], message: 'Selected model must belong to the same provider being configured' });
-    }
+  if (data.model && !matchesProviderModel(data.provider, data.model)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['model'], message: 'Selected model must belong to the same provider being configured' });
   }
 });
 const setDefaultSchema = z.object({
@@ -120,62 +119,267 @@ function runOpenClaw(args: string[], timeout = 30000) {
   return raw;
 }
 
-/**
- * After provider auth, discover all available models and add them as fallbacks
- * so they show up as "configured" in the model switcher.
- */
-function registerProviderModels(provider: string) {
-  try {
-    const output = runOpenClaw(['models', 'list', '--all', '--provider', provider, '--json'], 60000);
-    const parsed = JSON.parse(output);
-    const discovered = Array.isArray(parsed)
-      ? parsed
-      : Array.isArray(parsed?.models)
-        ? parsed.models
-        : [];
-    const models: string[] = Array.from(new Set(discovered
-      .map((model: any) => canonicalizeProviderModelId(provider, model?.key || model?.id || model?.model || model?.name || ''))
-      .filter(Boolean)));
-    if (!models.length) {
-      console.log(`[AI-Setup] No models discovered for ${provider}`);
-      return;
-    }
+const PROVIDER_MODEL_DISCOVERY_FALLBACKS: Record<string, string[]> = {
+  anthropic: [
+    'anthropic/claude-opus-4-6',
+    'anthropic/claude-sonnet-4-6',
+    'anthropic/claude-haiku-4-5',
+  ],
+  'openai-codex': [
+    'openai-codex/gpt-5.5',
+    'openai-codex/gpt-5.5-pro',
+    'openai-codex/gpt-5.4',
+    'openai-codex/gpt-5.4-pro',
+    'openai-codex/gpt-5.4-mini',
+    'openai-codex/gpt-5.3-codex',
+    'openai-codex/gpt-5.2',
+    'openai-codex/gpt-5.2-codex',
+  ],
+  'google-gemini-cli': [
+    'google-gemini-cli/gemini-2.0-flash',
+    'google-gemini-cli/gemini-2.5-flash',
+    'google-gemini-cli/gemini-2.5-pro',
+    'google-gemini-cli/gemini-3-flash-preview',
+    'google-gemini-cli/gemini-3-pro-preview',
+    'google-gemini-cli/gemini-3.1-flash-lite-preview',
+    'google-gemini-cli/gemini-3.1-pro-preview',
+  ],
+};
 
-    const currentFallbacksRaw = runOpenClaw(['models', 'fallbacks', 'list', '--json'], 10000);
-    let currentFallbacks: string[] = [];
-    try {
-      const parsedFallbacks = JSON.parse(currentFallbacksRaw);
-      const fallbackItems = Array.isArray(parsedFallbacks)
-        ? parsedFallbacks
-        : Array.isArray(parsedFallbacks?.fallbacks)
-          ? parsedFallbacks.fallbacks
-          : [];
-      currentFallbacks = Array.from(new Set(fallbackItems
-        .map((item: any) => canonicalizeProviderModelId(provider, typeof item === 'string' ? item : item?.model || item?.id || ''))
-        .filter(Boolean)));
-    } catch {
-      currentFallbacks = [];
-    }
 
-    const currentDefault = canonicalizeProviderModelId(provider, getDefaultModel() || '');
-    const toAdd = models.filter((modelId) => modelId !== currentDefault && !currentFallbacks.includes(modelId));
-    if (!toAdd.length) {
-      console.log(`[AI-Setup] All ${provider} models already configured`);
-      return;
-    }
+const PROVIDER_MODEL_PREFIX_ALIASES: Record<string, string[]> = {
+  'google-gemini-cli': ['google-gemini-cli', 'google'],
+  google: ['google', 'google-gemini-cli'],
+  'openai-codex': ['openai-codex', 'openai'],
+  openai: ['openai', 'openai-codex'],
+};
 
-    for (const modelId of toAdd) {
-      try {
-        runOpenClaw(['models', 'fallbacks', 'add', modelId], 10000);
-        console.log(`[AI-Setup] Added fallback: ${modelId}`);
-      } catch (err: any) {
-        console.warn(`[AI-Setup] Failed to add fallback ${modelId}: ${err.message}`);
-      }
-    }
-    console.log(`[AI-Setup] Registered ${toAdd.length} models for ${provider}`);
-  } catch (err: any) {
-    console.warn(`[AI-Setup] registerProviderModels(${provider}) failed: ${err.message}`);
+function getProviderModelPrefixes(provider: string): string[] {
+  return Array.from(new Set([provider, ...(PROVIDER_MODEL_PREFIX_ALIASES[provider] || [])]));
+}
+
+function bareModelLooksLikeProviderFamily(provider: string | null | undefined, rawModel: string | null | undefined): boolean {
+  const candidate = String(rawModel || '').trim().toLowerCase();
+  if (!provider || !candidate || candidate.includes('/')) return true;
+
+  switch (provider) {
+    case 'google':
+    case 'google-gemini-cli':
+      return candidate.startsWith('gemini-');
+    case 'openai':
+    case 'openai-codex':
+      return /^(gpt-|o\d|codex)/i.test(candidate);
+    case 'anthropic':
+      return /^(claude-|sonnet|opus|haiku)/i.test(candidate);
+    default:
+      return true;
   }
+}
+
+function providerBelongsToSameFamily(provider: string | null | undefined, otherProvider: string | null | undefined): boolean {
+  const left = String(provider || '').trim();
+  const right = String(otherProvider || '').trim();
+  if (!left || !right) return false;
+  return getProviderModelPrefixes(left).includes(right) || getProviderModelPrefixes(right).includes(left);
+}
+
+function resolveModelProviderHint(providerHint: string | null | undefined, rawModel: string | null | undefined, explicitProvider?: string | null): string | null {
+  const raw = String(rawModel || '').trim();
+  const selectedProvider = String(providerHint || '').trim();
+  const modelProvider = String(explicitProvider || '').trim();
+
+  if (selectedProvider && modelProvider) {
+    return providerBelongsToSameFamily(selectedProvider, modelProvider) ? selectedProvider : modelProvider;
+  }
+
+  if (selectedProvider && raw.includes('/')) {
+    const prefix = raw.split('/')[0] || '';
+    if (providerBelongsToSameFamily(selectedProvider, prefix)) {
+      return selectedProvider;
+    }
+    return null;
+  }
+
+  if (modelProvider) return modelProvider;
+  if (!selectedProvider) return null;
+  if (!bareModelLooksLikeProviderFamily(selectedProvider, raw)) return null;
+  return selectedProvider;
+}
+
+function canonicalizeDiscoveredProviderModelId(provider: string, rawModel: string | null | undefined): string {
+  const explicit = canonicalizeProviderModelId(null, rawModel);
+  if (explicit && explicit.includes('/') && !getProviderModelPrefixes(provider).some((prefix) => explicit.startsWith(`${prefix}/`))) {
+    return explicit;
+  }
+
+  return canonicalizeProviderModelId(provider, rawModel);
+}
+
+export function matchesProviderModel(provider: string, rawModel: string | null | undefined): boolean {
+  const canonical = canonicalizeDiscoveredProviderModelId(provider, rawModel);
+  if (!canonical) return false;
+
+  for (const prefix of getProviderModelPrefixes(provider)) {
+    const fullPrefix = `${prefix}/`;
+    if (!canonical.startsWith(fullPrefix)) continue;
+    const remainder = canonical.slice(fullPrefix.length);
+
+    if ((provider === 'google' || provider === 'google-gemini-cli' || provider === 'openai' || provider === 'openai-codex' || provider === 'anthropic') && remainder.includes('/')) {
+      return false;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+function extractModelArray(payload: any): any[] {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.models)) return payload.models;
+  if (Array.isArray(payload?.entries)) return payload.entries;
+  return [];
+}
+
+function dedupeProviderModels(provider: string, models: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const raw of models) {
+    const canonical = canonicalizeDiscoveredProviderModelId(provider, raw || '');
+    if (!canonical || seen.has(canonical)) continue;
+    seen.add(canonical);
+    deduped.push(canonical);
+  }
+  return deduped;
+}
+
+function parseDiscoveredProviderModels(provider: string, payload: any): string[] {
+  const models = normalizeModelPayload(extractModelArray(payload), provider)
+    .map((entry) => canonicalizeDiscoveredProviderModelId(provider, entry?.id || entry?.name || ''))
+    .filter((modelId) => matchesProviderModel(provider, modelId));
+  return dedupeProviderModels(provider, models);
+}
+
+function readDiscoveredProviderModelsFromCli(provider: string): string[] {
+  const attempts: Array<() => string> = [
+    () => runOpenClaw(['models', 'list', '--all', '--provider', provider, '--json'], 20000),
+    () => runOpenClaw(['models', 'list', '--all', '--json'], 20000),
+    () => runOpenClaw(['models', 'list', '--json'], 20000),
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const parsed = JSON.parse(attempt());
+      const models = parseDiscoveredProviderModels(provider, parsed)
+        .filter((modelId) => matchesProviderModel(provider, modelId));
+      if (models.length) return models;
+    } catch (err: any) {
+      console.warn(`[AI-Setup] CLI model discovery failed for ${provider}: ${err.message}`);
+    }
+  }
+
+  return [];
+}
+
+async function readDiscoveredProviderModelsFromGateway(provider: string): Promise<string[]> {
+  try {
+    const rpcResult = await listGatewayModels();
+    if (!rpcResult.ok) return [];
+    return parseDiscoveredProviderModels(provider, rpcResult.models || [])
+      .filter((modelId) => matchesProviderModel(provider, modelId));
+  } catch (err: any) {
+    console.warn(`[AI-Setup] Gateway model discovery failed for ${provider}: ${err.message}`);
+    return [];
+  }
+}
+
+export function mergeDiscoveredProviderModelsIntoConfig(config: any, provider: string, discoveredModels: string[]) {
+  const next = config && typeof config === 'object'
+    ? JSON.parse(JSON.stringify(config))
+    : {};
+
+  next.agents = next.agents || {};
+  next.agents.defaults = next.agents.defaults || {};
+  next.agents.defaults.model = next.agents.defaults.model || {};
+  next.agents.defaults.models = next.agents.defaults.models || {};
+
+  const currentDefault = canonicalizeDiscoveredProviderModelId(provider, next.agents.defaults.model.primary || '');
+  const existingFallbacks = Array.isArray(next.agents.defaults.model.fallbacks)
+    ? dedupeProviderModels(provider, next.agents.defaults.model.fallbacks)
+    : [];
+
+  const fallbackSet = new Set(existingFallbacks);
+  const addedAllowlist: string[] = [];
+  const addedFallbacks: string[] = [];
+  let changed = false;
+
+  for (const modelId of dedupeProviderModels(provider, discoveredModels)) {
+    if (!next.agents.defaults.models[modelId] || typeof next.agents.defaults.models[modelId] !== 'object') {
+      next.agents.defaults.models[modelId] = next.agents.defaults.models[modelId] && typeof next.agents.defaults.models[modelId] === 'object'
+        ? next.agents.defaults.models[modelId]
+        : {};
+      addedAllowlist.push(modelId);
+      changed = true;
+    }
+
+    if (modelId !== currentDefault && !fallbackSet.has(modelId)) {
+      existingFallbacks.push(modelId);
+      fallbackSet.add(modelId);
+      addedFallbacks.push(modelId);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    next.agents.defaults.model.fallbacks = existingFallbacks;
+  }
+
+  return {
+    config: next,
+    changed,
+    addedAllowlist,
+    addedFallbacks,
+  };
+}
+
+/**
+ * After provider auth, discover all available models and persist them into
+ * agents.defaults.models + agents.defaults.model.fallbacks so they are both
+ * selectable and visibly configured across the portal.
+ */
+async function registerProviderModels(provider: string) {
+  const discoveredViaCli = readDiscoveredProviderModelsFromCli(provider);
+  const discoveredViaGateway = discoveredViaCli.length ? [] : await readDiscoveredProviderModelsFromGateway(provider);
+  const staticFallbacks = dedupeProviderModels(provider, [
+    ...(PROVIDER_MODEL_DISCOVERY_FALLBACKS[provider] || []),
+    ...((getAiProviderMeta(provider)?.defaultModels || []).map((model) => canonicalizeProviderModelId(provider, model.id))),
+  ]);
+
+  const discoveredModels = dedupeProviderModels(provider, [
+    ...discoveredViaCli,
+    ...discoveredViaGateway,
+    ...staticFallbacks,
+  ]).filter((modelId) => matchesProviderModel(provider, modelId));
+
+  if (!discoveredModels.length) {
+    console.log(`[AI-Setup] No models discovered for ${provider}`);
+    return { changed: false, models: [] as string[], addedAllowlist: [] as string[], addedFallbacks: [] as string[] };
+  }
+
+  const openclawConfig = readOpenClawConfig();
+  const merged = mergeDiscoveredProviderModelsIntoConfig(openclawConfig, provider, discoveredModels);
+  if (merged.changed) {
+    atomicWriteJson(CONFIG_PATH, merged.config);
+    if (provider === 'anthropic') repairClaudeSubscriptionConfig();
+  }
+
+  console.log(`[AI-Setup] Registered ${discoveredModels.length} ${provider} models (${merged.addedAllowlist.length} allowlisted, ${merged.addedFallbacks.length} fallback additions)`);
+  return {
+    changed: merged.changed,
+    models: discoveredModels,
+    addedAllowlist: merged.addedAllowlist,
+    addedFallbacks: merged.addedFallbacks,
+  };
 }
 
 function restartGatewayBySignal() {
@@ -213,12 +417,22 @@ async function restartGateway() {
 }
 
 async function fetchGatewayHealth() {
-  try {
-    const response = await fetch(`${GATEWAY_HEALTH_URL.replace(/\/$/, '')}/health`, { signal: AbortSignal.timeout(3000) });
-    return response.ok;
-  } catch {
-    return false;
+  const url = `${GATEWAY_HEALTH_URL.replace(/\/$/, '')}/health`;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(3000) });
+      if (response.ok) return true;
+    } catch {
+      // retry once for transient gateway warm-up / restart races
+    }
+
+    if (attempt === 0) {
+      await sleep(500);
+    }
   }
+
+  return false;
 }
 
 function getConfiguredProfileCount(): number {
@@ -249,7 +463,7 @@ export function normalizeModelPayload(models: any[], providerHint?: string | nul
   return models.map((model) => {
     if (typeof model === 'string') {
       const rawId = String(model || '').trim();
-      const provider = rawId.includes('/') ? null : providerHint || null;
+      const provider = resolveModelProviderHint(providerHint || null, rawId);
       const canonicalId = canonicalizeProviderModelId(provider, rawId);
       return canonicalId ? {
         id: canonicalId,
@@ -259,7 +473,10 @@ export function normalizeModelPayload(models: any[], providerHint?: string | nul
     }
 
     const rawId = model?.key || model?.id || model?.model || model?.name || '';
-    const provider = model?.provider || model?.modelProvider || (String(rawId).includes('/') ? null : providerHint || null);
+    const explicitProvider = typeof model?.provider === 'string'
+      ? model.provider
+      : (typeof model?.modelProvider === 'string' ? model.modelProvider : null);
+    const provider = resolveModelProviderHint(providerHint || null, rawId, explicitProvider);
     const canonicalId = canonicalizeProviderModelId(provider, rawId);
     return canonicalId ? {
       id: canonicalId,
@@ -315,12 +532,14 @@ export function createAiSetupRouter(): Router {
         res.status(500).json(result);
         return;
       }
-      await restartGateway();
-      // Register all available models for this provider
       const sessionStatus = getOAuthFlowStatus(parsed.data.sessionId);
-      if (sessionStatus?.provider) {
-        registerProviderModels(sessionStatus.provider);
+      if (sessionStatus?.provider && sessionStatus.createdProfileId) {
+        pinProviderAuthProfile(sessionStatus.provider, sessionStatus.createdProfileId, 'oauth');
       }
+      if (sessionStatus?.provider) {
+        await registerProviderModels(sessionStatus.provider);
+      }
+      await restartGateway();
       res.json({ success: true });
     } catch (error: any) {
       res.status(500).json({ success: false, error: error?.message || 'Failed to complete OAuth flow' });
@@ -413,8 +632,8 @@ export function createAiSetupRouter(): Router {
         }
       }
 
+      await registerProviderModels(provider);
       await restartGateway();
-      registerProviderModels(provider);
 
       res.json({ success: true, profileId: savedProfileId, model: normalizedModel || null });
     } catch (error: any) {
@@ -425,6 +644,20 @@ export function createAiSetupRouter(): Router {
   // ── Claude setup-token flow (automated) ──────────────────────────
   router.post('/claude/start', async (_req: Request, res: Response) => {
     try {
+      const nativeClaude = getNativeCliAuthStatus('CLAUDE_CODE');
+      if (nativeClaude.status === 'authenticated') {
+        try {
+          const imported = await importClaudeCliAuthProfile(30000);
+          if (imported.profileId) pinProviderAuthProfile('anthropic', imported.profileId, 'oauth');
+          await registerProviderModels('anthropic');
+          await restartGateway();
+          res.json({ success: true, instantComplete: true, method: 'cli-reuse' });
+          return;
+        } catch (cliReuseError: any) {
+          console.warn('[Claude] Claude CLI reuse path failed, falling back to setup-token:', cliReuseError?.message || cliReuseError);
+        }
+      }
+
       const result = await startClaudeSetupTokenFlow();
       res.json({ success: true, ...result });
     } catch (error: any) {
@@ -452,21 +685,29 @@ export function createAiSetupRouter(): Router {
 
     try {
       const result = await getClaudeSetupToken(sessionId);
-      if (!result.success || !result.token) {
+      if (!result.success) {
         res.json(result);
         return;
       }
 
-      // Save the token
-      const saveResult = await saveClaudeToken(result.token);
-      if (!saveResult.success) {
-        res.json(saveResult);
+      if (result.token) {
+        const saveResult = await saveClaudeToken(result.token);
+        if (!saveResult.success) {
+          res.json(saveResult);
+          return;
+        }
+      } else if (!result.usedCliImport) {
+        res.json({ success: false, error: 'Claude authentication completed, but no reusable token or CLI auth import was found.' });
         return;
       }
 
-      // Restart gateway to pick up the new profile
+      if (result.usedCliImport) {
+        pinProviderAuthProfile('anthropic', 'anthropic:claude-cli', 'oauth');
+      }
+
+      await registerProviderModels('anthropic');
+      // Restart gateway after the allowlist/fallback updates are persisted.
       await restartGateway();
-      registerProviderModels('anthropic');
       res.json({ success: true });
     } catch (error: any) {
       console.error('[Claude] complete error:', error.message);
@@ -495,8 +736,8 @@ export function createAiSetupRouter(): Router {
         repairClaudeSubscriptionConfig(normalizedModel);
       }
 
+      await registerProviderModels(provider);
       await restartGateway();
-      registerProviderModels(provider);
 
       const authProfiles = readAuthProfiles();
       const providerProfileIds = Object.keys(authProfiles.profiles || {}).filter((profileId) => authProfiles.profiles[profileId]?.provider === provider);
@@ -522,10 +763,10 @@ export function createAiSetupRouter(): Router {
       const normalizedModel = normalizePortalModelId(parsed.data.model);
       runOpenClaw(['models', 'set', normalizedModel], 10000);
       repairClaudeSubscriptionConfig(normalizedModel);
-      await restartGateway();
       // Also register all models for this provider (handles auto-completion case)
       const provider = normalizedModel.split('/')[0];
-      if (provider) registerProviderModels(provider);
+      if (provider) await registerProviderModels(provider);
+      await restartGateway();
       res.json({ success: true, model: normalizedModel });
     } catch (error: any) {
       res.status(500).json({ success: false, error: error?.message || 'Failed to set default model' });
@@ -557,14 +798,14 @@ export function createAiSetupRouter(): Router {
       const rpcResult = await listGatewayModels();
       if (rpcResult.ok) {
         let models = normalizeModelPayload(rpcResult.models || [], providerFilter);
-        if (providerFilter) models = models.filter((model) => model.id.startsWith(`${providerFilter}/`) || model.provider === providerFilter);
+        if (providerFilter) models = models.filter((model) => matchesProviderModel(providerFilter, model.id || model.name || ''));
         res.json({ models });
         return;
       }
 
       const cliModels = JSON.parse(runOpenClaw(['models', 'list', '--json'], 60000));
       let models = normalizeModelPayload(Array.isArray(cliModels) ? cliModels : cliModels.models || [], providerFilter);
-      if (providerFilter) models = models.filter((model) => model.id.startsWith(`${providerFilter}/`) || model.provider === providerFilter);
+      if (providerFilter) models = models.filter((model) => matchesProviderModel(providerFilter, model.id || model.name || ''));
       res.json({ models });
     } catch (error: any) {
       res.status(500).json({ error: error?.message || 'Failed to list models' });
