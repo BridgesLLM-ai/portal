@@ -98,6 +98,10 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.11 (May 8, 2026)
+- **Gateway reconnect fallback is safer**: project chat no longer retries accepted persistent gateway RPC failures through a throwaway `gateway-client` socket, avoiding duplicate sends and live-stream eviction.
+- **Project model switching is more truthful**: explicit model changes now patch the gateway whenever the live session model differs, even if local session metadata already contains the requested model.
+
 ### v3.25.10 (May 8, 2026)
 - **Gemini-backed project chat replies are visible again**: project assistant polling now recovers replies from gateway history and Gemini CLI transcripts when OpenClaw does not create the expected session JSONL.
 - **Fresh project assistant sends are less fragile**: startup avoids the broken legacy warmup path, keeps selected models pinned locally, and does not let slow metadata refreshes block real sends.

@@ -3614,10 +3614,9 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
     const selectedModel = requestedModel || currentSessionModel || storedSessionModel || getDefaultModel() || 'openai/gpt-5.4';
 
     // Patch the session model before any init traffic only when the caller asked
-    // for a specific model or when a new/empty session still needs its first
-    // concrete model. Do not silently reset an existing session back to the
-    // gateway default on reload.
-    if (requestedModel && selectedModel && currentSessionModel !== selectedModel && storedSessionModel !== selectedModel) {
+    // for a specific model. Do not silently reset an existing session back to
+    // the gateway default on reload.
+    if (requestedModel && selectedModel && currentSessionModel !== selectedModel) {
       try {
         await patchSessionModel(sessionKey, selectedModel);
       } catch {}

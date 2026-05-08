@@ -2,6 +2,12 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.11] — 2026-05-08
+
+### Fixed
+- **Project chat no longer risks duplicate sends after gateway reconnect pressure**: backend gateway RPC calls now surface persistent WebSocket failures directly instead of retrying non-idempotent requests over a throwaway `gateway-client` connection that could evict the live stream.
+- **Explicit project model switches now actually patch stale gateway sessions**: when a user requests a model, the portal compares against the live gateway model instead of trusting stale `.agent-session.json` state, so the UI and runtime model stay aligned after gateway refreshes.
+
 ## [3.25.10] — 2026-05-08
 
 ### Fixed

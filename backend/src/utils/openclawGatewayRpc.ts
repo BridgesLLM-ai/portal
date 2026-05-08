@@ -15,6 +15,7 @@ import { buildSignedDevice, getOrCreateDeviceKeys } from './deviceIdentity';
 import { getGatewayToken } from './gatewayToken';
 
 const GATEWAY_WS_URL = getOpenClawWsUrl();
+const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(process.env.HOME || '/root', '.openclaw');
 const PROTOCOL_VERSION = 3;
 // NOTE: The gateway validates client.id against a fixed schema — only certain values are
 // allowed (e.g. 'gateway-client'). We share the same ID as PersistentGatewayWs, but
@@ -42,15 +43,24 @@ interface RpcResponse {
  * while the persistent WS is alive displaces it, breaking chat streaming.
  */
 export async function gatewayRpcCall(method: string, params: Record<string, any>, timeoutMs = 10000): Promise<RpcResponse> {
-  // Try persistent WS first to avoid clientId collision
+  // Try persistent WS first to avoid clientId collision. If the persistent RPC
+  // path accepts the call but fails/times out, surface that failure instead of
+  // retrying over a throwaway connection: retrying non-idempotent methods like
+  // chat.send can duplicate turns and can also evict the persistent stream WS.
+  let PGW: any = null;
   try {
-    const PGW = await import('../agents/providers/PersistentGatewayWs');
-    if (PGW.isConnected() && typeof PGW.callGatewayRpc === 'function') {
+    PGW = await import('../agents/providers/PersistentGatewayWs');
+  } catch {
+    PGW = null;
+  }
+
+  if (PGW?.isConnected?.() && typeof PGW.callGatewayRpc === 'function') {
+    try {
       const data = await PGW.callGatewayRpc(method, params, timeoutMs);
       return { ok: true, data };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err || `${method} RPC failed`) };
     }
-  } catch {
-    // PersistentGatewayWs not available — fall through to throwaway
   }
 
   return new Promise((resolve) => {
@@ -232,7 +242,7 @@ export async function createSession(sessionKey: string, agentId?: string): Promi
 
 function readLocalSessionRegistryEntry(sessionKey: string): any | null {
   const agentId = sessionKey.startsWith('agent:') ? sessionKey.split(':')[1] : 'portal';
-  const sessionsFile = path.join(process.env.HOME || '/root', '.openclaw', 'agents', agentId, 'sessions', 'sessions.json');
+  const sessionsFile = path.join(OPENCLAW_HOME, 'agents', agentId, 'sessions', 'sessions.json');
   try {
     const raw = JSON.parse(fs.readFileSync(sessionsFile, 'utf-8'));
     const entry = raw?.[sessionKey] || (Array.isArray(raw?.sessions) ? raw.sessions.find((s: any) => s?.key === sessionKey) : null);
