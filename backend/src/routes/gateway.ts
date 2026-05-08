@@ -584,23 +584,63 @@ function normalizeGeminiModelId(rawModel: unknown): string | undefined {
 }
 
 function resolveSessionRegistryEntry(sessionKey: string, sessionsDir = SESSIONS_DIR): any | null {
+  return resolveSessionRegistryEntries(sessionKey, sessionsDir)[0] || null;
+}
+
+function getSessionKeyLookupVariants(sessionKey: string): string[] {
+  const variants = new Set<string>();
+  const normalized = String(sessionKey || '').trim();
+  if (!normalized) return [];
+
+  const add = (value: string) => {
+    const trimmed = String(value || '').trim();
+    if (trimmed) variants.add(trimmed);
+  };
+
+  add(normalized);
+  add(normalizePortalNewSessionAlias(normalized));
+
+  const agentMatch = normalized.match(/^agent:([^:]+):(.+)$/);
+  if (agentMatch) {
+    const [, agentId, sessionName] = agentMatch;
+    if (sessionName.startsWith('new-')) add(`agent:${agentId}:portal-${sessionName}`);
+    if (sessionName.startsWith('portal-new-')) add(`agent:${agentId}:${sessionName.replace(/^portal-/, '')}`);
+  } else {
+    if (normalized.startsWith('new-')) add(`portal-${normalized}`);
+    if (normalized.startsWith('portal-new-')) add(normalized.replace(/^portal-/, ''));
+  }
+
+  return Array.from(variants);
+}
+
+function resolveSessionRegistryEntries(sessionKey: string, sessionsDir = SESSIONS_DIR): any[] {
   const sessionsFile = path.join(sessionsDir, 'sessions.json');
-  if (!existsSync(sessionsFile)) return null;
+  if (!existsSync(sessionsFile)) return [];
 
   try {
     const data = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
     const sessions = (Array.isArray(data.sessions) && data.sessions.length === 0) ? data : (data.sessions || data);
+    const variants = new Set(getSessionKeyLookupVariants(sessionKey));
+    const entries: any[] = [];
+
     if (typeof sessions === 'object' && !Array.isArray(sessions)) {
-      return sessions[sessionKey] || null;
+      for (const key of variants) {
+        if (sessions[key]) entries.push(sessions[key]);
+      }
+      return entries;
     }
+
     if (Array.isArray(sessions)) {
-      return sessions.find((session: any) => session?.key === sessionKey || session?.id === sessionKey) || null;
+      return sessions.filter((session: any) => {
+        const key = String(session?.key || session?.sessionKey || session?.id || '').trim();
+        return key && variants.has(key);
+      });
     }
   } catch {
-    return null;
+    return [];
   }
 
-  return null;
+  return [];
 }
 
 function resolveGeminiCliBindingSessionId(entry: any): string | null {
@@ -918,14 +958,17 @@ function getLatestMeaningfulConversationTimestamp(messages: any[]): number {
 }
 
 function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
-  const fileId = resolveSessionFileId(sessionKey, sessionsDir);
-  const localMessages = fileId ? readSessionMessagesEnhanced(fileId, limit, sessionsDir) : [];
+  const localMessages = readBestOpenClawSessionMessagesForSessionKey(sessionKey, limit, sessionsDir);
 
-  const sessionEntry = resolveSessionRegistryEntry(sessionKey, sessionsDir);
-  const geminiCliSessionId = resolveGeminiCliBindingSessionId(sessionEntry);
-  if (!geminiCliSessionId) return localMessages;
+  const geminiCliSessionIds = resolveSessionRegistryEntries(sessionKey, sessionsDir)
+    .map((entry) => resolveGeminiCliBindingSessionId(entry))
+    .filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
+  if (geminiCliSessionIds.length === 0) return localMessages;
 
-  const importedMessages = readGeminiCliImportedMessages(geminiCliSessionId, limit);
+  const importedMessages = geminiCliSessionIds
+    .flatMap((cliSessionId) => readGeminiCliImportedMessages(cliSessionId, limit))
+    .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp))
+    .slice(-Math.max(limit, 1));
   if (importedMessages.length === 0) return localMessages;
 
   const localLatestTimestamp = getLatestMeaningfulConversationTimestamp(localMessages);
@@ -1032,6 +1075,9 @@ function isHiddenHistoryArtifactText(text: string): boolean {
     /^An async command you ran earlier has completed\./i,
     /^Read HEARTBEAT\.md if it exists/i,
     /^HEARTBEAT_OK$/i,
+    /^Heartbeat check complete(?:d)?\.?$/i,
+    /^Pre-compaction memory flush\./i,
+    /^Memory flush complete(?:d)?\.?$/i,
     /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i,
     /Handle the result internally\./i,
     /Sender \(untrusted metadata\):/i,
@@ -1053,6 +1099,22 @@ function summarizeHiddenHistoryArtifactText(text: string): string | null {
 
   if (/^An async command you ran earlier has completed\./i.test(normalized)) {
     return 'Earlier async command completed';
+  }
+
+  if (/^Read HEARTBEAT\.md if it exists/i.test(normalized)) {
+    return 'Heartbeat check started';
+  }
+
+  if (/^HEARTBEAT_OK$/i.test(normalized) || /^Heartbeat check complete(?:d)?\.?$/i.test(normalized)) {
+    return 'Heartbeat check completed';
+  }
+
+  if (/^Pre-compaction memory flush\./i.test(normalized)) {
+    return 'Memory flush started';
+  }
+
+  if (/^Memory flush complete(?:d)?\.?$/i.test(normalized)) {
+    return 'Memory flush completed';
   }
 
   return null;
@@ -1637,10 +1699,9 @@ function augmentDirectHistoryPayload(payload: any, sessionKey: string, limit = 2
 
   try {
     const sessionsDir = resolveSessionsDir(sessionKey);
-    const fileId = resolveSessionFileId(sessionKey, sessionsDir);
-    if (!fileId) return payload;
+    const enhancedMessages = readSessionMessagesEnhancedForSessionKey(sessionKey, limit, sessionsDir);
+    if (enhancedMessages.length === 0) return payload;
 
-    const enhancedMessages = readSessionMessagesEnhanced(fileId, limit, sessionsDir);
     const compactionMessages = enhancedMessages
       .filter((message) => message?.role === 'system' && (message?.__openclaw?.kind === 'compaction' || isCompactionNoticeText(message?.content)))
       .map((message) => ({
@@ -1674,36 +1735,233 @@ function augmentDirectHistoryPayload(payload: any, sessionKey: string, limit = 2
 }
 
 
+function addSessionFileCandidate(candidates: string[], seen: Set<string>, sessionId: unknown, sessionsDir: string): void {
+  const normalized = typeof sessionId === 'string' ? sessionId.trim() : '';
+  if (!normalized || seen.has(normalized)) return;
+  if (!existsSync(path.join(sessionsDir, `${normalized}.jsonl`))) return;
+  seen.add(normalized);
+  candidates.push(normalized);
+}
+
+function findTrajectorySessionFileIdsForSessionKey(sessionKey: string, sessionsDir = SESSIONS_DIR): string[] {
+  const variants = new Set(getSessionKeyLookupVariants(sessionKey));
+  if (variants.size === 0 || !existsSync(sessionsDir)) return [];
+
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  let entries: any[] = [];
+  try {
+    entries = readdirSync(sessionsDir, { withFileTypes: true }) as any[];
+  } catch {
+    return [];
+  }
+
+  for (const entry of entries) {
+    if (!entry.isFile?.() || !entry.name.endsWith('.trajectory.jsonl')) continue;
+    const filePath = path.join(sessionsDir, entry.name);
+    let raw = '';
+    try {
+      raw = readFileSync(filePath, 'utf-8');
+    } catch {
+      continue;
+    }
+    if (![...variants].some((key) => raw.includes(key))) continue;
+
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line || ![...variants].some((key) => line.includes(key))) continue;
+      try {
+        const parsed = JSON.parse(line);
+        const key = typeof parsed?.sessionKey === 'string' ? parsed.sessionKey.trim() : '';
+        if (!key || !variants.has(key)) continue;
+        addSessionFileCandidate(candidates, seen, parsed?.sessionId, sessionsDir);
+        addSessionFileCandidate(candidates, seen, parsed?.data?.sessionId, sessionsDir);
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function findSessionFileIdsForSessionKey(sessionKey: string, sessionsDir = SESSIONS_DIR): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  for (const entry of resolveSessionRegistryEntries(sessionKey, sessionsDir)) {
+    addSessionFileCandidate(candidates, seen, entry?.sessionId || entry?.id, sessionsDir);
+  }
+
+  for (const key of getSessionKeyLookupVariants(sessionKey)) {
+    addSessionFileCandidate(candidates, seen, key, sessionsDir);
+    const parts = key.split(':');
+    if (parts.length >= 3) addSessionFileCandidate(candidates, seen, parts.slice(2).join(':'), sessionsDir);
+  }
+
+  for (const sessionId of findTrajectorySessionFileIdsForSessionKey(sessionKey, sessionsDir)) {
+    addSessionFileCandidate(candidates, seen, sessionId, sessionsDir);
+  }
+
+  return candidates;
+}
+
 /** Resolve a session key to its JSONL file id */
 function resolveSessionFileId(sessionKey: string, sessionsDir = SESSIONS_DIR): string | null {
-  // Try sessions.json index first
-  const sessionsFile = path.join(sessionsDir, 'sessions.json');
-  if (existsSync(sessionsFile)) {
-    try {
-      const data = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
-      // data.sessions may be an empty array (truthy), so fall back to top-level dict only when absent
-      const sessions = (Array.isArray(data.sessions) && data.sessions.length === 0) ? data : (data.sessions || data);
-      if (typeof sessions === 'object' && !Array.isArray(sessions)) {
-        const entry = sessions[sessionKey];
-        if (entry?.sessionId || entry?.id) return entry.sessionId || entry.id;
-      }
-      if (Array.isArray(sessions)) {
-        const match = sessions.find((s: any) => s.key === sessionKey || s.id === sessionKey);
-        if (match?.sessionId || match?.id) return match.sessionId || match.id;
-      }
-    } catch {}
+  return findSessionFileIdsForSessionKey(sessionKey, sessionsDir)[0] || null;
+}
+
+function mapTrajectoryRuntimeMessage(rawMessage: any, fallbackId: string, fallbackTimestamp: unknown): any | null {
+  if (!rawMessage || typeof rawMessage !== 'object') return null;
+  const role = rawMessage.role;
+  const timestamp = rawMessage.timestamp || fallbackTimestamp;
+  const id = typeof rawMessage.id === 'string' && rawMessage.id.trim()
+    ? rawMessage.id.trim()
+    : (typeof rawMessage.responseId === 'string' && rawMessage.responseId.trim() ? rawMessage.responseId.trim() : fallbackId);
+
+  if (role === 'user') {
+    const text = extractText(rawMessage.content);
+    if (!text || isHiddenHistoryArtifactText(text)) return null;
+    return { id, role: 'user', content: text, timestamp, provenance: 'trajectory-recovery' };
   }
-  // Try sessionKey directly as filename
-  const directFile = path.join(sessionsDir, `${sessionKey}.jsonl`);
-  if (existsSync(directFile)) return sessionKey;
-  // Extract the trailing UUID from agent:<agentId>:<fileId> format
-  const parts = sessionKey.split(':');
-  if (parts.length >= 3) {
-    const fileId = parts.slice(2).join(':');
-    const agentFile = path.join(sessionsDir, `${fileId}.jsonl`);
-    if (existsSync(agentFile)) return fileId;
+
+  if (role === 'assistant') {
+    const content = rawMessage.content;
+    const executedModel = normalizeGatewayModelId(rawMessage.model ?? rawMessage.modelId ?? rawMessage.actualModel);
+
+    if (Array.isArray(content)) {
+      const toolCalls: any[] = [];
+      const thinkingBlocks: string[] = [];
+      const textBlocks: string[] = [];
+
+      for (const block of content) {
+        if (block?.type === 'text' && typeof block.text === 'string') textBlocks.push(block.text);
+        if (block?.type === 'thinking' && (typeof block.thinking === 'string' || typeof block.text === 'string')) {
+          thinkingBlocks.push(typeof block.thinking === 'string' ? block.thinking : block.text);
+        }
+        if (block?.type === 'toolCall' && block.name) {
+          toolCalls.push({ id: block.id, name: block.name, arguments: block.arguments });
+        }
+      }
+
+      const text = extractSanitizedText(textBlocks.join('\n'));
+      const thinkingContent = extractSanitizedText(thinkingBlocks.join('\n'));
+      const hasVisibleText = Boolean(text) && !isControlOnlyAssistantText(text) && !isHiddenHistoryArtifactText(text);
+      const hasVisibleThinking = Boolean(thinkingContent) && !isHiddenHistoryArtifactText(thinkingContent);
+      if (!hasVisibleText && !hasVisibleThinking && toolCalls.length === 0) return null;
+
+      return {
+        id,
+        role: 'assistant',
+        content: hasVisibleText ? text : '',
+        model: executedModel,
+        thinkingContent: hasVisibleThinking ? thinkingContent : undefined,
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        timestamp,
+        provenance: 'trajectory-recovery',
+      };
+    }
+
+    const text = extractText(content);
+    if (!text || isControlOnlyAssistantText(text) || isHiddenHistoryArtifactText(text)) return null;
+    return { id, role: 'assistant', content: text, model: executedModel, timestamp, provenance: 'trajectory-recovery' };
   }
+
+  if (role === 'toolResult') {
+    return {
+      id,
+      role: 'toolResult',
+      toolCallId: rawMessage.toolCallId,
+      toolName: rawMessage.toolName,
+      content: extractText(rawMessage.content),
+      timestamp,
+      provenance: 'trajectory-recovery',
+    };
+  }
+
   return null;
+}
+
+function readTrajectoryMessagesForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
+  const variants = new Set(getSessionKeyLookupVariants(sessionKey));
+  if (variants.size === 0 || !existsSync(sessionsDir)) return [];
+
+  const rawMessages: any[] = [];
+  let entries: any[] = [];
+  try {
+    entries = readdirSync(sessionsDir, { withFileTypes: true }) as any[];
+  } catch {
+    return [];
+  }
+
+  for (const entry of entries) {
+    if (!entry.isFile?.() || !entry.name.endsWith('.trajectory.jsonl')) continue;
+    const filePath = path.join(sessionsDir, entry.name);
+    let raw = '';
+    try {
+      raw = readFileSync(filePath, 'utf-8');
+    } catch {
+      continue;
+    }
+    const variantList = Array.from(variants);
+    if (!variantList.some((key) => raw.includes(key))) continue;
+
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line || !variantList.some((key) => line.includes(key))) continue;
+      try {
+        const parsed = JSON.parse(line);
+        const key = typeof parsed?.sessionKey === 'string' ? parsed.sessionKey.trim() : '';
+        if (!key || !variants.has(key)) continue;
+        const snapshot = Array.isArray(parsed?.data?.messagesSnapshot) ? parsed.data.messagesSnapshot : [];
+        snapshot.forEach((message: any, index: number) => {
+          const mapped = mapTrajectoryRuntimeMessage(message, `trajectory-${parsed.runId || entry.name}-${index}`, message?.timestamp || parsed.ts);
+          if (mapped) rawMessages.push(mapped);
+        });
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  const seen = new Set<string>();
+  const deduped = rawMessages
+    .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp))
+    .filter((message) => {
+      const toolNames = Array.isArray(message?.toolCalls) ? message.toolCalls.map((tool: any) => tool?.name || '').join(',') : '';
+      const key = [message?.role || '', toHistoryTimestampMs(message?.timestamp), message?.content || '', message?.toolName || '', toolNames].join('::');
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+  return hydrateHistoryToolCalls(deduped).slice(-Math.max(limit, 1));
+}
+
+function readBestOpenClawSessionMessagesForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
+  const candidates = findSessionFileIdsForSessionKey(sessionKey, sessionsDir);
+  const seen = new Set<string>();
+  const combined: any[] = [];
+
+  const pushMessage = (message: any) => {
+    const toolNames = Array.isArray(message?.toolCalls) ? message.toolCalls.map((tool: any) => tool?.name || '').join(',') : '';
+    const contentKey = [message?.role || '', toHistoryTimestampMs(message?.timestamp), message?.content || '', message?.toolName || '', toolNames].join('::');
+    const messageId = typeof message?.id === 'string' ? message.id.trim() : '';
+    const key = contentKey || messageId;
+    if (key && seen.has(key)) return;
+    if (key) seen.add(key);
+    combined.push(message);
+  };
+
+  for (const sessionId of candidates) {
+    const messages = readSessionMessagesEnhanced(sessionId, limit, sessionsDir);
+    for (const message of messages) pushMessage(message);
+  }
+
+  for (const message of readTrajectoryMessagesForSessionKey(sessionKey, limit, sessionsDir)) {
+    pushMessage(message);
+  }
+
+  combined.sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
+  return combined.slice(-Math.max(limit, 1));
 }
 
 const PROVENANCE: Record<string, string> = {
@@ -1748,12 +2006,10 @@ router.get('/health', authenticateToken, async (_req: Request, res: Response) =>
 
     if (connected) {
       try {
-        const modelsResult = await gatewayRpcCall('models.list', {});
-        if (modelsResult.ok && Array.isArray(modelsResult.data?.models)) {
-          modelCount = modelsResult.data.models.length;
-          modelsConfigured = modelCount > 0;
-        }
-      } catch { /* gateway may not support models.list — treat as unknown */ }
+        const models = await listProviderModels('OPENCLAW');
+        modelCount = models.length;
+        modelsConfigured = modelCount > 0;
+      } catch { /* model catalog may be temporarily unavailable — treat as unknown */ }
 
       if (!modelsConfigured) {
         issues.push('No AI models configured. Run "openclaw onboard" on the server to set up API keys.');
@@ -2066,9 +2322,48 @@ async function getUsageStatsSnapshot(selectedAgent: string) {
       const sessionsResult = await gatewayRpcCall('sessions.list', {}, 10000);
       if (sessionsResult.ok && Array.isArray(sessionsResult.data?.sessions)) {
         sessions = sessionsResult.data.sessions;
+      } else if (sessionsResult.ok && sessionsResult.data?.agents && typeof sessionsResult.data.agents === 'object') {
+        sessions = Object.values(sessionsResult.data.agents).flatMap((agent: any) => Array.isArray(agent?.sessions) ? agent.sessions : []);
       }
     } catch {
-      // continue with empty sessions
+      // continue with CLI fallback
+    }
+
+    if (!sessions.length) {
+      try {
+        const agentsDir = path.join(process.env.HOME || '/root', '.openclaw/agents');
+        const collected: any[] = [];
+        if (existsSync(agentsDir)) {
+          for (const agentId of readdirSync(agentsDir)) {
+            const sessionsFile = path.join(agentsDir, agentId, 'sessions', 'sessions.json');
+            if (!existsSync(sessionsFile)) continue;
+            const raw = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
+            const source = Array.isArray(raw?.sessions) ? raw.sessions : raw;
+            const entries = Array.isArray(source) ? source : Object.values(source || {});
+            for (const session of entries as any[]) {
+              if (!session) continue;
+              collected.push({ ...session, agentId: session.agentId || agentId });
+            }
+          }
+        }
+        sessions = collected;
+      } catch {
+        // continue with CLI fallback
+      }
+    }
+
+    if (!sessions.length) {
+      try {
+        const sessionsRaw = execSync('openclaw sessions --json --all-agents 2>/dev/null', { timeout: 30000, encoding: 'utf-8', env: buildOpenClawCliEnv() });
+        const parsed = JSON.parse(sessionsRaw.trim());
+        if (Array.isArray(parsed.sessions)) {
+          sessions = parsed.sessions;
+        } else if (parsed.agents && typeof parsed.agents === 'object') {
+          sessions = Object.values(parsed.agents).flatMap((agent: any) => Array.isArray(agent?.sessions) ? agent.sessions : []);
+        }
+      } catch {
+        // continue with empty sessions
+      }
     }
 
     let cronJobs: any[] = [];

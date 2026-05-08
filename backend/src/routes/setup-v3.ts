@@ -791,10 +791,12 @@ router.post('/install-mail', requireSetupPending, requireSetupToken, async (req:
     }
 
     const writeStalwartConfig = () => {
+      // Pin Stalwart: v0.16 removed the legacy admin API endpoints this installer uses
+      // for domain/account provisioning. Do not use `latest` here.
       const composeContent = `version: '3.8'
 services:
   stalwart:
-    image: stalwartlabs/stalwart:latest
+    image: stalwartlabs/stalwart:v0.15.5
     container_name: stalwart-mail
     restart: unless-stopped
     ports:

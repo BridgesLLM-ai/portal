@@ -8,8 +8,8 @@ interface CompactionNoticeBlockProps {
   size?: 'default' | 'compact';
 }
 
-const COMPACTION_ACTIVE_RE = /\b(compacting context|auto-compaction|context compaction|compaction (?:in progress|started)|preparing context maintenance|preparing compaction|context maintenance in progress)\b/i;
-const COMPACTION_COMPLETE_RE = /\b(context compacted|compaction (?:complete(?:d)?|finished))\b/i;
+const COMPACTION_ACTIVE_RE = /\b(compacting context|auto-compaction|context compaction|compaction (?:in progress|started)|preparing context maintenance|preparing compaction|context maintenance in progress|memory flush(?: started| in progress)?|heartbeat check started)\b/i;
+const COMPACTION_COMPLETE_RE = /\b(context compacted|compaction (?:complete(?:d)?|finished)|memory flush complete(?:d)?|heartbeat check complete(?:d)?)\b/i;
 
 function getCompactionIcon(content: string) {
   if (COMPACTION_COMPLETE_RE.test(content)) {

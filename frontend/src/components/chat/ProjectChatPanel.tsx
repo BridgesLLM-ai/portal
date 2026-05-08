@@ -41,6 +41,7 @@ import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../
 import ComposerStatusBadge from './ComposerStatusBadge';
 import CompactionNoticeBlock from './CompactionNoticeBlock';
 import ToolGlyph from './ToolGlyph';
+import { resolveMaintenanceRailStatus } from './maintenanceRailLifecycle';
 import { getToolPresentation, getToolStatusText, getToolSummary, isCompactionNotice, resolveToolName } from '../../utils/toolPresentation';
 import {
   pruneExpiredExecApprovals,
@@ -93,6 +94,13 @@ const OPENCLAW_FAST_MODE_MODELS = new Set([
 function supportsOpenClawFastModeModel(model?: string | null): boolean {
   const normalized = String(model || '').trim().toLowerCase();
   return OPENCLAW_FAST_MODE_MODELS.has(normalized);
+}
+
+function resolveAvailableModelId(model: string, availableModels: string[]): string {
+  const normalized = canonicalizePortalModelId(model);
+  if (!normalized || normalized.includes('/')) return normalized;
+  const suffix = `/${normalized}`;
+  return availableModels.find((candidate) => candidate.endsWith(suffix)) || normalized;
 }
 
 /* ═══ WS Manager (local, not shared) ═══ */
@@ -284,6 +292,9 @@ function isHiddenHistoryArtifactText(text: string): boolean {
     /^An async command you ran earlier has completed\./i,
     /^Read HEARTBEAT\.md if it exists/i,
     /^HEARTBEAT_OK$/i,
+    /^Heartbeat check complete(?:d)?\.?$/i,
+    /^Pre-compaction memory flush\./i,
+    /^Memory flush complete(?:d)?\.?$/i,
     /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i,
     /Handle the result internally\./i,
     /Sender \(untrusted metadata\):/i,
@@ -307,6 +318,22 @@ function summarizeHiddenHistoryArtifactText(text: string): string | null {
     return 'Earlier async command completed';
   }
 
+  if (/^Read HEARTBEAT\.md if it exists/i.test(normalized)) {
+    return 'Heartbeat check started';
+  }
+
+  if (/^HEARTBEAT_OK$/i.test(normalized) || /^Heartbeat check complete(?:d)?\.?$/i.test(normalized)) {
+    return 'Heartbeat check completed';
+  }
+
+  if (/^Pre-compaction memory flush\./i.test(normalized)) {
+    return 'Memory flush started';
+  }
+
+  if (/^Memory flush complete(?:d)?\.?$/i.test(normalized)) {
+    return 'Memory flush completed';
+  }
+
   return null;
 }
 
@@ -326,10 +353,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
   if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(rawContent) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
     return null;
   }
-  if (m.role === 'assistant' && !isTruncationPlaceholder && isHiddenHistoryArtifactText(sanitizedHistoryText) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
-    return null;
-  }
-  if ((m.role === 'user' || m.role === 'system') && isHiddenHistoryArtifactText(sanitizedHistoryText)) {
+  if (!isTruncationPlaceholder && isHiddenHistoryArtifactText(sanitizedHistoryText) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
     const summary = summarizeHiddenHistoryArtifactText(sanitizedHistoryText);
     if (!summary) return null;
     return {
@@ -776,6 +800,57 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       });
   }, [appendSystemNotice, projectName]);
 
+  const applyMaintenanceState = useCallback((update: {
+    phase: 'start' | 'end';
+    content?: string | null;
+    completed?: boolean;
+    maintenanceKind?: 'compaction' | 'maintenance';
+  }) => {
+    const content = String(update.content || '').trim();
+    const completed = update.completed !== false;
+    const maintenanceKind = update.maintenanceKind || 'maintenance';
+
+    if (update.phase === 'start') {
+      const noticeText = content || (maintenanceKind === 'compaction' ? 'Compacting context…' : 'Context maintenance in progress…');
+      if (compactionTimerRef.current) {
+        clearTimeout(compactionTimerRef.current);
+        compactionTimerRef.current = null;
+      }
+      compactionPhaseRef.current = 'compacting';
+      setCompactionPhase('compacting');
+      setStatusText(noticeText);
+      setThinkingContent('');
+      return;
+    }
+
+    if (completed && maintenanceKind === 'compaction') {
+      const noticeText = content || 'Context compacted';
+      compactionPhaseRef.current = 'compacted';
+      setCompactionPhase('compacted');
+      setStatusText(noticeText);
+      if (!content) appendSystemNotice(noticeText, 'compaction');
+      if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
+      compactionTimerRef.current = setTimeout(() => {
+        compactionPhaseRef.current = 'idle';
+        setCompactionPhase('idle');
+        setStatusText((prev) => (prev === noticeText ? null : prev));
+        compactionTimerRef.current = null;
+      }, 3000);
+      return;
+    }
+
+    const noticeText = content || 'Context maintenance finished.';
+    compactionPhaseRef.current = 'idle';
+    setCompactionPhase('idle');
+    setStatusText(noticeText);
+    appendSystemNotice(noticeText, 'hidden-history-artifact');
+    if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
+    compactionTimerRef.current = setTimeout(() => {
+      setStatusText((prev) => (prev === noticeText ? null : prev));
+      compactionTimerRef.current = null;
+    }, 3000);
+  }, [appendSystemNotice]);
+
   const applyCompactionSnapshotState = useCallback((phase?: unknown) => {
     if (phase !== 'idle' && phase !== 'compacting' && phase !== 'compacted') return;
     if (compactionTimerRef.current) {
@@ -875,8 +950,9 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     setAvailableModels(models);
     // If no model selected or selected model isn't available, pick the first discovered option
     setSelectedModel(prev => {
-      if (prev && models.includes(prev)) return prev;
-      return prev || models[0] || '';
+      const resolved = resolveAvailableModelId(prev, models);
+      if (resolved && models.includes(resolved)) return resolved;
+      return resolved || models[0] || '';
     });
     return models;
   }, []);
@@ -1281,10 +1357,16 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         break;
       }
       case 'status': {
+        const maintenanceRail = resolveMaintenanceRailStatus(data);
+        if (maintenanceRail.update) {
+          applyMaintenanceState(maintenanceRail.update);
+        }
+
         if (!assistantId && !isStreamActiveRef.current) break;
         clearResumeSeededContent(assistantId);
-        setStatusText(data.content || null);
-        if (!assembledRef.current) setStreamingPhase('thinking');
+        setStatusText(maintenanceRail.displayStatusText);
+        if (activeToolName) setStreamingPhase('tool');
+        else if (!assembledRef.current) setStreamingPhase('thinking');
         break;
       }
       case 'thinking': {
@@ -1314,7 +1396,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         if (completed) {
           compactionPhaseRef.current = 'compacted';
           setCompactionPhase('compacted');
-          if (!data.content) appendSystemNotice(noticeText, 'compaction');
+          appendSystemNotice(noticeText, 'compaction');
         } else {
           compactionPhaseRef.current = 'idle';
           setCompactionPhase('idle');
@@ -1607,7 +1689,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       case 'keepalive':
         break;
     }
-  }, [activeToolName, clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent, finalizeStreamingAssistant, requestAutoCommit]);
+  }, [activeToolName, applyMaintenanceState, clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent, finalizeStreamingAssistant, requestAutoCommit]);
 
   const handleWsEventRef = useRef(handleWsEvent);
   useEffect(() => { handleWsEventRef.current = handleWsEvent; }, [handleWsEvent]);
@@ -1626,11 +1708,9 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setWsConnected(false);
         setConnectionNotice('Connecting to project agent…');
 
-        const preferredModel = canonicalizePortalModelId(modelRef.current || '');
-
         const { data } = await client.post(
           `/projects/${projectName}/assistant/ensure-session`,
-          preferredModel ? { model: preferredModel } : {}
+          {}
         );
         if (cancelled || historyGenRef.current !== myGen) return;
 
@@ -1772,7 +1852,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       session: sk,
       provider: 'OPENCLAW',
       agentId: agentId,
-      model: modelRef.current,
+      model: resolveAvailableModelId(modelRef.current, availableModels),
     });
 
     if (!sent) {
@@ -1806,7 +1886,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     resetWatchdog();
     setConnectionNotice(null);
     return true;
-  }, [agentId, resetWatchdog]);
+  }, [agentId, availableModels, resetWatchdog]);
 
   // ── Cancel stream ──
   const cancelStream = useCallback(() => {
@@ -1854,7 +1934,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       lastRawTextLenRef.current = 0;
 
       // Re-ensure session (gets fresh sessionKey after reset)
-      const { data } = await client.post(`/projects/${projectName}/assistant/ensure-session`, { model: modelRef.current });
+      const { data } = await client.post(`/projects/${projectName}/assistant/ensure-session`, {});
       setSessionKey(data.sessionKey);
       setAgentId(data.agentId);
       sessionKeyRef.current = data.sessionKey;
@@ -2137,8 +2217,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   // ── Model change ──
   const handleModelChange = useCallback(async (newModel: string) => {
     const normalizedModel = canonicalizePortalModelId(newModel);
+    if (normalizedModel === modelRef.current) return;
     setSelectedModel(normalizedModel);
-    // Patch the session model
+    modelRef.current = normalizedModel;
+    // Patch the session model only for an actual user-initiated model change.
     if (sessionKeyRef.current) {
       try {
         await client.post(`/projects/${projectName}/assistant/ensure-session`, { model: normalizedModel });
@@ -2556,7 +2638,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
       {/* Stream status rail */}
       <AnimatePresence>
-        {(isRunning || compactionPhase !== 'idle' || (!wsConnected && Boolean(connectionNotice))) && (
+        {(isRunning || compactionPhase !== 'idle' || Boolean(statusText) || (!wsConnected && Boolean(connectionNotice))) && (
           <ComposerStatusBadge
             phase={isRunning ? streamingPhase : 'idle'}
             toolName={activeToolName}

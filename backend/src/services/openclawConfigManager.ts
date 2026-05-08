@@ -24,6 +24,7 @@ export interface AuthProfile {
   expires?: number;
   email?: string;
   accountId?: string;
+  managedBy?: string;
 }
 
 interface AuthProfilesFile {
@@ -69,6 +70,88 @@ export function readOpenClawConfig(): any {
 
 export function readAuthProfiles(): AuthProfilesFile {
   return safeReadJson<AuthProfilesFile>(AUTH_PROFILES_PATH, { version: 2, profiles: {} });
+}
+
+export function getProviderAuthAliases(provider: string): Set<string> {
+  const normalized = String(provider || '').trim();
+  if (normalized === 'anthropic' || normalized === 'claude-cli') {
+    return new Set(['anthropic', 'claude-cli']);
+  }
+  return new Set([normalized]);
+}
+
+export function getStaleProviderProfileIds(
+  profiles: Record<string, Pick<AuthProfile, 'provider'> | undefined>,
+  provider: string,
+  preferredProfileId: string,
+): string[] {
+  const aliases = getProviderAuthAliases(provider);
+  return Object.keys(profiles || {}).filter((profileId) => {
+    if (profileId === preferredProfileId) return false;
+    const profileProvider = profiles?.[profileId]?.provider;
+    return typeof profileProvider === 'string' && aliases.has(profileProvider);
+  });
+}
+
+export function cleanupStaleProviderAuthProfiles(
+  provider: string,
+  preferredProfileId: string,
+  mode?: 'api_key' | 'token' | 'oauth',
+): { removedProfileIds: string[] } {
+  const aliases = getProviderAuthAliases(provider);
+  const authProfiles = readAuthProfiles();
+  if (!authProfiles.profiles) authProfiles.profiles = {};
+
+  const preferredProfile = authProfiles.profiles[preferredProfileId];
+  const removedProfileIds = getStaleProviderProfileIds(authProfiles.profiles, provider, preferredProfileId);
+
+  for (const profileId of removedProfileIds) {
+    delete authProfiles.profiles[profileId];
+    if (authProfiles.usageStats) delete authProfiles.usageStats[profileId];
+  }
+
+  if (authProfiles.lastGood) {
+    for (const [lastGoodKey, lastGoodProfileId] of Object.entries(authProfiles.lastGood)) {
+      if (aliases.has(lastGoodKey) || removedProfileIds.includes(lastGoodProfileId)) {
+        delete authProfiles.lastGood[lastGoodKey];
+      }
+    }
+  }
+
+  if (preferredProfile && preferredProfile.provider !== provider && aliases.has(preferredProfile.provider)) {
+    authProfiles.profiles[preferredProfileId] = {
+      ...preferredProfile,
+      provider,
+    };
+  }
+
+  fs.writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(authProfiles, null, 2), 'utf8');
+
+  const config = readOpenClawConfig();
+  if (!config.auth) config.auth = {};
+  if (!config.auth.profiles) config.auth.profiles = {};
+  if (!config.auth.order) config.auth.order = {};
+
+  for (const [profileId, profile] of Object.entries<any>(config.auth.profiles || {})) {
+    if (profileId !== preferredProfileId && aliases.has(profile?.provider)) {
+      delete config.auth.profiles[profileId];
+    }
+  }
+
+  const existingProfile = config.auth.profiles[preferredProfileId] || {};
+  config.auth.profiles[preferredProfileId] = {
+    ...existingProfile,
+    provider,
+    mode: mode || preferredProfile?.type || existingProfile.mode || 'oauth',
+  };
+
+  for (const alias of aliases) {
+    delete config.auth.order[alias];
+  }
+  config.auth.order[provider] = [preferredProfileId];
+
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+  return { removedProfileIds };
 }
 
 export function getDefaultModel(): string | null {
@@ -147,13 +230,7 @@ function writeProviderSecret(options: {
     : { type: 'token', provider, token: secret };
   fs.writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(authData, null, 2), 'utf8');
 
-  const config = readOpenClawConfig();
-  if (!config.auth) config.auth = {};
-  if (!config.auth.profiles) config.auth.profiles = {};
-  config.auth.profiles[profileId] = { provider, mode: authType };
-  if (!config.auth.order) config.auth.order = {};
-  config.auth.order[provider] = [profileId];
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+  cleanupStaleProviderAuthProfiles(provider, profileId, authType);
 
   const apiConfig = PROVIDER_API_CONFIG[provider];
   if (apiConfig) {
@@ -191,24 +268,7 @@ export function saveProviderToken(provider: string, token: string): { profileId:
 }
 
 export function pinProviderAuthProfile(provider: string, profileId: string, mode?: 'api_key' | 'token' | 'oauth') {
-  const config = readOpenClawConfig();
-  if (!config.auth) config.auth = {};
-  if (!config.auth.profiles) config.auth.profiles = {};
-
-  const storedProfile = readAuthProfiles().profiles?.[profileId];
-  const resolvedMode = mode || storedProfile?.type || 'oauth';
-  const existingProfile = config.auth.profiles[profileId] || {};
-
-  config.auth.profiles[profileId] = {
-    ...existingProfile,
-    provider,
-    mode: resolvedMode,
-  };
-
-  if (!config.auth.order) config.auth.order = {};
-  config.auth.order[provider] = [profileId];
-
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+  cleanupStaleProviderAuthProfiles(provider, profileId, mode);
 }
 
 export function getProviderStatuses(): ProviderStatus[] {
@@ -223,7 +283,7 @@ export function getProviderStatuses(): ProviderStatus[] {
   const now = Date.now();
 
   return AI_PROVIDERS.map((provider) => {
-    const providerAliases = provider.id === 'anthropic' ? new Set(['anthropic', 'claude-cli']) : new Set([provider.id]);
+    const providerAliases = getProviderAuthAliases(provider.id);
     const matchingConfigProfileId = Object.keys(configProfiles).find((profileId) => providerAliases.has(configProfiles[profileId]?.provider)) || null;
     const matchingStoredProfileId = Object.keys(storedProfiles).find((profileId) => providerAliases.has(storedProfiles[profileId]?.provider)) || null;
     const hasRuntimeProviderConfig = Boolean(modelsData?.providers?.[provider.id]);

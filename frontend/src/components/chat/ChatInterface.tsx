@@ -1238,7 +1238,7 @@ function getOpenClawContextSummary({
   if (!Number.isFinite(ratio) || ratio <= 0) return null;
 
   const normalizedStatus = (statusText || '').toLowerCase();
-  const hasPressureSignal = /context (?:budget|limit|window|maintenance|compaction|flush)|memory flush|running out of context|near(?:ing)? context/i.test(normalizedStatus);
+  const hasPressureSignal = /context (?:budget|limit|window|maintenance|compaction|flush)|memory flush|heartbeat check|running out of context|near(?:ing)? context/i.test(normalizedStatus);
   const percent = Math.round(ratio * 100);
   const remainingTokens = Math.max(0, telemetry.contextTokens - telemetry.totalTokens);
   const detailParts = [

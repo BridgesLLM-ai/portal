@@ -20,9 +20,11 @@ const ERROR_RE = /denied|failed|error|disconnected/;
 const COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction (?:in progress|started))\b/;
 const COMPACTED_RE = /\b(context compacted|compaction (?:complete(?:d)?|finished))\b/;
 const CONTEXT_PRESSURE_RE = /\b(context (?:getting|running) full|context (?:near(?:ing)?|almost) full|approaching (?:the )?context limit|context window (?:is )?(?:near|nearing|almost) full|running out of context|context budget)\b/;
-const FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/;
+const FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|started|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/;
 const FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context)\b/;
 const FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance (?:finished|complete(?:d)?)|compaction (?:incomplete|did not complete))\b/;
+const HEARTBEAT_RUNNING_RE = /\b(heartbeat check started|checking heartbeat|reading heartbeat\.md|heartbeat running)\b/;
+const HEARTBEAT_DONE_RE = /\b(heartbeat check complete(?:d)?|heartbeat_ok)\b/;
 
 function normalizeStatusText(statusText?: string | null): string {
   const raw = String(statusText || '').trim();
@@ -57,6 +59,8 @@ export function getStreamStatusPresentation({
     || FLUSH_RUNNING_RE.test(normalizedStatus)
     || FLUSH_DONE_RE.test(normalizedStatus)
     || FLUSH_PREPARING_RE.test(normalizedStatus)
+    || HEARTBEAT_RUNNING_RE.test(normalizedStatus)
+    || HEARTBEAT_DONE_RE.test(normalizedStatus)
     || CONTEXT_PRESSURE_RE.test(normalizedStatus);
   const displayStatus = phase === 'idle' ? rawStatus : (connectedLike ? '' : rawStatus);
 
@@ -124,6 +128,24 @@ export function getStreamStatusPresentation({
       bounce: false,
       showQueueMeta: false,
     };
+  } else if (HEARTBEAT_RUNNING_RE.test(normalizedStatus)) {
+    tone = {
+      ...tones.info,
+      icon: 'spinner',
+      label: displayStatus || 'Heartbeat check running…',
+      detail: 'The agent is doing scheduled maintenance without interrupting the chat.',
+      bounce: false,
+      showQueueMeta: false,
+    };
+  } else if (HEARTBEAT_DONE_RE.test(normalizedStatus)) {
+    tone = {
+      ...tones.info,
+      icon: 'check',
+      label: displayStatus || 'Heartbeat check complete',
+      detail: null,
+      bounce: false,
+      showQueueMeta: false,
+    };
   } else if (phase === 'tool') {
     const toolLabel = toolName ? getToolPresentation(toolName).label : 'Tool';
     const toolDisplayName = toolName ? getToolDisplayName(toolName) : 'tool';
@@ -156,21 +178,21 @@ export function getStreamStatusPresentation({
       bounce: false,
       showQueueMeta: false,
     };
-  } else if (FLUSH_RUNNING_RE.test(normalizedStatus)) {
-    tone = {
-      ...tones.info,
-      icon: 'spinner',
-      label: displayStatus || 'Context maintenance in progress…',
-      detail: 'The run is still active. Tool calls stay visible while memory is flushed.',
-      bounce: false,
-      showQueueMeta: false,
-    };
   } else if (FLUSH_DONE_RE.test(normalizedStatus)) {
     tone = {
       ...tones.info,
       icon: 'check',
       label: displayStatus || 'Context maintenance finished.',
       detail: 'The agent should continue shortly.',
+      bounce: false,
+      showQueueMeta: false,
+    };
+  } else if (FLUSH_RUNNING_RE.test(normalizedStatus)) {
+    tone = {
+      ...tones.info,
+      icon: 'spinner',
+      label: displayStatus || 'Context maintenance in progress…',
+      detail: 'The run is still active. Tool calls stay visible while memory is flushed.',
       bounce: false,
       showQueueMeta: false,
     };

@@ -1,4 +1,9 @@
-import { hasAnthropicClaudeCliReferences, isClaudeCliModelId } from '../services/openclawConfigManager';
+import {
+  getProviderAuthAliases,
+  getStaleProviderProfileIds,
+  hasAnthropicClaudeCliReferences,
+  isClaudeCliModelId,
+} from '../services/openclawConfigManager';
 
 describe('openclawConfigManager Claude CLI helpers', () => {
   test('detects claude-cli model ids', () => {
@@ -37,5 +42,32 @@ describe('openclawConfigManager Claude CLI helpers', () => {
         },
       },
     })).toBe(false);
+  });
+});
+
+describe('openclawConfigManager auth profile cleanup helpers', () => {
+  test('marks stale same-provider Codex profiles without touching OpenAI API-key profiles', () => {
+    const stale = getStaleProviderProfileIds({
+      'openai-codex:default': { provider: 'openai-codex' },
+      'openai-codex:user@example.com': { provider: 'openai-codex' },
+      'openai:default': { provider: 'openai' },
+      'google-gemini-cli:default': { provider: 'google-gemini-cli' },
+    }, 'openai-codex', 'openai-codex:user@example.com');
+
+    expect(stale).toEqual(['openai-codex:default']);
+  });
+
+  test('treats Claude CLI imports as Anthropic profiles for replacement cleanup', () => {
+    const stale = getStaleProviderProfileIds({
+      'anthropic:manual': { provider: 'anthropic' },
+      'anthropic:claude-cli': { provider: 'claude-cli' },
+      'openai-codex:default': { provider: 'openai-codex' },
+    }, 'anthropic', 'anthropic:claude-cli');
+
+    expect(stale).toEqual(['anthropic:manual']);
+  });
+
+  test('uses the same Anthropic cleanup aliases when called from the Claude CLI provider side', () => {
+    expect(Array.from(getProviderAuthAliases('claude-cli')).sort()).toEqual(['anthropic', 'claude-cli']);
   });
 });

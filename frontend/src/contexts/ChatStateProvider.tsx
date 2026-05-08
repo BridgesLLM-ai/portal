@@ -333,6 +333,9 @@ function isHiddenHistoryArtifactText(text: string): boolean {
     /^An async command you ran earlier has completed\./i,
     /^Read HEARTBEAT\.md if it exists/i,
     /^HEARTBEAT_OK$/i,
+    /^Heartbeat check complete(?:d)?\.?$/i,
+    /^Pre-compaction memory flush\./i,
+    /^Memory flush complete(?:d)?\.?$/i,
     /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i,
     /Handle the result internally\./i,
     /Sender \(untrusted metadata\):/i,
@@ -354,6 +357,22 @@ function summarizeHiddenHistoryArtifactText(text: string): string | null {
 
   if (/^An async command you ran earlier has completed\./i.test(normalized)) {
     return 'Earlier async command completed';
+  }
+
+  if (/^Read HEARTBEAT\.md if it exists/i.test(normalized)) {
+    return 'Heartbeat check started';
+  }
+
+  if (/^HEARTBEAT_OK$/i.test(normalized) || /^Heartbeat check complete(?:d)?\.?$/i.test(normalized)) {
+    return 'Heartbeat check completed';
+  }
+
+  if (/^Pre-compaction memory flush\./i.test(normalized)) {
+    return 'Memory flush started';
+  }
+
+  if (/^Memory flush complete(?:d)?\.?$/i.test(normalized)) {
+    return 'Memory flush completed';
   }
 
   return null;
@@ -962,9 +981,9 @@ const LIFECYCLE_CONTROL_TOKENS = new Set([
   'compacted',
 ]);
 
-const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/i;
+const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|started|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/i;
 const LIFECYCLE_FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context)\b/i;
-const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance (?:finished|complete(?:d)?)|compaction (?:incomplete|did not complete))\b/i;
+const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance (?:finished|complete(?:d)?)|compaction (?:incomplete|did not complete)|heartbeat check complete(?:d)?)\b/i;
 const LIFECYCLE_COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction (?:in progress|started))\b/i;
 const LIFECYCLE_COMPACTED_RE = /\b(context compacted|compaction (?:complete(?:d)?|finished))\b/i;
 
@@ -1781,7 +1800,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       compactionPhaseRef.current = 'compacted';
       setCompactionPhase('compacted');
       setStatusText(noticeText);
-      if (!content) appendSystemNotice(noticeText, 'compaction');
+      appendSystemNotice(noticeText, 'compaction');
       if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
       compactionTimerRef.current = setTimeout(() => {
         compactionPhaseRef.current = 'idle';
@@ -1796,6 +1815,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     compactionPhaseRef.current = 'idle';
     setCompactionPhase('idle');
     setStatusText(noticeText);
+    appendSystemNotice(noticeText, 'hidden-history-artifact');
     if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
     compactionTimerRef.current = setTimeout(() => {
       setStatusText((prev) => (prev === noticeText ? null : prev));

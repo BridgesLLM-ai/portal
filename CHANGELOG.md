@@ -2,6 +2,21 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.10] — 2026-05-08
+
+### Fixed
+- **Project chat now shows Gemini CLI-backed replies again**: project assistant polling falls back through OpenClaw gateway history and Gemini CLI transcripts when the gateway session registry points at a missing local JSONL, so real sends no longer complete invisibly.
+- **Project assistant startup no longer self-poisons fresh sessions**: session initialization now avoids the broken legacy chat-completions warmup path, records the selected model locally, and resumes existing project agents without blocking on slow config round-trips.
+- **OpenClaw runtime maintenance now has honest status rails**: heartbeat checks, memory flushes, context maintenance, and compaction events now surface as maintenance indicators instead of being replayed as fake chat content or generic thinking state.
+- **Project-agent rails keep tool activity visible during maintenance**: running tool labels stay visible while OpenClaw performs memory/context maintenance, with finished maintenance shown as a completed rail instead of a stuck spinner.
+- **Fresh mail setup no longer depends on Stalwart `latest`**: setup and Settings mail installers now pin `stalwartlabs/stalwart:v0.15.5`, avoiding the newer Stalwart admin API drift that broke domain provisioning on fresh installs.
+- **Agent Chat history recovery is more resilient for reused OpenClaw session aliases**: history loading now resolves `new-*` / `portal-new-*` aliases and recovers transcript messages from matching trajectory snapshots when the session registry points at a stale or stub session.
+
+### Improved
+- **Gateway metadata calls are bounded and less disruptive**: project chat and telemetry prefer direct session describes, reuse the persistent gateway WebSocket, and fall back to local session registry data when metadata is temporarily slow instead of turning harmless refreshes into user-visible failures.
+- **AI setup cleans stale provider auth state when pinning OAuth credentials**: successful provider setup now removes same-provider stale profiles and usage metadata while preserving unrelated providers, making provider status and default routing less ambiguous after reconnects.
+- **Regression coverage now protects the maintenance rail and Stalwart image pin paths**: targeted rail assertions and backend tests cover maintenance/tool rail behavior and prevent accidental reintroduction of drifting mail-server tags.
+
 ## [3.25.9] — 2026-05-06
 
 ### Fixed

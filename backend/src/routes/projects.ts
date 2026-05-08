@@ -8,16 +8,14 @@ import rateLimit from 'express-rate-limit';
 import { authenticateToken, browserAuthRedirect } from '../middleware/auth';
 import { requireApproved } from '../middleware/requireApproved';
 import { prisma } from '../config/database';
-import { getOpenClawApiUrl } from '../config/openclaw';
 import { nanoid } from 'nanoid';
 import { gatewayRpcCall, patchSessionModel, getSessionInfo, listGatewayModels, deleteSession } from '../utils/openclawGatewayRpc';
 import { detectDeployType, allocatePort, startApp, stopApp, getAppStatus, getAppPort, listRunningApps } from '../services/app-process.service';
 import { getWorkspaceOwnerId } from '../utils/workspaceScope';
 import extract from 'extract-zip';
-import { getGatewayToken } from '../utils/gatewayToken';
 import { desktopExec, desktopExecDetached } from '../utils/desktopEnv';
 import { getDefaultModel, getProviderStatuses } from '../services/openclawConfigManager';
-import { normalizePortalModelId } from '../utils/openclawCli';
+import { canonicalizeProviderModelId, normalizePortalModelId } from '../utils/openclawCli';
 
 /** Shell-escape a filename for safe use in execSync commands */
 function shellEscape(s: string): string {
@@ -3357,7 +3355,22 @@ async function ensureProjectAgent(
 
   // Fast path: already known from this process lifetime
   if (knownAgentIds.has(agentId)) {
-    await updateProjectAgentBindIfPresent(userId, stableSlug, projectDirName);
+    updateProjectAgentBindIfPresent(userId, stableSlug, projectDirName).catch((err) => {
+      console.warn('[ensureProjectAgent] Background bind refresh failed:', err?.message || err);
+    });
+    syncProjectAgentRuntimeFiles(agentId);
+    return { agentId, created: false };
+  }
+
+  // Fast path after backend restart: OpenClaw persists materialized agents on
+  // disk, but config.get can temporarily time out while the gateway is busy.
+  // If the agent directory already exists, do not block project chat startup on
+  // a config round-trip; refresh the bind best-effort in the background.
+  if (fs.existsSync(path.join(OPENCLAW_HOME, 'agents', agentId))) {
+    knownAgentIds.add(agentId);
+    updateProjectAgentBindIfPresent(userId, stableSlug, projectDirName).catch((err) => {
+      console.warn('[ensureProjectAgent] Background bind refresh failed:', err?.message || err);
+    });
     syncProjectAgentRuntimeFiles(agentId);
     return { agentId, created: false };
   }
@@ -3513,12 +3526,16 @@ async function getOrCreateSession(
     }
   } catch {}
   
-  // Check if gateway actually has this session (handles gateway restarts)
-  let gatewayHasSession = false;
-  try {
-    const result = await getSessionInfo(sessionKey);
-    gatewayHasSession = result.ok && !!result.data;
-  } catch {}
+  // Avoid blocking project chat startup on gateway metadata RPCs. A locally
+  // initialized project can be resumed/materialized by OpenClaw on the next
+  // send, and sessions.list can time out on busy gateways.
+  let gatewayHasSession = localInitialized;
+  if (!localInitialized) {
+    try {
+      const result = await getSessionInfo(sessionKey);
+      gatewayHasSession = result.ok && !!result.data;
+    } catch {}
+  }
   
   const needsInit = !localInitialized || !gatewayHasSession;
   
@@ -3569,107 +3586,69 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
     // when one already exists, and only fall back to the configured gateway
     // default for brand-new / unset sessions.
     const requestedModel = normalizePortalModelId(req.body?.model || '');
-    let currentSessionModel = '';
+    const sessionStatePath = path.join(projectDir, '.agent-session.json');
+    let storedSessionModel = '';
     try {
-      const sessionInfo = await getSessionInfo(sessionKey);
-      currentSessionModel = normalizePortalModelId(sessionInfo.ok ? String(sessionInfo.data?.model || '') : '');
+      if (fs.existsSync(sessionStatePath)) {
+        const meta = JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8'));
+        storedSessionModel = normalizePortalModelId(meta.model || '');
+      }
     } catch {}
+    let currentSessionModel = '';
+    if (requestedModel) {
+      try {
+        const sessionInfo = await getSessionInfo(sessionKey);
+        if (sessionInfo.ok) {
+          const rawModel = String(sessionInfo.data?.model || '');
+          const provider = String(
+            sessionInfo.data?.modelProvider
+            || sessionInfo.data?.currentModel?.provider
+            || sessionInfo.data?.agentRuntime?.id
+            || ''
+          );
+          currentSessionModel = canonicalizeProviderModelId(provider, rawModel) || normalizePortalModelId(rawModel);
+        }
+      } catch {}
+    }
 
-    const selectedModel = requestedModel || currentSessionModel || getDefaultModel() || 'openai/gpt-5.4';
+    const selectedModel = requestedModel || currentSessionModel || storedSessionModel || getDefaultModel() || 'openai/gpt-5.4';
 
     // Patch the session model before any init traffic only when the caller asked
     // for a specific model or when a new/empty session still needs its first
     // concrete model. Do not silently reset an existing session back to the
     // gateway default on reload.
-    if (selectedModel && currentSessionModel !== selectedModel && (Boolean(requestedModel) || !currentSessionModel)) {
+    if (requestedModel && selectedModel && currentSessionModel !== selectedModel && storedSessionModel !== selectedModel) {
       try {
         await patchSessionModel(sessionKey, selectedModel);
       } catch {}
     }
 
-    // If session needs init, send the project context as the first message via gateway RPC
+    // If session needs init, prepare local project state only. Do not send a
+    // background /v1/chat/completions init turn here: that legacy endpoint can
+    // leave project chat stuck in an active "Thinking…" run before the user
+    // sends anything. The dedicated project agent gets its sandbox guidance from
+    // its workspace AGENTS.md; the first real user send carries the task.
     if (needsInit) {
-      const assistantName = await getAssistantName();
-      const projectType = detectProjectType(projectDir);
-      const isDedicatedProjectAgent = agentId !== 'portal';
-      const sandboxProjectDir = isDedicatedProjectAgent ? `/workspace/project/` : `/home/user/projects/${name}/`;
-
-      // Initialize project memory if missing
       const memoryPath = path.join(projectDir, '.agent-memory.md');
       if (!fs.existsSync(memoryPath)) {
         fs.writeFileSync(memoryPath, `# Project Memory — ${name}\n\n## Overview\n(Describe what this project does)\n`, 'utf-8');
       }
 
-      const fileOpsGuidance = isDedicatedProjectAgent
-        ? `**Project File Operations:**\n- Use exec tool for project file reads and writes. Start from /workspace/project or set workdir to /workspace/project before editing.\n- Use shell commands like cat, sed, python, node, perl, tee, or here-docs to inspect and modify files.\n- Never write project files into /workspace root by accident.\n- All real project paths should be under ${sandboxProjectDir}`
-        : `**File Operations:**\n- Use Read tool with file_path to read files. For large files (>1MB), use offset (line number) and limit (max lines) to read in chunks.\n- Use Write tool to create/overwrite files.\n- Use Edit tool for surgical find-and-replace edits.\n- All paths should be absolute: ${sandboxProjectDir}filename.ext`;
+      fs.writeFileSync(sessionStatePath, JSON.stringify({ initialized: true, model: selectedModel, lastActivity: new Date().toISOString(), stableSlug }, null, 2), 'utf-8');
+    }
 
-      const initMessage = `[PORTAL PROJECT CONTEXT]
-You are ${assistantName}, an AI coding assistant working on the project "${name}".
-Project Type: ${projectType}
-Project Directory (inside sandbox): ${sandboxProjectDir}
-
-**CRITICAL: You are sandboxed to this project directory.**
-
-${fileOpsGuidance}
-
-**Commands:**
-- Use exec tool to run shell commands (git, npm, node, ls, grep, find, etc.)
-- ${isDedicatedProjectAgent ? 'Your default shell starts in /workspace, so cd /workspace/project first or set workdir to /workspace/project.' : `Set workdir to ${sandboxProjectDir} or cd there first`}
-- Examples: exec git status, exec npm install, exec ls -la
-
-**Internet:**
-- Use web_search for research
-- Use web_fetch to download documentation or resources
-
-**Project Memory:**
-- Read .agent-memory.md to learn project context
-- Update .agent-memory.md when you learn important patterns or decisions
-
-**Security:** Do not try to access files outside ${sandboxProjectDir} - the sandbox prevents this anyway.
-
-[END CONTEXT]
-
-Hello! I'm ready to help with this project. What would you like to work on?`;
-
-      // Send init via gateway chat completions (fire-and-forget, same as assistant/send)
-      const gatewayToken = getGatewayToken();
-      const gatewayUrl = `${getOpenClawApiUrl()}/v1/chat/completions`;
-
-      const sandboxSystemMessage = {
-        role: 'system' as const,
-        content: isDedicatedProjectAgent
-          ? `You are ${assistantName}, an AI coding assistant sandboxed to ${sandboxProjectDir}. Use exec for project file reads and writes, and always work from /workspace/project when touching project files. The sandbox is enforced at the container level - you cannot escape it.`
-          : `You are ${assistantName}, an AI coding assistant sandboxed to ${sandboxProjectDir}. You have full tool access (Read, Write, Edit, exec, web_search, web_fetch). The sandbox is enforced at the container level - you cannot escape it. Use tools to explore files intelligently instead of having everything embedded in prompts.`
-      };
-
-      // Fire-and-forget init
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60000);
-      fetch(gatewayUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${gatewayToken}`,
-          'x-openclaw-session-key': sessionKey,
-        },
-        body: JSON.stringify({
-          model: selectedModel,
-          messages: [sandboxSystemMessage, { role: 'user', content: initMessage }],
-        }),
-        signal: controller.signal,
-      }).then(() => clearTimeout(timeoutId)).catch(() => clearTimeout(timeoutId));
-
-      // Mark session as initialized
-      const sessionStatePath = path.join(projectDir, '.agent-session.json');
-      fs.writeFileSync(sessionStatePath, JSON.stringify({ initialized: true, lastActivity: new Date().toISOString(), stableSlug }, null, 2), 'utf-8');
+    if (!needsInit && requestedModel) {
+      try {
+        const previous = fs.existsSync(sessionStatePath) ? JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8')) : {};
+        fs.writeFileSync(sessionStatePath, JSON.stringify({ ...previous, initialized: true, model: selectedModel, lastActivity: new Date().toISOString(), stableSlug }, null, 2), 'utf-8');
+      } catch {}
     }
 
     res.json({
       sessionKey,
       agentId,
       model: selectedModel,
-      initialized: !needsInit,
+      initialized: true,
     });
   } catch (error: any) {
     console.error('[ensure-session] Error:', error.message);
@@ -3881,6 +3860,201 @@ const assistantPollLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+function extractGatewayHistoryText(content: any): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((block) => {
+        if (typeof block === 'string') return block;
+        if (typeof block?.text === 'string') return block.text;
+        if (typeof block?.content === 'string') return block.content;
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (typeof content?.text === 'string') return content.text;
+  return '';
+}
+
+function cleanProjectAssistantUserText(text: string): string {
+  const contextEnd = text.indexOf('[END CONTEXT]\n\n');
+  let displayText = contextEnd >= 0 ? text.substring(contextEnd + 15) : text;
+  const metadataEnd = displayText.indexOf('```\n\n');
+  if (/^Sender \(untrusted metadata\):/i.test(displayText) && metadataEnd >= 0) {
+    displayText = displayText.substring(metadataEnd + 5);
+  }
+  displayText = displayText.replace(/^\[[^\]]+\]\s*/, '');
+  const modelNote = displayText.match(/^\[Note: Model switched to [^\]]+\]\n\n/);
+  return (modelNote ? displayText.substring(modelNote[0].length) : displayText).trim();
+}
+
+const GEMINI_CLI_TMP_DIR = path.join(process.env.HOME || '/root', '.gemini', 'tmp');
+const GEMINI_CLI_PROVIDER = 'google-gemini-cli';
+
+function extractProjectGeminiCliSessionId(session: any): string {
+  const bindingSessionId = typeof session?.cliSessionBindings?.[GEMINI_CLI_PROVIDER]?.sessionId === 'string'
+    ? session.cliSessionBindings[GEMINI_CLI_PROVIDER].sessionId.trim()
+    : '';
+  if (bindingSessionId) return bindingSessionId;
+  const legacySessionId = typeof session?.cliSessionIds?.[GEMINI_CLI_PROVIDER] === 'string'
+    ? session.cliSessionIds[GEMINI_CLI_PROVIDER].trim()
+    : '';
+  return legacySessionId;
+}
+
+function readProjectGatewaySessionRegistryEntry(sessionKey: string): any | null {
+  const parts = sessionKey.split(':');
+  const agentId = parts[0] === 'agent' ? parts[1] : '';
+  if (!agentId) return null;
+  const sessionsFile = path.join(process.env.HOME || '/root', '.openclaw', 'agents', agentId, 'sessions', 'sessions.json');
+  try {
+    const sessions = JSON.parse(fs.readFileSync(sessionsFile, 'utf-8'));
+    return sessions?.[sessionKey] || null;
+  } catch {
+    return null;
+  }
+}
+
+function findProjectGeminiTranscript(sessionId: string): string | null {
+  if (!sessionId || !fs.existsSync(GEMINI_CLI_TMP_DIR)) return null;
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: GEMINI_CLI_TMP_DIR, depth: 0 }];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    if (current.depth > 6) continue;
+    let entries: fs.Dirent[] = [];
+    try { entries = fs.readdirSync(current.dir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const fullPath = path.join(current.dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push({ dir: fullPath, depth: current.depth + 1 });
+        continue;
+      }
+      if (!entry.isFile() || (!entry.name.endsWith('.json') && !entry.name.endsWith('.jsonl'))) continue;
+      if (!fullPath.includes(`${path.sep}chats${path.sep}`)) continue;
+      try {
+        const firstLine = fs.readFileSync(fullPath, 'utf-8').split(/\r?\n/, 1)[0];
+        const header = JSON.parse(firstLine || '{}');
+        if (header?.sessionId === sessionId) return fullPath;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+function readProjectGeminiTranscriptMessages(sessionId: string, limit = 200): any[] {
+  const transcriptPath = findProjectGeminiTranscript(sessionId);
+  if (!transcriptPath) return [];
+  try {
+    const lines = fs.readFileSync(transcriptPath, 'utf-8').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const messages: any[] = [];
+    for (const line of lines) {
+      let entry: any;
+      try { entry = JSON.parse(line); } catch { continue; }
+      const type = typeof entry?.type === 'string' ? entry.type.trim().toLowerCase() : '';
+      if (type === 'user') {
+        const content = cleanProjectAssistantUserText(extractGatewayHistoryText(entry.content));
+        if (content) {
+          messages.push({
+            id: typeof entry.id === 'string' ? entry.id : `gemini-user-${messages.length}`,
+            role: 'user',
+            content,
+            timestamp: entry.timestamp,
+            provenance: 'gemini-cli-import',
+          });
+        }
+        continue;
+      }
+      if (type !== 'gemini' && type !== 'model') continue;
+      const content = extractGatewayHistoryText(entry.content).trim();
+      if (!content) continue;
+      messages.push({
+        id: typeof entry.id === 'string' ? entry.id : `gemini-assistant-${messages.length}`,
+        role: 'assistant',
+        content,
+        timestamp: entry.timestamp,
+        model: typeof entry.model === 'string' ? entry.model : undefined,
+        provenance: 'gemini-cli-import',
+      });
+    }
+    return messages.slice(-Math.max(1, limit));
+  } catch {
+    return [];
+  }
+}
+
+async function buildGatewayHistoryPollResponse(sessionKey: string, afterLine: number) {
+  const history = await gatewayRpcCall('chat.history', { sessionKey, limit: 200, maxChars: 200000 }, 8000);
+  if (!history.ok) return null;
+
+  let status = '';
+  let lastActivity = '';
+  let sessionInfoData: any = null;
+  try {
+    const info = await getSessionInfo(sessionKey);
+    if (info.ok && info.data) {
+      sessionInfoData = info.data;
+      status = String(info.data.status || '');
+      const lastActivityMs = Number(info.data.endedAt || info.data.updatedAt || info.data.lastActivityAt || 0);
+      if (lastActivityMs > 0) lastActivity = new Date(lastActivityMs).toISOString();
+    }
+  } catch {}
+
+  let rawMessages = Array.isArray(history.data?.messages) ? history.data.messages : [];
+  if (rawMessages.length === 0) {
+    const registryEntry = readProjectGatewaySessionRegistryEntry(sessionKey);
+    const cliSessionId = extractProjectGeminiCliSessionId(sessionInfoData) || extractProjectGeminiCliSessionId(registryEntry);
+    if (cliSessionId) rawMessages = readProjectGeminiTranscriptMessages(cliSessionId, 200);
+  }
+
+  const normalizedMessages = rawMessages
+    .map((entry: any, index: number) => {
+      const role = typeof entry?.role === 'string' ? entry.role : '';
+      if (role !== 'user' && role !== 'assistant') return null;
+
+      const rawText = extractGatewayHistoryText(entry?.content);
+      const content = role === 'user' ? cleanProjectAssistantUserText(rawText) : rawText.trim();
+      const toolCalls = Array.isArray(entry?.toolCalls)
+        ? entry.toolCalls.map((tool: any) => typeof tool?.name === 'string' ? tool.name : '').filter(Boolean)
+        : [];
+      if (!content && toolCalls.length === 0) return null;
+
+      return {
+        id: typeof entry?.id === 'string' ? entry.id : `history-${index}`,
+        role,
+        content: content || (toolCalls.length ? `🔧 Using ${toolCalls.join(', ')}...` : ''),
+        timestamp: typeof entry?.timestamp === 'string' ? entry.timestamp : new Date().toISOString(),
+        lineIndex: index,
+        ...(toolCalls.length > 0 ? { toolCalls } : {}),
+      };
+    })
+    .filter(Boolean) as Array<{ id: string; role: string; content: string; timestamp: string; lineIndex: number; toolCalls?: string[] }>;
+
+  const latestMessageTs = [...normalizedMessages].reverse().find((message) => message.timestamp)?.timestamp || '';
+  const lastActivityTs = lastActivity || latestMessageTs;
+  const lastActivityMs = lastActivityTs ? Date.parse(lastActivityTs) : NaN;
+  const idleMs = Number.isFinite(lastActivityMs) ? Math.round(Date.now() - lastActivityMs) : null;
+  const hasAssistant = normalizedMessages.some((message) => message.role === 'assistant' && message.content.trim());
+  const isProcessing = /processing|running|active|queued|pending/i.test(status) || (!hasAssistant && normalizedMessages.some((message) => message.role === 'user'));
+  const complete = /done|idle|complete|completed|error|failed|aborted/i.test(status) || (hasAssistant && !isProcessing);
+
+  const activeToolCall = isProcessing
+    ? [...normalizedMessages].reverse().flatMap((message) => message.toolCalls || [])[0] || null
+    : null;
+
+  return {
+    messages: normalizedMessages.filter((message) => message.lineIndex >= afterLine),
+    lineCount: normalizedMessages.length,
+    sessionActive: normalizedMessages.length > 0,
+    complete,
+    isProcessing: !complete && isProcessing,
+    activeToolCall,
+    recentTools: [],
+    lastActivity: lastActivityTs || null,
+    idleMs,
+  };
+}
+
 // GET /api/projects/:name/assistant/poll - Poll for new messages from gateway session JSONL
 // This replaces SSE streaming for long-running sessions (Cloudflare-compatible)
 router.get('/:name/assistant/poll', authenticateToken, assistantPollLimiter, async (req: Request, res: Response) => {
@@ -3930,6 +4104,14 @@ router.get('/:name/assistant/poll', authenticateToken, assistantPollLimiter, asy
     const sessionKey = activeSessionKey;
 
     if (!jsonlPath) {
+      const historyPoll = await buildGatewayHistoryPollResponse(sessionKey, afterLine).catch((error) => {
+        console.warn('[Agent Poll] Gateway history fallback failed:', error?.message || error);
+        return null;
+      });
+      if (historyPoll) {
+        res.json(historyPoll);
+        return;
+      }
       res.json({ messages: [], lineCount: 0, sessionActive: false, complete: false });
       return;
     }
@@ -4099,22 +4281,13 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
     const projectDir = getProjectPath(ownerId, name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
 
-    const selectedModel = normalizePortalModelId(model || '') || getDefaultModel() || 'openai/gpt-5.4';
+    const requestedModel = normalizePortalModelId(model || '');
+    const selectedModel = requestedModel || getDefaultModel() || 'openai/gpt-5.4';
     
     // Get or create session (Phase 2: per-project agent isolation)
     const { sessionKey, agentId, needsInit, stableSlug } = await getOrCreateSession(
       projectDir, ownerId, name
     );
-    
-    const gatewayToken = getGatewayToken();
-    const gatewayUrl = `${getOpenClawApiUrl()}/v1/chat/completions`;
-
-    // Patch model if needed
-    if (selectedModel) {
-      try {
-        await patchSessionModel(sessionKey, selectedModel);
-      } catch {}
-    }
 
     // Check if model changed from last message
     const sessionStatePath = path.join(projectDir, '.agent-session.json');
@@ -4125,7 +4298,16 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
         previousModel = normalizePortalModelId(meta.model || '');
       }
     } catch {}
-    const modelChanged = previousModel && previousModel !== selectedModel;
+    const modelChanged = !previousModel || previousModel !== selectedModel;
+
+    // Patch model only when it actually changed or the caller explicitly asked
+    // for a concrete model on an uninitialized/stale session. Re-patching on
+    // every send turns normal chat into a transport timeout lottery.
+    if (selectedModel && modelChanged) {
+      try {
+        await patchSessionModel(sessionKey, selectedModel);
+      } catch {}
+    }
     
     // Phase 2: dedicated project agents work in /workspace/project/, legacy portal fallback uses /home/user/projects/{name}/
     const isDedicatedProjectAgent = agentId !== 'portal';
@@ -4201,55 +4383,25 @@ ${message}`;
       }
     })();
 
-    // Fire-and-forget: send to gateway without waiting for full response
-    // Use a background request with long timeout
-    const controller = new AbortController();
-    const timeoutMs = selectedModel.includes('ollama') ? 300000 : 600000;
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-    fetch(gatewayUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${gatewayToken}`,
-        'x-openclaw-session-key': sessionKey,
-      },
-      body: JSON.stringify({
-        messages: [sandboxSystemMessage, { role: 'user', content: fullMessage }],
-      }),
-      signal: controller.signal,
-    }).then(async (response) => {
-      clearTimeout(timeoutId);
-      
-      // Extract assistant response and save to DB
-      if (response.ok) {
-        try {
-          const data: any = await response.json();
-          const assistantText = data.choices?.[0]?.message?.content;
-          if (assistantText) {
-            await prisma.projectChatMessage.create({
-              data: { 
-                projectId: name, 
-                userId: ownerId, 
-                sessionKey: sessionId, 
-                role: 'assistant', 
-                content: assistantText.substring(0, 50000) 
-              },
-            });
-          }
-        } catch (dbErr: any) {
-          console.warn('[Agent Send] DB assistant message save failed (non-fatal):', dbErr.message);
-        }
+    // Fire-and-forget via direct gateway RPC.
+    // Do NOT use /v1/chat/completions here: it can leave project chat stuck in
+    // a fake active "Thinking…" state with no real session progress.
+    // Also avoid the portal's long-lived backend websocket here; after gateway
+    // restarts it can lag reconnects while one-shot RPC calls are healthy.
+    void (async () => {
+      try {
+        const rpc = await gatewayRpcCall('chat.send', {
+          sessionKey,
+          message: fullMessage,
+          idempotencyKey: `portal-project-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          deliver: false,
+        }, 30000);
+        if (!rpc.ok) throw new Error(rpc.error || 'chat.send failed');
+        autoCommitProjectChanges(projectDir, ownerId, name, undefined, selectedModel).catch(() => {});
+      } catch (err: any) {
+        console.error(`[Agent Send] Background request failed: ${err?.message || err}`);
       }
-      
-      // Auto-commit after response completes
-      autoCommitProjectChanges(projectDir, ownerId, name, undefined, selectedModel).catch(() => {});
-    }).catch((err) => {
-      clearTimeout(timeoutId);
-      if (err.name !== 'AbortError') {
-        console.error(`[Agent Send] Background request failed: ${err.message}`);
-      }
-    });
+    })();
 
     // Update session state
     const updatedMeta: SessionMeta = {

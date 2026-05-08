@@ -98,6 +98,14 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.10 (May 8, 2026)
+- **Gemini-backed project chat replies are visible again**: project assistant polling now recovers replies from gateway history and Gemini CLI transcripts when OpenClaw does not create the expected session JSONL.
+- **Fresh project assistant sends are less fragile**: startup avoids the broken legacy warmup path, keeps selected models pinned locally, and does not let slow metadata refreshes block real sends.
+- **OpenClaw maintenance rails are explicit now**: heartbeat checks, memory flushes, context maintenance, and compaction show as runtime status rails instead of fake chat content or vague thinking state.
+- **Project-agent tool rails survive maintenance**: running tools stay visible while OpenClaw performs context maintenance, and completed maintenance resolves to a check state instead of a stuck spinner.
+- **Fresh email setup is protected from Stalwart `latest` drift**: the setup wizard and Settings mail installer now pin `stalwartlabs/stalwart:v0.15.5`, the version compatible with the portal’s current domain/account provisioning flow.
+- **Agent Chat history recovery is tougher**: reused `new-*` and `portal-new-*` OpenClaw session aliases can recover messages from matching trajectory snapshots when the session registry points at a stale stub.
+
 ### v3.25.9 (May 6, 2026)
 - **Gemini/OpenClaw turns survive completion now**: when a local session file lags behind the imported Gemini transcript, Agent Chat merges the newer transcript tail instead of dropping the finished assistant reply, tool cards, or visible reasoning after the run ends.
 - **Fresh `new-*` session aliases resolve cleanly across reloads**: the portal now normalizes portal-created OpenClaw session aliases before history reloads and session lookups, which keeps completed turns attached to the right chat.

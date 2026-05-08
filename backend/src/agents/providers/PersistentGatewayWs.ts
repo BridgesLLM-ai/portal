@@ -79,9 +79,9 @@ const LIFECYCLE_CONTROL_TOKENS = new Set([
   'compacted',
 ]);
 
-const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/i;
+const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|started|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/i;
 const LIFECYCLE_FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context)\b/i;
-const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance complete(?:d)?)\b/i;
+const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance complete(?:d)?|heartbeat check complete(?:d)?)\b/i;
 const LIFECYCLE_COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction in progress)\b/i;
 const LIFECYCLE_COMPACTED_RE = /\b(context compacted|compaction complete(?:d)?)\b/i;
 
@@ -934,6 +934,55 @@ export function onApprovalResolved(callback: ApprovalResolvedCallback): () => vo
  * now go through the single persistent connection. Events for this session
  * will be received by the same connection and published to StreamEventBus.
  */
+export async function callGatewayRpc(method: string, params: Record<string, any> = {}, timeoutMs = 10000): Promise<any> {
+  if (!singletonWs || singletonWs.readyState !== WebSocket.OPEN) {
+    throw new Error('Persistent WebSocket not connected');
+  }
+  if (!isAuthenticated) {
+    throw new Error('Persistent WebSocket not authenticated');
+  }
+
+  const requestId = nextId();
+
+  return new Promise((resolve, reject) => {
+    const timeoutTimer = setTimeout(() => {
+      pendingResponses.delete(requestId);
+      reject(new Error(`${method} RPC timeout`));
+    }, timeoutMs);
+
+    pendingResponses.set(requestId, {
+      resolve: (payload: any) => {
+        clearTimeout(timeoutTimer);
+        const sessionKey = typeof params.sessionKey === 'string' ? params.sessionKey : '';
+        const runId = typeof payload?.runId === 'string' ? payload.runId : '';
+        if (method === 'chat.send' && sessionKey && runId) {
+          activeRunIds.set(sessionKey, runId);
+          streamEventBus.startStream(sessionKey, runId);
+          debugLog(`chat.send accepted via generic RPC: sessionKey=${sessionKey} runId=${runId}`);
+        }
+        resolve(payload);
+      },
+      reject: (err: Error) => {
+        clearTimeout(timeoutTimer);
+        reject(err);
+      },
+    });
+
+    try {
+      singletonWs!.send(JSON.stringify({
+        type: 'req',
+        id: requestId,
+        method,
+        params,
+      }));
+    } catch (err: any) {
+      clearTimeout(timeoutTimer);
+      pendingResponses.delete(requestId);
+      reject(new Error(`Failed to send ${method}: ${err.message}`));
+    }
+  });
+}
+
 export async function sendChatMessage(
   sessionKey: string,
   message: string,

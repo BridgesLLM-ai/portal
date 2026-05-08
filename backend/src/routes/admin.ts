@@ -1270,10 +1270,12 @@ router.post('/install-mail', requireOwner, async (req: Request, res: Response, n
     }
 
     const writeStalwartConfig = () => {
+      // Pin Stalwart: v0.16 removed the legacy admin API endpoints this installer uses
+      // for domain/account provisioning. Do not use `latest` here.
       const composeContent = `version: '3.8'
 services:
   stalwart:
-    image: stalwartlabs/stalwart:latest
+    image: stalwartlabs/stalwart:v0.15.5
     container_name: stalwart-mail
     restart: unless-stopped
     ports:
@@ -1447,6 +1449,28 @@ secret = "${adminPass}"
     process.env.STALWART_NOREPLY_PASS = noreplyPass;
     process.env.MAIL_DOMAIN = domain;
 
+    let reprovisionedMailboxes = 0;
+    const reprovisionErrors: Array<{ username: string; error: string }> = [];
+    try {
+      const users = await prisma.user.findMany({
+        where: { isActive: true, username: { not: '' } },
+        select: { id: true, username: true },
+      });
+      for (const user of users) {
+        try {
+          await provisionUserMailbox(user.username, user.id, { makePrimary: true });
+          reprovisionedMailboxes += 1;
+        } catch (err: any) {
+          reprovisionErrors.push({ username: user.username, error: err?.message || String(err) });
+        }
+      }
+      if (reprovisionErrors.length > 0) {
+        console.warn('[admin/install-mail] Existing mailbox reprovisioning had non-fatal failures:', reprovisionErrors);
+      }
+    } catch (err: any) {
+      console.warn('[admin/install-mail] Existing mailbox reprovisioning skipped:', err?.message || err);
+    }
+
     try {
       execSync('ufw allow 25/tcp 2>/dev/null; ufw allow 587/tcp 2>/dev/null; ufw allow 993/tcp 2>/dev/null', { timeout: 5000, shell: '/bin/bash' });
     } catch {}
@@ -1467,6 +1491,8 @@ secret = "${adminPass}"
       message: `Mail server installed for ${domain}! Add the DNS records below to complete setup.`,
       alreadyRunning: stalwartAlreadyRunning,
       recreated,
+      reprovisionedMailboxes,
+      reprovisionErrors: reprovisionErrors.slice(0, 5),
     });
   } catch (error) {
     next(error);
