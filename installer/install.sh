@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.12"
+readonly VERSION="3.25.13"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -1324,7 +1324,7 @@ install_system_packages() {
   fi
 
   # Remote Desktop packages (VNC + XFCE desktop + PulseAudio)
-  local rd_pkgs=(tigervnc-standalone-server novnc websockify xfce4 xfce4-goodies xfce4-terminal dbus-x11 x11-utils xterm firefox pulseaudio pulseaudio-utils librsvg2-common)
+  local rd_pkgs=(tigervnc-standalone-server novnc websockify xfce4 xfce4-goodies xfce4-terminal dbus-x11 x11-utils xclip xsel xterm firefox pulseaudio pulseaudio-utils librsvg2-common)
   local rd_missing=()
   for pkg in "${rd_pkgs[@]}"; do
     if ! dpkg -s "$pkg" &>/dev/null; then

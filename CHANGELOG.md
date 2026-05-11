@@ -2,6 +2,16 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.13] — 2026-05-11
+
+### Fixed
+- **Remote Desktop clipboard works on fresh installs**: the installer now includes `xclip` and `xsel`, matching the backend clipboard bridge requirements so copy/paste setup does not fail after provisioning.
+- **Mobile app-mode browser navigation stops fighting the keyboard**: the shared browser and OpenClaw UI app-mode address bars now preserve focused/manual URL edits instead of refreshing over typed text every few seconds.
+
+### Improved
+- **Remote Desktop copy/paste labels are clearer**: the clipboard panel now uses direction-based names like “Get Remote”, “Copy to Me”, “Get from Me”, “Set Remote”, and “Paste Remote” instead of internal bridge terminology.
+- **Shared browser nav injection is more reliable**: the launcher now waits for nav script injection confirmation instead of racing ahead immediately after navigation.
+
 ## [3.25.12] — 2026-05-10
 
 ### Fixed

@@ -46,14 +46,17 @@ JSON
   const bar = shadow.querySelector('.bar');
   const bubble = $('show');
   const input = $('url');
-  function syncUrl(){ input.value = location.href; }
+  let urlEditDirty = false;
+  function inputHasFocus(){ return shadow.activeElement === input; }
+  function syncUrl(force=false){ if(!force && (urlEditDirty || inputHasFocus())) return; input.value = location.href; urlEditDirty = false; }
   function normalizeTarget(raw){ const value=String(raw||'').trim(); if(!value) return ''; if(/^[a-z][a-z0-9+.-]*:/i.test(value)) return value; if(/^(localhost|\d{1,3}(?:\.\d{1,3}){3})(:\d+)?([/?#].*)?$/i.test(value)) return 'http://'+value; if(/^[^\s]+\.[^\s]{2,}([/?#].*)?$/i.test(value)) return 'https://'+value; return 'https://www.google.com/search?q='+encodeURIComponent(value); }
-  function go(){ const target=normalizeTarget(input.value); if(target) location.href=target; }
+  function go(){ const target=normalizeTarget(input.value); if(target){ urlEditDirty=false; input.blur(); location.href=target; } }
   function collapse(next){ bar.classList.toggle('hidden', next); bubble.classList.toggle('visible', next); localStorage.setItem('__bridgesllm_nav_collapsed', next ? '1' : '0'); }
   $('back').onclick=()=>history.back(); $('forward').onclick=()=>history.forward(); $('reload').onclick=()=>location.reload(); $('go').onclick=go; $('hide').onclick=()=>collapse(true); bubble.onclick=()=>collapse(false);
-  input.addEventListener('keydown',(event)=>{event.stopPropagation(); if(event.key==='Enter') go(); if(event.key==='Escape') input.blur();});
+  input.addEventListener('input',()=>{urlEditDirty=true;});
+  input.addEventListener('keydown',(event)=>{event.stopPropagation(); if(event.key==='Enter'){event.preventDefault(); go();} if(event.key==='Escape'){urlEditDirty=false; syncUrl(true); input.blur();}});
   shadow.addEventListener('keydown',(e)=>e.stopPropagation()); shadow.addEventListener('keyup',(e)=>e.stopPropagation()); shadow.addEventListener('keypress',(e)=>e.stopPropagation());
-  document.documentElement.appendChild(host); syncUrl(); window.addEventListener('popstate', syncUrl); window.addEventListener('hashchange', syncUrl); setInterval(syncUrl,1500);
+  function mountNav(){ if(!document.documentElement){ setTimeout(mountNav,50); return; } if(!host.isConnected) document.documentElement.appendChild(host); syncUrl(true); window.addEventListener('popstate', ()=>syncUrl(true)); window.addEventListener('hashchange', ()=>syncUrl(true)); setInterval(()=>syncUrl(false),1500); } mountNav();
 })();
 JS
 }

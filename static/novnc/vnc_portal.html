@@ -277,18 +277,18 @@
 
     <!-- Clipboard panel -->
     <div id="clipPanel">
-        <label>Clipboard Bridge</label>
-        <textarea id="clipText" placeholder="Pull from desktop, read this device, or type text here…" rows="4"></textarea>
+        <label>Copy / Paste</label>
+        <textarea id="clipText" placeholder="Text to move between this device and the Remote Desktop…" rows="4"></textarea>
         <div class="clip-actions">
-            <button class="clip-btn pull" id="clipPullBtn" title="Read the Remote Desktop clipboard into this box">⬇ Pull Desktop</button>
-            <button class="clip-btn copy" id="clipCopyOutBtn" title="Copy this box to your device clipboard">⬆ Copy Out</button>
-            <button class="clip-btn read" id="clipReadBtn" title="Read clipboard from your device into this box">📋 Read Device</button>
-            <button class="clip-btn send" id="clipSetBtn" title="Set the Remote Desktop clipboard without pressing paste">Set Desktop</button>
-            <button class="clip-btn paste" id="clipPasteBtn" title="Set the Remote Desktop clipboard and press Ctrl+V in the active app">Paste Now</button>
+            <button class="clip-btn pull" id="clipPullBtn" title="Bring the current Remote Desktop clipboard into this text box">⬇ Get Remote</button>
+            <button class="clip-btn copy" id="clipCopyOutBtn" title="Copy this text box to your phone/computer clipboard">⬆ Copy to Me</button>
+            <button class="clip-btn read" id="clipReadBtn" title="Read your phone/computer clipboard into this text box">📋 Get from Me</button>
+            <button class="clip-btn send" id="clipSetBtn" title="Put this text on the Remote Desktop clipboard without pressing Ctrl+V">Set Remote</button>
+            <button class="clip-btn paste" id="clipPasteBtn" title="Put this text on the Remote Desktop clipboard and paste it into the active remote app">Paste Remote</button>
             <button class="clip-btn type" id="clipTypeBtn" title="Type text character-by-character (like a keyboard)">⌨ Type</button>
         </div>
-        <div class="clip-status" id="clipStatus">Remote copy events appear here automatically.</div>
-        <div class="clip-hint">Pull Desktop → bring text out · Copy Out → device clipboard · Paste Now → remote Ctrl+V</div>
+        <div class="clip-status" id="clipStatus">Remote copied text will appear here automatically.</div>
+        <div class="clip-hint">Get Remote: remote → box · Copy to Me: box → my device · Get from Me: my device → box · Paste Remote: box → remote app</div>
     </div>
 
     <!-- Floating toolbar -->
@@ -434,7 +434,7 @@
             try {
                 const ok = await copyTextToDeviceClipboard(text);
                 setClipStatus(ok ? 'Copied to this device clipboard.' : 'Text selected — use system Copy.', ok ? 'ok' : 'warn');
-                setTemporaryButtonText(clipCopyOutBtn, ok ? '✓ Copied' : 'Selected', '⬆ Copy Out');
+                setTemporaryButtonText(clipCopyOutBtn, ok ? '✓ Copied' : 'Selected', '⬆ Copy to Me');
             } catch (err) {
                 clipText.focus();
                 clipText.select();
@@ -449,7 +449,7 @@
                 clipText.value = text;
                 clipText.focus();
                 setClipStatus(text ? 'Read from this device clipboard.' : 'This device clipboard is empty.', text ? 'ok' : 'warn');
-                setTemporaryButtonText(clipReadBtn, '✓ Read', '📋 Read Device');
+                setTemporaryButtonText(clipReadBtn, '✓ Got It', '📋 Get from Me');
             } catch (err) {
                 // Fallback: just focus the textarea so user can manually paste
                 clipText.focus();
@@ -464,7 +464,7 @@
             try {
                 await setDesktopClipboard(text);
                 setClipStatus('Remote Desktop clipboard set.', 'ok');
-                setTemporaryButtonText(clipSetBtn, '✓ Set', 'Set Desktop');
+                setTemporaryButtonText(clipSetBtn, '✓ Set', 'Set Remote');
             } catch (err) {
                 setClipStatus(err.message || 'Could not set Remote Desktop clipboard.', 'error');
             }
@@ -484,7 +484,7 @@
                     return;
                 }
                 setClipStatus('Sent to Remote Desktop and pressed Ctrl+V.', 'ok');
-                setTemporaryButtonText(clipPasteBtn, '✓ Pasted', 'Paste Now');
+                setTemporaryButtonText(clipPasteBtn, '✓ Pasted', 'Paste Remote');
             } catch (err) {
                 setClipStatus(err.message || 'Could not paste into Remote Desktop.', 'error');
             }
