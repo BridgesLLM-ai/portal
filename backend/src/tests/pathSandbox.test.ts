@@ -12,7 +12,8 @@ import { validateProjectPath } from '../middleware/pathSandbox';
 
 const TEST_USER = 'test-user-123';
 const TEST_PROJECT = 'my-project';
-const PROJECT_BASE = `/portal/projects/${TEST_USER}/${TEST_PROJECT}`;
+const TEST_PROJECTS_ROOT = process.env.PORTAL_PROJECTS_ROOT || path.join(process.env.PORTAL_ROOT || '/portal', 'projects');
+const PROJECT_BASE = path.join(TEST_PROJECTS_ROOT, TEST_USER, TEST_PROJECT);
 
 // Create a temp directory structure for symlink tests
 let tempDir: string;
@@ -26,7 +27,9 @@ beforeAll(() => {
   fs.writeFileSync(path.join(PROJECT_BASE, 'src/app.js'), 'console.log("test")');
 
   // Create a symlink that points outside the sandbox
-  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sandbox-test-'));
+  const outsideRoot = process.env.TEST_SANDBOX_OUTSIDE_ROOT || '/var/tmp';
+  fs.mkdirSync(outsideRoot, { recursive: true });
+  tempDir = fs.mkdtempSync(path.join(outsideRoot, 'sandbox-test-'));
   fs.writeFileSync(path.join(tempDir, 'secret.txt'), 'secret data');
   symlinkPath = path.join(PROJECT_BASE, 'escape-link');
   try {

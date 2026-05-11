@@ -13,7 +13,7 @@ import path from 'path';
 import fs from 'fs';
 import { prisma } from '../config/database';
 
-const PROJECTS_BASE = path.join(process.env.PORTAL_ROOT || '/portal', 'projects');
+const PROJECTS_BASE = process.env.PORTAL_PROJECTS_ROOT || path.join(process.env.PORTAL_ROOT || '/portal', 'projects');
 
 // Directories that must NEVER be accessible from project contexts
 const BLOCKED_PREFIXES = [
