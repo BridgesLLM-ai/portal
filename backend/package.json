@@ -54,7 +54,7 @@
     "sanitize-html": "^2.17.1",
     "sharp": "^0.34.5",
     "socket.io": "^4.6.0",
-    "systeminformation": "^5.21.20",
+    "systeminformation": "^5.31.6",
     "winston": "^3.11.0",
     "zod": "^3.22.4",
     "prisma": "^5.7.0"
