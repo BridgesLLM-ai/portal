@@ -208,6 +208,15 @@ function formatTime(dateStr?: string): string {
   }
 }
 
+function formatNewSessionSlug(slug: string): string | null {
+  const match = slug.match(/^(?:portal-)?new-(\d{13,})$/i);
+  if (!match) return null;
+  const timestamp = Number(match[1]);
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return 'New chat';
+  return `New chat · ${date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}`;
+}
+
 function getSessionLabel(s: GatewaySession): string {
   const title = typeof (s as any).title === 'string' ? (s as any).title.trim() : '';
   if (title) return title;
@@ -230,6 +239,11 @@ function getSessionLabel(s: GatewaySession): string {
 
   if (sessionName === 'main') {
     return agentName === 'main' ? 'Main session' : `${agentName} / main session`;
+  }
+
+  const newSessionLabel = formatNewSessionSlug(sessionName);
+  if (newSessionLabel) {
+    return agentName === 'main' ? newSessionLabel : `${agentName} / ${newSessionLabel}`;
   }
 
   return agentName === 'main'
@@ -327,8 +341,9 @@ function SessionDropdown({
       >
         <History size={12} />
         <span className="hidden sm:inline truncate">{headerLabel}</span>
-        {hasLoaded && (
-          <span className="hidden sm:inline tabular-nums rounded-full bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-slate-400">
+        {(loading || hasLoaded) && (
+          <span className="hidden sm:inline-flex items-center gap-1 tabular-nums rounded-full bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-slate-400">
+            {loading ? <Loader2 size={9} className="animate-spin text-sky-400" /> : null}
             {countLabel}
           </span>
         )}
@@ -357,10 +372,10 @@ function SessionDropdown({
             </div>
           </div>
 
-          {loading && sessions.length === 0 && (
-            <div className="px-4 py-6 text-xs text-slate-500 flex items-center gap-2">
-              <Loader2 size={12} className="animate-spin text-slate-500" />
-              <span>Loading sessions…</span>
+          {loading && (
+            <div className="mx-3 mb-2 rounded-lg border border-sky-400/15 bg-sky-500/10 px-3 py-2 text-xs text-sky-100 flex items-center gap-2">
+              <Loader2 size={12} className="animate-spin text-sky-300" />
+              <span>{sessions.length === 0 ? 'Loading session history…' : 'Refreshing session history…'}</span>
             </div>
           )}
 
@@ -658,15 +673,6 @@ export default function AgentSelector({
     displayTextClass = currentMeta.avatarText;
   }
 
-  if (loading) {
-    return (
-      <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.04] text-slate-500 text-sm">
-        <Loader2 size={14} className="animate-spin" />
-        <span>Loading…</span>
-      </div>
-    );
-  }
-
   return (
     <div className="flex items-center gap-1.5">
       {/* ── Agent Dropdown ──────────────────────────────────────── */}
@@ -683,10 +689,14 @@ export default function AgentSelector({
             textClass={displayTextClass}
           />
           <span className="truncate max-w-[80px] sm:max-w-[160px]">{displayLabel}</span>
-          <ChevronDown
-            size={14}
-            className={`text-slate-500 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
-          />
+          {loading ? (
+            <Loader2 size={13} className="animate-spin text-sky-400" />
+          ) : (
+            <ChevronDown
+              size={14}
+              className={`text-slate-500 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
+            />
+          )}
         </button>
 
         {/* ── Dropdown Panel ──────────────────────────────────────── */}
@@ -703,6 +713,19 @@ export default function AgentSelector({
                 Agents
               </div>
             </div>
+
+            {loading && (
+              <div className="mx-3 mb-2 rounded-lg border border-sky-400/15 bg-sky-500/10 px-3 py-2 text-xs text-sky-100 flex items-center gap-2">
+                <Loader2 size={12} className="animate-spin text-sky-300" />
+                <span>Loading available agents and providers…</span>
+              </div>
+            )}
+
+            {!loading && providers.length === 0 && (
+              <div className="px-4 py-4 text-xs text-slate-500">
+                No providers returned yet. Try refresh if this stays empty.
+              </div>
+            )}
 
             {providers.map((p) => {
               const meta = PROVIDER_META[p.name] || { emoji: '🤖', color: 'text-slate-400', label: p.displayName, initials: '??', avatarBg: 'bg-slate-600/20', avatarText: 'text-slate-300' };

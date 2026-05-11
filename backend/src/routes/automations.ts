@@ -1,8 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
-import { execFile } from 'child_process';
-import { buildOpenClawCliEnv } from '../utils/openclawCli';
+import { gatewayRpcCall } from '../utils/openclawGatewayRpc';
 
 const router = Router();
 
@@ -12,7 +11,11 @@ const AUTOMATIONS_LIST_CACHE_TTL_MS = 5000;
 let automationsListCache: { at: number; jobs: any[] } | null = null;
 let automationsListInflight: Promise<any[]> | null = null;
 
-type CronResult = { ok: true; stdout: string; stderr: string } | { ok: false; error: string; stdout: string; stderr: string };
+type CronRpcResult = { ok: true; data: any } | { ok: false; error: string; data?: any };
+
+type CronSchedule =
+  | { kind: 'every'; everyMs: number }
+  | { kind: 'cron'; expr: string; tz?: string };
 
 type AutomationInput = {
   name?: string;
@@ -38,36 +41,39 @@ function isTransientGatewayError(text: string): boolean {
   return normalized.includes('gateway connect failed')
     || normalized.includes('gateway not connected')
     || normalized.includes('gateway closed')
+    || normalized.includes('gateway rpc timeout')
     || normalized.includes('connect challenge timeout')
+    || normalized.includes('websocket closed unexpectedly')
+    || normalized.includes('websocket error')
     || normalized.includes('econnrefused')
     || normalized.includes('socket hang up');
 }
 
-function runCronOnce(args: string[], timeoutMs = 30000): Promise<CronResult> {
-  return new Promise((resolve) => {
-    execFile('openclaw', ['cron', ...args], { timeout: timeoutMs, encoding: 'utf-8', env: buildOpenClawCliEnv() }, (error, stdout, stderr) => {
-      if (error) {
-        resolve({
-          ok: false,
-          error: (stderr || error.message || 'Cron command failed').trim(),
-          stdout: String(stdout || ''),
-          stderr: String(stderr || ''),
-        });
-        return;
-      }
-      resolve({ ok: true, stdout: String(stdout || ''), stderr: String(stderr || '') });
-    });
-  });
+function formatGatewayRpcError(error: any): string {
+  if (typeof error === 'string') return error;
+  if (error?.message) return String(error.message);
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error || 'Gateway RPC failed');
+  }
 }
 
-async function runCron(args: string[], timeoutMs = 30000, retries = 5): Promise<CronResult> {
-  let lastResult: CronResult | null = null;
+async function runCronOnce(method: string, params: Record<string, any> = {}, timeoutMs = 30000): Promise<CronRpcResult> {
+  const result = await gatewayRpcCall(method, params, timeoutMs);
+  if (result.ok) return { ok: true, data: result.data };
+  return { ok: false, error: formatGatewayRpcError(result.error), data: result.data };
+}
+
+async function runCron(method: string, params: Record<string, any> = {}, timeoutMs = 30000, retries = 5): Promise<CronRpcResult> {
+  let lastResult: CronRpcResult | null = null;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
-    const result = await runCronOnce(args, timeoutMs);
+    const result = await runCronOnce(method, params, timeoutMs);
     if (result.ok) return result;
 
     lastResult = result;
-    const combined = `${result.error}\n${result.stderr}\n${result.stdout}`;
+    const combined = `${result.error}
+${JSON.stringify(result.data || {})}`;
     if (attempt >= retries || !isTransientGatewayError(combined)) {
       return result;
     }
@@ -75,7 +81,7 @@ async function runCron(args: string[], timeoutMs = 30000, retries = 5): Promise<
     const delayMs = Math.min(3000, 500 * Math.pow(2, attempt));
     await sleep(delayMs);
   }
-  return lastResult || { ok: false, error: 'Cron command failed', stdout: '', stderr: '' };
+  return lastResult || { ok: false, error: 'Cron gateway call failed' };
 }
 
 function parseJsonLoose(output: string): any | null {
@@ -99,7 +105,13 @@ function parseJsonLoose(output: string): any | null {
   return null;
 }
 
-function parseRuns(output: string): any[] {
+function parseRuns(payload: any): any[] {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.runs)) return payload.runs;
+  if (Array.isArray(payload?.entries)) return payload.entries;
+  if (Array.isArray(payload?.data?.entries)) return payload.data.entries;
+
+  const output = typeof payload === 'string' ? payload : '';
   const json = parseJsonLoose(output);
   if (Array.isArray(json)) return json;
   if (Array.isArray(json?.runs)) return json.runs;
@@ -158,15 +170,59 @@ function normalizeJobs(payload: any): any[] {
   return jobs.map(normalizeSingleJob);
 }
 
-function buildScheduleArgs(input: AutomationInput): string[] {
-  const args: string[] = [];
+async function listAllCronJobs(): Promise<CronRpcResult> {
+  const limit = 200;
+  let offset = 0;
+  const jobs: any[] = [];
+
+  for (let page = 0; page < 25; page += 1) {
+    const result = await runCron('cron.list', { includeDisabled: true, limit, offset });
+    if (!result.ok) return result;
+
+    const pageJobs = normalizeJobs(result.data);
+    jobs.push(...pageJobs);
+
+    if (!result.data?.hasMore) break;
+    const nextOffset = Number(result.data?.nextOffset);
+    offset = Number.isFinite(nextOffset) ? nextOffset : offset + pageJobs.length;
+    if (offset <= 0 || pageJobs.length === 0) break;
+  }
+
+  return { ok: true, data: { jobs } };
+}
+
+function parseIntervalMs(raw: string | undefined): number | null {
+  const value = String(raw || '').trim().toLowerCase();
+  const match = value.match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)?$/);
+  if (!match) return null;
+
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+
+  const unit = match[2] || 'm';
+  const multiplier = unit === 'ms'
+    ? 1
+    : unit === 's'
+      ? 1000
+      : unit === 'm'
+        ? 60000
+        : unit === 'h'
+          ? 3600000
+          : 86400000;
+
+  const ms = Math.round(amount * multiplier);
+  return ms > 0 ? ms : null;
+}
+
+function buildSchedule(input: AutomationInput): CronSchedule | null {
   const { schedule, scheduleType, interval, time, dayOfWeek } = input || {};
 
   let cronExpr = '';
   if (scheduleType === 'custom' && schedule) {
     cronExpr = String(schedule).trim();
   } else if (scheduleType === 'interval' && interval) {
-    args.push('--every', String(interval).trim());
+    const everyMs = parseIntervalMs(interval);
+    return everyMs ? { kind: 'every', everyMs } : null;
   } else if (scheduleType === 'daily' && time) {
     const [hour, minute] = String(time).split(':');
     cronExpr = `${parseInt(minute, 10)} ${parseInt(hour, 10)} * * *`;
@@ -177,20 +233,9 @@ function buildScheduleArgs(input: AutomationInput): string[] {
     cronExpr = '0 * * * *';
   }
 
-  if (cronExpr) args.push('--cron', cronExpr);
-  return args;
-}
-
-function scheduleUsesCron(input: AutomationInput): boolean {
-  switch (input.scheduleType) {
-    case 'custom':
-    case 'daily':
-    case 'weekly':
-    case 'hourly':
-      return true;
-    default:
-      return false;
-  }
+  if (!cronExpr) return null;
+  const tz = input.tz?.trim();
+  return tz ? { kind: 'cron', expr: cronExpr, tz } : { kind: 'cron', expr: cronExpr };
 }
 
 function validateAutomationInput(input: AutomationInput, mode: 'create' | 'update'): string | null {
@@ -240,12 +285,12 @@ async function getCachedAutomationJobs(): Promise<any[]> {
   }
 
   automationsListInflight = (async () => {
-    const result = await runCron(['list', '--json', '--all']);
+    const result = await listAllCronJobs();
     if (!result.ok) {
       throw new Error(result.error || 'Failed to list cron jobs');
     }
 
-    const jobs = normalizeJobs(parseJsonLoose(result.stdout));
+    const jobs = normalizeJobs(result.data);
     automationsListCache = { at: Date.now(), jobs };
     return jobs;
   })();
@@ -280,12 +325,12 @@ router.get('/', listAutomations);
 router.get('/list', listAutomations);
 
 router.get('/status', async (_req: Request, res: Response) => {
-  const result = await runCron(['status', '--json']);
+  const result = await runCron('cron.status', {});
   if (!result.ok) {
     res.status(500).json({ error: result.error || 'Failed to get scheduler status' });
     return;
   }
-  res.json(parseJsonLoose(result.stdout) || { status: 'unknown', raw: result.stdout.trim() });
+  res.json(result.data || { status: 'unknown' });
 });
 
 router.post('/', async (req: Request, res: Response) => {
@@ -296,22 +341,38 @@ router.post('/', async (req: Request, res: Response) => {
     return;
   }
 
-  const { name, message, agent, model, thinking, disabled, tz } = input;
-  const args: string[] = ['add', '--json', '--name', String(name).trim(), '--message', String(message).trim(), '--session', 'isolated'];
-  args.push(...buildScheduleArgs(input));
-  if (tz && scheduleUsesCron(input)) args.push('--tz', String(tz));
-  if (agent) args.push('--agent', String(agent));
-  if (model) args.push('--model', String(model));
-  if (thinking) args.push('--thinking', String(thinking));
-  if (disabled) args.push('--disabled');
+  const { name, message, agent, model, thinking, disabled } = input;
+  const schedule = buildSchedule(input);
+  if (!schedule) {
+    res.status(400).json({ error: 'invalid schedule' });
+    return;
+  }
 
-  const result = await runCron(args, 45000);
+  const payload: Record<string, any> = {
+    kind: 'agentTurn',
+    message: String(message).trim(),
+  };
+  if (model) payload.model = String(model).trim();
+  if (thinking) payload.thinking = String(thinking).trim();
+
+  const jobCreate: Record<string, any> = {
+    name: String(name).trim(),
+    enabled: disabled !== true,
+    schedule,
+    sessionTarget: 'isolated',
+    wakeMode: 'now',
+    payload,
+    delivery: { mode: 'announce' },
+  };
+  if (agent) jobCreate.agentId = String(agent).trim();
+
+  const result = await runCron('cron.add', jobCreate, 45000);
   if (!result.ok) {
     res.status(500).json({ error: result.error || 'Failed to create cron job' });
     return;
   }
   invalidateAutomationsListCache();
-  res.json({ ok: true, result: parseJsonLoose(result.stdout) || { message: result.stdout.trim() } });
+  res.json({ ok: true, result: result.data });
 });
 
 router.put('/:id', async (req: Request, res: Response) => {
@@ -323,23 +384,38 @@ router.put('/:id', async (req: Request, res: Response) => {
     return;
   }
 
-  const { name, message, agent, model, thinking, tz } = input;
-  const args: string[] = ['edit', id];
-  args.push(...buildScheduleArgs(input));
-  if (name) args.push('--name', String(name).trim());
-  if (message) args.push('--message', String(message).trim());
-  if (tz && scheduleUsesCron(input)) args.push('--tz', String(tz));
-  if (agent) args.push('--agent', String(agent));
-  if (model) args.push('--model', String(model));
-  if (thinking) args.push('--thinking', String(thinking));
+  const { name, message, agent, model, thinking } = input;
+  const patch: Record<string, any> = {};
 
-  const result = await runCron(args, 45000);
+  if (input.scheduleType !== undefined) {
+    const schedule = buildSchedule(input);
+    if (!schedule) {
+      res.status(400).json({ error: 'invalid schedule' });
+      return;
+    }
+    patch.schedule = schedule;
+  }
+  if (name !== undefined) patch.name = String(name).trim();
+  if (agent !== undefined) patch.agentId = String(agent).trim() || null;
+
+  const payload: Record<string, any> = { kind: 'agentTurn' };
+  if (message !== undefined) payload.message = String(message).trim();
+  if (model !== undefined) payload.model = String(model).trim() || undefined;
+  if (thinking !== undefined) payload.thinking = String(thinking).trim() || undefined;
+  if (Object.keys(payload).length > 1) patch.payload = payload;
+
+  if (Object.keys(patch).length === 0) {
+    res.json({ ok: true, result: null });
+    return;
+  }
+
+  const result = await runCron('cron.update', { id, patch }, 45000);
   if (!result.ok) {
     res.status(500).json({ error: result.error || 'Failed to update cron job' });
     return;
   }
   invalidateAutomationsListCache();
-  res.json({ ok: true, result: parseJsonLoose(result.stdout) || { message: result.stdout.trim() } });
+  res.json({ ok: true, result: result.data });
 });
 
 router.post('/:id/toggle', async (req: Request, res: Response) => {
@@ -350,12 +426,12 @@ router.post('/:id/toggle', async (req: Request, res: Response) => {
   if (typeof enabled === 'boolean') {
     targetEnabled = enabled;
   } else {
-    const listResult = await runCron(['list', '--json', '--all']);
+    const listResult = await listAllCronJobs();
     if (!listResult.ok) {
       res.status(500).json({ error: listResult.error || 'Failed to read current cron state' });
       return;
     }
-    const jobs = normalizeJobs(parseJsonLoose(listResult.stdout));
+    const jobs = normalizeJobs(listResult.data);
     const current = jobs.find((job: any) => job?.id === id);
     if (!current) {
       res.status(404).json({ error: 'Cron job not found' });
@@ -364,7 +440,7 @@ router.post('/:id/toggle', async (req: Request, res: Response) => {
     targetEnabled = current.enabled === false;
   }
 
-  const result = await runCron([targetEnabled ? 'enable' : 'disable', id]);
+  const result = await runCron('cron.update', { id, patch: { enabled: targetEnabled } });
   if (!result.ok) {
     res.status(500).json({ error: result.error || `Failed to ${targetEnabled ? 'enable' : 'disable'} cron job` });
     return;
@@ -375,7 +451,7 @@ router.post('/:id/toggle', async (req: Request, res: Response) => {
 
 router.delete('/:id', async (req: Request, res: Response) => {
   const { id } = req.params;
-  const result = await runCron(['rm', id, '--json', '--timeout', '45000'], 50000);
+  const result = await runCron('cron.remove', { id }, 50000);
   if (!result.ok) {
     res.status(500).json({ error: result.error || 'Failed to delete cron job' });
     return;
@@ -386,20 +462,20 @@ router.delete('/:id', async (req: Request, res: Response) => {
 
 router.post('/:id/run', async (req: Request, res: Response) => {
   const { id } = req.params;
-  const result = await runCron(['run', id, '--timeout', '120000', '--expect-final'], 125000, 0);
+  const result = await runCron('cron.run', { id, mode: 'force' }, 125000, 0);
   if (!result.ok) {
     res.status(500).json({ error: result.error || 'Failed to run cron job' });
     return;
   }
   invalidateAutomationsListCache();
-  res.json({ ok: true, result: parseJsonLoose(result.stdout) || { message: result.stdout.trim() } });
+  res.json({ ok: true, result: result.data });
 });
 
 router.get('/:id/runs', async (req: Request, res: Response) => {
   const { id } = req.params;
   const limit = req.query.limit ? Number(req.query.limit) : 20;
   const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.min(limit, 100) : 20;
-  const result = await runCron(['runs', '--id', id, '--limit', String(safeLimit)], 45000);
+  const result = await runCron('cron.runs', { id, limit: safeLimit }, 45000);
   if (!result.ok) {
     const err = String(result.error || '').toLowerCase();
     if (err.includes('not found') || err.includes('no runs')) {
@@ -409,7 +485,7 @@ router.get('/:id/runs', async (req: Request, res: Response) => {
     res.status(500).json({ error: result.error || 'Failed to get run history' });
     return;
   }
-  res.json({ runs: parseRuns(result.stdout) });
+  res.json({ runs: parseRuns(result.data) });
 });
 
 router.get('/:id', async (req: Request, res: Response) => {

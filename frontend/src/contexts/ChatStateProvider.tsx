@@ -41,6 +41,7 @@ import {
   upsertExecApproval,
 } from '../utils/execApprovalQueue';
 import { getToolStatusText, resolveToolName, isCompactionNotice } from '../utils/toolPresentation';
+import { resolveMaintenanceRailStatus } from '../components/chat/maintenanceRailLifecycle';
 
 const DEBUG_CHAT_STATE = import.meta.env.DEV;
 const BUILD_TIME_USE_DIRECT_GATEWAY = import.meta.env.VITE_USE_DIRECT_GATEWAY === 'true';
@@ -455,7 +456,10 @@ function parseHistoryMessage(m: any): ChatMessage | null {
   const sanitizedHistoryText = sanitizeHistoryMessageText(rawContent);
   const rawThinkingContent = typeof m.thinkingContent === 'string' ? sanitizeAssistantContent(m.thinkingContent) : '';
   const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
-  if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(rawContent) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
+  if (!isTruncationPlaceholder && isAssistantMaintenanceNoticeMessage({ ...m, content: sanitizedHistoryText, thinkingContent: rawThinkingContent })) {
+    return null;
+  }
+  if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOrMaintenanceAssistantContent(rawContent) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
     return null;
   }
   if (m.role === 'assistant' && !isTruncationPlaceholder && isHiddenHistoryArtifactText(sanitizedHistoryText) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
@@ -498,18 +502,33 @@ function parseHistoryMessage(m: any): ChatMessage | null {
   return msg;
 }
 
+function isGatewayTextBlock(block: any): boolean {
+  return Boolean(
+    block
+    && typeof block === 'object'
+    && (block.type === 'text' || block.type === 'input_text' || block.type === 'output_text')
+    && typeof block.text === 'string'
+  );
+}
+
+function gatewayTextFromBlocks(blocks: any[]): string {
+  return blocks
+    .filter(isGatewayTextBlock)
+    .map((block) => block.text as string)
+    .join('\n');
+}
+
 /**
  * Extract text content from a gateway message.
- * Gateway format: { role, content: [{type: "text", text: "..."}, ...] }
+ * Gateway/WebChat history can contain OpenAI-style `input_text`/`output_text`
+ * blocks as well as generic `text` blocks. Match Control UI by treating all
+ * three as visible transcript text.
  */
 function extractTextFromGatewayMessage(msg: GatewayChatMessage): string {
   const rawText = typeof msg.content === 'string'
     ? msg.content
     : Array.isArray(msg.content)
-      ? msg.content
-          .filter((block) => block.type === 'text' && typeof block.text === 'string')
-          .map((block) => block.text!)
-          .join('\n')
+      ? gatewayTextFromBlocks(msg.content)
       : '';
 
   return sanitizeHistoryMessageText(rawText);
@@ -622,7 +641,10 @@ function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage | null {
   const toolCalls = extractToolCallsFromGatewayMessage(msg);
   const thinking = extractThinkingFromGatewayMessage(msg);
   const isTruncationPlaceholder = msg.role === 'assistant' && text === CHAT_HISTORY_OMITTED_PLACEHOLDER;
-  if (msg.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(text) && !thinking && !toolCalls?.length) {
+  if (!isTruncationPlaceholder && isAssistantMaintenanceNoticeMessage({ role: msg.role, content: text, thinkingContent: thinking, toolCalls })) {
+    return null;
+  }
+  if (msg.role === 'assistant' && !isTruncationPlaceholder && isControlOrMaintenanceAssistantContent(text) && !thinking && !toolCalls?.length) {
     return null;
   }
   if (msg.role === 'assistant' && !isTruncationPlaceholder && isHiddenHistoryArtifactText(text) && !thinking && !toolCalls?.length) {
@@ -659,9 +681,46 @@ function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage | null {
 
 const HISTORY_REPLAY_DUPLICATE_WINDOW_MS = 5_000;
 const LOCAL_PENDING_ACK_WINDOW_MS = 120_000;
+const LOCAL_OPTIMISTIC_ASSISTANT_TAIL_WINDOW_MS = 30_000;
 
 function normalizeHistoryReplayContent(content: string): string {
   return (content || '').replace(/\r\n/g, '\n').trim();
+}
+
+function isStandaloneMaintenanceNoticeContent(text: string): boolean {
+  const normalized = sanitizeHistoryMessageText(text || '').replace(/\s+/g, ' ').trim();
+  if (!normalized || !isCompactionNotice(normalized)) return false;
+
+  const marker = normalized.replace(/^[^\p{L}\p{N}]+/u, '').trim();
+  return [
+    /^context compacted\.?$/i,
+    /^context maintenance (?:in progress|finished|complete(?:d)?)\.?$/i,
+    /^compacting context[.…]*$/i,
+    /^preparing (?:context maintenance|compaction)[.…]*$/i,
+    /^memory flush(?: started| complete(?:d)?| in progress)?[.…]*$/i,
+    /^heartbeat check (?:started|complete(?:d)?)[.…]*$/i,
+    /^compacted\s*\([^)]{1,80}\)(?:\s*[•-]\s*context\b.*)?$/i,
+    /^compaction (?:complete(?:d)?|finished|in progress|started|incomplete|did not complete)\.?$/i,
+    /^compaction skipped(?::.*)?$/i,
+  ].some((pattern) => pattern.test(marker));
+}
+
+function isAssistantMaintenanceNoticeMessage(message: {
+  role?: unknown;
+  content?: unknown;
+  thinkingContent?: unknown;
+  toolCalls?: unknown;
+}): boolean {
+  if (message?.role !== 'assistant') return false;
+  const content = typeof message.content === 'string' ? sanitizeHistoryMessageText(message.content) : '';
+  if (!content || !isStandaloneMaintenanceNoticeContent(content)) return false;
+  if (typeof message.thinkingContent === 'string' && message.thinkingContent.trim()) return false;
+  if (Array.isArray(message.toolCalls) && message.toolCalls.length > 0) return false;
+  return true;
+}
+
+function isControlOrMaintenanceAssistantContent(text: string): boolean {
+  return isControlOnlyAssistantContent(text || '') || isStandaloneMaintenanceNoticeContent(text || '');
 }
 
 function isEquivalentCompactionNotice(previous: ChatMessage | undefined, next: ChatMessage): boolean {
@@ -742,12 +801,33 @@ function mergeLoadedHistoryWithLocalMessages(
     : null;
   const preserveActiveAssistant = Boolean(options?.preserveActiveAssistant && activeAssistantId);
   const merged = [...loadedMessages];
+  const now = Date.now();
+  const latestLoadedTs = loadedMessages.reduce((latest, message) => {
+    const ts = message.createdAt instanceof Date ? message.createdAt.getTime() : NaN;
+    return Number.isFinite(ts) ? Math.max(latest, ts) : latest;
+  }, 0);
+
+  const isRecentOptimisticAssistant = (message: ChatMessage): boolean => {
+    if (message.role !== 'assistant') return false;
+    if (preserveActiveAssistant && message.id === activeAssistantId) return true;
+    const ts = message.createdAt instanceof Date ? message.createdAt.getTime() : NaN;
+    if (!Number.isFinite(ts)) return false;
+    if (now - ts > LOCAL_OPTIMISTIC_ASSISTANT_TAIL_WINDOW_MS) return false;
+    if (latestLoadedTs && ts < latestLoadedTs - HISTORY_REPLAY_DUPLICATE_WINDOW_MS) return false;
+    return Boolean(
+      normalizeHistoryReplayContent(message.content)
+      || message.thinkingContent
+      || (Array.isArray(message.segments) && message.segments.length > 0)
+      || (Array.isArray(message.toolCalls) && message.toolCalls.length > 0)
+    );
+  };
 
   const shouldKeepLocalMessage = (message: ChatMessage): boolean => {
     if (message.queued) return true;
     if (message.role === 'system' && message.provenance === 'live-steer') return true;
     if (message.role === 'user' && message.pendingAck) return true;
     if (preserveActiveAssistant && message.id === activeAssistantId) return true;
+    if (isRecentOptimisticAssistant(message)) return true;
     return false;
   };
 
@@ -756,6 +836,21 @@ function mergeLoadedHistoryWithLocalMessages(
       if (existing.id && candidate.id && existing.id === candidate.id) return true;
       if (candidate.role === 'user' && candidate.pendingAck) {
         return isLikelyCommittedPendingUser(candidate, existing);
+      }
+      if (candidate.role === 'assistant' && existing.role === 'assistant') {
+        const candidateContent = normalizeHistoryReplayContent(candidate.content);
+        const existingContent = normalizeHistoryReplayContent(existing.content);
+        const candidateTs = candidate.createdAt instanceof Date ? candidate.createdAt.getTime() : NaN;
+        const existingTs = existing.createdAt instanceof Date ? existing.createdAt.getTime() : NaN;
+        if (candidateContent && candidateContent === existingContent) return true;
+        if (
+          candidateContent
+          && existingContent
+          && Number.isFinite(candidateTs)
+          && Number.isFinite(existingTs)
+          && Math.abs(candidateTs - existingTs) <= LOCAL_PENDING_ACK_WINDOW_MS
+          && (candidateContent.includes(existingContent) || existingContent.includes(candidateContent))
+        ) return true;
       }
       if (isEquivalentCompactionNotice(existing, candidate)) return true;
       return false;
@@ -981,11 +1076,15 @@ const LIFECYCLE_CONTROL_TOKENS = new Set([
   'compacted',
 ]);
 
-const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|started|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/i;
+const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|started|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction|heartbeat check (?:started|starting|running|queued|pending)|checking heartbeat|reading heartbeat\.md|read heartbeat\.md)\b/i;
 const LIFECYCLE_FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context)\b/i;
-const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance (?:finished|complete(?:d)?)|compaction (?:incomplete|did not complete)|heartbeat check complete(?:d)?)\b/i;
-const LIFECYCLE_COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction (?:in progress|started))\b/i;
-const LIFECYCLE_COMPACTED_RE = /\b(context compacted|compaction (?:complete(?:d)?|finished))\b/i;
+const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance (?:finished|complete(?:d)?)|compaction (?:incomplete|did not complete)|heartbeat check complete(?:d)?|heartbeat_ok)\b/i;
+const LIFECYCLE_COMPACTING_RE = /^(?:compacting context[.…]*|auto-compaction(?: started| in progress)?[.…]*|context compaction(?: started| in progress)?[.…]*|compaction (?:in progress|started)\.?)$/i;
+const LIFECYCLE_COMPACTED_RE = /^(?:context compacted\.?|auto-compaction complete(?:d)?\.?|context compaction complete(?:d)?\.?|compaction (?:complete(?:d)?|finished)\.?)$/i;
+
+function normalizeLifecycleMarker(text: string): string {
+  return String(text || '').replace(/\s+/g, ' ').trim().replace(/^[^\p{L}\p{N}]+/u, '').trim();
+}
 
 type LifecycleMaintenanceSignal = 'idle' | 'maintenance' | 'maintenance_done' | 'compacting' | 'compacted';
 
@@ -1085,12 +1184,19 @@ function extractLifecycleStatusText(data: any): string | null {
 
 function inferLifecycleMaintenanceSignal(phase: string, statusText: string | null): LifecycleMaintenanceSignal {
   const normalizedPhase = String(phase || '').trim().toLowerCase();
-  const normalizedStatus = String(statusText || '').trim();
+  const normalizedStatus = normalizeLifecycleMarker(String(statusText || ''));
 
-  if (normalizedPhase === 'compacted' || normalizedPhase === 'compaction_end' || normalizedPhase === 'compaction_completed') {
+  const phaseClaimsCompaction = normalizedPhase === 'compacted'
+    || normalizedPhase === 'compaction_end'
+    || normalizedPhase === 'compaction_completed'
+    || normalizedPhase === 'compacting'
+    || normalizedPhase === 'compaction_start'
+    || normalizedPhase === 'compaction_started';
+  const statusContradictsCompaction = Boolean(normalizedStatus && phaseClaimsCompaction && !isCompactionNotice(normalizedStatus));
+  if (!statusContradictsCompaction && (normalizedPhase === 'compacted' || normalizedPhase === 'compaction_end' || normalizedPhase === 'compaction_completed')) {
     return 'compacted';
   }
-  if (normalizedPhase === 'compacting' || normalizedPhase === 'compaction_start' || normalizedPhase === 'compaction_started') {
+  if (!statusContradictsCompaction && (normalizedPhase === 'compacting' || normalizedPhase === 'compaction_start' || normalizedPhase === 'compaction_started')) {
     return 'compacting';
   }
   if (!normalizedStatus) {
@@ -1328,7 +1434,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // switch or clearMessages. Any async history load that started in a previous
   // generation simply discards its result, eliminating race conditions.
   const historyGenRef = useRef(0);
-  const loadHistoryInternalRef = useRef<((sessionKey: string, prov?: string, options?: { force?: boolean; refreshActiveSnapshot?: boolean }) => Promise<boolean>) | null>(null);
+  const loadHistoryInternalRef = useRef<((sessionKey: string, prov?: string, options?: { force?: boolean; refreshActiveSnapshot?: boolean; preserveLocalMessages?: boolean }) => Promise<boolean>) | null>(null);
   const lastForegroundReconcileAtRef = useRef(0);
   // Throttle refs for streaming text updates — batch text deltas to reduce re-renders
   const textThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1369,7 +1475,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   const setLiveRunPhase = useCallback((preferredPhase: 'thinking' | 'streaming', nextStatusText?: string | null) => {
     const runningToolName = getRunningToolName();
-    const normalizedStatus = typeof nextStatusText === 'string' ? nextStatusText.trim() : '';
+    const normalizedStatus = typeof nextStatusText === 'string' ? normalizeLifecycleMarker(nextStatusText) : '';
     const isMaintenanceStatus = normalizedStatus
       ? (
           LIFECYCLE_FLUSH_PREPARING_RE.test(normalizedStatus)
@@ -1476,7 +1582,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const schedulePostTurnHistorySync = useCallback((delayMs = 1200) => {
+  const schedulePostTurnHistorySync = useCallback((delayMs = 1200, followUpDelayMs = 3500) => {
     clearPostTurnHistorySync();
     const targetSession = sessionRef.current || 'main';
     const targetProvider = providerRef.current;
@@ -1486,7 +1592,20 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       if (providerRef.current !== targetProvider) return;
       if ((sessionRef.current || 'main') !== targetSession) return;
       if (targetProvider === 'OPENCLAW') {
-        void loadHistoryInternalRef.current?.(targetSession, targetProvider, { force: true, refreshActiveSnapshot: false });
+        void loadHistoryInternalRef.current?.(targetSession, targetProvider, { force: true, refreshActiveSnapshot: false })
+          ?.finally(() => {
+            if (followUpDelayMs <= 0) return;
+            if (isStreamActiveRef.current) return;
+            if (providerRef.current !== targetProvider) return;
+            if ((sessionRef.current || 'main') !== targetSession) return;
+            postTurnHistorySyncTimerRef.current = setTimeout(() => {
+              postTurnHistorySyncTimerRef.current = null;
+              if (isStreamActiveRef.current) return;
+              if (providerRef.current !== targetProvider) return;
+              if ((sessionRef.current || 'main') !== targetSession) return;
+              void loadHistoryInternalRef.current?.(targetSession, targetProvider, { force: true, refreshActiveSnapshot: false });
+            }, Math.max(0, followUpDelayMs));
+          });
       }
     }, Math.max(0, delayMs));
   }, [clearPostTurnHistorySync]);
@@ -1825,24 +1944,20 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   const applyCompactionSnapshotState = useCallback((phase?: unknown) => {
     if (phase !== 'idle' && phase !== 'compacting' && phase !== 'compacted') return;
+    // Snapshot hydration is replay/reconnect state, not a live lifecycle event.
+    // Replaying a completed compaction marker on every refresh creates a fake rail.
+    // Live compaction_end events still use applyCompactionState('end') and render once.
+    const effectivePhase = phase === 'compacted' ? 'idle' : phase;
     if (compactionTimerRef.current) {
       clearTimeout(compactionTimerRef.current);
       compactionTimerRef.current = null;
     }
-    compactionPhaseRef.current = phase;
-    setCompactionPhase(phase);
-    if (phase === 'compacting') {
+    compactionPhaseRef.current = effectivePhase;
+    setCompactionPhase(effectivePhase);
+    if (effectivePhase === 'compacting') {
       setStatusText('Compacting context…');
-    }
-    if (phase === 'compacted') {
-      const noticeText = 'Context compacted';
-      setStatusText(noticeText);
-      compactionTimerRef.current = setTimeout(() => {
-        compactionPhaseRef.current = 'idle';
-        setCompactionPhase('idle');
-        setStatusText((prev) => (prev === noticeText ? null : prev));
-        compactionTimerRef.current = null;
-      }, 3000);
+    } else {
+      setStatusText(prev => (prev === 'Compacting context…' || prev === 'Context compacted' ? null : prev));
     }
   }, []);
 
@@ -1993,7 +2108,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     source?: 'portal' | 'direct';
   }) => {
     if (!snapshot?.active) return false;
-    const snapshotContent = typeof snapshot.content === 'string' && !isControlOnlyAssistantContent(snapshot.content)
+    const snapshotContent = typeof snapshot.content === 'string' && !isControlOrMaintenanceAssistantContent(snapshot.content)
       ? sanitizeAssistantContent(snapshot.content)
       : '';
     const snapshotToolCalls = normalizeToolCalls(snapshot.toolCalls, 'running') || [];
@@ -2005,6 +2120,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       ? resolveToolName(toolNameCandidate)
       : null;
     const rawStatusText = typeof snapshot.statusText === 'string' ? snapshot.statusText.trim() : '';
+    const isMaintenanceStatusOnly = Boolean(rawStatusText && isControlOrMaintenanceAssistantContent(rawStatusText));
     const currentStreamText = assembledRef.current;
     const normalizedSnapshotContent = normalizeHistoryReplayContent(snapshotContent);
     const snapshotDuplicatesGraduatedText = Boolean(normalizedSnapshotContent)
@@ -2017,13 +2133,18 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const shouldReplaceSnapshotText = Boolean(effectiveSnapshotContent)
       && (!currentStreamText || effectiveSnapshotContent.length >= currentStreamText.length || effectiveSnapshotContent.includes(currentStreamText));
     let assistantId = streamingAssistantIdRef.current;
-    const hasStatusSignal = Boolean(rawStatusText)
-      || snapshot.compactionPhase === 'compacting'
-      || snapshot.compactionPhase === 'compacted';
-    const hasMeaningfulSnapshotSignal = Boolean(effectiveSnapshotContent)
+    const hasStatusSignal = Boolean(rawStatusText && !isMaintenanceStatusOnly);
+    const hasMaintenanceSignal = isMaintenanceStatusOnly
+      || snapshot.compactionPhase === 'compacting';
+    const hasLiveSnapshotSignal = Boolean(effectiveSnapshotContent)
       || Boolean(snapshotToolName)
       || effectiveToolCalls.length > 0
       || hasStatusSignal;
+    if (!hasLiveSnapshotSignal && hasMaintenanceSignal) {
+      applyCompactionSnapshotState(snapshot.compactionPhase);
+      return true;
+    }
+    const hasMeaningfulSnapshotSignal = hasLiveSnapshotSignal;
     const shouldHydrateLiveState = hasMeaningfulSnapshotSignal || Boolean(assistantId);
     if (!shouldHydrateLiveState) {
       return false;
@@ -2046,14 +2167,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         : snapshot.phase === 'streaming'
           ? 'streaming'
           : 'thinking';
-    const compactionStatusText = snapshot.compactionPhase === 'compacting'
-      ? (rawStatusText || 'Compacting context…')
-      : snapshot.compactionPhase === 'compacted'
-        ? (rawStatusText || 'Context compacted')
+    const liveStatusText = isMaintenanceStatusOnly ? '' : rawStatusText;
+    const compactionStatusText = hasLiveSnapshotSignal && snapshot.compactionPhase === 'compacting'
+      ? (liveStatusText || 'Compacting context…')
+      : hasLiveSnapshotSignal && snapshot.compactionPhase === 'compacted'
+        ? (liveStatusText || 'Context compacted')
         : '';
     const fallbackStatusText = snapshotToolName
-      ? getToolStatusText(snapshotToolName, rawStatusText || compactionStatusText || null)
-      : compactionStatusText || rawStatusText || options?.statusTextWhenNoTool || (snapshotPhase === 'streaming' ? 'Still responding…' : 'Still working…');
+      ? getToolStatusText(snapshotToolName, liveStatusText || compactionStatusText || null)
+      : liveStatusText || options?.statusTextWhenNoTool || (snapshotPhase === 'streaming' ? 'Still responding…' : 'Still working…');
     setIsRunning(true);
     setSessionAvailability('present');
     setStreamingPhase(snapshotPhase);
@@ -2156,7 +2278,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   }, [applyOpenClawActiveStreamSnapshot, clearActiveStreamState, resetStreamWatchdog, useDirectGateway]);
 
   // History loader
-  const loadHistoryInternal = useCallback(async (sessionKey: string, prov?: string, options?: { force?: boolean; refreshActiveSnapshot?: boolean }): Promise<boolean> => {
+  const loadHistoryInternal = useCallback(async (sessionKey: string, prov?: string, options?: { force?: boolean; refreshActiveSnapshot?: boolean; preserveLocalMessages?: boolean }): Promise<boolean> => {
     if (!sessionKey || (isStreamActiveRef.current && !options?.force)) return false;
     // Snapshot the current generation — if it changes while we await, discard results.
     const myGen = ++historyGenRef.current;
@@ -2268,14 +2390,17 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (prov === 'OPENCLAW' && loaded.length > 0) {
           setSessionAvailability('present');
         }
-        const reconciledHistory = mergeLoadedHistoryWithLocalMessages(
-          mergeToolResultsIntoToolCalls(dedupeHistoryMessages(loaded)),
-          messagesRef.current,
-          {
-            activeAssistantId: streamingAssistantIdRef.current,
-            preserveActiveAssistant: isStreamActiveRef.current,
-          },
-        );
+        const normalizedLoadedHistory = mergeToolResultsIntoToolCalls(dedupeHistoryMessages(loaded));
+        const reconciledHistory = options?.preserveLocalMessages === false
+          ? normalizedLoadedHistory
+          : mergeLoadedHistoryWithLocalMessages(
+              normalizedLoadedHistory,
+              messagesRef.current,
+              {
+                activeAssistantId: streamingAssistantIdRef.current,
+                preserveActiveAssistant: isStreamActiveRef.current,
+              },
+            );
         setMessages(reconciledHistory);
         if (prov === 'OPENCLAW') {
           return await hydrateActiveStream(sessionKey, prov, historyActiveStream, {
@@ -2311,26 +2436,24 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // and force-loads history, bypassing the isStreamActive guard.
   const selectSession = useCallback(async (sessionKey: string) => {
     if (!sessionKey) return;
-    // Reset stream state inline (clearMessages is defined later in the file)
-    isStreamActiveRef.current = false;
     historyGenRef.current++;
     setIsSwitchingSession(true);
     setIsLoadingHistory(true);
-    setIsRunning(false);
-    setStreamingPhase('idle');
-    setStatusText(null);
+    clearActiveStreamState();
     setLastProvenance(null);
-    setThinkingContent('');
     compactionPhaseRef.current = 'idle';
-    setCompactionPhase('idle');
-    setActiveToolName(null);
-    activeStreamToolCallsRef.current = [];
-    // Keep current messages visible until the target session history resolves.
+    // Clear the previous thread immediately. Otherwise a pending user message from
+    // the old session can be merged onto the newly selected session while history loads.
+    messagesRef.current = [];
+    messageQueueRef.current = [];
+    setMessages([]);
+    setMessageQueue([]);
     setSessionRaw(sessionKey);
     persistStoredSession(providerRef.current, sessionKey);
-    // Force-load history bypassing the isStreamActive guard
-    await loadHistoryInternal(sessionKey, providerRef.current, { force: true });
-  }, [loadHistoryInternal]);
+    // Force-load history bypassing the isStreamActive guard, but do not preserve
+    // transient local messages from the previously selected session.
+    await loadHistoryInternal(sessionKey, providerRef.current, { force: true, preserveLocalMessages: false });
+  }, [clearActiveStreamState, loadHistoryInternal]);
 
   // Refresh: reload history + check for active stream and resubscribe
   const refreshChat = useCallback(async () => {
@@ -2422,9 +2545,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           return;
         }
       }
-      // Still allow non-streaming events (session, exec_approval, connected, keepalive)
+      // Still allow non-streaming events (session, exec_approval, connected, keepalive).
+      // Maintenance/lifecycle status is intentionally allowed through even in
+      // direct mode because it may arrive on the portal-global WS path while the
+      // direct stream is busy. That is the visible clue for lag/compaction.
       const directHandledTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'stream_resume', 'run_resumed'];
-      if (directHandledTypes.includes(data?.type)) {
+      const isMaintenancePortalStatus = data?.type === 'status' && resolveMaintenanceRailStatus(data).isMaintenanceStatus;
+      if (directHandledTypes.includes(data?.type) && !isMaintenancePortalStatus) {
         return; // Direct gateway already handling this
       }
     }
@@ -2446,8 +2573,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     // OR events that don't have a sessionKey (global events like connected/keepalive).
     // Also allow compaction events through regardless of session key — they're important
     // system notifications that should display even if the sessionKey hasn't resolved yet.
-    const alwaysPassthroughTypes = ['compaction_start', 'compaction_end', 'connected', 'keepalive'];
-    if (data?.sessionKey && data.sessionKey !== sessionRef.current && !alwaysPassthroughTypes.includes(data.type)) {
+    const alwaysPassthroughTypes = ['connected', 'keepalive'];
+    const resolvedPortalSession = typeof data?.sessionKey === 'string' ? resolveOpenClawSessionKey(data.sessionKey) : '';
+    const resolvedCurrentSession = resolveOpenClawSessionKey(sessionRef.current);
+    if (resolvedPortalSession && resolvedCurrentSession && resolvedPortalSession !== resolvedCurrentSession && !alwaysPassthroughTypes.includes(data.type)) {
       return;
     }
     if (data?.type && ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'done', 'stream_resume', 'stream_ended', 'run_resumed', 'compaction_start', 'compaction_end'].includes(data.type)) {
@@ -2468,7 +2597,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const passthrough = ['session', 'exec_approval', 'exec_approval_resolved', 'connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended', 'run_resumed'];
     const autoCreateBubbleTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
     const waitForVisibleStreamTypes = ['status', 'thinking', 'done', 'error'];
-    if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOnlyAssistantContent(data.content)) {
+    if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOrMaintenanceAssistantContent(data.content)) {
       return;
     }
     if (!streamingAssistantIdRef.current && !passthrough.includes(data.type)) {
@@ -2508,7 +2637,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       case 'status': {
         const nextStatusText = typeof data.content === 'string' ? data.content : null;
-        const normalizedStatus = typeof nextStatusText === 'string' ? nextStatusText.trim() : '';
+        const normalizedStatus = typeof nextStatusText === 'string' ? normalizeLifecycleMarker(nextStatusText) : '';
         const isMaintenanceStatus = data.maintenanceKind === 'maintenance'
           || LIFECYCLE_FLUSH_PREPARING_RE.test(normalizedStatus)
           || LIFECYCLE_FLUSH_RUNNING_RE.test(normalizedStatus)
@@ -2685,7 +2814,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       case 'text': {
         const rawChunk = typeof data.content === 'string' ? data.content : '';
-        if (rawChunk && isControlOnlyAssistantContent(rawChunk)) {
+        if (rawChunk && isControlOrMaintenanceAssistantContent(rawChunk)) {
           break;
         }
         const safeChunk = typeof data.content === 'string'
@@ -2708,7 +2837,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         lastTerminalRunIdRef.current = incomingPortalRunId || currentRunIdRef.current;
 
         const rawFinal = typeof data.content === 'string' ? data.content : '';
-        const hasVisibleFinal = rawFinal.length > 0 && !isControlOnlyAssistantContent(rawFinal);
+        const hasVisibleFinal = rawFinal.length > 0 && !isControlOrMaintenanceAssistantContent(rawFinal);
         const finalContent = hasVisibleFinal ? sanitizeAssistantContent(rawFinal) : assembledRef.current;
         assembledRef.current = finalContent;
         const prov = data.provenance || null;
@@ -2922,14 +3051,70 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
+    if (evt.event === 'session.message') {
+      setWsConnected(true);
+      if (payloadSession && currentSession && payloadSession !== currentSession) {
+        debugLog('[ChatState] Ignoring direct session.message for different session', {
+          payloadSession,
+          currentSession,
+        });
+        return;
+      }
+      if (providerRef.current === 'OPENCLAW') {
+        scheduleSessionTelemetryRefresh(200);
+        if (isStreamActiveRef.current || currentRunIdRef.current) {
+          schedulePostTurnHistorySync(900, 2500);
+        } else {
+          void loadHistoryInternalRef.current?.(currentSession || sessionRef.current || 'main', 'OPENCLAW', {
+            force: true,
+            refreshActiveSnapshot: false,
+          });
+        }
+      }
+      return;
+    }
+
+    if (evt.event === 'sessions.changed') {
+      const changedSession = typeof payload?.sessionKey === 'string'
+        ? resolveOpenClawSessionKey(payload.sessionKey)
+        : '';
+      if (!changedSession || changedSession === currentSession) {
+        scheduleSessionTelemetryRefresh(250);
+      }
+      return;
+    }
+
     if (evt.event === 'chat') {
       const state = payload.state;
+      const rawMessageContent = payload.message?.content;
+      const contentBlocks = Array.isArray(rawMessageContent)
+        ? rawMessageContent
+        : [];
+      const visibleMessageText = (
+        typeof rawMessageContent === 'string'
+          ? rawMessageContent
+          : contentBlocks.length
+            ? contentBlocks
+                .map((b: any) => (
+                  typeof b?.text === 'string'
+                    ? b.text
+                    : (typeof b?.content === 'string' ? b.content : '')
+                ))
+                .join('')
+            : (typeof (payload as any).content === 'string' ? (payload as any).content : '')
+      ).trim();
+      const hasVisibleNonMaintenanceText = Boolean(visibleMessageText && !isStandaloneMaintenanceNoticeContent(visibleMessageText));
+      const stateIsCompactionStart = state === 'compacting' || state === 'compaction_start';
+      const stateIsCompactionEnd = state === 'compacted' || state === 'compaction_end';
+      const effectiveState = (stateIsCompactionStart || stateIsCompactionEnd) && hasVisibleNonMaintenanceText
+        ? 'delta'
+        : state;
 
-      if (state === 'compacting' || state === 'compaction_start') {
+      if (stateIsCompactionStart && effectiveState !== 'delta') {
         applyCompactionState('start');
         return;
       }
-      if (state === 'compacted' || state === 'compaction_end') {
+      if (stateIsCompactionEnd && effectiveState !== 'delta') {
         applyCompactionState('end');
         return;
       }
@@ -2941,12 +3126,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       streamTransportRef.current = 'direct';
 
-      switch (state) {
+      switch (effectiveState) {
         case 'delta': {
-          const contentBlocks = Array.isArray(payload.message?.content)
-            ? payload.message.content
-            : [];
-
           let assistantId = streamingAssistantIdRef.current;
 
           const thinkingText = contentBlocks
@@ -2954,12 +3135,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             .map((b: any) => (typeof b.thinking === 'string' ? b.thinking : (b.text || '')))
             .join('');
 
-          const text = contentBlocks
-            .filter((b: any) => b.type === 'text')
-            .map((b: any) => b.text || '')
-            .join('');
+          const text = gatewayTextFromBlocks(contentBlocks);
 
-          if (text && isControlOnlyAssistantContent(text)) {
+          if (text && isControlOrMaintenanceAssistantContent(text)) {
             if (assistantId || isStreamActiveRef.current) resetStreamWatchdog();
             break;
           }
@@ -3007,17 +3185,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           lastTerminalRunIdRef.current = incomingRunId || currentRunIdRef.current;
 
           const finalTextBlocks = Array.isArray(payload.message?.content)
-            ? payload.message.content
-                .filter((b: any) => b.type === 'text')
-                .map((b: any) => b.text || '')
-                .join('')
+            ? gatewayTextFromBlocks(payload.message.content)
             : '';
           let finalText = finalTextBlocks || assembledRef.current;
           if (lastSegmentStartRef.current > 0 && finalText.length > lastSegmentStartRef.current) {
             finalText = finalText.slice(lastSegmentStartRef.current);
           }
 
-          const finalContent = isControlOnlyAssistantContent(finalText)
+          const finalContent = isControlOrMaintenanceAssistantContent(finalText)
             ? assembledRef.current
             : sanitizeAssistantContent(finalText);
           assembledRef.current = finalContent;
@@ -3077,8 +3252,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             }
           }
           scheduleSessionTelemetryRefresh(400);
-          if (providerRef.current === 'OPENCLAW' && (hadToolEvents || currentStreamSegs.length > 0 || !finalContent.trim())) {
-            schedulePostTurnHistorySync();
+          if (providerRef.current === 'OPENCLAW') {
+            // Match Control UI: live events are delivery state; chat.history is
+            // transcript truth. Refresh every completed turn, with one follow-up
+            // pass for gateways whose durable JSONL write lags the final event.
+            schedulePostTurnHistorySync(450, 2500);
           }
           break;
         }
@@ -3319,7 +3497,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           ? lifecycleStatusText
           : (lifecycleStatusText || defaultLifecycleStatusText(lifecycleSignal));
 
-        if (lifecyclePhase === 'started' || lifecyclePhase === 'running' || lifecyclePhase === 'start' || lifecycleSignal !== 'idle') {
+        const lifecycleBelongsToActiveRun = Boolean(incomingRunId)
+          || isStreamActiveRef.current
+          || Boolean(streamingAssistantIdRef.current)
+          || Boolean(getRunningToolName());
+        if (lifecycleBelongsToActiveRun && (lifecyclePhase === 'started' || lifecyclePhase === 'running' || lifecyclePhase === 'start' || lifecycleSignal !== 'idle')) {
           isStreamActiveRef.current = true;
           streamTransportRef.current = 'direct';
           setIsRunning(true);
@@ -3329,7 +3511,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
       }
     }
-  }, [clearSuppressedRunId, ensureStreamingAssistantBubble, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase]);
+  }, [clearSuppressedRunId, ensureStreamingAssistantBubble, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase]);
 
   // WS setup — runs once on mount, survives entire app lifetime
   // Handler registration MUST happen in the same effect that creates the manager,
@@ -3944,7 +4126,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             if (evt.provenance) setLastProvenance(evt.provenance);
           } else if (evt.type === 'text') {
             const rawChunk = typeof evt.content === 'string' ? evt.content : '';
-            if (rawChunk && isControlOnlyAssistantContent(rawChunk)) {
+            if (rawChunk && isControlOrMaintenanceAssistantContent(rawChunk)) {
               continue;
             }
             const chunk = typeof evt.content === 'string'
@@ -3958,7 +4140,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, content: assembled } : m));
           } else if (evt.type === 'status') {
             const nextStatusText = typeof evt.content === 'string' ? evt.content : null;
-            const normalizedStatus = typeof nextStatusText === 'string' ? nextStatusText.trim() : '';
+            const normalizedStatus = typeof nextStatusText === 'string' ? normalizeLifecycleMarker(nextStatusText) : '';
             const isMaintenanceStatus = evt.maintenanceKind === 'maintenance'
               || LIFECYCLE_FLUSH_PREPARING_RE.test(normalizedStatus)
               || LIFECYCLE_FLUSH_RUNNING_RE.test(normalizedStatus)
@@ -4110,7 +4292,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             }
           } else if (evt.type === 'done') {
             const rawFinal = typeof evt.content === 'string' ? evt.content : '';
-            const hasFinal = rawFinal.length > 0 && !isControlOnlyAssistantContent(rawFinal);
+            const hasFinal = rawFinal.length > 0 && !isControlOrMaintenanceAssistantContent(rawFinal);
             const finalContent = hasFinal ? sanitizeAssistantContent(rawFinal) : (assembled || '');
             assembled = finalContent;
             assembledRef.current = finalContent;

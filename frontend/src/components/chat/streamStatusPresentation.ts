@@ -1,4 +1,4 @@
-import { getToolDisplayName, getToolPresentation, getToolStatusText } from '../../utils/toolPresentation';
+import { getToolDisplayName, getToolPresentation, getToolStatusText, isCompactionNotice } from '../../utils/toolPresentation';
 
 export type StreamPhase = 'idle' | 'thinking' | 'tool' | 'streaming';
 
@@ -17,8 +17,8 @@ const CONNECTED_RE = /\b(connected|reconnected|recovered)\b/;
 const APPROVAL_RE = /approval|waiting for command approval/;
 const WAITING_RE = /\b(reconnecting|queued|waiting)\b/;
 const ERROR_RE = /denied|failed|error|disconnected/;
-const COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction (?:in progress|started))\b/;
-const COMPACTED_RE = /\b(context compacted|compaction (?:complete(?:d)?|finished))\b/;
+const COMPACTING_RE = /^(?:compacting context[.…]*|auto-compaction(?: started| in progress)?[.…]*|context compaction(?: started| in progress)?[.…]*|compaction (?:in progress|started)\.?)$/;
+const COMPACTED_RE = /^(?:context compacted\.?|auto-compaction complete(?:d)?\.?|context compaction complete(?:d)?\.?|compaction (?:complete(?:d)?|finished)\.?)$/;
 const CONTEXT_PRESSURE_RE = /\b(context (?:getting|running) full|context (?:near(?:ing)?|almost) full|approaching (?:the )?context limit|context window (?:is )?(?:near|nearing|almost) full|running out of context|context budget)\b/;
 const FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|started|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/;
 const FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context)\b/;
@@ -30,7 +30,7 @@ function normalizeStatusText(statusText?: string | null): string {
   const raw = String(statusText || '').trim();
   if (!raw) return '';
   const withoutLeadingDecorators = raw.replace(/^[^\p{L}\p{N}]+/u, '').trim();
-  return withoutLeadingDecorators.replace(/^using tool:\s*/i, 'Using ').trim();
+  return withoutLeadingDecorators.replace(/^using tool:\s*/i, 'Using ').replace(/\s+/g, ' ').trim();
 }
 
 export function getStreamStatusPresentation({
@@ -52,8 +52,10 @@ export function getStreamStatusPresentation({
   const normalizedStatus = rawStatus.toLowerCase();
   const queueSize = queueCount || 0;
   const connectedLike = CONNECTED_RE.test(normalizedStatus);
-  const maintenanceLike = compactionPhase === 'compacting'
-    || compactionPhase === 'compacted'
+  const statusLooksLikeMaintenance = !rawStatus || isCompactionNotice(rawStatus) || /^(?:memory flush|context maintenance|preparing context maintenance|heartbeat check)\b/i.test(rawStatus);
+  const effectiveCompactionPhase = statusLooksLikeMaintenance ? compactionPhase : 'idle';
+  const maintenanceLike = effectiveCompactionPhase === 'compacting'
+    || effectiveCompactionPhase === 'compacted'
     || COMPACTING_RE.test(normalizedStatus)
     || COMPACTED_RE.test(normalizedStatus)
     || FLUSH_RUNNING_RE.test(normalizedStatus)
@@ -160,43 +162,43 @@ export function getStreamStatusPresentation({
       bounce: false,
       showQueueMeta: false,
     };
-  } else if (compactionPhase === 'compacting' || COMPACTING_RE.test(normalizedStatus)) {
+  } else if (phase === 'idle' && (COMPACTING_RE.test(normalizedStatus) || effectiveCompactionPhase === 'compacting')) {
     tone = {
       ...tones.info,
       icon: 'spinner',
       label: displayStatus || 'Compacting context…',
-      detail: 'The run is still active. Tool calls stay visible while the context is compacted.',
+      detail: 'Context maintenance is running in the background.',
       bounce: false,
       showQueueMeta: false,
     };
-  } else if (compactionPhase === 'compacted' || COMPACTED_RE.test(normalizedStatus)) {
+  } else if (phase === 'idle' && (COMPACTED_RE.test(normalizedStatus) || effectiveCompactionPhase === 'compacted')) {
     tone = {
       ...tones.info,
       icon: 'check',
       label: displayStatus || 'Context compacted',
-      detail: 'Context maintenance finished. The agent should continue shortly.',
+      detail: null,
       bounce: false,
       showQueueMeta: false,
     };
-  } else if (FLUSH_DONE_RE.test(normalizedStatus)) {
+  } else if (phase === 'idle' && FLUSH_DONE_RE.test(normalizedStatus)) {
     tone = {
       ...tones.info,
       icon: 'check',
       label: displayStatus || 'Context maintenance finished.',
-      detail: 'The agent should continue shortly.',
+      detail: null,
       bounce: false,
       showQueueMeta: false,
     };
-  } else if (FLUSH_RUNNING_RE.test(normalizedStatus)) {
+  } else if (phase === 'idle' && FLUSH_RUNNING_RE.test(normalizedStatus)) {
     tone = {
       ...tones.info,
       icon: 'spinner',
       label: displayStatus || 'Context maintenance in progress…',
-      detail: 'The run is still active. Tool calls stay visible while memory is flushed.',
+      detail: 'Context maintenance is running in the background.',
       bounce: false,
       showQueueMeta: false,
     };
-  } else if (FLUSH_PREPARING_RE.test(normalizedStatus) || CONTEXT_PRESSURE_RE.test(normalizedStatus)) {
+  } else if (phase === 'idle' && (FLUSH_PREPARING_RE.test(normalizedStatus) || CONTEXT_PRESSURE_RE.test(normalizedStatus))) {
     tone = {
       ...tones.reconnecting,
       icon: 'clock',
@@ -227,7 +229,7 @@ export function getStreamStatusPresentation({
     return null;
   }
 
-  tone.showQueueMeta = queueSize > 0 && !(phase === 'idle' && !showConnectionLost && compactionPhase === 'idle' && !connectedLike);
+  tone.showQueueMeta = queueSize > 0 && !(phase === 'idle' && !showConnectionLost && effectiveCompactionPhase === 'idle' && !connectedLike);
 
   return tone;
 }

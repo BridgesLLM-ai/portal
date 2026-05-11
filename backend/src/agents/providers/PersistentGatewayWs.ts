@@ -26,7 +26,8 @@ const debugLog = (...args: unknown[]) => {
 };
 
 const GATEWAY_WS_URL = getOpenClawWsUrl();
-const PROTOCOL_VERSION = 3;
+const MIN_PROTOCOL_VERSION = 3;
+const MAX_PROTOCOL_VERSION = 4;
 
 let GATEWAY_TOKEN = getGatewayToken();
 const CLIENT_ID = 'gateway-client';
@@ -79,9 +80,9 @@ const LIFECYCLE_CONTROL_TOKENS = new Set([
   'compacted',
 ]);
 
-const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|started|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/i;
+const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|started|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction|heartbeat check (?:started|starting|running|queued|pending)|checking heartbeat|reading heartbeat\.md|read heartbeat\.md)\b/i;
 const LIFECYCLE_FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context)\b/i;
-const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance complete(?:d)?|heartbeat check complete(?:d)?)\b/i;
+const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance complete(?:d)?|heartbeat check complete(?:d)?|heartbeat_ok)\b/i;
 const LIFECYCLE_COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction in progress)\b/i;
 const LIFECYCLE_COMPACTED_RE = /\b(context compacted|compaction complete(?:d)?)\b/i;
 
@@ -181,6 +182,46 @@ const assistantLastSeenTextMap: Map<string, string> = new Map();
 // Track which sessions have active runs (to filter stale replayed events)
 const activeRunIds: Map<string, string> = new Map();
 
+// Track session-message subscriptions on the singleton backend gateway socket.
+// OpenClaw's Control UI subscribes to live session events and handles runtime
+// events directly; history is only the durable record. The portal mirrors that
+// model here so context maintenance can update the rail even when no transcript
+// reload happens.
+const desiredSessionMessageSubscriptions: Set<string> = new Set();
+const activeSessionMessageSubscriptions: Set<string> = new Set();
+const latestCompactionCheckpointBySession: Map<string, string> = new Map();
+
+function resolveSessionKeyForGatewayPayload(payload: Record<string, unknown> | undefined): string {
+  const direct = typeof payload?.sessionKey === 'string' ? payload.sessionKey.trim() : '';
+  if (direct) return direct;
+
+  // Some OpenClaw runtime events, especially compaction events, are emitted
+  // run-scoped without a sessionKey. Control UI accepts those when the runId
+  // matches the active chat. Do the same instead of dropping them.
+  const runId = typeof payload?.runId === 'string' ? payload.runId.trim() : '';
+  if (!runId) return '';
+  for (const [sessionKey, activeRunId] of activeRunIds) {
+    if (activeRunId === runId) return sessionKey;
+  }
+  return '';
+}
+
+function compactionCheckpointSignature(payload: any): string | null {
+  const row = payload?.session && typeof payload.session === 'object' ? payload.session : payload;
+  const checkpoint = row?.latestCompactionCheckpoint;
+  const count = typeof row?.compactionCheckpointCount === 'number' && Number.isFinite(row.compactionCheckpointCount)
+    ? row.compactionCheckpointCount
+    : null;
+  if (!checkpoint && count == null) return null;
+  const checkpointId = typeof checkpoint?.checkpointId === 'string' && checkpoint.checkpointId.trim()
+    ? checkpoint.checkpointId.trim()
+    : (typeof checkpoint?.id === 'string' && checkpoint.id.trim() ? checkpoint.id.trim() : '');
+  const createdAt = typeof checkpoint?.createdAt === 'number' && Number.isFinite(checkpoint.createdAt)
+    ? checkpoint.createdAt
+    : '';
+  return `${count ?? ''}:${checkpointId}:${createdAt}`;
+}
+
 type ToolPhaseState = {
   runId?: string;
   toolName: string;
@@ -268,8 +309,11 @@ function shouldProcessTrackedSessionEvent(sessionKey: string): boolean {
 function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   if (!payload) return;
 
-  const sessionKey = typeof payload.sessionKey === 'string' ? payload.sessionKey : '';
-  if (!sessionKey) return;
+  const sessionKey = resolveSessionKeyForGatewayPayload(payload);
+  if (!sessionKey) {
+    debugLog(`Ignoring agent event without resolvable sessionKey: stream=${String(payload.stream || '')} runId=${String(payload.runId || '')}`);
+    return;
+  }
 
   const stream = typeof payload.stream === 'string' ? payload.stream : '';
   const data = (payload.data && typeof payload.data === 'object' ? payload.data : {}) as Record<string, unknown>;
@@ -290,12 +334,15 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
         maintenanceKind: 'compaction',
       });
     } else if (compPhase === 'end' || compPhase === 'completed' || compPhase === 'compacted') {
-      const completed = data.completed !== false;
+      const completed = data.completed === true || compPhase === 'completed' || compPhase === 'compacted';
+      const willRetry = data.willRetry === true;
       streamEventBus.publish(sessionKey, {
-        type: 'compaction_end',
-        content: completed ? 'Context compacted' : 'Context maintenance finished.',
+        type: willRetry && completed ? 'compaction_start' : 'compaction_end',
+        content: willRetry && completed
+          ? 'Compaction retrying…'
+          : (completed ? 'Context compacted' : 'Context maintenance finished.'),
         completed,
-        willRetry: data.willRetry === true,
+        willRetry,
         maintenanceKind: completed ? 'compaction' : 'maintenance',
       });
     }
@@ -476,6 +523,82 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   }
 }
 
+function handleSessionMessageEvent(payload: Record<string, unknown> | undefined): void {
+  if (!payload) return;
+  const sessionKey = resolveSessionKeyForGatewayPayload(payload);
+  if (!sessionKey) return;
+
+  const message = payload.message && typeof payload.message === 'object' ? payload.message as any : null;
+  if (!message) return;
+
+  const meta = (message.__openclaw && typeof message.__openclaw === 'object' ? message.__openclaw : null)
+    || (message.metadata?.__openclaw && typeof message.metadata.__openclaw === 'object' ? message.metadata.__openclaw : null);
+  const text = extractTextFromContent(message.content ?? message.text ?? '');
+  const kind = typeof meta?.kind === 'string' ? meta.kind.toLowerCase() : '';
+  const phase = typeof meta?.phase === 'string' ? meta.phase.toLowerCase() : '';
+  const isCompactionMeta = kind === 'compaction';
+  const signal = isCompactionMeta
+    ? inferLifecycleMaintenanceSignal(phase, text || null)
+    : inferLifecycleMaintenanceSignal('', text || null);
+
+  if (!isCompactionMeta && signal === 'idle') return;
+
+  if (signal === 'compacting') {
+    streamEventBus.publish(sessionKey, {
+      type: 'compaction_start',
+      content: text || 'Compacting context…',
+      maintenanceKind: 'compaction',
+    });
+    return;
+  }
+
+  if (signal === 'compacted') {
+    streamEventBus.publish(sessionKey, {
+      type: 'compaction_end',
+      content: text || 'Context compacted',
+      completed: true,
+      maintenanceKind: 'compaction',
+    });
+    return;
+  }
+
+  if (signal === 'maintenance') {
+    streamEventBus.publish(sessionKey, {
+      type: 'status',
+      content: text || 'Context maintenance in progress…',
+      maintenanceKind: 'maintenance',
+    });
+    return;
+  }
+
+  if (signal === 'maintenance_done') {
+    streamEventBus.publish(sessionKey, {
+      type: 'status',
+      content: text || 'Context maintenance finished.',
+      maintenanceKind: 'maintenance',
+    });
+  }
+}
+
+function handleSessionsChangedEvent(payload: Record<string, unknown> | undefined): void {
+  if (!payload) return;
+  const sessionKey = resolveSessionKeyForGatewayPayload(payload);
+  if (!sessionKey) return;
+
+  const signature = compactionCheckpointSignature(payload);
+  if (!signature) return;
+  const previous = latestCompactionCheckpointBySession.get(sessionKey);
+  latestCompactionCheckpointBySession.set(sessionKey, signature);
+  if (!previous || previous === signature) return;
+
+  streamEventBus.publish(sessionKey, {
+    type: 'compaction_end',
+    content: 'Context compacted',
+    completed: true,
+    maintenanceKind: 'compaction',
+  });
+}
+
 /**
  * Handle `chat` events from the gateway.
  * Shape: { runId, sessionKey, seq, state: 'delta'|'final'|'error', message?, errorMessage? }
@@ -483,8 +606,11 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
 function handleChatEvent(payload: Record<string, unknown> | undefined): void {
   if (!payload) return;
 
-  const sessionKey = typeof payload.sessionKey === 'string' ? payload.sessionKey : '';
-  if (!sessionKey) return;
+  const sessionKey = resolveSessionKeyForGatewayPayload(payload);
+  if (!sessionKey) {
+    debugLog(`Ignoring chat event without resolvable sessionKey: state=${String(payload.state || '')} runId=${String(payload.runId || '')}`);
+    return;
+  }
 
   const state = typeof payload.state === 'string' ? payload.state : '';
 
@@ -663,8 +789,8 @@ function connect(): void {
         role: GATEWAY_ROLE,
         scopes: GATEWAY_SCOPES,
         caps: ['tool-events'],
-        minProtocol: PROTOCOL_VERSION,
-        maxProtocol: PROTOCOL_VERSION,
+        minProtocol: MIN_PROTOCOL_VERSION,
+        maxProtocol: MAX_PROTOCOL_VERSION,
       };
 
     // NOTE: Do NOT send lastSeq, stateVersion, or any resume hints here.
@@ -730,6 +856,13 @@ function connect(): void {
           stateVersion = msg.payload.stateVersion;
         }
         debugLog('Authenticated and listening for events');
+
+        void callGatewayRpc('sessions.subscribe', {}, 10000)
+          .then(() => debugLog('Subscribed to OpenClaw session events'))
+          .catch((err: Error) => debugLog(`sessions.subscribe failed: ${err.message}`));
+        for (const key of desiredSessionMessageSubscriptions) {
+          void subscribeGatewaySessionMessageNow(key);
+        }
 
         // On reconnect, restore active session tracking and notify StreamEventBus
         // that sessions may need to be re-subscribed.
@@ -835,6 +968,16 @@ function connect(): void {
       return;
     }
 
+    if (msg.event === 'session.message') {
+      handleSessionMessageEvent(msg.payload);
+      return;
+    }
+
+    if (msg.event === 'sessions.changed') {
+      handleSessionsChangedEvent(msg.payload);
+      return;
+    }
+
     // Log unhandled events for debugging (helps discover new event types like compaction)
     if (msg.event) {
       debugLog(`UNHANDLED event type: "${msg.event}" payload keys: ${Object.keys(msg.payload || {}).join(',')}`);
@@ -860,6 +1003,7 @@ function connect(): void {
     singletonWs = null;
     isConnecting = false;
     isAuthenticated = false;
+    activeSessionMessageSubscriptions.clear();
 
     // Reject any pending RPC calls
     for (const [id, pending] of pendingResponses) {
@@ -874,6 +1018,20 @@ function connect(): void {
   });
 
   singletonWs = ws;
+}
+
+async function subscribeGatewaySessionMessageNow(sessionKey: string): Promise<void> {
+  const key = sessionKey.trim();
+  if (!key || activeSessionMessageSubscriptions.has(key)) return;
+  try {
+    const payload = await callGatewayRpc('sessions.messages.subscribe', { key }, 10000);
+    const canonicalKey = typeof payload?.key === 'string' && payload.key.trim() ? payload.key.trim() : key;
+    activeSessionMessageSubscriptions.add(canonicalKey);
+    if (canonicalKey !== key) activeSessionMessageSubscriptions.add(key);
+    debugLog(`Subscribed to OpenClaw session messages: ${canonicalKey}`);
+  } catch (err: any) {
+    debugLog(`sessions.messages.subscribe failed for ${key}: ${err?.message || err}`);
+  }
 }
 
 /* ─── Public API ────────────────────────────────────────────────────── */
@@ -924,6 +1082,19 @@ export function onApprovalRequest(callback: ApprovalRequestCallback): () => void
 export function onApprovalResolved(callback: ApprovalResolvedCallback): () => void {
   approvalResolvedListeners.add(callback);
   return () => approvalResolvedListeners.delete(callback);
+}
+
+/**
+ * Subscribe the backend singleton socket to live transcript messages for a
+ * session. This mirrors OpenClaw Control UI's session-message path and is used
+ * only as a live signal source; history remains the durable record.
+ */
+export async function subscribeGatewaySessionMessages(sessionKey: string): Promise<void> {
+  const key = sessionKey.trim();
+  if (!key) return;
+  desiredSessionMessageSubscriptions.add(key);
+  if (!isConnected()) return;
+  await subscribeGatewaySessionMessageNow(key);
 }
 
 /**

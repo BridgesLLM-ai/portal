@@ -253,6 +253,24 @@ function dedupeProviderModels(provider: string, models: Array<string | null | un
   return deduped;
 }
 
+function stripPortalUnsupportedModelMetadata(config: any): boolean {
+  // Keep setup writes inside OpenClaw's stable public config schema. Runtime
+  // harness selection is not a valid key under agents.defaults.models in
+  // OpenClaw 2026.5.x; persisting it makes `openclaw gateway restart` abort.
+  const models = config?.agents?.defaults?.models;
+  if (!models || typeof models !== 'object') return false;
+
+  let changed = false;
+  for (const entry of Object.values(models) as any[]) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (Object.prototype.hasOwnProperty.call(entry, 'agentRuntime')) {
+      delete entry.agentRuntime;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 function parseDiscoveredProviderModels(provider: string, payload: any): string[] {
   const models = normalizeModelPayload(extractModelArray(payload), provider)
     .map((entry) => canonicalizeDiscoveredProviderModelId(provider, entry?.id || entry?.name || ''))
@@ -311,7 +329,7 @@ export function mergeDiscoveredProviderModelsIntoConfig(config: any, provider: s
   const fallbackSet = new Set(existingFallbacks);
   const addedAllowlist: string[] = [];
   const addedFallbacks: string[] = [];
-  let changed = false;
+  let changed = stripPortalUnsupportedModelMetadata(next);
 
   for (const modelId of dedupeProviderModels(provider, discoveredModels)) {
     if (!next.agents.defaults.models[modelId] || typeof next.agents.defaults.models[modelId] !== 'object') {

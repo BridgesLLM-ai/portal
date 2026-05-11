@@ -48,7 +48,7 @@ export interface GatewayEventPayload {
 
 export interface GatewayEvent {
   type: 'event';
-  event: 'chat' | 'agent' | 'connect.challenge';
+  event: 'chat' | 'agent' | 'chat.side_result' | 'session.message' | 'sessions.changed' | 'connect.challenge';
   payload: GatewayEventPayload;
 }
 
@@ -72,6 +72,7 @@ export interface GatewayChatMessage {
 
 export interface GatewayHistoryResponse {
   messages: GatewayChatMessage[];
+  sessionId?: string;
   thinkingLevel?: string;
 }
 
@@ -113,6 +114,8 @@ export class OpenClawGatewayClient {
   private reconnecting = false;
   private currentSessionKey: string | null = null;
   private activeRunSessionKey: string | null = null;
+  private sessionIdsByKey = new Map<string, string>();
+  private subscribedSessionMessageKeys = new Set<string>();
 
   private readonly url: string;
   private readonly onEvent: (evt: GatewayEvent) => void;
@@ -284,6 +287,14 @@ export class OpenClawGatewayClient {
       .then((result) => {
         console.log('[OpenClawGatewayClient] Connected with protocol:', result.protocol);
         this.authenticated = true;
+        void this.subscribeSessions().catch((error) => {
+          console.warn('[OpenClawGatewayClient] sessions.subscribe failed:', error);
+        });
+        if (this.currentSessionKey) {
+          void this.subscribeSession(this.currentSessionKey).catch((error) => {
+            console.warn('[OpenClawGatewayClient] Failed to subscribe current session:', error);
+          });
+        }
         this.sendReconnectFrame();
         if (this.reconnecting && this.activeRunSessionKey) {
           void this.subscribeSession(this.activeRunSessionKey).catch((error) => {
@@ -305,6 +316,7 @@ export class OpenClawGatewayClient {
     this.connected = false;
     this.authenticated = false;
     this.challengeNonce = null;
+    this.subscribedSessionMessageKeys.clear();
 
     if (this.pingTimer) {
       clearInterval(this.pingTimer);
@@ -440,9 +452,11 @@ export class OpenClawGatewayClient {
     this.currentSessionKey = sessionKey;
     this.activeRunSessionKey = sessionKey;
     const idempotencyKey = clientRandomId();
+    const sessionId = this.sessionIdsByKey.get(sessionKey);
 
     const result = await this.request<{ runId?: string; status?: string }>('chat.send', {
       sessionKey,
+      ...(sessionId ? { sessionId } : {}),
       message,
       deliver: false,
       idempotencyKey,
@@ -492,15 +506,20 @@ export class OpenClawGatewayClient {
   /**
    * Load message history for a session.
    */
-  async loadHistory(sessionKey: string, limit = 100): Promise<GatewayHistoryResponse> {
+  async loadHistory(sessionKey: string, limit = 200): Promise<GatewayHistoryResponse> {
     this.currentSessionKey = sessionKey;
-    const result = await this.request<{ messages: GatewayChatMessage[]; thinkingLevel?: string }>('chat.history', {
+    const result = await this.request<{ messages: GatewayChatMessage[]; sessionId?: string; thinkingLevel?: string }>('chat.history', {
       sessionKey,
       limit,
     });
 
+    if (typeof result.sessionId === 'string' && result.sessionId.trim()) {
+      this.sessionIdsByKey.set(sessionKey, result.sessionId.trim());
+    }
+
     return {
       messages: result.messages || [],
+      sessionId: result.sessionId,
       thinkingLevel: result.thinkingLevel,
     };
   }
@@ -523,8 +542,25 @@ export class OpenClawGatewayClient {
    * no explicit subscribe RPC is needed. This just tracks the active session.
    */
   async subscribeSession(sessionKey: string): Promise<void> {
-    this.currentSessionKey = sessionKey;
-    // No RPC needed — gateway pushes events to all connected backend clients
+    const key = String(sessionKey || '').trim();
+    if (!key) return;
+    this.currentSessionKey = key;
+    if (!this.isConnected || this.subscribedSessionMessageKeys.has(key)) return;
+    try {
+      const result = await this.request<{ key?: string }>('sessions.messages.subscribe', { key });
+      const canonicalKey = typeof result?.key === 'string' && result.key.trim() ? result.key.trim() : key;
+      this.subscribedSessionMessageKeys.add(key);
+      this.subscribedSessionMessageKeys.add(canonicalKey);
+    } catch (error) {
+      // Older gateways may not expose per-session message subscriptions. The
+      // broad sessions.subscribe channel still gives us session/change events.
+      console.warn('[OpenClawGatewayClient] sessions.messages.subscribe failed:', error);
+    }
+  }
+
+  async subscribeSessions(): Promise<void> {
+    if (!this.isConnected) return;
+    await this.request('sessions.subscribe', {});
   }
 }
 

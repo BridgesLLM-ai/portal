@@ -55,19 +55,31 @@
         }
         #clipText:focus { border-color: rgba(59,130,246,0.5); }
         #clipText::placeholder { color: #4a5872; }
-        .clip-actions { display: flex; gap: 6px; }
+        .clip-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
         .clip-btn {
-            flex: 1; padding: 7px 0; border: none; border-radius: 8px;
-            font: 600 12px/1 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            min-height: 32px; padding: 8px 8px; border: none; border-radius: 8px;
+            font: 700 11px/1.1 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             cursor: pointer; transition: all 0.15s; text-transform: uppercase; letter-spacing: 0.03em;
+            white-space: nowrap;
         }
+        .clip-btn:disabled { opacity: 0.55; cursor: not-allowed; }
         .clip-btn.send { background: #3b82f6; color: #fff; }
         .clip-btn.send:hover { background: #2563eb; }
+        .clip-btn.paste { background: rgba(59,130,246,0.18); color: #93c5fd; border: 1px solid rgba(59,130,246,0.35); }
+        .clip-btn.paste:hover { background: rgba(59,130,246,0.28); }
+        .clip-btn.copy { background: rgba(245,158,11,0.16); color: #fbbf24; border: 1px solid rgba(245,158,11,0.3); }
+        .clip-btn.copy:hover { background: rgba(245,158,11,0.25); }
+        .clip-btn.pull { background: rgba(20,184,166,0.16); color: #5eead4; border: 1px solid rgba(20,184,166,0.3); }
+        .clip-btn.pull:hover { background: rgba(20,184,166,0.25); }
         .clip-btn.type { background: rgba(139,92,246,0.2); color: #a78bfa; border: 1px solid rgba(139,92,246,0.3); }
         .clip-btn.type:hover { background: rgba(139,92,246,0.3); }
         .clip-btn.read { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
         .clip-btn.read:hover { background: rgba(16,185,129,0.25); }
         .clip-hint { font-size: 10px; color: #4a5872; text-align: center; }
+        .clip-status { min-height: 16px; font-size: 10px; color: #64748b; text-align: center; }
+        .clip-status.ok { color: #34d399; }
+        .clip-status.warn { color: #fbbf24; }
+        .clip-status.error { color: #f87171; }
 
         /* Mobile keyboard input (hidden offscreen, captures keystrokes) */
         #mobileInput {
@@ -207,6 +219,7 @@
                 });
                 // Expose for clipboard/keyboard toolbar
                 window._rfb = rfb;
+                window.dispatchEvent(new CustomEvent('bridgesllm.rfb.ready', { detail: { rfb } }));
 
                 rfb.scaleViewport = resize !== 'off';
                 rfb.resizeSession = resize === 'remote';
@@ -264,14 +277,18 @@
 
     <!-- Clipboard panel -->
     <div id="clipPanel">
-        <label>Clipboard / Text Input</label>
-        <textarea id="clipText" placeholder="Paste or type text here, then send to desktop…" rows="3"></textarea>
+        <label>Clipboard Bridge</label>
+        <textarea id="clipText" placeholder="Pull from desktop, read this device, or type text here…" rows="4"></textarea>
         <div class="clip-actions">
-            <button class="clip-btn read" id="clipReadBtn" title="Read clipboard from your device">📋 Read</button>
-            <button class="clip-btn send" id="clipSendBtn" title="Paste text into the remote desktop clipboard">⬆ Paste</button>
+            <button class="clip-btn pull" id="clipPullBtn" title="Read the Remote Desktop clipboard into this box">⬇ Pull Desktop</button>
+            <button class="clip-btn copy" id="clipCopyOutBtn" title="Copy this box to your device clipboard">⬆ Copy Out</button>
+            <button class="clip-btn read" id="clipReadBtn" title="Read clipboard from your device into this box">📋 Read Device</button>
+            <button class="clip-btn send" id="clipSetBtn" title="Set the Remote Desktop clipboard without pressing paste">Set Desktop</button>
+            <button class="clip-btn paste" id="clipPasteBtn" title="Set the Remote Desktop clipboard and press Ctrl+V in the active app">Paste Now</button>
             <button class="clip-btn type" id="clipTypeBtn" title="Type text character-by-character (like a keyboard)">⌨ Type</button>
         </div>
-        <div class="clip-hint">Paste → sets clipboard · Type → sends keystrokes</div>
+        <div class="clip-status" id="clipStatus">Remote copy events appear here automatically.</div>
+        <div class="clip-hint">Pull Desktop → bring text out · Copy Out → device clipboard · Paste Now → remote Ctrl+V</div>
     </div>
 
     <!-- Floating toolbar -->
@@ -294,19 +311,135 @@
 
         const clipPanel = document.getElementById('clipPanel');
         const clipText = document.getElementById('clipText');
+        const clipPullBtn = document.getElementById('clipPullBtn');
+        const clipCopyOutBtn = document.getElementById('clipCopyOutBtn');
         const clipReadBtn = document.getElementById('clipReadBtn');
-        const clipSendBtn = document.getElementById('clipSendBtn');
+        const clipSetBtn = document.getElementById('clipSetBtn');
+        const clipPasteBtn = document.getElementById('clipPasteBtn');
         const clipTypeBtn = document.getElementById('clipTypeBtn');
+        const clipStatus = document.getElementById('clipStatus');
         const tbClipboard = document.getElementById('tbClipboard');
         const tbKeyboard = document.getElementById('tbKeyboard');
         const mobileInput = document.getElementById('mobileInput');
 
         let keyboardActive = false;
+        let clipboardListenerAttachedTo = null;
+
+        function setClipStatus(text, tone = '') {
+            clipStatus.textContent = text;
+            clipStatus.className = 'clip-status' + (tone ? ' ' + tone : '');
+        }
+
+        function setTemporaryButtonText(button, text, restoreText, delay = 1500) {
+            button.textContent = text;
+            setTimeout(() => { button.textContent = restoreText; }, delay);
+        }
+
+        function currentText() {
+            return clipText.value || '';
+        }
+
+        async function requestDesktopClipboard(method, body) {
+            const response = await fetch('/api/remote-desktop/clipboard', {
+                method,
+                credentials: 'same-origin',
+                headers: body ? { 'Content-Type': 'application/json' } : undefined,
+                body: body ? JSON.stringify(body) : undefined,
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok || data.ok === false) {
+                throw new Error(data.error || ('Clipboard bridge failed with HTTP ' + response.status));
+            }
+            return data;
+        }
+
+        async function pullDesktopClipboard() {
+            clipPullBtn.disabled = true;
+            setClipStatus('Reading Remote Desktop clipboard…');
+            try {
+                const data = await requestDesktopClipboard('GET');
+                clipText.value = data.text || '';
+                setClipStatus(data.text ? 'Pulled from Remote Desktop clipboard.' : 'Remote Desktop clipboard is empty.', data.text ? 'ok' : 'warn');
+                setTemporaryButtonText(clipPullBtn, '✓ Pulled', '⬇ Pull Desktop');
+            } catch (err) {
+                setClipStatus(err.message || 'Could not read Remote Desktop clipboard.', 'error');
+            } finally {
+                clipPullBtn.disabled = false;
+                clipText.focus();
+            }
+        }
+
+        async function setDesktopClipboard(text) {
+            const rfb = window._rfb;
+            if (rfb && typeof rfb.clipboardPasteFrom === 'function') {
+                rfb.clipboardPasteFrom(text);
+            }
+            return requestDesktopClipboard('POST', { text, selection: 'clipboard' });
+        }
+
+        function sendCtrlV() {
+            const rfb = window._rfb;
+            if (!rfb) return false;
+            rfb.sendKey(0xffe3, 'ControlLeft', true);  // Ctrl down
+            rfb.sendKey(0x0076, 'KeyV', true);          // v down
+            rfb.sendKey(0x0076, 'KeyV', false);         // v up
+            rfb.sendKey(0xffe3, 'ControlLeft', false);  // Ctrl up
+            return true;
+        }
+
+        async function copyTextToDeviceClipboard(text) {
+            if (!text) return false;
+            if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text);
+                return true;
+            }
+            clipText.focus();
+            clipText.select();
+            return document.execCommand?.('copy') === true;
+        }
+
+        function attachClipboardListener(rfb) {
+            if (!rfb || clipboardListenerAttachedTo === rfb) return;
+            clipboardListenerAttachedTo = rfb;
+            rfb.addEventListener('clipboard', (event) => {
+                const text = event.detail?.text || '';
+                clipText.value = text;
+                setClipStatus(text ? 'Remote Desktop copied text is ready. Tap Copy Out to move it to this device.' : 'Remote Desktop clipboard event was empty.', text ? 'ok' : 'warn');
+                if (!clipPanel.classList.contains('open')) {
+                    tbClipboard.classList.add('active');
+                }
+            });
+        }
+
+        window.addEventListener('bridgesllm.rfb.ready', (event) => attachClipboardListener(event.detail?.rfb));
+        setInterval(() => attachClipboardListener(window._rfb), 1000);
 
         // Toggle clipboard panel
         tbClipboard.addEventListener('click', () => {
             clipPanel.classList.toggle('open');
             tbClipboard.classList.toggle('active', clipPanel.classList.contains('open'));
+            if (clipPanel.classList.contains('open')) clipText.focus();
+        });
+
+        // Pull Remote Desktop clipboard into textarea
+        clipPullBtn.addEventListener('click', pullDesktopClipboard);
+
+        // Copy textarea to device clipboard
+        clipCopyOutBtn.addEventListener('click', async () => {
+            const text = currentText();
+            if (!text) {
+                setClipStatus('Nothing to copy out yet.', 'warn');
+                return;
+            }
+            try {
+                const ok = await copyTextToDeviceClipboard(text);
+                setClipStatus(ok ? 'Copied to this device clipboard.' : 'Text selected — use system Copy.', ok ? 'ok' : 'warn');
+                setTemporaryButtonText(clipCopyOutBtn, ok ? '✓ Copied' : 'Selected', '⬆ Copy Out');
+            } catch (err) {
+                clipText.focus();
+                clipText.select();
+                setClipStatus('Clipboard permission blocked. Text selected — use system Copy.', 'warn');
+            }
         });
 
         // Read device clipboard into textarea
@@ -315,42 +448,58 @@
                 const text = await navigator.clipboard.readText();
                 clipText.value = text;
                 clipText.focus();
+                setClipStatus(text ? 'Read from this device clipboard.' : 'This device clipboard is empty.', text ? 'ok' : 'warn');
+                setTemporaryButtonText(clipReadBtn, '✓ Read', '📋 Read Device');
             } catch (err) {
                 // Fallback: just focus the textarea so user can manually paste
                 clipText.focus();
                 clipText.placeholder = 'Tap here and use Ctrl+V / long-press paste';
+                setClipStatus('Clipboard permission blocked. Paste manually into the box.', 'warn');
             }
         });
 
-        // Paste: send text to VNC clipboard
-        clipSendBtn.addEventListener('click', () => {
-            const rfb = window._rfb;
-            const text = clipText.value;
-            if (!rfb || !text) return;
+        // Set Remote Desktop clipboard without pasting
+        clipSetBtn.addEventListener('click', async () => {
+            const text = currentText();
+            try {
+                await setDesktopClipboard(text);
+                setClipStatus('Remote Desktop clipboard set.', 'ok');
+                setTemporaryButtonText(clipSetBtn, '✓ Set', 'Set Desktop');
+            } catch (err) {
+                setClipStatus(err.message || 'Could not set Remote Desktop clipboard.', 'error');
+            }
+        });
 
-            // Send to VNC clipboard
-            rfb.clipboardPasteFrom(text);
-
-            // Then simulate Ctrl+V to paste it in the active app
-            rfb.sendKey(0xffe3, 'ControlLeft', true);  // Ctrl down
-            rfb.sendKey(0x0076, 'KeyV', true);          // v down
-            rfb.sendKey(0x0076, 'KeyV', false);          // v up
-            rfb.sendKey(0xffe3, 'ControlLeft', false);  // Ctrl up
-
-            // Visual feedback
-            clipSendBtn.textContent = '✓ Sent';
-            setTimeout(() => { clipSendBtn.textContent = '⬆ Paste'; }, 1500);
+        // Paste Now: set desktop clipboard, then press Ctrl+V in the active remote app
+        clipPasteBtn.addEventListener('click', async () => {
+            const text = currentText();
+            if (!text) {
+                setClipStatus('Nothing to paste.', 'warn');
+                return;
+            }
+            try {
+                await setDesktopClipboard(text);
+                if (!sendCtrlV()) {
+                    setClipStatus('Remote clipboard set, but VNC is not connected for Ctrl+V.', 'warn');
+                    return;
+                }
+                setClipStatus('Sent to Remote Desktop and pressed Ctrl+V.', 'ok');
+                setTemporaryButtonText(clipPasteBtn, '✓ Pasted', 'Paste Now');
+            } catch (err) {
+                setClipStatus(err.message || 'Could not paste into Remote Desktop.', 'error');
+            }
         });
 
         // Type: send text as individual keystrokes
         clipTypeBtn.addEventListener('click', () => {
             const rfb = window._rfb;
-            const text = clipText.value;
+            const text = currentText();
             if (!rfb || !text) return;
 
             let i = 0;
             const typeNext = () => {
                 if (i >= text.length) {
+                    setClipStatus('Typed into Remote Desktop.', 'ok');
                     clipTypeBtn.textContent = '✓ Done';
                     setTimeout(() => { clipTypeBtn.textContent = '⌨ Type'; }, 1500);
                     return;
@@ -378,6 +527,7 @@
                 setTimeout(typeNext, 12);
             };
 
+            setClipStatus('Typing into Remote Desktop…');
             clipTypeBtn.textContent = '⌨ Typing…';
             typeNext();
         });

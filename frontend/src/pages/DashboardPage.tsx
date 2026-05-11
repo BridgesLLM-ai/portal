@@ -17,6 +17,21 @@ import {
 
 const LazyDashboardCharts = lazy(() => import('../components/dashboard/DashboardCharts'));
 
+type OpenClawVersionStatus = {
+  installedVersion: string | null;
+  runningVersion: string | null;
+  latestVersion: string | null;
+  updateChannel: string | null;
+  mismatch: boolean;
+  restartRecommended: boolean;
+  reason: string | null;
+  listenerPid: number | null;
+  listenerStartedAt: string | null;
+  installedPackageMtime: string | null;
+  probeOk: boolean;
+  probeError?: string | null;
+};
+
 /* ─── helpers ──────────────────────────────────────────── */
 
 function formatBytes(bytes: number | bigint | string, decimals = 1): string {
@@ -191,7 +206,9 @@ export default function DashboardPage() {
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const [openClawStatus, setOpenClawStatus] = useState<'checking' | 'connected' | 'misconfigured' | 'offline'>('checking');
   const [openClawIssues, setOpenClawIssues] = useState<string[]>([]);
+  const [openClawVersion, setOpenClawVersion] = useState<OpenClawVersionStatus | null>(null);
   const [reconnecting, setReconnecting] = useState(false);
+  const [restartingGateway, setRestartingGateway] = useState(false);
   const [showCharts, setShowCharts] = useState(false);
   // readiness + recentActivity sections removed per design cleanup
   const socketRef = useRef<Socket | null>(null);
@@ -305,7 +322,12 @@ export default function DashboardPage() {
           client.get('/gateway/health', { _silent: true } as any).then(r => r.data).catch(() => null),
         ]);
         if (cancelled) return;
-        if (gateway?.ok) {
+        const versionStatus = gateway?.openclawVersion || null;
+        setOpenClawVersion(versionStatus);
+        if (versionStatus?.restartRecommended) {
+          setOpenClawStatus('misconfigured');
+          setOpenClawIssues(gateway?.issues || [versionStatus.reason || 'OpenClaw gateway is running a stale version and should be restarted.']);
+        } else if (gateway?.ok) {
           setOpenClawStatus('connected');
           setOpenClawIssues([]);
         } else if (gateway?.connected && !gateway?.wsConnected) {
@@ -423,6 +445,29 @@ export default function DashboardPage() {
     }
     setUpdateBannerDismissed(true);
   };
+
+  const restartOpenClawGateway = useCallback(async () => {
+    if (!canReconnectGateway) return;
+    try {
+      setRestartingGateway(true);
+      const { data } = await client.post('/gateway/restart');
+      const nextVersion = data?.after || data?.openclawVersion || null;
+      setOpenClawVersion(nextVersion);
+      if (data?.ok || (nextVersion && !nextVersion.restartRecommended)) {
+        setOpenClawStatus('connected');
+        setOpenClawIssues([]);
+      } else {
+        setOpenClawStatus('misconfigured');
+        setOpenClawIssues([data?.message || nextVersion?.reason || 'OpenClaw gateway restart did not clear the version warning.']);
+      }
+    } catch (err: any) {
+      setOpenClawStatus('misconfigured');
+      setOpenClawIssues([err?.response?.data?.message || err?.response?.data?.error || 'OpenClaw gateway restart request failed.']);
+    } finally {
+      setRestartingGateway(false);
+      fetchData();
+    }
+  }, [canReconnectGateway, fetchData]);
 
   const runSelfUpdate = useCallback(async () => {
     if (!canRunSelfUpdate) return;
@@ -558,7 +603,30 @@ export default function DashboardPage() {
             : 'Offline'
           }</span>
         </div>
-        {(openClawStatus === 'offline' || openClawStatus === 'misconfigured') && openClawIssues.length > 0 && (
+        {openClawVersion?.restartRecommended && (
+          <div className="flex flex-wrap items-center gap-2 rounded-xl border border-cyan-400/25 bg-cyan-500/10 px-3 py-2 text-sm text-cyan-100">
+            <span className="flex-1 min-w-[16rem]">
+              {openClawVersion.reason || 'OpenClaw gateway should be restarted to load the installed version.'}
+              {openClawVersion.installedVersion ? ` Installed: v${openClawVersion.installedVersion}.` : ''}
+              {openClawVersion.runningVersion ? ` Running: v${openClawVersion.runningVersion}.` : ''}
+            </span>
+            {canReconnectGateway ? (
+              <button
+                onClick={restartOpenClawGateway}
+                disabled={restartingGateway}
+                className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-cyan-300/30 bg-cyan-500/20 hover:bg-cyan-500/30 px-3 py-1 text-xs font-medium text-cyan-100 transition disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {restartingGateway ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                {restartingGateway ? 'Restarting…' : 'Restart OpenClaw'}
+              </button>
+            ) : (
+              <span className="shrink-0 rounded-lg border border-cyan-300/20 bg-black/10 px-2.5 py-1 text-xs text-cyan-100/90">
+                Admin access required to restart OpenClaw.
+              </span>
+            )}
+          </div>
+        )}
+        {(openClawStatus === 'offline' || openClawStatus === 'misconfigured') && openClawIssues.length > 0 && !openClawVersion?.restartRecommended && (
           <div className="flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
             <span className="flex-1 min-w-[14rem]">{openClawIssues[0]}</span>
             {canReconnectGateway ? (

@@ -2,6 +2,26 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.12] — 2026-05-10
+
+### Fixed
+- **OpenClaw refresh and reconnect recovery is boring again**: Agent Chat and project chat now subscribe to live session events, preserve context-maintenance markers across reloads, and avoid reporting stale active streams after a run has already finished.
+- **Compaction and memory-maintenance notices no longer masquerade as assistant prose**: compaction, memory flush, heartbeat, and skipped-maintenance markers are recognized only when they match anchored runtime notices, so ordinary chat text stays visible as normal conversation.
+- **Project chat avoids duplicate sends during gateway reconnect pressure**: accepted persistent gateway RPC calls now fail visibly instead of retrying non-idempotent sends through a second socket that can disrupt the active stream.
+- **AI provider setup no longer writes unsupported OpenClaw model metadata**: provider discovery now strips portal-only runtime fields before saving model config, preventing gateway restart failures on current OpenClaw builds.
+- **Codex/Gemini/Claude OAuth handoffs are more tolerant of terminal prompt changes**: callback-paste prompts are detected even when the CLI renders them one character per line or with newer wording.
+- **Fresh installs require a Node.js version new enough for current OpenClaw**: the installer now repairs old Node 22 minors and verifies Node.js 22.16+ before continuing.
+
+### Improved
+- **Dashboard health now detects stale OpenClaw gateway processes**: admins get a clear version-mismatch warning and a controlled restart action when the installed OpenClaw package and running gateway listener diverge.
+- **Session and provider pickers stay usable while refreshing**: Agent Chat keeps the current selection visible, shows inline loading states, and avoids replacing the whole control with a generic spinner.
+- **Remote Desktop launchers fit shared browser windows more reliably**: bundled shared-browser and OpenClaw UI launch scripts now adapt to the VNC work area and preserve in-page navigation controls on compact desktops.
+- **Release packaging keeps the visual assets together**: the tarball and hosted artifacts include the current favicon, logo, provider icons, Remote Desktop icons, noVNC icons, and portal branding assets.
+
+### Maintenance
+- **Regression coverage was extended for provider setup and OAuth prompt parsing**: tests now protect model-config cleanup and callback prompt detection paths that previously depended on fragile CLI output shapes.
+- **Public release metadata was refreshed**: README, changelog, hosted installer metadata, and LLM-facing product summaries now point at v3.25.12 without private deployment notes.
+
 ## [3.25.11] — 2026-05-08
 
 ### Fixed

@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Shared Browser">
+  <defs>
+    <linearGradient id="bg" x1="28" y1="18" x2="228" y2="238" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#102947"/>
+      <stop offset="0.55" stop-color="#071827"/>
+      <stop offset="1" stop-color="#05080f"/>
+    </linearGradient>
+    <linearGradient id="window" x1="54" y1="54" x2="202" y2="190" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f8fbff"/>
+      <stop offset="1" stop-color="#dbe8ff"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="70" y1="92" x2="190" y2="184" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#d7fbff"/>
+      <stop offset="1" stop-color="#7ec8ff"/>
+    </linearGradient>
+    <linearGradient id="cursorA" x1="57" y1="132" x2="117" y2="207" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#bdeaff"/>
+    </linearGradient>
+    <linearGradient id="cursorB" x1="138" y1="105" x2="202" y2="183" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff2bd"/>
+      <stop offset="1" stop-color="#ffb85f"/>
+    </linearGradient>
+    <filter id="shadow" x="-25%" y="-25%" width="150%" height="160%">
+      <feDropShadow dx="0" dy="12" stdDeviation="10" flood-color="#000" flood-opacity="0.40"/>
+    </filter>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="2.6" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect x="14" y="14" width="228" height="228" rx="52" fill="url(#bg)"/>
+  <path d="M39 198c45 31 133 31 178 0" fill="none" stroke="#1f4565" stroke-width="18" stroke-linecap="round" opacity="0.28"/>
+  <circle cx="203" cy="58" r="8" fill="#59f1d6" opacity="0.9" filter="url(#glow)"/>
+  <circle cx="51" cy="67" r="4" fill="#8bd7ff" opacity="0.8"/>
+
+  <!-- clean browser surface -->
+  <g filter="url(#shadow)">
+    <rect x="45" y="54" width="166" height="132" rx="24" fill="url(#window)"/>
+    <path d="M45 80c0-14 11-26 26-26h114c14 0 26 12 26 26v13H45V80Z" fill="#e7f0ff"/>
+    <circle cx="68" cy="74" r="6" fill="#ff6b6b"/>
+    <circle cx="87" cy="74" r="6" fill="#ffd166"/>
+    <circle cx="106" cy="74" r="6" fill="#59d99d"/>
+    <rect x="124" y="66" width="65" height="16" rx="8" fill="#cbdcf4"/>
+    <rect x="60" y="100" width="136" height="70" rx="18" fill="url(#glass)"/>
+  </g>
+
+  <!-- shared globe / browser meaning -->
+  <g opacity="0.98">
+    <circle cx="128" cy="136" r="37" fill="#0a3850" opacity="0.16"/>
+    <circle cx="128" cy="136" r="32" fill="none" stroke="#ffffff" stroke-width="5" opacity="0.88"/>
+    <path d="M96 136h64M128 104c12 13 18 23 18 32s-6 19-18 32M128 104c-12 13-18 23-18 32s6 19 18 32" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" opacity="0.82"/>
+  </g>
+
+  <!-- two human cursors meeting on the same page -->
+  <g filter="url(#shadow)">
+    <path d="M70 134l42 74 10-35 33-9-85-30Z" fill="url(#cursorA)" stroke="#0b2134" stroke-width="5" stroke-linejoin="round"/>
+    <path d="M170 111l-20 80 27-23 29 16-36-73Z" fill="url(#cursorB)" stroke="#0b2134" stroke-width="5" stroke-linejoin="round"/>
+    <path d="M111 179c12 9 26 9 39 0" fill="none" stroke="#33e0d2" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="109" cy="178" r="5" fill="#33e0d2"/>
+    <circle cx="151" cy="178" r="5" fill="#33e0d2"/>
+  </g>
+</svg>

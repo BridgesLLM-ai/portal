@@ -64,6 +64,11 @@ function writeJson(targetPath: string, value: unknown): void {
 
 export function buildOpenClawCliEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
+  // BridgesLLM Portal currently runs OpenClaw CLI helpers from the root-owned
+  // appliance service. OpenClaw 2026.5.9+ intentionally refuses those commands
+  // unless the operator opts in, so portal-managed CLI calls must carry the
+  // explicit root escape hatch while HOME/OPENCLAW_HOME stay anchored to /root.
+  env.OPENCLAW_ALLOW_ROOT = env.OPENCLAW_ALLOW_ROOT || '1';
   delete env.OPENCLAW_API_URL;
   delete env.OPENCLAW_GATEWAY_URL;
   delete env.OPENCLAW_GATEWAY_TOKEN;

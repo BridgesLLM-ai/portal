@@ -1,6 +1,6 @@
 # Remote Desktop
 
-**Default browser rule:** if the task is collaborative/visible, use the shared desktop Chrome path (`scripts/shared-browser.sh`) so Robert can see what the agent is doing. Hidden headless browsing is fallback-only.
+**Default browser rule:** if the task is collaborative/visible, use the shared desktop Chrome path (`scripts/shared-browser.sh`) so the user can see what the agent is doing. Hidden headless browsing is fallback-only.
 
 Full Linux desktop (XFCE) accessible via noVNC in the browser. Portal page: `/desktop`.
 

@@ -128,8 +128,14 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
 
         {/* Status */}
         {loading ? (
-          <div className="py-3 text-center">
-            <Loader2 className="mx-auto h-4 w-4 animate-spin text-slate-600" />
+          <div className="rounded-lg border border-sky-400/15 bg-sky-500/10 px-3 py-3 text-sky-100">
+            <div className="flex items-center gap-2 text-xs font-medium">
+              <Loader2 className="h-4 w-4 animate-spin text-sky-300" />
+              Loading provider status…
+            </div>
+            <div className="mt-1 text-[10px] text-sky-100/70">
+              Checking installed providers, auth state, default model, and gateway health.
+            </div>
           </div>
         ) : null}
 

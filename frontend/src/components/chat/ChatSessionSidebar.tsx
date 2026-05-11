@@ -34,11 +34,31 @@ function getSessionTitle(session: SessionInfo, index: number): string {
   if (session.title) return session.title;
   if (session.preview && session.preview.length <= 72) return session.preview;
   const raw = session.key || session.sessionId || session.id || '';
-  const normalized = raw
+  const sessionSlug = raw
     .split(':')
     .slice(2)
     .join(':')
     .replace(/^portal-[a-f0-9]{8}-/i, '')
+    .trim();
+  const newSessionMatch = sessionSlug.match(/^(?:portal-)?new-(\d{13,})$/i);
+  if (newSessionMatch) {
+    try {
+      const d = new Date(parseInt(newSessionMatch[1]));
+      if (!isNaN(d.getTime())) {
+        return `New chat · ${d.toLocaleDateString(undefined, {
+          month: 'short',
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+        })}`;
+      }
+    } catch {
+      // fall through
+    }
+    return 'New chat';
+  }
+
+  const normalized = sessionSlug
     .replace(/[-_]+/g, ' ')
     .trim();
 

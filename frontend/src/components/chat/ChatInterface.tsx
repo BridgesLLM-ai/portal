@@ -1005,7 +1005,15 @@ function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete }: { ope
           >
             {/* Header */}
             <div className="flex items-center justify-between px-5 py-3.5 border-b border-slate-800">
-              <h2 className="text-sm font-semibold text-white">Settings</h2>
+              <div className="min-w-0">
+                <h2 className="text-sm font-semibold text-white">Settings</h2>
+                {toolsLoading ? (
+                  <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-sky-300">
+                    <Loader2 size={10} className="animate-spin" />
+                    Loading settings…
+                  </div>
+                ) : null}
+              </div>
               <button
                 onClick={onClose}
                 className="rounded-lg p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
@@ -1237,7 +1245,10 @@ function getOpenClawContextSummary({
   const ratio = telemetry.pressureRatio ?? Math.max(0, Math.min(1, telemetry.totalTokens / telemetry.contextTokens));
   if (!Number.isFinite(ratio) || ratio <= 0) return null;
 
-  const normalizedStatus = (statusText || '').toLowerCase();
+  const rawStatus = String(statusText || '').trim();
+  const normalizedStatus = rawStatus.toLowerCase();
+  const statusLooksLikeMaintenance = !rawStatus || isCompactionNotice(rawStatus) || /^(?:memory flush|context maintenance|preparing context maintenance|heartbeat check)\b/i.test(rawStatus);
+  const effectiveCompactionPhase = statusLooksLikeMaintenance ? compactionPhase : 'idle';
   const hasPressureSignal = /context (?:budget|limit|window|maintenance|compaction|flush)|memory flush|heartbeat check|running out of context|near(?:ing)? context/i.test(normalizedStatus);
   const percent = Math.round(ratio * 100);
   const remainingTokens = Math.max(0, telemetry.contextTokens - telemetry.totalTokens);
@@ -1249,11 +1260,11 @@ function getOpenClawContextSummary({
     detailParts.push(`${telemetry.compactionCount} auto-compaction${telemetry.compactionCount === 1 ? '' : 's'}`);
   }
 
-  if (compactionPhase === 'compacting' || compactionPhase === 'compacted') {
+  if (!isRunning && (effectiveCompactionPhase === 'compacting' || effectiveCompactionPhase === 'compacted')) {
     return {
       text: 'text-[rgba(191,219,254,0.92)]',
       dot: 'bg-[#60a5fa]',
-      label: compactionPhase === 'compacting' ? `Context maintenance active (${percent}%)` : `Context maintenance finished (${percent}%)`,
+      label: effectiveCompactionPhase === 'compacting' ? `Context maintenance active (${percent}%)` : `Context maintenance finished (${percent}%)`,
       detail: detailParts.join(' • '),
     };
   }
@@ -3460,17 +3471,17 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: 8 }}
                   transition={{ duration: 0.15 }}
-                  className="absolute bottom-[90px] left-1/2 -translate-x-1/2 z-10"
+                  className="absolute right-3 sm:right-5 bottom-[132px] z-20"
                 >
                   <button
                     onClick={() => {
                       isUserScrolledUp.current = false;
                       scrollToBottom(true);
                     }}
-                    className="flex items-center gap-1.5 px-3.5 py-2 rounded-full bg-[#1A1F3A] border border-white/[0.10] text-xs text-slate-300 hover:text-white hover:bg-[#252B4A] transition-colors shadow-lg shadow-black/40"
+                    className="flex h-9 items-center gap-1.5 rounded-full bg-[#1A1F3A]/95 border border-white/[0.12] px-2.5 sm:px-3.5 text-xs text-slate-300 hover:text-white hover:bg-[#252B4A] transition-colors shadow-lg shadow-black/40 backdrop-blur"
                   >
                     <ChevronDown size={14} />
-                    Scroll to bottom
+                    <span className="hidden sm:inline">Scroll to bottom</span>
                   </button>
                 </motion.div>
               )}

@@ -3,7 +3,7 @@
 # Always starts clean, pins device scale at 1, and matches the active VNC resolution.
 set -euo pipefail
 
-USER_URL="${1:-about:blank}"
+USER_URL="${1:-https://www.google.com/}"
 
 # Never let root own or mutate the shared browser profile.
 if [ "$(id -u)" = "0" ]; then
@@ -33,8 +33,45 @@ else
   export SDL_AUDIODRIVER=pulseaudio
 fi
 
+
+write_nav_extension() {
+  local extension_dir="$1"
+  mkdir -p "$extension_dir"
+  cat > "$extension_dir/manifest.json" <<'JSON'
+{"manifest_version":3,"name":"BridgesLLM Remote Browser Navigation","version":"1.0.0","description":"Compact navigation bar for app-mode Remote Desktop browsers.","content_scripts":[{"matches":["http://*/*","https://*/*"],"js":["content.js"],"run_at":"document_idle","all_frames":false}]}
+JSON
+  cat > "$extension_dir/content.js" <<'JS'
+(() => {
+  if (window.top !== window) return;
+  if (document.getElementById('__bridgesllm_nav_host')) return;
+  const host = document.createElement('div');
+  host.id = '__bridgesllm_nav_host';
+  const shadow = host.attachShadow({ mode: 'open' });
+  const collapsed = localStorage.getItem('__bridgesllm_nav_collapsed') === '1';
+  shadow.innerHTML = `
+    <style>
+      :host{all:initial;color-scheme:dark}.bar,.bubble{position:fixed;z-index:2147483647;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}.bar{left:8px;right:8px;top:calc(env(safe-area-inset-top,0px) + 6px);min-height:40px;display:flex;align-items:center;gap:5px;padding:5px;border:1px solid rgba(148,163,184,.28);border-radius:13px;background:rgba(9,14,27,.88);box-shadow:0 10px 34px rgba(0,0,0,.38);backdrop-filter:blur(14px)}.bar.hidden{display:none}button{all:unset;box-sizing:border-box;min-width:32px;height:30px;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;background:rgba(30,41,59,.95);color:#dbeafe;border:1px solid rgba(148,163,184,.18);font:700 13px/1 Inter,system-ui,sans-serif;cursor:pointer;user-select:none}button:active{transform:translateY(1px);background:rgba(59,130,246,.35)}input{all:unset;box-sizing:border-box;flex:1 1 auto;min-width:0;height:30px;border-radius:9px;background:rgba(2,6,23,.9);color:#f8fafc;border:1px solid rgba(96,165,250,.25);padding:0 10px;font:500 13px/30px ui-sans-serif,system-ui,sans-serif}input::selection{background:rgba(59,130,246,.55)}.go{min-width:38px;background:rgba(37,99,235,.95);color:white}.bubble{right:10px;top:calc(env(safe-area-inset-top,0px) + 8px);width:42px;height:42px;border-radius:999px;display:none;place-items:center;background:rgba(9,14,27,.9);color:#dbeafe;border:1px solid rgba(148,163,184,.3);box-shadow:0 10px 30px rgba(0,0,0,.35);font-size:18px;cursor:pointer;backdrop-filter:blur(14px)}.bubble.visible{display:grid}@media(max-width:520px){.bar{left:5px;right:5px;gap:4px;padding:4px}button{min-width:29px;height:29px;font-size:12px}input{height:29px;font-size:12px;padding:0 8px}.go{min-width:34px}}
+    </style>
+    <div class="bar${collapsed ? ' hidden' : ''}" role="navigation" aria-label="Remote browser navigation"><button id="back" title="Back">←</button><button id="forward" title="Forward">→</button><button id="reload" title="Reload">↻</button><input id="url" inputmode="url" spellcheck="false" autocomplete="off" aria-label="Address"/><button id="go" class="go" title="Go">Go</button><button id="hide" title="Hide bar">×</button></div><button class="bubble${collapsed ? ' visible' : ''}" id="show" title="Show navigation">🌐</button>`;
+  const $ = (id) => shadow.getElementById(id);
+  const bar = shadow.querySelector('.bar');
+  const bubble = $('show');
+  const input = $('url');
+  function syncUrl(){ input.value = location.href; }
+  function normalizeTarget(raw){ const value=String(raw||'').trim(); if(!value) return ''; if(/^[a-z][a-z0-9+.-]*:/i.test(value)) return value; if(/^(localhost|\d{1,3}(?:\.\d{1,3}){3})(:\d+)?([/?#].*)?$/i.test(value)) return 'http://'+value; if(/^[^\s]+\.[^\s]{2,}([/?#].*)?$/i.test(value)) return 'https://'+value; return 'https://www.google.com/search?q='+encodeURIComponent(value); }
+  function go(){ const target=normalizeTarget(input.value); if(target) location.href=target; }
+  function collapse(next){ bar.classList.toggle('hidden', next); bubble.classList.toggle('visible', next); localStorage.setItem('__bridgesllm_nav_collapsed', next ? '1' : '0'); }
+  $('back').onclick=()=>history.back(); $('forward').onclick=()=>history.forward(); $('reload').onclick=()=>location.reload(); $('go').onclick=go; $('hide').onclick=()=>collapse(true); bubble.onclick=()=>collapse(false);
+  input.addEventListener('keydown',(event)=>{event.stopPropagation(); if(event.key==='Enter') go(); if(event.key==='Escape') input.blur();});
+  shadow.addEventListener('keydown',(e)=>e.stopPropagation()); shadow.addEventListener('keyup',(e)=>e.stopPropagation()); shadow.addEventListener('keypress',(e)=>e.stopPropagation());
+  document.documentElement.appendChild(host); syncUrl(); window.addEventListener('popstate', syncUrl); window.addEventListener('hashchange', syncUrl); setInterval(syncUrl,1500);
+})();
+JS
+}
+
 PROFILE_ROOT="/tmp/bridges-agent-browser"
 PROFILE_DIR="${PROFILE_ROOT}/profile"
+NAV_EXTENSION_DIR="${PROFILE_ROOT}/nav-extension"
 WARMUP_FILE="${PROFILE_ROOT}/warmup.html"
 CDP_PORT=18801
 
@@ -47,12 +84,20 @@ fi
 pkill -f "remote-debugging-port=${CDP_PORT}" 2>/dev/null || true
 sleep 1
 
-VNC_RES=$(DISPLAY=:1 xrandr 2>/dev/null | awk '/\*/ { print $1; exit }' || echo "1280x1024")
-VNC_W=${VNC_RES%x*}
-VNC_H=${VNC_RES#*x}
+read_vnc_geometry() {
+  local res
+  res=$(DISPLAY=:1 xrandr 2>/dev/null | awk '/\*/ { print $1; exit }' || true)
+  if [[ ! "$res" =~ ^[0-9]+x[0-9]+$ ]]; then
+    res="1280x1024"
+  fi
+  printf '%s %s\n' "${res%x*}" "${res#*x}"
+}
+
+read -r VNC_W VNC_H < <(read_vnc_geometry)
 
 rm -rf "$PROFILE_ROOT" 2>/dev/null || true
 mkdir -p "$PROFILE_DIR/Default"
+write_nav_extension "$NAV_EXTENSION_DIR"
 
 cat > "$PROFILE_DIR/Default/Preferences" <<PREFS
 {
@@ -435,6 +480,28 @@ HTML
 
 WARMUP_URL="file://${WARMUP_FILE}"
 
+# Match the OpenClaw Web UI launcher's mobile-friendly behavior on narrow VNC
+# desktops: Chrome's full browser chrome has a large minimum width, so iPhone-
+# sized Remote Desktop sessions can end up with a window wider than the screen.
+# App mode removes that minimum-width toolbar while CDP still lets the agent
+# navigate/control the shared page. Keep the normal browser chrome on larger
+# desktops unless explicitly overridden.
+SHARED_BROWSER_MODE="${BRIDGES_SHARED_BROWSER_MODE:-auto}"
+CHROME_TARGET_ARGS=("$WARMUP_URL")
+if [ "$SHARED_BROWSER_MODE" = "app" ] || { [ "$SHARED_BROWSER_MODE" = "auto" ] && [ "${VNC_W:-1280}" -lt 700 ]; }; then
+  CHROME_TARGET_ARGS=("--app=$WARMUP_URL")
+fi
+
+fit_active_window_to_vnc() {
+  command -v wmctrl >/dev/null 2>&1 || return 0
+  local w h
+  read -r w h < <(read_vnc_geometry)
+  [ "${w:-0}" -gt 0 ] && [ "${h:-0}" -gt 0 ] || return 0
+  wmctrl -r :ACTIVE: -b remove,maximized_vert,maximized_horz 2>/dev/null || true
+  wmctrl -r :ACTIVE: -e "0,0,0,${w},${h}" 2>/dev/null || true
+  wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz 2>/dev/null || true
+}
+
 "$CHROME_BIN" \
   --window-size="${VNC_W},${VNC_H}" \
   --window-position=0,0 \
@@ -451,18 +518,27 @@ WARMUP_URL="file://${WARMUP_FILE}"
   --disable-background-networking \
   --disable-sync \
   --disable-translate \
-  --disable-extensions \
   --disable-features=TranslateUI \
   --disable-component-update \
   --disable-default-apps \
   --disable-domain-reliability \
   --metrics-recording-only \
+  --disable-extensions \
   --user-data-dir="$PROFILE_DIR" \
   --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=${CDP_PORT} \
-  "$WARMUP_URL" &
+  "${CHROME_TARGET_ARGS[@]}" &
 
 CHROME_PID=$!
+
+(
+  # noVNC smart-resize can settle after Chrome starts. Keep the shared browser
+  # pinned to the current VNC work area during that settling window.
+  for _ in $(seq 1 30); do
+    fit_active_window_to_vnc
+    sleep 0.5
+  done
+) >/dev/null 2>&1 &
 
 for i in $(seq 1 30); do
   if curl -sf "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1; then
@@ -473,15 +549,17 @@ done
 
 if command -v wmctrl >/dev/null 2>&1; then
   sleep 1
-  wmctrl -r :ACTIVE: -e "0,0,0,${VNC_W},${VNC_H}" 2>/dev/null || true
-  wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz 2>/dev/null || true
+  fit_active_window_to_vnc
 fi
 
 if curl -sf "http://127.0.0.1:${CDP_PORT}/json/list" >/dev/null 2>&1; then
-  node - <<'NODE' "$CDP_PORT" "$USER_URL"
+  node - <<'NODE' "$CDP_PORT" "$USER_URL" "$NAV_EXTENSION_DIR/content.js"
+const fs = require('fs');
 const http = require('http');
 const port = Number(process.argv[2]);
-const finalUrl = process.argv[3] || 'about:blank';
+const finalUrl = process.argv[3] || 'https://www.google.com/';
+const navSourcePath = process.argv[4] || '';
+const navSource = navSourcePath ? fs.readFileSync(navSourcePath, 'utf8') : '';
 
 function getJson(path) {
   return new Promise((resolve, reject) => {
@@ -504,7 +582,15 @@ function getJson(path) {
     const done = () => { try { ws.close(); } catch {} process.exit(0); };
     const timer = setTimeout(done, 12000);
     let sentNavigate = false;
+    function send(id, method, params = {}) {
+      ws.send(JSON.stringify({ id, method, params }));
+    }
+    function injectNav(id) {
+      if (!navSource) return;
+      send(id, 'Runtime.evaluate', { expression: navSource, awaitPromise: false, returnByValue: false });
+    }
     ws.addEventListener('open', () => {
+      if (navSource) send(10, 'Page.addScriptToEvaluateOnNewDocument', { source: navSource });
       ws.send(JSON.stringify({
         id: 1,
         method: 'Runtime.evaluate',
@@ -522,12 +608,16 @@ function getJson(path) {
         if (finalUrl && finalUrl !== 'about:blank') {
           ws.send(JSON.stringify({ id: 2, method: 'Page.navigate', params: { url: finalUrl } }));
         } else {
+          injectNav(3);
           clearTimeout(timer);
-          done();
+          setTimeout(done, 500);
         }
       } else if (message.id === 2) {
-        clearTimeout(timer);
-        done();
+        setTimeout(() => {
+          injectNav(3);
+          clearTimeout(timer);
+          done();
+        }, 1200);
       }
     });
     ws.addEventListener('error', done);

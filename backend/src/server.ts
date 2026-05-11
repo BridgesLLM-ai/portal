@@ -35,7 +35,7 @@ import agentJobsRoutes from './routes/agent-jobs';
 import agentToolsRoutes from './routes/agent-tools';
 import agentRuntimeRoutes from './routes/agent-runtime';
 import ollamaRoutes from './routes/ollama';
-import remoteDesktopRoutes, { reconcilePortalVisibleBrowserDefaults } from './routes/remote-desktop';
+import remoteDesktopRoutes, { reconcilePortalVisibleBrowserDefaults, reconcileRemoteDesktopLauncherAssets } from './routes/remote-desktop';
 import agentBrowserRoutes, { attachAgentBrowserWebSocket } from './routes/agentBrowser';
 import systemRemediationRoutes from './routes/system-remediation';
 import mailRoutes from './routes/mail';
@@ -1014,6 +1014,7 @@ const startServer = async () => {
       console.log(`\nEnvironment: ${config.nodeEnv}`);
       console.log('Press Ctrl+C to stop\n');
       void reconcilePortalVisibleBrowserDefaults();
+      void reconcileRemoteDesktopLauncherAssets();
     });
   } catch (error) {
     console.error('❌ Failed to start server:', error);

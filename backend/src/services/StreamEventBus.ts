@@ -267,7 +267,8 @@ export class StreamEventBus {
     //    per-session subscribers exist, though the gateway handler deduplicates)
     const noPerSessionSubs = !subs || subs.size === 0;
     const isCompaction = event.type === 'compaction_start' || event.type === 'compaction_end';
-    if (noPerSessionSubs || isCompaction) {
+    const isMaintenance = event.maintenanceKind === 'maintenance';
+    if (noPerSessionSubs || isCompaction || isMaintenance) {
       for (const cb of this.globalListeners) {
         try {
           cb(sessionKey, event);

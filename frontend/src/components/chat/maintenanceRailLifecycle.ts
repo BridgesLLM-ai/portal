@@ -15,11 +15,15 @@ const LIFECYCLE_CONTROL_TOKENS = new Set([
   'compacted',
 ]);
 
-const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|started|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction)\b/i;
+const LIFECYCLE_FLUSH_PREPARING_RE = /\b(memory flush (?:about to start|starting|started|queued|pending)|preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|preparing to store durable memor(?:y|ies)|about to compact|pre-compaction|heartbeat check (?:started|starting|running|queued|pending)|checking heartbeat|reading heartbeat\.md|read heartbeat\.md)\b/i;
 const LIFECYCLE_FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context)\b/i;
-const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance (?:finished|complete(?:d)?)|compaction (?:incomplete|did not complete)|heartbeat check complete(?:d)?)\b/i;
-const LIFECYCLE_COMPACTING_RE = /\b(compacting context|auto-compaction|context compaction|compaction (?:in progress|started))\b/i;
-const LIFECYCLE_COMPACTED_RE = /\b(context compacted|compaction (?:complete(?:d)?|finished))\b/i;
+const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance (?:finished|complete(?:d)?)|compaction (?:incomplete|did not complete)|heartbeat check complete(?:d)?|heartbeat_ok)\b/i;
+const LIFECYCLE_COMPACTING_RE = /^(?:compacting context[.…]*|auto-compaction(?: started| in progress)?[.…]*|context compaction(?: started| in progress)?[.…]*|compaction (?:in progress|started)\.?)$/i;
+const LIFECYCLE_COMPACTED_RE = /^(?:context compacted\.?|auto-compaction complete(?:d)?\.?|context compaction complete(?:d)?\.?|compaction (?:complete(?:d)?|finished)\.?)$/i;
+
+function normalizeLifecycleMarker(text: string): string {
+  return String(text || '').replace(/\s+/g, ' ').trim().replace(/^[^\p{L}\p{N}]+/u, '').trim();
+}
 
 export interface MaintenanceRailResolution {
   isMaintenanceStatus: boolean;
@@ -57,12 +61,19 @@ export function extractLifecycleStatusText(data: any): string | null {
 
 export function inferLifecycleMaintenanceSignal(phase: string, statusText: string | null): LifecycleMaintenanceSignal {
   const normalizedPhase = String(phase || '').trim().toLowerCase();
-  const normalizedStatus = String(statusText || '').trim();
+  const normalizedStatus = normalizeLifecycleMarker(String(statusText || ''));
 
-  if (normalizedPhase === 'compacted' || normalizedPhase === 'compaction_end' || normalizedPhase === 'compaction_completed') {
+  const phaseClaimsCompaction = normalizedPhase === 'compacted'
+    || normalizedPhase === 'compaction_end'
+    || normalizedPhase === 'compaction_completed'
+    || normalizedPhase === 'compacting'
+    || normalizedPhase === 'compaction_start'
+    || normalizedPhase === 'compaction_started';
+  const statusContradictsCompaction = Boolean(normalizedStatus && phaseClaimsCompaction && !/^(?:context compacted\.?|compacting context[.…]*|auto-compaction(?: started| in progress| complete(?:d)?)?[.…]*|context compaction(?: started| in progress| complete(?:d)?)?[.…]*|compaction (?:in progress|started|complete(?:d)?|finished)\.?)$/i.test(normalizedStatus));
+  if (!statusContradictsCompaction && (normalizedPhase === 'compacted' || normalizedPhase === 'compaction_end' || normalizedPhase === 'compaction_completed')) {
     return 'compacted';
   }
-  if (normalizedPhase === 'compacting' || normalizedPhase === 'compaction_start' || normalizedPhase === 'compaction_started') {
+  if (!statusContradictsCompaction && (normalizedPhase === 'compacting' || normalizedPhase === 'compaction_start' || normalizedPhase === 'compaction_started')) {
     return 'compacting';
   }
   if (!normalizedStatus) return 'idle';

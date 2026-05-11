@@ -98,6 +98,12 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.12 (May 10, 2026)
+- **Refresh/reconnect behavior is stable again**: Agent Chat and project chat now preserve OpenClaw maintenance markers across reloads, avoid stale active-stream status, and keep finished runs from turning into reconnect loops.
+- **Compaction notices are stricter and cleaner**: runtime maintenance markers render as status/compaction rails only when they are actual standalone notices, not ordinary assistant text.
+- **Provider setup and OpenClaw restarts are safer**: setup no longer persists unsupported model metadata, OAuth prompt detection is more tolerant of current CLI output, and the Dashboard can flag/restart stale gateway listeners for admins.
+- **Installer and Remote Desktop polish shipped together**: installs now verify Node.js 22.16+, while shared-browser/OpenClaw UI launchers resize more reliably and the release archive carries the current icon and branding assets.
+
 ### v3.25.11 (May 8, 2026)
 - **Gateway reconnect fallback is safer**: project chat no longer retries accepted persistent gateway RPC failures through a throwaway `gateway-client` socket, avoiding duplicate sends and live-stream eviction.
 - **Project model switching is more truthful**: explicit model changes now patch the gateway whenever the live session model differs, even if local session metadata already contains the requested model.

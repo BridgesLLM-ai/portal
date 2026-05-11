@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.11"
+readonly VERSION="3.25.12"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -30,6 +30,7 @@ readonly MIN_DISK_GB=35
 # Pinned versions
 # OpenClaw: use latest during development; pin to a stable version for releases
 readonly PIN_NODE_MAJOR="22"
+readonly PIN_NODE_MIN_MINOR="16"
 
 # Flags
 DOMAIN=""
@@ -62,6 +63,18 @@ OS_ID=""
 OS_VERSION=""
 APT_AVAILABLE=false
 IS_WSL=false
+
+
+node_version_meets_minimum() {
+  command -v node &>/dev/null || return 1
+  local version major minor
+  version="$(node -v 2>/dev/null | sed 's/^v//' || true)"
+  major="${version%%.*}"
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+  [[ "${major}" =~ ^[0-9]+$ && "${minor}" =~ ^[0-9]+$ ]] || return 1
+  (( major > PIN_NODE_MAJOR || (major == PIN_NODE_MAJOR && minor >= PIN_NODE_MIN_MINOR) ))
+}
 
 # ═══════════════════════════════════════════════════════════════
 # Terminal styling
@@ -596,11 +609,14 @@ update_dependencies() {
 
   # ── Tier 2: Minor/patch only (apt-based) ──
 
-  # Node.js — update within major version
+  # Node.js — update within major version, and repair too-old Node 22 minors
   if command -v node &>/dev/null; then
     local current_node_major
     current_node_major="$(node --version | grep -oP '(?<=v)\d+' || echo '0')"
     if (( current_node_major == PIN_NODE_MAJOR )); then
+      if ! node_version_meets_minimum; then
+        spin "Setting up Node.js ${PIN_NODE_MAJOR} repository" "curl -fsSL https://deb.nodesource.com/setup_${PIN_NODE_MAJOR}.x | bash -" || true
+      fi
       spin "Updating Node.js (minor/patch)"         "apt-get update -qq && apt-get install -y -qq --only-upgrade nodejs 2>/dev/null" || true
     fi
   fi
@@ -1238,20 +1254,15 @@ install_system_packages() {
   step_header "Installing system packages"
   CURRENT_STEP="system packages"
 
-  # Node.js 22
-  if command -v node &>/dev/null; then
-    local major
-    major=$(node -v | sed 's/^v//' | cut -d. -f1)
-    if (( major >= PIN_NODE_MAJOR )); then
-      ok "Node.js $(node -v)"
-    else
-      spin "Setting up Node.js ${PIN_NODE_MAJOR} repository" "curl -fsSL https://deb.nodesource.com/setup_${PIN_NODE_MAJOR}.x | bash -"
-      spin "Installing Node.js ${PIN_NODE_MAJOR}" "apt-get install -y -qq nodejs"
-      ok "Node.js $(node -v)"
-    fi
+  # Node.js 22.16+ — OpenClaw 2026.5.9+ relies on Node 22.16 APIs
+  if node_version_meets_minimum; then
+    ok "Node.js $(node -v)"
   else
     spin "Setting up Node.js ${PIN_NODE_MAJOR} repository" "curl -fsSL https://deb.nodesource.com/setup_${PIN_NODE_MAJOR}.x | bash -"
-    spin "Installing Node.js ${PIN_NODE_MAJOR}" "apt-get install -y -qq nodejs"
+    spin "Installing Node.js ${PIN_NODE_MAJOR}.${PIN_NODE_MIN_MINOR}+" "apt-get install -y -qq nodejs"
+    if ! node_version_meets_minimum; then
+      fail "Node.js $(node -v 2>/dev/null || echo 'missing') is too old; OpenClaw requires Node.js ${PIN_NODE_MAJOR}.${PIN_NODE_MIN_MINOR}+"
+    fi
     ok "Node.js $(node -v)"
   fi
 
@@ -1742,6 +1753,100 @@ else
 fi
 WEBEOF
   chmod 755 "$web_launcher"
+
+  # Branded Remote Desktop launchers/icons. Shared Browser keeps the agent-controlled
+  # reset-on-open profile; OpenClaw Web UI gets its own persistent profile so it
+  # does not get confused with normal Chrome or the shared browser.
+  local shared_browser_launcher="/usr/local/bin/bridges-rd-shared-chrome.sh"
+  local openclaw_ui_launcher="/usr/local/bin/bridges-rd-openclaw-ui.sh"
+  local shared_browser_src="${PORTAL_DIR}/skills/bridgesllm-portal/scripts/bridges-rd-shared-chrome.sh"
+  local openclaw_ui_src="${PORTAL_DIR}/skills/bridgesllm-portal/scripts/bridges-rd-openclaw-ui.sh"
+  [[ -f "$shared_browser_src" ]] || shared_browser_src="${PORTAL_DIR}/static/scripts/bridges-rd-shared-chrome.sh"
+  [[ -f "$openclaw_ui_src" ]] || openclaw_ui_src="${PORTAL_DIR}/static/scripts/bridges-rd-openclaw-ui.sh"
+  if [[ -f "$shared_browser_src" ]]; then
+    install -m 755 "$shared_browser_src" "$shared_browser_launcher"
+  fi
+  if [[ -f "$openclaw_ui_src" ]]; then
+    install -m 755 "$openclaw_ui_src" "$openclaw_ui_launcher"
+  fi
+
+  mkdir -p /usr/local/share/pixmaps "/home/$RD_USER/Desktop"
+  local shared_browser_icon="/usr/local/share/pixmaps/bridges-shared-browser.svg"
+  local openclaw_ui_icon="/usr/local/share/pixmaps/bridges-openclaw-ui.svg"
+  [[ -f "${PORTAL_DIR}/static/icons/bridges-shared-browser.svg" ]] && install -m 644 "${PORTAL_DIR}/static/icons/bridges-shared-browser.svg" "$shared_browser_icon"
+  [[ -f "${PORTAL_DIR}/static/icons/bridges-openclaw-ui.svg" ]] && install -m 644 "${PORTAL_DIR}/static/icons/bridges-openclaw-ui.svg" "$openclaw_ui_icon"
+
+  local openclaw_ui_profile_dir="/home/$RD_USER/.config/openclaw-control-ui-browser"
+  local openclaw_ui_url_file="$openclaw_ui_profile_dir/dashboard-url"
+  local openclaw_ui_launch_html="$openclaw_ui_profile_dir/launch.html"
+  mkdir -p "$openclaw_ui_profile_dir"
+  OPENCLAW_UI_URL_FILE="$openclaw_ui_url_file" OPENCLAW_UI_LAUNCH_HTML="$openclaw_ui_launch_html" python3 - <<'PY'
+import html
+import json
+import os
+from pathlib import Path
+from urllib.parse import quote
+base = 'http://127.0.0.1:18789/'
+token = ''
+config = Path('/root/.openclaw/openclaw.json')
+try:
+    if config.exists():
+        token = (json.loads(config.read_text()).get('gateway') or {}).get('auth', {}).get('token') or ''
+except Exception:
+    token = ''
+if not token:
+    token_file = Path('/root/.openclaw/gateway.token')
+    try:
+        if token_file.exists():
+            token = token_file.read_text().strip()
+    except Exception:
+        token = ''
+url = base + (('#token=' + quote(token, safe='')) if token else '')
+Path(os.environ['OPENCLAW_UI_URL_FILE']).write_text(url + '\n')
+Path(os.environ['OPENCLAW_UI_LAUNCH_HTML']).write_text(f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Opening OpenClaw Web UI…</title>
+<meta http-equiv="refresh" content="0; url={html.escape(url, quote=True)}" />
+<style>:root{{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#070b14;color:#d9f6ff}}body{{min-height:100vh;margin:0;display:grid;place-items:center}}main{{text-align:center;padding:24px}}.mark{{font-size:52px;line-height:1;margin-bottom:14px}}p{{margin:0;opacity:.78}}</style>
+</head><body><main><div class="mark">🦞</div><p>Opening OpenClaw Web UI…</p></main>
+<script>window.location.replace({json.dumps(url)});</script></body></html>
+''')
+PY
+  chown -R "$RD_USER:$RD_USER" "$openclaw_ui_profile_dir"
+  chmod 600 "$openclaw_ui_url_file" "$openclaw_ui_launch_html"
+
+  cat > "/home/$RD_USER/Desktop/Shared Chrome.desktop" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Shared Browser
+Comment=Shared browser used by the agent and the user inside Remote Desktop
+Exec=$shared_browser_launcher
+Icon=$shared_browser_icon
+Terminal=false
+Categories=Network;WebBrowser;
+StartupNotify=true
+EOF
+
+  cat > "/home/$RD_USER/Desktop/OpenClaw Web UI.desktop" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OpenClaw Web UI
+Comment=Open native OpenClaw Control UI in a dedicated browser profile
+Exec=$openclaw_ui_launcher
+Icon=$openclaw_ui_icon
+Terminal=false
+Categories=Development;Network;WebBrowser;
+StartupNotify=true
+EOF
+
+  chown -R "$RD_USER:$RD_USER" "/home/$RD_USER/Desktop"
+  chmod 755 "/home/$RD_USER/Desktop/Shared Chrome.desktop" "/home/$RD_USER/Desktop/OpenClaw Web UI.desktop"
+  runuser -u "$RD_USER" -- bash -lc "command -v gio >/dev/null 2>&1 && gio set '/home/$RD_USER/Desktop/Shared Chrome.desktop' metadata::trusted true || true; command -v gio >/dev/null 2>&1 && gio set '/home/$RD_USER/Desktop/OpenClaw Web UI.desktop' metadata::trusted true || true" || true
+  ps -eo pid=,args= | awk '/[O]penClawControlUI/ && /[#]token=/ {print $1}' | xargs -r kill || true
+  ok "Remote Desktop browser launchers configured"
 
   # VNC launcher script (identical to what auto-setup writes)
   local vnc_launcher="/usr/local/bin/bridges-rd-xtigervnc-start.sh"

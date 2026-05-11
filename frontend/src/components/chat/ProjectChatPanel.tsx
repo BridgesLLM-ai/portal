@@ -345,12 +345,34 @@ function getLastRunningToolCall(toolCalls: ToolCall[] | undefined): ToolCall | n
   return null;
 }
 
+function isStandaloneMaintenanceNoticeContent(text: string): boolean {
+  const normalized = sanitizeHistoryMessageText(text || '').replace(/\s+/g, ' ').trim();
+  if (!normalized || !isCompactionNotice(normalized)) return false;
+
+  const marker = normalized.replace(/^[^\p{L}\p{N}]+/u, '').trim();
+  return [
+    /^context compacted\.?$/i,
+    /^context maintenance (?:in progress|finished|complete(?:d)?)\.?$/i,
+    /^compacting context[.…]*$/i,
+    /^preparing (?:context maintenance|compaction)[.…]*$/i,
+    /^memory flush(?: started| complete(?:d)?| in progress)?[.…]*$/i,
+    /^heartbeat check (?:started|complete(?:d)?)[.…]*$/i,
+    /^compacted\s*\([^)]{1,80}\)(?:\s*[•-]\s*context\b.*)?$/i,
+    /^compaction (?:complete(?:d)?|finished|in progress|started|incomplete|did not complete)\.?$/i,
+    /^compaction skipped(?::.*)?$/i,
+  ].some((pattern) => pattern.test(marker));
+}
+
+function isControlOrMaintenanceAssistantContent(text: string): boolean {
+  return isControlOnlyAssistantContent(text || '') || isStandaloneMaintenanceNoticeContent(text || '');
+}
+
 function parseHistoryMessage(m: any): ChatMessage | null {
   const rawContent = typeof m.content === 'string' ? m.content : '';
   const sanitizedHistoryText = sanitizeHistoryMessageText(rawContent);
   const rawThinkingContent = typeof m.thinkingContent === 'string' ? sanitizeAssistantContent(m.thinkingContent) : '';
   const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
-  if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOnlyAssistantContent(rawContent) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
+  if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOrMaintenanceAssistantContent(rawContent) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
     return null;
   }
   if (!isTruncationPlaceholder && isHiddenHistoryArtifactText(sanitizedHistoryText) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
@@ -828,7 +850,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       compactionPhaseRef.current = 'compacted';
       setCompactionPhase('compacted');
       setStatusText(noticeText);
-      if (!content) appendSystemNotice(noticeText, 'compaction');
+      appendSystemNotice(noticeText, 'compaction');
       if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
       compactionTimerRef.current = setTimeout(() => {
         compactionPhaseRef.current = 'idle';
@@ -1078,7 +1100,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     if (!snapshot?.active || isStaleSessionLoad(expectedSession, expectedGen)) return false;
 
     const resumePhase = snapshot.phase === 'tool' ? 'tool' : snapshot.phase === 'streaming' ? 'streaming' : 'thinking';
-    const snapshotContent = typeof snapshot.content === 'string' && !isControlOnlyAssistantContent(snapshot.content)
+    const snapshotContent = typeof snapshot.content === 'string' && !isControlOrMaintenanceAssistantContent(snapshot.content)
       ? sanitizeAssistantContent(snapshot.content)
       : '';
     const snapshotToolCalls: ToolCall[] = Array.isArray(snapshot.toolCalls)
@@ -1095,12 +1117,20 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     const snapshotToolNameCandidate = snapshot.toolName || snapshot.name || runningToolCall?.name || null;
     const snapshotToolName = snapshotToolNameCandidate ? resolveToolName(snapshotToolNameCandidate) : null;
     const rawStatusText = typeof snapshot.statusText === 'string' ? snapshot.statusText.trim() : '';
-    const hasStatusSignal = Boolean(rawStatusText)
+    const isMaintenanceStatusOnly = Boolean(rawStatusText && isControlOrMaintenanceAssistantContent(rawStatusText));
+    const hasStatusSignal = Boolean(rawStatusText && !isMaintenanceStatusOnly);
+    const hasMaintenanceSignal = isMaintenanceStatusOnly
       || snapshot.compactionPhase === 'compacting'
       || snapshot.compactionPhase === 'compacted';
-    const shouldHydrateLiveState = Boolean(snapshotContent)
+    const hasLiveSnapshotSignal = Boolean(snapshotContent)
       || Boolean(snapshotToolName)
-      || hasStatusSignal
+      || snapshotToolCalls.length > 0
+      || hasStatusSignal;
+    if (!hasLiveSnapshotSignal && hasMaintenanceSignal) {
+      applyCompactionSnapshotState(snapshot.compactionPhase);
+      return true;
+    }
+    const shouldHydrateLiveState = hasLiveSnapshotSignal
       || Boolean(streamingAssistantIdRef.current);
     if (!shouldHydrateLiveState) {
       return false;
@@ -1112,14 +1142,15 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     setIsRunning(true);
     setStreamingPhase(resumePhase);
     setActiveToolName(snapshotToolName || null);
-    const compactionStatusText = snapshot.compactionPhase === 'compacting'
-      ? (rawStatusText || 'Compacting context…')
-      : snapshot.compactionPhase === 'compacted'
-        ? (rawStatusText || 'Context compacted')
+    const liveStatusText = isMaintenanceStatusOnly ? '' : rawStatusText;
+    const compactionStatusText = hasLiveSnapshotSignal && snapshot.compactionPhase === 'compacting'
+      ? (liveStatusText || 'Compacting context…')
+      : hasLiveSnapshotSignal && snapshot.compactionPhase === 'compacted'
+        ? (liveStatusText || 'Context compacted')
         : '';
     setStatusText(snapshotToolName
-      ? getToolStatusText(snapshotToolName, rawStatusText || compactionStatusText || null)
-      : (compactionStatusText || rawStatusText || 'Reconnecting to stream…'));
+      ? getToolStatusText(snapshotToolName, liveStatusText || compactionStatusText || null)
+      : (liveStatusText || 'Reconnecting to stream…'));
     setConnectionNotice(null);
 
     applyCompactionSnapshotState(snapshot.compactionPhase);
@@ -1321,7 +1352,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     const passthrough = ['connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended', 'run_resumed', 'exec_approval', 'exec_approval_resolved'];
     const autoCreateBubbleTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
     const waitForVisibleStreamTypes = ['status', 'thinking', 'done', 'error'];
-    if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOnlyAssistantContent(data.content)) {
+    if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOrMaintenanceAssistantContent(data.content)) {
       return;
     }
     if (!streamingAssistantIdRef.current && !passthrough.includes(data.type)) {
@@ -1380,11 +1411,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         break;
       }
       case 'compaction_start': {
-        const noticeText = typeof data.content === 'string' && data.content.trim() ? data.content : 'Compacting context…';
-        compactionPhaseRef.current = 'compacting';
-        setCompactionPhase('compacting');
-        setStatusText(noticeText);
-        if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
+        applyMaintenanceState({
+          phase: 'start',
+          content: typeof data.content === 'string' ? data.content : null,
+          maintenanceKind: 'compaction',
+        });
         break;
       }
       case 'compaction_end': {
@@ -1530,7 +1561,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       }
       case 'text': {
         const rawChunk = typeof data.content === 'string' ? data.content : '';
-        if (rawChunk && isControlOnlyAssistantContent(rawChunk)) {
+        if (rawChunk && isControlOrMaintenanceAssistantContent(rawChunk)) {
           break;
         }
         const safeChunk = typeof data.content === 'string'
@@ -1554,7 +1585,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         clearWatchdog();
         const fst = assembledRef.current.substring(lastSegmentStartRef.current);
         const rawFinal = typeof data.content === 'string' ? data.content : '';
-        const hasFinal = rawFinal.length > 0 && !isControlOnlyAssistantContent(rawFinal);
+        const hasFinal = rawFinal.length > 0 && !isControlOrMaintenanceAssistantContent(rawFinal);
         const finalText = hasFinal ? sanitizeAssistantContent(rawFinal) : fst;
         const fc = finalText || '';
         const prov = data.provenance || null;
@@ -1627,7 +1658,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       case 'stream_resume': {
         suppressLiveBubbleContentRef.current = true;
         const resumePhase = data.phase === 'tool' ? 'tool' : data.phase === 'streaming' ? 'streaming' : 'thinking';
-        const resumeContent = typeof data.content === 'string' && !isControlOnlyAssistantContent(data.content)
+        const resumeContent = typeof data.content === 'string' && !isControlOrMaintenanceAssistantContent(data.content)
           ? sanitizeAssistantContent(data.content)
           : '';
         const resumeToolName = resolveToolName(data.toolName, data.name, data.content);
@@ -1646,7 +1677,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setStreamingPhase(resumePhase);
         setActiveToolName(resumeToolName || null);
         setStatusText(resumeToolName ? getToolStatusText(resumeToolName) : null);
-        if (resumePhase === 'streaming' && typeof data.content === 'string' && !isControlOnlyAssistantContent(data.content)) {
+        if (resumePhase === 'streaming' && typeof data.content === 'string' && !isControlOrMaintenanceAssistantContent(data.content)) {
           resumeSeededContentRef.current = true;
           const safeChunk = sanitizeAssistantContent(data.content);
           const fullText = mergeAssistantStream(assembledRef.current, safeChunk, { replace: true });
@@ -2623,14 +2654,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             initial={{ opacity: 0, y: 4 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 4 }}
-            className="absolute bottom-[80px] left-1/2 -translate-x-1/2 z-10"
+            className="absolute right-3 bottom-[118px] z-20"
           >
             <button
               onClick={() => { isScrolledUp.current = false; scrollToBottom(true); }}
-              className="flex items-center gap-1 px-3 py-1.5 rounded-full bg-[#1A1F3A] border border-white/[0.10] text-[10px] text-slate-300 hover:text-white hover:bg-[#252B4A] transition-colors shadow-lg"
+              className="flex h-8 items-center gap-1 rounded-full bg-[#1A1F3A]/95 border border-white/[0.12] px-2.5 text-[10px] text-slate-300 hover:text-white hover:bg-[#252B4A] transition-colors shadow-lg backdrop-blur"
             >
               <ChevronDown size={12} />
-              <span>Scroll down</span>
+              <span className="hidden sm:inline">Scroll down</span>
             </button>
           </motion.div>
         )}

@@ -6,6 +6,7 @@ import * as http from 'http';
 import { createHash, randomBytes } from 'crypto';
 import { execSync } from 'child_process';
 import { AUTH_PROFILES_PATH, readAuthProfiles, saveProviderToken } from './openclawConfigManager';
+import { buildOpenClawCliEnv } from '../utils/openclawCli';
 
 export type OAuthFlowStatus = 'starting' | 'awaiting_callback' | 'polling_device' | 'processing' | 'complete' | 'error';
 
@@ -144,7 +145,7 @@ function rewriteStoredAuthProfileProvider(profileId: string | null | undefined, 
 
 function buildPortalOAuthEnv(extraEnv?: Record<string, string>) {
   return {
-    ...process.env,
+    ...buildOpenClawCliEnv(),
     ...extraEnv,
     BROWSER: '/bin/false',
     DISPLAY: '',
@@ -187,7 +188,7 @@ function spawnOpenClawPty(args: string[], extraEnv?: Record<string, string>) {
     rows: 40,
     cwd: process.cwd(),
     env: {
-      ...process.env,
+      ...buildOpenClawCliEnv(),
       // Force OpenClaw's remote/manual OAuth path for portal-managed auth sessions.
       // The portal UI expects a paste-the-redirect flow; letting the CLI drift into
       // local desktop callback mode on a server is brittle and provider-specific.
@@ -217,7 +218,7 @@ function runOpenClawViaScript(args: string[], timeoutMs: number, extraEnv?: Reco
     return execSync(`script -qefc ${shellEscape(command)} /dev/null`, {
       cwd: process.cwd(),
       env: {
-        ...process.env,
+        ...buildOpenClawCliEnv(),
         ...extraEnv,
       },
       timeout: timeoutMs,
@@ -255,8 +256,7 @@ function validateOAuthCallbackForSession(session: OAuthSession, callbackUrl: str
   return null;
 }
 
-function hasCallbackPastePrompt(session: OAuthSession): boolean {
-  const text = session.cleanOutput;
+export function textContainsCallbackPastePrompt(text: string): boolean {
   const normalizedText = normalizeTerminalScreenText(text);
   const squashedText = squashPromptText(text);
 
@@ -268,8 +268,16 @@ function hasCallbackPastePrompt(session: OAuthSession): boolean {
     || /Waiting for you to paste the callback URL/i.test(normalizedText)
     || /Enter the authorization code:/i.test(normalizedText)
     || squashedText.includes('waitingforyoutopastethecallbackurl')
-    || squashedText.includes('entertheauthorizationcode:')
+    || squashedText.includes('entertheauthorizationcode')
+    || squashedText.includes('pastetheauthorizationcode')
+    || squashedText.includes('pastetheredirecturlhere')
+    || squashedText.includes('pastethecallbackurlhere')
+    || squashedText.includes('pastethefullredirecturl')
   );
+}
+
+function hasCallbackPastePrompt(session: OAuthSession): boolean {
+  return textContainsCallbackPastePrompt(session.cleanOutput);
 }
 
 function waitForCallbackPastePrompt(session: OAuthSession, timeoutMs: number) {
@@ -399,8 +407,7 @@ function updateSessionFromOutput(session: OAuthSession) {
       || /paste.*callback url/i.test(normalizedText)
       || /paste the authorization code/i.test(normalizedText)
       || /paste the full redirect url/i.test(normalizedText)
-      || squashedText.includes('waitingforyoutopastethecallbackurl')
-      || squashedText.includes('entertheauthorizationcode:')
+      || textContainsCallbackPastePrompt(text)
       || /localhost/i.test(normalizedText)
       || /127\.0\.0\.1/i.test(normalizedText)
       || Boolean(session.authUrl);
@@ -435,8 +442,7 @@ function waitForInitialOutput(session: OAuthSession, timeoutMs: number) {
         || /Paste the authorization code/i.test(normalizedText)
         || /Paste the redirect URL here/i.test(normalizedText)
         || /Waiting for you to paste the callback URL/i.test(normalizedText)
-        || squashedText.includes('waitingforyoutopastethecallbackurl')
-        || squashedText.includes('entertheauthorizationcode:')
+        || textContainsCallbackPastePrompt(text)
         || /browser didn't open, visit:/i.test(normalizedText)
         || /Enter the authorization code:/i.test(normalizedText)  // Gemini headless OAuth
       );

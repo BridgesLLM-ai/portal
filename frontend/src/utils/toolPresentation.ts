@@ -445,5 +445,21 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
 }
 
 export function isCompactionNotice(content: string): boolean {
-  return /\b(context compacted|compaction (?:complete(?:d)?|finished|in progress|started|incomplete|did not complete)|compacting context|context maintenance(?: in progress| finished| complete(?:d)?)?|auto-compaction|preparing context maintenance|preparing compaction|memory flush(?: started| complete(?:d)?| in progress)?|heartbeat check (?:started|complete(?:d)?))\b/i.test(content || '');
+  const normalized = String(content || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+
+  const marker = normalized.replace(/^[^\p{L}\p{N}]+/u, '').trim();
+  return [
+    /^context compacted\.?$/i,
+    /^context maintenance (?:in progress|finished|complete(?:d)?)\.?$/i,
+    /^compacting context[.…]*$/i,
+    /^preparing (?:context maintenance|compaction)[.…]*$/i,
+    /^auto-compaction(?: started| in progress| complete(?:d)?)?[.…]*$/i,
+    /^context compaction(?: started| in progress| complete(?:d)?)?[.…]*$/i,
+    /^memory flush(?: started| complete(?:d)?| in progress)?[.…]*$/i,
+    /^heartbeat check (?:started|complete(?:d)?)[.…]*$/i,
+    /^compacted\s*\([^)]{1,80}\)(?:\s*[•-]\s*context\b.*)?$/i,
+    /^compaction (?:complete(?:d)?|finished|in progress|started|incomplete|did not complete)\.?$/i,
+    /^compaction skipped(?::.*)?$/i,
+  ].some((pattern) => pattern.test(marker));
 }

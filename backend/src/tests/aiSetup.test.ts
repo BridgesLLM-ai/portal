@@ -91,6 +91,24 @@ describe('ai-setup model normalization', () => {
       'openai-codex/gpt-5.4',
       'openai-codex/gpt-5.4-mini',
     ]);
+    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.5']).toEqual({});
+    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.4']).toEqual({});
+  });
+
+  test('register merge strips schema-unsupported runtime metadata from existing model entries', () => {
+    const merged = mergeDiscoveredProviderModelsIntoConfig({
+      agents: {
+        defaults: {
+          model: { primary: 'openai-codex/gpt-5.5', fallbacks: [] },
+          models: { 'openai-codex/gpt-5.5': { agentRuntime: { id: 'pi' } } },
+        },
+      },
+    }, 'openai-codex', ['openai-codex/gpt-5.5']);
+
+    expect(merged.changed).toBe(true);
+    expect(merged.addedAllowlist).toEqual([]);
+    expect(merged.addedFallbacks).toEqual([]);
+    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.5']).toEqual({});
   });
 
   test('register merge preserves Gemini CLI provider namespace before persisting models', () => {

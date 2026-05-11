@@ -63,7 +63,7 @@ Caddy (HTTPS) → Express backend (:4001)
 
 Control the shared Chrome visible in the VNC desktop. Both agent and user see the same browser.
 
-**Policy:** For portal UI work, debugging, "open this", "check the browser", console inspection, or anything Robert may want to watch or guide live, use this shared browser path first. Treat OpenClaw's hidden headless browser as fallback-only for cases where the user explicitly wants invisible/background automation or the shared browser is unavailable.
+**Policy:** For portal UI work, debugging, "open this", "check the browser", console inspection, or anything the user may want to watch or guide live, use this shared browser path first. Treat OpenClaw's hidden headless browser as fallback-only for cases where the user explicitly wants invisible/background automation or the shared browser is unavailable.
 
 **Decision rule:** If the request is visual, auth-gated, collaborative, or phrased like "open this," "check this page," "show me," "look at the browser," or "go there for me," do **not** default to pasting links into chat. Instead, launch the shared browser and navigate there so the user can see the same page. Only send raw links when the user explicitly asks for a link, wants something for later, or the shared browser path is not the right tool.
 

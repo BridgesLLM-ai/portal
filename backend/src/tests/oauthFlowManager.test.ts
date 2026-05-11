@@ -1,10 +1,21 @@
-import { extractClaudeAuthUrl, extractClaudeSetupToken, normalizeTerminalScreenText, squashPromptText } from '../services/oauthFlowManager';
+import { extractClaudeAuthUrl, extractClaudeSetupToken, normalizeTerminalScreenText, squashPromptText, textContainsCallbackPastePrompt } from '../services/oauthFlowManager';
 
 describe('oauthFlowManager terminal parsing', () => {
   test('squashes screen-control fragments that render prompts one glyph per line', () => {
     const raw = 'P\r[2m\na\r[2m\ns\r[2m\nt\r[2m\ne\r[2m\n';
     expect(normalizeTerminalScreenText(raw)).toContain('P');
     expect(squashPromptText(raw)).toBe('paste');
+  });
+
+  test('detects OpenClaw Codex callback prompts rendered one glyph per line', () => {
+    const raw = [
+      'P', 'a', 's', 't', 'e', ' ', 't', 'h', 'e', ' ',
+      'a', 'u', 't', 'h', 'o', 'r', 'i', 'z', 'a', 't', 'i', 'o', 'n', ' ',
+      'c', 'o', 'd', 'e', ' ', '(', 'o', 'r', ' ', 'f', 'u', 'l', 'l', ' ',
+      'r', 'e', 'd', 'i', 'r', 'e', 'c', 't', ' ', 'U', 'R', 'L', ')', ':',
+    ].join('\n');
+
+    expect(textContainsCallbackPastePrompt(raw)).toBe(true);
   });
 
   test('extracts Claude setup tokens from screen-normalized PTY output', () => {

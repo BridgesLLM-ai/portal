@@ -6,7 +6,8 @@ import fs from 'fs';
 import path from 'path';
 import net from 'net';
 import { createHash } from 'crypto';
-import { exec as cpExec } from 'child_process';
+import { exec as cpExec, execFile, spawn } from 'child_process';
+import { getGatewayToken } from '../utils/gatewayToken';
 
 const router = Router();
 router.use(authenticateToken, requireAdmin);
@@ -19,8 +20,16 @@ const PORTAL_VISIBLE_AGENT_NAME = 'Assistant';
 const PORTAL_VISIBLE_AGENT_EMOJI = '🖥️';
 const OPENCLAW_WORKSPACE = process.env.OPENCLAW_WORKSPACE || '/root/.openclaw/workspace-main';
 const OPENCLAW_CONFIG_PATH = process.env.OPENCLAW_CONFIG_PATH || path.join(process.env.HOME || '/root', '.openclaw/openclaw.json');
+const PORTAL_STATIC_DIR = path.resolve(process.cwd(), '../static');
 const PORTAL_STATIC_NOVNC_DIR = path.resolve(process.cwd(), '../static/novnc');
 const SYSTEM_NOVNC_DIR = '/usr/share/novnc';
+const SHARED_BROWSER_ICON_PATH = '/usr/local/share/pixmaps/bridges-shared-browser.svg';
+const OPENCLAW_UI_ICON_PATH = '/usr/local/share/pixmaps/bridges-openclaw-ui.svg';
+const OPENCLAW_UI_PROFILE_DIR = '/home/bridgesrd/.config/openclaw-control-ui-browser';
+const OPENCLAW_UI_DASHBOARD_URL_FILE = `${OPENCLAW_UI_PROFILE_DIR}/dashboard-url`;
+const OPENCLAW_UI_LAUNCH_HTML_FILE = `${OPENCLAW_UI_PROFILE_DIR}/launch.html`;
+const SHARED_BROWSER_DESKTOP_ENTRY = '/home/bridgesrd/Desktop/Shared Chrome.desktop';
+const OPENCLAW_UI_DESKTOP_ENTRY = '/home/bridgesrd/Desktop/OpenClaw Web UI.desktop';
 
 function hashDirectoryContents(root: string): string | null {
   try {
@@ -115,6 +124,116 @@ function runShell(cmd: string, timeoutMs = 60000): Promise<{ ok: boolean; stdout
   });
 }
 
+
+type DesktopClipboardSelection = 'clipboard' | 'primary';
+type DesktopClipboardTool = { name: 'xclip' | 'xsel'; path: string };
+
+const DESKTOP_DISPLAY = process.env.REMOTE_DESKTOP_DISPLAY || ':1';
+const DESKTOP_RUNTIME_DIR = process.env.REMOTE_DESKTOP_RUNTIME_DIR || '/tmp/bridges-rd-runtime';
+
+function normalizeDesktopClipboardSelection(raw: unknown): DesktopClipboardSelection {
+  return raw === 'primary' ? 'primary' : 'clipboard';
+}
+
+function desktopClipboardEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    DISPLAY: DESKTOP_DISPLAY,
+    HOME: '/home/bridgesrd',
+    XDG_RUNTIME_DIR: DESKTOP_RUNTIME_DIR,
+  };
+}
+
+function commandExists(command: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile('/usr/bin/env', ['bash', '-lc', `command -v ${command}`], { timeout: 2000, encoding: 'utf8' }, (error, stdout) => {
+      if (error) return resolve(null);
+      const value = String(stdout || '').trim().split('\n')[0]?.trim();
+      resolve(value || null);
+    });
+  });
+}
+
+async function resolveDesktopClipboardTool(): Promise<DesktopClipboardTool | null> {
+  const xclip = await commandExists('xclip');
+  if (xclip) return { name: 'xclip', path: xclip };
+  const xsel = await commandExists('xsel');
+  if (xsel) return { name: 'xsel', path: xsel };
+  return null;
+}
+
+function readDesktopClipboardWithTool(tool: DesktopClipboardTool, selection: DesktopClipboardSelection, timeoutMs = 3000): Promise<string> {
+  const args = tool.name === 'xclip'
+    ? ['-selection', selection, '-out']
+    : [selection === 'clipboard' ? '--clipboard' : '--primary', '--output'];
+
+  return new Promise((resolve, reject) => {
+    execFile(tool.path, args, { env: desktopClipboardEnv(), timeout: timeoutMs, encoding: 'utf8', maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+      if (!error) {
+        resolve(String(stdout || ''));
+        return;
+      }
+
+      const message = String(stderr || error.message || 'Desktop clipboard read failed');
+      if (/target .* not available|unable to open display|could not open display|no owner/i.test(message)) {
+        resolve('');
+        return;
+      }
+      reject(new Error(message.trim()));
+    });
+  });
+}
+
+async function readDesktopClipboard(selection: DesktopClipboardSelection): Promise<{ text: string; tool: DesktopClipboardTool }> {
+  const tool = await resolveDesktopClipboardTool();
+  if (!tool) throw new Error('No desktop clipboard tool installed. Install xclip or xsel.');
+
+  const text = await readDesktopClipboardWithTool(tool, selection);
+  if (text || selection === 'primary') return { text, tool };
+
+  try {
+    const primaryText = await readDesktopClipboardWithTool(tool, 'primary', 1200);
+    return { text: primaryText, tool };
+  } catch {
+    return { text, tool };
+  }
+}
+
+function writeDesktopClipboard(selection: DesktopClipboardSelection, text: string): Promise<{ tool: DesktopClipboardTool }> {
+  return new Promise(async (resolve, reject) => {
+    const tool = await resolveDesktopClipboardTool();
+    if (!tool) {
+      reject(new Error('No desktop clipboard tool installed. Install xclip or xsel.'));
+      return;
+    }
+
+    const args = tool.name === 'xclip'
+      ? ['-selection', selection, '-in']
+      : [selection === 'clipboard' ? '--clipboard' : '--primary', '--input'];
+
+    const child = spawn(tool.path, args, { env: desktopClipboardEnv(), detached: true, stdio: ['pipe', 'ignore', 'pipe'] });
+    let stderr = '';
+    let settled = false;
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolve({ tool });
+    };
+
+    child.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.once('error', (error) => finish(error));
+    child.once('exit', (code) => {
+      if (settled) return;
+      if (code && code !== 0) finish(new Error(stderr.trim() || `Desktop clipboard write failed with exit code ${code}`));
+    });
+    child.stdin?.end(text);
+    child.unref();
+    // xclip/xsel may stay alive as the selection owner. That is success, not a hang.
+    setTimeout(() => finish(), 350);
+  });
+}
+
 function getPortalNovncHtml(): string {
   const candidate = path.resolve(__dirname, '../../../static/novnc/vnc_portal.html');
   try {
@@ -124,6 +243,179 @@ function getPortalNovncHtml(): string {
   }
 }
 
+function resolveBundledStaticPath(relativePath: string): string | null {
+  const candidates = [
+    path.resolve(__dirname, '../../..', relativePath),
+    path.join(PORTAL_STATIC_DIR, relativePath.replace(/^static\//, '')),
+  ];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function copyBundledStaticFile(relativePath: string, destPath: string, mode: number): boolean {
+  const source = resolveBundledStaticPath(relativePath);
+  if (!source) return false;
+  fs.mkdirSync(path.dirname(destPath), { recursive: true });
+  fs.copyFileSync(source, destPath);
+  fs.chmodSync(destPath, mode);
+  return true;
+}
+
+function getOpenClawDashboardUrl(): string {
+  const configured = process.env.OPENCLAW_DASHBOARD_URL?.trim();
+  if (configured) return configured;
+  const token = getGatewayToken().trim();
+  const baseUrl = 'http://127.0.0.1:18789/';
+  return token ? `${baseUrl}#token=${encodeURIComponent(token)}` : baseUrl;
+}
+
+function getOpenClawLaunchHtml(dashboardUrl = getOpenClawDashboardUrl()): string {
+  const urlJson = JSON.stringify(dashboardUrl);
+  const escapedRefreshUrl = dashboardUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Opening OpenClaw Web UI…</title>
+  <meta http-equiv="refresh" content="0; url=${escapedRefreshUrl}" />
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #070b14; color: #d9f6ff; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; }
+    main { text-align: center; padding: 24px; }
+    .mark { font-size: 52px; line-height: 1; margin-bottom: 14px; }
+    p { margin: 0; opacity: .78; }
+  </style>
+</head>
+<body>
+  <main><div class="mark">🦞</div><p>Opening OpenClaw Web UI…</p></main>
+  <script>window.location.replace(${urlJson});</script>
+</body>
+</html>
+`;
+}
+
+function writeFileIfChanged(filePath: string, content: string, mode: number): boolean {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : null;
+  const changed = existing !== content;
+  if (changed) fs.writeFileSync(filePath, content, { mode });
+  fs.chmodSync(filePath, mode);
+  return changed;
+}
+
+function copyBundledStaticFileIfChanged(relativePaths: string[], destPath: string, mode: number): { ok: boolean; changed: boolean; source?: string } {
+  const source = relativePaths.map(resolveBundledStaticPath).find((candidate): candidate is string => Boolean(candidate));
+  if (!source) return { ok: false, changed: false };
+  fs.mkdirSync(path.dirname(destPath), { recursive: true });
+  const src = fs.readFileSync(source);
+  const changed = !fs.existsSync(destPath) || !fs.readFileSync(destPath).equals(src);
+  if (changed) fs.copyFileSync(source, destPath);
+  fs.chmodSync(destPath, mode);
+  return { ok: true, changed, source };
+}
+
+function openClawDashboardUrlFileIsCurrent(): boolean {
+  try {
+    return fs.readFileSync(OPENCLAW_UI_DASHBOARD_URL_FILE, 'utf8').trim() === getOpenClawDashboardUrl();
+  } catch {
+    return false;
+  }
+}
+
+function openClawLaunchHtmlIsCurrent(): boolean {
+  try {
+    return fs.readFileSync(OPENCLAW_UI_LAUNCH_HTML_FILE, 'utf8') === getOpenClawLaunchHtml();
+  } catch {
+    return false;
+  }
+}
+
+async function ensureRemoteDesktopLauncherAssets(options: { reloadDesktop?: boolean } = {}): Promise<{ ok: boolean; changed: boolean; note: string }> {
+  const userCheck = await runShell('id bridgesrd >/dev/null 2>&1', 3000);
+  if (!userCheck.ok) return { ok: true, changed: false, note: 'bridgesrd user absent; launcher reconcile skipped' };
+
+  const notes: string[] = [];
+  let changed = false;
+  let ok = true;
+
+  try {
+    const sharedScript = copyBundledStaticFileIfChanged([
+      'skills/bridgesllm-portal/scripts/bridges-rd-shared-chrome.sh',
+      'static/scripts/bridges-rd-shared-chrome.sh',
+    ], '/usr/local/bin/bridges-rd-shared-chrome.sh', 0o755);
+    const openclawScript = copyBundledStaticFileIfChanged([
+      'skills/bridgesllm-portal/scripts/bridges-rd-openclaw-ui.sh',
+      'static/scripts/bridges-rd-openclaw-ui.sh',
+    ], '/usr/local/bin/bridges-rd-openclaw-ui.sh', 0o755);
+    const sharedIcon = copyBundledStaticFileIfChanged(['static/icons/bridges-shared-browser.svg'], SHARED_BROWSER_ICON_PATH, 0o644);
+    const openclawIcon = copyBundledStaticFileIfChanged(['static/icons/bridges-openclaw-ui.svg'], OPENCLAW_UI_ICON_PATH, 0o644);
+    const sharedPng = copyBundledStaticFileIfChanged(['static/icons/bridges-shared-browser.png'], '/usr/local/share/pixmaps/bridges-shared-browser.png', 0o644);
+    const openclawPng = copyBundledStaticFileIfChanged(['static/icons/bridges-openclaw-ui.png'], '/usr/local/share/pixmaps/bridges-openclaw-ui.png', 0o644);
+
+    for (const [label, result] of Object.entries({ sharedScript, openclawScript, sharedIcon, openclawIcon })) {
+      ok = ok && result.ok;
+      changed = changed || result.changed;
+      if (!result.ok) notes.push(`${label} missing from bundled assets`);
+    }
+    for (const [label, result] of Object.entries({ sharedPng, openclawPng })) {
+      changed = changed || result.changed;
+      if (!result.ok) notes.push(`${label} optional PNG missing from bundled assets`);
+    }
+
+    const dashboardUrl = getOpenClawDashboardUrl();
+    changed = writeFileIfChanged(OPENCLAW_UI_DASHBOARD_URL_FILE, `${dashboardUrl}\n`, 0o600) || changed;
+    changed = writeFileIfChanged(OPENCLAW_UI_LAUNCH_HTML_FILE, getOpenClawLaunchHtml(dashboardUrl), 0o600) || changed;
+
+    const sharedDesktopEntry = `[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Shared Browser
+Comment=Shared browser used by the agent and the user inside Remote Desktop
+Exec=/usr/local/bin/bridges-rd-shared-chrome.sh
+Icon=${SHARED_BROWSER_ICON_PATH}
+Terminal=false
+Categories=Network;WebBrowser;
+StartupNotify=true
+`;
+    const openclawDesktopEntry = `[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OpenClaw Web UI
+Comment=Open native OpenClaw Control UI in a dedicated browser profile
+Exec=/usr/local/bin/bridges-rd-openclaw-ui.sh
+Icon=${OPENCLAW_UI_ICON_PATH}
+Terminal=false
+Categories=Development;Network;WebBrowser;
+StartupNotify=true
+`;
+    changed = writeFileIfChanged(SHARED_BROWSER_DESKTOP_ENTRY, sharedDesktopEntry, 0o755) || changed;
+    changed = writeFileIfChanged(OPENCLAW_UI_DESKTOP_ENTRY, openclawDesktopEntry, 0o755) || changed;
+
+    await runShell(`chown -R bridgesrd:bridgesrd /home/bridgesrd/Desktop ${OPENCLAW_UI_PROFILE_DIR}`, 5000);
+    await runShell(`chmod 755 ${JSON.stringify(SHARED_BROWSER_DESKTOP_ENTRY)} ${JSON.stringify(OPENCLAW_UI_DESKTOP_ENTRY)}; chmod 600 ${JSON.stringify(OPENCLAW_UI_DASHBOARD_URL_FILE)} ${JSON.stringify(OPENCLAW_UI_LAUNCH_HTML_FILE)}`, 5000);
+    await runShell(`runuser -u bridgesrd -- bash -lc 'command -v gio >/dev/null 2>&1 && gio set ${JSON.stringify(SHARED_BROWSER_DESKTOP_ENTRY)} metadata::trusted true || true; command -v gio >/dev/null 2>&1 && gio set ${JSON.stringify(OPENCLAW_UI_DESKTOP_ENTRY)} metadata::trusted true || true'`, 5000);
+    await runShell(`ps -eo pid=,args= | awk '/[O]penClawControlUI/ && /[#]token=/ {print $1}' | xargs -r kill`, 5000);
+
+    if (options.reloadDesktop) {
+      await runShell(`pgrep -u bridgesrd xfdesktop >/dev/null 2>&1 && runuser -u bridgesrd -- bash -lc 'DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/bridges-rd-runtime xfdesktop --reload' || true`, 5000);
+    }
+  } catch (err: any) {
+    ok = false;
+    notes.push(err?.message || String(err));
+  }
+
+  if (ok && !notes.length) notes.push(changed ? 'launcher assets refreshed' : 'launcher assets already current');
+  return { ok, changed, note: notes.join('; ') };
+}
+
+async function writeOpenClawDashboardUrlFile(): Promise<boolean> {
+  const result = await ensureRemoteDesktopLauncherAssets();
+  return result.ok;
+}
 
 function ensureNovncStaticBundle(): { changed: boolean; ok: boolean; note: string } {
   try {
@@ -315,6 +607,19 @@ async function ensurePortalVisibleBrowserDefaults(): Promise<{ changed: boolean;
   return { changed, note: notes.join('; ') };
 }
 
+export async function reconcileRemoteDesktopLauncherAssets(): Promise<void> {
+  try {
+    const result = await ensureRemoteDesktopLauncherAssets({ reloadDesktop: true });
+    if (result.changed) {
+      console.log(`[remote-desktop] Reconciled browser launchers/icons: ${result.note}`);
+    } else if (!result.ok) {
+      console.warn(`[remote-desktop] Launcher/icon reconcile incomplete: ${result.note}`);
+    }
+  } catch (err: any) {
+    console.warn('[remote-desktop] best-effort launcher/icon reconcile failed:', err?.message || err);
+  }
+}
+
 export async function reconcilePortalVisibleBrowserDefaults(): Promise<void> {
   try {
     const settings = await prisma.systemSetting.findMany({
@@ -350,6 +655,7 @@ async function attemptSelfHeal(reason: string): Promise<{ attempted: boolean; ok
   recoveryState.lastAttemptAt = now;
 
   try {
+    await ensureRemoteDesktopLauncherAssets({ reloadDesktop: true });
     const cmd = 'systemctl restart bridges-rd-xtigervnc.service bridges-rd-websockify.service';
     const result = await runShell(cmd, 20000);
     const backoff = nextBackoffMs(recoveryState.attempt);
@@ -405,6 +711,8 @@ router.get('/status', async (_req: Request, res: Response) => {
     const novncPortOpen = await checkTcpPort(6080);
     const vncPortOpen = await checkTcpPort(5901);
     const sharedChromeDebugPortOpen = await checkTcpPort(18801);
+    const clipboardTool = await resolveDesktopClipboardTool();
+    const clipboardToolPresent = Boolean(clipboardTool);
 
     // websockify no longer serves static files (March 2026) — Express serves them directly.
     // HTTP check removed; only TCP port checks matter now.
@@ -415,6 +723,10 @@ router.get('/status', async (_req: Request, res: Response) => {
     };
     const sharedChromeLauncher = '/usr/local/bin/bridges-rd-shared-chrome.sh';
     const sharedChromeDesktopEntry = '/home/bridgesrd/Desktop/Shared Chrome.desktop';
+    const openclawUiLauncher = '/usr/local/bin/bridges-rd-openclaw-ui.sh';
+    const openclawUiDesktopEntry = '/home/bridgesrd/Desktop/OpenClaw Web UI.desktop';
+    const openclawUiDashboardUrlFile = OPENCLAW_UI_DASHBOARD_URL_FILE;
+    const openclawUiLaunchHtmlFile = OPENCLAW_UI_LAUNCH_HTML_FILE;
     const novncPortalHtml = path.join(PORTAL_STATIC_NOVNC_DIR, 'vnc_portal.html');
     const novncCoreRfb = path.join(PORTAL_STATIC_NOVNC_DIR, 'core', 'rfb.js');
 
@@ -422,6 +734,14 @@ router.get('/status', async (_req: Request, res: Response) => {
     const websockifyUnitPresent = fs.existsSync(systemdServiceHints.websockify);
     const sharedChromeLauncherPresent = fs.existsSync(sharedChromeLauncher);
     const sharedChromeDesktopEntryPresent = fs.existsSync(sharedChromeDesktopEntry);
+    const sharedChromeIconPresent = fs.existsSync(SHARED_BROWSER_ICON_PATH);
+    const openclawUiLauncherPresent = fs.existsSync(openclawUiLauncher);
+    const openclawUiDesktopEntryPresent = fs.existsSync(openclawUiDesktopEntry);
+    const openclawUiDashboardUrlFilePresent = fs.existsSync(openclawUiDashboardUrlFile);
+    const openclawUiDashboardUrlCurrent = openClawDashboardUrlFileIsCurrent();
+    const openclawUiLaunchHtmlPresent = fs.existsSync(openclawUiLaunchHtmlFile);
+    const openclawUiLaunchHtmlCurrent = openClawLaunchHtmlIsCurrent();
+    const openclawUiIconPresent = fs.existsSync(OPENCLAW_UI_ICON_PATH);
     const novncPortalHtmlPresent = fs.existsSync(novncPortalHtml);
     const novncCoreBundlePresent = fs.existsSync(novncCoreRfb);
 
@@ -435,10 +755,20 @@ router.get('/status', async (_req: Request, res: Response) => {
         novncPortOpen,
         vncPortOpen,
         sharedChromeDebugPortOpen,
+        clipboardToolPresent,
+        clipboardTool: clipboardTool?.name || null,
         vncServiceUnitPresent,
         websockifyUnitPresent,
         sharedChromeLauncherPresent,
         sharedChromeDesktopEntryPresent,
+        sharedChromeIconPresent,
+        openclawUiLauncherPresent,
+        openclawUiDesktopEntryPresent,
+        openclawUiDashboardUrlFilePresent,
+        openclawUiDashboardUrlCurrent,
+        openclawUiLaunchHtmlPresent,
+        openclawUiLaunchHtmlCurrent,
+        openclawUiIconPresent,
         novncPortalHtmlPresent,
         novncCoreBundlePresent,
       },
@@ -446,7 +776,8 @@ router.get('/status', async (_req: Request, res: Response) => {
         'Check systemd units: bridges-rd-xtigervnc.service and bridges-rd-websockify.service.',
         'Verify host ports: 5901 (VNC), 6080 (websockify), and 18801 (shared Chrome debug).',
         'Verify portal noVNC assets exist: static/novnc/vnc_portal.html and static/novnc/core/rfb.js.',
-        'Re-run Remote Desktop setup if Shared Chrome launcher/desktop entry or noVNC assets are missing.',
+        'Verify desktop clipboard bridge tools are installed: xclip or xsel.',
+        'Re-run Remote Desktop setup if Shared Browser/OpenClaw Web UI launchers or noVNC assets are missing.',
         'Use POST /api/remote-desktop/recover to attempt automatic recovery.',
       ],
     };
@@ -461,9 +792,19 @@ router.get('/status', async (_req: Request, res: Response) => {
       !novncCoreBundlePresent ? 'noVNC static bundle missing' : null,
     ].filter(Boolean).join(', ');
     const sharedChromeReason = [
-      !sharedChromeLauncherPresent ? 'Shared Chrome launcher missing' : null,
-      !sharedChromeDesktopEntryPresent ? 'Shared Chrome desktop entry missing' : null,
-      !sharedChromeDebugPortOpen ? 'Shared Chrome 18801 down' : null,
+      !sharedChromeLauncherPresent ? 'Shared Browser launcher missing' : null,
+      !sharedChromeDesktopEntryPresent ? 'Shared Browser desktop entry missing' : null,
+      !sharedChromeIconPresent ? 'Shared Browser icon missing' : null,
+      !sharedChromeDebugPortOpen ? 'Shared Browser 18801 down' : null,
+    ].filter(Boolean).join(', ');
+    const openclawUiReason = [
+      !openclawUiLauncherPresent ? 'OpenClaw Web UI launcher missing' : null,
+      !openclawUiDesktopEntryPresent ? 'OpenClaw Web UI desktop entry missing' : null,
+      !openclawUiDashboardUrlFilePresent ? 'OpenClaw Web UI tokenized URL file missing' : null,
+      openclawUiDashboardUrlFilePresent && !openclawUiDashboardUrlCurrent ? 'OpenClaw Web UI tokenized URL stale' : null,
+      !openclawUiLaunchHtmlPresent ? 'OpenClaw Web UI private launch page missing' : null,
+      openclawUiLaunchHtmlPresent && !openclawUiLaunchHtmlCurrent ? 'OpenClaw Web UI private launch page stale' : null,
+      !openclawUiIconPresent ? 'OpenClaw Web UI icon missing' : null,
     ].filter(Boolean).join(', ');
 
     // Status reporting only — no automatic self-heal on poll.
@@ -473,9 +814,10 @@ router.get('/status', async (_req: Request, res: Response) => {
 
     if (hasConfiguredUrl && novncPortOpen && vncPortOpen && novncPortalHtmlPresent && novncCoreBundlePresent) {
       status = 'ready';
-      message = sharedChromeReason
-        ? `Remote Desktop is ready. Shared Chrome needs attention: ${sharedChromeReason}.`
-        : 'Remote Desktop is ready, including the shared Chrome browser path.';
+      const launcherReasons = [sharedChromeReason, openclawUiReason].filter(Boolean).join('; ');
+      message = launcherReasons
+        ? `Remote Desktop is ready. Launchers need attention: ${launcherReasons}.`
+        : 'Remote Desktop is ready, including Shared Browser and OpenClaw Web UI launchers.';
     } else if (hasConfiguredUrl && (novncPortOpen || vncPortOpen)) {
       status = 'degraded';
       message = `Remote Desktop is partially available: ${desktopUnhealthyReason || 'desktop setup incomplete'}. Use POST /api/remote-desktop/recover to attempt recovery.`;
@@ -503,6 +845,54 @@ router.get('/status', async (_req: Request, res: Response) => {
       diagnostics: null,
       timestamp: new Date().toISOString(),
     });
+  }
+});
+
+
+// ── Remote Desktop clipboard bridge ─────────────────────────────────
+// Authenticated HTTP bridge for mobile clients and iframe clipboard-permission weirdness.
+// noVNC clipboard events still run client-side; these endpoints pull from and write to the X11 desktop clipboard.
+router.get('/clipboard', async (req: Request, res: Response) => {
+  try {
+    const selection = normalizeDesktopClipboardSelection(req.query.selection);
+    const result = await readDesktopClipboard(selection);
+    res.json({
+      ok: true,
+      text: result.text,
+      selection,
+      tool: result.tool.name,
+      display: DESKTOP_DISPLAY,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    const message = error?.message || 'Failed to read desktop clipboard';
+    const statusCode = /xclip|xsel|clipboard tool/i.test(message) ? 503 : 500;
+    res.status(statusCode).json({ ok: false, error: message });
+  }
+});
+
+router.post('/clipboard', async (req: Request, res: Response) => {
+  try {
+    const selection = normalizeDesktopClipboardSelection(req.body?.selection);
+    const text = typeof req.body?.text === 'string' ? req.body.text : '';
+    if (text.length > 1024 * 1024) {
+      res.status(413).json({ ok: false, error: 'Clipboard text is too large' });
+      return;
+    }
+
+    const result = await writeDesktopClipboard(selection, text);
+    res.json({
+      ok: true,
+      selection,
+      length: text.length,
+      tool: result.tool.name,
+      display: DESKTOP_DISPLAY,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    const message = error?.message || 'Failed to write desktop clipboard';
+    const statusCode = /xclip|xsel|clipboard tool/i.test(message) ? 503 : 500;
+    res.status(statusCode).json({ ok: false, error: message });
   }
 });
 
@@ -549,7 +939,7 @@ export async function runRemoteDesktopAutoSetup(): Promise<{ ok: boolean; steps:
 
     // Step 1: Install packages if missing (idempotent — apt skips already-installed)
     // Matches production setup: full XFCE desktop + goodies, x11-utils for xdpyinfo, Google Chrome for browsing
-    const requiredPkgs = ['tigervnc-standalone-server', 'novnc', 'websockify', 'xfce4', 'xfce4-goodies', 'xfce4-terminal', 'dbus-x11', 'x11-utils', 'xterm', 'firefox', 'pulseaudio', 'pulseaudio-utils', 'librsvg2-common'];
+    const requiredPkgs = ['tigervnc-standalone-server', 'novnc', 'websockify', 'xfce4', 'xfce4-goodies', 'xfce4-terminal', 'dbus-x11', 'x11-utils', 'xclip', 'xsel', 'xterm', 'firefox', 'pulseaudio', 'pulseaudio-utils', 'librsvg2-common'];
     // Check each package individually — count-based check was unreliable because
     // meta-packages (xfce4-goodies) inflate the count, masking missing packages
     const missingCheck = await runShell(`for pkg in ${requiredPkgs.join(' ')}; do dpkg -s "$pkg" &>/dev/null || echo "$pkg"; done`);
@@ -660,74 +1050,91 @@ export async function runRemoteDesktopAutoSetup(): Promise<{ ok: boolean; steps:
     // Portal authentication (httpOnly cookie) gates all noVNC access, so no VNC-level password is needed.
     steps.push({ step: 'VNC auth mode', ok: true, message: 'Portal-authenticated noVNC (Xtigervnc localhost-only, no VNC password needed)' });
 
-    // Step 4: Write launcher scripts (Xtigervnc managed directly by systemd + shared Chrome)
+    // Step 4: Write launcher scripts, branded icons, and desktop entries.
     const webLauncher = '/usr/local/bin/bridges-rd-websockify-launcher.sh';
     const webScript = '#!/usr/bin/env bash\nset -euo pipefail\n# WebSocket-only mode — static files served by Express\n# Bind loopback only so raw websockify never bypasses portal auth.\nexec websockify 127.0.0.1:6080 127.0.0.1:5901\n';
     fs.writeFileSync(webLauncher, webScript, { mode: 0o755 });
 
     const sharedChromeLauncher = '/usr/local/bin/bridges-rd-shared-chrome.sh';
-    // Copy the launcher from the portal's bundled skill (includes warm-up logic)
-    const bundledLauncher = path.resolve(__dirname, '../../..', 'skills/bridgesllm-portal/scripts/bridges-rd-shared-chrome.sh');
-    if (fs.existsSync(bundledLauncher)) {
-      fs.copyFileSync(bundledLauncher, sharedChromeLauncher);
-      fs.chmodSync(sharedChromeLauncher, 0o755);
-    } else {
+    const openclawUiLauncher = '/usr/local/bin/bridges-rd-openclaw-ui.sh';
+    const copiedShared = copyBundledStaticFile('skills/bridgesllm-portal/scripts/bridges-rd-shared-chrome.sh', sharedChromeLauncher, 0o755)
+      || copyBundledStaticFile('static/scripts/bridges-rd-shared-chrome.sh', sharedChromeLauncher, 0o755);
+    const copiedOpenClawUi = copyBundledStaticFile('skills/bridgesllm-portal/scripts/bridges-rd-openclaw-ui.sh', openclawUiLauncher, 0o755)
+      || copyBundledStaticFile('static/scripts/bridges-rd-openclaw-ui.sh', openclawUiLauncher, 0o755);
+
+    if (!copiedShared) {
       // Fallback: write minimal launcher if bundled version not found
       const sharedChromeScript = `#!/usr/bin/env bash
 set -euo pipefail
-# Source canonical desktop env (written by VNC launcher / RD setup)
 ENV_FILE="/home/bridgesrd/.bridges-rd-env"
-if [ -f "$ENV_FILE" ]; then
-  . "$ENV_FILE"
-else
-  # Fallback for older installs
-  export DISPLAY=:1
-  export XDG_RUNTIME_DIR=/tmp/bridges-rd-runtime
-  export PULSE_SERVER=unix:/tmp/bridges-rd-runtime/pulse/native
-  export SDL_AUDIODRIVER=pulseaudio
-fi
+if [ -f "$ENV_FILE" ]; then . "$ENV_FILE"; else export DISPLAY=:1; export XDG_RUNTIME_DIR=/tmp/bridges-rd-runtime; export PULSE_SERVER=unix:/tmp/bridges-rd-runtime/pulse/native; export SDL_AUDIODRIVER=pulseaudio; fi
 PROFILE_DIR="/home/bridgesrd/.config/bridges-agent-browser"
 mkdir -p "$PROFILE_DIR"
 CHROME_BIN="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium-browser || command -v chromium)"
-if [ -z "$CHROME_BIN" ]; then
-  echo "No Chrome/Chromium binary found" >&2
-  exit 1
-fi
-exec "$CHROME_BIN" \\
-  --new-window \\
-  --no-first-run \\
-  --no-default-browser-check \\
-  --no-sandbox \\
-  --disable-gpu-sandbox \\
-  --disable-setuid-sandbox \\
-  --user-data-dir="$PROFILE_DIR" \\
-  --remote-debugging-address=127.0.0.1 \\
-  --remote-debugging-port=18801 \\
-  "$@"
+if [ -z "$CHROME_BIN" ]; then echo "No Chrome/Chromium binary found" >&2; exit 1; fi
+exec "$CHROME_BIN" --new-window --no-first-run --no-default-browser-check --no-sandbox --disable-gpu-sandbox --disable-setuid-sandbox --user-data-dir="$PROFILE_DIR" --remote-debugging-address=127.0.0.1 --remote-debugging-port=18801 "$@"
 `;
       fs.writeFileSync(sharedChromeLauncher, sharedChromeScript, { mode: 0o755 });
     }
-    steps.push({ step: 'Launcher scripts', ok: true, message: 'Written (websockify + shared Chrome)' });
+
+    if (!copiedOpenClawUi) {
+      const openclawUiScript = `#!/usr/bin/env bash
+set -euo pipefail
+USER_URL="\${1:-\${OPENCLAW_DASHBOARD_URL:-}}"
+ENV_FILE="/home/bridgesrd/.bridges-rd-env"
+if [ -f "$ENV_FILE" ]; then . "$ENV_FILE"; else export DISPLAY=:1; export XDG_RUNTIME_DIR=/tmp/bridges-rd-runtime; export PULSE_SERVER=unix:/tmp/bridges-rd-runtime/pulse/native; export SDL_AUDIODRIVER=pulseaudio; fi
+PROFILE_DIR="/home/bridgesrd/.config/openclaw-control-ui-browser"
+URL_FILE="\${OPENCLAW_DASHBOARD_URL_FILE:-/home/bridgesrd/.config/openclaw-control-ui-browser/dashboard-url}"
+mkdir -p "$PROFILE_DIR"
+if [ -z "$USER_URL" ] && [ -r "$URL_FILE" ]; then USER_URL="$(head -n 1 "$URL_FILE" | tr -d '\\r\\n')"; fi
+USER_URL="\${USER_URL:-http://127.0.0.1:18789/}"
+CHROME_BIN="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium-browser || command -v chromium)"
+if [ -z "$CHROME_BIN" ]; then echo "No Chrome/Chromium binary found" >&2; exit 1; fi
+exec "$CHROME_BIN" --new-window --app="$USER_URL" --class=OpenClawControlUI --name=OpenClawControlUI --no-first-run --no-default-browser-check --no-sandbox --disable-gpu-sandbox --disable-setuid-sandbox --user-data-dir="$PROFILE_DIR"
+`;
+      fs.writeFileSync(openclawUiLauncher, openclawUiScript, { mode: 0o755 });
+    }
+
+    const copiedSharedIcon = copyBundledStaticFile('static/icons/bridges-shared-browser.svg', SHARED_BROWSER_ICON_PATH, 0o644);
+    const copiedOpenClawIcon = copyBundledStaticFile('static/icons/bridges-openclaw-ui.svg', OPENCLAW_UI_ICON_PATH, 0o644);
+    const wroteOpenClawUrl = await writeOpenClawDashboardUrlFile();
+    steps.push({
+      step: 'Launcher scripts, icons, and OpenClaw URL',
+      ok: copiedSharedIcon && copiedOpenClawIcon && wroteOpenClawUrl,
+      message: `Written (Shared Browser + OpenClaw Web UI${copiedSharedIcon && copiedOpenClawIcon && wroteOpenClawUrl ? '' : '; one asset/url fallback missing'})`,
+    });
 
     try {
       const desktopDir = '/home/bridgesrd/Desktop';
       fs.mkdirSync(desktopDir, { recursive: true });
-      const sharedChromeDesktopEntry = `[Desktop Entry]
+      const sharedBrowserDesktopEntry = `[Desktop Entry]
 Version=1.0
 Type=Application
-Name=Shared Chrome
+Name=Shared Browser
 Comment=Shared browser used by the agent and the user inside Remote Desktop
 Exec=/usr/local/bin/bridges-rd-shared-chrome.sh
-Icon=google-chrome
+Icon=${SHARED_BROWSER_ICON_PATH}
 Terminal=false
 Categories=Network;WebBrowser;
 StartupNotify=true
 `;
-      fs.writeFileSync(path.join(desktopDir, 'Shared Chrome.desktop'), sharedChromeDesktopEntry, { mode: 0o755 });
+      const openclawUiDesktopEntry = `[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OpenClaw Web UI
+Comment=Open native OpenClaw Control UI in a dedicated browser profile
+Exec=/usr/local/bin/bridges-rd-openclaw-ui.sh
+Icon=${OPENCLAW_UI_ICON_PATH}
+Terminal=false
+Categories=Development;Network;WebBrowser;
+StartupNotify=true
+`;
+      fs.writeFileSync(path.join(desktopDir, 'Shared Chrome.desktop'), sharedBrowserDesktopEntry, { mode: 0o755 });
+      fs.writeFileSync(path.join(desktopDir, 'OpenClaw Web UI.desktop'), openclawUiDesktopEntry, { mode: 0o755 });
       await runShell('chown -R bridgesrd:bridgesrd /home/bridgesrd/Desktop', 5000);
-      steps.push({ step: 'Shared Chrome desktop entry', ok: true, message: 'Desktop shortcut created' });
+      steps.push({ step: 'Desktop launchers', ok: true, message: 'Shared Browser and OpenClaw Web UI shortcuts created' });
     } catch (err: any) {
-      steps.push({ step: 'Shared Chrome desktop entry', ok: false, message: `Non-fatal: ${err?.message?.slice(0, 200)}` });
+      steps.push({ step: 'Desktop launchers', ok: false, message: `Non-fatal: ${err?.message?.slice(0, 200)}` });
     }
 
     // Step 5: Write systemd units (Xtigervnc + websockify)
@@ -1001,12 +1408,34 @@ WantedBy=multi-user.target
     const chromeBinaryOk = (await runShell('command -v google-chrome-stable || command -v google-chrome || command -v chromium-browser || command -v chromium', 5000)).ok;
     steps.push({ step: 'Verify Chrome/Chromium binary', ok: chromeBinaryOk, message: chromeBinaryOk ? 'Found browser binary' : 'No Chrome/Chromium binary found' });
 
-    const launcherOk = fs.existsSync('/usr/local/bin/bridges-rd-shared-chrome.sh');
-    const desktopEntryOk = fs.existsSync('/home/bridgesrd/Desktop/Shared Chrome.desktop');
+    const sharedLauncherOk = fs.existsSync('/usr/local/bin/bridges-rd-shared-chrome.sh');
+    const sharedDesktopEntryOk = fs.existsSync('/home/bridgesrd/Desktop/Shared Chrome.desktop');
+    const openclawUiLauncherOk = fs.existsSync('/usr/local/bin/bridges-rd-openclaw-ui.sh');
+    const openclawUiDesktopEntryOk = fs.existsSync('/home/bridgesrd/Desktop/OpenClaw Web UI.desktop');
+    const sharedIconOk = fs.existsSync(SHARED_BROWSER_ICON_PATH);
+    const openclawUiIconOk = fs.existsSync(OPENCLAW_UI_ICON_PATH);
+    const openclawUiUrlFileOk = fs.existsSync(OPENCLAW_UI_DASHBOARD_URL_FILE);
+    const openclawUiUrlCurrentOk = openClawDashboardUrlFileIsCurrent();
+    const openclawUiLaunchHtmlOk = fs.existsSync(OPENCLAW_UI_LAUNCH_HTML_FILE);
+    const openclawUiLaunchHtmlCurrentOk = openClawLaunchHtmlIsCurrent();
     const novncPortalOk = fs.existsSync(path.join(PORTAL_STATIC_NOVNC_DIR, 'vnc_portal.html'));
     const novncCoreOk = fs.existsSync(path.join(PORTAL_STATIC_NOVNC_DIR, 'core', 'rfb.js'));
-    steps.push({ step: 'Verify Shared Chrome launcher', ok: launcherOk, message: launcherOk ? 'Present' : 'Missing launcher script' });
-    steps.push({ step: 'Verify Shared Chrome desktop entry', ok: desktopEntryOk, message: desktopEntryOk ? 'Present' : 'Missing desktop shortcut' });
+    steps.push({ step: 'Verify Shared Browser launcher', ok: sharedLauncherOk, message: sharedLauncherOk ? 'Present' : 'Missing launcher script' });
+    steps.push({ step: 'Verify Shared Browser desktop entry', ok: sharedDesktopEntryOk, message: sharedDesktopEntryOk ? 'Present' : 'Missing desktop shortcut' });
+    steps.push({ step: 'Verify Shared Browser icon', ok: sharedIconOk, message: sharedIconOk ? 'Present' : 'Missing icon' });
+    steps.push({ step: 'Verify OpenClaw Web UI launcher', ok: openclawUiLauncherOk, message: openclawUiLauncherOk ? 'Present' : 'Missing launcher script' });
+    steps.push({ step: 'Verify OpenClaw Web UI desktop entry', ok: openclawUiDesktopEntryOk, message: openclawUiDesktopEntryOk ? 'Present' : 'Missing desktop shortcut' });
+    steps.push({ step: 'Verify OpenClaw Web UI icon', ok: openclawUiIconOk, message: openclawUiIconOk ? 'Present' : 'Missing icon' });
+    steps.push({
+      step: 'Verify OpenClaw Web UI tokenized URL',
+      ok: openclawUiUrlFileOk && openclawUiUrlCurrentOk,
+      message: openclawUiUrlFileOk ? (openclawUiUrlCurrentOk ? 'Present/current' : 'Present but stale') : 'Missing dashboard URL file',
+    });
+    steps.push({
+      step: 'Verify OpenClaw Web UI private launch page',
+      ok: openclawUiLaunchHtmlOk && openclawUiLaunchHtmlCurrentOk,
+      message: openclawUiLaunchHtmlOk ? (openclawUiLaunchHtmlCurrentOk ? 'Present/current' : 'Present but stale') : 'Missing private launch page',
+    });
     steps.push({ step: 'Verify noVNC portal HTML', ok: novncPortalOk, message: novncPortalOk ? 'Present' : 'Missing static/novnc/vnc_portal.html' });
     steps.push({ step: 'Verify noVNC core bundle', ok: novncCoreOk, message: novncCoreOk ? 'Present' : 'Missing static/novnc/core/rfb.js' });
 

@@ -2,8 +2,8 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
 import { requireApproved } from '../middleware/requireApproved';
-import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'fs';
-import { execFile, execFileSync } from 'child_process';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'fs';
+import { execFile, execFileSync, spawn } from 'child_process';
 import path from 'path';
 import { AgentRegistry, AgentProviderName } from '../agents';
 import { AgentAbortError } from '../agents/AgentProvider.interface';
@@ -18,6 +18,7 @@ import {
   steerSessionMessage,
   onApprovalRequest,
   onApprovalResolved,
+  subscribeGatewaySessionMessages,
   isConnected as isPersistentWsConnected,
   reconnectNow as reconnectPersistentWs,
   type ExecApprovalRequest as PersistentApprovalRequest,
@@ -44,6 +45,7 @@ import { buildOpenClawCliEnv, normalizePortalModelId } from '../utils/openclawCl
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server as HttpServer, IncomingMessage } from 'http';
 import type { Duplex } from 'stream';
+import { createHash } from 'crypto';
 
 const DEBUG_GATEWAY_WS = process.env.DEBUG_GATEWAY_WS === '1';
 const debugLog = (...args: unknown[]) => {
@@ -75,6 +77,176 @@ const GEMINI_CLI_TMP_DIR = path.join(process.env.HOME || '/root', '.gemini', 'tm
 const GEMINI_CLI_PROVIDER = 'google-gemini-cli';
 const GEMINI_CLI_TRANSCRIPT_INDEX_TTL_MS = 30000;
 const MAIN_SESSION_LIST_CACHE_TTL_MS = 5000;
+const MAIN_SESSION_DERIVED_TITLE_LIMIT = 80;
+const MAINTENANCE_HISTORY_DIR = path.join(PORTAL_ROOT, 'backend', '.data', 'maintenance-history');
+const MAINTENANCE_HISTORY_DEDUP_WINDOW_MS = 4000;
+const maintenanceHistoryDedup = new Map<string, number>();
+
+type OpenClawCliResult = { ok: boolean; stdout: string; stderr: string; error?: string };
+
+function runOpenClawCli(args: string[], timeoutMs = 8000, extraEnv: NodeJS.ProcessEnv = {}): Promise<OpenClawCliResult> {
+  return new Promise((resolve) => {
+    execFile('openclaw', args, { env: { ...buildOpenClawCliEnv(), ...extraEnv }, timeout: timeoutMs }, (error, stdout, stderr) => {
+      resolve({
+        ok: !error,
+        stdout: String(stdout || '').trim(),
+        stderr: String(stderr || '').trim(),
+        error: error ? (error as any)?.message || String(error) : undefined,
+      });
+    });
+  });
+}
+
+function parseOpenClawVersion(raw: unknown): string | null {
+  const text = String(raw || '').trim();
+  const match = text.match(/OpenClaw\s+v?(\d{4}\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?)/i)
+    || text.match(/\bv?(\d{4}\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?)\b/);
+  return match?.[1] || null;
+}
+
+function parseJsonLoose(raw: string): any | null {
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+function getOpenClawPackageMtimeMs(): number | null {
+  const candidates = [
+    '/usr/lib/node_modules/openclaw/package.json',
+    '/usr/local/lib/node_modules/openclaw/package.json',
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return statSync(candidate).mtimeMs;
+    } catch {}
+  }
+  return null;
+}
+
+function gatewayRecoveryEnv(): NodeJS.ProcessEnv {
+  return {
+    ...buildOpenClawCliEnv(),
+    // Needed when the installed stable CLI is intentionally recovering from a
+    // beta-written config after channel downgrade. OpenClaw gates destructive
+    // downgrade actions unless this is explicit.
+    OPENCLAW_ALLOW_OLDER_BINARY_DESTRUCTIVE_ACTIONS: '1',
+  };
+}
+
+function forceStartOpenClawGateway(): { ok: boolean; pid?: number; error?: string } {
+  try {
+    const logPath = '/root/.openclaw/logs/openclaw.log';
+    const out = openSync(logPath, 'a');
+    const child = spawn('openclaw', ['gateway', '--force', 'run'], {
+      env: gatewayRecoveryEnv(),
+      detached: true,
+      stdio: ['ignore', out, out],
+    });
+    child.unref();
+    closeSync(out);
+    return { ok: true, pid: child.pid };
+  } catch (err: any) {
+    return { ok: false, error: err?.message || 'Failed to force-start OpenClaw gateway' };
+  }
+}
+
+async function waitForGatewayVersionClear(timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs;
+  let last: any = null;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    last = await getOpenClawVersionStatus().catch((err: any) => ({
+      installedVersion: null,
+      runningVersion: null,
+      latestVersion: null,
+      updateChannel: null,
+      mismatch: false,
+      restartRecommended: false,
+      reason: null,
+      listenerPid: null,
+      listenerStartedAt: null,
+      installedPackageMtime: null,
+      probeOk: false,
+      probeError: err?.message || 'Version status check failed while waiting for gateway restart',
+    }));
+    if (last?.probeOk && !last?.restartRecommended) return last;
+  }
+  return last;
+}
+
+function getGatewayListenerProcess(): { pid: number | null; startedAt: string | null; startedAtMs: number | null } {
+  try {
+    const output = execFileSync('bash', ['-lc', "ss -ltnp 'sport = :18789' 2>/dev/null | tail -n +2 | head -n 1"], {
+      env: buildOpenClawCliEnv(),
+      timeout: 2500,
+      encoding: 'utf8',
+    }).trim();
+    const pid = Number(output.match(/pid=(\d+)/)?.[1] || 0) || null;
+    if (!pid) return { pid: null, startedAt: null, startedAtMs: null };
+
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const bootTimeRaw = readFileSync('/proc/stat', 'utf8').match(/^btime\s+(\d+)/m)?.[1];
+    const afterCommand = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+    const startTicks = Number(afterCommand[19]); // proc stat field 22 after removing pid+comm
+    const bootSeconds = Number(bootTimeRaw || 0);
+    const ticksPerSecond = Number(execFileSync('getconf', ['CLK_TCK'], { timeout: 1000, encoding: 'utf8' }).trim()) || 100;
+    const startedAtMs = bootSeconds && Number.isFinite(startTicks) ? Math.round((bootSeconds + startTicks / ticksPerSecond) * 1000) : null;
+    return {
+      pid,
+      startedAt: startedAtMs ? new Date(startedAtMs).toISOString() : null,
+      startedAtMs,
+    };
+  } catch {
+    return { pid: null, startedAt: null, startedAtMs: null };
+  }
+}
+
+async function getOpenClawVersionStatus() {
+  const [cliVersionResult, updateStatusResult, probeResult] = await Promise.all([
+    runOpenClawCli(['--version'], 4000),
+    runOpenClawCli(['update', 'status', '--json', '--timeout', '3'], 9000),
+    runOpenClawCli(['gateway', 'probe', '--json'], 9000),
+  ]);
+
+  const installedVersion = parseOpenClawVersion(cliVersionResult.stdout);
+  const updateStatus = parseJsonLoose(updateStatusResult.stdout);
+  const probe = parseJsonLoose(probeResult.stdout);
+  const primaryTarget = Array.isArray(probe?.targets) ? probe.targets[0] : null;
+  const runningVersion = parseOpenClawVersion(primaryTarget?.self?.version || probe?.self?.version);
+  const listener = getGatewayListenerProcess();
+  const installedPackageMtimeMs = getOpenClawPackageMtimeMs();
+  const installedPackageMtime = installedPackageMtimeMs ? new Date(installedPackageMtimeMs).toISOString() : null;
+  const probeError = primaryTarget?.connect?.error || probe?.warnings?.[0]?.message || probeResult.error || null;
+
+  const exactVersionMismatch = Boolean(installedVersion && runningVersion && installedVersion !== runningVersion);
+  const listenerOlderThanInstall = Boolean(
+    listener.startedAtMs
+    && installedPackageMtimeMs
+    && listener.startedAtMs + 5000 < installedPackageMtimeMs
+  );
+  const protocolMismatch = String(probeError || '').toLowerCase().includes('protocol mismatch');
+  const mismatch = exactVersionMismatch || (!runningVersion && listenerOlderThanInstall) || protocolMismatch;
+  const reason = exactVersionMismatch
+    ? `OpenClaw gateway is running ${runningVersion}, but ${installedVersion} is installed.`
+    : protocolMismatch
+      ? 'OpenClaw gateway protocol does not match the installed CLI; the gateway is probably still an older detached process.'
+      : listenerOlderThanInstall
+        ? 'OpenClaw gateway listener started before the installed package was updated.'
+        : null;
+
+  return {
+    installedVersion,
+    runningVersion,
+    latestVersion: updateStatus?.availability?.latestVersion || updateStatus?.update?.registry?.latestVersion || null,
+    updateChannel: updateStatus?.channel?.value || null,
+    mismatch,
+    restartRecommended: mismatch,
+    reason,
+    listenerPid: listener.pid,
+    listenerStartedAt: listener.startedAt,
+    installedPackageMtime,
+    probeOk: Boolean(probe?.ok),
+    probeError,
+  };
+}
 
 let geminiCliTranscriptIndexCache: { at: number; index: Map<string, string> } | null = null;
 let mainSessionListCache: { at: number; mtimeMs: number; size: number; sessions: any[] } | null = null;
@@ -567,9 +739,113 @@ function extractCompactionNoticeText(content: any, compactionMeta?: any): string
 }
 
 function isCompactionNoticeText(text: unknown): boolean {
-  const normalized = typeof text === 'string' ? text.trim() : '';
+  const normalized = typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '';
   if (!normalized) return false;
-  return /\b(compacting context|context compacted|compaction (?:complete(?:d)?|finished|in progress|started|incomplete|did not complete)|context maintenance(?: in progress| finished| complete(?:d)?)?|auto-compaction|preparing context maintenance|preparing compaction)\b/i.test(normalized);
+  if (!/(?:\b(context compacted|compaction (?:complete(?:d)?|finished|in progress|started|incomplete|did not complete|skipped)|compacting context|context maintenance(?: in progress| finished| complete(?:d)?)?|auto-compaction|preparing context maintenance|preparing compaction|memory flush(?: started| complete(?:d)?| in progress)?|heartbeat check (?:started|complete(?:d)?)|heartbeat_ok)\b|(?:^|[^\w])compacted\s*\()/i.test(normalized)) return false;
+
+  const marker = normalized.replace(/^[^\p{L}\p{N}]+/u, '').trim();
+  return [
+    /^context compacted\.?$/i,
+    /^context maintenance (?:in progress|finished|complete(?:d)?)\.?$/i,
+    /^compacting context[.…]*$/i,
+    /^preparing (?:context maintenance|compaction)[.…]*$/i,
+    /^memory flush(?: started| complete(?:d)?| in progress)?[.…]*$/i,
+    /^heartbeat check (?:started|complete(?:d)?)[.…]*$/i,
+    /^heartbeat_ok\.?$/i,
+    /^compacted\s*\([^)]{1,80}\)(?:\s*[•-]\s*context\b.*)?$/i,
+    /^compaction (?:complete(?:d)?|finished|in progress|started|incomplete|did not complete)\.?$/i,
+    /^compaction skipped(?::.*)?$/i,
+  ].some((pattern) => pattern.test(marker));
+}
+
+
+function maintenanceHistoryPathForSession(sessionKey: string): string {
+  const digest = createHash('sha256').update(sessionKey || 'main').digest('hex').slice(0, 32);
+  return path.join(MAINTENANCE_HISTORY_DIR, `${digest}.jsonl`);
+}
+
+function defaultMaintenanceNoticeText(evt: StreamEvent): string {
+  if (evt.type === 'compaction_start') return 'Compacting context…';
+  if (evt.type === 'compaction_end') return evt.completed === false ? 'Context maintenance finished.' : 'Context compacted';
+  return evt.maintenanceKind === 'maintenance' ? 'Context maintenance in progress…' : 'Context maintenance finished.';
+}
+
+function buildMaintenanceHistoryMarker(sessionKey: string, evt: StreamEvent): any | null {
+  if (!sessionKey) return null;
+  const text = typeof evt.content === 'string' && evt.content.trim()
+    ? evt.content.trim()
+    : defaultMaintenanceNoticeText(evt);
+  if (!text || !isCompactionNoticeText(text)) return null;
+
+  const isCompaction = evt.type === 'compaction_start'
+    || (evt.type === 'compaction_end' && evt.completed !== false && evt.maintenanceKind !== 'maintenance');
+  const timestamp = new Date().toISOString();
+  const markerId = `maintenance-${createHash('sha256').update(`${sessionKey}:${timestamp}:${evt.type}:${text}`).digest('hex').slice(0, 24)}`;
+  return {
+    id: markerId,
+    role: 'system',
+    content: text,
+    provenance: isCompaction ? 'compaction' : 'hidden-history-artifact',
+    timestamp,
+    maintenanceKind: isCompaction ? 'compaction' : 'maintenance',
+    __portal: {
+      kind: isCompaction ? 'compaction' : 'maintenance',
+      source: 'stream-event',
+      eventType: evt.type,
+    },
+  };
+}
+
+function recordMaintenanceHistoryMarker(sessionKey: string, evt: StreamEvent): void {
+  const marker = buildMaintenanceHistoryMarker(sessionKey, evt);
+  if (!marker) return;
+  const dedupKey = `${sessionKey}:${marker.maintenanceKind}:${marker.content}`;
+  const now = Date.now();
+  const last = maintenanceHistoryDedup.get(dedupKey) || 0;
+  if (now - last < MAINTENANCE_HISTORY_DEDUP_WINDOW_MS) return;
+  maintenanceHistoryDedup.set(dedupKey, now);
+
+  try {
+    mkdirSync(MAINTENANCE_HISTORY_DIR, { recursive: true });
+    appendFileSync(maintenanceHistoryPathForSession(sessionKey), JSON.stringify(marker) + '\n', 'utf8');
+  } catch (err: any) {
+    console.warn('[gateway-maintenance-history] Failed to record maintenance marker:', err?.message || err);
+  }
+}
+
+function readMaintenanceHistoryMarkers(sessionKey: string, limit = 200): any[] {
+  if (!sessionKey || limit <= 0) return [];
+  const filePath = maintenanceHistoryPathForSession(sessionKey);
+  if (!existsSync(filePath)) return [];
+
+  try {
+    const lines = readFileSync(filePath, 'utf8').split('\n').filter((line) => line.trim()).slice(-Math.max(limit * 2, limit));
+    return lines
+      .map((line) => {
+        try { return JSON.parse(line); } catch { return null; }
+      })
+      .filter((entry) => entry?.role === 'system' && typeof entry?.content === 'string' && entry.content.trim())
+      .slice(-Math.max(limit, 1));
+  } catch (err: any) {
+    console.warn('[gateway-maintenance-history] Failed to read maintenance markers:', err?.message || err);
+    return [];
+  }
+}
+
+function mergeMaintenanceHistoryMarkers(sessionKey: string, messages: any[], limit = 200): any[] {
+  const markers = readMaintenanceHistoryMarkers(sessionKey, limit);
+  if (markers.length === 0) return messages;
+
+  const seenIds = new Set<string>();
+  const combined = [...messages, ...markers]
+    .filter((message) => {
+      const id = typeof message?.id === 'string' ? message.id : '';
+      if (id && seenIds.has(id)) return false;
+      if (id) seenIds.add(id);
+      return true;
+    })
+    .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
+  return combined.slice(-Math.max(limit, 1));
 }
 
 function sanitizeHistoryText(text: string): string {
@@ -930,29 +1206,36 @@ function hasMeaningfulConversationTurns(messages: any[]): boolean {
 }
 
 function getLatestMeaningfulConversationTimestamp(messages: any[]): number {
-  let latest = 0;
+  return getLatestMeaningfulConversationMarker(messages)?.timestamp || 0;
+}
+
+function getLatestMeaningfulConversationMarker(messages: any[]): { role: 'user' | 'assistant'; timestamp: number; content: string } | null {
+  let latest: { role: 'user' | 'assistant'; timestamp: number; content: string } | null = null;
+  const consider = (role: 'user' | 'assistant', timestamp: number, content: string) => {
+    if (!latest || timestamp > latest.timestamp) latest = { role, timestamp, content };
+  };
   for (const message of messages) {
     if (!message || typeof message !== 'object') continue;
     const timestampMs = toHistoryTimestampMs(message?.timestamp);
     if (!timestampMs) continue;
 
     if (message.role === 'user' && typeof message.content === 'string' && message.content.trim()) {
-      latest = Math.max(latest, timestampMs);
+      consider('user', timestampMs, message.content.trim());
       continue;
     }
 
     if (message.role !== 'assistant') continue;
     if (Array.isArray(message.toolCalls) && message.toolCalls.length > 0) {
-      latest = Math.max(latest, timestampMs);
+      consider('assistant', timestampMs, typeof message.content === 'string' ? message.content.trim() : 'tool call');
       continue;
     }
     if (typeof message.thinkingContent === 'string' && message.thinkingContent.trim()) {
-      latest = Math.max(latest, timestampMs);
+      consider('assistant', timestampMs, typeof message.content === 'string' ? message.content.trim() : message.thinkingContent.trim());
       continue;
     }
     if (typeof message.content !== 'string') continue;
     const normalized = message.content.trim();
-    if (normalized && !/^Model set to /i.test(normalized)) latest = Math.max(latest, timestampMs);
+    if (normalized && !/^Model set to /i.test(normalized) && !isCompactionNoticeText(normalized)) consider('assistant', timestampMs, normalized);
   }
   return latest;
 }
@@ -963,28 +1246,28 @@ function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 20
   const geminiCliSessionIds = resolveSessionRegistryEntries(sessionKey, sessionsDir)
     .map((entry) => resolveGeminiCliBindingSessionId(entry))
     .filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
-  if (geminiCliSessionIds.length === 0) return localMessages;
+  if (geminiCliSessionIds.length === 0) return mergeMaintenanceHistoryMarkers(sessionKey, localMessages, limit);
 
   const importedMessages = geminiCliSessionIds
     .flatMap((cliSessionId) => readGeminiCliImportedMessages(cliSessionId, limit))
     .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp))
     .slice(-Math.max(limit, 1));
-  if (importedMessages.length === 0) return localMessages;
+  if (importedMessages.length === 0) return mergeMaintenanceHistoryMarkers(sessionKey, localMessages, limit);
 
   const localLatestTimestamp = getLatestMeaningfulConversationTimestamp(localMessages);
   if (!hasMeaningfulConversationTurns(localMessages) || !localLatestTimestamp) {
     const combined = [...localMessages, ...importedMessages]
       .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
-    return combined.slice(-Math.max(limit, 1));
+    return mergeMaintenanceHistoryMarkers(sessionKey, combined.slice(-Math.max(limit, 1)), limit);
   }
 
   const importedTail = importedMessages.filter((message) => toHistoryTimestampMs(message?.timestamp) > localLatestTimestamp);
-  if (importedTail.length === 0) return localMessages;
+  if (importedTail.length === 0) return mergeMaintenanceHistoryMarkers(sessionKey, localMessages, limit);
 
   const combined = [...localMessages, ...importedTail]
     .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
 
-  return combined.slice(-Math.max(limit, 1));
+  return mergeMaintenanceHistoryMarkers(sessionKey, combined.slice(-Math.max(limit, 1)), limit);
 }
 
 async function recoverRecentOpenClawAssistantReply(
@@ -1127,6 +1410,16 @@ function humanizeSessionKey(sessionKey: string, sessionId: string): string {
   const slug = parts.slice(2).join(':') || sessionId;
   const normalized = slug.replace(/^portal-[a-f0-9]{8}-/i, '');
 
+  const newSessionMatch = normalized.match(/^(?:portal-)?new-(\d{13,})$/i);
+  if (newSessionMatch) {
+    const timestamp = Number(newSessionMatch[1]);
+    const date = new Date(timestamp);
+    if (!Number.isNaN(date.getTime())) {
+      return `New chat · ${date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}`;
+    }
+    return 'New chat';
+  }
+
   if (/^blip-analysis(?:-\d+)?$/i.test(normalized)) {
     return normalized.replace(/-/g, ' ');
   }
@@ -1166,7 +1459,10 @@ function cleanSessionTitleCandidate(text: string): string {
 }
 
 function isUsableSessionTitle(title: string): boolean {
-  if (!title || title.length > 72) return false;
+  if (!title) return false;
+  // Long prompts are still useful session labels once truncated by the caller.
+  // Rejecting them here made real portal-created chats fall back to
+  // "New chat · date/time", which is exactly the multitasking-hostile case.
   if (/^you are\s/i.test(title)) return false;
   if (/^system:/i.test(title)) return false;
   if (/^sender\s*\(/i.test(title)) return false;
@@ -1337,6 +1633,39 @@ function readLastJsonlLines(filePath: string, maxLines: number): { lines: string
 
   const lines = text.split('\n').filter((line) => line.trim());
   return { lines: lines.slice(-maxLines), hitStart };
+}
+
+function readFirstJsonlLines(filePath: string, maxLines: number, maxBytes = 256 * 1024): string[] {
+  if (!existsSync(filePath) || maxLines <= 0 || maxBytes <= 0) return [];
+
+  const stat = statSync(filePath);
+  if (!stat.size) return [];
+
+  const fd = openSync(filePath, 'r');
+  const buffer = Buffer.allocUnsafe(Math.min(stat.size, maxBytes));
+  let bytesRead = 0;
+  try {
+    bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+  } finally {
+    closeSync(fd);
+  }
+
+  if (bytesRead <= 0) return [];
+  return buffer
+    .subarray(0, bytesRead)
+    .toString('utf-8')
+    .split('\n')
+    .filter((line) => line.trim())
+    .slice(0, maxLines);
+}
+
+function deriveSessionLabelFromSessionFile(sessionKey: string, sessionId: string, sessionsDir = SESSIONS_DIR): { title?: string; preview?: string; isMainSession?: boolean } | null {
+  const filePath = path.join(sessionsDir, `${sessionId}.jsonl`);
+  const lines = readFirstJsonlLines(filePath, 80);
+  if (!lines.length) return null;
+  const summary = summarizeSessionLabel({ sessionKey, sessionId, lines });
+  if (!summary?.title || !isUsableSessionTitle(summary.title)) return null;
+  return summary;
 }
 
 function readRecentSessionMessages<T>(params: {
@@ -2003,6 +2332,24 @@ router.get('/health', authenticateToken, async (_req: Request, res: Response) =>
     let modelsConfigured = false;
     let modelCount = 0;
     const issues: string[] = [];
+    const openclawVersion = await getOpenClawVersionStatus().catch((err: any) => ({
+      installedVersion: null,
+      runningVersion: null,
+      latestVersion: null,
+      updateChannel: null,
+      mismatch: false,
+      restartRecommended: false,
+      reason: null,
+      listenerPid: null,
+      listenerStartedAt: null,
+      installedPackageMtime: null,
+      probeOk: false,
+      probeError: err?.message || 'Version status check failed',
+    }));
+
+    if (openclawVersion.restartRecommended && openclawVersion.reason) {
+      issues.push(openclawVersion.reason);
+    }
 
     if (connected) {
       try {
@@ -2032,10 +2379,49 @@ router.get('/health', authenticateToken, async (_req: Request, res: Response) =>
       }
     }
 
-    const ok = chatReady && modelsConfigured;
-    res.json({ ok, connected, wsConnected, chatReady, gatewayReachable, modelsConfigured, modelCount, issues });
+    const ok = chatReady && modelsConfigured && !openclawVersion.restartRecommended;
+    res.json({ ok, connected, wsConnected, chatReady, gatewayReachable, modelsConfigured, modelCount, issues, openclawVersion });
   } catch {
-    res.json({ ok: false, connected: false, wsConnected: false, gatewayReachable: false, modelsConfigured: false, modelCount: 0, issues: ['Health check failed'] });
+    res.json({ ok: false, connected: false, wsConnected: false, gatewayReachable: false, modelsConfigured: false, modelCount: 0, issues: ['Health check failed'], openclawVersion: null });
+  }
+});
+
+// Restart the OpenClaw gateway process. Used when the installed package changed
+// but the detached listener is still the older in-memory runtime.
+router.post('/restart', authenticateToken, requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const before = await getOpenClawVersionStatus().catch(() => null);
+    const restart = await runOpenClawCli(['gateway', 'restart'], 45000, gatewayRecoveryEnv());
+    let forcedStart: { ok: boolean; pid?: number; error?: string } | null = null;
+    let after = await waitForGatewayVersionClear(7000);
+
+    // Some customer-like installs run OpenClaw as a detached listener instead of
+    // an enabled service. In that mode `gateway restart` may report success-ish
+    // instructions but leave the stale port owner alive. Fall back to the same
+    // recovery path an operator would use: force-kill the stale listener and run
+    // the installed gateway binary detached.
+    if (!after || after.restartRecommended || !after.probeOk) {
+      forcedStart = forceStartOpenClawGateway();
+      after = await waitForGatewayVersionClear(12000);
+    }
+
+    reconnectPersistentWs();
+    const ok = Boolean(after && !after.restartRecommended && after.probeOk);
+
+    res.status(ok ? 200 : 500).json({
+      ok,
+      restarted: ok,
+      forcedStart,
+      message: ok
+        ? 'OpenClaw gateway restarted.'
+        : (forcedStart?.error || restart.stderr || restart.error || 'OpenClaw gateway restart failed'),
+      before,
+      after,
+      stdout: restart.stdout.slice(-4000),
+      stderr: restart.stderr.slice(-4000),
+    });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, restarted: false, error: err?.message || 'OpenClaw gateway restart failed' });
   }
 });
 
@@ -2244,10 +2630,20 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
               title,
               preview: previewParts.join(' • '),
               isMainSession: sessionKey === 'agent:main:main',
+              _hasExplicitTitle: Boolean(label),
             });
           }
 
           sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          for (const session of sessions.slice(0, MAIN_SESSION_DERIVED_TITLE_LIMIT)) {
+            if (session._hasExplicitTitle) continue;
+            const derived = deriveSessionLabelFromSessionFile(session.key, session.sessionId, sessionsDir);
+            if (!derived?.title) continue;
+            session.title = derived.title;
+            if (derived.preview) session.preview = derived.preview;
+            if (typeof derived.isMainSession === 'boolean') session.isMainSession = derived.isMainSession;
+          }
+          for (const session of sessions) delete session._hasExplicitTitle;
           mainSessionListCache = { at: Date.now(), mtimeMs: stat.mtimeMs, size: stat.size, sessions };
           res.json({ sessions });
           return;
@@ -2448,26 +2844,80 @@ const TASKS_ROUTE_CACHE_TTL_MS = 10000;
 let tasksRouteCache: { at: number; payload: any } | null = null;
 let tasksRouteInflight: Promise<any> | null = null;
 
-async function fetchTasksSnapshot() {
-  const result = await gatewayRpcCall('sessions.list', {}, 30000);
+function normalizeGatewayTaskStatus(status: unknown, endedAt?: unknown): 'running' | 'done' | 'failed' | 'unknown' {
+  const normalized = typeof status === 'string' ? status.toLowerCase() : '';
+  if (['done', 'completed', 'success', 'succeeded'].includes(normalized)) return 'done';
+  if (['failed', 'error', 'errored', 'cancelled', 'canceled'].includes(normalized)) return 'failed';
+  if (['running', 'active', 'pending', 'queued', 'starting'].includes(normalized)) return 'running';
+  if (endedAt) return 'done';
+  return 'unknown';
+}
 
-  if (!result.ok || !result.data?.sessions) {
-    throw new Error(result.error || 'Gateway unavailable');
+function mapOpenClawLedgerTask(task: any) {
+  const id = String(task?.taskId || task?.id || task?.runId || task?.sourceId || '').trim();
+  if (!id) return null;
+  const kind = String(task?.kind || task?.runtime || '').toLowerCase() || 'task';
+  const status = normalizeGatewayTaskStatus(task?.status, task?.endedAt);
+
+  return {
+    id,
+    name: summarizeTaskText(task?.title ?? task?.name ?? task?.label ?? task?.message ?? id, 120) || id,
+    status,
+    model: normalizeGatewayModelId(task?.model ?? task?.modelId ?? task?.modelProvider) || 'unknown',
+    kind: kind.includes('cron') ? 'cron' : kind.includes('subagent') ? 'subagent' : kind,
+    createdAt: task?.createdAt ?? task?.startedAt,
+    updatedAt: task?.updatedAt ?? task?.endedAt ?? task?.startedAt,
+    duration: task?.runtimeMs ?? (typeof task?.startedAt === 'number' && typeof task?.endedAt === 'number' ? task.endedAt - task.startedAt : undefined),
+    summary: summarizeTaskText(task?.summary ?? task?.terminalSummary ?? task?.finalSummary ?? task?.result),
+    prompt: summarizeTaskText(task?.prompt ?? task?.message ?? task?.title, 240),
+    detail: summarizeTaskText(task?.detail ?? task?.terminalSummary ?? task?.error, 500),
+    parentSession: task?.ownerKey ?? task?.parentSession ?? task?.sessionKey ?? null,
+    error: status === 'failed' ? summarizeTaskText(task?.error ?? task?.terminalSummary ?? 'Task failed') : null,
+  };
+}
+
+function collapseKeyForTaskSession(session: any) {
+  const key = String(session?.key || session?.sessionKey || '');
+  const cronRunMatch = key.match(/^(agent:[^:]+:cron:[^:]+):run:[^:]+$/);
+  if (cronRunMatch) return cronRunMatch[1];
+  return key;
+}
+
+function mapOpenClawTaskSession(session: any) {
+  const status = normalizeGatewayTaskStatus(session.status, session.endedAt);
+  return {
+    id: collapseKeyForTaskSession(session) || session.key || session.sessionKey || session.id || 'unknown',
+    name: session.displayName || session.origin?.label || session.key?.split(':').pop() || 'Task',
+    status,
+    model: normalizeGatewayModelId(session.model) || session.modelProvider || 'unknown',
+    kind: String(session.kind || session.key || session.sessionKey || '').includes('cron') ? 'cron' : 'subagent',
+    createdAt: session.startedAt,
+    updatedAt: session.endedAt || session.updatedAt,
+    duration: session.runtimeMs,
+    summary: pickTaskSummaryCandidate(session),
+    prompt: pickTaskPromptCandidate(session),
+    detail: null,
+    parentSession: session.origin?.from || null,
+    error: status === 'failed' ? summarizeTaskText(session.error || 'Task failed') : null,
+  };
+}
+
+async function fetchTasksSnapshot() {
+  const [sessionsResult, ledgerResult] = await Promise.all([
+    gatewayRpcCall('sessions.list', {}, 30000),
+    gatewayRpcCall('tasks.list', { limit: 100 }, 15000).catch((err: any) => ({ ok: false, error: err?.message || String(err) })),
+  ]);
+
+  if (!sessionsResult.ok || !sessionsResult.data?.sessions) {
+    throw new Error(sessionsResult.error || 'Gateway unavailable');
   }
 
-  const sessions = Array.isArray(result.data.sessions) ? result.data.sessions : [];
+  const sessions = Array.isArray(sessionsResult.data.sessions) ? sessionsResult.data.sessions : [];
   const taskSessions = sessions.filter((s: any) => {
     const key = s.key || s.sessionKey || '';
     const kind = String(s.kind || '').toLowerCase();
     return kind === 'subagent' || kind === 'cron' || key.includes(':subagent:') || key.includes(':cron:');
   });
-
-  const collapseKeyForTaskSession = (session: any) => {
-    const key = String(session?.key || session?.sessionKey || '');
-    const cronRunMatch = key.match(/^(agent:[^:]+:cron:[^:]+):run:[^:]+$/);
-    if (cronRunMatch) return cronRunMatch[1];
-    return key;
-  };
 
   const collapsedTaskSessions = new Map<string, any>();
   for (const session of taskSessions) {
@@ -2490,21 +2940,18 @@ async function fetchTasksSnapshot() {
     }
   }
 
-  const tasks = Array.from(collapsedTaskSessions.values()).map((s: any) => ({
-    id: collapseKeyForTaskSession(s) || s.key || s.sessionKey || s.id || 'unknown',
-    name: s.displayName || s.origin?.label || s.key?.split(':').pop() || 'Task',
-    status: s.status === 'done' ? 'done' : s.status === 'error' ? 'failed' : s.endedAt ? 'done' : 'running',
-    model: normalizeGatewayModelId(s.model) || s.modelProvider || 'unknown',
-    kind: String(s.kind || s.key || s.sessionKey || '').includes('cron') ? 'cron' : 'subagent',
-    createdAt: s.startedAt,
-    updatedAt: s.endedAt || s.updatedAt,
-    duration: s.runtimeMs,
-    summary: pickTaskSummaryCandidate(s),
-    prompt: pickTaskPromptCandidate(s),
-    detail: null,
-    parentSession: s.origin?.from || null,
-    error: s.status === 'error' ? summarizeTaskText(s.error || 'Task failed') : null,
-  }));
+  const tasksById = new Map<string, any>();
+  for (const task of Array.from(collapsedTaskSessions.values()).map(mapOpenClawTaskSession)) {
+    tasksById.set(task.id, task);
+  }
+
+  if (ledgerResult.ok && Array.isArray((ledgerResult as any).data?.tasks)) {
+    for (const task of (ledgerResult as any).data.tasks.map(mapOpenClawLedgerTask).filter(Boolean)) {
+      tasksById.set(task.id, task);
+    }
+  }
+
+  const tasks = Array.from(tasksById.values());
 
   tasks.sort((a: any, b: any) => {
     const aTime = Number(a.updatedAt || a.createdAt || 0);
@@ -2512,7 +2959,13 @@ async function fetchTasksSnapshot() {
     return bTime - aTime;
   });
 
-  return { ok: true, tasks, fetchedAt: new Date().toISOString() };
+  return {
+    ok: true,
+    tasks,
+    fetchedAt: new Date().toISOString(),
+    source: ledgerResult.ok ? 'tasks.list+sessions.list' : 'sessions.list',
+    warning: ledgerResult.ok ? undefined : (ledgerResult as any).error || 'OpenClaw tasks.list unavailable; showing session-derived tasks only',
+  };
 }
 
 // GET /api/gateway/tasks — Query OpenClaw gateway for task/subagent state
@@ -3632,7 +4085,13 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
             res.json({ active: false });
             return;
           }
-          debugLog(`[stream-status] StreamEventBus empty but gateway reports chatState=${chatState} with recent activity — reporting active`);
+          const latestMarker = getLatestMeaningfulConversationMarker(readSessionMessagesEnhancedForSessionKey(sessionKey, 20));
+          if (latestMarker?.role === 'assistant' && (!lastActivity || latestMarker.timestamp >= lastActivity - 30_000)) {
+            debugLog(`[stream-status] Gateway reports chatState=${chatState}, but latest durable meaningful message is assistant at ${new Date(latestMarker.timestamp).toISOString()} — reporting inactive`);
+            res.json({ active: false });
+            return;
+          }
+          debugLog(`[stream-status] StreamEventBus empty but gateway reports chatState=${chatState} with recent activity and latest durable turn is not assistant — reporting active`);
           res.json({
             active: true,
             phase: chatState === 'tool' ? 'tool' : chatState === 'streaming' ? 'streaming' : 'thinking',
@@ -3837,6 +4296,14 @@ function runWsStreamCleanup(ws: WebSocket, sessionKey: string): void {
   if (unsub) { unsub(); map.delete(sessionKey); }
 }
 
+function subscribeBackendToLiveSessionEvents(sessionKey: string): void {
+  const key = typeof sessionKey === 'string' ? sessionKey.trim() : '';
+  if (!key) return;
+  void subscribeGatewaySessionMessages(key).catch((err: any) => {
+    debugLog(`[gateway-ws] live session-message subscribe failed for ${key}: ${err?.message || err}`);
+  });
+}
+
 function attachBrowserWsToSessionStream(params: {
   ws: WebSocket;
   sessionKey: string;
@@ -3922,6 +4389,7 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
 
   try {
     assertGatewaySessionAccess(sessionKey, user, { providerName });
+    if (!providerName || providerName === 'OPENCLAW') subscribeBackendToLiveSessionEvents(sessionKey);
     // Try provider abstraction for non-OpenClaw providers only.
     if (providerName && providerName !== 'OPENCLAW') {
       try {
@@ -4088,6 +4556,7 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
     }, 10000);
 
     if (isOpenClawProvider) {
+      subscribeBackendToLiveSessionEvents(sessionId);
       // ── Single-path streaming via StreamEventBus ──────────────────────
       // OpenClawProvider.sendMessage() sends chat.send via the persistent WS
       // and internally subscribes to StreamEventBus for its own resolution.
@@ -4333,6 +4802,7 @@ function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtP
 
   try {
     if (user) assertGatewaySessionAccess(sessionKey, user);
+    subscribeBackendToLiveSessionEvents(sessionKey);
   } catch (err: any) {
     wsSend(ws, { type: 'error', content: err?.message === 'Admin access required' ? 'Admin access required' : `Reconnect failed: ${err.message}` });
     return;
@@ -4389,14 +4859,22 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
       return;
     }
 
-    // If per-session subscribers exist, they handle forwarding — skip to avoid duplicates.
+    recordMaintenanceHistoryMarker(sessionKey, evt);
+
+    // If per-session subscribers exist, they handle normal forwarding. Maintenance
+    // events are deliberately also sent through the global path so the composer
+    // rail and durable history marker update even when the active stream
+    // subscription is mid-transition or attached to a different handler.
     const hasSubs = streamEventBus.hasSubscribers(sessionKey);
-    if (hasSubs) {
+    const isMaintenanceEvent = evt.type === 'compaction_start'
+      || evt.type === 'compaction_end'
+      || evt.maintenanceKind === 'maintenance';
+    if (hasSubs && !isMaintenanceEvent) {
       return;
     }
 
     // No per-session subscriber: forward the event directly.
-    // This covers compaction events AND regular stream events that arrive
+    // This covers maintenance events AND regular stream events that arrive
     // after a backend restart (before the user re-subscribes).
     if (ws.readyState === WebSocket.OPEN) {
       wsSend(ws, { ...evt, sessionKey });
@@ -4463,6 +4941,8 @@ const ALLOWED_GATEWAY_METHODS = new Set([
   'chat.abort',
   'chat.history',
   'sessions.steer',
+  'sessions.subscribe',
+  'sessions.messages.subscribe',
 ]);
 
 function isDirectGatewayMethodAllowed(method: unknown, user: JwtPayload): boolean {
@@ -4643,14 +5123,13 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       };
 
       const serialized = JSON.stringify(fullFrame);
-      console.log(`[gateway-direct] CONNECT FRAME SENDING: readyState=${gatewayWs.readyState} bufferedAmount=${gatewayWs.bufferedAmount}`);
-      console.log('[gateway-direct] CONNECT FRAME SENT:', serialized.substring(0, 800));
+      debugLog(`[gateway-direct] CONNECT frame forwarding: readyState=${gatewayWs.readyState} bufferedAmount=${gatewayWs.bufferedAmount} id=${stringId} client=${DIRECT_PROXY_CLIENT_ID} scopeCount=${directProxyScopes.length}`);
       try {
         gatewayWs.send(serialized, (err) => {
           if (err) {
             console.error('[gateway-direct] Send callback error:', err.message);
           } else {
-            console.log(`[gateway-direct] CONNECT FRAME CONFIRMED SENT: bufferedAmount=${gatewayWs?.bufferedAmount}`);
+            debugLog(`[gateway-direct] CONNECT frame forwarded: bufferedAmount=${gatewayWs?.bufferedAmount} id=${stringId}`);
           }
         });
       } catch (err: any) {

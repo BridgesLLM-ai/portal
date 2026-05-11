@@ -16,7 +16,8 @@ import { getGatewayToken } from './gatewayToken';
 
 const GATEWAY_WS_URL = getOpenClawWsUrl();
 const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(process.env.HOME || '/root', '.openclaw');
-const PROTOCOL_VERSION = 3;
+const MIN_PROTOCOL_VERSION = 3;
+const MAX_PROTOCOL_VERSION = 4;
 // NOTE: The gateway validates client.id against a fixed schema — only certain values are
 // allowed (e.g. 'gateway-client'). We share the same ID as PersistentGatewayWs, but
 // avoid collision by keeping throwaway connections extremely short-lived and not competing
@@ -127,8 +128,8 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
           }),
           role: GATEWAY_ROLE,
           scopes: GATEWAY_SCOPES,
-          minProtocol: PROTOCOL_VERSION,
-          maxProtocol: PROTOCOL_VERSION,
+          minProtocol: MIN_PROTOCOL_VERSION,
+          maxProtocol: MAX_PROTOCOL_VERSION,
         },
       });
     };
