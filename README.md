@@ -98,6 +98,9 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.14 (May 11, 2026)
+- **Existing Remote Desktop installs repair missing clipboard tools during update**: the updater now runs the Remote Desktop package check before reconfiguring services, so `xclip`/`xsel` are installed on already-deployed servers instead of only on fresh installs.
+
 ### v3.25.13 (May 11, 2026)
 - **Remote Desktop copy/paste is easier to trust**: fresh installs now include the required desktop clipboard tools, and the clipboard panel uses clearer direction-based labels for moving text between your device and the remote desktop.
 - **Mobile app-mode navigation behaves like an address bar**: shared browser and OpenClaw UI URL fields now preserve what you are typing instead of overwriting focused edits during automatic URL sync.

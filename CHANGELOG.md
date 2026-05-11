@@ -2,6 +2,11 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.14] — 2026-05-11
+
+### Fixed
+- **Remote Desktop clipboard tools now repair existing installs during updates**: Remote Desktop setup now idempotently installs missing VNC/XFCE clipboard packages, including `xclip` and `xsel`, even when reached from the update path instead of a fresh install.
+
 ## [3.25.13] — 2026-05-11
 
 ### Fixed

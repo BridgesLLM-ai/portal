@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.13"
+readonly VERSION="3.25.14"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -1250,6 +1250,26 @@ preflight() {
 # Step 2: System packages
 # ═══════════════════════════════════════════════════════════════
 
+ensure_remote_desktop_packages() {
+  # Remote Desktop packages (VNC + XFCE desktop + PulseAudio + X11 clipboard bridge).
+  # Keep this idempotent: update/recovery paths call Remote Desktop setup directly,
+  # so new package requirements must repair existing installs, not just fresh installs.
+  local rd_pkgs=(tigervnc-standalone-server novnc websockify xfce4 xfce4-goodies xfce4-terminal dbus-x11 x11-utils xclip xsel xterm firefox pulseaudio pulseaudio-utils librsvg2-common)
+  local rd_missing=()
+  for pkg in "${rd_pkgs[@]}"; do
+    if ! dpkg -s "$pkg" &>/dev/null; then
+      rd_missing+=("$pkg")
+    fi
+  done
+  if [[ ${#rd_missing[@]} -eq 0 ]]; then
+    ok "Remote Desktop packages"
+  else
+    run "apt-get update -qq"
+    spin_apt "Installing Remote Desktop packages" "${rd_missing[@]}"
+    ok "Remote Desktop packages"
+  fi
+}
+
 install_system_packages() {
   step_header "Installing system packages"
   CURRENT_STEP="system packages"
@@ -1323,21 +1343,7 @@ install_system_packages() {
     ok "Firewall (UFW)"
   fi
 
-  # Remote Desktop packages (VNC + XFCE desktop + PulseAudio)
-  local rd_pkgs=(tigervnc-standalone-server novnc websockify xfce4 xfce4-goodies xfce4-terminal dbus-x11 x11-utils xclip xsel xterm firefox pulseaudio pulseaudio-utils librsvg2-common)
-  local rd_missing=()
-  for pkg in "${rd_pkgs[@]}"; do
-    if ! dpkg -s "$pkg" &>/dev/null; then
-      rd_missing+=("$pkg")
-    fi
-  done
-  if [[ ${#rd_missing[@]} -eq 0 ]]; then
-    ok "Remote Desktop packages"
-  else
-    run "apt-get update -qq"
-    spin_apt "Installing Remote Desktop packages" "${rd_missing[@]}"
-    ok "Remote Desktop packages"
-  fi
+  ensure_remote_desktop_packages
 
   # Desktop themes (Greybird + elementary icons)
   local theme_pkgs=(greybird-gtk-theme elementary-xfce-icon-theme numix-gtk-theme gnome-themes-extra)
@@ -1708,6 +1714,8 @@ setup_remote_desktop() {
   CURRENT_STEP="remote desktop"
 
   $DRY_RUN && { ok "[dry-run] Would configure Remote Desktop"; return; }
+
+  ensure_remote_desktop_packages
 
   local RD_USER="bridgesrd"
   local XDG_DIR="/tmp/bridges-rd-runtime"
