@@ -118,9 +118,9 @@ describe('Path Sandbox', () => {
   // Test 5: Block access to portal directories
   test('blocks access to portal directories', () => {
     const cases = [
-      '/root/bridgesllm-product/frontend/src/App.css',
-      '/root/bridgesllm-product/backend/src/server.ts',
-      '/root/bridgesllm-product/frontend/src/components/Layout.tsx',
+      '/opt/bridgesllm/portal/frontend/src/App.css',
+      '/opt/bridgesllm/portal/backend/src/server.ts',
+      '/opt/bridgesllm/portal/frontend/src/components/Layout.tsx',
       '/root/portal/anything',
     ];
 

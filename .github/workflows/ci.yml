@@ -31,7 +31,7 @@ jobs:
 
       - name: Run backend tests
         working-directory: ./backend
-        run: npm test || true
+        run: npm test
 
       - name: Install frontend dependencies
         working-directory: ./frontend
@@ -39,4 +39,6 @@ jobs:
 
       - name: Build frontend
         working-directory: ./frontend
+        env:
+          VITE_API_URL: /api
         run: npm run build

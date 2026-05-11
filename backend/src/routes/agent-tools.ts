@@ -24,7 +24,7 @@ const DETECTION_TIMEOUT_MS = 3000;
 const DETECTION_CACHE_MS = 60_000;
 const detectionCache = new Map<string, DetectionCacheEntry>();
 
-const JOBS_DIR = path.join(process.env.PORTAL_ROOT || '/root/bridgesllm-product', '.data/jobs');
+const JOBS_DIR = path.join(process.env.PORTAL_ROOT || '/opt/bridgesllm/portal', '.data/jobs');
 fs.mkdirSync(JOBS_DIR, { recursive: true });
 
 const router = Router();

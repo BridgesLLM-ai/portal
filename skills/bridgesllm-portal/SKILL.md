@@ -90,7 +90,7 @@ bash <skill-dir>/scripts/shared-browser.sh evaluate '<js>'         # Run JavaScr
 bash <skill-dir>/scripts/shared-browser.sh launch [url]            # Start Chrome if not running
 ```
 
-Where `<skill-dir>` is the directory containing this SKILL.md file (e.g., `~/.openclaw/workspace-main/skills/bridgesllm-portal`).
+Where `<skill-dir>` is the directory containing this SKILL.md file.
 
 ### When to Use Shared Browser
 
@@ -107,7 +107,7 @@ When debugging portal issues:
 2. **`console`** — read JavaScript errors
 3. **`evaluate 'document.querySelector(...)'`** — inspect DOM state
 4. Read backend logs: `journalctl -u bridgesllm-product -n 50 --no-pager`
-5. Fix source in `/root/bridgesllm-product/` first, not in the deployed runtime tree
+5. Fix source in the source checkout first, not by ad-hoc editing the deployed runtime tree
 6. If validation needs deployment, copy only the validated build output into `/opt/bridgesllm/portal/` deliberately
 7. Build: `cd backend && npm run build` or `cd frontend && npm run build`
 8. Restart only when the backend changed: `systemctl restart bridgesllm-product`

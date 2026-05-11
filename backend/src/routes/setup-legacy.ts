@@ -107,7 +107,7 @@ function generateDnsRecords(domain: string): Array<{ type: string; name: string;
 
   // Try to read saved DKIM record file (safer than shelling out)
   let dkimValue = 'v=DKIM1; k=rsa; p=YOUR_DKIM_PUBLIC_KEY';
-  const dkimRecordPath = path.join(process.env.PORTAL_ROOT || '/root/bridgesllm-product', 'stalwart/dkim-dns-record.txt');
+  const dkimRecordPath = path.join(process.env.PORTAL_ROOT || '/opt/bridgesllm/portal', 'stalwart/dkim-dns-record.txt');
   try {
     if (fs.existsSync(dkimRecordPath)) {
       const saved = fs.readFileSync(dkimRecordPath, 'utf-8').trim();
@@ -127,7 +127,7 @@ function generateDnsRecords(domain: string): Array<{ type: string; name: string;
 // File upload for logo
 const logoStorage = multer.diskStorage({
   destination: (_req, _file, cb) => {
-    const dir = path.join(process.env.PORTAL_ROOT || '/root/bridgesllm-product', 'assets/branding');
+    const dir = path.join(process.env.PORTAL_ROOT || '/opt/bridgesllm/portal', 'assets/branding');
     fs.mkdirSync(dir, { recursive: true });
     cb(null, dir);
   },

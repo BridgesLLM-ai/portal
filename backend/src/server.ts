@@ -364,7 +364,7 @@ app.use('/share', shareRouter);
 // Assets live at INSTALL_ROOT/assets (e.g. /opt/bridgesllm/assets), NOT inside the portal dir.
 // In dev, PORTAL_ROOT is the repo root, so assets/ is alongside backend/.
 const STATIC_ASSETS_ROOT = path.join(
-  process.env.INSTALL_ROOT || process.env.PORTAL_ROOT || '/root/bridgesllm-product',
+  process.env.INSTALL_ROOT || process.env.PORTAL_ROOT || '/opt/bridgesllm/portal',
   'assets'
 );
 app.use('/static-assets', express.static(STATIC_ASSETS_ROOT, {

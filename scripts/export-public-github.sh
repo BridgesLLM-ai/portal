@@ -16,7 +16,8 @@ set -euo pipefail
 # - Scans for sensitive file patterns before staging
 # - Preserves existing remote history (incremental commits, not force-push)
 
-SRC_ROOT="/root/bridgesllm-product"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_ROOT="${SRC_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 TMP_ROOT="/tmp/bridgesllm-public-export"
 DEFAULT_REPO_URL="https://github.com/BridgesLLM-ai/portal.git"
 REPO_URL="$DEFAULT_REPO_URL"
@@ -77,6 +78,7 @@ rsync -a \
   --exclude='assets/avatars' \
   --exclude='assets/branding' \
   --exclude='backup-full.sh' \
+  --exclude='scripts/build-release.sh' \
   --exclude='*.log' \
   --exclude='*.db' \
   --exclude='*.sqlite' \

@@ -30,7 +30,7 @@ type RuntimeJob = {
   child?: ChildProcessWithoutNullStreams;
 };
 
-const JOBS_DIR = path.join(process.env.PORTAL_ROOT || '/root/bridgesllm-product', '.data/jobs');
+const JOBS_DIR = path.join(process.env.PORTAL_ROOT || '/opt/bridgesllm/portal', '.data/jobs');
 fs.mkdirSync(JOBS_DIR, { recursive: true });
 
 const runtimes = new Map<string, RuntimeJob>();

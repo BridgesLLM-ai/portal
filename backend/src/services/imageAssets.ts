@@ -9,7 +9,7 @@ const execFileAsync = promisify(execFile);
 
 // Assets live at INSTALL_ROOT/assets (e.g. /opt/bridgesllm/assets), NOT inside the portal dir.
 export const ASSETS_ROOT = path.join(
-  process.env.INSTALL_ROOT || process.env.PORTAL_ROOT || '/root/bridgesllm-product',
+  process.env.INSTALL_ROOT || process.env.PORTAL_ROOT || '/opt/bridgesllm/portal',
   'assets'
 );
 export const AVATARS_DIR = path.join(ASSETS_ROOT, 'avatars');

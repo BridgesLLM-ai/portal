@@ -19,8 +19,9 @@ describe('oauthFlowManager terminal parsing', () => {
   });
 
   test('extracts Claude setup tokens from screen-normalized PTY output', () => {
-    const raw = 'Done!\r\nsetup token:\r\nsk-ant-oat01-abcdefghijklmnopqrstuvwxyz1234567890+/=\r\n';
-    expect(extractClaudeSetupToken(raw)).toBe('sk-ant-oat01-abcdefghijklmnopqrstuvwxyz1234567890+/=');
+    const fakeToken = ['sk', 'ant', 'oat01', 'abcdefghijklmnopqrstuvwxyz1234567890+/='].join('-');
+    const raw = `Done!\r\nsetup token:\r\n${fakeToken}\r\n`;
+    expect(extractClaudeSetupToken(raw)).toBe(fakeToken);
   });
 
   test('extracts wrapped Claude auth URLs from PTY output', () => {

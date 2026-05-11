@@ -122,7 +122,7 @@ Apps are deployed from projects. The deployment process copies files, installs d
 | Portal env | `/opt/bridgesllm/portal/backend/.env.production` |
 | Caddy config | `/etc/caddy/Caddyfile` |
 | Portal DB | PostgreSQL via `DATABASE_URL` in env |
-| OpenClaw workspace | `/root/.openclaw/workspace-main/` |
+| OpenClaw workspace | Configured OpenClaw workspace directory |
 | OpenClaw config | `/root/.openclaw/openclaw.json` |
 | Portal service | `/etc/systemd/system/bridgesllm-product.service` |
 | VNC service | `/etc/systemd/system/bridges-rd-xtigervnc.service` |

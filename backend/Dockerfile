@@ -24,8 +24,8 @@ COPY package*.json ./
 RUN npm ci
 
 # Git config for auto-commit functionality
-RUN git config --global user.email "marcus@bridgesllm.com" && \
-    git config --global user.name "Marcus AI"
+RUN git config --global user.email "agent@bridgesllm.local" && \
+    git config --global user.name "BridgesLLM Agent"
 
 COPY . .
 

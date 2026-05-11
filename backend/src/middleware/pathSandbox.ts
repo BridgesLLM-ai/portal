@@ -32,7 +32,7 @@ const BLOCKED_PREFIXES = [
 
 // Portal source directories - the primary protection target
 const PORTAL_DIRS = [
-  process.env.PORTAL_ROOT || '/root/bridgesllm-product',
+  process.env.PORTAL_ROOT || '/opt/bridgesllm/portal',
 ];
 
 // Track repeat offenders for escalation

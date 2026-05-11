@@ -256,7 +256,7 @@ router.post('/create', async (req: Request, res: Response) => {
     // All backup types use the same canonical script
     // Map 'comprehensive' → 'weekly' (full backup including node_modules)
     const scriptType = backupType === 'comprehensive' ? 'weekly' : backupType;
-    command = `bash ${process.env.PORTAL_ROOT || '/root/bridgesllm-product'}/backup-full.sh ${scriptType}`;
+    command = `bash ${process.env.PORTAL_ROOT || '/opt/bridgesllm/portal'}/backup-full.sh ${scriptType}`;
 
     // Execute directly on host (portal runs as systemd service, not Docker)
     const child = spawn('bash', ['-c', command], {

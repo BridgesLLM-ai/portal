@@ -15,7 +15,7 @@ const OPENCLAW_SANDBOXES_ROOT = path.join(OPENCLAW_ROOT, 'sandboxes');
 const NATIVE_SESSIONS_ROOT = process.env.PORTAL_NATIVE_AGENT_SESSIONS_DIR
   ? path.resolve(process.env.PORTAL_NATIVE_AGENT_SESSIONS_DIR)
   : path.join(OPENCLAW_ROOT, 'portal-native-agent-sessions');
-const PORTAL_ROOT = process.env.PORTAL_ROOT || '/root/bridgesllm-product';
+const PORTAL_ROOT = process.env.PORTAL_ROOT || '/opt/bridgesllm/portal';
 const AGENT_JOBS_ROOT = path.join(PORTAL_ROOT, '.data', 'jobs');
 const IMAGE_EXTS = new Set(['.gif', '.png', '.jpg', '.jpeg', '.webp']);
 const NATIVE_PROVIDERS = ['claude_code', 'codex', 'gemini', 'ollama', 'agent_zero'] as const;

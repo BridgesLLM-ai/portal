@@ -22,7 +22,7 @@ readonly LOG_DIR="${INSTALL_ROOT}/logs"
 readonly TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 readonly LOG_FILE="${LOG_DIR}/install-${TIMESTAMP}.log"
 readonly RELEASE_URL="https://bridgesllm.ai/portal.tar.gz"
-readonly RELEASE_FALLBACK_DIR="/root/bridgesllm-product"
+readonly RELEASE_FALLBACK_DIR="/opt/bridgesllm/portal"
 
 readonly MIN_RAM_MB=3500
 readonly MIN_DISK_GB=35
