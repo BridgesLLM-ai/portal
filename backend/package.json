@@ -17,7 +17,7 @@
   "dependencies": {
     "@prisma/client": "^5.7.0",
     "@types/archiver": "^7.0.0",
-    "@types/express-session": "^1.18.2",
+    "@types/express-session": "^1.19.0",
     "@types/pdfkit": "^0.17.5",
     "@types/qrcode": "^1.5.6",
     "archiver": "^7.0.1",
