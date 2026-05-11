@@ -57,7 +57,7 @@
     "systeminformation": "^5.21.20",
     "winston": "^3.11.0",
     "zod": "^3.22.4",
-    "prisma": "^5.7.0"
+    "prisma": "^7.8.0"
   },
   "devDependencies": {
     "@types/bcrypt": "^5.0.2",
