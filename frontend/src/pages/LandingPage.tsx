@@ -427,7 +427,7 @@ export default function LandingPage() {
           <div className="flex items-center gap-3">
             <a href="/docs" className="hover:text-slate-100 transition">Docs</a>
             <span className="text-slate-600">|</span>
-            <a href="mailto:support@bridgesllm.ai" className="hover:text-slate-100 transition">Support</a>
+            <a href="mailto:support@bridgesllm.com" className="hover:text-slate-100 transition">Support</a>
           </div>
           <p>© 2026 BridgesLLM</p>
         </div>

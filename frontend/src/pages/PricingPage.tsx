@@ -14,7 +14,7 @@ const tiers = [
     price: '$X',
     subtitle: 'One-time',
     features: ['We install and configure everything', 'Domain + SSL setup', 'Production-ready handoff'],
-    cta: { label: 'Contact Support', href: 'mailto:support@bridgesllm.ai' },
+    cta: { label: 'Contact Support', href: 'mailto:support@bridgesllm.com' },
   },
   {
     name: 'Pro',
