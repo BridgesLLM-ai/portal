@@ -51,7 +51,7 @@
     "puppeteer": "^24.37.3",
     "qrcode": "^1.5.4",
     "rss-parser": "^3.13.0",
-    "sanitize-html": "^2.17.1",
+    "sanitize-html": "^2.17.4",
     "sharp": "^0.34.5",
     "socket.io": "^4.6.0",
     "systeminformation": "^5.21.20",
