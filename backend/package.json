@@ -47,7 +47,7 @@
     "passport-jwt": "^4.0.1",
     "passport-local": "^1.0.0",
     "pdf-parse": "^2.4.5",
-    "pdfkit": "^0.17.2",
+    "pdfkit": "^0.18.0",
     "puppeteer": "^24.37.3",
     "qrcode": "^1.5.4",
     "rss-parser": "^3.13.0",
