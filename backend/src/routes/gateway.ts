@@ -11,7 +11,7 @@ import { listProviderModels } from '../agents/providerModels';
 import { getProviderCommandCatalog } from '../agents/providerCommandCatalog';
 import { resolveExecApproval, ExecApprovalRequest } from '../agents/providers/OpenClawProvider';
 import { appendNativeMessage, loadNativeSession, updateNativeSessionModel } from '../agents/providers/NativeSessionStore';
-import { gatewayRpcCall, patchSessionModel, getSessionInfo, isGatewayTransportError, chatSend, createSession } from '../utils/openclawGatewayRpc';
+import { gatewayRpcCall, patchSessionModel, getSessionInfo, isGatewayTransportError, chatSend, createSession, listGatewayModels } from '../utils/openclawGatewayRpc';
 import {
   sendApprovalDecision,
   injectChatMessage,
@@ -24,7 +24,15 @@ import {
   type ExecApprovalRequest as PersistentApprovalRequest,
   type ExecApprovalResolved,
 } from '../agents/providers/PersistentGatewayWs';
+import {
+  onNativeCliApprovalRequest,
+  onNativeCliApprovalResolved,
+  resolveNativeCliApproval,
+  type NativeCliApprovalDecision,
+} from '../agents/nativeCliApprovals';
 import { streamEventBus, type StreamEvent } from '../services/StreamEventBus';
+import { readRuntimeTurnEvents } from '../services/RuntimeTurnEventHistory';
+import type { RuntimeTurnEvent } from '../services/RuntimeTurnEvents';
 import { verifyAccessToken, JwtPayload } from '../utils/jwt';
 import { buildSignedDevice, getOrCreateDeviceKeys } from '../utils/deviceIdentity';
 import { prisma } from '../config/database';
@@ -40,7 +48,7 @@ import { canAccessPortal, canUseInteractivePortal, isElevatedRole, isOwnerRole }
 import { hasGatewayToken, getGatewayToken } from '../utils/gatewayToken';
 import { getOpenClawWsUrl } from '../config/openclaw';
 import { isAllowedWebSocketOrigin } from '../utils/websocketOrigin';
-import { buildOpenClawCliEnv, normalizePortalModelId } from '../utils/openclawCli';
+import { buildOpenClawCliEnv, canonicalizeProviderModelId, modelForOpenClawSessionPatch, normalizePortalModelId, resolvePortalModelFromCatalog } from '../utils/openclawCli';
 // @ts-ignore - ws doesn't have type declarations in this project
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server as HttpServer, IncomingMessage } from 'http';
@@ -153,7 +161,7 @@ async function waitForGatewayVersionClear(timeoutMs = 12000) {
   let last: any = null;
   while (Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 1000));
-    last = await getOpenClawVersionStatus().catch((err: any) => ({
+    last = await getOpenClawVersionStatus({ force: true }).catch((err: any) => ({
       installedVersion: null,
       runningVersion: null,
       latestVersion: null,
@@ -199,7 +207,49 @@ function getGatewayListenerProcess(): { pid: number | null; startedAt: string | 
   }
 }
 
-async function getOpenClawVersionStatus() {
+interface OpenClawVersionStatus {
+  installedVersion: string | null;
+  runningVersion: string | null;
+  latestVersion: string | null;
+  updateChannel: string | null;
+  mismatch: boolean;
+  restartRecommended: boolean;
+  reason: string | null;
+  listenerPid: number | null;
+  listenerStartedAt: string | null;
+  installedPackageMtime: string | null;
+  probeOk: boolean;
+  probeError: string | null;
+  checkedAt?: string;
+  cached?: boolean;
+  lightweight?: boolean;
+}
+
+const OPENCLAW_VERSION_STATUS_TTL_MS = Number(process.env.PORTAL_OPENCLAW_VERSION_STATUS_TTL_MS || 5 * 60 * 1000);
+let openClawVersionStatusCache: { status: OpenClawVersionStatus; checkedAtMs: number } | null = null;
+let openClawVersionStatusProbe: Promise<OpenClawVersionStatus> | null = null;
+
+function getLightweightOpenClawVersionStatus(reason: string | null = null): OpenClawVersionStatus {
+  const listener = getGatewayListenerProcess();
+  return {
+    installedVersion: null,
+    runningVersion: null,
+    latestVersion: null,
+    updateChannel: null,
+    mismatch: false,
+    restartRecommended: false,
+    reason,
+    listenerPid: listener.pid,
+    listenerStartedAt: listener.startedAt,
+    installedPackageMtime: null,
+    probeOk: true,
+    probeError: null,
+    checkedAt: new Date().toISOString(),
+    lightweight: true,
+  };
+}
+
+async function probeOpenClawVersionStatus(): Promise<OpenClawVersionStatus> {
   const [cliVersionResult, updateStatusResult, probeResult] = await Promise.all([
     runOpenClawCli(['--version'], 4000),
     runOpenClawCli(['update', 'status', '--json', '--timeout', '3'], 9000),
@@ -245,7 +295,49 @@ async function getOpenClawVersionStatus() {
     installedPackageMtime,
     probeOk: Boolean(probe?.ok),
     probeError,
+    checkedAt: new Date().toISOString(),
   };
+}
+
+async function getOpenClawVersionStatus(options: { force?: boolean } = {}): Promise<OpenClawVersionStatus> {
+  const now = Date.now();
+  const force = options.force === true;
+  const cacheFresh = openClawVersionStatusCache && now - openClawVersionStatusCache.checkedAtMs < OPENCLAW_VERSION_STATUS_TTL_MS;
+
+  if (!force && cacheFresh) {
+    return { ...openClawVersionStatusCache!.status, cached: true };
+  }
+
+  // Operator kill-switch: dashboard health stays cheap, but explicit admin
+  // actions can still force a probe/restart path when they need ground truth.
+  if (!force && process.env.PORTAL_DISABLE_OPENCLAW_CLI_STATUS === '1') {
+    return getLightweightOpenClawVersionStatus('OpenClaw CLI status probe disabled by PORTAL_DISABLE_OPENCLAW_CLI_STATUS=1.');
+  }
+
+  if (openClawVersionStatusProbe) {
+    if (force) return openClawVersionStatusProbe;
+    return openClawVersionStatusCache
+      ? { ...openClawVersionStatusCache.status, cached: true }
+      : getLightweightOpenClawVersionStatus('OpenClaw version probe already running.');
+  }
+
+  openClawVersionStatusProbe = probeOpenClawVersionStatus()
+    .then(status => {
+      openClawVersionStatusCache = { status, checkedAtMs: Date.now() };
+      return status;
+    })
+    .finally(() => {
+      openClawVersionStatusProbe = null;
+    });
+
+  if (force) return openClawVersionStatusProbe;
+
+  // Do not make /api/gateway/health wait on OpenClaw CLI/update probes. The
+  // Dashboard polls this route, and previous synchronous probes were enough to
+  // saturate small VPSes when OpenClaw was already unhealthy.
+  return openClawVersionStatusCache
+    ? { ...openClawVersionStatusCache.status, cached: true }
+    : getLightweightOpenClawVersionStatus('OpenClaw version probe scheduled.');
 }
 
 let geminiCliTranscriptIndexCache: { at: number; index: Map<string, string> } | null = null;
@@ -542,6 +634,40 @@ function normalizeGatewayModelId(rawModel: unknown): string | undefined {
   }
 
   return undefined;
+}
+
+function normalizeGatewayModelCatalogIds(rawModels: unknown): string[] {
+  if (!Array.isArray(rawModels)) return [];
+  const ids = new Set<string>();
+  for (const model of rawModels) {
+    const direct = normalizeGatewayModelId(model);
+    const provider = model && typeof model === 'object' && typeof (model as any).provider === 'string'
+      ? (model as any).provider.trim()
+      : '';
+    const rawId = model && typeof model === 'object'
+      ? String((model as any).id || (model as any).name || (model as any).model || '').trim()
+      : String(model || '').trim();
+    const canonical = canonicalizeProviderModelId(provider, rawId || direct || '');
+    const normalizedDirect = normalizePortalModelId(direct || rawId);
+    if (canonical) ids.add(canonical);
+    if (normalizedDirect) ids.add(normalizedDirect);
+  }
+  return Array.from(ids);
+}
+
+async function resolveOpenClawPatchModel(rawModel: string): Promise<string> {
+  const normalized = normalizePortalModelId(rawModel);
+  if (!normalized) return '';
+  try {
+    const live = await listGatewayModels();
+    if (live.ok) {
+      const resolved = resolvePortalModelFromCatalog(normalized, normalizeGatewayModelCatalogIds(live.models));
+      if (resolved) return resolved;
+    }
+  } catch {
+    // If the live catalog is unavailable, fall back to the normalized request.
+  }
+  return normalized;
 }
 
 function isSandboxProjectAgentIdForUser(agentId: string, user: JwtPayload): boolean {
@@ -850,6 +976,29 @@ function mergeMaintenanceHistoryMarkers(sessionKey: string, messages: any[], lim
 
 function sanitizeHistoryText(text: string): string {
   return stripOpenClawReplyTags(stripEnvelope(text || '')).replace(/\r\n/g, '\n').trim();
+}
+
+function stripReasoningMirrorPrefix(text: string): string {
+  return sanitizeHistoryText(text || '')
+    .replace(/^\s*(?:Codex|OpenClaw) reasoning:\s*/i, '')
+    .trim();
+}
+
+function isReasoningMirrorHistoryMessage(message: any, text?: string): boolean {
+  if (!message || typeof message !== 'object') return false;
+  const meta = (message.__openclaw && typeof message.__openclaw === 'object' ? message.__openclaw : null)
+    || (message.metadata?.__openclaw && typeof message.metadata.__openclaw === 'object' ? message.metadata.__openclaw : null);
+  const mirrorIdentity = typeof meta?.mirrorIdentity === 'string' ? meta.mirrorIdentity : '';
+  if (/:reasoning$/i.test(mirrorIdentity)) return true;
+  const idempotencyKey = typeof message.idempotencyKey === 'string' ? message.idempotencyKey : '';
+  if (/:reasoning(?:$|:)/i.test(idempotencyKey)) return true;
+  const candidate = typeof text === 'string' ? text : extractText(message.content ?? message.text ?? '');
+  return /^\s*(?:Codex|OpenClaw) reasoning:\s*/i.test(candidate || '');
+}
+
+function extractReasoningMirrorHistoryText(message: any, text?: string): string {
+  if (!isReasoningMirrorHistoryMessage(message, text)) return '';
+  return stripReasoningMirrorPrefix(typeof text === 'string' ? text : extractText(message.content ?? message.text ?? ''));
 }
 
 function normalizeGeminiModelId(rawModel: unknown): string | undefined {
@@ -1240,34 +1389,316 @@ function getLatestMeaningfulConversationMarker(messages: any[]): { role: 'user' 
   return latest;
 }
 
+function normalizeRuntimeHistoryMatchText(text: unknown): string {
+  return sanitizeHistoryText(typeof text === 'string' ? text : '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function mergeRuntimeText(current: string, incoming: string, replace?: boolean): string {
+  const chunk = sanitizeHistoryText(incoming || '');
+  if (!chunk) return current;
+  if (replace || !current) return chunk;
+  if (chunk === current || current.includes(chunk)) return current;
+  if (chunk.startsWith(current)) return chunk;
+
+  const minOverlap = 8;
+  const maxOverlap = Math.min(current.length, chunk.length);
+  for (let overlap = maxOverlap; overlap >= minOverlap; overlap -= 1) {
+    if (current.slice(-overlap) === chunk.slice(0, overlap)) {
+      return current + chunk.slice(overlap);
+    }
+  }
+  return `${current}\n${chunk}`.trim();
+}
+
+type RuntimeHistorySegment = {
+  text: string;
+  position: 'before' | 'after' | 'between';
+  kind: 'thinking' | 'text';
+  ts: number;
+  order: number;
+};
+
+type RuntimeHistoryToolCall = {
+  id: string;
+  name: string;
+  arguments?: unknown;
+  result?: string;
+  startedAt: number;
+  endedAt?: number;
+  status: 'running' | 'done' | 'error';
+  order: number;
+};
+
+function runtimeTurnEventGroupKey(event: RuntimeTurnEvent, fallbackIndex: number): string {
+  const runId = typeof event.runId === 'string' && event.runId.trim() ? event.runId.trim() : '';
+  if (runId) return runId;
+  return `runtime-${Math.floor((event.ts || Date.now()) / 300000)}-${fallbackIndex}`;
+}
+
+function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
+  if (!Array.isArray(events) || events.length === 0) return [];
+
+  const groups: Array<{ key: string; events: RuntimeTurnEvent[]; terminal: boolean }> = [];
+  let current: { key: string; events: RuntimeTurnEvent[]; terminal: boolean } | null = null;
+
+  for (const event of [...events].sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq))) {
+    if (!event || event.schema !== 'bridgesllm.runtime-turn-event.v1') continue;
+    const key = runtimeTurnEventGroupKey(event, groups.length);
+    if (!current || current.terminal || current.key !== key) {
+      current = { key, events: [], terminal: false };
+      groups.push(current);
+    }
+    current.events.push(event);
+    if (event.terminal) current.terminal = true;
+  }
+
+  return groups.flatMap((group) => {
+    const timeline: Array<{ kind: 'segment'; segment: RuntimeHistorySegment } | { kind: 'tool'; tool: RuntimeHistoryToolCall }> = [];
+    const toolsByKey = new Map<string, RuntimeHistoryToolCall>();
+    let finalText = '';
+    let model: string | undefined;
+    let provenance: string | undefined;
+    let lastTs = 0;
+
+    const appendSegment = (kind: 'thinking' | 'text', text: string, ts: number, replace?: boolean) => {
+      const value = sanitizeHistoryText(text || '');
+      if (!value || isHiddenHistoryArtifactText(value)) return;
+      const last = timeline[timeline.length - 1];
+      if (replace && last?.kind === 'segment' && last.segment.kind === kind) {
+        last.segment.text = value;
+        last.segment.ts = ts;
+        return;
+      }
+      timeline.push({
+        kind: 'segment',
+        segment: {
+          text: value,
+          position: 'before',
+          kind,
+          ts,
+          order: timeline.length,
+        },
+      });
+    };
+
+    const upsertTool = (event: RuntimeTurnEvent) => {
+      const rawName = typeof event.tool?.name === 'string' ? event.tool.name.trim() : '';
+      if (!rawName) return;
+      const eventStatus = event.tool?.status === 'error'
+        ? 'error'
+        : event.tool?.status === 'running'
+          ? 'running'
+          : event.type === 'tool_output'
+            ? 'done'
+            : 'running';
+      const key = typeof event.tool?.id === 'string' && event.tool.id.trim()
+        ? event.tool.id.trim()
+        : `${rawName}:${toolsByKey.size}`;
+      const existing = toolsByKey.get(key);
+      if (existing) {
+        existing.arguments = existing.arguments ?? event.tool?.arguments;
+        existing.result = typeof event.tool?.result === 'string' ? event.tool.result : existing.result;
+        existing.endedAt = eventStatus === 'running' ? existing.endedAt : event.ts;
+        existing.status = eventStatus;
+        return;
+      }
+      const tool: RuntimeHistoryToolCall = {
+        id: key,
+        name: rawName,
+        arguments: event.tool?.arguments,
+        result: typeof event.tool?.result === 'string' ? event.tool.result : undefined,
+        startedAt: event.ts,
+        endedAt: eventStatus === 'running' ? undefined : event.ts,
+        status: eventStatus,
+        order: timeline.length,
+      };
+      toolsByKey.set(key, tool);
+      timeline.push({ kind: 'tool', tool });
+    };
+
+    for (const event of group.events) {
+      lastTs = Math.max(lastTs, event.ts || 0);
+      if (typeof event.model === 'string' && event.model.trim()) model = event.model.trim();
+      if (typeof event.provenance === 'string' && event.provenance.trim()) provenance = event.provenance.trim();
+
+      if (event.type === 'assistant_reasoning') {
+        appendSegment('thinking', event.text || '', event.ts, event.replace === true);
+      } else if (event.type === 'tool_started' || event.type === 'tool_output') {
+        upsertTool(event);
+      } else if (event.type === 'assistant_delta') {
+        finalText = mergeRuntimeText(finalText, event.text || '', event.replace === true);
+      } else if (event.type === 'assistant_final') {
+        finalText = mergeRuntimeText(finalText, event.text || '', event.replace === true);
+      } else if (event.type === 'turn_error' && !finalText) {
+        finalText = sanitizeHistoryText(event.text || '');
+      }
+    }
+
+    const segments = timeline
+      .filter((item): item is { kind: 'segment'; segment: RuntimeHistorySegment } => item.kind === 'segment')
+      .map((item, index) => ({ ...item.segment, order: index }));
+    const toolCalls = [...toolsByKey.values()].map((tool) => ({
+      ...tool,
+      status: tool.status === 'running' ? 'done' : tool.status,
+      endedAt: tool.endedAt ?? lastTs,
+    }));
+
+    const content = sanitizeHistoryText(finalText || '');
+    if (!content && segments.length === 0 && toolCalls.length === 0) return [];
+
+    const timestamp = new Date(lastTs || Date.now()).toISOString();
+    const id = `runtime-turn-${createHash('sha256').update(`${group.key}:${timestamp}:${content}`).digest('hex').slice(0, 24)}`;
+    return [{
+      id,
+      role: 'assistant',
+      content,
+      timestamp,
+      model,
+      provenance: provenance || 'runtime-turn-event-history',
+      toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+      segments: segments.length > 0 ? segments : undefined,
+      __portal: { kind: 'runtime-turn-event-history', runId: group.key },
+    }];
+  });
+}
+
+function mergeRuntimeTurnEventHistory(sessionKey: string, messages: any[], limit = 200): any[] {
+  const runtimeMessages = buildRuntimeHistoryMessages(readRuntimeTurnEvents(sessionKey, Math.max(limit * 250, 25000)));
+  if (runtimeMessages.length === 0) return messages;
+
+  const combined = messages.map((message) => ({ ...message }));
+  const findMatchingAssistantIndex = (runtimeMessage: any): number => {
+    const runtimeText = normalizeRuntimeHistoryMatchText(runtimeMessage?.content);
+    const runtimeTs = toHistoryTimestampMs(runtimeMessage?.timestamp);
+    let fallbackIndex = -1;
+    let fallbackDistance = Number.POSITIVE_INFINITY;
+
+    for (let index = 0; index < combined.length; index += 1) {
+      const candidate = combined[index];
+      if (candidate?.role !== 'assistant') continue;
+      const candidateText = normalizeRuntimeHistoryMatchText(candidate?.content);
+      const candidateTs = toHistoryTimestampMs(candidate?.timestamp);
+      const distance = runtimeTs && candidateTs ? Math.abs(runtimeTs - candidateTs) : Number.POSITIVE_INFINITY;
+
+      if (runtimeText && candidateText && runtimeText === candidateText) return index;
+      if (runtimeText && candidateText && (runtimeText.includes(candidateText) || candidateText.includes(runtimeText)) && distance < fallbackDistance) {
+        fallbackIndex = index;
+        fallbackDistance = distance;
+      } else if (!runtimeText && distance < 5 * 60 * 1000 && distance < fallbackDistance) {
+        fallbackIndex = index;
+        fallbackDistance = distance;
+      }
+    }
+
+    return fallbackIndex;
+  };
+
+  for (const runtimeMessage of runtimeMessages) {
+    const matchIndex = findMatchingAssistantIndex(runtimeMessage);
+    if (matchIndex >= 0) {
+      const existing = combined[matchIndex];
+      const existingSegments = Array.isArray(existing.segments) ? existing.segments : [];
+      const runtimeSegments = Array.isArray(runtimeMessage.segments) ? runtimeMessage.segments : [];
+      const existingTools = Array.isArray(existing.toolCalls) ? existing.toolCalls : [];
+      const runtimeTools = Array.isArray(runtimeMessage.toolCalls) ? runtimeMessage.toolCalls : [];
+      combined[matchIndex] = {
+        ...existing,
+        model: existing.model || runtimeMessage.model,
+        provenance: existing.provenance || runtimeMessage.provenance,
+        segments: existingSegments.length > 0 ? existingSegments : (runtimeSegments.length > 0 ? runtimeSegments : existing.segments),
+        toolCalls: existingTools.length > 0 ? existingTools : (runtimeTools.length > 0 ? runtimeTools : existing.toolCalls),
+      };
+      continue;
+    }
+
+    combined.push(runtimeMessage);
+  }
+
+  const seen = new Set<string>();
+  return combined
+    .filter((message, index, all) => !isDuplicateToolOnlyAssistantHistoryMessage(message, index, all))
+    .filter((message) => {
+      const id = typeof message?.id === 'string' ? message.id : '';
+      const key = id || `${message?.role}:${message?.timestamp}:${normalizeRuntimeHistoryMatchText(message?.content)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp))
+    .slice(-Math.max(limit, 1));
+}
+
+function getHistoryToolIds(message: any): string[] {
+  return (Array.isArray(message?.toolCalls) ? message.toolCalls : [])
+    .map((tool: any) => (typeof tool?.id === 'string' ? tool.id.trim() : ''))
+    .filter(Boolean);
+}
+
+function isToolOnlyAssistantHistoryMessage(message: any): boolean {
+  if (!message || message.role !== 'assistant') return false;
+  const content = typeof message.content === 'string' ? message.content.trim() : '';
+  const hasThinking = typeof message.thinkingContent === 'string' && message.thinkingContent.trim().length > 0;
+  const hasSegments = Array.isArray(message.segments) && message.segments.length > 0;
+  const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+  return !content && !hasThinking && !hasSegments && toolCalls.length > 0;
+}
+
+function isDuplicateToolOnlyAssistantHistoryMessage(message: any, index: number, messages: any[]): boolean {
+  if (!isToolOnlyAssistantHistoryMessage(message)) return false;
+  const toolIds = getHistoryToolIds(message);
+  if (toolIds.length === 0) return false;
+
+  return messages.some((candidate, candidateIndex) => {
+    if (candidateIndex === index || candidate?.role !== 'assistant') return false;
+    if (isToolOnlyAssistantHistoryMessage(candidate)) return false;
+
+    const candidateToolIds = new Set(getHistoryToolIds(candidate));
+    if (candidateToolIds.size === 0) return false;
+    return toolIds.every((toolId) => candidateToolIds.has(toolId));
+  });
+}
+
+function finalizeEnhancedHistoryMessages(sessionKey: string, messages: any[], limit = 200): any[] {
+  const mergeLimit = Math.max(limit * 250, 25000);
+  return mergeRuntimeTurnEventHistory(
+    sessionKey,
+    mergeMaintenanceHistoryMarkers(sessionKey, messages, mergeLimit),
+    limit,
+  );
+}
+
 function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
-  const localMessages = readBestOpenClawSessionMessagesForSessionKey(sessionKey, limit, sessionsDir);
+  const readLimit = Math.max(limit * 250, 25000);
+  const localMessages = readBestOpenClawSessionMessagesForSessionKey(sessionKey, readLimit, sessionsDir);
 
   const geminiCliSessionIds = resolveSessionRegistryEntries(sessionKey, sessionsDir)
     .map((entry) => resolveGeminiCliBindingSessionId(entry))
     .filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
-  if (geminiCliSessionIds.length === 0) return mergeMaintenanceHistoryMarkers(sessionKey, localMessages, limit);
+  if (geminiCliSessionIds.length === 0) return finalizeEnhancedHistoryMessages(sessionKey, localMessages, limit);
 
   const importedMessages = geminiCliSessionIds
-    .flatMap((cliSessionId) => readGeminiCliImportedMessages(cliSessionId, limit))
+    .flatMap((cliSessionId) => readGeminiCliImportedMessages(cliSessionId, readLimit))
     .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp))
-    .slice(-Math.max(limit, 1));
-  if (importedMessages.length === 0) return mergeMaintenanceHistoryMarkers(sessionKey, localMessages, limit);
+    .slice(-Math.max(readLimit, 1));
+  if (importedMessages.length === 0) return finalizeEnhancedHistoryMessages(sessionKey, localMessages, limit);
 
   const localLatestTimestamp = getLatestMeaningfulConversationTimestamp(localMessages);
   if (!hasMeaningfulConversationTurns(localMessages) || !localLatestTimestamp) {
     const combined = [...localMessages, ...importedMessages]
       .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
-    return mergeMaintenanceHistoryMarkers(sessionKey, combined.slice(-Math.max(limit, 1)), limit);
+    return finalizeEnhancedHistoryMessages(sessionKey, combined.slice(-Math.max(readLimit, 1)), limit);
   }
 
   const importedTail = importedMessages.filter((message) => toHistoryTimestampMs(message?.timestamp) > localLatestTimestamp);
-  if (importedTail.length === 0) return mergeMaintenanceHistoryMarkers(sessionKey, localMessages, limit);
+  if (importedTail.length === 0) return finalizeEnhancedHistoryMessages(sessionKey, localMessages, limit);
 
   const combined = [...localMessages, ...importedTail]
     .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
 
-  return mergeMaintenanceHistoryMarkers(sessionKey, combined.slice(-Math.max(limit, 1)), limit);
+  return finalizeEnhancedHistoryMessages(sessionKey, combined.slice(-Math.max(readLimit, 1)), limit);
 }
 
 async function recoverRecentOpenClawAssistantReply(
@@ -1366,6 +1797,78 @@ function isHiddenHistoryArtifactText(text: string): boolean {
     /Sender \(untrusted metadata\):/i,
     /Conversation info \(untrusted metadata\):/i,
   ].some((pattern) => pattern.test(normalized));
+}
+
+function isDeliveryStatusArtifactText(text: string): boolean {
+  const normalized = String(text || '').trim();
+  if (!normalized) return false;
+  return [
+    /^sent (?:the |a |an )?.{1,180}(?:recommendations|recipe|recipes|code|answer|response|reply|message|summary|details|instructions|analysis|report|results|update)s?\.?$/i,
+    /^sent\b.{0,260}\.?$/i,
+    /^sent message to (?:web ?chat|current(?: chat| run)?|the user)\.?$/i,
+    /^message sent(?: to (?:web ?chat|current(?: chat| run)?|the user))?\.?$/i,
+    /^answered in (?:the )?web ?chat(?:\b.*)?\.?$/i,
+    /^reported .{1,180} in (?:the )?web ?chat\.?$/i,
+    /^elaborated in (?:the )?web ?chat(?:\b.*)?\.?$/i,
+  ].some((pattern) => pattern.test(normalized));
+}
+
+function stripMessageDeliveryArtifactsFromHistory(messages: any[]): any[] {
+  return messages.flatMap((message) => {
+    if (!message || message.role !== 'assistant') return [message];
+
+    const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+    const nonMessageToolCalls = toolCalls.filter((tool: any) => String(tool?.name || '').trim().toLowerCase() !== 'message');
+    const messageToolCount = toolCalls.length - nonMessageToolCalls.length;
+    const content = typeof message.content === 'string' ? message.content.trim() : '';
+    const hasThinking = typeof message.thinkingContent === 'string' && message.thinkingContent.trim();
+    const hasSegments = Array.isArray(message.segments) && message.segments.length > 0;
+
+    if (messageToolCount === 0) {
+      return !hasThinking && !hasSegments && isDeliveryStatusArtifactText(content) ? [] : [message];
+    }
+
+    if (nonMessageToolCalls.length === 0) {
+      // The OpenClaw `message` tool is delivery plumbing for webchat; its result
+      // often becomes transcript noise like "Sent message to Web chat". Do not
+      // render it as an assistant turn or tool pill in portal history.
+      if (!hasThinking && !hasSegments) return [];
+      return [{ ...message, toolCalls: undefined, content: isDeliveryStatusArtifactText(content) ? '' : content }];
+    }
+
+    return [{
+      ...message,
+      toolCalls: nonMessageToolCalls,
+      content: isDeliveryStatusArtifactText(content) ? '' : message.content,
+    }];
+  });
+}
+
+function extractReadableReasoningSummary(payload: any): string {
+  const parts: string[] = [];
+  const collect = (value: any) => {
+    if (!value) return;
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) parts.push(trimmed);
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(collect);
+      return;
+    }
+    if (typeof value === 'object') {
+      collect(value.text ?? value.content ?? value.summary ?? value.description);
+    }
+  };
+
+  collect(payload?.summary);
+  collect(payload?.item?.summary);
+  collect(payload?.text);
+  collect(payload?.item?.text);
+  // Intentionally do not read encrypted_content. If OpenClaw only stored private
+  // encrypted reasoning with no summary, there is nothing displayable here.
+  return extractSanitizedText(parts.join('\n\n'));
 }
 
 function summarizeHiddenHistoryArtifactText(text: string): string | null {
@@ -1735,7 +2238,20 @@ async function readSessionMessages(sessionId: string, limit = 100, sessionsDir =
         if (role !== 'user' && role !== 'assistant') return null;
         const text = extractText(entry.message.content);
         if (!text) return null;
-        if (role === 'assistant' && isControlOnlyAssistantText(text)) return null;
+        if (role === 'assistant') {
+          const reasoningMirrorText = extractReasoningMirrorHistoryText(entry.message, text);
+          if (reasoningMirrorText && !isHiddenHistoryArtifactText(reasoningMirrorText)) {
+            return {
+              id: entry.id,
+              role: 'assistant',
+              content: '',
+              thinkingContent: reasoningMirrorText,
+              timestamp: entry.timestamp,
+              provenance: 'reasoning-mirror',
+            };
+          }
+          if (isControlOnlyAssistantText(text)) return null;
+        }
         return { id: entry.id, role, content: text, timestamp: entry.timestamp };
       } catch {
         return null;
@@ -1743,6 +2259,15 @@ async function readSessionMessages(sessionId: string, limit = 100, sessionsDir =
     },
   });
 }
+
+// Narrow test surface for legacy history compatibility. Keep private helpers
+// private; export only the behavior the /api/gateway/history legacy path uses.
+export const __gatewayHistoryTest = {
+  readSessionMessages,
+  readSessionMessagesEnhanced,
+  readSessionMessagesEnhancedForSessionKey,
+  readBestOpenClawSessionMessagesForSessionKey,
+};
 
 /**
  * Enhanced history reader — includes tool calls and tool results from JSONL.
@@ -1755,6 +2280,18 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
     parseLine: (line) => {
       try {
         const entry = JSON.parse(line);
+        if (entry.type === 'response_item' && entry.payload?.type === 'reasoning') {
+          const thinkingContent = extractReadableReasoningSummary(entry.payload);
+          if (!thinkingContent || isHiddenHistoryArtifactText(thinkingContent)) return null;
+          return {
+            id: entry.id || `reasoning-${entry.timestamp || Date.now()}`,
+            role: 'assistant',
+            content: '',
+            thinkingContent,
+            timestamp: entry.timestamp,
+            provenance: 'reasoning-summary',
+          };
+        }
         if (entry.type === 'compaction') {
           const compactionMeta = typeof entry.__openclaw === 'object' && entry.__openclaw
             ? entry.__openclaw
@@ -1822,12 +2359,18 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
           if (Array.isArray(content)) {
             const toolCalls: any[] = [];
             const thinkingBlocks: string[] = [];
+            const messageIsReasoningMirror = isReasoningMirrorHistoryMessage(entry.message);
             // Track text blocks and where tool calls appear so we can separate
             // narration (text before tools) from the final response (text after tools).
             const allBlocks: { type: 'text' | 'tool'; text?: string }[] = [];
             for (const block of content) {
               if (block.type === 'text' && block.text) {
-                allBlocks.push({ type: 'text', text: block.text });
+                if (messageIsReasoningMirror || isReasoningMirrorHistoryMessage(entry.message, block.text)) {
+                  const reasoningText = extractReasoningMirrorHistoryText(entry.message, block.text);
+                  if (reasoningText) thinkingBlocks.push(reasoningText);
+                } else {
+                  allBlocks.push({ type: 'text', text: block.text });
+                }
               } else if (block.type === 'thinking' && (typeof block.thinking === 'string' || typeof block.text === 'string')) {
                 thinkingBlocks.push(typeof block.thinking === 'string' ? block.thinking : block.text);
               } else if (block.type === 'toolCall' && block.name) {
@@ -1883,6 +2426,18 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
           }
 
           const text = extractText(content);
+          const reasoningMirrorText = extractReasoningMirrorHistoryText(entry.message, text);
+          if (reasoningMirrorText && !isHiddenHistoryArtifactText(reasoningMirrorText)) {
+            return {
+              id: entry.id,
+              role: 'assistant',
+              content: '',
+              model: executedModel,
+              thinkingContent: reasoningMirrorText,
+              timestamp: entry.timestamp,
+              provenance: 'reasoning-mirror',
+            };
+          }
           if (!text || isControlOnlyAssistantText(text) || isHiddenHistoryArtifactText(text)) return null;
           return { id: entry.id, role: 'assistant', content: text, model: executedModel, timestamp: entry.timestamp };
         }
@@ -1905,7 +2460,7 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
     },
   });
 
-  return hydrateHistoryToolCalls(messages);
+  return stripMessageDeliveryArtifactsFromHistory(hydrateHistoryToolCalls(messages));
 }
 
 function toHistoryTimestampMs(value: unknown): number {
@@ -1915,6 +2470,13 @@ function toHistoryTimestampMs(value: unknown): number {
     if (Number.isFinite(parsed)) return parsed;
   }
   return Date.now();
+}
+
+function findHistoryToolResultMatchIndex(toolCalls: any[], toolResult: any): number {
+  return toolCalls.findIndex((toolCall: any) => {
+    if (!toolCall || typeof toolCall !== 'object') return false;
+    return Boolean(toolResult?.toolCallId && toolCall.id === toolResult.toolCallId);
+  });
 }
 
 function buildHistoryToolCallFromResult(toolResult: any, fallbackBaseId: string, index: number) {
@@ -1943,14 +2505,7 @@ function mergePendingToolResultsIntoAssistant(assistant: any, pendingToolResults
   for (let index = 0; index < pendingToolResults.length; index += 1) {
     const toolResult = pendingToolResults[index];
     const synthesized = buildHistoryToolCallFromResult(toolResult, fallbackBaseId, index);
-
-    const matchIndex = existingToolCalls.findIndex((toolCall: any) => {
-      if (!toolCall || typeof toolCall !== 'object') return false;
-      if (toolResult?.toolCallId && toolCall.id === toolResult.toolCallId) return true;
-      return toolResult?.toolName
-        && toolCall.name === toolResult.toolName
-        && !toolCall.result;
-    });
+    const matchIndex = findHistoryToolResultMatchIndex(existingToolCalls, toolResult);
 
     if (matchIndex >= 0) {
       existingToolCalls[matchIndex] = {
@@ -1965,7 +2520,8 @@ function mergePendingToolResultsIntoAssistant(assistant: any, pendingToolResults
       continue;
     }
 
-    existingToolCalls.push(synthesized);
+    // No exact match. Do not attach by toolName or position; that corrupts
+    // history when OpenClaw delivery/tool plumbing interleaves with real turns.
   }
 
   if (existingToolCalls.length === 0) return assistant;
@@ -1976,35 +2532,38 @@ function mergePendingToolResultsIntoAssistant(assistant: any, pendingToolResults
   };
 }
 
-function synthesizeAssistantFromPendingToolResults(pendingToolResults: any[]): any {
-  const lastResult = pendingToolResults[pendingToolResults.length - 1];
-  const fallbackBaseId = lastResult?.id || `history-tool-${Date.now()}`;
-
-  return {
-    id: `synthetic-${fallbackBaseId}`,
-    role: 'assistant',
-    content: '',
-    timestamp: lastResult?.timestamp,
-    toolCalls: pendingToolResults.map((toolResult: any, index: number) => (
-      buildHistoryToolCallFromResult(toolResult, fallbackBaseId, index)
-    )),
-  };
-}
-
 function hydrateHistoryToolCalls(messages: any[]): any[] {
   const hydrated: any[] = [];
   let pendingToolResults: any[] = [];
 
   const flushPendingToolResults = () => {
-    if (pendingToolResults.length === 0) return;
-    hydrated.push(synthesizeAssistantFromPendingToolResults(pendingToolResults));
+    // Unmatched toolResult messages are not user-visible conversation turns.
+    // If they cannot be attached by exact toolCallId, dropping them is safer
+    // than inventing synthetic empty tool-card messages or contaminating the
+    // next assistant turn by tool name.
     pendingToolResults = [];
+  };
+
+  const mergeToolResultIntoExistingAssistant = (toolResult: any): boolean => {
+    for (let index = hydrated.length - 1; index >= 0; index -= 1) {
+      const candidate = hydrated[index];
+      if (!candidate || candidate.role !== 'assistant') continue;
+      const toolCalls = Array.isArray(candidate.toolCalls) ? candidate.toolCalls : [];
+      if (toolCalls.length === 0) continue;
+
+      const matchIndex = findHistoryToolResultMatchIndex(toolCalls, toolResult);
+      if (matchIndex < 0) continue;
+      hydrated[index] = mergePendingToolResultsIntoAssistant(candidate, [toolResult]);
+      return true;
+    }
+    return false;
   };
 
   for (const message of messages) {
     if (!message) continue;
 
     if (message.role === 'toolResult') {
+      if (mergeToolResultIntoExistingAssistant(message)) continue;
       pendingToolResults.push(message);
       continue;
     }
@@ -2146,7 +2705,6 @@ function mapTrajectoryRuntimeMessage(rawMessage: any, fallbackId: string, fallba
   const id = typeof rawMessage.id === 'string' && rawMessage.id.trim()
     ? rawMessage.id.trim()
     : (typeof rawMessage.responseId === 'string' && rawMessage.responseId.trim() ? rawMessage.responseId.trim() : fallbackId);
-
   if (role === 'user') {
     const text = extractText(rawMessage.content);
     if (!text || isHiddenHistoryArtifactText(text)) return null;
@@ -2161,9 +2719,17 @@ function mapTrajectoryRuntimeMessage(rawMessage: any, fallbackId: string, fallba
       const toolCalls: any[] = [];
       const thinkingBlocks: string[] = [];
       const textBlocks: string[] = [];
+      const messageIsReasoningMirror = isReasoningMirrorHistoryMessage(rawMessage);
 
       for (const block of content) {
-        if (block?.type === 'text' && typeof block.text === 'string') textBlocks.push(block.text);
+        if (block?.type === 'text' && typeof block.text === 'string') {
+          if (messageIsReasoningMirror || isReasoningMirrorHistoryMessage(rawMessage, block.text)) {
+            const reasoningText = extractReasoningMirrorHistoryText(rawMessage, block.text);
+            if (reasoningText) thinkingBlocks.push(reasoningText);
+          } else {
+            textBlocks.push(block.text);
+          }
+        }
         if (block?.type === 'thinking' && (typeof block.thinking === 'string' || typeof block.text === 'string')) {
           thinkingBlocks.push(typeof block.thinking === 'string' ? block.thinking : block.text);
         }
@@ -2191,20 +2757,16 @@ function mapTrajectoryRuntimeMessage(rawMessage: any, fallbackId: string, fallba
     }
 
     const text = extractText(content);
+    const reasoningMirrorText = extractReasoningMirrorHistoryText(rawMessage, text);
+    if (reasoningMirrorText && !isHiddenHistoryArtifactText(reasoningMirrorText)) {
+      return { id, role: 'assistant', content: '', model: executedModel, thinkingContent: reasoningMirrorText, timestamp, provenance: 'reasoning-mirror' };
+    }
     if (!text || isControlOnlyAssistantText(text) || isHiddenHistoryArtifactText(text)) return null;
     return { id, role: 'assistant', content: text, model: executedModel, timestamp, provenance: 'trajectory-recovery' };
   }
 
   if (role === 'toolResult') {
-    return {
-      id,
-      role: 'toolResult',
-      toolCallId: rawMessage.toolCallId,
-      toolName: rawMessage.toolName,
-      content: extractText(rawMessage.content),
-      timestamp,
-      provenance: 'trajectory-recovery',
-    };
+    return null;
   }
 
   return null;
@@ -2262,15 +2824,62 @@ function readTrajectoryMessagesForSessionKey(sessionKey: string, limit = 200, se
       return true;
     });
 
-  return hydrateHistoryToolCalls(deduped).slice(-Math.max(limit, 1));
+  return stripMessageDeliveryArtifactsFromHistory(hydrateHistoryToolCalls(deduped)).slice(-Math.max(limit, 1));
+}
+
+function getHistoryTimestampRange(messages: any[]): { min: number; max: number } | null {
+  const timestamps = messages
+    .map((message) => toHistoryTimestampMs(message?.timestamp))
+    .filter((timestamp) => Number.isFinite(timestamp) && timestamp > 0);
+  if (timestamps.length === 0) return null;
+  return { min: Math.min(...timestamps), max: Math.max(...timestamps) };
+}
+
+function filterTrajectoryMessagesNearCanonicalMessages(trajectoryMessages: any[], canonicalMessages: any[]): any[] {
+  if (trajectoryMessages.length === 0 || canonicalMessages.length === 0) return trajectoryMessages;
+
+  const canonicalRange = getHistoryTimestampRange(canonicalMessages);
+  if (!canonicalRange) return trajectoryMessages;
+
+  // Trajectory logs are a recovery source, not a second durable transcript. Session keys
+  // can be reused across Portal turns, so blindly appending every matching trajectory
+  // snapshot leaks stale tool cards/model labels from earlier runs into the current chat.
+  // Keep recovery data only when it is plausibly part of the same canonical history span.
+  const recoveryWindowMs = 30 * 60 * 1000;
+  const minAllowed = canonicalRange.min - recoveryWindowMs;
+  const maxAllowed = canonicalRange.max + recoveryWindowMs;
+
+  return trajectoryMessages.filter((message) => {
+    const timestamp = toHistoryTimestampMs(message?.timestamp);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return true;
+    return timestamp >= minAllowed && timestamp <= maxAllowed;
+  });
 }
 
 function readBestOpenClawSessionMessagesForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
   const candidates = findSessionFileIdsForSessionKey(sessionKey, sessionsDir);
   const seen = new Set<string>();
   const combined: any[] = [];
+  const canonicalMessages: any[] = [];
+
+  const normalizedDuplicateSignature = (message: any) => {
+    const toolNames = Array.isArray(message?.toolCalls) ? message.toolCalls.map((tool: any) => tool?.name || '').join(',') : '';
+    return [message?.role || '', String(message?.content || '').trim(), message?.toolName || '', toolNames].join('::');
+  };
+
+  const isTrajectoryDuplicateOfCanonical = (message: any): boolean => {
+    if (message?.provenance !== 'trajectory-recovery') return false;
+    const signature = normalizedDuplicateSignature(message);
+    const ts = toHistoryTimestampMs(message?.timestamp);
+    return combined.some((existing) => {
+      if (existing?.provenance === 'trajectory-recovery') return false;
+      if (normalizedDuplicateSignature(existing) !== signature) return false;
+      return Math.abs(toHistoryTimestampMs(existing?.timestamp) - ts) <= 10 * 60 * 1000;
+    });
+  };
 
   const pushMessage = (message: any) => {
+    if (isTrajectoryDuplicateOfCanonical(message)) return;
     const toolNames = Array.isArray(message?.toolCalls) ? message.toolCalls.map((tool: any) => tool?.name || '').join(',') : '';
     const contentKey = [message?.role || '', toHistoryTimestampMs(message?.timestamp), message?.content || '', message?.toolName || '', toolNames].join('::');
     const messageId = typeof message?.id === 'string' ? message.id.trim() : '';
@@ -2282,15 +2891,23 @@ function readBestOpenClawSessionMessagesForSessionKey(sessionKey: string, limit 
 
   for (const sessionId of candidates) {
     const messages = readSessionMessagesEnhanced(sessionId, limit, sessionsDir);
-    for (const message of messages) pushMessage(message);
+    for (const message of messages) {
+      canonicalMessages.push(message);
+      pushMessage(message);
+    }
   }
 
-  for (const message of readTrajectoryMessagesForSessionKey(sessionKey, limit, sessionsDir)) {
+  const trajectoryMessages = filterTrajectoryMessagesNearCanonicalMessages(
+    readTrajectoryMessagesForSessionKey(sessionKey, limit, sessionsDir),
+    canonicalMessages,
+  );
+
+  for (const message of trajectoryMessages) {
     pushMessage(message);
   }
 
   combined.sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
-  return combined.slice(-Math.max(limit, 1));
+  return stripMessageDeliveryArtifactsFromHistory(combined).slice(-Math.max(limit, 1));
 }
 
 const PROVENANCE: Record<string, string> = {
@@ -2315,9 +2932,14 @@ router.get('/status', authenticateToken, async (_req: Request, res: Response) =>
   }
 });
 
-// Dashboard health check — includes connectivity + config validation
-router.get('/health', authenticateToken, async (_req: Request, res: Response) => {
+// Dashboard health check — includes connectivity + config validation.
+// By default this keeps the dashboard cheap and schedules the expensive
+// CLI/version probe in the background. Admin/status flows can pass
+// ?forceVersion=1 to wait for the real installed-vs-running Gateway version
+// check, which catches stale detached OpenClaw listeners after updates.
+router.get('/health', authenticateToken, async (req: Request, res: Response) => {
   try {
+    const forceVersionProbe = ['1', 'true', 'yes'].includes(String(req.query.forceVersion || req.query.force || '').toLowerCase());
     const wsConnected = isPersistentWsConnected();
     const probe = await fetch(`${GATEWAY_URL}/`, { signal: AbortSignal.timeout(3000) }).then(r => r.ok).catch(() => false);
     // Gateway is reachable if the HTTP probe passes OR the persistent WS is up
@@ -2332,7 +2954,7 @@ router.get('/health', authenticateToken, async (_req: Request, res: Response) =>
     let modelsConfigured = false;
     let modelCount = 0;
     const issues: string[] = [];
-    const openclawVersion = await getOpenClawVersionStatus().catch((err: any) => ({
+    const openclawVersion = await getOpenClawVersionStatus({ force: forceVersionProbe }).catch((err: any) => ({
       installedVersion: null,
       runningVersion: null,
       latestVersion: null,
@@ -2390,7 +3012,7 @@ router.get('/health', authenticateToken, async (_req: Request, res: Response) =>
 // but the detached listener is still the older in-memory runtime.
 router.post('/restart', authenticateToken, requireAdmin, async (_req: Request, res: Response) => {
   try {
-    const before = await getOpenClawVersionStatus().catch(() => null);
+    const before = await getOpenClawVersionStatus({ force: true }).catch(() => null);
     const restart = await runOpenClawCli(['gateway', 'restart'], 45000, gatewayRecoveryEnv());
     let forcedStart: { ok: boolean; pid?: number; error?: string } | null = null;
     let after = await waitForGatewayVersionClear(7000);
@@ -2511,7 +3133,34 @@ router.get('/models', authenticateToken, async (req: Request, res: Response) => 
       return;
     }
 
-    const models = await listProviderModels(providerName);
+    let models = await listProviderModels(providerName);
+    if (providerName === 'OPENCLAW') {
+      try {
+        const live = await listGatewayModels();
+        if (live.ok && Array.isArray(live.models) && live.models.length > 0) {
+          const seen = new Set<string>();
+          models = live.models
+            .map((model: any) => {
+              const rawId = String(model?.id || model?.name || model?.model || '').trim();
+              const provider = String(model?.provider || '').trim();
+              const id = canonicalizeProviderModelId(provider, rawId) || normalizePortalModelId(rawId);
+              if (!id || seen.has(id)) return null;
+              seen.add(id);
+              const resolvedProvider = provider || id.split('/')[0] || 'other';
+              return {
+                id,
+                alias: typeof model?.alias === 'string' && model.alias.trim() ? model.alias.trim() : null,
+                provider: resolvedProvider,
+                displayName: String(model?.displayName || model?.name || id.split('/').slice(1).join('/') || id),
+                source: 'dynamic' as const,
+              };
+            })
+            .filter(Boolean) as any;
+        }
+      } catch {
+        // Fall back to config-derived catalog below.
+      }
+    }
     res.json({
       provider: providerName,
       capabilities: providerInfo.capabilities,
@@ -3007,6 +3656,15 @@ router.get('/session-info', authenticateToken, async (req: Request, res: Respons
       }
     }
     if (!result.ok) {
+      // Silent probes are used by UI components that can legitimately mount
+      // before a just-created gateway session has durable metadata. Return a
+      // non-error payload so Chrome does not report expected 404s as console
+      // noise during normal Project Chat startup.
+      const silentProbe = ['1', 'true', 'yes'].includes(String(req.query.silent || '').toLowerCase());
+      if (silentProbe && !isGatewayTransportError(result.error)) {
+        res.json({ session: null, missing: true, error: result.error || 'Session not found' });
+        return;
+      }
       // Distinguish gateway transport failures (timeout, WS error) from "session not found"
       const status = isGatewayTransportError(result.error) ? 502 : 404;
       res.status(status).json({ error: result.error || 'Session not found' });
@@ -3043,8 +3701,23 @@ router.post('/session-create', authenticateToken, requireApproved, async (req: R
       return;
     }
 
-    const info = await getSessionInfo(created.key || sessionKey);
-    res.json({ ok: true, key: created.key || sessionKey, session: info.ok ? info.data : null });
+    const createdKey = created.key || sessionKey;
+    let info = await getSessionInfo(createdKey);
+    if (info.ok && info.data) {
+      const currentThinking = String(info.data.thinkingLevel || '').trim().toLowerCase();
+      const currentReasoning = String(info.data.reasoningLevel || '').trim().toLowerCase();
+      const shouldDefaultThinking = !currentThinking || currentThinking === 'off' || currentThinking === 'none';
+      const shouldDefaultReasoning = !currentReasoning || currentReasoning === 'off' || currentReasoning === 'none';
+      if (shouldDefaultThinking || shouldDefaultReasoning) {
+        await gatewayRpcCall('sessions.patch', {
+          key: createdKey,
+          ...(shouldDefaultThinking ? { thinkingLevel: 'high' } : {}),
+          ...(shouldDefaultReasoning ? { reasoningLevel: 'stream' } : {}),
+        });
+        info = await getSessionInfo(createdKey);
+      }
+    }
+    res.json({ ok: true, key: createdKey, session: info.ok ? info.data : null });
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 500;
     res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to create session', detail: err.message });
@@ -3088,7 +3761,9 @@ router.post('/session-model', authenticateToken, requireApproved, async (req: Re
         return;
       }
 
-      const patched = await patchSessionModel(sessionKey, model);
+      const resolvedModel = await resolveOpenClawPatchModel(model);
+      const runtimeModel = modelForOpenClawSessionPatch(info.data, resolvedModel || model);
+      const patched = await patchSessionModel(sessionKey, runtimeModel || resolvedModel || model);
       if (!patched.ok) {
         res.status(502).json({ error: patched.error || 'Failed to patch session model' });
         return;
@@ -3163,6 +3838,7 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
     }
 
     const thinking = typeof settings.thinking === 'string' ? settings.thinking.trim().toLowerCase() : '';
+    const reasoning = typeof settings.reasoning === 'string' ? settings.reasoning.trim().toLowerCase() : '';
     const model = typeof settings.model === 'string' ? settings.model.trim() : '';
     const rawFastMode = settings.fastMode;
 
@@ -3175,6 +3851,15 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
         return;
       }
       patch.thinkingLevel = thinking;
+    }
+
+    if (reasoning) {
+      const allowedReasoning = new Set(['off', 'on', 'stream']);
+      if (!allowedReasoning.has(reasoning)) {
+        res.status(400).json({ error: `Unsupported reasoning visibility: ${reasoning}` });
+        return;
+      }
+      patch.reasoningLevel = reasoning;
     }
 
     if (typeof rawFastMode === 'boolean' || rawFastMode === null) {
@@ -3194,7 +3879,13 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
     }
 
     if (model) {
-      patch.model = model;
+      const resolvedModel = await resolveOpenClawPatchModel(model);
+      let sessionInfoForPatch: any = null;
+      try {
+        const sessionInfo = await getSessionInfo(sessionKey);
+        if (sessionInfo.ok) sessionInfoForPatch = sessionInfo.data;
+      } catch {}
+      patch.model = modelForOpenClawSessionPatch(sessionInfoForPatch, resolvedModel || model) || resolvedModel || model;
     }
 
     if (Object.keys(patch).length === 1) {
@@ -3215,6 +3906,7 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
     res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to patch session', detail: err.message });
   }
 });
+
 
 router.get('/config-path', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
@@ -3643,7 +4335,14 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         return;
       }
       try {
-        await patchSessionModel(sessionId, requestedModel);
+        const resolvedModel = await resolveOpenClawPatchModel(requestedModel);
+        let sessionInfoForPatch: any = null;
+        try {
+          const sessionInfo = await getSessionInfo(sessionId);
+          if (sessionInfo.ok) sessionInfoForPatch = sessionInfo.data;
+        } catch {}
+        const runtimeModel = modelForOpenClawSessionPatch(sessionInfoForPatch, resolvedModel || requestedModel);
+        await patchSessionModel(sessionId, runtimeModel || resolvedModel || requestedModel);
       } catch (err: any) {
         console.warn(`[gateway] Failed to patch session model: ${err.message}`);
       }
@@ -3728,7 +4427,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         if (!gotRealStatus && sseAlive) try { sseWrite(`data: ${JSON.stringify({ type: 'status', content: `${provider.displayName} is thinking…` })}\n\n`); } catch { sseAlive = false; }
       }, 2000);
 
-      const senderIdentity = req.user ? { label: req.user.email, userId: req.user.userId } : undefined;
+      const senderIdentity = req.user ? { label: req.user.email, userId: req.user.userId, role: req.user.role } : undefined;
       const streamStartedAtMs = Date.now();
 
       if (provider.providerName === 'OPENCLAW') {
@@ -3832,8 +4531,31 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
 
       const onStatus = (evt: { type: string; content: string; [key: string]: any }) => {
         gotRealStatus = true;
+        if (evt.type === 'exec_approval' && evt.approval) {
+          const approval = evt.approval as ExecApprovalRequest;
+          if (!isElevatedRole(req.user?.role)) {
+            void denyExecApprovalForUnauthorizedUser(approval, req.user);
+            if (sseAlive) {
+              try {
+                sseWrite(`data: ${JSON.stringify({
+                  type: 'status',
+                  content: 'Command approval is only available to portal admins. This request was denied automatically.',
+                })}\n\n`);
+              } catch { sseAlive = false; }
+            }
+            return;
+          }
+          if (sseAlive) try { sseWrite(`data: ${JSON.stringify({ type: 'exec_approval', approval })}\n\n`); } catch { sseAlive = false; }
+          return;
+        }
         const runId = typeof evt.runId === 'string' ? evt.runId : undefined;
         if (evt.type === 'tool_start') {
+          streamEventBus.startStream(sessionId, runId, {
+            provenance,
+            model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
+          });
+          streamEventBus.updateStreamPhase(sessionId, { phase: 'tool', toolName: typeof evt.toolName === 'string' ? evt.toolName : undefined, runId });
+        } else if (evt.type === 'tool_update') {
           streamEventBus.startStream(sessionId, runId, {
             provenance,
             model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
@@ -3861,6 +4583,18 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         if (sseAlive) try { sseWrite(`data: ${JSON.stringify(evt)}\n\n`); } catch { sseAlive = false; }
       };
       const onExecApproval = (approval: ExecApprovalRequest) => {
+        if (!isElevatedRole(req.user?.role)) {
+          void denyExecApprovalForUnauthorizedUser(approval, req.user);
+          if (sseAlive) {
+            try {
+              sseWrite(`data: ${JSON.stringify({
+                type: 'status',
+                content: 'Command approval is only available to portal admins. This request was denied automatically.',
+              })}\n\n`);
+            } catch { sseAlive = false; }
+          }
+          return;
+        }
         if (sseAlive) try { sseWrite(`data: ${JSON.stringify({ type: 'exec_approval', approval })}\n\n`); } catch { sseAlive = false; }
       };
       streamEventBus.startStream(sessionId, undefined, {
@@ -3924,7 +4658,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     }
 
     // Non-streaming
-    const senderIdentity = req.user ? { label: req.user.email, userId: req.user.userId } : undefined;
+    const senderIdentity = req.user ? { label: req.user.email, userId: req.user.userId, role: req.user.role } : undefined;
     const nonStreamingStartedAtMs = Date.now();
     try {
       const result = await (provider as any).sendMessage(sessionId, message, undefined, undefined, undefined, senderIdentity);
@@ -4079,9 +4813,9 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
           // after a browser refresh while direct-gateway streaming is in progress. Be conservative:
           // stale gateway chatState otherwise leaves the UI stuck in a fake running state.
           const lastActivity = typeof sess.lastActivity === 'number' ? sess.lastActivity : 0;
-          const staleCutoff = Date.now() - 30_000; // 30s
-          if (lastActivity && lastActivity < staleCutoff) {
-            debugLog(`[stream-status] Gateway reports chatState=${chatState} but lastActivity=${new Date(lastActivity).toISOString()} is stale for fallback mode — reporting inactive`);
+          const fallbackStaleCutoffMs = chatState === 'streaming' ? 180_000 : 15 * 60_000;
+          if (lastActivity && (Date.now() - lastActivity) > fallbackStaleCutoffMs) {
+            debugLog(`[stream-status] Gateway reports chatState=${chatState} but lastActivity=${new Date(lastActivity).toISOString()} exceeded fallback cutoff=${fallbackStaleCutoffMs}ms — reporting inactive`);
             res.json({ active: false });
             return;
           }
@@ -4091,7 +4825,7 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
             res.json({ active: false });
             return;
           }
-          debugLog(`[stream-status] StreamEventBus empty but gateway reports chatState=${chatState} with recent activity and latest durable turn is not assistant — reporting active`);
+          debugLog(`[stream-status] StreamEventBus empty but gateway reports chatState=${chatState} within fallback cutoff and latest durable turn is not assistant — reporting active`);
           res.json({
             active: true,
             phase: chatState === 'tool' ? 'tool' : chatState === 'streaming' ? 'streaming' : 'thinking',
@@ -4179,17 +4913,28 @@ router.post('/session-steer', authenticateToken, requireApproved, async (req: Re
   }
 });
 
+async function resolveAnyExecApproval(
+  approvalId: string,
+  decision: NativeCliApprovalDecision,
+): Promise<{ ok: boolean; error?: string }> {
+  const nativeResult = resolveNativeCliApproval(approvalId, decision);
+  if (nativeResult.ok) return nativeResult;
+
+  if (isPersistentWsConnected()) {
+    const persistentResult = await sendApprovalDecision(approvalId, decision);
+    if (persistentResult.ok) return persistentResult;
+    console.warn(`[gateway] Persistent WS resolution failed: ${persistentResult.error}`);
+  }
+
+  return resolveExecApproval(approvalId, decision);
+}
+
 router.post('/exec-approval/resolve', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<void> => {
   const { approvalId, decision } = req.body;
   if (!approvalId || typeof approvalId !== 'string') { res.status(400).json({ error: 'Missing approvalId' }); return; }
   if (!decision || !['allow-once', 'deny', 'allow-always'].includes(decision)) { res.status(400).json({ error: 'Invalid decision' }); return; }
   try {
-    if (isPersistentWsConnected()) {
-      const result = await sendApprovalDecision(approvalId, decision);
-      if (result.ok) { res.json({ ok: true, approvalId, decision }); return; }
-      console.warn(`[gateway] Persistent WS resolution failed: ${result.error}`);
-    }
-    const result = await resolveExecApproval(approvalId, decision);
+    const result = await resolveAnyExecApproval(approvalId, decision);
     if (!result.ok) { res.status(404).json({ error: result.error || 'Failed' }); return; }
     res.json({ ok: true, approvalId, decision });
   } catch (err: any) {
@@ -4213,7 +4958,16 @@ router.get('/approvals/stream', authenticateToken, requireAdmin, (req: Request, 
   const keepaliveTimer = setInterval(() => { if (alive) sseWrite(': keepalive\n\n'); }, 15000);
   const unsubReq = onApprovalRequest((a: PersistentApprovalRequest) => sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_requested', approval: a })}\n\n`));
   const unsubRes = onApprovalResolved((r: ExecApprovalResolved) => sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_resolved', resolved: r })}\n\n`));
-  req.on('close', () => { alive = false; clearInterval(keepaliveTimer); unsubReq(); unsubRes(); });
+  const unsubNativeReq = onNativeCliApprovalRequest((a: ExecApprovalRequest) => sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_requested', approval: a })}\n\n`));
+  const unsubNativeRes = onNativeCliApprovalResolved((r: ExecApprovalResolved) => sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_resolved', resolved: r })}\n\n`));
+  req.on('close', () => {
+    alive = false;
+    clearInterval(keepaliveTimer);
+    unsubReq();
+    unsubRes();
+    unsubNativeReq();
+    unsubNativeRes();
+  });
 });
 
 
@@ -4241,7 +4995,7 @@ let approvalBroadcastInit = false;
 function initApprovalWsBroadcast() {
   if (approvalBroadcastInit) return;
   approvalBroadcastInit = true;
-  onApprovalRequest((approval: PersistentApprovalRequest) => {
+  const broadcastApprovalRequest = (approval: ExecApprovalRequest) => {
     const msg = JSON.stringify({ type: 'exec_approval', approval });
     const sessionKey = approval?.request?.sessionKey;
     for (const c of portalWsClients) {
@@ -4257,13 +5011,17 @@ function initApprovalWsBroadcast() {
       }
       try { c.send(msg); } catch {}
     }
-  });
-  onApprovalResolved((resolved: ExecApprovalResolved) => {
+  };
+  const broadcastApprovalResolved = (resolved: ExecApprovalResolved) => {
     const msg = JSON.stringify({ type: 'exec_approval_resolved', resolved });
     for (const c of portalWsClients) {
       if (c.readyState === WebSocket.OPEN) try { c.send(msg); } catch {}
     }
-  });
+  };
+  onApprovalRequest((approval: PersistentApprovalRequest) => broadcastApprovalRequest(approval));
+  onNativeCliApprovalRequest((approval: ExecApprovalRequest) => broadcastApprovalRequest(approval));
+  onApprovalResolved((resolved: ExecApprovalResolved) => broadcastApprovalResolved(resolved));
+  onNativeCliApprovalResolved((resolved: ExecApprovalResolved) => broadcastApprovalResolved(resolved));
 }
 
 function wsSend(ws: WebSocket, data: any) {
@@ -4343,6 +5101,7 @@ function attachBrowserWsToSessionStream(params: {
         compactionPhase: status.compactionPhase || 'idle',
         runId: status.runId || null,
         content: latestText || undefined,
+        turnEvents: streamEventBus.getRecentTurnEvents(sessionKey, 100),
       });
     } else {
       wsSend(ws, { type: 'stream_ended', sessionKey });
@@ -4499,7 +5258,14 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
           wsSend(ws, { type: 'error', content: `Invalid model "${requestedModel}": must include provider prefix (e.g. openai-codex/gpt-5.4). Please reselect your model.` });
           return;
         }
-        await patchSessionModel(sessionId, requestedModel);
+        const resolvedModel = await resolveOpenClawPatchModel(requestedModel);
+        let sessionInfoForPatch: any = null;
+        try {
+          const sessionInfo = await getSessionInfo(sessionId);
+          if (sessionInfo.ok) sessionInfoForPatch = sessionInfo.data;
+        } catch {}
+        const runtimeModel = modelForOpenClawSessionPatch(sessionInfoForPatch, resolvedModel || requestedModel);
+        await patchSessionModel(sessionId, runtimeModel || resolvedModel || requestedModel);
       } catch (err: any) {
         console.warn(`[gateway-ws] Failed to patch model: ${err.message}`);
       }
@@ -4632,7 +5398,7 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       const onChunk = (_chunk: string) => {};
       const onStatus = (_evt: { type: string; content?: string; [key: string]: any }) => {};
       const onExecApproval = (_approval: ExecApprovalRequest) => {};
-      const senderIdentity = { label: user.email, userId: user.userId };
+      const senderIdentity = { label: user.email, userId: user.userId, role: user.role };
 
       try {
         await (provider as any).sendMessage(
@@ -4660,6 +5426,15 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
     const onStatus = (evt: { type: string; content?: string; [key: string]: any }) => {
       gotRealStatus = true;
       if (evt?.type === 'exec_approval' && evt.approval) {
+        if (!isElevatedRole(user.role)) {
+          void denyExecApprovalForUnauthorizedUser(evt.approval as ExecApprovalRequest, user);
+          wsSend(ws, {
+            type: 'status',
+            content: 'Command approval is only available to portal admins. This request was denied automatically.',
+            sessionKey: sessionId,
+          });
+          return;
+        }
         wsSend(ws, { type: 'exec_approval', approval: evt.approval });
         return;
       }
@@ -4667,6 +5442,15 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       wsSend(ws, { ...evt, type: eventType });
     };
     const onExecApproval = (approval: any) => {
+      if (!isElevatedRole(user.role)) {
+        void denyExecApprovalForUnauthorizedUser(approval as ExecApprovalRequest, user);
+        wsSend(ws, {
+          type: 'status',
+          content: 'Command approval is only available to portal admins. This request was denied automatically.',
+          sessionKey: sessionId,
+        });
+        return;
+      }
       wsSend(ws, { type: 'exec_approval', approval });
     };
 
@@ -4677,7 +5461,7 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
         onChunk,
         onStatus,
         onExecApproval,
-        { label: user.email, userId: user.userId },
+        { label: user.email, userId: user.userId, role: user.role },
       );
       clearTimeout(fallbackTimer);
       if (streamKeepalive) clearInterval(streamKeepalive);
@@ -4765,11 +5549,7 @@ async function handleWsExecApproval(ws: WebSocket, msg: any, user?: JwtPayload) 
     return;
   }
   try {
-    if (isPersistentWsConnected()) {
-      const result = await sendApprovalDecision(approvalId, decision);
-      if (result.ok) { wsSend(ws, { type: 'approval_result', ok: true, approvalId, decision }); return; }
-    }
-    const result = await resolveExecApproval(approvalId, decision);
+    const result = await resolveAnyExecApproval(approvalId, decision);
     wsSend(ws, { type: 'approval_result', ok: result.ok, approvalId, decision, error: result.ok ? undefined : result.error });
   } catch (err: any) {
     wsSend(ws, { type: 'approval_result', ok: false, approvalId, error: err.message });
@@ -4784,6 +5564,9 @@ async function handleWsExecApproval(ws: WebSocket, msg: any, user?: JwtPayload) 
 async function denyExecApprovalForUnauthorizedUser(approval: ExecApprovalRequest, user?: JwtPayload): Promise<void> {
   if (!approval?.id || !user || isElevatedRole(user.role)) return;
   try {
+    const nativeResult = resolveNativeCliApproval(approval.id, 'deny');
+    if (nativeResult.ok) return;
+
     const result = await sendApprovalDecision(approval.id, 'deny');
     if (!result.ok) {
       console.warn(`[gateway] Failed to auto-deny exec approval ${approval.id} for unauthorized user ${user.userId}: ${result.error || 'unknown error'}`);
@@ -4926,7 +5709,8 @@ const DIRECT_PROXY_CLIENT_ID = 'gateway-client';
 const DIRECT_PROXY_CLIENT_MODE = 'backend';
 const DIRECT_PROXY_ROLE = 'operator';
 const DIRECT_PROXY_BASE_SCOPES = ['operator.read', 'operator.write'];
-const DIRECT_PROXY_PROTOCOL = 3;
+const DIRECT_PROXY_MIN_PROTOCOL = 3;
+const DIRECT_PROXY_MAX_PROTOCOL = 4;
 
 function getDirectProxyScopes(user: JwtPayload): string[] {
   if (isElevatedRole(user.role)) {
@@ -5002,8 +5786,7 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       const str = data.toString();
       const msg = JSON.parse(str);
 
-      // VERBOSE DIAGNOSTIC LOGGING
-      if (msg.type === 'event') {
+      if (DEBUG_GATEWAY_WS && msg.type === 'event') {
         if (msg.event === 'chat') {
           const state = msg.payload?.state;
           const content = msg.payload?.message?.content;
@@ -5012,13 +5795,13 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
           const textLen = textBlocks.reduce((a: number, b: any) => a + (b.text || '').length, 0);
           const thinkLen = thinkBlocks.reduce((a: number, b: any) => a + (b.thinking || b.text || '').length, 0);
           const textPreview = textBlocks.map((b: any) => (b.text || '').substring(0, 60)).join('|');
-          console.log(`[DIAG] chat state=${state} textBlocks=${textBlocks.length} textLen=${textLen} thinkBlocks=${thinkBlocks.length} thinkLen=${thinkLen} runId=${msg.payload?.runId||'-'} preview="${textPreview}"`);
+          debugLog(`[gateway-direct] chat state=${state} textBlocks=${textBlocks.length} textLen=${textLen} thinkBlocks=${thinkBlocks.length} thinkLen=${thinkLen} runId=${msg.payload?.runId||'-'} preview="${textPreview}"`);
         } else if (msg.event === 'agent') {
           const stream = msg.payload?.stream;
           const data = msg.payload?.data;
-          console.log(`[DIAG] agent stream=${stream} phase=${data?.phase||'-'} name=${data?.name||'-'} toolCallId=${data?.toolCallId||'-'}`);
+          debugLog(`[gateway-direct] agent stream=${stream} phase=${data?.phase||'-'} name=${data?.name||'-'} toolCallId=${data?.toolCallId||'-'}`);
         } else {
-          console.log(`[DIAG] event=${msg.event}`);
+          debugLog(`[gateway-direct] event=${msg.event}`);
         }
       }
 
@@ -5103,8 +5886,8 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
         role: DIRECT_PROXY_ROLE,
         scopes: directProxyScopes,
         caps: ['tool-events'],
-        minProtocol: DIRECT_PROXY_PROTOCOL,
-        maxProtocol: DIRECT_PROXY_PROTOCOL,
+        minProtocol: DIRECT_PROXY_MIN_PROTOCOL,
+        maxProtocol: DIRECT_PROXY_MAX_PROTOCOL,
       };
 
       const stringId = String(frame.id);

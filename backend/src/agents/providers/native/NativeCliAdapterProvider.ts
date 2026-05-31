@@ -15,6 +15,8 @@ import type {
   AgentSendResult,
 } from '../../AgentProvider.interface';
 import { AgentAbortError } from '../../AgentProvider.interface';
+import { requestNativeCliApproval } from '../../nativeCliApprovals';
+import { isElevatedRole } from '../../../utils/authz';
 import {
   appendNativeMessage,
   createNativeSession,
@@ -98,8 +100,8 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
     message: string,
     onChunk?: OnChunkCallback,
     onStatus?: OnStatusCallback,
-    _onExecApproval?: OnExecApprovalCallback,
-    _sender?: SenderIdentity,
+    onExecApproval?: OnExecApprovalCallback,
+    sender?: SenderIdentity,
   ) {
     const providerAvailability = getProviderAvailability(this.adapter.providerName);
     if (!providerAvailability.usable) {
@@ -120,6 +122,7 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
       message,
       onChunk,
       onStatus,
+      onExecApproval,
       fullText: '',
       lastAssistantMessage: '',
       stderr: '',
@@ -131,6 +134,20 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
       appendFullText: (text) => { if (text) ctx.fullText += text; },
       setLastAssistantMessage: (text) => { ctx.lastAssistantMessage = text; },
       appendStderr: (text) => { if (text) ctx.stderr += text; },
+      requestApproval: async (approval) => {
+        if (sender?.role && !isElevatedRole(sender.role)) {
+          ctx.emitStatus('Command approval is only available to portal admins. This request was denied automatically.');
+          return 'deny';
+        }
+        const promise = requestNativeCliApproval({
+          providerName: this.adapter.providerName,
+          sessionId: session.sessionId,
+          cwd: session.cwd,
+          onRequest: onExecApproval,
+          ...approval,
+        });
+        return promise;
+      },
       updateSessionMetadata: (metadata) => {
         session.metadata = {
           ...(session.metadata || {}),
@@ -152,113 +169,127 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
       : this.adapter.initialStatus;
     if (initialStatus) ctx.emitStatus(initialStatus);
 
-    const invocation = await this.adapter.buildInvocation(ctx);
-
     return new Promise<AgentSendResult>((resolve, reject) => {
-      let stdoutBuffer = '';
-
-      const child = spawn(invocation.command, invocation.args, {
-        cwd: session.cwd,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: buildNativeCliEnv(this.adapter.providerName),
-        ...(invocation.options || {}),
-      });
-
-      const activeRun = { child, aborted: false, killTimer: null as ReturnType<typeof setTimeout> | null };
-      this.activeRuns.set(session.sessionId, activeRun);
-
-      const clearActiveRun = () => {
-        const current = this.activeRuns.get(session.sessionId);
-        if (current?.killTimer) clearTimeout(current.killTimer);
-        if (current === activeRun) {
-          this.activeRuns.delete(session.sessionId);
-        }
-      };
-
       const flushLine = (line: string) => {
         const normalized = line.replace(/\r$/, '');
         if (!normalized.trim()) return;
         this.adapter.handleStdoutLine(normalized, ctx);
       };
 
-      child.stdout?.on('data', (data: Buffer) => {
-        stdoutBuffer += data.toString();
-        let idx;
-        while ((idx = stdoutBuffer.indexOf('\n')) >= 0) {
-          const line = stdoutBuffer.slice(0, idx);
-          stdoutBuffer = stdoutBuffer.slice(idx + 1);
-          flushLine(line);
-        }
-      });
+      const startChild = async () => {
+        ctx.state.turnAttempt = Number(ctx.state.turnAttempt || 0) + 1;
+        let stdoutBuffer = '';
+        const invocation = await this.adapter.buildInvocation(ctx);
 
-      child.stderr?.on('data', (data: Buffer) => {
-        const text = data.toString();
-        ctx.appendStderr(text);
-        this.adapter.handleStderrChunk?.(text, ctx);
-      });
+        const child = spawn(invocation.command, invocation.args, {
+          cwd: session.cwd,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: buildNativeCliEnv(this.adapter.providerName),
+          ...(invocation.options || {}),
+        });
 
-      child.on('close', async (code) => {
-        const wasAborted = activeRun.aborted;
-        clearActiveRun();
-        try {
-          if (stdoutBuffer.trim()) {
-            if (this.adapter.handleStdoutRemainder) {
-              this.adapter.handleStdoutRemainder(stdoutBuffer, ctx);
-            } else {
-              flushLine(stdoutBuffer);
+        const activeRun = { child, aborted: false, killTimer: null as ReturnType<typeof setTimeout> | null };
+        this.activeRuns.set(session.sessionId, activeRun);
+
+        const clearActiveRun = () => {
+          const current = this.activeRuns.get(session.sessionId);
+          if (current?.killTimer) clearTimeout(current.killTimer);
+          if (current === activeRun) {
+            this.activeRuns.delete(session.sessionId);
+          }
+        };
+
+        child.stdout?.on('data', (data: Buffer) => {
+          stdoutBuffer += data.toString();
+          let idx;
+          while ((idx = stdoutBuffer.indexOf('\n')) >= 0) {
+            const line = stdoutBuffer.slice(0, idx);
+            stdoutBuffer = stdoutBuffer.slice(idx + 1);
+            flushLine(line);
+          }
+        });
+
+        child.stderr?.on('data', (data: Buffer) => {
+          const text = data.toString();
+          ctx.appendStderr(text);
+          this.adapter.handleStderrChunk?.(text, ctx);
+        });
+
+        child.on('close', async (code) => {
+          const wasAborted = activeRun.aborted;
+          clearActiveRun();
+          try {
+            if (stdoutBuffer.trim()) {
+              if (this.adapter.handleStdoutRemainder) {
+                this.adapter.handleStdoutRemainder(stdoutBuffer, ctx);
+              } else {
+                flushLine(stdoutBuffer);
+              }
             }
-          }
 
-          if (wasAborted) {
-            ctx.emitStatus('');
-            reject(new AgentAbortError());
-            return;
-          }
+            if (wasAborted) {
+              ctx.emitStatus('');
+              reject(new AgentAbortError());
+              return;
+            }
 
-          ctx.exitCode = code ?? 0;
-          await this.adapter.finalizeTurn?.(ctx);
+            ctx.exitCode = code ?? 0;
+            await this.adapter.finalizeTurn?.(ctx);
 
-          const result = this.adapter.transformResult
-            ? await this.adapter.transformResult(ctx)
-            : {
-                fullText: stripAnsi((this.adapter.getResultText?.(ctx) || ctx.fullText || ctx.lastAssistantMessage)).trim(),
-                metadata: this.adapter.getResultMetadata?.(ctx),
-              };
+            if (ctx.state.retryRequested && !ctx.state.retryStarted) {
+              ctx.state.retryStarted = true;
+              ctx.state.retryRequested = false;
+              ctx.setFullText('');
+              ctx.setLastAssistantMessage('');
+              ctx.stderr = '';
+              void startChild().catch(reject);
+              return;
+            }
 
-          const text = stripAnsi(result.fullText || '').trim();
+            const result = this.adapter.transformResult
+              ? await this.adapter.transformResult(ctx)
+              : {
+                  fullText: stripAnsi((this.adapter.getResultText?.(ctx) || ctx.fullText || ctx.lastAssistantMessage)).trim(),
+                  metadata: this.adapter.getResultMetadata?.(ctx),
+                };
 
-          if ((code ?? 0) !== 0 && !text) {
-            const errMsg = stripAnsi(this.adapter.getErrorMessage?.(ctx) || ctx.stderr || `${this.adapter.displayName} CLI exited with code ${code}`).trim();
+            const text = stripAnsi(result.fullText || '').trim();
+
+            if ((code ?? 0) !== 0 && !text) {
+              const errMsg = stripAnsi(this.adapter.getErrorMessage?.(ctx) || ctx.stderr || `${this.adapter.displayName} CLI exited with code ${code}`).trim();
+              appendNativeMessage(session, {
+                id: this.nextId(),
+                role: 'assistant',
+                content: `Error: ${errMsg}`,
+                timestamp: new Date().toISOString(),
+              });
+              reject(new Error(errMsg));
+              return;
+            }
+
             appendNativeMessage(session, {
               id: this.nextId(),
               role: 'assistant',
-              content: `Error: ${errMsg}`,
+              content: text,
               timestamp: new Date().toISOString(),
             });
-            reject(new Error(errMsg));
-            return;
+            ctx.emitStatus('');
+            resolve({
+              fullText: text,
+              metadata: result.metadata,
+            });
+          } catch (err) {
+            reject(err);
           }
+        });
 
-          appendNativeMessage(session, {
-            id: this.nextId(),
-            role: 'assistant',
-            content: text,
-            timestamp: new Date().toISOString(),
-          });
-          ctx.emitStatus('');
-          resolve({
-            fullText: text,
-            metadata: result.metadata,
-          });
-        } catch (err) {
-          reject(err);
-        }
-      });
+        child.on('error', (err) => {
+          clearActiveRun();
+          reject(new Error(`${this.adapter.spawnErrorPrefix || `Failed to spawn ${this.adapter.cliCommand} CLI`}: ${err.message}`));
+        });
+      };
 
-      child.on('error', (err) => {
-        clearActiveRun();
-        reject(new Error(`${this.adapter.spawnErrorPrefix || `Failed to spawn ${this.adapter.cliCommand} CLI`}: ${err.message}`));
-      });
+      void startChild().catch(reject);
     });
   }
 

@@ -2,6 +2,28 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.15] — 2026-05-30
+
+### Fixed
+- **Agent Chat is compatible with current OpenClaw runtime releases again**: live turns now keep thinking, tool activity, final replies, and completion state aligned across active streams, reconnects, and refreshes instead of dropping completed messages or replaying runtime bookkeeping as chat text.
+- **Project agents use the same reliable chat path as the main Agent Chat surface**: project chat now restores live progress, replies, model labels, and persisted history cleanly after reloads, while avoiding stray tool artifacts and stale reconnect warnings in the project Agent panel.
+- **OpenClaw provider setup keeps pace with current CLI and config formats**: Codex, Gemini, and Claude setup flows handle newer OAuth/setup-token prompt shapes, register provider model catalogs in the runtime config OpenClaw now validates, and clean stale provider auth/model state more completely.
+- **Native Claude Code approvals now work from the browser**: when Claude Code asks for permission to read files or run shell commands, the portal surfaces the existing approval popup, resolves the decision, and retries the turn with the approved one-turn tool/path scope.
+- **Native Codex CLI approvals now recover from sandbox blocks**: Codex starts in a workspace-write sandbox, detects permission/read-only failures, asks for approval through the portal, and retries once with the approved execution scope instead of leaving the user stuck with a failed tool attempt.
+- **Native Gemini CLI tool execution is approval-gated**: prompts that look like file, shell, or tool work now request approval before enabling Gemini headless tool execution; denied turns continue in read-only plan mode.
+- **Native Codex and Gemini tool activity now streams visibly**: shell/tool starts and completions are shown in the same chat rail as other providers, including command output where available.
+- **Long tool-heavy histories keep the real conversation**: enhanced history now merges runtime turn events through a wider recovery window, preserves thinking/tool segments after refresh, and prevents duplicate tool-only records from pushing the user prompt and final answer out of view.
+
+### Improved
+- **Provider capability reporting is more honest**: OpenClaw, Claude Code, Codex CLI, Gemini CLI, and project agents now advertise their history, model-selection, follow-up, and approval capabilities more accurately to the UI.
+- **Model patching is more compatible with OpenClaw runtime families**: the portal now maps selected provider models to the runtime-specific form OpenClaw expects before patching sessions, reducing stale-model and unsupported-model errors.
+- **Live status rails are quieter and more deliberate**: command approvals, context maintenance, memory flushes, compaction, and reconnect states are filtered into status rails only when they are actual runtime notices.
+
+### Maintenance
+- **Release validation now covers the real browser flows**: bundled validation harnesses exercise normal Agent Chat and project Agent panel sends against a deployed portal, including live progress, reload persistence, enhanced history, and artifact filtering.
+- **Regression coverage was extended around native adapters and runtime history**: tests now protect Claude/Codex/Gemini adapter behavior, provider capability metadata, OpenClaw CLI parsing, AI setup registration, stream rail filtering, and runtime event history recovery.
+- **Public export checks were re-run for this release**: the export scanner checks sensitive-file patterns and beta/staging contamination before publishing the source tree.
+
 ## [3.25.14] — 2026-05-11
 
 ### Fixed

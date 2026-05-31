@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.14"
+readonly VERSION="3.25.15"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -578,6 +578,22 @@ update_dependencies() {
       spin "Updating OpenClaw (${current_oc} → ${latest_oc})"         "npm install -g openclaw@latest 2>/dev/null" || true
     else
       ok "OpenClaw ${current_oc:-unknown} (current)"
+    fi
+  fi
+
+  # ClawHub powers Skills marketplace search/install. Older installs may not have it.
+  if command -v npm &>/dev/null; then
+    if command -v clawhub &>/dev/null; then
+      local current_clawhub latest_clawhub
+      current_clawhub="$(npm list -g clawhub 2>/dev/null | grep 'clawhub@' | grep -oP '\d+\.\d+\.\d+' | head -1 || echo '')"
+      latest_clawhub="$(npm view clawhub version 2>/dev/null || echo '')"
+      if [[ -n "${latest_clawhub}" && "${current_clawhub}" != "${latest_clawhub}" ]]; then
+        spin "Updating ClawHub (${current_clawhub:-unknown} → ${latest_clawhub})" "npm install -g clawhub@latest 2>/dev/null" || true
+      else
+        ok "ClawHub ${current_clawhub:-installed} (current)"
+      fi
+    else
+      spin "Installing ClawHub CLI (skills marketplace)" "npm install -g clawhub@latest 2>/dev/null" || warn "ClawHub CLI install failed; Skills marketplace search/install will be unavailable until installed."
     fi
   fi
 
@@ -1404,6 +1420,15 @@ install_ai_tools() {
     ok "OpenClaw"
   fi
 
+  # ClawHub powers Skills marketplace search/install. Keep it with OpenClaw setup.
+  if ! $SKIP_OPENCLAW && command -v npm &>/dev/null; then
+    if command -v clawhub &>/dev/null; then
+      ok "ClawHub $(clawhub --cli-version 2>/dev/null | head -1 || echo '')"
+    else
+      spin "Installing ClawHub CLI (skills marketplace)" "npm install -g clawhub@latest" || warn "ClawHub CLI install failed; Skills marketplace search/install will be unavailable until installed."
+    fi
+  fi
+
   # Configure OpenClaw gateway with the portal's operator token
   if ! $SKIP_OPENCLAW && command -v openclaw &>/dev/null; then
     local oc_dir="${HOME}/.openclaw"
@@ -2036,6 +2061,63 @@ ensure_openclaw_gateway_boots_cleanly() {
   return 1
 }
 
+ensure_openclaw_sandbox_image() {
+  if $SKIP_OPENCLAW; then
+    return 0
+  fi
+  if ! command -v openclaw &>/dev/null; then
+    return 0
+  fi
+  if ! command -v docker &>/dev/null; then
+    fail "Docker is required for OpenClaw project sandboxes, but docker is not installed."
+  fi
+
+  systemctl start docker >> "$LOG_FILE" 2>&1 || true
+
+  local image="openclaw-sandbox:bookworm-slim"
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    if docker run --rm --entrypoint sh "$image" -lc 'python3 --version >/dev/null 2>&1 && command -v rg >/dev/null 2>&1 && command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1' >> "$LOG_FILE" 2>&1; then
+      ok "OpenClaw sandbox image"
+      return 0
+    fi
+    warn "Existing OpenClaw sandbox image is missing required tools; rebuilding."
+  fi
+
+  local build_dir
+  build_dir="$(mktemp -d)"
+  cat > "${build_dir}/Dockerfile" <<'SANDBOX_DOCKERFILE'
+FROM debian:bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    jq \
+    python3 \
+    ripgrep \
+  && rm -rf /var/lib/apt/lists/*
+RUN useradd --create-home --shell /bin/bash sandbox
+USER sandbox
+WORKDIR /home/sandbox
+CMD ["sleep", "infinity"]
+SANDBOX_DOCKERFILE
+
+  if ! spin "Building OpenClaw project sandbox image" "docker build -t '${image}' '${build_dir}'"; then
+    rm -rf "$build_dir"
+    fail "Failed to build ${image}. Project assistants require this image for Docker sandboxing."
+  fi
+  rm -rf "$build_dir"
+
+  if ! docker run --rm --entrypoint sh "$image" -lc 'python3 --version >/dev/null 2>&1 && command -v rg >/dev/null 2>&1 && command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1' >> "$LOG_FILE" 2>&1; then
+    fail "Built ${image}, but required sandbox tools are missing."
+  fi
+
+  ok "OpenClaw sandbox image"
+}
+
+
 auto_apply_openclaw_compatibility_hotfix() {
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
@@ -2078,6 +2160,7 @@ start_portal() {
 
   # Start OpenClaw gateway first (portal connects to it)
   if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
+    ensure_openclaw_sandbox_image
     auto_apply_openclaw_compatibility_hotfix
     ensure_openclaw_gateway_boots_cleanly || true
     sleep 3  # Let gateway fully initialize and write its config
@@ -2155,16 +2238,17 @@ print_success() {
 
   # What was installed summary
   echo -e "  ${DIM}What was installed:${NC}"
-  local node_ver="" pg_ver="" caddy_ver="" docker_ver="" ollama_ver="" openclaw_ver=""
+  local node_ver="" pg_ver="" caddy_ver="" docker_ver="" ollama_ver="" openclaw_ver="" clawhub_ver=""
   node_ver="$(node -v 2>/dev/null || echo '?')"
   pg_ver="$(psql --version 2>/dev/null | grep -oP '\d+' | head -1 || echo '?')"
   caddy_ver="$(caddy version 2>/dev/null | head -1 | cut -d' ' -f1 || echo '?')"
   docker_ver="$(docker --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1 || echo '?')"
   ollama_ver="$(ollama --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo '-')"
   openclaw_ver="$(openclaw --version 2>/dev/null | head -1 | grep -oP '\d{4}\.\d+\.\d+(-\d+)?' || echo '-')"
+  clawhub_ver="$(clawhub --cli-version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' || echo '-')"
 
   echo -e "  ${DIM}${BULLET}${NC} Node.js ${node_ver}  ${DIM}${BULLET}${NC} PostgreSQL ${pg_ver}  ${DIM}${BULLET}${NC} Caddy ${caddy_ver}"
-  echo -e "  ${DIM}${BULLET}${NC} Docker ${docker_ver}  ${DIM}${BULLET}${NC} Ollama ${ollama_ver}  ${DIM}${BULLET}${NC} OpenClaw ${openclaw_ver}"
+  echo -e "  ${DIM}${BULLET}${NC} Docker ${docker_ver}  ${DIM}${BULLET}${NC} Ollama ${ollama_ver}  ${DIM}${BULLET}${NC} OpenClaw ${openclaw_ver}  ${DIM}${BULLET}${NC} ClawHub ${clawhub_ver}"
   echo ""
 
   if use_local_profile; then
@@ -2311,7 +2395,34 @@ do_update() {
   # Clear the safety-net trap — we're about to start the service ourselves
   trap - ERR
 
-  info "Starting portal..."
+  info "Starting OpenClaw gateway and portal..."
+  if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
+    ensure_openclaw_sandbox_image
+    auto_apply_openclaw_compatibility_hotfix
+    ensure_openclaw_gateway_boots_cleanly || true
+    sleep 3
+
+    local oc_config_path="${HOME}/.openclaw/openclaw.json"
+    if [[ -f "${oc_config_path}" ]]; then
+      local live_token
+      live_token="$(python3 -c "
+import json
+try:
+    d = json.load(open('${oc_config_path}'))
+    print(d.get('gateway',{}).get('auth',{}).get('token',''))
+except: pass
+" 2>/dev/null || true)"
+      if [[ -n "${live_token}" ]] && [[ -f "${env_file}" ]]; then
+        local env_token
+        env_token="$(read_env_value "${env_file}" "OPENCLAW_GATEWAY_TOKEN" || true)"
+        if [[ "${live_token}" != "${env_token}" ]]; then
+          info "Syncing gateway token (openclaw.json → .env.production)"
+          sed -i "s/^OPENCLAW_GATEWAY_TOKEN=.*/OPENCLAW_GATEWAY_TOKEN=${live_token}/" "${env_file}"
+        fi
+      fi
+    fi
+  fi
+
   systemctl start bridgesllm-product
 
   if command -v openclaw &>/dev/null; then

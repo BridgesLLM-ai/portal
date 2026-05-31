@@ -15,7 +15,7 @@ import { getWorkspaceOwnerId } from '../utils/workspaceScope';
 import extract from 'extract-zip';
 import { desktopExec, desktopExecDetached } from '../utils/desktopEnv';
 import { getDefaultModel, getProviderStatuses } from '../services/openclawConfigManager';
-import { canonicalizeProviderModelId, normalizePortalModelId } from '../utils/openclawCli';
+import { canonicalizeProviderModelId, modelForOpenClawSessionPatch, normalizePortalModelId, resolvePortalModelFromCatalog } from '../utils/openclawCli';
 
 /** Shell-escape a filename for safe use in execSync commands */
 function shellEscape(s: string): string {
@@ -3545,6 +3545,57 @@ async function getOrCreateSession(
 
 // --- Legacy backward-compat: .assistant-* / .marcus-* → .agent-* ---
 // Auto-migrate known legacy internal files on first access.
+function normalizeGatewayModelIds(models: any[] | undefined): string[] {
+  const ids = new Set<string>();
+  for (const model of Array.isArray(models) ? models : []) {
+    const direct = typeof model === 'string' ? model : String(model?.id || model?.name || '').trim();
+    const provider = typeof model?.provider === 'string' ? model.provider.trim() : '';
+    const nestedModel = typeof model?.model === 'string' ? model.model.trim() : '';
+    const normalizedDirect = normalizePortalModelId(direct);
+    if (normalizedDirect) ids.add(normalizedDirect);
+    const canonical = canonicalizeProviderModelId(provider, nestedModel || direct);
+    if (canonical) ids.add(canonical);
+  }
+  return Array.from(ids);
+}
+
+async function resolveAllowedProjectModel(candidates: string[], requestedForWarning = ''): Promise<{ model: string; warning?: string }> {
+  const normalizedCandidates = candidates.map((candidate) => normalizePortalModelId(candidate)).filter(Boolean);
+  const requestedModel = normalizePortalModelId(requestedForWarning);
+  const hardFallback = 'openai/gpt-5.4';
+  const fallbackCandidates = [...normalizedCandidates, hardFallback];
+
+  let availableModels: string[] = [];
+  try {
+    const listed = await listGatewayModels();
+    if (listed.ok) availableModels = normalizeGatewayModelIds(listed.models);
+  } catch {}
+
+  if (!availableModels.length) {
+    return { model: fallbackCandidates[0] || hardFallback };
+  }
+
+  for (const candidate of fallbackCandidates) {
+    const resolved = resolvePortalModelFromCatalog(candidate, availableModels);
+    if (resolved) {
+      return {
+        model: resolved,
+        warning: requestedModel && requestedModel !== resolved
+          ? `Requested model ${requestedModel} is not available in the current OpenClaw catalog; using ${resolved}.`
+          : undefined,
+      };
+    }
+  }
+
+  const fallback = availableModels[0] || hardFallback;
+  return {
+    model: fallback,
+    warning: requestedModel && requestedModel !== fallback
+      ? `Requested model ${requestedModel} is not available in the current OpenClaw catalog; using ${fallback}.`
+      : undefined,
+  };
+}
+
 function migrateAssistantFiles(projectDir: string) {
   const migrations = [
     ['.assistant-memory.md', '.agent-memory.md'],
@@ -3595,30 +3646,40 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
       }
     } catch {}
     let currentSessionModel = '';
-    if (requestedModel) {
-      try {
-        const sessionInfo = await getSessionInfo(sessionKey);
-        if (sessionInfo.ok) {
-          const rawModel = String(sessionInfo.data?.model || '');
-          const provider = String(
-            sessionInfo.data?.modelProvider
-            || sessionInfo.data?.currentModel?.provider
-            || sessionInfo.data?.agentRuntime?.id
-            || ''
-          );
-          currentSessionModel = canonicalizeProviderModelId(provider, rawModel) || normalizePortalModelId(rawModel);
+    let currentSessionInfo: any = null;
+    try {
+      const sessionInfo = await getSessionInfo(sessionKey);
+      if (sessionInfo.ok) {
+        currentSessionInfo = sessionInfo.data;
+        const rawModel = String(sessionInfo.data?.model || '');
+        const provider = String(
+          sessionInfo.data?.modelProvider
+          || sessionInfo.data?.currentModel?.provider
+          || sessionInfo.data?.agentRuntime?.id
+          || ''
+        );
+        currentSessionModel = canonicalizeProviderModelId(provider, rawModel) || normalizePortalModelId(rawModel);
+        if (!sessionInfo.data?.reasoningLevel) {
+          await gatewayRpcCall('sessions.patch', { key: sessionKey, reasoningLevel: 'on' });
         }
-      } catch {}
-    }
+      }
+    } catch {}
 
-    const selectedModel = requestedModel || currentSessionModel || storedSessionModel || getDefaultModel() || 'openai/gpt-5.4';
+    const modelResolution = await resolveAllowedProjectModel([
+      requestedModel,
+      currentSessionModel,
+      storedSessionModel,
+      getDefaultModel() || '',
+    ], requestedModel);
+    const selectedModel = modelResolution.model;
 
     // Patch the session model before any init traffic only when the caller asked
     // for a specific model. Do not silently reset an existing session back to
     // the gateway default on reload.
     if (requestedModel && selectedModel && currentSessionModel !== selectedModel) {
       try {
-        await patchSessionModel(sessionKey, selectedModel);
+        const runtimeModel = modelForOpenClawSessionPatch(currentSessionInfo, selectedModel);
+        await patchSessionModel(sessionKey, runtimeModel);
       } catch {}
     }
 
@@ -3647,6 +3708,7 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
       sessionKey,
       agentId,
       model: selectedModel,
+      modelWarning: modelResolution.warning || null,
       initialized: true,
     });
   } catch (error: any) {
@@ -4281,7 +4343,11 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
 
     const requestedModel = normalizePortalModelId(model || '');
-    const selectedModel = requestedModel || getDefaultModel() || 'openai/gpt-5.4';
+    const modelResolution = await resolveAllowedProjectModel([
+      requestedModel,
+      getDefaultModel() || '',
+    ], requestedModel);
+    const selectedModel = modelResolution.model;
     
     // Get or create session (Phase 2: per-project agent isolation)
     const { sessionKey, agentId, needsInit, stableSlug } = await getOrCreateSession(
@@ -4304,7 +4370,13 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
     // every send turns normal chat into a transport timeout lottery.
     if (selectedModel && modelChanged) {
       try {
-        await patchSessionModel(sessionKey, selectedModel);
+        let currentSessionInfo: any = null;
+        try {
+          const sessionInfo = await getSessionInfo(sessionKey);
+          if (sessionInfo.ok) currentSessionInfo = sessionInfo.data;
+        } catch {}
+        const runtimeModel = modelForOpenClawSessionPatch(currentSessionInfo, selectedModel);
+        await patchSessionModel(sessionKey, runtimeModel || selectedModel);
       } catch {}
     }
     
@@ -4412,7 +4484,7 @@ ${message}`;
     fs.writeFileSync(sessionStatePath, JSON.stringify(updatedMeta, null, 2), 'utf-8');
 
     // Return immediately - frontend will poll for response
-    res.json({ sent: true, sessionKey });
+    res.json({ sent: true, sessionKey, model: selectedModel, modelWarning: modelResolution.warning || null });
   } catch (error: any) {
     console.error('[Agent Send] Error:', error.message);
     res.status(500).json({ error: 'Failed to send message', detail: error.message });

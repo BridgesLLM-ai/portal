@@ -53,6 +53,7 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
   const eventSourceRef = useRef<EventSource | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef(0);
+  const intentionalCloseRef = useRef(false);
 
   // Resolve an approval
   const resolveApproval = useCallback(async (
@@ -94,6 +95,7 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
 
     // Close existing connection if any
     if (eventSourceRef.current) {
+      intentionalCloseRef.current = true;
       eventSourceRef.current.close();
       eventSourceRef.current = null;
     }
@@ -109,6 +111,7 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
     
     debugLog('[useExecApprovals] Connecting to SSE stream:', url);
     
+    intentionalCloseRef.current = false;
     const es = new EventSource(url, { withCredentials: true });
     eventSourceRef.current = es;
 
@@ -152,10 +155,14 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
     };
 
     es.onerror = (err) => {
-      console.error('[useExecApprovals] SSE error:', err);
+      if (intentionalCloseRef.current || eventSourceRef.current !== es) {
+        return;
+      }
+      if (DEBUG_EXEC_APPROVALS) console.error('[useExecApprovals] SSE error:', err);
       setIsConnected(false);
       
       // Close and schedule reconnect
+      intentionalCloseRef.current = true;
       es.close();
       eventSourceRef.current = null;
       
@@ -178,6 +185,7 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
         reconnectTimerRef.current = null;
       }
       if (eventSourceRef.current) {
+        intentionalCloseRef.current = true;
         eventSourceRef.current.close();
         eventSourceRef.current = null;
       }
@@ -193,6 +201,7 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
         reconnectTimerRef.current = null;
       }
       if (eventSourceRef.current) {
+        intentionalCloseRef.current = true;
         eventSourceRef.current.close();
         eventSourceRef.current = null;
       }

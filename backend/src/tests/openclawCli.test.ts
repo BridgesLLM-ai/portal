@@ -1,4 +1,4 @@
-import { canonicalizeProviderModelId, extractJsonFromCliOutput } from '../utils/openclawCli';
+import { canonicalizeProviderModelId, extractJsonFromCliOutput, modelForOpenClawSessionPatch, resolvePortalModelFromCatalog } from '../utils/openclawCli';
 
 describe('openclawCli helpers', () => {
   test('canonicalizeProviderModelId prefixes provider-specific runtime ids', () => {
@@ -15,6 +15,33 @@ describe('openclawCli helpers', () => {
     expect(canonicalizeProviderModelId('google-gemini-cli', 'gemini-3.1-flash')).toBe('google-gemini-cli/gemini-3-flash-preview');
     expect(canonicalizeProviderModelId('google', 'gemini-3.1-pro')).toBe('google/gemini-3.1-pro-preview');
     expect(canonicalizeProviderModelId('openai-codex', 'gpt-5.4-codex')).toBe('openai-codex/gpt-5.4');
+  });
+
+  test('resolvePortalModelFromCatalog chooses live catalog aliases and rejects unavailable full ids', () => {
+    const catalog = ['openai/gpt-5.5', 'openai/gpt-5.4', 'anthropic/claude-sonnet-4-6'];
+    expect(resolvePortalModelFromCatalog('openai-codex/gpt-5.5', catalog)).toBe('openai/gpt-5.5');
+    expect(resolvePortalModelFromCatalog('openai-codex/gpt-5.5', ['openai/gpt-5.5', 'openai-codex/gpt-5.5'])).toBe('openai-codex/gpt-5.5');
+    expect(resolvePortalModelFromCatalog('gpt-5.4', catalog)).toBe('openai/gpt-5.4');
+    expect(resolvePortalModelFromCatalog('google-gemini-cli/gemini-2.5-flash', catalog)).toBe('');
+  });
+
+  test('modelForOpenClawSessionPatch keeps Codex runtime sessions in the Codex model family', () => {
+    expect(modelForOpenClawSessionPatch(
+      { agentRuntime: { id: 'codex' }, modelProvider: 'openai', model: 'gpt-5.5' },
+      'openai/gpt-5.5',
+    )).toBe('openai-codex/gpt-5.5');
+    expect(modelForOpenClawSessionPatch(
+      { modelProvider: 'openai-codex', model: 'gpt-5.5' },
+      'openai-codex/gpt-5.5',
+    )).toBe('openai-codex/gpt-5.5');
+    expect(modelForOpenClawSessionPatch(
+      { agentRuntime: { id: 'codex' }, modelProvider: 'openai-codex', model: 'gpt-5.5' },
+      'gpt-5.5',
+    )).toBe('openai-codex/gpt-5.5');
+    expect(modelForOpenClawSessionPatch(
+      { modelProvider: 'openai', model: 'gpt-5.5' },
+      'openai/gpt-5.5',
+    )).toBe('openai/gpt-5.5');
   });
 
   test('extractJsonFromCliOutput strips non-JSON prefix noise', () => {

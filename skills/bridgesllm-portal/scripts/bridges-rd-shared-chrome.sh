@@ -3,6 +3,12 @@
 # Always starts clean, pins device scale at 1, and matches the active VNC resolution.
 set -euo pipefail
 
+DISABLE_FILE="${BRIDGES_SHARED_CHROME_DISABLE_FILE:-/run/bridges-shared-chrome.disabled}"
+if [ -e "$DISABLE_FILE" ]; then
+  echo "Shared Chrome launch disabled: $(cat "$DISABLE_FILE" 2>/dev/null || true)" >&2
+  exit 75
+fi
+
 USER_URL="${1:-https://www.google.com/}"
 
 # Never let root own or mutate the shared browser profile.
@@ -515,9 +521,14 @@ fit_active_window_to_vnc() {
   --no-first-run \
   --no-default-browser-check \
   --no-sandbox \
+  --disable-gpu \
   --disable-gpu-sandbox \
+  --disable-gpu-compositing \
+  --disable-accelerated-2d-canvas \
+  --disable-accelerated-video-decode \
   --disable-setuid-sandbox \
   --disable-dev-shm-usage \
+  --renderer-process-limit=2 \
   --disable-background-networking \
   --disable-sync \
   --disable-translate \

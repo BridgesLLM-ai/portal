@@ -408,7 +408,8 @@ function resolveAppApiTarget(proxiedPath: string, target: string, req: any): str
   const envKey = 'APP_API_TARGET_' + namespace.toUpperCase().replace(/-/g, '_');
   const envTarget = process.env[envKey];
   if (envTarget) return envTarget + target;
-  const port = getAppPort(namespace);
+  const deployId = typeof req.params?.deployId === 'string' ? req.params.deployId : '';
+  const port = (deployId ? getAppPort(deployId) : null) || getAppPort(namespace);
   if (port) return `http://127.0.0.1:${port}${target}`;
   return req.protocol + '://' + req.get('host') + target;
 }
@@ -883,31 +884,39 @@ const startServer = async () => {
     // Load blocked IPs from database
     await loadBlockedIPs();
 
-    // Start metrics collection
-    metricsInterval = setInterval(async () => {
-      const m = await collectMetrics();
-      if (m) {
-        metricsNs.emit('metrics', {
-          ...m,
-          memoryTotal: m.memoryTotal.toString(),
-          diskTotal: m.diskTotal.toString(),
-          networkIn: m.networkIn.toString(),
-          networkOut: m.networkOut.toString(),
-        });
-      }
-    }, 30000);
+    // Start metrics collection unless explicitly disabled for CPU containment.
+    if (process.env.PORTAL_DISABLE_METRICS_COLLECTION === '1') {
+      console.warn('⚠️ Metrics collection disabled by PORTAL_DISABLE_METRICS_COLLECTION=1');
+    } else {
+      metricsInterval = setInterval(async () => {
+        const m = await collectMetrics();
+        if (m) {
+          metricsNs.emit('metrics', {
+            ...m,
+            memoryTotal: m.memoryTotal.toString(),
+            diskTotal: m.diskTotal.toString(),
+            networkIn: m.networkIn.toString(),
+            networkOut: m.networkOut.toString(),
+          });
+        }
+      }, 30000);
 
-    // Collect initial metrics
-    collectMetrics();
+      // Collect initial metrics
+      collectMetrics();
+    }
 
-    // Start OpenClaw log watcher for system alerts
-    startLogWatcher();
+    if (process.env.PORTAL_DISABLE_OPENCLAW_BACKGROUND === '1') {
+      console.warn('⚠️ OpenClaw background watchers disabled by PORTAL_DISABLE_OPENCLAW_BACKGROUND=1');
+    } else {
+      // Start OpenClaw log watcher for system alerts
+      startLogWatcher();
 
-    // Start OpenClaw agent status watcher
-    startStatusWatcher();
+      // Start OpenClaw agent status watcher
+      startStatusWatcher();
 
-    // Initialize persistent WebSocket connection to OpenClaw gateway for exec approvals
-    initPersistentGatewayWs();
+      // Initialize persistent WebSocket connection to OpenClaw gateway for exec approvals
+      initPersistentGatewayWs();
+    }
 
     // Initialize cron jobs
     initializeCronJobs();

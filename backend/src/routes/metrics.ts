@@ -1,51 +1,78 @@
 import { Router, Request, Response } from 'express';
 import si from 'systeminformation';
 import os from 'os';
+import fs from 'fs';
 import { authenticateToken } from '../middleware/auth';
 import { prisma } from '../config/database';
 
 const router = Router();
 
+function collectLightweightHostMetrics() {
+  const loadAvg = os.loadavg(); // [1min, 5min, 15min]
+  const cpuCores = Math.max(os.cpus().length || 1, 1);
+  const memoryTotal = os.totalmem();
+  const memoryFree = os.freemem();
+  const memoryUsed = Math.max(memoryTotal - memoryFree, 0);
+
+  let processCount = 0;
+  try {
+    processCount = fs.readdirSync('/proc').filter(name => /^\d+$/.test(name)).length;
+  } catch { /* /proc may be unavailable in some installs */ }
+
+  let diskTotal = 0;
+  let diskUsed = 0;
+  try {
+    const statfs = (fs as any).statfsSync('/');
+    const blockSize = Number(statfs.bsize || statfs.frsize || 0);
+    diskTotal = Number(statfs.blocks || 0) * blockSize;
+    const diskAvailable = Number(statfs.bavail ?? statfs.bfree ?? 0) * blockSize;
+    diskUsed = Math.max(diskTotal - diskAvailable, 0);
+  } catch { /* non-fatal */ }
+
+  return {
+    cpuUsage: Math.min(100, Math.max(0, (loadAvg[0] / cpuCores) * 100)),
+    memoryUsage: memoryTotal > 0 ? (memoryUsed / memoryTotal) * 100 : 0,
+    memoryTotal,
+    memoryUsed,
+    memoryFree,
+    diskUsage: diskTotal > 0 ? (diskUsed / diskTotal) * 100 : 0,
+    diskTotal,
+    diskUsed,
+    networkIn: 0,
+    networkOut: 0,
+    processCount,
+    loadAvg,
+    cpuCores,
+  };
+}
+
 export async function collectMetrics() {
   try {
-    const [cpu, mem, disk, net, procs] = await Promise.all([
-      si.currentLoad(),
-      si.mem(),
-      si.fsSize(),
-      si.networkStats(),
-      si.processes(),
-    ]);
-
-    const diskMain = disk[0] || { use: 0, size: 0 };
-    const netTotal = net.reduce(
-      (acc, n) => ({
-        rx: acc.rx + (n.rx_sec || 0),
-        tx: acc.tx + (n.tx_sec || 0),
-      }),
-      { rx: 0, tx: 0 }
-    );
-
-    const loadAvg = os.loadavg(); // [1min, 5min, 15min]
+    // Emergency CPU containment: avoid systeminformation.processes(), which shells
+    // out into a giant `/proc/*/stat` scan on this host. During throttling that can
+    // wedge the portal event loop and make even /health time out.
+    const host = collectLightweightHostMetrics();
 
     const metrics = await prisma.metrics.create({
       data: {
-        cpuUsage: cpu.currentLoad || 0,
-        memoryUsage: mem.total > 0 ? ((mem.total - mem.available) / mem.total) * 100 : 0,
-        memoryTotal: BigInt(mem.total),
-        diskUsage: diskMain.use || 0,
-        diskTotal: BigInt(diskMain.size || 0),
-        networkIn: BigInt(Math.round(netTotal.rx)),
-        networkOut: BigInt(Math.round(netTotal.tx)),
-        processCount: procs.all || 0,
-        loadAverage: loadAvg,
+        cpuUsage: host.cpuUsage,
+        memoryUsage: host.memoryUsage,
+        memoryTotal: BigInt(host.memoryTotal),
+        diskUsage: host.diskUsage,
+        diskTotal: BigInt(host.diskTotal),
+        networkIn: BigInt(host.networkIn),
+        networkOut: BigInt(host.networkOut),
+        processCount: host.processCount,
+        loadAverage: host.loadAvg,
         metadata: {
-          memoryUsedBytes: mem.used,
-          memoryFreeBytes: mem.available,
-          diskUsedBytes: diskMain.used || 0,
+          memoryUsedBytes: host.memoryUsed,
+          memoryFreeBytes: host.memoryFree,
+          diskUsedBytes: host.diskUsed,
           uptimeSeconds: os.uptime(),
-          cpuCores: os.cpus().length,
+          cpuCores: host.cpuCores,
           hostname: os.hostname(),
           platform: os.platform(),
+          lightweightCollector: true,
         },
       },
     });

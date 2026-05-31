@@ -98,6 +98,13 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.15 (May 30, 2026)
+- **Current OpenClaw runtime compatibility is restored**: Agent Chat and project agents keep live progress, tool activity, final replies, and refresh history aligned on newer OpenClaw releases.
+- **CLI-backed providers are usable out of the box again**: Claude Code, Codex CLI, and Gemini CLI now surface browser approval prompts when tool execution needs permission, with provider-specific retry behavior after approval.
+- **Provider setup is tougher across Claude, Codex, and Gemini**: OAuth/setup-token handoffs, provider model registration, stale auth cleanup, and runtime model patching handle newer CLI/config formats more reliably.
+- **Long-running and tool-heavy chats survive reloads better**: runtime turn-event recovery preserves thinking/tool segments and prevents duplicate tool-only records from hiding the real prompt and final answer.
+- **Release validation now exercises real browser chat flows**: the shipped validation harnesses cover normal Agent Chat and project Agent panel sends, including live status, reload persistence, enhanced history, and artifact filtering.
+
 ### v3.25.14 (May 11, 2026)
 - **Existing Remote Desktop installs repair missing clipboard tools during update**: the updater now runs the Remote Desktop package check before reconfiguring services, so `xclip`/`xsel` are installed on already-deployed servers instead of only on fresh installs.
 

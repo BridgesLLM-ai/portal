@@ -5,6 +5,7 @@ import { useDropzone } from 'react-dropzone';
 import { projectsAPI, aiAPI, alertsAPI } from '../api/endpoints';
 import { extractError, logError } from '../utils/errorHelpers';
 import ConfirmDialog from '../components/ConfirmDialog';
+import ViewportOverlay from '../components/ViewportOverlay';
 import { useIsMobile } from '../hooks/useIsMobile';
 import MobileOverflowMenu, { MenuAction } from '../components/mobile/MobileOverflowMenu';
 import sounds from '../utils/sounds';
@@ -1894,13 +1895,14 @@ export default function AppsPage() {
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="h-full flex flex-col">
       {/* Enhanced Toast with expandable details */}
-      <AnimatePresence>
-        {toast && (
-          <motion.div
-            initial={{ opacity: 0, y: -20 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -20 }}
-            className={`fixed top-4 right-4 z-[100] rounded-xl text-sm font-medium shadow-2xl backdrop-blur-xl max-w-lg border ${
+      {toast && (
+        <ViewportOverlay anchor="top-right" zIndex={1200} className="w-[min(32rem,calc(100vw-2rem))]">
+          <AnimatePresence>
+            <motion.div
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className={`rounded-xl text-sm font-medium shadow-2xl backdrop-blur-xl border ${
               toast.type === 'success' ? 'bg-emerald-500/90 border-emerald-400/30 text-white' :
               toast.type === 'error' ? 'bg-red-900/95 border-red-500/50 text-red-100' :
               'bg-blue-500/90 border-blue-400/30 text-white'
@@ -1951,9 +1953,10 @@ export default function AppsPage() {
                 )}
               </div>
             )}
-          </motion.div>
-        )}
-      </AnimatePresence>
+            </motion.div>
+          </AnimatePresence>
+        </ViewportOverlay>
+      )}
 
       {/* Fullscreen Editor Overlay */}
       <AnimatePresence>
@@ -3047,13 +3050,15 @@ export default function AppsPage() {
 
       {/* Floating Agent Button */}
       {selectedProject && !agentChatOpen && (
-        <button
-          onClick={openAgentChat}
-          className="fixed bottom-4 right-4 z-40 w-12 h-12 rounded-full bg-purple-500/20 border border-purple-500/30 flex items-center justify-center shadow-lg shadow-purple-500/10 hover:bg-purple-500/30 transition-colors"
-          title="Chat with Agent"
-        >
-          <Bot size={20} className="text-purple-400" />
-        </button>
+        <ViewportOverlay anchor="bottom-right" zIndex={1000}>
+          <button
+            onClick={openAgentChat}
+            className="w-12 h-12 rounded-full bg-purple-500/20 border border-purple-500/30 flex items-center justify-center shadow-lg shadow-purple-500/10 hover:bg-purple-500/30 transition-colors"
+            title="Chat with Agent"
+          >
+            <Bot size={20} className="text-purple-400" />
+          </button>
+        </ViewportOverlay>
       )}
 
       {/* Create Project Dialog */}

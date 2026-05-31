@@ -103,6 +103,12 @@ export function mergeThinkingStream(
   if (opts?.replace) return chunk;
   if (!current) return chunk;
   if (chunk === current) return current;
+  const normalizedCurrent = current.trim().toLowerCase();
+  const normalizedChunk = chunk.trim().toLowerCase();
+  if ((normalizedCurrent === 'thinking…' || normalizedCurrent === 'thinking...')
+    && normalizedChunk !== normalizedCurrent) {
+    return chunk;
+  }
   if (chunk.startsWith(current)) return chunk;
 
   const smartDedupeMinChars = 8;
@@ -122,7 +128,7 @@ export function mergeThinkingStream(
   return current + chunk;
 }
 
-const GENERIC_THINKING_PLACEHOLDER_RE = /^(?:🧠\s*)?agent is thinking(?:\.|…){0,3}$/i;
+const GENERIC_THINKING_PLACEHOLDER_RE = /^(?:🧠\s*)?(?:agent is thinking|thinking)(?:\s*(?:\.|…|\.\.\.))*$/i;
 
 export function extractThinkingChunk(
   eventType: string | undefined,
@@ -149,6 +155,6 @@ export function extractThinkingChunk(
     return '';
   }
 
-  if (cleaned.includes('thinking') || cleaned.startsWith('🧠')) return text;
+  if (cleaned.startsWith('🧠')) return text;
   return hasAssistantText ? '' : text;
 }

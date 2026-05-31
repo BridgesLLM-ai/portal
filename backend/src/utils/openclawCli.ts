@@ -87,6 +87,61 @@ export function normalizePortalModelId(rawModel: string | null | undefined): str
   return mapped;
 }
 
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+export function getPortalModelCatalogAliases(rawModel: string | null | undefined): string[] {
+  const normalized = normalizePortalModelId(rawModel);
+  if (!normalized) return [];
+
+  const aliases = [normalized];
+  const addProviderAlias = (from: string, to: string) => {
+    if (normalized.startsWith(`${from}/`)) {
+      aliases.push(`${to}/${normalized.slice(from.length + 1)}`);
+    }
+  };
+
+  addProviderAlias('openai-codex', 'openai');
+  addProviderAlias('openai', 'openai-codex');
+  addProviderAlias('google-gemini-cli', 'google');
+  addProviderAlias('google', 'google-gemini-cli');
+  addProviderAlias('claude-cli', 'anthropic');
+  addProviderAlias('anthropic', 'claude-cli');
+
+  if (!normalized.includes('/')) {
+    if (/^(gpt-|o\d|codex)/i.test(normalized)) {
+      aliases.push(`openai/${normalized}`, `openai-codex/${normalized}`);
+    }
+    if (normalized.startsWith('gemini-')) {
+      aliases.push(`google/${normalized}`, `google-gemini-cli/${normalized}`);
+    }
+  }
+
+  return uniqueStrings(aliases.map((alias) => normalizePortalModelId(alias)));
+}
+
+export function resolvePortalModelFromCatalog(rawModel: string | null | undefined, availableModels: string[]): string {
+  const aliases = getPortalModelCatalogAliases(rawModel);
+  if (!aliases.length) return '';
+
+  const catalog = uniqueStrings(availableModels.map((model) => normalizePortalModelId(model)));
+  if (!catalog.length) return aliases[0];
+
+  for (const alias of aliases) {
+    if (catalog.includes(alias)) return alias;
+  }
+
+  const normalized = normalizePortalModelId(rawModel);
+  if (normalized && !normalized.includes('/')) {
+    const suffix = `/${normalized}`;
+    const suffixMatch = catalog.find((model) => model.endsWith(suffix));
+    if (suffixMatch) return suffixMatch;
+  }
+
+  return '';
+}
+
 function translateProviderOwnedAlias(provider: string, normalized: string): string {
   if (!provider || !normalized) return normalized;
 
@@ -168,6 +223,37 @@ export function canonicalizeProviderModelId(providerId: string | null | undefine
   }
 
   return `${provider}/${translated}`;
+}
+
+export function getOpenClawRuntimeHint(sessionInfo: any): string {
+  return [
+    sessionInfo?.agentRuntime?.id,
+    sessionInfo?.agentRuntime?.label,
+    sessionInfo?.runtime,
+    sessionInfo?.runtimeLabel,
+    sessionInfo?.modelProvider,
+    sessionInfo?.currentModel?.provider,
+    sessionInfo?.provider,
+  ].map((value) => String(value || '').trim().toLowerCase()).filter(Boolean).join(' ');
+}
+
+export function modelForOpenClawSessionPatch(sessionInfo: any, portalModel: string): string {
+  const normalized = normalizePortalModelId(portalModel);
+  if (!normalized) return '';
+
+  // OpenClaw 2026.5 keeps Codex-owned OpenAI models in the openai-codex provider
+  // family. Sending openai/gpt-* to a Codex-runtime session creates a split-brain
+  // state: modelProvider=openai with agentRuntime=codex, which the harness rejects.
+  const runtimeHint = getOpenClawRuntimeHint(sessionInfo);
+  const codexRuntime = /\bcodex\b/.test(runtimeHint) || normalized.startsWith('openai-codex/');
+  if (codexRuntime) {
+    if (normalized.startsWith('openai-codex/')) return normalized;
+    if (normalized.startsWith('openai/')) return `openai-codex/${normalized.slice('openai/'.length)}`;
+    if (normalized.startsWith('codex/')) return `openai-codex/${normalized.slice('codex/'.length)}`;
+    if (/^(gpt-|o\d|codex)/i.test(normalized)) return `openai-codex/${normalized}`;
+  }
+
+  return normalized;
 }
 
 export function extractJsonFromCliOutput(rawOutput: string): string {

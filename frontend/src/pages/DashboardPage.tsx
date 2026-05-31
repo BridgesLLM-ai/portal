@@ -30,6 +30,9 @@ type OpenClawVersionStatus = {
   installedPackageMtime: string | null;
   probeOk: boolean;
   probeError?: string | null;
+  cached?: boolean;
+  lightweight?: boolean;
+  checkedAt?: string;
 };
 
 /* ─── helpers ──────────────────────────────────────────── */
@@ -307,9 +310,37 @@ export default function DashboardPage() {
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
+  const applyGatewayHealth = useCallback((gateway: any) => {
+    const versionStatus = gateway?.openclawVersion || null;
+    setOpenClawVersion(versionStatus);
+    if (versionStatus?.restartRecommended) {
+      setOpenClawStatus('misconfigured');
+      setOpenClawIssues(gateway?.issues || [versionStatus.reason || 'OpenClaw gateway is running a stale version and should be restarted.']);
+    } else if (gateway?.ok) {
+      setOpenClawStatus('connected');
+      setOpenClawIssues([]);
+    } else if (gateway?.connected && !gateway?.wsConnected) {
+      setOpenClawStatus('offline');
+      setOpenClawIssues(gateway?.issues || ['Gateway is reachable but agent chat connection failed. Try restarting the portal service.']);
+    } else if (gateway?.connected && !gateway?.modelsConfigured) {
+      setOpenClawStatus('misconfigured');
+      setOpenClawIssues(gateway?.issues || ['No AI models configured. Run "openclaw onboard" on the server.']);
+    } else {
+      setOpenClawStatus('offline');
+      setOpenClawIssues(gateway?.issues || []);
+    }
+  }, []);
+
+  const needsForcedGatewayVersionProbe = useCallback((gateway: any) => {
+    const status = gateway?.openclawVersion;
+    const reason = String(status?.reason || '').toLowerCase();
+    return Boolean(status?.lightweight || reason.includes('probe scheduled') || reason.includes('probe already running'));
+  }, []);
+
   // Defer non-critical startup checks so the main dashboard cards can settle first
   useEffect(() => {
     let cancelled = false;
+    let forceProbeTimer: number | undefined;
     const timer = window.setTimeout(async () => {
       try {
         const [al, upd, gateway] = await Promise.all([
@@ -322,23 +353,16 @@ export default function DashboardPage() {
           client.get('/gateway/health', { _silent: true } as any).then(r => r.data).catch(() => null),
         ]);
         if (cancelled) return;
-        const versionStatus = gateway?.openclawVersion || null;
-        setOpenClawVersion(versionStatus);
-        if (versionStatus?.restartRecommended) {
-          setOpenClawStatus('misconfigured');
-          setOpenClawIssues(gateway?.issues || [versionStatus.reason || 'OpenClaw gateway is running a stale version and should be restarted.']);
-        } else if (gateway?.ok) {
-          setOpenClawStatus('connected');
-          setOpenClawIssues([]);
-        } else if (gateway?.connected && !gateway?.wsConnected) {
-          setOpenClawStatus('offline');
-          setOpenClawIssues(gateway?.issues || ['Gateway is reachable but agent chat connection failed. Try restarting the portal service.']);
-        } else if (gateway?.connected && !gateway?.modelsConfigured) {
-          setOpenClawStatus('misconfigured');
-          setOpenClawIssues(gateway?.issues || ['No AI models configured. Run "openclaw onboard" on the server.']);
-        } else {
-          setOpenClawStatus('offline');
-          setOpenClawIssues(gateway?.issues || []);
+        applyGatewayHealth(gateway);
+        if (needsForcedGatewayVersionProbe(gateway)) {
+          forceProbeTimer = window.setTimeout(async () => {
+            try {
+              const { data } = await client.get('/gateway/health?forceVersion=1', { _silent: true } as any);
+              if (!cancelled) applyGatewayHealth(data);
+            } catch (err) {
+              if (!cancelled) console.error('[Dashboard] Forced OpenClaw version probe failed:', err);
+            }
+          }, 1600);
         }
         if (upd) {
           setUpdateStatus(upd);
@@ -367,8 +391,9 @@ export default function DashboardPage() {
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
+      if (forceProbeTimer !== undefined) window.clearTimeout(forceProbeTimer);
     };
-  }, [canRunSelfUpdate]);
+  }, [applyGatewayHealth, canRunSelfUpdate, needsForcedGatewayVersionProbe]);
 
   // Fallback polling if WebSocket disconnects
   useEffect(() => {

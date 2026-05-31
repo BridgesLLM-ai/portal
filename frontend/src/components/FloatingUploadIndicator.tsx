@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, ChevronUp, ChevronDown, Pause, Play, XCircle, CheckCircle, AlertCircle } from 'lucide-react';
 import { useUploadStore, GlobalUpload } from '../stores/uploadStore';
 import { formatBytes, formatSpeed, formatTime } from '../utils/smartUpload';
+import ViewportOverlay from './ViewportOverlay';
 
 function UploadCard({ u }: { u: GlobalUpload }) {
   const pct = Math.round(u.progress?.percentage || 0);
@@ -92,12 +93,13 @@ export default function FloatingUploadIndicator() {
   const hasActive = activeUploads.length > 0;
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 20, scale: 0.9 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={{ opacity: 0, y: 20, scale: 0.9 }}
-      className="fixed bottom-4 left-4 z-[90]"
-    >
+    <ViewportOverlay anchor="bottom-left" zIndex={1100} className="max-w-[calc(100vw-2rem)]">
+      <motion.div
+        initial={{ opacity: 0, y: 20, scale: 0.9 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: 20, scale: 0.9 }}
+        className="max-w-full"
+      >
       {/* Collapsed pill */}
       <button
         onClick={() => setExpanded(!expanded)}
@@ -133,7 +135,7 @@ export default function FloatingUploadIndicator() {
             initial={{ opacity: 0, y: 10, height: 0 }}
             animate={{ opacity: 1, y: 0, height: 'auto' }}
             exit={{ opacity: 0, y: 10, height: 0 }}
-            className="mt-2 w-80 bg-[#0D1130]/95 border border-white/10 rounded-xl backdrop-blur-xl shadow-2xl overflow-hidden"
+            className="mt-2 w-[min(20rem,calc(100vw-2rem))] bg-[#0D1130]/95 border border-white/10 rounded-xl backdrop-blur-xl shadow-2xl overflow-hidden"
           >
             {activeUploads.length > 0 && (
               <>
@@ -158,6 +160,7 @@ export default function FloatingUploadIndicator() {
           </motion.div>
         )}
       </AnimatePresence>
-    </motion.div>
+      </motion.div>
+    </ViewportOverlay>
   );
 }

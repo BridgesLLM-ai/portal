@@ -44,6 +44,8 @@ export interface SenderIdentity {
   label: string;
   /** Stable user ID from the auth system */
   userId: string;
+  /** Portal role, when available, for provider-side approval gating. */
+  role?: string;
 }
 
 /** Result returned after a (possibly streamed) sendMessage completes. */

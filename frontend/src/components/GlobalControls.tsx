@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import CommandPalette from './CommandPalette';
 import KeyboardShortcutsHelp from './KeyboardShortcutsHelp';
+import ViewportOverlay from './ViewportOverlay';
 
 interface GlobalControlsProps {
   children: React.ReactNode;
@@ -92,7 +93,7 @@ export default function GlobalControls({ children, onToggleSidebar, onToggleAssi
 
       {/* Keyboard hint overlay */}
       {showKeyboardHint && (
-        <div className="fixed bottom-6 right-6 z-[100] max-w-xs">
+        <ViewportOverlay anchor="bottom-right" zIndex={1100} margin="1.5rem" className="max-w-[min(20rem,calc(100vw-3rem))]">
           <div className="bg-[#0A0E27]/95 border border-emerald-500/30 rounded-xl p-4 shadow-2xl backdrop-blur-xl animate-fade-in">
             <div className="flex items-start justify-between gap-3 mb-2">
               <div className="flex-1">
@@ -115,7 +116,7 @@ export default function GlobalControls({ children, onToggleSidebar, onToggleAssi
               Press <kbd className="px-1 py-0.5 rounded bg-slate-800 text-emerald-400 font-mono">Shift ?</kbd> to see all shortcuts
             </div>
           </div>
-        </div>
+        </ViewportOverlay>
       )}
     </>
   );

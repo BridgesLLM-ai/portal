@@ -594,7 +594,13 @@ function GatewaySessionsPanel({ onViewSession }: { onViewSession: (sessionKey: s
 /* ─── Session Controls (real OpenClaw thinking + native OpenClaw fast mode) ───────────────────── */
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
+type ReasoningVisibility = 'off' | 'on' | 'stream';
 const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive'];
+const REASONING_VISIBILITY_LABELS: Record<ReasoningVisibility, string> = {
+  off: 'Hidden',
+  on: 'Visible',
+  stream: 'Stream',
+};
 const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
   off: 'Off',
   minimal: 'Minimal',
@@ -618,6 +624,7 @@ function supportsOpenClawFastModeModel(model?: string | null): boolean {
 interface SessionControlsProps {
   loading?: boolean;
   thinkingLevel: ThinkingLevel;
+  reasoningVisibility: ReasoningVisibility;
   fastModeEnabled: boolean;
   compactionModelOverride: string;
   heartbeatModel: string;
@@ -632,6 +639,7 @@ interface SessionControlsProps {
   onRefreshCompatibilityHotfix?: () => void;
   onApplyCompatibilityHotfix?: () => void;
   onSetThinkingLevel: (level: ThinkingLevel) => void;
+  onSetReasoningVisibility: (level: ReasoningVisibility) => void;
   onToggleFastMode: () => void;
   onSetCompactionModelOverride: (model: string) => void;
   onSetHeartbeatModel: (model: string) => void;
@@ -650,6 +658,7 @@ interface SessionControlsProps {
 function SessionControls({
   loading = false,
   thinkingLevel,
+  reasoningVisibility,
   fastModeEnabled,
   compactionModelOverride,
   heartbeatModel,
@@ -664,6 +673,7 @@ function SessionControls({
   onRefreshCompatibilityHotfix,
   onApplyCompatibilityHotfix,
   onSetThinkingLevel,
+  onSetReasoningVisibility,
   onToggleFastMode,
   onSetCompactionModelOverride,
   onSetHeartbeatModel,
@@ -723,7 +733,7 @@ function SessionControls({
         }}
         disabled={disabled}
         className={`p-1.5 rounded-lg transition-colors ${
-          (thinkingLevel !== 'off') || fastModeEnabled
+          (thinkingLevel !== 'off') || reasoningVisibility !== 'off' || fastModeEnabled
             ? 'text-emerald-400 bg-emerald-500/[0.12] hover:bg-emerald-500/[0.2]'
             : 'text-slate-400 hover:text-white hover:bg-white/[0.06]'
         } disabled:opacity-50`}
@@ -792,6 +802,29 @@ function SessionControls({
                   {localThinking === 'adaptive' && !adaptiveSupported && (
                     <span className="ml-1 text-[9px] text-amber-400/80">(unsupported for current model)</span>
                   )}
+                </div>
+              </div>
+
+              <div className="p-2 rounded-lg bg-white/[0.02] space-y-2">
+                <div className="flex items-center gap-2">
+                  <MessageSquare size={14} className={reasoningVisibility !== 'off' ? 'text-cyan-400' : 'text-slate-500'} />
+                  <div>
+                    <div className="text-xs font-medium text-white">Reasoning Visibility</div>
+                    <div className="text-[10px] text-slate-500">Controls whether OpenClaw exposes readable reasoning summaries when the provider emits them.</div>
+                  </div>
+                </div>
+                <select
+                  value={reasoningVisibility}
+                  onChange={(e) => onSetReasoningVisibility(e.target.value as ReasoningVisibility)}
+                  disabled={disabled || loading || !sessionControlsSupported}
+                  className="w-full rounded-lg border border-white/[0.08] bg-[#141A43] px-2 py-1.5 text-xs text-slate-200 disabled:opacity-50"
+                >
+                  <option value="off">Hidden</option>
+                  <option value="on">Visible / persistent</option>
+                  <option value="stream">Stream when supported</option>
+                </select>
+                <div className="text-[10px] text-slate-400">
+                  Current: <span className="font-semibold uppercase text-cyan-300">{REASONING_VISIBILITY_LABELS[reasoningVisibility]}</span>
                 </div>
               </div>
 
@@ -1755,6 +1788,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
   isLast,
   isStreaming,
   liveThinkingContent,
+  liveStatusText,
   onRetry,
 }: {
   agent: AgentIdentity;
@@ -1763,6 +1797,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
   isLast: boolean;
   isStreaming: boolean;
   liveThinkingContent?: string;
+  liveStatusText?: string | null;
   onRetry?: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
@@ -1775,6 +1810,11 @@ const AssistantBubble = React.memo(function AssistantBubble({
     ? liveThinkingContent
     : (message.thinkingContent || '');
   const hasThinkingContent = !!visibleThinkingContent.trim();
+  const liveStatusPlaceholder = isCurrentlyStreaming && !hasContent && !hasThinkingContent
+    ? String(liveStatusText || '').trim()
+    : '';
+  const visibleMessageContent = hasContent ? message.content : liveStatusPlaceholder;
+  const hasVisibleMessageContent = !!visibleMessageContent.trim();
 
   return (
     <div
@@ -1804,7 +1844,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
         )}
 
         {/* Message content */}
-        {(hasContent || (isCurrentlyStreaming && !hasThinkingContent)) && (
+        {(hasVisibleMessageContent || (isCurrentlyStreaming && !hasThinkingContent)) && (
           <div
             className={`rounded-2xl rounded-bl-sm px-4 py-2.5 transition-all duration-500 ${
               hasContent && message.content.startsWith('⚠️')
@@ -1825,7 +1865,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
               </div>
             ) : (
               <div className={isCurrentlyStreaming ? 'streaming-cursor text-slate-300/95' : undefined}>
-                <MarkdownRenderer content={message.content} isStreaming={isCurrentlyStreaming} />
+                <MarkdownRenderer content={visibleMessageContent} isStreaming={isCurrentlyStreaming} />
               </div>
             )}
           </div>
@@ -2037,6 +2077,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   // Session controls
   const thinkingLevel = chatState.thinkingLevel;
   const setThinkingLevel = chatState.setThinkingLevel;
+  const reasoningVisibility = chatState.reasoningVisibility;
+  const setReasoningVisibility = chatState.setReasoningVisibility;
   const fastModeEnabled = chatState.fastModeEnabled;
   const toggleFastMode = chatState.toggleFastMode;
   const compactionModelOverride = chatState.compactionModelOverride;
@@ -3098,6 +3140,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               <SessionControls
                 loading={sessionControlsLoading || currentProviderModelsLoading}
                 thinkingLevel={thinkingLevel}
+                reasoningVisibility={reasoningVisibility}
                 fastModeEnabled={fastModeEnabled}
                 compactionModelOverride={compactionModelOverride}
                 heartbeatModel={heartbeatModel}
@@ -3112,6 +3155,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 onRefreshCompatibilityHotfix={() => { void loadCompatibilityHotfixStatus(); }}
                 onApplyCompatibilityHotfix={() => { void handleApplyCompatibilityHotfix(); }}
                 onSetThinkingLevel={(level) => { void setThinkingLevel(level); }}
+                onSetReasoningVisibility={(level) => { void setReasoningVisibility(level); }}
                 onToggleFastMode={() => { void toggleFastMode(); }}
                 onSetCompactionModelOverride={(model) => { void setCompactionModelOverride(model); }}
                 onSetHeartbeatModel={(model) => { void handleHeartbeatModelChange(model); }}
@@ -3333,15 +3377,56 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                   )
                                 );
                               } else {
-                                // History: reconstruct from position-based segments
-                                // Render: before segments, then tools, then after segments
+                                // History/finalized turn: prefer timestamped segments from the live stream,
+                                // then fall back to position-based reconstruction from durable history.
                                 const segments = msg.segments || [];
+                                const hasTimestampedSegments = segments.some((seg) => typeof seg.ts === 'number' && Number.isFinite(seg.ts));
+
+                                if (hasTimestampedSegments) {
+                                  type HistoryTimelineItem =
+                                    | { kind: 'segment'; seg: typeof segments[0]; segIdx: number; ts: number }
+                                    | { kind: 'tool'; tool: ToolCall; ts: number };
+                                  const timeline: HistoryTimelineItem[] = [
+                                    ...segments.map((seg, segIdx) => ({
+                                      kind: 'segment' as const,
+                                      seg,
+                                      segIdx,
+                                      ts: typeof seg.ts === 'number' && Number.isFinite(seg.ts) ? seg.ts : msg.createdAt.getTime() + segIdx,
+                                    })),
+                                    ...toolCalls.map((tool, toolIdx) => ({
+                                      kind: 'tool' as const,
+                                      tool,
+                                      ts: typeof tool.startedAt === 'number' && Number.isFinite(tool.startedAt) ? tool.startedAt : msg.createdAt.getTime() + toolIdx,
+                                    })),
+                                  ];
+                                  timeline.sort((a, b) => a.ts - b.ts);
+
+                                  return timeline.map((item) =>
+                                    item.kind === 'segment' ? (
+                                      <AssistantBubble
+                                        key={`hist-seg-${msg.id}-${item.segIdx}-${item.ts}`}
+                                        message={{
+                                          id: `hist-seg-${msg.id}-${item.segIdx}`,
+                                          role: 'assistant' as const,
+                                          content: item.seg.kind === 'thinking' ? '' : item.seg.text,
+                                          thinkingContent: item.seg.kind === 'thinking' ? item.seg.text : undefined,
+                                          createdAt: new Date(item.ts),
+                                        }}
+                                        agent={agent}
+                                        avatarUrl={agentAvatars[agent.providerName]}
+                                        isLast={false}
+                                        isStreaming={false}
+                                      />
+                                    ) : (
+                                      <ToolCallBlock key={`hist-tool-${item.tool.id}`} tool={item.tool} />
+                                    )
+                                  );
+                                }
+
                                 const beforeSegs = segments.filter(s => s.position === 'before');
-                                const afterSegs = segments.filter(s => s.position === 'after');
-                                
+                                const betweenSegs = segments.filter(s => s.position === 'between');
                                 return (
                                   <>
-                                    {/* Narration before tool calls */}
                                     {beforeSegs.map((seg, i) => (
                                       <AssistantBubble
                                         key={`hist-before-${msg.id}-${i}`}
@@ -3358,9 +3443,26 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                         isStreaming={false}
                                       />
                                     ))}
-                                    {/* Tool calls */}
-                                    {toolCalls.map(tool => (
-                                      <ToolCallBlock key={`hist-tool-${tool.id}`} tool={tool} />
+                                    {toolCalls.map((tool, toolIdx) => (
+                                      <React.Fragment key={`hist-tool-wrap-${tool.id}`}>
+                                        <ToolCallBlock key={`hist-tool-${tool.id}`} tool={tool} />
+                                        {toolIdx < toolCalls.length - 1 && betweenSegs.length > 0 && toolIdx === 0 && betweenSegs.map((seg, i) => (
+                                          <AssistantBubble
+                                            key={`hist-between-${msg.id}-${i}`}
+                                            message={{
+                                              id: `hist-between-${msg.id}-${i}`,
+                                              role: 'assistant' as const,
+                                              content: seg.kind === 'thinking' ? '' : seg.text,
+                                              thinkingContent: seg.kind === 'thinking' ? seg.text : undefined,
+                                              createdAt: msg.createdAt,
+                                            }}
+                                            agent={agent}
+                                            avatarUrl={agentAvatars[agent.providerName]}
+                                            isLast={false}
+                                            isStreaming={false}
+                                          />
+                                        ))}
+                                      </React.Fragment>
                                     ))}
                                     {/* Text after tool calls (main response) — rendered by the AssistantBubble below */}
                                   </>
@@ -3373,7 +3475,9 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                               const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0;
                               const renderedBeforeSegments = isLiveTimeline
                                 ? streamSegments
-                                : (msg.segments || []).filter((segment) => segment.position === 'before');
+                                : ((msg.segments || []).some((segment) => typeof segment.ts === 'number' && Number.isFinite(segment.ts))
+                                    ? (msg.segments || [])
+                                    : (msg.segments || []).filter((segment) => segment.position === 'before'));
                               const bubbleMessage = (isLiveTimeline || hasHistorySegments)
                                 ? { ...msg, toolCalls: undefined, segments: undefined }
                                 : msg;
@@ -3401,10 +3505,14 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                   }
                                 : bubbleMessage;
                               const effectiveLiveThinkingContent = liveThinkingAlreadyRendered ? undefined : liveThinkingValue;
+                              const effectiveLiveStatusText = idx === messages.length - 1 && isRunning
+                                ? String(statusText || '').trim()
+                                : '';
                               const hasVisibleBubble = Boolean(
                                 effectiveBubbleMessage.content?.trim()
                                 || effectiveBubbleMessage.thinkingContent?.trim()
                                 || effectiveLiveThinkingContent?.trim()
+                                || effectiveLiveStatusText
                                 || (effectiveBubbleMessage.toolCalls || []).length > 0,
                               );
                               if (!hasVisibleBubble && (isLiveTimeline || hasHistorySegments)) {
@@ -3418,6 +3526,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                   isLast={idx === messages.length - 1}
                                   isStreaming={isRunning}
                                   liveThinkingContent={effectiveLiveThinkingContent}
+                                  liveStatusText={effectiveLiveStatusText}
                                   onRetry={
                                     idx === messages.length - 1 && lastUserMessage
                                       ? () => {

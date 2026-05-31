@@ -267,6 +267,86 @@ export function saveProviderToken(provider: string, token: string): { profileId:
   return { profileId };
 }
 
+function normalizeProviderRuntimeModelId(provider: string, modelId: string): string | null {
+  const raw = String(modelId || '').trim();
+  if (!raw) return null;
+  const prefix = `${provider}/`;
+  return raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+}
+
+function mergeProviderRuntimeCatalog(provider: string, existingProviderConfig: Record<string, any>, modelIds: string[]) {
+  const apiConfig = PROVIDER_API_CONFIG[provider];
+  const existingModels = Array.isArray(existingProviderConfig.models) ? existingProviderConfig.models : [];
+  const seen = new Set<string>();
+  const nextModels: Array<Record<string, any>> = [];
+
+  for (const entry of existingModels) {
+    const rawId = typeof entry === 'string' ? entry : String(entry?.id || '').trim();
+    const id = normalizeProviderRuntimeModelId(provider, rawId);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    nextModels.push(typeof entry === 'string' ? { id, name: id } : { ...entry, id, name: entry.name || id });
+  }
+
+  const addedModels: string[] = [];
+  for (const modelId of modelIds) {
+    const id = normalizeProviderRuntimeModelId(provider, modelId);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    addedModels.push(id);
+    nextModels.push({ id, name: id });
+  }
+
+  const nextProviderConfig: Record<string, any> = {
+    ...existingProviderConfig,
+    ...apiConfig,
+    models: nextModels,
+  };
+
+  const changed = JSON.stringify({
+    baseUrl: existingProviderConfig.baseUrl,
+    api: existingProviderConfig.api,
+    auth: existingProviderConfig.auth,
+    models: existingModels.map((entry: any) => typeof entry === 'string' ? { id: entry, name: entry } : { id: entry?.id, name: entry?.name, api: entry?.api }),
+  }) !== JSON.stringify({
+    baseUrl: nextProviderConfig.baseUrl,
+    api: nextProviderConfig.api,
+    auth: nextProviderConfig.auth,
+    models: nextProviderConfig.models.map((entry: any) => ({ id: entry.id, name: entry.name, api: entry.api })),
+  });
+
+  return { changed, addedModels, nextProviderConfig };
+}
+
+export function registerProviderRuntimeModels(provider: string, modelIds: string[]): { changed: boolean; addedModels: string[] } {
+  const apiConfig = PROVIDER_API_CONFIG[provider];
+  if (!apiConfig) return { changed: false, addedModels: [] };
+
+  const modelsData = safeReadJson<any>(MODELS_JSON_PATH, { providers: {} });
+  if (!modelsData.providers) modelsData.providers = {};
+
+  const modelsMerge = mergeProviderRuntimeCatalog(provider, modelsData.providers[provider] || {}, modelIds);
+  if (modelsMerge.changed) {
+    modelsData.providers[provider] = modelsMerge.nextProviderConfig;
+    fs.writeFileSync(MODELS_JSON_PATH, JSON.stringify(modelsData, null, 2), 'utf8');
+  }
+
+  const config = readOpenClawConfig();
+  if (!config.models || typeof config.models !== 'object') config.models = {};
+  if (!config.models.providers || typeof config.models.providers !== 'object') config.models.providers = {};
+  const configMerge = mergeProviderRuntimeCatalog(provider, config.models.providers[provider] || {}, modelIds);
+  if (configMerge.changed) {
+    config.models.providers[provider] = configMerge.nextProviderConfig;
+    config.meta = { ...(config.meta && typeof config.meta === 'object' ? config.meta : {}), lastTouchedAt: new Date().toISOString() };
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+  }
+
+  return {
+    changed: modelsMerge.changed || configMerge.changed,
+    addedModels: Array.from(new Set([...modelsMerge.addedModels, ...configMerge.addedModels])),
+  };
+}
+
 export function pinProviderAuthProfile(provider: string, profileId: string, mode?: 'api_key' | 'token' | 'oauth') {
   cleanupStaleProviderAuthProfiles(provider, profileId, mode);
 }

@@ -1,4 +1,4 @@
-import { matchesProviderModel, mergeDiscoveredProviderModelsIntoConfig, normalizeModelPayload } from '../routes/ai-setup';
+import { getProviderDefaultModelPayload, matchesProviderModel, mergeDiscoveredProviderModelsIntoConfig, normalizeModelPayload } from '../routes/ai-setup';
 
 describe('ai-setup model normalization', () => {
   test('does not prefix providerHint onto already-prefixed string model ids', () => {
@@ -91,16 +91,19 @@ describe('ai-setup model normalization', () => {
       'openai-codex/gpt-5.4',
       'openai-codex/gpt-5.4-mini',
     ]);
-    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.5']).toEqual({});
-    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.4']).toEqual({});
+    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.5']).toEqual({ agentRuntime: { id: 'codex' } });
+    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.4']).toEqual({ agentRuntime: { id: 'codex' } });
   });
 
-  test('register merge strips schema-unsupported runtime metadata from existing model entries', () => {
+  test('register merge repairs Codex model-scoped runtime metadata', () => {
     const merged = mergeDiscoveredProviderModelsIntoConfig({
       agents: {
         defaults: {
           model: { primary: 'openai-codex/gpt-5.5', fallbacks: [] },
-          models: { 'openai-codex/gpt-5.5': { agentRuntime: { id: 'pi' } } },
+          models: {
+            'openai/gpt-5.5': { agentRuntime: { id: 'codex' } },
+            'openai-codex/gpt-5.5': { agentRuntime: { id: 'pi' } },
+          },
         },
       },
     }, 'openai-codex', ['openai-codex/gpt-5.5']);
@@ -108,7 +111,8 @@ describe('ai-setup model normalization', () => {
     expect(merged.changed).toBe(true);
     expect(merged.addedAllowlist).toEqual([]);
     expect(merged.addedFallbacks).toEqual([]);
-    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.5']).toEqual({});
+    expect(merged.config.agents.defaults.models['openai/gpt-5.5']).toEqual({});
+    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.5']).toEqual({ agentRuntime: { id: 'codex' } });
   });
 
   test('register merge preserves Gemini CLI provider namespace before persisting models', () => {
@@ -127,6 +131,22 @@ describe('ai-setup model normalization', () => {
     ]);
   });
 
+  test('register merge removes stale Claude CLI runtime metadata from Anthropic models', () => {
+    const merged = mergeDiscoveredProviderModelsIntoConfig({
+      agents: {
+        defaults: {
+          model: { primary: 'anthropic/claude-haiku-4-5', fallbacks: [] },
+          models: {
+            'anthropic/claude-haiku-4-5': { agentRuntime: { id: 'claude-cli' } },
+          },
+        },
+      },
+    }, 'anthropic', ['anthropic/claude-haiku-4-5']);
+
+    expect(merged.changed).toBe(true);
+    expect(merged.config.agents.defaults.models['anthropic/claude-haiku-4-5']).toEqual({});
+  });
+
   test('provider filter accepts google runtime alias models from the gateway catalog', () => {
     expect(matchesProviderModel('google-gemini-cli', 'google/gemini-3.1-pro-preview')).toBe(true);
     expect(matchesProviderModel('google-gemini-cli', 'google-gemini-cli/gemini-3.1-pro-preview')).toBe(true);
@@ -139,5 +159,11 @@ describe('ai-setup model normalization', () => {
     expect(matchesProviderModel('openai-codex', 'openai-codex/gpt-5.4')).toBe(true);
     expect(matchesProviderModel('openai-codex', 'google/gemini-3.1-pro-preview')).toBe(false);
     expect(matchesProviderModel('openai-codex', 'openai-codex/google/gemini-3.1-pro-preview')).toBe(false);
+  });
+
+  test('setup model fallback exposes provider defaults without requiring OpenClaw model discovery', () => {
+    expect(getProviderDefaultModelPayload('openai-codex').map((model) => model.id)).toContain('openai-codex/gpt-5.5');
+    expect(getProviderDefaultModelPayload('google-gemini-cli').map((model) => model.id)).toContain('google-gemini-cli/gemini-3.1-pro-preview');
+    expect(getProviderDefaultModelPayload(null)).toEqual([]);
   });
 });

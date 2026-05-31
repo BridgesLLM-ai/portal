@@ -6,8 +6,11 @@
  * in gateway.ts so that stream status survives handler lifecycle.
  */
 
+import { normalizeRuntimeTurnEvent, type RuntimeTurnEvent } from './RuntimeTurnEvents';
+import { recordRuntimeTurnEvent } from './RuntimeTurnEventHistory';
+
 export interface StreamEvent {
-  type: 'text' | 'thinking' | 'tool_start' | 'tool_end' | 'tool_used' | 'status' | 'done' | 'error' | 'segment_break' | 'compaction_start' | 'compaction_end' | 'run_resumed';
+  type: 'text' | 'thinking' | 'tool_start' | 'tool_update' | 'tool_end' | 'tool_used' | 'status' | 'done' | 'error' | 'segment_break' | 'compaction_start' | 'compaction_end' | 'run_resumed';
   content?: string;
   toolName?: string;
   toolArgs?: unknown;
@@ -16,6 +19,8 @@ export interface StreamEvent {
   completed?: boolean;
   willRetry?: boolean;
   maintenanceKind?: 'compaction' | 'maintenance';
+  /** Stable BridgesLLM turn-event contract used by Agent Chat. */
+  turnEvent?: RuntimeTurnEvent;
   [key: string]: unknown;
 }
 
@@ -26,7 +31,7 @@ export interface StreamToolCall {
   result?: string;
   startedAt: number;
   endedAt?: number;
-  status: 'running' | 'done';
+  status: 'running' | 'done' | 'error';
 }
 
 export interface StreamInfo {
@@ -60,6 +65,19 @@ function getLastRunningToolCall(toolCalls?: StreamToolCall[]): StreamToolCall | 
   return null;
 }
 
+const RAIL_SAFE_STATUS_RE = /^(?:thinking[.…]*|connecting directly to openclaw[.…]*|reconnecting to stream[.…]*|resuming stream[.…]*|still responding[.…]*|still working[.…]*|starting codex runtime[.…]*|codex session ready\.?|starting codex turn[.…]*|codex accepted the turn\.?|codex is writing[.…]*|codex is working[.…]*|running tool[.…]*|preparing execution hooks[.…]*|execution hooks ready\.?|waiting for command approval[.…]*|command denied|command approved|approval did not complete|approval failed(?::.*)?|compacting context[.…]*|context compacted\.?|context maintenance (?:in progress|finished|complete(?:d)?)[.…]*|preparing context maintenance[.…]*|memory flush (?:about to start|starting|started|queued|pending|complete(?:d)?)[.…]*|heartbeat check (?:started|starting|running|queued|pending|complete(?:d)?)[.…]*|heartbeat_ok)$/i;
+const RAIL_SAFE_MAINTENANCE_RE = /\b(preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|pre-compaction|memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context|durable memor(?:y|ies) (?:stored|written)|context refreshed)\b/i;
+
+function normalizeRailStatusText(text?: unknown): string | undefined {
+  if (typeof text !== 'string') return undefined;
+  const normalized = text.replace(/\s+/g, ' ').trim().replace(/^[^\p{L}\p{N}]+/u, '').trim();
+  if (!normalized) return undefined;
+  if (RAIL_SAFE_STATUS_RE.test(normalized) || RAIL_SAFE_MAINTENANCE_RE.test(normalized)) {
+    return normalized;
+  }
+  return undefined;
+}
+
 export class StreamEventBus {
   /** sessionKey → set of subscriber callbacks */
   private listeners = new Map<string, Set<StreamCallback>>();
@@ -75,6 +93,12 @@ export class StreamEventBus {
 
   /** sessionKey → latest fully-assembled text snapshot for reconnect recovery */
   private latestText = new Map<string, string>();
+
+  /** sessionKey → monotonic turn-event sequence. Stable across transport event shapes. */
+  private turnEventSeq = new Map<string, number>();
+
+  /** sessionKey → recent normalized turn events for reconnect/parity diagnostics. */
+  private recentTurnEvents = new Map<string, RuntimeTurnEvent[]>();
 
   /** Backwards-compatible alias for activeStreams */
   private get activeStreams(): Map<string, StreamInfo> {
@@ -94,6 +118,8 @@ export class StreamEventBus {
           this.streams.delete(sessionKey);
           this.lastSeenText.delete(sessionKey);
           this.latestText.delete(sessionKey);
+          this.turnEventSeq.delete(sessionKey);
+          this.recentTurnEvents.delete(sessionKey);
         }
       }
     }, 15 * 60 * 1000);
@@ -180,12 +206,18 @@ export class StreamEventBus {
       }
     } else if (info) {
       if (event.type === 'thinking') {
-        if (!runningToolCall) {
-          info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : 'Thinking…';
+        const railStatusText = normalizeRailStatusText(event.content);
+        if (!runningToolCall && railStatusText) {
+          info.statusText = railStatusText;
         }
       } else if (event.type === 'status') {
         if (!runningToolCall) {
-          info.statusText = typeof event.content === 'string' && event.content.trim() ? event.content.trim() : info.statusText;
+          const railStatusText = normalizeRailStatusText(event.content);
+          if (railStatusText) {
+            info.statusText = railStatusText;
+          } else if (event.maintenanceKind === 'maintenance' && !info.statusText) {
+            info.statusText = 'Context maintenance in progress…';
+          }
         }
       } else if (event.type === 'tool_start') {
         info.toolName = typeof event.toolName === 'string' && event.toolName.trim() ? event.toolName.trim() : info.toolName;
@@ -202,16 +234,32 @@ export class StreamEventBus {
             status: 'running',
           },
         ];
+      } else if (event.type === 'tool_update') {
+        info.toolName = typeof event.toolName === 'string' && event.toolName.trim() ? event.toolName.trim() : info.toolName;
+        if (info.toolName) info.statusText = `Using ${info.toolName}…`;
+        const existingCalls = Array.isArray(info.toolCalls) ? [...info.toolCalls] : [];
+        for (let i = existingCalls.length - 1; i >= 0; i--) {
+          if (existingCalls[i].status === 'running') {
+            existingCalls[i] = {
+              ...existingCalls[i],
+              result: typeof event.toolResult === 'string' ? event.toolResult : existingCalls[i].result,
+              status: 'running',
+            };
+            break;
+          }
+        }
+        info.toolCalls = existingCalls;
       } else if (event.type === 'tool_end') {
         info.statusText = undefined;
         const existingCalls = Array.isArray(info.toolCalls) ? [...info.toolCalls] : [];
+        const completedStatus = event.status === 'error' ? 'error' : 'done';
         for (let i = existingCalls.length - 1; i >= 0; i--) {
           if (existingCalls[i].status === 'running') {
             existingCalls[i] = {
               ...existingCalls[i],
               endedAt: now,
               result: typeof event.toolResult === 'string' ? event.toolResult : undefined,
-              status: 'done',
+              status: completedStatus,
             };
             break;
           }
@@ -249,10 +297,36 @@ export class StreamEventBus {
         console.warn(`[StreamEventBus] ⚠️ EXTRA SUBS: ${subs.size} subscribers for ${sessionKey} on text event (expected <= 2). Check registerWsStreamCleanup / reconnect lifecycle.`);
       }
     }
+    const nextTurnSeq = (this.turnEventSeq.get(sessionKey) || 0) + 1;
+    const turnEvent = event.turnEvent || normalizeRuntimeTurnEvent({
+      sessionKey,
+      event,
+      info,
+      seq: nextTurnSeq,
+      now,
+    });
+    if (turnEvent) {
+      this.turnEventSeq.set(sessionKey, nextTurnSeq);
+      const recent = this.recentTurnEvents.get(sessionKey) || [];
+      recent.push(turnEvent);
+      this.recentTurnEvents.set(sessionKey, recent.slice(-500));
+      recordRuntimeTurnEvent(sessionKey, turnEvent);
+    }
+
+    const outboundBase: StreamEvent = info
+      && !(typeof event.model === 'string' && event.model.trim())
+      && typeof info.model === 'string'
+      && info.model.trim()
+        ? { ...event, model: info.model.trim() }
+        : event;
+    const outboundEvent: StreamEvent = turnEvent
+      ? { ...outboundBase, turnEvent }
+      : outboundBase;
+
     if (subs && subs.size > 0) {
       for (const cb of subs) {
         try {
-          cb(event);
+          cb(outboundEvent);
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[StreamEventBus] Subscriber error for ${sessionKey}: ${msg}`);
@@ -271,7 +345,7 @@ export class StreamEventBus {
     if (noPerSessionSubs || isCompaction || isMaintenance) {
       for (const cb of this.globalListeners) {
         try {
-          cb(sessionKey, event);
+          cb(sessionKey, outboundEvent);
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[StreamEventBus] Global listener error: ${msg}`);
@@ -304,6 +378,7 @@ export class StreamEventBus {
    */
   updateStreamPhase(sessionKey: string, info: Partial<StreamInfo> & { phase: StreamInfo['phase'] }): void {
     const existing = this.activeStreams.get(sessionKey);
+    const nextStatusText = 'statusText' in info ? normalizeRailStatusText(info.statusText) : undefined;
     if (existing) {
       const wasDormant = existing.active === false;
       const runningToolCall = getLastRunningToolCall(existing.toolCalls);
@@ -316,7 +391,10 @@ export class StreamEventBus {
         existing.toolName = runningToolCall.name;
       }
       if ('runId' in info) existing.runId = info.runId;
-      if ('statusText' in info && !shouldPreserveToolStatus) existing.statusText = info.statusText;
+      if ('statusText' in info && !shouldPreserveToolStatus) {
+        if (nextStatusText) existing.statusText = nextStatusText;
+        else if (info.statusText == null) existing.statusText = undefined;
+      }
       if (shouldPreserveToolStatus && !existing.statusText && existing.toolName) {
         existing.statusText = `Using ${existing.toolName}…`;
       }
@@ -337,7 +415,7 @@ export class StreamEventBus {
         phase: runningToolCall && info.phase !== 'tool' ? 'tool' : info.phase,
         toolName: info.toolName,
         toolCalls: Array.isArray(info.toolCalls) ? [...info.toolCalls] : [],
-        statusText: info.statusText,
+        statusText: nextStatusText || (info.phase === 'thinking' ? 'Thinking…' : undefined),
         provenance: info.provenance,
         model: info.model,
         compactionPhase: info.compactionPhase,
@@ -353,12 +431,13 @@ export class StreamEventBus {
    * Mark a stream as started (called when PersistentGatewayWs sees first event).
    */
   startStream(sessionKey: string, runId?: string, info?: Partial<StreamInfo>): void {
+    const statusText = normalizeRailStatusText(info?.statusText) || 'Thinking…';
     if (!this.activeStreams.has(sessionKey)) {
       this.activeStreams.set(sessionKey, {
         active: true,
         phase: 'thinking',
         toolCalls: [],
-        statusText: info?.statusText || 'Thinking…',
+        statusText,
         provenance: info?.provenance,
         model: info?.model,
         compactionPhase: info?.compactionPhase || 'idle',
@@ -376,7 +455,7 @@ export class StreamEventBus {
         current.startedAt = Date.now();
         current.toolName = undefined;
         current.toolCalls = [];
-        current.statusText = info?.statusText || 'Thinking…';
+        current.statusText = statusText;
         current.compactionPhase = info?.compactionPhase || 'idle';
         current.latestText = this.latestText.get(sessionKey) || '';
         delete current.lastDoneAt;
@@ -396,6 +475,15 @@ export class StreamEventBus {
     this.activeStreams.delete(sessionKey);
     this.lastSeenText.delete(sessionKey);
     this.latestText.delete(sessionKey);
+  }
+
+  /**
+   * Return recent normalized turn events for reconnect/debugging.
+   * This is intentionally independent from provider-specific raw events.
+   */
+  getRecentTurnEvents(sessionKey: string, limit = 100): RuntimeTurnEvent[] {
+    const events = this.recentTurnEvents.get(sessionKey) || [];
+    return events.slice(-Math.max(0, limit));
   }
 
   /**

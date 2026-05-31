@@ -33,6 +33,10 @@ function runClawHub(args: string[], timeout = 30000): string {
   return stdout || stderr;
 }
 
+function isMissingClawHubError(err: unknown): boolean {
+  return err instanceof Error && ((err as NodeJS.ErrnoException).code === 'ENOENT' || /spawnSync clawhub ENOENT/.test(err.message));
+}
+
 /** Extract the first JSON object or array from a string (handles ANSI/banner preamble). */
 function parseJson(raw: string) {
   const trimmed = raw.trim();
@@ -141,6 +145,10 @@ router.get('/search', async (req: Request, res: Response) => {
     const results = enrichMarketplaceResults(parseSearchOutput(raw), Math.min(limit, 10));
     res.json({ available: true, results });
   } catch (err) {
+    if (isMissingClawHubError(err)) {
+      res.json({ available: false, results: [], error: 'ClawHub CLI is not installed on this server.' });
+      return;
+    }
     const message = err instanceof Error ? err.message : 'Marketplace search failed';
     res.status(500).json({ error: message });
   }

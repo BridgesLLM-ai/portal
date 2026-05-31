@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { CheckCircle, XCircle, AlertCircle, Info, X, ChevronDown, ChevronUp, Copy, Check } from 'lucide-react';
+import ViewportOverlay from './ViewportOverlay';
 
 export type ToastType = 'success' | 'error' | 'warning' | 'info';
 
@@ -49,7 +50,7 @@ export function Toast({ id, type, message, detail, hint, duration = 3000, onClos
   const hasExtra = !!(detail || hint);
 
   return (
-    <div className={`flex flex-col rounded-lg border backdrop-blur-xl ${styles[type]} animate-slide-in max-w-md`}>
+    <div className={`flex w-full flex-col rounded-lg border backdrop-blur-xl ${styles[type]} animate-slide-in`}>
       {/* Main row */}
       <div className="flex items-start gap-2 px-4 py-3">
         <Icon size={18} className="mt-0.5 flex-shrink-0" />
@@ -105,11 +106,17 @@ export function Toast({ id, type, message, detail, hint, duration = 3000, onClos
 }
 
 export function ToastContainer({ toasts, onClose }: { toasts: ToastProps[]; onClose: (id: string) => void }) {
+  if (toasts.length === 0) return null;
+
   return (
-    <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-md">
+    <ViewportOverlay
+      anchor="bottom-right"
+      zIndex={1200}
+      className="flex w-[min(28rem,calc(100vw-2rem))] flex-col gap-2 overflow-y-auto overscroll-contain pr-1"
+    >
       {toasts.map((toast) => (
         <Toast key={toast.id} {...toast} onClose={onClose} />
       ))}
-    </div>
+    </ViewportOverlay>
   );
 }

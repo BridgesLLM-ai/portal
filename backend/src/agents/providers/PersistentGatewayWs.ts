@@ -110,6 +110,46 @@ function extractLifecycleStatusText(data: any): string | null {
   return null;
 }
 
+function extractToolResultText(value: any): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed || undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+
+  const directCandidates = [
+    value.output,
+    value.stdout,
+    value.stderr,
+    value.text,
+    value.message,
+    value.error,
+    value.result,
+  ];
+  const directParts = directCandidates
+    .filter((candidate): candidate is string => typeof candidate === 'string' && candidate.trim().length > 0)
+    .map((candidate) => candidate.trim());
+  if (directParts.length > 0) return directParts.join('\n');
+
+  if (Array.isArray(value.content)) {
+    const contentParts = value.content
+      .map((block: any) => {
+        if (typeof block === 'string') return block;
+        if (block && typeof block === 'object') {
+          if (typeof block.text === 'string') return block.text;
+          if (typeof block.content?.text === 'string') return block.content.text;
+          if (typeof block.content === 'string') return block.content;
+        }
+        return '';
+      })
+      .filter((part: string) => part.trim().length > 0)
+      .map((part: string) => part.trim());
+    if (contentParts.length > 0) return contentParts.join('\n');
+  }
+
+  return undefined;
+}
+
 function inferLifecycleMaintenanceSignal(phase: string, statusText: string | null): LifecycleMaintenanceSignal {
   const normalizedPhase = String(phase || '').trim().toLowerCase();
   const normalizedStatus = String(statusText || '').trim();
@@ -179,6 +219,11 @@ const pendingResponses: Map<string, { resolve: (value: any) => void; reject: (er
 // Separate text accumulator for assistant stream events (resets per segment after tool calls).
 const assistantLastSeenTextMap: Map<string, string> = new Map();
 
+// Chat events carry cumulative assistant text on newer OpenClaw builds. Use them
+// as the fallback live-text source when assistant stream events are metadata-only.
+const chatLastSeenTextMap: Map<string, string> = new Map();
+const sessionsWithAssistantTextStream: Set<string> = new Set();
+
 // Track which sessions have active runs (to filter stale replayed events)
 const activeRunIds: Map<string, string> = new Map();
 
@@ -231,12 +276,165 @@ type ToolPhaseState = {
 // Deduplicate repeated gateway tool snapshots for the same session/run/tool phase.
 const lastToolPhaseBySession: Map<string, ToolPhaseState> = new Map();
 
+// OpenClaw 2026.5.x Codex/app-server sessions can finish the chat run before
+// the visible assistant delivery mirror is emitted on `session.message`.
+// If we immediately publish `done` for an empty `chat.final`, the browser closes
+// the live bubble and the actual answer only appears after a history reload. Hold
+// those empty finals briefly and complete the stream when the assistant message
+// arrives. If no mirror arrives, release the empty done so the UI does not hang.
+const pendingEmptyFinalBySession: Map<string, {
+  runId?: string;
+  model?: string | null;
+  timer: ReturnType<typeof setTimeout>;
+}> = new Map();
+
+const messageToolReplyBySession: Map<string, {
+  text: string;
+  ts: number;
+}> = new Map();
+
+const recentlyCompletedRunBySession: Map<string, {
+  runId: string;
+  ts: number;
+}> = new Map();
+
+const recentlyCompletedDeliveryBySession: Map<string, {
+  text: string;
+  ts: number;
+}> = new Map();
+
 // Event listeners
 const approvalRequestListeners: Set<ApprovalRequestCallback> = new Set();
 const approvalResolvedListeners: Set<ApprovalResolvedCallback> = new Set();
 
 function nextId(): string {
   return `rpc-${Date.now()}-${++messageCounter}`;
+}
+
+function clearPendingEmptyFinal(sessionKey: string): { runId?: string; model?: string | null } | null {
+  const pending = pendingEmptyFinalBySession.get(sessionKey);
+  if (!pending) return null;
+  clearTimeout(pending.timer);
+  pendingEmptyFinalBySession.delete(sessionKey);
+  return { runId: pending.runId, model: pending.model };
+}
+
+function cleanupCompletedRun(sessionKey: string, runId?: string): void {
+  // Use soft-clear instead of hard-clear: the agent may resume after a sub-agent
+  // completes (sessions_yield → sub-agent → result injected → new run starts).
+  // Soft-clear resets text accumulators but preserves subscribers so the next run's
+  // events are still forwarded to the browser.
+  if (runId) {
+    recentlyCompletedRunBySession.set(sessionKey, { runId, ts: Date.now() });
+  }
+  streamEventBus.softClearStream(sessionKey);
+  activeRunIds.delete(sessionKey);
+  assistantLastSeenTextMap.delete(sessionKey);
+  chatLastSeenTextMap.delete(sessionKey);
+  sessionsWithAssistantTextStream.delete(sessionKey);
+  lastToolPhaseBySession.delete(sessionKey);
+  messageToolReplyBySession.delete(sessionKey);
+}
+
+function isRecentlyCompletedRun(sessionKey: string, runId?: string, withinMs = 30000): boolean {
+  if (!runId) return false;
+  const recent = recentlyCompletedRunBySession.get(sessionKey);
+  if (!recent) return false;
+  if (Date.now() - recent.ts > withinMs) {
+    recentlyCompletedRunBySession.delete(sessionKey);
+    return false;
+  }
+  return recent.runId === runId;
+}
+
+function markCompletedDelivery(sessionKey: string, text: string): void {
+  const finalText = sanitizeAssistantDelta(text).trim();
+  if (!finalText) return;
+  recentlyCompletedDeliveryBySession.set(sessionKey, { text: finalText, ts: Date.now() });
+}
+
+function isRecentlyCompletedDeliveryText(sessionKey: string, text: string, withinMs = 10000): boolean {
+  const finalText = sanitizeAssistantDelta(text).trim();
+  if (!finalText) return false;
+  const recent = recentlyCompletedDeliveryBySession.get(sessionKey);
+  if (!recent) return false;
+  if (Date.now() - recent.ts > withinMs) {
+    recentlyCompletedDeliveryBySession.delete(sessionKey);
+    return false;
+  }
+  return recent.text === finalText;
+}
+
+function publishTextIfNew(sessionKey: string, text: string): void {
+  const finalText = sanitizeAssistantDelta(text);
+  if (!finalText) return;
+
+  const streamedText = streamEventBus.getLatestText(sessionKey);
+  if (!streamedText) {
+    streamEventBus.publish(sessionKey, { type: 'text', content: finalText, replace: true });
+  } else if (finalText === streamedText) {
+    // Already visible.
+  } else if (finalText.startsWith(streamedText) && finalText.length > streamedText.length) {
+    streamEventBus.publish(sessionKey, { type: 'text', content: finalText.substring(streamedText.length) });
+  } else if (!streamedText.includes(finalText)) {
+    streamEventBus.publish(sessionKey, { type: 'text', content: finalText, replace: true });
+  }
+
+  chatLastSeenTextMap.set(sessionKey, finalText);
+}
+
+function takeRecentMessageToolReply(sessionKey: string, withinMs = 30000): string {
+  const cached = messageToolReplyBySession.get(sessionKey);
+  if (!cached) return '';
+  if (Date.now() - cached.ts > withinMs) {
+    messageToolReplyBySession.delete(sessionKey);
+    return '';
+  }
+  messageToolReplyBySession.delete(sessionKey);
+  return cached.text;
+}
+
+function isCodexTurnCompletionIdleTimeoutError(text: unknown): boolean {
+  return /\bcodex app-server turn idle timed out waiting for turn\/completed\b/i.test(String(text || ''));
+}
+
+function latestVisibleAssistantText(sessionKey: string): string {
+  return sanitizeAssistantDelta(
+    streamEventBus.getLatestText(sessionKey)
+      || chatLastSeenTextMap.get(sessionKey)
+      || assistantLastSeenTextMap.get(sessionKey)
+      || '',
+  ).trim();
+}
+
+function completeIdleTimedOutTurnIfVisible(sessionKey: string, runId: string | undefined, errorText: string): boolean {
+  if (!isCodexTurnCompletionIdleTimeoutError(errorText)) return false;
+  if (hasRunningToolCall(sessionKey)) return false;
+
+  const finalText = latestVisibleAssistantText(sessionKey);
+  if (!finalText) return false;
+
+  debugLog(`Treating Codex turn/completed idle timeout as completed after visible assistant output for ${sessionKey}`);
+  publishTextIfNew(sessionKey, finalText);
+  markCompletedDelivery(sessionKey, finalText);
+  streamEventBus.publish(sessionKey, {
+    type: 'done',
+    content: finalText,
+    runId,
+  });
+  cleanupCompletedRun(sessionKey, runId);
+  return true;
+}
+
+function scheduleEmptyFinal(sessionKey: string, runId?: string, model?: string | null): void {
+  clearPendingEmptyFinal(sessionKey);
+  const timer = setTimeout(() => {
+    pendingEmptyFinalBySession.delete(sessionKey);
+    streamEventBus.publish(sessionKey, { type: 'done', content: '', model: model || null });
+    cleanupCompletedRun(sessionKey, runId);
+  }, 2500);
+  timer.unref?.();
+  pendingEmptyFinalBySession.set(sessionKey, { runId, model, timer });
 }
 
 function getReconnectDelay(): number {
@@ -276,6 +474,30 @@ function extractTextFromContent(content: unknown): string {
   return '';
 }
 
+function stripReasoningMirrorPrefix(text: string): string {
+  return sanitizeAssistantText(text || '')
+    .replace(/^\s*(?:Codex|OpenClaw) reasoning:\s*/i, '')
+    .trim();
+}
+
+function isReasoningMirrorMessage(message: any): boolean {
+  if (!message || typeof message !== 'object') return false;
+  const meta = (message.__openclaw && typeof message.__openclaw === 'object' ? message.__openclaw : null)
+    || (message.metadata?.__openclaw && typeof message.metadata.__openclaw === 'object' ? message.metadata.__openclaw : null);
+  const mirrorIdentity = typeof meta?.mirrorIdentity === 'string' ? meta.mirrorIdentity : '';
+  if (/:reasoning$/i.test(mirrorIdentity)) return true;
+  const idempotencyKey = typeof message.idempotencyKey === 'string' ? message.idempotencyKey : '';
+  if (/:reasoning(?:$|:)/i.test(idempotencyKey)) return true;
+
+  const text = extractTextFromContent(message.content ?? message.text ?? '');
+  return /^\s*(?:Codex|OpenClaw) reasoning:\s*/i.test(text);
+}
+
+function extractReasoningMirrorText(message: any): string {
+  if (!isReasoningMirrorMessage(message)) return '';
+  return stripReasoningMirrorPrefix(extractTextFromContent(message.content ?? message.text ?? ''));
+}
+
 function sanitizeAssistantDelta(text: string): string {
   if (!text) return '';
   const sanitized = sanitizeAssistantText(text);
@@ -289,6 +511,78 @@ function getToolIcon(name: string): string {
     browser: '🌐', image: '🖼️', message: '💬', tts: '🔊',
   };
   return icons[name] || '🔧';
+}
+
+function isMessageToolName(name: unknown): boolean {
+  return String(name || '').trim().toLowerCase() === 'message';
+}
+
+function isGenericAnalysisMetadataText(text: string): boolean {
+  const normalized = String(text || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  return [
+    'reasoning',
+    'analysis',
+    'start',
+    'started',
+    'running',
+    'end',
+    'ended',
+    'complete',
+    'completed',
+    'analyzing…',
+    'analyzing...',
+    'analysis complete.',
+    'analysis complete',
+  ].includes(normalized);
+}
+
+function extractVisibleAnalysisThinkingText(data: Record<string, unknown>): string {
+  // `item.analysis` is lifecycle metadata in current OpenClaw. Actual streamed
+  // thought text is emitted on stream='thinking'; do not turn titles like
+  // "Reasoning" into visible thought bubbles.
+  const candidates = [data.delta, data.text, data.content, data.message, data.statusText];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const trimmed = candidate.trim();
+    if (!trimmed || isGenericAnalysisMetadataText(trimmed)) continue;
+    return trimmed;
+  }
+  return '';
+}
+
+function extractPreambleProgressText(data: Record<string, unknown>): string {
+  const candidate = typeof data.progressText === 'string'
+    ? data.progressText
+    : (typeof data.text === 'string'
+        ? data.text
+        : (typeof data.content === 'string' ? data.content : ''));
+  return sanitizeAssistantDelta(candidate);
+}
+
+function extractMessageToolReplyText(message: any): string {
+  const role = String(message?.role || message?.type || '').trim().toLowerCase();
+  const toolName = message?.toolName ?? message?.name ?? message?.tool_name;
+  if (role !== 'toolresult' || !isMessageToolName(toolName)) return '';
+
+  const rawCandidates: string[] = [];
+  const content = message?.content;
+  if (typeof content === 'string') {
+    rawCandidates.push(content);
+  } else if (Array.isArray(content)) {
+    for (const item of content) {
+      if (typeof item?.content === 'string') rawCandidates.push(item.content);
+      if (typeof item?.text === 'string') rawCandidates.push(item.text);
+    }
+  }
+
+  for (const raw of rawCandidates) {
+    try {
+      const parsed = JSON.parse(raw);
+      const text = parsed?.sourceReply?.text ?? parsed?.message;
+      if (typeof text === 'string' && text.trim()) return sanitizeAssistantDelta(text);
+    } catch {}
+  }
+  return '';
 }
 
 /**
@@ -362,12 +656,25 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
     return;
   }
 
+  const isLateTerminalError = streamEventBus.wasRecentlyDone(sessionKey, 10000)
+    && (stream === 'lifecycle' && String(data.phase || '').toLowerCase() === 'error');
+  if (!expectedRunId && runId && isLateTerminalError) {
+    debugLog(`Ignoring late lifecycle.error after completed run for session=${sessionKey} runId=${runId}`);
+    return;
+  }
+  if (!expectedRunId && runId && isRecentlyCompletedRun(sessionKey, runId)) {
+    debugLog(`Ignoring late agent event for completed run session=${sessionKey} runId=${runId}`);
+    return;
+  }
+
   // If no active runId is set but the event has one, adopt it (new run segment after yield)
   if (!expectedRunId && runId) {
     activeRunIds.set(sessionKey, runId);
     debugLog(`Adopted new runId=${runId} for session ${sessionKey} (resumed after yield)`);
     // Reset text accumulators for the new run
     assistantLastSeenTextMap.delete(sessionKey);
+    chatLastSeenTextMap.delete(sessionKey);
+    sessionsWithAssistantTextStream.delete(sessionKey);
     lastToolPhaseBySession.delete(sessionKey);
     streamEventBus.setLastSeenText(sessionKey, '');
     streamEventBus.setLatestText(sessionKey, '');
@@ -378,9 +685,36 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   // Ensure the stream is tracked
   streamEventBus.startStream(sessionKey, runId);
 
+  if (stream === 'item' && data.kind === 'preamble') {
+    const content = extractPreambleProgressText(data);
+    if (content) {
+      if (!hasRunningToolCall(sessionKey)) {
+        streamEventBus.updateStreamPhase(sessionKey, {
+          phase: 'thinking',
+          runId,
+          statusText: content,
+        });
+      }
+      streamEventBus.publish(sessionKey, { type: 'thinking', content, runId, replace: true });
+    }
+    return;
+  }
+
+  if (stream === 'item' && data.kind === 'analysis') {
+    const content = extractVisibleAnalysisThinkingText(data);
+    streamEventBus.updateStreamPhase(sessionKey, {
+      phase: 'thinking',
+      runId,
+      ...(content ? { statusText: content } : {}),
+    });
+    if (content) streamEventBus.publish(sessionKey, { type: 'thinking', content, runId });
+    return;
+  }
+
   if (stream === 'assistant') {
     const text = typeof data.text === 'string' ? sanitizeAssistantDelta(data.text) : undefined;
     const delta = typeof data.delta === 'string' ? sanitizeAssistantDelta(data.delta) : undefined;
+    debugLog(`assistant event: session=${sessionKey} runId=${runId || '-'} keys=${Object.keys(data).join(',')} textLen=${text?.length || 0} deltaLen=${delta?.length || 0}`);
 
     const assistantLastSeen = assistantLastSeenTextMap.get(sessionKey) || '';
 
@@ -391,17 +725,25 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
         assistantLastSeenTextMap.set(sessionKey, text);
         streamEventBus.setLastSeenText(sessionKey, text);
         if (text) {
+          sessionsWithAssistantTextStream.add(sessionKey);
           streamEventBus.updateStreamPhase(sessionKey, { phase: 'streaming' });
           streamEventBus.publish(sessionKey, { type: 'text', content: text, replace: true });
         }
       } else if (text.length > assistantLastSeen.length) {
         const newPart = text.substring(assistantLastSeen.length);
+        sessionsWithAssistantTextStream.add(sessionKey);
         streamEventBus.updateStreamPhase(sessionKey, { phase: 'streaming' });
         streamEventBus.publish(sessionKey, { type: 'text', content: newPart });
         assistantLastSeenTextMap.set(sessionKey, text);
         streamEventBus.setLastSeenText(sessionKey, text);
+      } else if (text === assistantLastSeen) {
+        // A chat.delta fallback may have already emitted this exact cumulative
+        // text before the assistant stream arrived. Mark assistant stream as
+        // available without re-emitting duplicate content.
+        sessionsWithAssistantTextStream.add(sessionKey);
       }
     } else if (delta) {
+      sessionsWithAssistantTextStream.add(sessionKey);
       streamEventBus.updateStreamPhase(sessionKey, { phase: 'streaming' });
       streamEventBus.publish(sessionKey, { type: 'text', content: delta });
       const nextSeen = assistantLastSeen + delta;
@@ -416,12 +758,12 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
       ? data.text
       : (typeof data.delta === 'string' ? data.delta : (typeof data.content === 'string' ? data.content : ''));
     if (thinkingText) {
-      if (hasRunningToolCall(sessionKey)) {
-        debugLog(`Ignoring thinking event while tool is active for ${sessionKey}`);
-        return;
+      // Thought deltas can arrive while a tool card is still active. Do not
+      // discard them; just avoid overwriting the visible tool phase/status.
+      if (!hasRunningToolCall(sessionKey)) {
+        streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking' });
       }
-      streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking' });
-      streamEventBus.publish(sessionKey, { type: 'thinking', content: thinkingText });
+      streamEventBus.publish(sessionKey, { type: 'thinking', content: thinkingText, runId });
     }
     return;
   }
@@ -429,6 +771,7 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   if (stream === 'tool') {
     const phase = typeof data.phase === 'string' ? data.phase : '';
     const toolName = typeof data.name === 'string' ? data.name : 'tool';
+    if (isMessageToolName(toolName)) return;
     const lastToolPhase = lastToolPhaseBySession.get(sessionKey);
     const isDuplicateToolPhase = (
       lastToolPhase
@@ -442,7 +785,7 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
       return;
     }
 
-    console.log(`[PersistentGatewayWs] TOOL EVENT: phase=${phase} name=${toolName} session=${sessionKey}`);
+    debugLog(`TOOL EVENT: phase=${phase} name=${toolName} session=${sessionKey}`);
 
     if (phase === 'start') {
       lastToolPhaseBySession.set(sessionKey, { runId, toolName, phase: 'start' });
@@ -459,15 +802,31 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
         toolName,
         toolArgs: data.input || data.args,
       });
+    } else if (phase === 'update') {
+      const partialOutput = extractToolResultText(data.partialResult ?? data.output ?? data.result)?.substring(0, 1000);
+      if (partialOutput) {
+        streamEventBus.updateStreamPhase(sessionKey, { phase: 'tool', toolName });
+        streamEventBus.publish(sessionKey, {
+          type: 'tool_update',
+          content: partialOutput,
+          toolName,
+          toolCallId: data.toolCallId,
+          toolResult: partialOutput,
+        });
+      }
     } else if (phase === 'result') {
       lastToolPhaseBySession.set(sessionKey, { runId, toolName, phase: 'result' });
       streamEventBus.updateStreamPhase(sessionKey, { phase: 'streaming', toolName: undefined });
-      const output = typeof data.output === 'string' ? data.output.substring(0, 500) : undefined;
+      const output = extractToolResultText(data.output ?? data.result)?.substring(0, 1000);
+      const resultStatus = String((data.result as any)?.status || data.status || '').toLowerCase();
+      const isError = data.isError === true || resultStatus === 'failed' || resultStatus === 'error';
       streamEventBus.publish(sessionKey, {
         type: 'tool_end',
-        content: `✅ Tool completed: ${toolName}`,
+        content: isError ? `❌ Tool failed: ${toolName}` : `✅ Tool completed: ${toolName}`,
         toolName,
+        toolCallId: data.toolCallId,
         toolResult: output,
+        ...(isError ? { status: 'error' } : {}),
       });
     }
     return;
@@ -486,6 +845,7 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
       const errMsg = typeof data.error === 'string'
         ? data.error
         : (typeof data.errorMessage === 'string' ? data.errorMessage : 'Agent error');
+      if (completeIdleTimedOutTurnIfVisible(sessionKey, runId, errMsg)) return;
       streamEventBus.publish(sessionKey, { type: 'error', content: errMsg });
       streamEventBus.clearStream(sessionKey);
       activeRunIds.delete(sessionKey);
@@ -534,6 +894,65 @@ function handleSessionMessageEvent(payload: Record<string, unknown> | undefined)
   const meta = (message.__openclaw && typeof message.__openclaw === 'object' ? message.__openclaw : null)
     || (message.metadata?.__openclaw && typeof message.metadata.__openclaw === 'object' ? message.metadata.__openclaw : null);
   const text = extractTextFromContent(message.content ?? message.text ?? '');
+  const role = typeof message.role === 'string' ? message.role : (typeof message.type === 'string' ? message.type : '');
+  debugLog(`session.message event: session=${sessionKey} role=${role || '-'} textLen=${text.length} keys=${Object.keys(message).join(',')}`);
+
+  const normalizedRole = role.trim().toLowerCase();
+  const reasoningMirrorText = normalizedRole === 'assistant' ? extractReasoningMirrorText(message) : '';
+  if (reasoningMirrorText && !isControlOnlyAssistantText(reasoningMirrorText)) {
+    // Codex/app-server stores visible reasoning as a delivery-mirror assistant
+    // message (`mirrorIdentity: ...:reasoning`) instead of a normal assistant
+    // answer. Keep it on the thinking channel and do not close the turn as done.
+    if (activeRunIds.has(sessionKey) || pendingEmptyFinalBySession.has(sessionKey) || streamEventBus.getTrackedStream(sessionKey)) {
+      streamEventBus.startStream(sessionKey, activeRunIds.get(sessionKey));
+      streamEventBus.publish(sessionKey, { type: 'thinking', content: reasoningMirrorText });
+    }
+    return;
+  }
+
+  const messageToolReplyText = extractMessageToolReplyText(message);
+  if (messageToolReplyText && !isControlOnlyAssistantText(messageToolReplyText)) {
+    const pending = clearPendingEmptyFinal(sessionKey);
+    if (pending) {
+      if (pending.runId) streamEventBus.startStream(sessionKey, pending.runId);
+      publishTextIfNew(sessionKey, messageToolReplyText);
+      markCompletedDelivery(sessionKey, messageToolReplyText);
+      streamEventBus.publish(sessionKey, {
+        type: 'done',
+        content: messageToolReplyText,
+        model: extractGatewayMessageModel(payload) || pending.model || null,
+      });
+      cleanupCompletedRun(sessionKey, pending.runId);
+      return;
+    }
+    messageToolReplyBySession.set(sessionKey, { text: messageToolReplyText, ts: Date.now() });
+  }
+
+  if (normalizedRole === 'assistant' && text && !isControlOnlyAssistantText(text)) {
+    const pending = clearPendingEmptyFinal(sessionKey);
+    const activeRunId = activeRunIds.get(sessionKey) || streamEventBus.getTrackedStream(sessionKey)?.runId;
+    const deliveryRunId = pending?.runId || activeRunId;
+    const shouldMirrorDelivery = Boolean(pending)
+      || activeRunIds.has(sessionKey)
+      || streamEventBus.wasRecentlyDone(sessionKey, 5000);
+    if (shouldMirrorDelivery) {
+      if (!pending && !activeRunId && isRecentlyCompletedDeliveryText(sessionKey, text)) {
+        return;
+      }
+      if (deliveryRunId) streamEventBus.startStream(sessionKey, deliveryRunId);
+      publishTextIfNew(sessionKey, text);
+      markCompletedDelivery(sessionKey, text);
+      streamEventBus.publish(sessionKey, {
+        type: 'done',
+        content: text,
+        model: extractGatewayMessageModel(payload) || pending?.model || null,
+        runId: deliveryRunId,
+      });
+      cleanupCompletedRun(sessionKey, deliveryRunId);
+      return;
+    }
+  }
+
   const kind = typeof meta?.kind === 'string' ? meta.kind.toLowerCase() : '';
   const phase = typeof meta?.phase === 'string' ? meta.phase.toLowerCase() : '';
   const isCompactionMeta = kind === 'compaction';
@@ -641,6 +1060,15 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     return;
   }
 
+  if (!expectedRunId && runId && state === 'error' && streamEventBus.wasRecentlyDone(sessionKey, 10000)) {
+    debugLog(`Ignoring late chat.error after completed run for session=${sessionKey} runId=${runId}`);
+    return;
+  }
+  if (!expectedRunId && runId && isRecentlyCompletedRun(sessionKey, runId)) {
+    debugLog(`Ignoring late chat.${state || 'event'} for completed run session=${sessionKey} runId=${runId}`);
+    return;
+  }
+
   // If no active runId is set but the event has one, adopt it (new run segment)
   if (!expectedRunId && runId) {
     const wasRecent = streamEventBus.wasRecentlyDone(sessionKey);
@@ -648,6 +1076,8 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     debugLog(`Adopted new runId=${runId} for session ${sessionKey} via chat event (wasRecentlyDone=${wasRecent})`);
     // Reset text accumulators for the new run
     assistantLastSeenTextMap.delete(sessionKey);
+    chatLastSeenTextMap.delete(sessionKey);
+    sessionsWithAssistantTextStream.delete(sessionKey);
     lastToolPhaseBySession.delete(sessionKey);
     streamEventBus.setLastSeenText(sessionKey, '');
     streamEventBus.setLatestText(sessionKey, '');
@@ -661,16 +1091,81 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
   streamEventBus.startStream(sessionKey, runId);
 
   if (state === 'delta') {
-    // Chat deltas carry accumulated text across the ENTIRE response (never resets).
-    // The assistant stream is the primary text source (faster, per-token).
-    // Chat deltas only serve as position tracking — no text emission here.
+    // Newer OpenClaw builds may emit assistant text only through chat.delta,
+    // while agent stream='assistant' can be metadata-only. Treat chat.delta as a
+    // cumulative fallback text stream unless assistant stream text already won.
+    const message = payload.message as Record<string, unknown> | undefined;
+    const reasoningMirrorText = extractReasoningMirrorText(message);
+    if (reasoningMirrorText && !isControlOnlyAssistantText(reasoningMirrorText)) {
+      streamEventBus.publish(sessionKey, { type: 'thinking', content: reasoningMirrorText, runId });
+      return;
+    }
+
+    const deltaText = extractTextFromContent(
+      message?.content ?? payload.text ?? payload.delta ?? payload.content ?? '',
+    );
+
+    debugLog(`chat.delta event: session=${sessionKey} runId=${runId || '-'} textLen=${deltaText.length} payloadKeys=${Object.keys(payload).join(',')}`);
+    if (!deltaText || isControlOnlyAssistantText(deltaText)) return;
+
+    if (sessionsWithAssistantTextStream.has(sessionKey)) {
+      chatLastSeenTextMap.set(sessionKey, deltaText);
+      return;
+    }
+
+    // Keep assistant-stream diffing aligned if chat.delta wins the race. If a
+    // real assistant stream event arrives later with the same cumulative text,
+    // it will be recognized as already emitted rather than duplicated.
+    assistantLastSeenTextMap.set(sessionKey, deltaText);
+
+    const lastSeen = chatLastSeenTextMap.get(sessionKey) || '';
+    if (deltaText.length < lastSeen.length || (lastSeen && !deltaText.startsWith(lastSeen))) {
+      streamEventBus.updateStreamPhase(sessionKey, { phase: 'streaming' });
+      streamEventBus.publish(sessionKey, { type: 'text', content: deltaText, replace: true });
+    } else if (deltaText.length > lastSeen.length) {
+      streamEventBus.updateStreamPhase(sessionKey, { phase: 'streaming' });
+      streamEventBus.publish(sessionKey, { type: 'text', content: deltaText.substring(lastSeen.length) });
+    }
+    chatLastSeenTextMap.set(sessionKey, deltaText);
+    streamEventBus.setLastSeenText(sessionKey, deltaText);
     return;
   }
 
   if (state === 'final') {
     const message = payload.message as Record<string, unknown> | undefined;
+    const finalReasoningMirrorText = extractReasoningMirrorText(message);
+    if (finalReasoningMirrorText && !isControlOnlyAssistantText(finalReasoningMirrorText)) {
+      streamEventBus.publish(sessionKey, { type: 'thinking', content: finalReasoningMirrorText, runId });
+      scheduleEmptyFinal(sessionKey, runId, extractGatewayMessageModel(payload));
+      return;
+    }
+
     const finalText = message ? extractTextFromContent(message.content) : '';
     const finalModel = extractGatewayMessageModel(payload);
+    debugLog(`chat.final event: session=${sessionKey} runId=${runId || '-'} finalLen=${finalText.length} payloadKeys=${Object.keys(payload).join(',')}`);
+
+    if (!finalText || isControlOnlyAssistantText(finalText)) {
+      // Codex/app-server may emit the visible assistant text as either a
+      // message-tool sourceReply or a delivery-mirror `session.message` around
+      // an empty chat.final. Prefer that real visible delivery over closing the
+      // live bubble empty.
+      const messageToolReplyText = takeRecentMessageToolReply(sessionKey);
+      if (messageToolReplyText) {
+        publishTextIfNew(sessionKey, messageToolReplyText);
+        markCompletedDelivery(sessionKey, messageToolReplyText);
+        streamEventBus.publish(sessionKey, {
+          type: 'done',
+          content: messageToolReplyText,
+          model: finalModel,
+        });
+        cleanupCompletedRun(sessionKey, runId);
+        return;
+      }
+      scheduleEmptyFinal(sessionKey, runId, finalModel);
+      return;
+    }
+
+    clearPendingEmptyFinal(sessionKey);
 
     // Reconcile final text against what was already streamed.
     // IMPORTANT: After tool calls, the gateway's final message.content contains ALL
@@ -686,11 +1181,13 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
       if (!streamedText) {
         // Nothing was streamed — deliver the full final text
         streamEventBus.publish(sessionKey, { type: 'text', content: finalText, replace: true });
+        chatLastSeenTextMap.set(sessionKey, finalText);
       } else if (finalText === streamedText) {
         // Exact match — nothing to do
       } else if (finalText.startsWith(streamedText) && finalText.length > streamedText.length) {
         // Final is a continuation of what we have — append the tail
         streamEventBus.publish(sessionKey, { type: 'text', content: finalText.substring(streamedText.length) });
+        chatLastSeenTextMap.set(sessionKey, finalText);
       } else if (finalText.includes(streamedText)) {
         // Our streamed text is a substring of the final (multi-segment).
         // The stream already showed the correct latest segment — don't replace
@@ -702,23 +1199,18 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
       } else {
         // Genuinely different — replace (covers edge cases like compaction rewrites)
         streamEventBus.publish(sessionKey, { type: 'text', content: finalText, replace: true });
+        chatLastSeenTextMap.set(sessionKey, finalText);
       }
     }
 
+    markCompletedDelivery(sessionKey, finalText);
     streamEventBus.publish(sessionKey, {
       type: 'done',
-      content: isControlOnlyAssistantText(finalText) ? '' : finalText,
+      content: finalText,
       model: finalModel,
     });
 
-    // Use soft-clear instead of hard-clear: the agent may resume after a sub-agent
-    // completes (sessions_yield → sub-agent → result injected → new run starts).
-    // Soft-clear resets text accumulators but preserves subscribers so the next run's
-    // events are still forwarded to the browser.
-    streamEventBus.softClearStream(sessionKey);
-    activeRunIds.delete(sessionKey);
-    assistantLastSeenTextMap.delete(sessionKey);
-    lastToolPhaseBySession.delete(sessionKey);
+    cleanupCompletedRun(sessionKey, runId);
     return;
   }
 
@@ -726,10 +1218,13 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     const errMsg = typeof payload.errorMessage === 'string'
       ? payload.errorMessage
       : (typeof payload.error === 'string' ? payload.error : 'Chat error');
+    if (completeIdleTimedOutTurnIfVisible(sessionKey, runId, errMsg)) return;
     streamEventBus.publish(sessionKey, { type: 'error', content: errMsg });
     streamEventBus.clearStream(sessionKey);
     activeRunIds.delete(sessionKey);
     assistantLastSeenTextMap.delete(sessionKey);
+    chatLastSeenTextMap.delete(sessionKey);
+    sessionsWithAssistantTextStream.delete(sessionKey);
     lastToolPhaseBySession.delete(sessionKey);
     return;
   }
@@ -743,6 +1238,8 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     streamEventBus.clearStream(sessionKey);
     activeRunIds.delete(sessionKey);
     assistantLastSeenTextMap.delete(sessionKey);
+    chatLastSeenTextMap.delete(sessionKey);
+    sessionsWithAssistantTextStream.delete(sessionKey);
     lastToolPhaseBySession.delete(sessionKey);
     return;
   }
@@ -957,7 +1454,7 @@ function connect(): void {
     }
 
     // Agent stream events
-    if (msg.event === 'agent') {
+    if (msg.event === 'agent' || msg.event === 'session.tool') {
       handleAgentEvent(msg.payload);
       return;
     }

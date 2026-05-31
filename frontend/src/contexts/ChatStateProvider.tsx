@@ -34,6 +34,17 @@ import {
   type GatewayChatMessage,
 } from '../utils/openclawGatewayClient';
 import { canonicalizePortalModelId } from '../utils/modelId';
+import {
+  appendCompletedToolCallIfMissing,
+  appendToolCallToMessage,
+  buildCompletedToolCall,
+  buildRunningToolCall,
+  finishMatchingToolCallInMessage,
+  finishRunningToolCallInMessage,
+  getLastRunningToolCall,
+  updateRunningToolCallInMessage,
+} from '../utils/liveTurnProjector';
+import { normalizePortalStreamEventFromTurnEvent } from '../utils/runtimeTurnEvents';
 import { usePublicSettings } from '../hooks/usePublicSettings';
 import {
   pruneExpiredExecApprovals,
@@ -41,7 +52,7 @@ import {
   upsertExecApproval,
 } from '../utils/execApprovalQueue';
 import { getToolStatusText, resolveToolName, isCompactionNotice } from '../utils/toolPresentation';
-import { resolveMaintenanceRailStatus } from '../components/chat/maintenanceRailLifecycle';
+import { getRailSafeStatusText, resolveMaintenanceRailStatus } from '../components/chat/maintenanceRailLifecycle';
 
 const DEBUG_CHAT_STATE = import.meta.env.DEV;
 const BUILD_TIME_USE_DIRECT_GATEWAY = import.meta.env.VITE_USE_DIRECT_GATEWAY === 'true';
@@ -59,6 +70,7 @@ export interface ToolCall {
   result?: string;
   status: 'running' | 'done' | 'error';
   arguments?: any;
+  order?: number;
 }
 
 export interface ExecApprovalRequest {
@@ -81,6 +93,8 @@ export interface TextSegment {
   text: string;
   position: 'before' | 'after' | 'between';
   kind?: 'text' | 'thinking';
+  ts?: number;
+  order?: number;
 }
 
 interface StreamSegment {
@@ -310,7 +324,8 @@ function stripHistoryEnvelope(text: string): string {
   if (match && match.index !== undefined) {
     const beforeTimestamp = text.substring(0, match.index);
     if (
-      beforeTimestamp.includes('Conversation info (untrusted metadata)')
+      match.index === 0
+      || beforeTimestamp.includes('Conversation info (untrusted metadata)')
       || beforeTimestamp.includes('Sender (untrusted metadata)')
     ) {
       return text.substring(match.index + match[0].length).trim();
@@ -421,6 +436,7 @@ function normalizeToolCalls(toolCalls: any, defaultStatus: ToolCall['status'] = 
         status: tc.status === 'running' || tc.status === 'error' || tc.status === 'done'
           ? tc.status
           : defaultStatus,
+        order: typeof tc.order === 'number' && Number.isFinite(tc.order) ? tc.order : undefined,
       };
     });
 }
@@ -516,6 +532,68 @@ function gatewayTextFromBlocks(blocks: any[]): string {
     .filter(isGatewayTextBlock)
     .map((block) => block.text as string)
     .join('\n');
+}
+
+function gatewayThinkingFromBlocks(blocks: any[]): string {
+  return blocks
+    .filter((block) => block?.type === 'thinking' && (typeof block.thinking === 'string' || typeof block.text === 'string'))
+    .map((block) => (typeof block.thinking === 'string' ? block.thinking : block.text) as string)
+    .join('');
+}
+
+function gatewayTextFromLiveChatPayload(payload: any): string {
+  const content = payload?.message?.content;
+  const fromMessageContent = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? gatewayTextFromBlocks(content)
+      : '';
+  if (fromMessageContent) return fromMessageContent;
+
+  if (typeof payload?.message?.text === 'string') return payload.message.text;
+  if (typeof payload?.deltaText === 'string') return payload.deltaText;
+  if (typeof payload?.text === 'string') return payload.text;
+  if (typeof payload?.content === 'string') return payload.content;
+  return '';
+}
+
+function gatewayThinkingFromLiveChatPayload(payload: any): string {
+  const content = payload?.message?.content;
+  const fromBlocks = Array.isArray(content) ? gatewayThinkingFromBlocks(content) : '';
+  if (fromBlocks) return fromBlocks;
+  if (typeof payload?.thinking === 'string') return payload.thinking;
+  if (typeof payload?.thinkingText === 'string') return payload.thinkingText;
+  return '';
+}
+
+function gatewayModelFromPayload(payload: any): string {
+  const message = payload?.message;
+  const candidates = [
+    message?.model,
+    message?.modelId,
+    message?.model_id,
+    message?.actualModel,
+    message?.executedModel,
+    message?.metadata?.model,
+    payload?.model,
+    payload?.modelId,
+    payload?.model_id,
+    payload?.actualModel,
+    payload?.executedModel,
+    payload?.metadata?.model,
+    payload?.session?.resolved?.model && payload?.session?.resolved?.modelProvider
+      ? `${payload.session.resolved.modelProvider}/${payload.session.resolved.model}`
+      : '',
+    payload?.session?.modelProvider && payload?.session?.model
+      ? `${payload.session.modelProvider}/${payload.session.model}`
+      : '',
+    payload?.session?.model,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+  return '';
 }
 
 /**
@@ -687,6 +765,91 @@ function normalizeHistoryReplayContent(content: string): string {
   return (content || '').replace(/\r\n/g, '\n').trim();
 }
 
+function isMessageToolName(name: unknown): boolean {
+  return String(name || '').trim().toLowerCase() === 'message';
+}
+
+function isGenericAnalysisMetadataText(text: string): boolean {
+  const normalized = normalizeHistoryReplayContent(text).replace(/\s+/g, ' ').toLowerCase();
+  return [
+    'reasoning',
+    'analysis',
+    'start',
+    'started',
+    'running',
+    'end',
+    'ended',
+    'complete',
+    'completed',
+    'analyzing…',
+    'analyzing...',
+    'analysis complete.',
+    'analysis complete',
+  ].includes(normalized);
+}
+
+function extractVisibleAnalysisThinkingText(data: Record<string, any> | null | undefined): string {
+  if (!data || typeof data !== 'object') return '';
+  // OpenClaw item.analysis events are usually lifecycle metadata. The actual
+  // visible reasoning stream arrives on stream='thinking'. Never promote titles
+  // like "Reasoning" into thought text.
+  const candidates = [data.delta, data.text, data.content, data.message, data.statusText];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const trimmed = candidate.trim();
+    if (!trimmed || isGenericAnalysisMetadataText(trimmed)) continue;
+    return trimmed;
+  }
+  return '';
+}
+
+function collectGatewayContentStrings(content: unknown): string[] {
+  if (typeof content === 'string') return [content];
+  if (!Array.isArray(content)) return [];
+  const values: string[] = [];
+  for (const item of content) {
+    if (!item || typeof item !== 'object') continue;
+    const entry = item as Record<string, any>;
+    if (typeof entry.content === 'string') values.push(entry.content);
+    if (typeof entry.text === 'string') values.push(entry.text);
+  }
+  return values;
+}
+
+function extractMessageToolSourceReplyTextFromGatewayPayload(payload: any): string {
+  const message = payload?.message ?? payload;
+  if (!message || typeof message !== 'object') return '';
+
+  const role = typeof message.role === 'string'
+    ? message.role.trim().toLowerCase()
+    : (typeof message.type === 'string' ? message.type.trim().toLowerCase() : '');
+  if (role !== 'toolresult' && role !== 'tool_result' && role !== 'tool') return '';
+
+  const toolName = message.toolName ?? message.name ?? message.tool_name ?? payload?.toolName ?? payload?.name ?? payload?.tool_name;
+  const payloadCandidates: Record<string, any>[] = [];
+  for (const candidate of [payload, message]) {
+    if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) payloadCandidates.push(candidate);
+  }
+  for (const raw of collectGatewayContentStrings(message.content ?? message.text ?? '')) {
+    const parsed = parseToolResultPayload(raw);
+    if (parsed) payloadCandidates.push(parsed);
+  }
+
+  for (const candidate of payloadCandidates) {
+    const mode = typeof candidate.sourceReplyDeliveryMode === 'string'
+      ? candidate.sourceReplyDeliveryMode.trim().toLowerCase()
+      : '';
+    const text = typeof candidate.sourceReply?.text === 'string'
+      ? candidate.sourceReply.text
+      : (typeof candidate.message === 'string' ? candidate.message : '');
+    if (!text.trim()) continue;
+    if (mode === 'message_tool_only' || (isMessageToolName(toolName) && candidate.sourceReply)) {
+      return normalizeHistoryReplayContent(sanitizeAssistantContent(text));
+    }
+  }
+  return '';
+}
+
 function isStandaloneMaintenanceNoticeContent(text: string): boolean {
   const normalized = sanitizeHistoryMessageText(text || '').replace(/\s+/g, ' ').trim();
   if (!normalized || !isCompactionNotice(normalized)) return false;
@@ -751,6 +914,339 @@ function isLikelyHistoryReplayDuplicate(previous: ChatMessage | undefined, next:
   return (nextTs - previousTs) <= HISTORY_REPLAY_DUPLICATE_WINDOW_MS;
 }
 
+function isTrajectoryRecoveryMessage(message: ChatMessage): boolean {
+  return message.provenance === 'trajectory-recovery'
+    || (typeof message.id === 'string' && message.id.startsWith('trajectory-'));
+}
+
+function isLikelyTrajectoryRecoveryDuplicate(existing: ChatMessage, next: ChatMessage): boolean {
+  if (!isTrajectoryRecoveryMessage(existing) && !isTrajectoryRecoveryMessage(next)) return false;
+  if (existing.role !== next.role || (next.role !== 'user' && next.role !== 'assistant')) return false;
+
+  const existingContent = normalizeHistoryReplayContent(existing.content);
+  const nextContent = normalizeHistoryReplayContent(next.content);
+  if (!existingContent || existingContent !== nextContent) return false;
+
+  const existingTs = existing.createdAt instanceof Date ? existing.createdAt.getTime() : NaN;
+  const nextTs = next.createdAt instanceof Date ? next.createdAt.getTime() : NaN;
+  if (!Number.isFinite(existingTs) || !Number.isFinite(nextTs)) return false;
+
+  return Math.abs(nextTs - existingTs) <= LOCAL_PENDING_ACK_WINDOW_MS;
+}
+
+function extractMessageToolVisibleText(toolCall: ToolCall | undefined): string {
+  if (!toolCall) return '';
+  const toolName = String(toolCall.name || '').trim().toLowerCase();
+  if (toolName !== 'message') return '';
+
+  const args = toolCall.arguments;
+  let candidate = '';
+  if (typeof args === 'string') {
+    const trimmed = args.trim();
+    if (!trimmed) return '';
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object') {
+        candidate = typeof parsed.message === 'string'
+          ? parsed.message
+          : (typeof parsed.text === 'string'
+              ? parsed.text
+              : (typeof parsed.content === 'string' ? parsed.content : ''));
+      } else {
+        candidate = trimmed;
+      }
+    } catch {
+      candidate = trimmed;
+    }
+  } else if (args && typeof args === 'object') {
+    candidate = typeof args.message === 'string'
+      ? args.message
+      : (typeof args.text === 'string'
+          ? args.text
+          : (typeof args.content === 'string'
+              ? args.content
+              : (typeof args.body === 'string' ? args.body : '')));
+  }
+
+  return sanitizeAssistantContent(candidate).trim();
+}
+
+function findMatchingMessageToolCall(message: ChatMessage, visibleText: string): ToolCall | undefined {
+  const normalizedVisibleText = normalizeHistoryReplayContent(visibleText);
+  if (!normalizedVisibleText || !Array.isArray(message.toolCalls)) return undefined;
+  const exact = message.toolCalls.find((toolCall) => normalizeHistoryReplayContent(extractMessageToolVisibleText(toolCall)) === normalizedVisibleText);
+  if (exact) return exact;
+
+  const messageTools = message.toolCalls.filter((toolCall) => String(toolCall?.name || '').trim().toLowerCase() === 'message');
+  if (messageTools.length === 1 && !normalizeHistoryReplayContent(extractMessageToolVisibleText(messageTools[0]))) {
+    return messageTools[0];
+  }
+  return undefined;
+}
+
+function addMessageToolDeliverySegment(target: ChatMessage, deliveryText: string, toolCall: ToolCall): ChatMessage {
+  const normalizedDeliveryText = normalizeHistoryReplayContent(deliveryText);
+  if (!normalizedDeliveryText) return target;
+  const existingSegments = Array.isArray(target.segments) ? target.segments : [];
+  if (existingSegments.some((segment) => normalizeHistoryReplayContent(segment.text) === normalizedDeliveryText)) {
+    return target;
+  }
+
+  const targetTs = target.createdAt instanceof Date ? target.createdAt.getTime() : Date.now();
+  const toolTs = typeof toolCall.endedAt === 'number' && Number.isFinite(toolCall.endedAt)
+    ? toolCall.endedAt
+    : (typeof toolCall.startedAt === 'number' && Number.isFinite(toolCall.startedAt) ? toolCall.startedAt : targetTs);
+
+  return {
+    ...target,
+    segments: [
+      ...existingSegments,
+      {
+        text: normalizedDeliveryText,
+        position: 'between',
+        kind: 'text',
+        ts: toolTs + 1,
+        order: existingSegments.length,
+      },
+    ],
+  };
+}
+
+function sortMessagesChronologically(messages: ChatMessage[]): ChatMessage[] {
+  const roleWeight = (role: ChatMessage['role']) => {
+    if (role === 'system') return 0;
+    if (role === 'user') return 1;
+    if (role === 'assistant') return 2;
+    return 3;
+  };
+  return messages
+    .map((message, index) => ({ message, index }))
+    .sort((a, b) => {
+      const aTs = a.message.createdAt instanceof Date ? a.message.createdAt.getTime() : NaN;
+      const bTs = b.message.createdAt instanceof Date ? b.message.createdAt.getTime() : NaN;
+      if (Number.isFinite(aTs) && Number.isFinite(bTs) && aTs !== bTs) return aTs - bTs;
+      if (Number.isFinite(aTs) !== Number.isFinite(bTs)) return Number.isFinite(aTs) ? -1 : 1;
+      const roleDelta = roleWeight(a.message.role) - roleWeight(b.message.role);
+      if (roleDelta !== 0) return roleDelta;
+      return a.index - b.index;
+    })
+    .map(({ message }) => message);
+}
+
+function isMessageToolOnlyAssistant(message: ChatMessage): boolean {
+  if (message.role !== 'assistant') return false;
+  const content = normalizeHistoryReplayContent(message.content).toLowerCase();
+  if (content && content !== 'message') return false;
+  const calls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+  return content === 'message' || (calls.length > 0 && calls.every((tool) => tool?.name === 'message'));
+}
+
+function parseToolResultPayload(content: string): Record<string, any> | null {
+  const normalized = String(content || '').trim();
+  if (!normalized.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(normalized);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractMessageToolSourceReplyText(message: ChatMessage): string {
+  if (message.role !== 'toolResult') return '';
+  const payload = parseToolResultPayload(message.content);
+  if (!payload) return '';
+  if (payload.sourceReplyDeliveryMode !== 'message_tool_only') return '';
+  const sourceText = typeof payload.sourceReply?.text === 'string'
+    ? payload.sourceReply.text
+    : (typeof payload.message === 'string' ? payload.message : '');
+  return normalizeHistoryReplayContent(sourceText);
+}
+
+function isDeliveryStatusText(text: string): boolean {
+  const normalized = normalizeHistoryReplayContent(text);
+  if (!normalized) return false;
+  return [
+    /^sent (?:the |a |an )?.{1,160}(?:recommendations|recipe|recipes|code|answer|response|reply|message|summary|details|instructions|analysis|report|results|update)s?\.?$/i,
+    /^sent\b.{0,260}\.?$/i,
+    /^sent message to (?:web ?chat|current(?: chat| run)?|the user)\.?$/i,
+    /^message sent(?: to (?:web ?chat|current(?: chat| run)?|the user))?\.?$/i,
+    /^answered in (?:the )?web ?chat(?:.*)?\.?$/i,
+    /^reported .{1,180} in (?:the )?web ?chat\.?$/i,
+    /^elaborated in (?:the )?web ?chat(?:.*)?\.?$/i,
+  ].some((pattern) => pattern.test(normalized));
+}
+
+function isMessageToolDeliveryStatusArtifact(message: ChatMessage): boolean {
+  if (message.role !== 'assistant') return false;
+  if (message.thinkingContent || (Array.isArray(message.segments) && message.segments.length > 0)) return false;
+  const calls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+  const nonMessageCalls = calls.filter((tool) => String(tool?.name || '').trim().toLowerCase() !== 'message');
+  if (nonMessageCalls.length > 0) return false;
+  return isDeliveryStatusText(message.content);
+}
+
+function stripMessageDeliveryToolArtifacts(messages: ChatMessage[]): ChatMessage[] {
+  return messages.flatMap((message) => {
+    if (message.role !== 'assistant') return [message];
+    const calls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+    if (calls.length === 0) return isMessageToolDeliveryStatusArtifact(message) ? [] : [message];
+
+    const nonMessageCalls = calls.filter((tool) => String(tool?.name || '').trim().toLowerCase() !== 'message');
+    const messageCalls = calls.length - nonMessageCalls.length;
+
+    if (messageCalls === 0) return [message];
+    if (nonMessageCalls.length === 0) {
+      const content = normalizeHistoryReplayContent(message.content);
+      // A lone message tool is delivery plumbing. If it carried real user-visible
+      // text, OpenClaw also persists that text as a normal assistant message or
+      // sourceReply payload; keep this history path focused on the transcript.
+      if (!content || isDeliveryStatusText(content) || content.toLowerCase() === 'message') return [];
+      return [{ ...message, toolCalls: undefined }];
+    }
+
+    return [{ ...message, toolCalls: nonMessageCalls }];
+  });
+}
+
+function normalizeOutOfTurnMessageDeliveryMirrors(messages: ChatMessage[]): ChatMessage[] {
+  const skip = new Set<number>();
+  const insertAt = new Map<number, ChatMessage[]>();
+
+  const queueInsert = (index: number, message: ChatMessage) => {
+    const existing = insertAt.get(index) || [];
+    if (!existing.some((candidate) => normalizeHistoryReplayContent(candidate.content) === normalizeHistoryReplayContent(message.content))) {
+      existing.push(message);
+    }
+    insertAt.set(index, existing);
+  };
+
+  for (let i = 0; i < messages.length - 1; i++) {
+    if (!isMessageToolOnlyAssistant(messages[i])) continue;
+    const resultMessage = messages[i + 1];
+    const sourceReplyText = extractMessageToolSourceReplyText(resultMessage);
+    if (!sourceReplyText) continue;
+
+    skip.add(i);
+    skip.add(i + 1);
+
+    // OpenClaw 2026.5.x direct-webchat sessions persist a bookkeeping assistant
+    // message after the internal message tool, e.g. "Sent the tic-tac-toe game
+    // code." or "Sent message to Web chat". That is delivery state, not chat
+    // content. Hide any such summaries immediately following the tool result.
+    for (let j = i + 2; j < messages.length && j <= i + 5; j++) {
+      const candidate = messages[j];
+      if (!candidate || candidate.role === 'user') break;
+      if (isMessageToolDeliveryStatusArtifact(candidate)) {
+        skip.add(j);
+        continue;
+      }
+      break;
+    }
+
+    // If the real visible reply is already persisted after the tool result,
+    // leave that full assistant message in place. Otherwise synthesize a visible
+    // assistant bubble at the tool's chronological position from sourceReply.text.
+    const mirrorIndex = messages.findIndex((candidate, index) => (
+      index > i + 1
+      && candidate.role === 'assistant'
+      && normalizeHistoryReplayContent(candidate.content) === sourceReplyText
+    ));
+
+    if (mirrorIndex < 0) {
+      const toolTs = messages[i].createdAt instanceof Date ? messages[i].createdAt.getTime() : Date.now();
+      queueInsert(i, {
+        id: `${messages[i].id || resultMessage.id || `message-tool-${i}`}:source-reply`,
+        role: 'assistant',
+        content: sourceReplyText,
+        createdAt: new Date(toolTs + 1),
+        provenance: 'message-tool-source-reply',
+      });
+    }
+  }
+
+  const normalized: ChatMessage[] = [];
+  messages.forEach((message, index) => {
+    const inserted = insertAt.get(index);
+    if (inserted?.length) normalized.push(...inserted);
+    if (!skip.has(index)) normalized.push(message);
+  });
+  return normalized;
+}
+
+function weaveMessageToolDeliveryMirrors(messages: ChatMessage[]): ChatMessage[] {
+  const result: ChatMessage[] = [];
+  for (const msg of messages) {
+    if (msg.role === 'assistant') {
+      const content = normalizeHistoryReplayContent(msg.content);
+      if (content) {
+        let attachedToMessageTool = false;
+        for (let i = result.length - 1; i >= 0 && i >= result.length - 16; i--) {
+          const candidate = result[i];
+          if (candidate.role === 'user') break;
+          if (candidate.role !== 'assistant' || !candidate.toolCalls?.length) continue;
+          const matchingTool = findMatchingMessageToolCall(candidate, content);
+          if (!matchingTool) continue;
+          result[i] = addMessageToolDeliverySegment(candidate, content, matchingTool);
+          attachedToMessageTool = true;
+          break;
+        }
+        // OpenClaw's delivery mirror records the visible text after the final event,
+        // but it semantically belongs to the earlier message tool call. Keep it in
+        // that turn's timeline and suppress the late duplicate bubble.
+        if (attachedToMessageTool) continue;
+      }
+    }
+    result.push(msg);
+  }
+  return result;
+}
+
+function orderMessageToolVisibleMirrorsBeforeFinal(messages: ChatMessage[]): ChatMessage[] {
+  const moved = new Set<number>();
+  const ordered: ChatMessage[] = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    if (moved.has(i)) continue;
+
+    const current = messages[i];
+    const currentText = current?.role === 'assistant' ? normalizeHistoryReplayContent(current.content) : '';
+    const currentHasMessageTool = current?.role === 'assistant'
+      && Array.isArray(current.toolCalls)
+      && current.toolCalls.some((tool) => String(tool?.name || '').trim().toLowerCase() === 'message');
+
+    if (currentHasMessageTool && currentText) {
+      let visibleMirrorIndex = -1;
+      for (let j = i + 1; j < messages.length && j <= i + 12; j++) {
+        const candidate = messages[j];
+        if (candidate.role === 'user') break;
+        if (candidate.role !== 'assistant') continue;
+        const candidateText = normalizeHistoryReplayContent(candidate.content)
+          || normalizeHistoryReplayContent((candidate.segments || []).map((segment) => segment.text).join('\n'));
+        const candidateHasTools = Array.isArray(candidate.toolCalls) && candidate.toolCalls.length > 0;
+        if (candidateText && candidateText !== currentText && (!candidateHasTools || isMessageToolOnlyAssistant(candidate))) {
+          visibleMirrorIndex = j;
+          break;
+        }
+      }
+
+      if (visibleMirrorIndex >= 0) {
+        // Some enhanced/direct history payloads merge the message tool into the
+        // final assistant message, leaving the visible delivery mirror after it
+        // and sometimes separated by hidden artifacts. Display chronology should
+        // still be user → visible delivery → final answer.
+        ordered.push(messages[visibleMirrorIndex], current);
+        moved.add(visibleMirrorIndex);
+        continue;
+      }
+    }
+
+    ordered.push(current);
+  }
+
+  return ordered;
+}
+
 function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
   const seenIds = new Set<string>();
   const seenSignatures = new Set<string>();
@@ -760,6 +1256,23 @@ function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
     const previous = deduped[deduped.length - 1];
     if (isLikelyHistoryReplayDuplicate(previous, msg)) continue;
     if (isEquivalentCompactionNotice(previous, msg)) continue;
+
+    const trajectoryDuplicateIndex = deduped.findIndex((existing) => isLikelyTrajectoryRecoveryDuplicate(existing, msg));
+    if (trajectoryDuplicateIndex >= 0) {
+      if (isTrajectoryRecoveryMessage(deduped[trajectoryDuplicateIndex]) && !isTrajectoryRecoveryMessage(msg)) {
+        const previous = deduped[trajectoryDuplicateIndex];
+        const previousId = previous.id;
+        if (previousId) seenIds.delete(previousId);
+        const previousTs = previous.createdAt instanceof Date ? previous.createdAt.getTime() : Date.now();
+        seenSignatures.delete(`${previous.role}|${Number.isFinite(previousTs) ? previousTs : 0}|${previous.content}`);
+        // Do not replace in-place. Trajectory recovery can be slightly out of
+        // order; keep the canonical persisted message at its real position.
+        deduped.splice(trajectoryDuplicateIndex, 1);
+      } else {
+        continue;
+      }
+    }
+
     const ts = msg.createdAt instanceof Date ? msg.createdAt.getTime() : Date.now();
     const signature = `${msg.role}|${Number.isFinite(ts) ? ts : 0}|${msg.content}`;
     if (msg.role === 'assistant' && seenSignatures.has(signature)) continue;
@@ -784,6 +1297,66 @@ function isLikelyCommittedPendingUser(localMessage: ChatMessage, committedMessag
   const earliestExpectedCommitTs = localTs - 10_000;
   const latestExpectedCommitTs = localTs + LOCAL_PENDING_ACK_WINDOW_MS;
   return committedTs >= earliestExpectedCommitTs && committedTs <= latestExpectedCommitTs;
+}
+
+function enrichAssistantHistoryFromLocalProjection(historyMessage: ChatMessage, localMessage: ChatMessage): void {
+  if (historyMessage.role !== 'assistant' || localMessage.role !== 'assistant') return;
+
+  const localSegments = Array.isArray(localMessage.segments) ? localMessage.segments.filter((segment) => segment?.text?.trim()) : [];
+  const historySegments = Array.isArray(historyMessage.segments) ? historyMessage.segments.filter((segment) => segment?.text?.trim()) : [];
+  if (localSegments.length > historySegments.length) {
+    historyMessage.segments = localSegments;
+  }
+
+  if (!historyMessage.thinkingContent?.trim() && localMessage.thinkingContent?.trim()) {
+    historyMessage.thinkingContent = localMessage.thinkingContent;
+  }
+
+  const localToolCalls = Array.isArray(localMessage.toolCalls) ? localMessage.toolCalls : [];
+  const historyToolCalls = Array.isArray(historyMessage.toolCalls) ? historyMessage.toolCalls : [];
+  if (localToolCalls.length === 0) return;
+  if (historyToolCalls.length === 0) {
+    historyMessage.toolCalls = localToolCalls;
+    return;
+  }
+
+  historyMessage.toolCalls = historyToolCalls.map((historyTool, index) => {
+    const localTool = localToolCalls.find((candidate) => (
+      candidate.id && historyTool.id && candidate.id === historyTool.id
+    )) || localToolCalls[index];
+    if (!localTool) return historyTool;
+    return {
+      ...historyTool,
+      arguments: historyTool.arguments ?? localTool.arguments,
+      startedAt: typeof historyTool.startedAt === 'number' ? historyTool.startedAt : localTool.startedAt,
+      endedAt: typeof historyTool.endedAt === 'number' ? historyTool.endedAt : localTool.endedAt,
+      result: historyTool.result ?? localTool.result,
+      status: historyTool.status === 'done' ? historyTool.status : localTool.status ?? historyTool.status,
+    };
+  });
+}
+
+function assistantToolSignature(message: ChatMessage): string {
+  const calls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+  return calls.map((tool) => resolveToolName(tool.name)).filter(Boolean).join('|');
+}
+
+function removeDuplicateToolOnlyAssistantProjection(
+  messages: ChatMessage[],
+  localMessage: ChatMessage,
+  keepIndex: number,
+): void {
+  const localToolSig = assistantToolSignature(localMessage);
+  if (!localToolSig) return;
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (index === keepIndex) continue;
+    const candidate = messages[index];
+    if (candidate?.role !== 'assistant') continue;
+    if (normalizeHistoryReplayContent(candidate.content)) continue;
+    if (assistantToolSignature(candidate) !== localToolSig) continue;
+    messages.splice(index, 1);
+  }
 }
 
 function mergeLoadedHistoryWithLocalMessages(
@@ -832,7 +1405,7 @@ function mergeLoadedHistoryWithLocalMessages(
   };
 
   const alreadyRepresented = (candidate: ChatMessage): boolean => {
-    return merged.some((existing) => {
+    return merged.some((existing, existingIndex) => {
       if (existing.id && candidate.id && existing.id === candidate.id) return true;
       if (candidate.role === 'user' && candidate.pendingAck) {
         return isLikelyCommittedPendingUser(candidate, existing);
@@ -842,7 +1415,11 @@ function mergeLoadedHistoryWithLocalMessages(
         const existingContent = normalizeHistoryReplayContent(existing.content);
         const candidateTs = candidate.createdAt instanceof Date ? candidate.createdAt.getTime() : NaN;
         const existingTs = existing.createdAt instanceof Date ? existing.createdAt.getTime() : NaN;
-        if (candidateContent && candidateContent === existingContent) return true;
+        if (candidateContent && candidateContent === existingContent) {
+          enrichAssistantHistoryFromLocalProjection(existing, candidate);
+          removeDuplicateToolOnlyAssistantProjection(merged, candidate, existingIndex);
+          return true;
+        }
         if (
           candidateContent
           && existingContent
@@ -850,7 +1427,32 @@ function mergeLoadedHistoryWithLocalMessages(
           && Number.isFinite(existingTs)
           && Math.abs(candidateTs - existingTs) <= LOCAL_PENDING_ACK_WINDOW_MS
           && (candidateContent.includes(existingContent) || existingContent.includes(candidateContent))
-        ) return true;
+        ) {
+          enrichAssistantHistoryFromLocalProjection(existing, candidate);
+          removeDuplicateToolOnlyAssistantProjection(merged, candidate, existingIndex);
+          return true;
+        }
+
+        const candidateTools = Array.isArray(candidate.toolCalls) ? candidate.toolCalls : [];
+        const existingTools = Array.isArray(existing.toolCalls) ? existing.toolCalls : [];
+        if (candidateTools.length > 0 && existingTools.length > 0 && Number.isFinite(candidateTs) && Number.isFinite(existingTs)) {
+          const candidateToolSig = candidateTools.map(tool => resolveToolName(tool.name)).join('|');
+          const existingToolSig = existingTools.map(tool => resolveToolName(tool.name)).join('|');
+          const hasMatchingFinalAssistant = Boolean(candidateContent) && merged.some((message, messageIndex) => (
+            messageIndex !== existingIndex
+            && message.role === 'assistant'
+            && normalizeHistoryReplayContent(message.content) === candidateContent
+          ));
+          if (hasMatchingFinalAssistant && !existingContent) return false;
+          if (
+            candidateToolSig
+            && candidateToolSig === existingToolSig
+            && Math.abs(candidateTs - existingTs) <= LOCAL_PENDING_ACK_WINDOW_MS
+          ) {
+            enrichAssistantHistoryFromLocalProjection(existing, candidate);
+            return true;
+          }
+        }
       }
       if (isEquivalentCompactionNotice(existing, candidate)) return true;
       return false;
@@ -860,6 +1462,23 @@ function mergeLoadedHistoryWithLocalMessages(
   const localTail = currentMessages
     .filter(shouldKeepLocalMessage)
     .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+
+  const insertLocalChronologically = (localMessage: ChatMessage) => {
+    const localTs = localMessage.createdAt instanceof Date ? localMessage.createdAt.getTime() : NaN;
+    if (!Number.isFinite(localTs)) {
+      merged.push(localMessage);
+      return;
+    }
+    const insertAt = merged.findIndex((candidate) => {
+      const candidateTs = candidate.createdAt instanceof Date ? candidate.createdAt.getTime() : NaN;
+      return Number.isFinite(candidateTs) && candidateTs > localTs;
+    });
+    if (insertAt >= 0) {
+      merged.splice(insertAt, 0, localMessage);
+    } else {
+      merged.push(localMessage);
+    }
+  };
 
   for (const localMessage of localTail) {
     if (alreadyRepresented(localMessage)) continue;
@@ -879,7 +1498,11 @@ function mergeLoadedHistoryWithLocalMessages(
       continue;
     }
 
-    merged.push(localMessage);
+    if (localMessage.queued) {
+      merged.push(localMessage);
+    } else {
+      insertLocalChronologically(localMessage);
+    }
   }
 
   return dedupeHistoryMessages(merged);
@@ -1003,6 +1626,8 @@ export interface ChatStateContextValue {
   // Session controls (OpenClaw session thinking + fast mode)
   thinkingLevel: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
   setThinkingLevel: (level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive') => Promise<void>;
+  reasoningVisibility: 'off' | 'on' | 'stream';
+  setReasoningVisibility: (level: 'off' | 'on' | 'stream') => Promise<void>;
   fastModeEnabled: boolean;
   toggleFastMode: () => Promise<void>;
   compactionModelOverride: string;
@@ -1101,15 +1726,6 @@ function firstFiniteNumber(...candidates: unknown[]): number | null {
   for (const candidate of candidates) {
     if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) {
       return candidate;
-    }
-  }
-  return null;
-}
-
-function getLastRunningToolCall(toolCalls: ToolCall[]): ToolCall | null {
-  for (let i = toolCalls.length - 1; i >= 0; i--) {
-    if (toolCalls[i]?.status === 'running') {
-      return toolCalls[i];
     }
   }
   return null;
@@ -1225,9 +1841,44 @@ function defaultLifecycleStatusText(signal: LifecycleMaintenanceSignal): string 
   return 'Agent is thinking…';
 }
 
+function getCodexAppServerProgressStatus(stream: unknown, data: any): string | null {
+  const streamName = typeof stream === 'string' ? stream.trim().toLowerCase() : '';
+  if (!streamName.startsWith('codex_app_server.')) return null;
+
+  const phase = String(data?.phase || data?.status || '').trim().toLowerCase();
+  const explicit = extractLifecycleStatusText(data);
+  if (explicit) return explicit;
+
+  if (streamName === 'codex_app_server.lifecycle') {
+    if (phase === 'startup') return 'Starting Codex runtime…';
+    if (phase === 'thread_ready') return 'Codex session ready.';
+    if (phase === 'turn_starting') return 'Starting Codex turn…';
+    if (phase === 'turn_accepted') return 'Codex accepted the turn.';
+    if (phase === 'assistant_output_started') return 'Codex is writing…';
+    if (phase === 'tool_execution_started') return 'Running tool…';
+    if (phase === 'error') return 'Codex reported an error.';
+    return null;
+  }
+
+  if (streamName === 'codex_app_server.hook') {
+    if (phase === 'started') return 'Preparing execution hooks…';
+    if (phase === 'completed') return 'Execution hooks ready.';
+    return null;
+  }
+
+  if (streamName === 'codex_app_server.item') {
+    if (phase === 'started') return 'Codex is working…';
+    return null;
+  }
+
+  return null;
+}
+
 export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
+  type ReasoningVisibility = 'off' | 'on' | 'stream';
   const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive'];
+  const REASONING_VISIBILITY_LEVELS: ReasoningVisibility[] = ['off', 'on', 'stream'];
   const publicSettings = usePublicSettings();
   const useDirectGateway = publicSettings?.useDirectGateway ?? BUILD_TIME_USE_DIRECT_GATEWAY;
 
@@ -1367,6 +2018,28 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const messagesRef = useRef<ChatMessage[]>([]);
   useEffect(() => { messagesRef.current = messages; }, [messages]);
+  const appendLocalMessage = useCallback((message: ChatMessage) => {
+    messagesRef.current = messagesRef.current.some(existing => existing.id === message.id)
+      ? messagesRef.current
+      : [...messagesRef.current, message];
+    setMessages(prev => {
+      if (prev.some(existing => existing.id === message.id)) {
+        messagesRef.current = prev;
+        return prev;
+      }
+      const next = [...prev, message];
+      messagesRef.current = next;
+      return next;
+    });
+  }, []);
+  const removeLocalMessageById = useCallback((messageId: string) => {
+    messagesRef.current = messagesRef.current.filter(message => message.id !== messageId);
+    setMessages(prev => {
+      const next = prev.filter(message => message.id !== messageId);
+      messagesRef.current = next;
+      return next;
+    });
+  }, []);
   const [messageQueue, setMessageQueue] = useState<MessageQueueItem[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
@@ -1381,6 +2054,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const [startupReady, setStartupReady] = useState(false);
   const [directGatewayBootstrapReady, setDirectGatewayBootstrapReady] = useState(false);
   const [directGatewayDemanded, setDirectGatewayDemanded] = useState(false);
+  const directPendingEmptyFinalRef = useRef<{
+    runId: string | null;
+    model: string | null;
+    timer: ReturnType<typeof setTimeout>;
+  } | null>(null);
   // Graduated streaming segments — when a tool call starts, current accumulated text
   // gets "graduated" into a segment so it renders as a finalized bubble. This matches
   // the OpenClaw web UI v2 pattern where thoughts don't disappear on tool transitions.
@@ -1396,6 +2074,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   // Session controls state (thinking/fast mode)
   const [thinkingLevel, setThinkingLevelState] = useState<ThinkingLevel>('high');
+  const [reasoningVisibility, setReasoningVisibilityState] = useState<ReasoningVisibility>('stream');
   const [fastModeEnabled, setFastModeEnabled] = useState(false);
   const [compactionModelOverride, setCompactionModelOverrideState] = useState<string>('');
   const [compactionModelLoading, setCompactionModelLoading] = useState(false);
@@ -1475,31 +2154,18 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   const setLiveRunPhase = useCallback((preferredPhase: 'thinking' | 'streaming', nextStatusText?: string | null) => {
     const runningToolName = getRunningToolName();
-    const normalizedStatus = typeof nextStatusText === 'string' ? normalizeLifecycleMarker(nextStatusText) : '';
-    const isMaintenanceStatus = normalizedStatus
-      ? (
-          LIFECYCLE_FLUSH_PREPARING_RE.test(normalizedStatus)
-          || LIFECYCLE_FLUSH_RUNNING_RE.test(normalizedStatus)
-          || LIFECYCLE_FLUSH_DONE_RE.test(normalizedStatus)
-          || LIFECYCLE_COMPACTING_RE.test(normalizedStatus)
-          || LIFECYCLE_COMPACTED_RE.test(normalizedStatus)
-        )
-      : false;
+    const railStatusText = getRailSafeStatusText(nextStatusText);
 
     if (runningToolName) {
       setStreamingPhase('tool');
       setActiveToolName(runningToolName);
-      setStatusText(
-        isMaintenanceStatus
-          ? getToolStatusText(runningToolName)
-          : getToolStatusText(runningToolName, normalizedStatus || null)
-      );
+      setStatusText(getToolStatusText(runningToolName));
       return;
     }
 
     setStreamingPhase(preferredPhase);
     setActiveToolName(null);
-    setStatusText(normalizedStatus || null);
+    setStatusText(railStatusText);
   }, [getRunningToolName]);
 
   const getStreamWatchdogTimeoutMs = useCallback(() => {
@@ -1654,12 +2320,32 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (actualModel) {
           setSelectedModelRaw((prev) => (prev === actualModel ? prev : actualModel));
         }
-        const sessionThinking = String(
+        let sessionThinking = String(
           data?.session?.thinkingLevel
           || data?.session?.thinking
           || data?.session?.settings?.thinking
           || '',
         ).toLowerCase();
+        let sessionReasoning = String(
+          data?.session?.reasoningLevel
+          || data?.session?.reasoning
+          || data?.session?.settings?.reasoning
+          || '',
+        ).toLowerCase();
+
+        const defaultPatch: Record<string, string> = {};
+        if (!sessionThinking || sessionThinking === 'none') defaultPatch.thinking = 'high';
+        if (!sessionReasoning || sessionReasoning === 'none') defaultPatch.reasoning = 'stream';
+        if (Object.keys(defaultPatch).length > 0) {
+          try {
+            await gatewayAPI.patchSession(session, defaultPatch, provider);
+            if (defaultPatch.thinking) sessionThinking = defaultPatch.thinking;
+            if (defaultPatch.reasoning) sessionReasoning = defaultPatch.reasoning;
+          } catch (err) {
+            console.warn('[ChatState] Failed to backfill OpenClaw session defaults:', err);
+          }
+        }
+
         if (THINKING_LEVELS.includes(sessionThinking as ThinkingLevel)) {
           setThinkingLevelState(sessionThinking as ThinkingLevel);
         } else {
@@ -1667,6 +2353,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           const isAdaptiveDefault = /claude-(opus|sonnet)-4[._-](5|6|7|8|9)|claude-(opus|sonnet)-[5-9]/.test(modelStr);
           setThinkingLevelState(isAdaptiveDefault ? 'adaptive' : 'high');
         }
+        setReasoningVisibilityState(sessionReasoning === 'on'
+          ? 'stream'
+          : (REASONING_VISIBILITY_LEVELS.includes(sessionReasoning as ReasoningVisibility)
+              ? sessionReasoning as ReasoningVisibility
+              : 'stream'));
         setFastModeEnabled(Boolean(
           data?.session?.fastMode
           ?? data?.session?.settings?.fastMode
@@ -1701,6 +2392,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setSessionControlsMetadataLoaded(false);
     sessionControlsMetadataPromiseRef.current = null;
     setThinkingLevelState('high');
+    setReasoningVisibilityState('stream');
     setFastModeEnabled(false);
     setCompactionModelOverrideState('');
     setCompactionModelError(null);
@@ -2026,11 +2718,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         next[index] = { ...next[index], content: maybeContent };
         return next;
       }
+      const streamModel = normalizeProviderModel(providerRef.current, modelRef.current || '');
       return [...prev, {
         id: assistantId!,
         role: 'assistant' as const,
         content: maybeContent ?? '',
         createdAt: new Date(),
+        model: streamModel || undefined,
         toolCalls: [],
       }];
     });
@@ -2040,7 +2734,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const appendStreamSegment = useCallback((kind: StreamSegment['kind'], text: string) => {
     const value = typeof text === 'string' ? text : '';
     if (!value.trim()) return false;
-    setStreamSegments(prev => [...prev, { text: value, ts: Date.now(), kind }]);
+    const nextSegments = [...streamSegmentsRef.current, { text: value, ts: Date.now(), kind }];
+    streamSegmentsRef.current = nextSegments;
+    setStreamSegments(nextSegments);
     return true;
   }, []);
 
@@ -2062,27 +2758,35 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const currentThinking = thinkingContentRef.current;
     if (!currentThinking.trim()) return false;
     appendStreamSegment('thinking', currentThinking);
+    thinkingContentRef.current = '';
     setThinkingContent('');
     return true;
   }, [appendStreamSegment]);
 
   const buildGraduatedSegments = useCallback((segments: StreamSegment[], finalContent: string): TextSegment[] => {
     const graduatedSegments: TextSegment[] = [];
-    for (const seg of segments) {
-      graduatedSegments.push({ text: seg.text, position: 'before', kind: seg.kind });
+    for (const [index, seg] of segments.entries()) {
+      graduatedSegments.push({ text: seg.text, position: 'before', kind: seg.kind, ts: seg.ts, order: index });
     }
     if (finalContent && finalContent.trim()) {
-      graduatedSegments.push({ text: finalContent, position: 'after', kind: 'text' });
+      graduatedSegments.push({ text: finalContent, position: 'after', kind: 'text', ts: Date.now(), order: graduatedSegments.length });
     }
     return graduatedSegments;
   }, []);
 
-  const appendThinkingChunk = useCallback((_assistantId: string | null, chunk: string) => {
+  const appendThinkingChunk = useCallback((_assistantId: string | null, chunk: string, opts?: { replace?: boolean }) => {
     if (!chunk) return;
-    setThinkingContent(prev => mergeThinkingStream(prev, chunk));
+    const nextThinking = mergeThinkingStream(thinkingContentRef.current, chunk, opts);
+    thinkingContentRef.current = nextThinking;
+    setThinkingContent(nextThinking);
   }, []);
 
   const clearActiveStreamState = useCallback(() => {
+    const pendingDirectFinal = directPendingEmptyFinalRef.current;
+    if (pendingDirectFinal) {
+      clearTimeout(pendingDirectFinal.timer);
+      directPendingEmptyFinalRef.current = null;
+    }
     clearStreamWatchdog();
     clearPendingTextRender();
     isStreamActiveRef.current = false;
@@ -2119,7 +2823,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const snapshotToolName = typeof toolNameCandidate === 'string' && toolNameCandidate.trim()
       ? resolveToolName(toolNameCandidate)
       : null;
-    const rawStatusText = typeof snapshot.statusText === 'string' ? snapshot.statusText.trim() : '';
+    const rawStatusText = getRailSafeStatusText(typeof snapshot.statusText === 'string' ? snapshot.statusText.trim() : '');
     const isMaintenanceStatusOnly = Boolean(rawStatusText && isControlOrMaintenanceAssistantContent(rawStatusText));
     const currentStreamText = assembledRef.current;
     const normalizedSnapshotContent = normalizeHistoryReplayContent(snapshotContent);
@@ -2167,7 +2871,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         : snapshot.phase === 'streaming'
           ? 'streaming'
           : 'thinking';
-    const liveStatusText = isMaintenanceStatusOnly ? '' : rawStatusText;
+    const liveStatusText = isMaintenanceStatusOnly ? '' : (rawStatusText || '');
     const compactionStatusText = hasLiveSnapshotSignal && snapshot.compactionPhase === 'compacting'
       ? (liveStatusText || 'Compacting context…')
       : hasLiveSnapshotSignal && snapshot.compactionPhase === 'compacted'
@@ -2320,11 +3024,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     try {
       let loaded: ChatMessage[];
 
-      // For OPENCLAW, prefer gateway-native history whenever the direct gateway is connected.
-      // That keeps transcript rendering aligned with upstream semantics, preserves thinking
-      // blocks, and avoids the portal's JSONL fallback from reshaping live turns.
+      // Keep direct WebSocket for live OpenClaw sends/events, but load transcript
+      // history through the portal's enhanced HTTP path. Gateway-native history can
+      // timestamp tool artifacts before the matching user prompt in newer OpenClaw
+      // builds, which makes reload/post-turn chronology look wrong in the UI.
       const directClient = directClientRef.current;
-      const useDirectHistory = useDirectGateway && prov === 'OPENCLAW' && directClient?.isConnected;
+      const useDirectHistory = false;
       debugLog('loadHistoryInternal', {
         useDirectGateway,
         provider: prov,
@@ -2390,17 +3095,24 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (prov === 'OPENCLAW' && loaded.length > 0) {
           setSessionAvailability('present');
         }
-        const normalizedLoadedHistory = mergeToolResultsIntoToolCalls(dedupeHistoryMessages(loaded));
+        const dedupedLoadedHistory = dedupeHistoryMessages(loaded);
+        const cleanedLoadedHistory = normalizeOutOfTurnMessageDeliveryMirrors(dedupedLoadedHistory);
+        const normalizedLoadedHistory = orderMessageToolVisibleMirrorsBeforeFinal(
+          weaveMessageToolDeliveryMirrors(stripMessageDeliveryToolArtifacts(mergeToolResultsIntoToolCalls(cleanedLoadedHistory))),
+        );
         const reconciledHistory = options?.preserveLocalMessages === false
           ? normalizedLoadedHistory
-          : mergeLoadedHistoryWithLocalMessages(
-              normalizedLoadedHistory,
-              messagesRef.current,
-              {
-                activeAssistantId: streamingAssistantIdRef.current,
-                preserveActiveAssistant: isStreamActiveRef.current,
-              },
+          : orderMessageToolVisibleMirrorsBeforeFinal(
+              weaveMessageToolDeliveryMirrors(stripMessageDeliveryToolArtifacts(mergeLoadedHistoryWithLocalMessages(
+                normalizedLoadedHistory,
+                messagesRef.current,
+                {
+                  activeAssistantId: streamingAssistantIdRef.current,
+                  preserveActiveAssistant: isStreamActiveRef.current,
+                },
+              ))),
             );
+        messagesRef.current = reconciledHistory;
         setMessages(reconciledHistory);
         if (prov === 'OPENCLAW') {
           return await hydrateActiveStream(sessionKey, prov, historyActiveStream, {
@@ -2412,7 +3124,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
     } catch (err) {
       console.error('[ChatState] History load failed:', err);
-      if (historyGenRef.current === myGen) setMessages([]);
+      if (historyGenRef.current === myGen) {
+        messagesRef.current = [];
+        setMessages([]);
+      }
       return false;
     } finally {
       if (historyGenRef.current === myGen) {
@@ -2448,8 +3163,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     messageQueueRef.current = [];
     setMessages([]);
     setMessageQueue([]);
+    sessionRef.current = sessionKey;
     setSessionRaw(sessionKey);
     persistStoredSession(providerRef.current, sessionKey);
+    directClientRef.current?.setCurrentSession(sessionKey);
     // Force-load history bypassing the isStreamActive guard, but do not preserve
     // transient local messages from the previously selected session.
     await loadHistoryInternal(sessionKey, providerRef.current, { force: true, preserveLocalMessages: false });
@@ -2523,6 +3240,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       sessionRef.current = data.sessionId;
     }
 
+    data = normalizePortalStreamEventFromTurnEvent(data);
+
     const incomingPortalRunId = normalizeRunId(data?.runId);
     if (incomingPortalRunId && isRunIdSuppressed(incomingPortalRunId)) {
       if (data?.type === 'done' || data?.type === 'error' || data?.type === 'stream_ended') {
@@ -2535,9 +3254,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    // When the direct gateway client is connected, it handles all streaming events
-    // (chat, agent) directly. The Socket.IO/WS path should NOT also process them,
-    // otherwise the browser receives the same text twice causing stutter/cascade.
+    // When the direct gateway transport owns the active turn, it is the only live
+    // authority allowed to mutate assistant/status/tool UI. The portal WS may still
+    // mirror the same OpenClaw turn through StreamEventBus, but those frames are
+    // fallback/reconciliation data in direct mode — not a second renderer.
     if (directClientRef.current?.isConnected && streamTransportRef.current === 'direct') {
       const isPortalTerminalEvent = data?.type === 'done' || data?.type === 'stream_ended';
       if (isPortalTerminalEvent && !isStreamActiveRef.current && !streamingAssistantIdRef.current) {
@@ -2546,16 +3266,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
       }
       // Still allow non-streaming events (session, exec_approval, connected, keepalive).
-      // Maintenance/lifecycle status is intentionally allowed through even in
-      // direct mode because it may arrive on the portal-global WS path while the
-      // direct stream is busy. That is the visible clue for lag/compaction.
-      const directHandledTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'stream_resume', 'run_resumed'];
-      const isMaintenancePortalStatus = data?.type === 'status' && resolveMaintenanceRailStatus(data).isMaintenanceStatus;
-      if (directHandledTypes.includes(data?.type) && !isMaintenancePortalStatus) {
+      // Compaction has explicit event types and direct lifecycle events now; generic
+      // portal `status`/terminal frames must not race direct `chat`/`agent` frames.
+      const directHandledTypes = ['status', 'text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'segment_break', 'done', 'error', 'stream_resume', 'stream_ended', 'run_resumed'];
+      if (directHandledTypes.includes(data?.type)) {
         return; // Direct gateway already handling this
       }
     }
-    const portalStreamTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'done', 'error', 'stream_resume', 'stream_ended', 'run_resumed'];
+    const portalStreamTypes = ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'status', 'segment_break', 'done', 'error', 'stream_resume', 'stream_ended', 'run_resumed'];
     if (incomingPortalRunId && portalStreamTypes.includes(data?.type)) {
       if (!currentRunIdRef.current || !isStreamActiveRef.current) {
         currentRunIdRef.current = incomingPortalRunId;
@@ -2579,7 +3297,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (resolvedPortalSession && resolvedCurrentSession && resolvedPortalSession !== resolvedCurrentSession && !alwaysPassthroughTypes.includes(data.type)) {
       return;
     }
-    if (data?.type && ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'status', 'segment_break', 'done', 'stream_resume', 'stream_ended', 'run_resumed', 'compaction_start', 'compaction_end'].includes(data.type)) {
+    if (data?.type && ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'status', 'segment_break', 'done', 'stream_resume', 'stream_ended', 'run_resumed', 'compaction_start', 'compaction_end'].includes(data.type)) {
       setWsConnected(true);
     }
     // Temp debug: log tool-related events to diagnose missing tool cards
@@ -2595,8 +3313,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     // Some event types are allowed without a bubble so we can wait for visible
     // content before materializing a resumed turn.
     const passthrough = ['session', 'exec_approval', 'exec_approval_resolved', 'connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended', 'run_resumed'];
-    const autoCreateBubbleTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
-    const waitForVisibleStreamTypes = ['status', 'thinking', 'done', 'error'];
+    const autoCreateBubbleTypes = ['text', 'thinking', 'status', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
+    const waitForVisibleStreamTypes = ['thinking', 'done', 'error'];
     if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOrMaintenanceAssistantContent(data.content)) {
       return;
     }
@@ -2627,48 +3345,46 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
         if (data.provenance) setLastProvenance(data.provenance);
         if (data.model) {
+          const normalizedModel = normalizeProviderModel(providerRef.current, String(data.model));
+          if (normalizedModel) {
+            modelRef.current = normalizedModel;
+            setSelectedModelRaw(prev => (prev === normalizedModel ? prev : normalizedModel));
+          }
           setMessages(prev => prev.map(m => (
             m.id === streamingAssistantIdRef.current
-              ? { ...m, model: normalizeProviderModel(providerRef.current, String(data.model)) }
+              ? { ...m, model: normalizedModel || m.model }
               : m
           )));
         }
         break;
       }
       case 'status': {
-        const nextStatusText = typeof data.content === 'string' ? data.content : null;
-        const normalizedStatus = typeof nextStatusText === 'string' ? normalizeLifecycleMarker(nextStatusText) : '';
-        const isMaintenanceStatus = data.maintenanceKind === 'maintenance'
-          || LIFECYCLE_FLUSH_PREPARING_RE.test(normalizedStatus)
-          || LIFECYCLE_FLUSH_RUNNING_RE.test(normalizedStatus)
-          || LIFECYCLE_FLUSH_DONE_RE.test(normalizedStatus);
-        if (isMaintenanceStatus) {
-          applyCompactionState({
-            phase: LIFECYCLE_FLUSH_DONE_RE.test(normalizedStatus) ? 'end' : 'start',
-            content: nextStatusText,
-            completed: false,
-            maintenanceKind: 'maintenance',
-          });
-        }
+        const maintenanceRail = resolveMaintenanceRailStatus(data);
+        if (maintenanceRail.update) applyCompactionState(maintenanceRail.update);
         if (!assistantId && !isStreamActiveRef.current) break;
-        // OpenClaw emits dedicated `thinking` events; avoid mixing generic
-        // status text into the thought bubble (live-only divergence vs refresh).
-        if (providerRef.current !== 'OPENCLAW') {
+        // Show OpenClaw's live thinking status immediately. Some provider/runtime
+        // combinations do not expose private reasoning deltas, so the status event
+        // is the only honest in-turn signal before tools begin.
+        if (!maintenanceRail.isMaintenanceStatus) {
           appendThinkingChunk(
             assistantId,
             extractThinkingChunk('status', data.content, assembledRef.current.length > 0),
           );
         }
         if (!assembledRef.current || getRunningToolName()) {
-          setLiveRunPhase('thinking', nextStatusText);
+          setLiveRunPhase('thinking', maintenanceRail.displayStatusText);
         }
         break;
       }
       case 'thinking': {
         if (!assistantId && !isStreamActiveRef.current) break;
-        appendThinkingChunk(assistantId, extractThinkingChunk('thinking', data.content, assembledRef.current.length > 0));
+        appendThinkingChunk(
+          assistantId,
+          extractThinkingChunk('thinking', data.content, assembledRef.current.length > 0),
+          { replace: data.replace === true },
+        );
         if (!assembledRef.current || getRunningToolName()) {
-          setLiveRunPhase('thinking', typeof data.content === 'string' ? data.content : null);
+          setLiveRunPhase('thinking', null);
         }
         break;
       }
@@ -2691,6 +3407,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         break;
       }
       case 'tool_start': {
+        const toolName = resolveToolName(data.toolName, data.name, data.content, 'tool');
+        if (isMessageToolName(toolName)) break;
         hasRealToolEventsRef.current = true;
         graduateLiveThinkingSegment();
         // Graduate current streaming text into a finalized segment before tool call.
@@ -2698,37 +3416,55 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (assembledRef.current && assembledRef.current.trim().length > 0) {
           graduateLiveTextSegment(assistantId);
         }
-        const toolName = resolveToolName(data.toolName, data.name, data.content, 'tool');
-        setStatusText(getToolStatusText(toolName, data.content));
+        setStatusText(getToolStatusText(toolName));
         setStreamingPhase('tool');
         setActiveToolName(toolName);
         const toolId = 'tool-' + (++toolCounterRef.current);
         const toolArgs = data.toolArgs || undefined;
-        setMessages(prev => prev.map(m => {
-          if (m.id !== assistantId) return m;
-          const nextToolCalls = [...(m.toolCalls || []), { id: toolId, name: toolName, arguments: toolArgs, startedAt: Date.now(), status: 'running' as const }];
-          activeStreamToolCallsRef.current = nextToolCalls;
-          return { ...m, toolCalls: nextToolCalls };
-        }));
+        setMessages(prev => {
+          const projection = appendToolCallToMessage(prev, assistantId, buildRunningToolCall({
+            id: toolId,
+            name: toolName,
+            arguments: toolArgs,
+          }));
+          activeStreamToolCallsRef.current = projection.toolCalls as ToolCall[];
+          return projection.messages as ChatMessage[];
+        });
+        break;
+      }
+      case 'tool_update': {
+        const updatedToolName = resolveToolName(data.toolName, data.name, data.content, 'tool');
+        if (isMessageToolName(updatedToolName)) break;
+        const toolResult = data.toolResult || data.content || '';
+        hasRealToolEventsRef.current = true;
+        setStreamingPhase('tool');
+        setActiveToolName(updatedToolName);
+        setStatusText(getToolStatusText(updatedToolName));
+        setMessages(prev => {
+          const projection = updateRunningToolCallInMessage(prev, assistantId, {
+            toolCallId: data.toolCallId,
+            toolName: updatedToolName,
+            result: typeof toolResult === 'string' ? toolResult : String(toolResult),
+          });
+          if (projection.changed) activeStreamToolCallsRef.current = projection.toolCalls as ToolCall[];
+          return projection.messages as ChatMessage[];
+        });
         break;
       }
       case 'tool_end': {
+        const endedToolName = resolveToolName(data.toolName, data.name, data.content, 'tool');
+        if (isMessageToolName(endedToolName)) break;
         const toolResult = data.toolResult || data.content || 'Completed';
         let nextRunningToolName: string | null = null;
-        setMessages(prev => prev.map(m => {
-          if (m.id !== assistantId) return m;
-          const calls = [...(m.toolCalls || [])];
-          for (let i = calls.length - 1; i >= 0; i--) {
-            if (calls[i].status === 'running') {
-              calls[i] = { ...calls[i], endedAt: Date.now(), result: toolResult, status: 'done' };
-              break;
-            }
-          }
-          const nextRunningTool = getLastRunningToolCall(calls);
-          nextRunningToolName = nextRunningTool ? resolveToolName(nextRunningTool.name) : null;
-          activeStreamToolCallsRef.current = calls;
-          return { ...m, toolCalls: calls };
-        }));
+        setMessages(prev => {
+          const projection = finishRunningToolCallInMessage(prev, assistantId, {
+            result: String(toolResult),
+            status: data.status,
+          });
+          nextRunningToolName = projection.nextRunningToolName ? resolveToolName(projection.nextRunningToolName) : null;
+          activeStreamToolCallsRef.current = projection.toolCalls as ToolCall[];
+          return projection.messages as ChatMessage[];
+        });
         if (nextRunningToolName) {
           setStreamingPhase('tool');
           setActiveToolName(nextRunningToolName);
@@ -2743,31 +3479,29 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'tool_used': {
         if (hasRealToolEventsRef.current) break;
         const tn = resolveToolName(data.toolName, data.name, data.content, 'tool');
+        if (isMessageToolName(tn)) break;
         graduateLiveThinkingSegment();
         if (assembledRef.current && assembledRef.current.trim().length > 0) {
           graduateLiveTextSegment(assistantId);
         }
         setMessages(prev => {
-          const exists = prev.some(m =>
-            m.role === 'assistant' && (m.toolCalls || []).some(
-              tc => tc.status === 'done' && tc.name === tn && tc.endedAt && (Date.now() - tc.endedAt < 5000)
-            )
-          );
-          if (exists) return prev;
           const tid = 'tool-' + (++toolCounterRef.current);
           const now = Date.now();
-          return prev.map(m => {
-            if (m.id !== assistantId) return m;
-            const nextToolCalls = [...(m.toolCalls || []), { id: tid, name: tn, startedAt: now - 1000, endedAt: now, status: 'done' as const }];
-            activeStreamToolCallsRef.current = nextToolCalls;
-            return { ...m, toolCalls: nextToolCalls };
-          });
+          const projection = appendCompletedToolCallIfMissing(prev, assistantId, buildCompletedToolCall({
+            id: tid,
+            name: tn,
+            startedAt: now - 1000,
+            endedAt: now,
+          }), { now });
+          if (projection.changed) activeStreamToolCallsRef.current = projection.toolCalls as ToolCall[];
+          return projection.messages as ChatMessage[];
         });
         break;
       }
       case 'toolCall': {
         const tid = 'tool-' + (++toolCounterRef.current);
         const toolName = resolveToolName(data.toolName, data.name, 'tool');
+        if (isMessageToolName(toolName)) break;
         graduateLiveThinkingSegment();
         if (assembledRef.current && assembledRef.current.trim().length > 0) {
           graduateLiveTextSegment(assistantId);
@@ -2775,27 +3509,32 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setStreamingPhase('tool');
         setActiveToolName(toolName);
         setStatusText(getToolStatusText(toolName));
-        setMessages(prev => prev.map(m => {
-          if (m.id !== assistantId) return m;
-          const nextToolCalls = [...(m.toolCalls || []), { id: data.id || tid, name: toolName, arguments: data.arguments, startedAt: Date.now(), status: 'running' as const }];
-          activeStreamToolCallsRef.current = nextToolCalls;
-          return { ...m, toolCalls: nextToolCalls };
-        }));
+        setMessages(prev => {
+          const projection = appendToolCallToMessage(prev, assistantId, buildRunningToolCall({
+            id: data.id || tid,
+            name: toolName,
+            arguments: data.arguments,
+          }));
+          activeStreamToolCallsRef.current = projection.toolCalls as ToolCall[];
+          return projection.messages as ChatMessage[];
+        });
         break;
       }
       case 'toolResult': {
         const resolvedToolName = resolveToolName(data.toolName, data.name, data.content, 'tool');
+        if (isMessageToolName(resolvedToolName)) break;
         let nextRunningToolName: string | null = null;
-        setMessages(prev => prev.map(m => {
-          if (m.id !== assistantId) return m;
-          const calls = [...(m.toolCalls || [])];
-          const idx = calls.findIndex(c => c.id === data.toolCallId || c.name === resolvedToolName);
-          if (idx >= 0) calls[idx] = { ...calls[idx], endedAt: Date.now(), result: data.content, status: 'done' };
-          const nextRunningTool = getLastRunningToolCall(calls);
-          nextRunningToolName = nextRunningTool ? resolveToolName(nextRunningTool.name) : null;
-          activeStreamToolCallsRef.current = calls;
-          return { ...m, toolCalls: calls };
-        }));
+        setMessages(prev => {
+          const projection = finishMatchingToolCallInMessage(prev, assistantId, {
+            toolCallId: data.toolCallId,
+            toolName: resolvedToolName,
+            result: typeof data.content === 'string' ? data.content : undefined,
+            status: data.status,
+          });
+          nextRunningToolName = projection.nextRunningToolName ? resolveToolName(projection.nextRunningToolName) : null;
+          activeStreamToolCallsRef.current = projection.toolCalls as ToolCall[];
+          return projection.messages as ChatMessage[];
+        });
         if (nextRunningToolName) {
           setStreamingPhase('tool');
           setActiveToolName(nextRunningToolName);
@@ -2895,8 +3634,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           }
         }
         scheduleSessionTelemetryRefresh(400);
-        if (providerRef.current === 'OPENCLAW' && (hadToolEvents || currentStreamSegs.length > 0 || !hasVisibleFinal)) {
-          schedulePostTurnHistorySync();
+        if (providerRef.current === 'OPENCLAW' && graduatedSegments.length === 0) {
+          // OpenClaw can persist side-effect UI deliveries (notably message-tool
+          // source replies) only in history, while the live stream may contain
+          // just the final assistant text. Reconcile after every completed turn so
+          // live and reload chronology converge.
+          schedulePostTurnHistorySync(450, 2500);
         }
         break;
       }
@@ -2985,6 +3728,112 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const handleWsEventRef = useRef(handleWsEvent);
   useEffect(() => { handleWsEventRef.current = handleWsEvent; }, [handleWsEvent]);
 
+  const resolveCurrentStreamModel = useCallback((rawModel?: unknown): string => {
+    const normalizedCandidate = typeof rawModel === 'string' && rawModel.trim()
+      ? normalizeProviderModel(providerRef.current, rawModel.trim())
+      : '';
+    if (normalizedCandidate) {
+      modelRef.current = normalizedCandidate;
+      setSelectedModelRaw(prev => (prev === normalizedCandidate ? prev : normalizedCandidate));
+      return normalizedCandidate;
+    }
+    return normalizeProviderModel(providerRef.current, modelRef.current || '');
+  }, []);
+
+  const clearDirectPendingEmptyFinal = useCallback(() => {
+    const pending = directPendingEmptyFinalRef.current;
+    if (!pending) return null;
+    clearTimeout(pending.timer);
+    directPendingEmptyFinalRef.current = null;
+    return { runId: pending.runId, model: pending.model };
+  }, []);
+
+  const completeDirectAssistantTurn = useCallback((rawFinal: string, options?: {
+    runId?: string | null;
+    model?: string | null;
+    provenance?: string | null;
+  }) => {
+    clearStreamWatchdog();
+    clearPendingTextRender();
+    clearDirectPendingEmptyFinal();
+
+    const terminalRunId = options?.runId || currentRunIdRef.current || null;
+    lastTerminalRunIdRef.current = terminalRunId || currentRunIdRef.current;
+
+    const rawText = typeof rawFinal === 'string' ? rawFinal : '';
+    const finalContent = rawText && !isControlOrMaintenanceAssistantContent(rawText)
+      ? sanitizeAssistantContent(rawText)
+      : assembledRef.current;
+    assembledRef.current = finalContent;
+
+    const model = resolveCurrentStreamModel(options?.model || undefined);
+    const prov = options?.provenance || null;
+    const hadToolEvents = hasRealToolEventsRef.current;
+    const currentStreamSegs = [...streamSegmentsRef.current];
+    const finalStreamSegs = thinkingContentRef.current.trim()
+      ? [...currentStreamSegs, { text: thinkingContentRef.current, ts: Date.now(), kind: 'thinking' as const }]
+      : currentStreamSegs;
+    const shouldHideTurn = !finalContent.trim() && finalStreamSegs.length === 0 && !hadToolEvents;
+    let cid = streamingAssistantIdRef.current;
+    if (!cid && !shouldHideTurn) {
+      cid = ensureStreamingAssistantBubble({ idPrefix: 'direct-final', content: '', resetIfCreated: false }).assistantId;
+    }
+
+    setStatusText(null);
+    setStreamingPhase('idle');
+    setThinkingContent('');
+    setStreamSegments([]);
+    setActiveToolName(null);
+    if (prov) setLastProvenance(prov);
+    setIsRunning(false);
+    if (compactionPhaseRef.current === 'compacting') {
+      compactionPhaseRef.current = 'idle';
+      setCompactionPhase('idle');
+      if (compactionTimerRef.current) {
+        clearTimeout(compactionTimerRef.current);
+        compactionTimerRef.current = null;
+      }
+    }
+
+    isStreamActiveRef.current = false;
+    streamTransportRef.current = null;
+    streamingAssistantIdRef.current = null;
+    activeStreamToolCallsRef.current = [];
+    currentRunIdRef.current = null;
+    directClientRef.current?.setActiveStreamSession(null);
+    assembledRef.current = '';
+    lastSegmentStartRef.current = 0;
+    lastRawTextLenRef.current = 0;
+
+    const graduatedSegments = finalStreamSegs.length > 0 || hadToolEvents
+      ? buildGraduatedSegments(finalStreamSegs, finalContent)
+      : [];
+
+    if (cid) {
+      if (shouldHideTurn) {
+        setMessages(prev => prev.filter(m => m.id !== cid));
+      } else {
+        setMessages(prev => prev.map(m => {
+          if (m.id !== cid) return m;
+          const update: Partial<ChatMessage> = {
+            content: finalContent,
+            provenance: prov || m.provenance,
+            model: model || m.model,
+          };
+          if (graduatedSegments.length > 0) {
+            update.segments = graduatedSegments;
+          }
+          return { ...m, ...update };
+        }));
+      }
+    }
+
+    scheduleSessionTelemetryRefresh(400);
+    if (providerRef.current === 'OPENCLAW' && graduatedSegments.length === 0) {
+      schedulePostTurnHistorySync(450, 2500);
+    }
+  }, [buildGraduatedSegments, clearDirectPendingEmptyFinal, clearPendingTextRender, clearStreamWatchdog, ensureStreamingAssistantBubble, resolveCurrentStreamModel, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh]);
+
   /**
    * Handle events from the direct gateway client.
    * Maps native gateway events to our internal event format.
@@ -3060,9 +3909,44 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         });
         return;
       }
+
+      const message = payload?.message as any;
+      const role = typeof message?.role === 'string'
+        ? message.role.trim().toLowerCase()
+        : (typeof message?.type === 'string' ? message.type.trim().toLowerCase() : '');
+      const visibleText = gatewayTextFromLiveChatPayload({ message }).trim();
+      const messageToolSourceReplyText = extractMessageToolSourceReplyTextFromGatewayPayload(payload);
+      const pendingEmptyFinal = directPendingEmptyFinalRef.current;
+      const canCompleteFromSessionMessage = Boolean(pendingEmptyFinal) || isStreamActiveRef.current || Boolean(currentRunIdRef.current);
+
+      if (messageToolSourceReplyText && !isControlOrMaintenanceAssistantContent(messageToolSourceReplyText) && canCompleteFromSessionMessage) {
+        const pending = clearDirectPendingEmptyFinal();
+        completeDirectAssistantTurn(messageToolSourceReplyText, {
+          runId: pending?.runId || incomingRunId || currentRunIdRef.current,
+          model: gatewayModelFromPayload(payload) || pending?.model || null,
+          provenance: 'via OpenClaw',
+        });
+        return;
+      }
+
+      const shouldMirrorAssistantDelivery = role === 'assistant'
+        && visibleText
+        && !isControlOrMaintenanceAssistantContent(visibleText)
+        && canCompleteFromSessionMessage;
+
+      if (shouldMirrorAssistantDelivery) {
+        const pending = clearDirectPendingEmptyFinal();
+        completeDirectAssistantTurn(visibleText, {
+          runId: pending?.runId || incomingRunId || currentRunIdRef.current,
+          model: gatewayModelFromPayload(payload) || pending?.model || null,
+          provenance: 'via OpenClaw',
+        });
+        return;
+      }
+
       if (providerRef.current === 'OPENCLAW') {
         scheduleSessionTelemetryRefresh(200);
-        if (isStreamActiveRef.current || currentRunIdRef.current) {
+        if (isStreamActiveRef.current || currentRunIdRef.current || pendingEmptyFinal) {
           schedulePostTurnHistorySync(900, 2500);
         } else {
           void loadHistoryInternalRef.current?.(currentSession || sessionRef.current || 'main', 'OPENCLAW', {
@@ -3090,19 +3974,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       const contentBlocks = Array.isArray(rawMessageContent)
         ? rawMessageContent
         : [];
-      const visibleMessageText = (
-        typeof rawMessageContent === 'string'
-          ? rawMessageContent
-          : contentBlocks.length
-            ? contentBlocks
-                .map((b: any) => (
-                  typeof b?.text === 'string'
-                    ? b.text
-                    : (typeof b?.content === 'string' ? b.content : '')
-                ))
-                .join('')
-            : (typeof (payload as any).content === 'string' ? (payload as any).content : '')
-      ).trim();
+      const visibleMessageText = gatewayTextFromLiveChatPayload(payload).trim();
       const hasVisibleNonMaintenanceText = Boolean(visibleMessageText && !isStandaloneMaintenanceNoticeContent(visibleMessageText));
       const stateIsCompactionStart = state === 'compacting' || state === 'compaction_start';
       const stateIsCompactionEnd = state === 'compacted' || state === 'compaction_end';
@@ -3130,12 +4002,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         case 'delta': {
           let assistantId = streamingAssistantIdRef.current;
 
-          const thinkingText = contentBlocks
-            .filter((b: any) => b.type === 'thinking')
-            .map((b: any) => (typeof b.thinking === 'string' ? b.thinking : (b.text || '')))
-            .join('');
+          const thinkingText = gatewayThinkingFromLiveChatPayload(payload);
 
-          const text = gatewayTextFromBlocks(contentBlocks);
+          const text = gatewayTextFromLiveChatPayload(payload);
 
           if (text && isControlOrMaintenanceAssistantContent(text)) {
             if (assistantId || isStreamActiveRef.current) resetStreamWatchdog();
@@ -3144,7 +4013,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
           const safeChunk = text ? sanitizeAssistantChunk(text) : '';
           const hasVisibleText = Boolean(safeChunk);
-          if (!assistantId && hasVisibleText) {
+          if (!assistantId && (hasVisibleText || thinkingText)) {
             assistantId = ensureStreamingAssistantBubble({ idPrefix: 'direct', content: '', resetIfCreated: true }).assistantId;
             isStreamActiveRef.current = true;
             streamTransportRef.current = 'direct';
@@ -3180,89 +4049,49 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           break;
         }
         case 'final': {
-          clearStreamWatchdog();
-          clearPendingTextRender();
-          lastTerminalRunIdRef.current = incomingRunId || currentRunIdRef.current;
-
-          const finalTextBlocks = Array.isArray(payload.message?.content)
-            ? gatewayTextFromBlocks(payload.message.content)
-            : '';
-          let finalText = finalTextBlocks || assembledRef.current;
+          let finalText = gatewayTextFromLiveChatPayload(payload) || assembledRef.current;
           if (lastSegmentStartRef.current > 0 && finalText.length > lastSegmentStartRef.current) {
             finalText = finalText.slice(lastSegmentStartRef.current);
           }
 
-          const finalContent = isControlOrMaintenanceAssistantContent(finalText)
-            ? assembledRef.current
-            : sanitizeAssistantContent(finalText);
-          assembledRef.current = finalContent;
+          const hasVisibleFinal = Boolean(finalText.trim()) && !isControlOrMaintenanceAssistantContent(finalText);
+          const hasAnyVisibleState = Boolean(assembledRef.current.trim())
+            || Boolean(thinkingContentRef.current.trim())
+            || hasRealToolEventsRef.current;
 
-          const hadToolEvents = hasRealToolEventsRef.current;
-          const currentStreamSegs = [...streamSegmentsRef.current];
-          const finalStreamSegs = thinkingContentRef.current.trim()
-            ? [...currentStreamSegs, { text: thinkingContentRef.current, ts: Date.now(), kind: 'thinking' as const }]
-            : currentStreamSegs;
-          const shouldHideTurn = !finalContent.trim() && finalStreamSegs.length === 0 && !hadToolEvents;
-          let cid = streamingAssistantIdRef.current;
-          if (!cid && !shouldHideTurn) {
-            cid = ensureStreamingAssistantBubble({ idPrefix: 'direct-final', content: '', resetIfCreated: false }).assistantId;
+          if (!hasVisibleFinal && !hasAnyVisibleState) {
+            clearStreamWatchdog();
+            clearPendingTextRender();
+            clearDirectPendingEmptyFinal();
+
+            const pendingRunId = incomingRunId || currentRunIdRef.current || null;
+            const pendingModel = resolveCurrentStreamModel(gatewayModelFromPayload(payload));
+            const timer = setTimeout(() => {
+              if (directPendingEmptyFinalRef.current?.runId !== pendingRunId) return;
+              directPendingEmptyFinalRef.current = null;
+              completeDirectAssistantTurn('', {
+                runId: pendingRunId,
+                model: pendingModel,
+                provenance: 'via OpenClaw',
+              });
+            }, 2500);
+            directPendingEmptyFinalRef.current = { runId: pendingRunId, model: pendingModel || null, timer };
+            scheduleSessionTelemetryRefresh(400);
+            schedulePostTurnHistorySync(900, 2500);
+            break;
           }
 
-          setStatusText(null);
-          setStreamingPhase('idle');
-          setThinkingContent('');
-          setStreamSegments([]);
-          setActiveToolName(null);
-          setIsRunning(false);
-          if (compactionPhaseRef.current === 'compacting') {
-            compactionPhaseRef.current = 'idle';
-            setCompactionPhase('idle');
-            if (compactionTimerRef.current) {
-              clearTimeout(compactionTimerRef.current);
-              compactionTimerRef.current = null;
-            }
-          }
-
-          isStreamActiveRef.current = false;
-          streamTransportRef.current = null;
-          streamingAssistantIdRef.current = null;
-          activeStreamToolCallsRef.current = [];
-          currentRunIdRef.current = null;
-          directClientRef.current?.setActiveStreamSession(null);
-          assembledRef.current = '';
-          lastSegmentStartRef.current = 0;
-          lastRawTextLenRef.current = 0;
-
-          const graduatedSegments = finalStreamSegs.length > 0 || hadToolEvents
-            ? buildGraduatedSegments(finalStreamSegs, finalContent)
-            : [];
-
-          if (cid) {
-            if (shouldHideTurn) {
-              setMessages(prev => prev.filter(m => m.id !== cid));
-            } else {
-              setMessages(prev => prev.map(m => {
-                if (m.id !== cid) return m;
-                const update: Partial<ChatMessage> = { content: finalContent };
-                if (graduatedSegments.length > 0) {
-                  update.segments = graduatedSegments;
-                }
-                return { ...m, ...update };
-              }));
-            }
-          }
-          scheduleSessionTelemetryRefresh(400);
-          if (providerRef.current === 'OPENCLAW') {
-            // Match Control UI: live events are delivery state; chat.history is
-            // transcript truth. Refresh every completed turn, with one follow-up
-            // pass for gateways whose durable JSONL write lags the final event.
-            schedulePostTurnHistorySync(450, 2500);
-          }
+          completeDirectAssistantTurn(finalText, {
+            runId: incomingRunId || currentRunIdRef.current,
+            model: gatewayModelFromPayload(payload),
+            provenance: 'via OpenClaw',
+          });
           break;
         }
         case 'aborted': {
           clearStreamWatchdog();
           clearPendingTextRender();
+          clearDirectPendingEmptyFinal();
           lastTerminalRunIdRef.current = incomingRunId || currentRunIdRef.current;
 
           const cid = streamingAssistantIdRef.current;
@@ -3290,6 +4119,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         case 'error': {
           clearStreamWatchdog();
           clearPendingTextRender();
+          clearDirectPendingEmptyFinal();
           lastTerminalRunIdRef.current = incomingRunId || currentRunIdRef.current;
           if (compactionTimerRef.current) {
             clearTimeout(compactionTimerRef.current);
@@ -3323,6 +4153,90 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     } else if (evt.event === 'agent') {
       const payload = evt.payload;
       const rawData = payload.data as any;
+      const codexProgressStatus = getCodexAppServerProgressStatus(payload.stream, rawData);
+
+      if (codexProgressStatus) {
+        let assistantId = streamingAssistantIdRef.current;
+        if (!assistantId) {
+          assistantId = ensureStreamingAssistantBubble({ idPrefix: 'direct-progress', content: '', resetIfCreated: true }).assistantId;
+        }
+        isStreamActiveRef.current = true;
+        streamTransportRef.current = 'direct';
+        setIsRunning(true);
+        setSessionAvailability('present');
+        directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
+        appendThinkingChunk(
+          assistantId,
+          extractThinkingChunk('status', codexProgressStatus, assembledRef.current.length > 0),
+        );
+        setLiveRunPhase('thinking', codexProgressStatus);
+        resetStreamWatchdog();
+        return;
+      }
+
+      if (payload.stream === 'assistant') {
+        const snapshotText = typeof rawData?.text === 'string' ? sanitizeAssistantChunk(rawData.text) : '';
+        const deltaText = typeof rawData?.delta === 'string' ? sanitizeAssistantChunk(rawData.delta) : '';
+        const incomingText = snapshotText || deltaText;
+        if (!incomingText || isControlOrMaintenanceAssistantContent(incomingText)) return;
+
+        let assistantId = streamingAssistantIdRef.current;
+        if (!assistantId) {
+          assistantId = ensureStreamingAssistantBubble({ idPrefix: 'direct-assistant', content: '', resetIfCreated: true }).assistantId;
+        }
+        isStreamActiveRef.current = true;
+        streamTransportRef.current = 'direct';
+        setIsRunning(true);
+        setSessionAvailability('present');
+        directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
+
+        graduateLiveThinkingSegment();
+
+        let nextText: string;
+        if (snapshotText) {
+          lastRawTextLenRef.current = snapshotText.length;
+          nextText = lastSegmentStartRef.current > 0 && snapshotText.length > lastSegmentStartRef.current
+            ? snapshotText.slice(lastSegmentStartRef.current)
+            : snapshotText;
+          assembledRef.current = nextText;
+        } else {
+          nextText = mergeStreamText(deltaText);
+          lastRawTextLenRef.current += deltaText.length;
+        }
+
+        setStatusText(null);
+        setStreamingPhase('streaming');
+        setActiveToolName(null);
+        schedulePendingTextRender(nextText);
+        setLiveRunPhase('streaming', null);
+        resetStreamWatchdog();
+        return;
+      }
+
+      if (payload.stream === 'item' && rawData?.kind === 'preamble') {
+        const preambleText = typeof rawData?.progressText === 'string'
+          ? sanitizeAssistantChunk(rawData.progressText)
+          : (typeof rawData?.text === 'string'
+              ? sanitizeAssistantChunk(rawData.text)
+              : (typeof rawData?.content === 'string' ? sanitizeAssistantChunk(rawData.content) : ''));
+        const thinkingChunk = extractThinkingChunk('thinking', preambleText, assembledRef.current.length > 0);
+        if (!thinkingChunk) return;
+
+        let assistantId = streamingAssistantIdRef.current;
+        if (!assistantId) {
+          assistantId = ensureStreamingAssistantBubble({ idPrefix: 'direct-preamble', content: '', resetIfCreated: true }).assistantId;
+        }
+        isStreamActiveRef.current = true;
+        streamTransportRef.current = 'direct';
+        setIsRunning(true);
+        setSessionAvailability('present');
+        directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
+        appendThinkingChunk(assistantId, thinkingChunk, { replace: true });
+        setLiveRunPhase('thinking', null);
+        resetStreamWatchdog();
+        return;
+      }
+
       const normalizedToolData = payload.stream === 'tool' && rawData
         ? rawData
         : (payload.stream === 'item' && rawData?.kind === 'tool'
@@ -3332,6 +4246,60 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                 result: rawData.result ?? rawData.partialResult ?? rawData.statusText ?? rawData.meta,
               }
             : null);
+
+      if (payload.stream === 'thinking') {
+        const thinkingText = typeof rawData?.text === 'string' && rawData.text.trim()
+          ? rawData.text
+          : (typeof rawData?.delta === 'string' && rawData.delta.trim()
+              ? rawData.delta
+              : (typeof rawData?.content === 'string' ? rawData.content : ''));
+        const thinkingChunk = extractThinkingChunk('thinking', thinkingText, assembledRef.current.length > 0);
+        if (!thinkingChunk) return;
+
+        let assistantId = streamingAssistantIdRef.current;
+        if (!assistantId) {
+          assistantId = ensureStreamingAssistantBubble({ idPrefix: 'direct-thinking', content: '', resetIfCreated: true }).assistantId;
+        }
+        isStreamActiveRef.current = true;
+        streamTransportRef.current = 'direct';
+        setIsRunning(true);
+        setSessionAvailability('present');
+        directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
+        appendThinkingChunk(assistantId, thinkingChunk);
+        setLiveRunPhase('thinking', null);
+        resetStreamWatchdog();
+        return;
+      }
+
+      if (payload.stream === 'item' && rawData?.kind === 'analysis') {
+        const thinkingText = extractVisibleAnalysisThinkingText(rawData);
+        if (thinkingText) {
+          let assistantId = streamingAssistantIdRef.current;
+          if (!assistantId) {
+            assistantId = ensureStreamingAssistantBubble({ idPrefix: 'direct-analysis', content: '', resetIfCreated: true }).assistantId;
+          }
+          isStreamActiveRef.current = true;
+          streamTransportRef.current = 'direct';
+          setIsRunning(true);
+          setSessionAvailability('present');
+          directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
+          appendThinkingChunk(assistantId, extractThinkingChunk('thinking', thinkingText, assembledRef.current.length > 0));
+          setLiveRunPhase('thinking', null);
+          resetStreamWatchdog();
+        }
+        return;
+      }
+
+      if (normalizedToolData && isMessageToolName(normalizedToolData.name ?? normalizedToolData.toolName)) {
+        // The OpenClaw `message` tool is webchat delivery plumbing. The visible
+        // transcript arrives through chat/history; showing this as a tool call is
+        // what leaks "sending to Web chat" artifacts into Agent Chats.
+        if (incomingRunId) {
+          currentRunIdRef.current = incomingRunId;
+          directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
+        }
+        return;
+      }
 
       if (normalizedToolData) {
         const data = normalizedToolData;
@@ -3511,7 +4479,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
       }
     }
-  }, [clearSuppressedRunId, ensureStreamingAssistantBubble, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase]);
+  }, [clearDirectPendingEmptyFinal, clearSuppressedRunId, completeDirectAssistantTurn, ensureStreamingAssistantBubble, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, clearPendingTextRender, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, resolveCurrentStreamModel, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase]);
 
   // WS setup — runs once on mount, survives entire app lifetime
   // Handler registration MUST happen in the same effect that creates the manager,
@@ -3779,6 +4747,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // Clear messages helper — also invalidates any in-flight history load and
   // resets transient stream UI so switching sessions always starts clean.
   const clearMessages = useCallback(() => {
+    const pendingDirectFinal = directPendingEmptyFinalRef.current;
+    if (pendingDirectFinal) {
+      clearTimeout(pendingDirectFinal.timer);
+      directPendingEmptyFinalRef.current = null;
+    }
     historyGenRef.current++; // invalidate any in-flight loadHistoryInternal
     setMessages([]);
     setMessageQueue([]);
@@ -3860,6 +4833,20 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setMessages(prev => prev.filter(m => m.id !== id));
   }, []);
 
+  const waitForDirectGatewayClient = useCallback(async (timeoutMs = 7000) => {
+    const existing = directClientRef.current;
+    if (existing?.isConnected) return existing;
+
+    setDirectGatewayDemanded(true);
+    const deadline = Date.now() + Math.max(timeoutMs, 0);
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const candidate = directClientRef.current;
+      if (candidate?.isConnected) return candidate;
+    }
+    return directClientRef.current?.isConnected ? directClientRef.current : null;
+  }, []);
+
   // Send message via WS (with SSE fallback)
   const sendMessage = useCallback(async (text: string) => {
     const normalized = String(text || '').trim();
@@ -3889,13 +4876,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (shouldQueue) {
       const queuedId = nextId();
       const queuedAt = Date.now();
-      setMessages(prev => [...prev, {
+      appendLocalMessage({
         id: queuedId,
         role: 'user',
         content: normalized,
         createdAt: new Date(queuedAt),
         queued: true,
-      }]);
+      });
       setMessageQueue(prev => [...prev, { id: queuedId, text: normalized, createdAt: queuedAt }]);
       return;
     }
@@ -3908,7 +4895,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       createdAt: new Date(),
       pendingAck: true,
     };
-    setMessages(prev => [...prev, userMsg]);
+    appendLocalMessage(userMsg);
 
     clearPostTurnHistorySync();
     clearPendingTextRender();
@@ -3935,18 +4922,24 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       content: '',
       createdAt: new Date(),
     };
-    setMessages(prev => [...prev, assistantMsg]);
+    appendLocalMessage(assistantMsg);
     setIsRunning(true);
     setSessionAvailability('present');
     isStreamActiveRef.current = true;
     resetStreamWatchdog();
 
+    let directClient = directClientRef.current;
     if (useDirectGateway && providerRef.current === 'OPENCLAW') {
       setDirectGatewayDemanded(true);
+      if (!directClient?.isConnected) {
+        setStatusText('Connecting directly to OpenClaw…');
+        directClient = await waitForDirectGatewayClient(7000);
+      }
     }
 
-    // For OPENCLAW with direct gateway enabled, use the direct client
-    const directClient = directClientRef.current;
+    // For OPENCLAW with direct gateway enabled, use the direct client.
+    // Wait briefly on the first user-initiated run so direct mode does not
+    // silently route the initial message through the portal WS fallback.
     if (useDirectGateway && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
       try {
         streamTransportRef.current = 'direct';
@@ -4051,7 +5044,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         streamingAssistantIdRef.current = null;
       }
     }
-  }, [clearActiveStreamState, clearSuppressedRunId, markRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, resolveOpenClawSessionKey, useDirectGateway]);
+  }, [appendLocalMessage, clearActiveStreamState, clearSuppressedRunId, markRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, resolveOpenClawSessionKey, useDirectGateway, waitForDirectGatewayClient]);
 
   const drainNextQueuedMessage = useCallback(() => {
     if (isStreamActiveRef.current || isQueueDrainActiveRef.current) return;
@@ -4060,11 +5053,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
     isQueueDrainActiveRef.current = true;
     setMessageQueue(prev => prev.slice(1));
-    setMessages(prev => prev.filter(m => m.id !== next.id));
+    removeLocalMessageById(next.id);
     void sendMessage(next.text).finally(() => {
       isQueueDrainActiveRef.current = false;
     });
-  }, [sendMessage]);
+  }, [removeLocalMessageById, sendMessage]);
 
   // SSE fallback sender
   const sendViaSSE = useCallback(async (text: string, initialAssistantId: string) => {
@@ -4139,32 +5132,20 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             setStatusText(null);
             setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, content: assembled } : m));
           } else if (evt.type === 'status') {
-            const nextStatusText = typeof evt.content === 'string' ? evt.content : null;
-            const normalizedStatus = typeof nextStatusText === 'string' ? normalizeLifecycleMarker(nextStatusText) : '';
-            const isMaintenanceStatus = evt.maintenanceKind === 'maintenance'
-              || LIFECYCLE_FLUSH_PREPARING_RE.test(normalizedStatus)
-              || LIFECYCLE_FLUSH_RUNNING_RE.test(normalizedStatus)
-              || LIFECYCLE_FLUSH_DONE_RE.test(normalizedStatus);
-            if (isMaintenanceStatus) {
-              applyCompactionState({
-                phase: LIFECYCLE_FLUSH_DONE_RE.test(normalizedStatus) ? 'end' : 'start',
-                content: nextStatusText,
-                completed: false,
-                maintenanceKind: 'maintenance',
-              });
-            }
-            if (providerRef.current !== 'OPENCLAW') {
+            const maintenanceRail = resolveMaintenanceRailStatus(evt);
+            if (maintenanceRail.update) applyCompactionState(maintenanceRail.update);
+            if (!maintenanceRail.isMaintenanceStatus) {
               const thinkingChunk = extractThinkingChunk('status', evt.content, assembled.length > 0);
               appendThinkingChunk(assistantId, thinkingChunk);
             }
             if (!assembled || getRunningToolName()) {
-              setLiveRunPhase('thinking', nextStatusText);
+              setLiveRunPhase('thinking', maintenanceRail.displayStatusText);
             }
           } else if (evt.type === 'thinking') {
             const thinkingChunk = extractThinkingChunk('thinking', evt.content, assembled.length > 0);
             appendThinkingChunk(assistantId, thinkingChunk);
             if (!assembled || getRunningToolName()) {
-              setLiveRunPhase('thinking', typeof evt.content === 'string' ? evt.content : null);
+              setLiveRunPhase('thinking', null);
             }
           } else if (evt.type === 'compaction_start') {
             applyCompactionState({
@@ -4199,7 +5180,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             const toolId = typeof evt.toolCallId === 'string' && evt.toolCallId.trim()
               ? evt.toolCallId.trim()
               : 'tool-' + (++toolCounterRef.current);
-            setStatusText(getToolStatusText(toolName, typeof evt.content === 'string' ? evt.content : null));
+            setStatusText(getToolStatusText(toolName));
             setStreamingPhase('tool');
             setActiveToolName(toolName);
             setMessages(prev => prev.map(m => {
@@ -4243,6 +5224,23 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             setStreamingPhase('tool');
             setActiveToolName(toolName);
             setStatusText(getToolStatusText(toolName));
+          } else if (evt.type === 'tool_update') {
+            const toolResult = typeof (evt as any).toolResult === 'string'
+              ? (evt as any).toolResult
+              : (typeof evt.content === 'string' ? evt.content : '');
+            const toolName = resolveToolName((evt as any).toolName, evt.content, 'tool');
+            setStreamingPhase('tool');
+            setActiveToolName(toolName);
+            setStatusText(getToolStatusText(toolName));
+            setMessages(prev => {
+              const projection = updateRunningToolCallInMessage(prev, assistantId, {
+                toolCallId: (evt as any).toolCallId,
+                toolName,
+                result: toolResult,
+              });
+              if (projection.changed) activeStreamToolCallsRef.current = projection.toolCalls as ToolCall[];
+              return projection.messages as ChatMessage[];
+            });
           } else if (evt.type === 'tool_end') {
             const toolResult = typeof (evt as any).toolResult === 'string'
               ? (evt as any).toolResult
@@ -4449,6 +5447,16 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
   }, [sessionControlsSupported, session, provider]);
 
+  const setReasoningVisibility = useCallback(async (nextLevel: ReasoningVisibility) => {
+    if (!sessionControlsSupported) return;
+    try {
+      await gatewayAPI.patchSession(session, { reasoning: nextLevel }, provider);
+      setReasoningVisibilityState(nextLevel);
+    } catch (err) {
+      console.error('[ChatState] Failed to patch reasoning visibility:', err);
+    }
+  }, [sessionControlsSupported, session, provider]);
+
   const reconnectSocket = useCallback(() => {
     if (useDirectGateway && providerRef.current === 'OPENCLAW' && directClientRef.current) {
       directClientRef.current.disconnect();
@@ -4484,7 +5492,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       setCompactionModelLoading(false);
     }
   }, []);
-
 
   // Build context value
   const contextValue: ChatStateContextValue = {
@@ -4531,6 +5538,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     // Session controls
     thinkingLevel,
     setThinkingLevel,
+    reasoningVisibility,
+    setReasoningVisibility,
     fastModeEnabled,
     toggleFastMode,
     compactionModelOverride,

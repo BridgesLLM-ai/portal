@@ -415,7 +415,7 @@ export const gatewayAPI = {
   },
   sessionInfo: async (session = 'agent:main:main', options?: { silent?: boolean }) => {
     const { data } = await client.get('/gateway/session-info', {
-      params: { session },
+      params: { session, ...(options?.silent ? { silent: '1' } : {}) },
       ...(options?.silent ? { _silent: true } as any : {}),
     });
     return data;

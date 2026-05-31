@@ -16,6 +16,7 @@ import { agentRuntimeAPI, AgentRuntimeStatus } from '../api/agentRuntime';
 import { authAPI, TwoFactorSetupResponse, TwoFactorStatusResponse } from '../api/auth';
 import sounds from '../utils/sounds';
 import { DEFAULT_REGISTRATION_MODE } from '../utils/securityDefaults';
+import ViewportOverlay from '../components/ViewportOverlay';
 
 const LazyBackupsTab = lazy(() => import('../components/settings/BackupsTab'));
 const LazyAiProviderSetup = lazy(() => import('../components/ai-setup/AiProviderSetup'));
@@ -44,8 +45,10 @@ function useToasts() {
 }
 
 function SettingsToasts({ toasts }: { toasts: ToastItem[] }) {
+  if (toasts.length === 0) return null;
+
   return (
-    <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm">
+    <ViewportOverlay anchor="bottom-right" zIndex={1200} className="flex w-[min(24rem,calc(100vw-2rem))] flex-col gap-2 overflow-y-auto overscroll-contain pr-1">
       {toasts.map(t => (
         <div key={t.id} className={`flex items-center gap-2 px-4 py-3 rounded-lg border text-sm font-medium animate-slide-in ${
           t.type === 'success'
@@ -56,7 +59,7 @@ function SettingsToasts({ toasts }: { toasts: ToastItem[] }) {
           {t.message}
         </div>
       ))}
-    </div>
+    </ViewportOverlay>
   );
 }
 

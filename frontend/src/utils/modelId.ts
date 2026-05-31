@@ -38,6 +38,61 @@ export function canonicalizePortalModelId(rawModel: unknown): string {
   return mapped;
 }
 
+function uniqueModelIds(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => canonicalizePortalModelId(value)).filter(Boolean)));
+}
+
+export function getPortalModelCatalogAliases(rawModel: unknown): string[] {
+  const normalized = canonicalizePortalModelId(rawModel);
+  if (!normalized) return [];
+
+  const aliases = [normalized];
+  const addProviderAlias = (from: string, to: string) => {
+    if (normalized.startsWith(`${from}/`)) {
+      aliases.push(`${to}/${normalized.slice(from.length + 1)}`);
+    }
+  };
+
+  addProviderAlias('openai-codex', 'openai');
+  addProviderAlias('openai', 'openai-codex');
+  addProviderAlias('google-gemini-cli', 'google');
+  addProviderAlias('google', 'google-gemini-cli');
+  addProviderAlias('claude-cli', 'anthropic');
+  addProviderAlias('anthropic', 'claude-cli');
+
+  if (!normalized.includes('/')) {
+    if (/^(gpt-|o\d|codex)/i.test(normalized)) {
+      aliases.push(`openai/${normalized}`, `openai-codex/${normalized}`);
+    }
+    if (normalized.startsWith('gemini-')) {
+      aliases.push(`google/${normalized}`, `google-gemini-cli/${normalized}`);
+    }
+  }
+
+  return uniqueModelIds(aliases);
+}
+
+export function resolvePortalModelFromCatalog(rawModel: unknown, availableModels: string[]): string {
+  const aliases = getPortalModelCatalogAliases(rawModel);
+  if (!aliases.length) return '';
+
+  const catalog = uniqueModelIds(availableModels);
+  if (!catalog.length) return aliases[0];
+
+  for (const alias of aliases) {
+    if (catalog.includes(alias)) return alias;
+  }
+
+  const normalized = canonicalizePortalModelId(rawModel);
+  if (normalized && !normalized.includes('/')) {
+    const suffix = `/${normalized}`;
+    const suffixMatch = catalog.find((model) => model.endsWith(suffix));
+    if (suffixMatch) return suffixMatch;
+  }
+
+  return '';
+}
+
 export function normalizeModelId(rawModel: unknown): string {
   if (typeof rawModel === 'string') {
     return canonicalizePortalModelId(rawModel);

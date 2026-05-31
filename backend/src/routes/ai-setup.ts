@@ -16,6 +16,7 @@ import {
   pinProviderAuthProfile,
   readAuthProfiles,
   readOpenClawConfig,
+  registerProviderRuntimeModels,
   saveProviderApiKey,
 } from '../services/openclawConfigManager';
 import { listGatewayModels } from '../utils/openclawGatewayRpc';
@@ -253,17 +254,34 @@ function dedupeProviderModels(provider: string, models: Array<string | null | un
   return deduped;
 }
 
-function stripPortalUnsupportedModelMetadata(config: any): boolean {
-  // Keep setup writes inside OpenClaw's stable public config schema. Runtime
-  // harness selection is not a valid key under agents.defaults.models in
-  // OpenClaw 2026.5.x; persisting it makes `openclaw gateway restart` abort.
+function repairProviderModelRuntimeMetadata(config: any, provider: string): boolean {
   const models = config?.agents?.defaults?.models;
   if (!models || typeof models !== 'object') return false;
 
   let changed = false;
-  for (const entry of Object.values(models) as any[]) {
+  if (provider !== 'openai-codex' && provider !== 'anthropic') return changed;
+
+  for (const [modelId, entry] of Object.entries(models) as Array<[string, any]>) {
     if (!entry || typeof entry !== 'object') continue;
-    if (Object.prototype.hasOwnProperty.call(entry, 'agentRuntime')) {
+
+    if (provider === 'anthropic') {
+      if (modelId.startsWith('anthropic/') && String(entry.agentRuntime?.id || '').trim() === 'claude-cli') {
+        delete entry.agentRuntime;
+        changed = true;
+      }
+      continue;
+    }
+
+    if (modelId.startsWith('openai-codex/')) {
+      const runtimeId = String(entry.agentRuntime?.id || '').trim();
+      if (runtimeId !== 'codex') {
+        entry.agentRuntime = { ...(entry.agentRuntime && typeof entry.agentRuntime === 'object' ? entry.agentRuntime : {}), id: 'codex' };
+        changed = true;
+      }
+      continue;
+    }
+
+    if (modelId.startsWith('openai/') && String(entry.agentRuntime?.id || '').trim() === 'codex') {
       delete entry.agentRuntime;
       changed = true;
     }
@@ -276,6 +294,20 @@ function parseDiscoveredProviderModels(provider: string, payload: any): string[]
     .map((entry) => canonicalizeDiscoveredProviderModelId(provider, entry?.id || entry?.name || ''))
     .filter((modelId) => matchesProviderModel(provider, modelId));
   return dedupeProviderModels(provider, models);
+}
+
+export function getProviderDefaultModelPayload(provider: string | null): any[] {
+  if (!provider) return [];
+  const meta = getAiProviderMeta(provider);
+  if (!meta) return [];
+  return normalizeModelPayload(
+    meta.defaultModels.map((model) => ({
+      id: model.id,
+      name: model.name,
+      description: model.description,
+    })),
+    provider,
+  ).filter((model) => matchesProviderModel(provider, model.id || model.name || ''));
 }
 
 function readDiscoveredProviderModelsFromCli(provider: string): string[] {
@@ -329,7 +361,7 @@ export function mergeDiscoveredProviderModelsIntoConfig(config: any, provider: s
   const fallbackSet = new Set(existingFallbacks);
   const addedAllowlist: string[] = [];
   const addedFallbacks: string[] = [];
-  let changed = stripPortalUnsupportedModelMetadata(next);
+  let changed = repairProviderModelRuntimeMetadata(next, provider);
 
   for (const modelId of dedupeProviderModels(provider, discoveredModels)) {
     if (!next.agents.defaults.models[modelId] || typeof next.agents.defaults.models[modelId] !== 'object') {
@@ -338,6 +370,15 @@ export function mergeDiscoveredProviderModelsIntoConfig(config: any, provider: s
         : {};
       addedAllowlist.push(modelId);
       changed = true;
+    }
+
+    if (provider === 'openai-codex' && modelId.startsWith('openai-codex/')) {
+      const entry = next.agents.defaults.models[modelId];
+      const runtimeId = String(entry.agentRuntime?.id || '').trim();
+      if (runtimeId !== 'codex') {
+        entry.agentRuntime = { ...(entry.agentRuntime && typeof entry.agentRuntime === 'object' ? entry.agentRuntime : {}), id: 'codex' };
+        changed = true;
+      }
     }
 
     if (modelId !== currentDefault && !fallbackSet.has(modelId)) {
@@ -386,14 +427,15 @@ async function registerProviderModels(provider: string) {
 
   const openclawConfig = readOpenClawConfig();
   const merged = mergeDiscoveredProviderModelsIntoConfig(openclawConfig, provider, discoveredModels);
+  const runtimeModels = registerProviderRuntimeModels(provider, discoveredModels);
   if (merged.changed) {
     atomicWriteJson(CONFIG_PATH, merged.config);
     if (provider === 'anthropic') repairClaudeSubscriptionConfig();
   }
 
-  console.log(`[AI-Setup] Registered ${discoveredModels.length} ${provider} models (${merged.addedAllowlist.length} allowlisted, ${merged.addedFallbacks.length} fallback additions)`);
+  console.log(`[AI-Setup] Registered ${discoveredModels.length} ${provider} models (${merged.addedAllowlist.length} allowlisted, ${merged.addedFallbacks.length} fallback additions, ${runtimeModels.addedModels.length} runtime additions)`);
   return {
-    changed: merged.changed,
+    changed: merged.changed || runtimeModels.changed,
     models: discoveredModels,
     addedAllowlist: merged.addedAllowlist,
     addedFallbacks: merged.addedFallbacks,
@@ -811,23 +853,37 @@ export function createAiSetupRouter(): Router {
 
   router.get('/models', async (req: Request, res: Response) => {
     const providerFilter = typeof req.query.provider === 'string' ? req.query.provider : null;
+    const fallbackModels = getProviderDefaultModelPayload(providerFilter);
+    const warnings: string[] = [];
 
     try {
       const rpcResult = await listGatewayModels();
       if (rpcResult.ok) {
         let models = normalizeModelPayload(rpcResult.models || [], providerFilter);
         if (providerFilter) models = models.filter((model) => matchesProviderModel(providerFilter, model.id || model.name || ''));
-        res.json({ models });
+        res.json({ models: models.length ? models : fallbackModels, source: models.length ? 'gateway' : 'defaults' });
         return;
       }
+      if (rpcResult.error) warnings.push(`Gateway model catalog unavailable: ${rpcResult.error}`);
+    } catch (error: any) {
+      warnings.push(`Gateway model catalog unavailable: ${error?.message || String(error)}`);
+    }
 
-      const cliModels = JSON.parse(runOpenClaw(['models', 'list', '--json'], 60000));
+    try {
+      const cliModels = JSON.parse(runOpenClaw(['models', 'list', '--json'], 20000));
       let models = normalizeModelPayload(Array.isArray(cliModels) ? cliModels : cliModels.models || [], providerFilter);
       if (providerFilter) models = models.filter((model) => matchesProviderModel(providerFilter, model.id || model.name || ''));
-      res.json({ models });
+      res.json({ models: models.length ? models : fallbackModels, source: models.length ? 'cli' : 'defaults', warnings });
+      return;
     } catch (error: any) {
-      res.status(500).json({ error: error?.message || 'Failed to list models' });
+      warnings.push(`OpenClaw model list unavailable: ${error?.message || 'Failed to list models'}`);
     }
+
+    // Setup must be able to proceed before OpenClaw is fully configured. Model
+    // discovery is a convenience, not a wizard-blocking prerequisite; the UI can
+    // render static provider defaults and let the save path register models after
+    // auth completes.
+    res.json({ models: fallbackModels, source: 'defaults', warnings });
   });
 
   router.delete('/provider/:id', async (req: Request, res: Response) => {

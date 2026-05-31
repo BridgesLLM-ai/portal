@@ -4,8 +4,10 @@ import type {
   AgentSessionConfig,
   AgentSendResult,
   OnChunkCallback,
+  OnExecApprovalCallback,
   OnStatusCallback,
 } from '../../AgentProvider.interface';
+import type { NativeCliApprovalDecision, NativeCliApprovalDraft } from '../../nativeCliApprovals';
 import type { NativeSessionData } from '../NativeSessionStore';
 
 export interface NativeCliInvocation {
@@ -20,6 +22,7 @@ export interface NativeCliTurnContext {
   message: string;
   onChunk?: OnChunkCallback;
   onStatus?: OnStatusCallback;
+  onExecApproval?: OnExecApprovalCallback;
   fullText: string;
   lastAssistantMessage: string;
   stderr: string;
@@ -31,6 +34,7 @@ export interface NativeCliTurnContext {
   appendFullText: (text: string) => void;
   setLastAssistantMessage: (text: string) => void;
   appendStderr: (text: string) => void;
+  requestApproval: (approval: Omit<NativeCliApprovalDraft, 'providerName' | 'sessionId' | 'cwd'> & { cwd?: string }) => Promise<NativeCliApprovalDecision>;
   updateSessionMetadata: (metadata: Record<string, unknown>) => void;
   rekeySession: (nextSessionId: string) => void;
   stripAnsi: (text: string) => string;

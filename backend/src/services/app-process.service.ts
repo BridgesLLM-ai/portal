@@ -24,6 +24,7 @@ interface ManagedApp {
   restartCount: number;
   lastError?: string;
   restartTimer?: NodeJS.Timeout;
+  stopping?: boolean;
   logs: string[];
   deployPath: string;
 }
@@ -49,12 +50,12 @@ export function detectDeployType(projectDir: string): 'static' | 'fullstack' | '
   const hasRequirementsTxt = files.includes('requirements.txt');
   const hasMainCpp = files.includes('main.cpp');
   const hasMakefile = files.includes('Makefile');
-  
+
   // Python runtime: has main.py or requirements.txt (and no package.json)
   if ((hasMainPy || hasRequirementsTxt) && !hasPackageJson) {
     return 'runtime';
   }
-  
+
   // C++ runtime: has main.cpp or Makefile with g++ (and no package.json, no index.html)
   if ((hasMainCpp || hasMakefile) && !hasPackageJson && !hasIndexHtml) {
     // Verify Makefile contains g++ references if it exists
@@ -68,25 +69,25 @@ export function detectDeployType(projectDir: string): 'static' | 'fullstack' | '
     }
     if (hasMainCpp) return 'runtime';
   }
-  
+
   // Node.js detection
   if (hasPackageJson) {
     try {
       const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
-      
+
       // Node CLI runtime: has package.json but NO start script and NO index.html
       if (!pkg.scripts?.start && !hasIndexHtml) {
         return 'runtime';
       }
-      
+
       // Fullstack: has start script (web server)
       if (pkg.scripts?.start) return 'fullstack';
-      
+
       // Static: has build script
       if (pkg.scripts?.build) return 'static';
     } catch {}
   }
-  
+
   // Default to static (HTML apps)
   return 'static';
 }
@@ -99,15 +100,15 @@ export async function allocatePort(): Promise<number> {
     where: { port: { not: null } },
     select: { port: true },
   });
-  
+
   const usedSet = new Set(usedPorts.map(a => a.port));
-  
+
   for (let p = PORT_RANGE_START; p <= PORT_RANGE_END; p++) {
     if (!usedSet.has(p) && !isPortInUseByProcess(p)) {
       return p;
     }
   }
-  
+
   throw new Error('No available ports in range 5001-5099');
 }
 
@@ -124,15 +125,15 @@ function isPortInUseByProcess(port: number): boolean {
 export async function startApp(appId: string, deployId: string, deployPath: string, port: number): Promise<ManagedApp> {
   // Kill existing if running
   await stopApp(deployId);
-  
+
   // Install dependencies if needed
   const nmPath = path.join(deployPath, 'node_modules');
   if (!fs.existsSync(nmPath)) {
     console.log(`[AppProcess] Installing dependencies for ${deployId}...`);
     try {
-      execSync('npm install --production 2>&1', { 
-        cwd: deployPath, 
-        timeout: 120000, 
+      execSync('npm install --production 2>&1', {
+        cwd: deployPath,
+        timeout: 120000,
         encoding: 'utf-8',
         env: { ...process.env, PORT: String(port) },
       });
@@ -141,9 +142,9 @@ export async function startApp(appId: string, deployId: string, deployPath: stri
       throw new Error(`Dependency install failed: ${e.message}`);
     }
   }
-  
+
   console.log(`[AppProcess] Starting ${deployId} on port ${port}...`);
-  
+
   // Kill any stale process on this port before starting
   try {
     const { execSync: es } = require('child_process');
@@ -153,15 +154,15 @@ export async function startApp(appId: string, deployId: string, deployPath: stri
 
   const child = spawn('npm', ['start'], {
     cwd: deployPath,
-    env: { 
-      ...process.env, 
+    env: {
+      ...process.env,
       PORT: String(port),
       NODE_ENV: 'production',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false,
   });
-  
+
   const managed: ManagedApp = {
     appId,
     deployId,
@@ -172,13 +173,13 @@ export async function startApp(appId: string, deployId: string, deployPath: stri
     logs: [],
     deployPath,
   };
-  
+
   child.stdout?.on('data', (data: Buffer) => {
     const line = data.toString().trim();
     if (line) {
       managed.logs.push(`[out] ${line}`);
       if (managed.logs.length > MAX_LOG_LINES) managed.logs.shift();
-      
+
       if (managed.status === 'starting' && /listen|started|ready|running/i.test(line)) {
         managed.status = 'running';
         updateAppStatus(appId, 'running').catch(() => {});
@@ -186,7 +187,7 @@ export async function startApp(appId: string, deployId: string, deployPath: stri
       }
     }
   });
-  
+
   child.stderr?.on('data', (data: Buffer) => {
     const line = data.toString().trim();
     if (line) {
@@ -194,16 +195,23 @@ export async function startApp(appId: string, deployId: string, deployPath: stri
       if (managed.logs.length > MAX_LOG_LINES) managed.logs.shift();
     }
   });
-  
+
   child.on('exit', (code, signal) => {
     console.log(`[AppProcess] ${deployId} exited (code=${code}, signal=${signal})`);
     managed.status = 'stopped';
-    
+
+    // Intentional/admin stops must not schedule a restart. SIGTERM/SIGKILL are
+    // used by stopApp(), deploy replacement, and service shutdown paths.
+    if (managed.stopping || signal === 'SIGTERM' || signal === 'SIGKILL') {
+      if (appId) updateAppStatus(appId, 'stopped').catch(() => {});
+      return;
+    }
+
     if (code !== 0 && managed.restartCount < MAX_RESTART_ATTEMPTS) {
       managed.restartCount++;
       managed.lastError = `Exited with code ${code}`;
       console.log(`[AppProcess] Restarting ${deployId} (attempt ${managed.restartCount}/${MAX_RESTART_ATTEMPTS})...`);
-      
+
       managed.restartTimer = setTimeout(() => {
         startApp(appId, deployId, deployPath, port).catch(err => {
           console.error(`[AppProcess] Restart failed for ${deployId}:`, err.message);
@@ -216,14 +224,14 @@ export async function startApp(appId: string, deployId: string, deployPath: stri
       updateAppStatus(appId, 'error').catch(() => {});
     }
   });
-  
+
   child.on('error', (err) => {
     console.error(`[AppProcess] Spawn error for ${deployId}:`, err.message);
     managed.status = 'error';
     managed.lastError = err.message;
     updateAppStatus(appId, 'error').catch(() => {});
   });
-  
+
   // Mark as running after 5s if no "listening" message detected
   const startupTimer = setTimeout(() => {
     if (managed.status === 'starting') {
@@ -232,7 +240,7 @@ export async function startApp(appId: string, deployId: string, deployPath: stri
       console.log(`[AppProcess] ${deployId} assumed running (no listen message detected)`);
     }
   }, 5000);
-  
+
   runningApps.set(deployId, managed);
   return managed;
 }
@@ -243,10 +251,11 @@ export async function startApp(appId: string, deployId: string, deployPath: stri
 export async function stopApp(deployId: string): Promise<void> {
   const app = runningApps.get(deployId);
   if (!app) return;
-  
+
   console.log(`[AppProcess] Stopping ${deployId}...`);
+  app.stopping = true;
   if (app.restartTimer) { clearTimeout(app.restartTimer); app.restartTimer = undefined; }
-  
+
   try {
     app.process.kill('SIGTERM');
     await new Promise<void>((resolve) => {
@@ -254,16 +263,16 @@ export async function stopApp(deployId: string): Promise<void> {
         try { app.process.kill('SIGKILL'); } catch {}
         resolve();
       }, 5000);
-      
+
       app.process.once('exit', () => {
         clearTimeout(timeout);
         resolve();
       });
     });
   } catch {}
-  
+
   runningApps.delete(deployId);
-  
+
   if (app.appId) {
     await updateAppStatus(app.appId, 'stopped').catch(() => {});
   }
@@ -275,7 +284,7 @@ export async function stopApp(deployId: string): Promise<void> {
 export function getAppStatus(deployId: string): { status: string; port?: number; logs: string[]; lastError?: string; restartCount: number } | null {
   const app = runningApps.get(deployId);
   if (!app) return null;
-  
+
   return {
     status: app.status,
     port: app.port,
@@ -325,16 +334,16 @@ export async function restoreRunningApps(): Promise<void> {
     const apps = await prisma.app.findMany({
       where: { deployType: 'fullstack', processStatus: 'running' },
     });
-    
+
     for (const app of apps) {
       if (!app.port || !app.zipPath || !fs.existsSync(app.zipPath)) {
         await updateAppStatus(app.id, 'stopped');
         continue;
       }
-      
+
       const deployId = `${app.userId}-${app.name}`;
       console.log(`[AppProcess] Restoring ${deployId} on port ${app.port}...`);
-      
+
       try {
         await startApp(app.id, deployId, app.zipPath, app.port);
       } catch (e: any) {

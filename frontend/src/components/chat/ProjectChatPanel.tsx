@@ -11,7 +11,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   Bot, X, Trash2, Send, Loader2, ChevronRight, ChevronDown,
   Wrench, Sparkles, StopCircle, Paperclip, Copy, Check, Code2, Radio,
-  Mic, MicOff, XCircle, CheckCircle2, RotateCcw
+  Mic, MicOff, XCircle, CheckCircle2, RotateCcw, MessageSquare
 } from 'lucide-react';
 import MarkdownRenderer from './MarkdownRenderer';
 import SlashCommandMenu from './SlashCommandMenu';
@@ -36,12 +36,24 @@ import {
   getModelProviderLabel,
   getModelRuntimeLabel,
   normalizeModelId,
+  resolvePortalModelFromCatalog,
 } from '../../utils/modelId';
 import { matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../utils/slashCommands';
+import {
+  appendCompletedToolCallIfMissing,
+  appendToolCallToMessage,
+  buildCompletedToolCall,
+  buildRunningToolCall,
+  finishMatchingToolCallInMessage,
+  finishRunningToolCallInMessage,
+  getLastRunningToolCall,
+  updateRunningToolCallInMessage,
+} from '../../utils/liveTurnProjector';
+import { normalizePortalStreamEventFromTurnEvent } from '../../utils/runtimeTurnEvents';
 import ComposerStatusBadge from './ComposerStatusBadge';
 import CompactionNoticeBlock from './CompactionNoticeBlock';
 import ToolGlyph from './ToolGlyph';
-import { resolveMaintenanceRailStatus } from './maintenanceRailLifecycle';
+import { getRailSafeStatusText, resolveMaintenanceRailStatus } from './maintenanceRailLifecycle';
 import { getToolPresentation, getToolStatusText, getToolSummary, isCompactionNotice, resolveToolName } from '../../utils/toolPresentation';
 import {
   pruneExpiredExecApprovals,
@@ -74,8 +86,14 @@ interface PendingAttachment {
 }
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
+type ReasoningVisibility = 'off' | 'on' | 'stream';
 
 const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive'];
+const REASONING_VISIBILITY_LABELS: Record<ReasoningVisibility, string> = {
+  off: 'Hidden',
+  on: 'Visible',
+  stream: 'Stream',
+};
 const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
   off: 'Off',
   minimal: 'Minimal',
@@ -97,10 +115,7 @@ function supportsOpenClawFastModeModel(model?: string | null): boolean {
 }
 
 function resolveAvailableModelId(model: string, availableModels: string[]): string {
-  const normalized = canonicalizePortalModelId(model);
-  if (!normalized || normalized.includes('/')) return normalized;
-  const suffix = `/${normalized}`;
-  return availableModels.find((candidate) => candidate.endsWith(suffix)) || normalized;
+  return resolvePortalModelFromCatalog(model, availableModels);
 }
 
 /* ═══ WS Manager (local, not shared) ═══ */
@@ -334,14 +349,6 @@ function summarizeHiddenHistoryArtifactText(text: string): string | null {
     return 'Memory flush completed';
   }
 
-  return null;
-}
-
-function getLastRunningToolCall(toolCalls: ToolCall[] | undefined): ToolCall | null {
-  if (!Array.isArray(toolCalls)) return null;
-  for (let i = toolCalls.length - 1; i >= 0; i--) {
-    if (toolCalls[i]?.status === 'running') return toolCalls[i];
-  }
   return null;
 }
 
@@ -741,10 +748,12 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [streamingPhase, setStreamingPhase] = useState<StreamingPhase>('idle');
   const [activeToolName, setActiveToolName] = useState<string | null>(null);
+  const activeToolNameRef = useRef<string | null>(null);
   const [statusText, setStatusText] = useState<string | null>(null);
   const [thinkingContent, setThinkingContent] = useState<string>('');
   const thinkingContentRef = useRef('');
   useEffect(() => { thinkingContentRef.current = thinkingContent; }, [thinkingContent]);
+  useEffect(() => { activeToolNameRef.current = activeToolName; }, [activeToolName]);
   const [pendingApprovals, setPendingApprovals] = useState<ExecApprovalRequest[]>([]);
   const pendingApproval = pendingApprovals[0] || null;
   const [compactionPhase, setCompactionPhase] = useState<'idle' | 'compacting' | 'compacted'>('idle');
@@ -759,6 +768,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
   const [showSessionControls, setShowSessionControls] = useState(false);
   const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>('high');
+  const [reasoningVisibility, setReasoningVisibility] = useState<ReasoningVisibility>('off');
   const [fastModeEnabled, setFastModeEnabled] = useState(false);
   const [thinkingPending, setThinkingPending] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -908,6 +918,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     let cancelled = false;
     if (!sessionKey) {
       setThinkingLevel('high');
+      setReasoningVisibility('off');
       setFastModeEnabled(false);
       return;
     }
@@ -941,6 +952,13 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           const adaptiveDefault = /claude-(opus|sonnet)-4[._-](5|6|7|8|9)|claude-(opus|sonnet)-[5-9]/.test(modelStr);
           setThinkingLevel(adaptiveDefault ? 'adaptive' : 'high');
         }
+        const rawReasoning = String(
+          data?.session?.reasoningLevel
+          || data?.session?.reasoning
+          || data?.session?.settings?.reasoning
+          || '',
+        ).toLowerCase();
+        setReasoningVisibility(['off', 'on', 'stream'].includes(rawReasoning) ? rawReasoning as ReasoningVisibility : 'off');
         setFastModeEnabled(Boolean(
           data?.session?.fastMode
           ?? data?.session?.settings?.fastMode
@@ -950,6 +968,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       .catch(() => {
         if (!cancelled) {
           setThinkingLevel('high');
+          setReasoningVisibility('off');
           setFastModeEnabled(false);
         }
       });
@@ -970,10 +989,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       ? Array.from(new Set(data.models.map((m: any) => canonicalizePortalModelId(String(m?.id || '').trim())).filter(Boolean)))
       : [];
     setAvailableModels(models);
-    // If no model selected or selected model isn't available, pick the first discovered option
+    // If no model selected or selected model isn't available, pick the first discovered option.
+    // Provider-owned aliases are resolved against the live catalog while preserving
+    // the user's selected provider family when both aliases are present.
     setSelectedModel(prev => {
       const resolved = resolveAvailableModelId(prev, models);
-      if (resolved && models.includes(resolved)) return resolved;
       return resolved || models[0] || '';
     });
     return models;
@@ -1030,14 +1050,61 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   }, [isRunning, scrollToBottom]);
 
   // ── Watchdog ──
-  const STREAM_TIMEOUT_MS = 60_000;
+  const STREAM_TIMEOUT_MS = 180_000;
 
   const resetWatchdog = useCallback(() => {
     if (watchdogRef.current) clearTimeout(watchdogRef.current);
     if (!isStreamActiveRef.current) return;
-    watchdogRef.current = setTimeout(() => {
+    watchdogRef.current = setTimeout(async () => {
       if (!isStreamActiveRef.current) return;
-      console.warn('[ProjectChat] Stream watchdog: no activity for 60s');
+      const sk = sessionKeyRef.current;
+      const currentToolName = activeToolNameRef.current;
+
+      try {
+        if (sk) {
+          const { data } = await client.get('/gateway/stream-status', {
+            params: { session: sk, provider: 'OPENCLAW' },
+            _silent: true,
+          } as any);
+
+          if (data?.active) {
+            const phase: StreamingPhase = data.phase === 'tool'
+              ? 'tool'
+              : data.phase === 'streaming'
+                ? 'streaming'
+                : 'thinking';
+            const runningTool = Array.isArray(data.toolCalls)
+              ? getLastRunningToolCall(data.toolCalls as ToolCall[])
+              : null;
+            const snapshotToolName = resolveToolName(data.toolName, data.name, runningTool?.name, currentToolName || undefined);
+            const rawStatusText = getRailSafeStatusText(typeof data.statusText === 'string' ? data.statusText.trim() : '');
+            const fallbackStatus = snapshotToolName
+              ? getToolStatusText(snapshotToolName)
+              : phase === 'streaming'
+                ? 'Still responding…'
+                : 'Still working…';
+
+            isStreamActiveRef.current = true;
+            setIsRunning(true);
+            setStreamingPhase(phase);
+            setActiveToolName(snapshotToolName || null);
+            setStatusText(rawStatusText || fallbackStatus);
+            applyCompactionSnapshotState(data.compactionPhase);
+            resetWatchdog();
+            return;
+          }
+        }
+      } catch (err) {
+        console.warn('[ProjectChat] Stream watchdog verification failed:', err);
+        if (currentToolName || hasRealToolEventsRef.current || compactionPhaseRef.current !== 'idle') {
+          setIsRunning(true);
+          setStreamingPhase(currentToolName ? 'tool' : 'thinking');
+          setStatusText(currentToolName ? getToolStatusText(currentToolName) : 'Reconnecting to stream…');
+          resetWatchdog();
+          return;
+        }
+      }
+
       const cid = streamingAssistantIdRef.current;
       const ft = assembledRef.current.substring(lastSegmentStartRef.current);
       const shouldHideTurn = !ft.trim() && !hasRealToolEventsRef.current && !thinkingContentRef.current.trim();
@@ -1061,7 +1128,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       resumeSeededContentRef.current = false;
       suppressLiveBubbleContentRef.current = false;
     }, STREAM_TIMEOUT_MS);
-  }, []);
+  }, [applyCompactionSnapshotState]);
 
   const clearWatchdog = useCallback(() => {
     if (watchdogRef.current) { clearTimeout(watchdogRef.current); watchdogRef.current = null; }
@@ -1116,7 +1183,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     const runningToolCall = getLastRunningToolCall(snapshotToolCalls);
     const snapshotToolNameCandidate = snapshot.toolName || snapshot.name || runningToolCall?.name || null;
     const snapshotToolName = snapshotToolNameCandidate ? resolveToolName(snapshotToolNameCandidate) : null;
-    const rawStatusText = typeof snapshot.statusText === 'string' ? snapshot.statusText.trim() : '';
+    const rawStatusText = getRailSafeStatusText(typeof snapshot.statusText === 'string' ? snapshot.statusText.trim() : '');
     const isMaintenanceStatusOnly = Boolean(rawStatusText && isControlOrMaintenanceAssistantContent(rawStatusText));
     const hasStatusSignal = Boolean(rawStatusText && !isMaintenanceStatusOnly);
     const hasMaintenanceSignal = isMaintenanceStatusOnly
@@ -1142,15 +1209,15 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     setIsRunning(true);
     setStreamingPhase(resumePhase);
     setActiveToolName(snapshotToolName || null);
-    const liveStatusText = isMaintenanceStatusOnly ? '' : rawStatusText;
+    const liveStatusText = isMaintenanceStatusOnly ? '' : (rawStatusText || '');
     const compactionStatusText = hasLiveSnapshotSignal && snapshot.compactionPhase === 'compacting'
       ? (liveStatusText || 'Compacting context…')
       : hasLiveSnapshotSignal && snapshot.compactionPhase === 'compacted'
         ? (liveStatusText || 'Context compacted')
         : '';
     setStatusText(snapshotToolName
-      ? getToolStatusText(snapshotToolName, liveStatusText || compactionStatusText || null)
-      : (liveStatusText || 'Reconnecting to stream…'));
+      ? getToolStatusText(snapshotToolName)
+      : (liveStatusText || compactionStatusText || 'Reconnecting to stream…'));
     setConnectionNotice(null);
 
     applyCompactionSnapshotState(snapshot.compactionPhase);
@@ -1294,13 +1361,15 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     return false;
   }, [applyActiveStreamSnapshot, applyCompactionSnapshotState, clearWatchdog, isStaleSessionLoad, loadHistorySnapshot]);
 
-  const appendThinkingChunk = useCallback((assistantId: string | null, chunk: string) => {
+  const appendThinkingChunk = useCallback((assistantId: string | null, chunk: string, opts?: { replace?: boolean }) => {
     if (!chunk) return;
-    setThinkingContent(prev => mergeThinkingStream(prev, chunk));
+    const nextThinking = mergeThinkingStream(thinkingContentRef.current, chunk, opts);
+    thinkingContentRef.current = nextThinking;
+    setThinkingContent(nextThinking);
     if (!assistantId) return;
     setMessages(prev => prev.map(m =>
       m.id === assistantId
-        ? { ...m, thinkingContent: mergeThinkingStream(m.thinkingContent || '', chunk) }
+        ? { ...m, thinkingContent: mergeThinkingStream(m.thinkingContent || '', chunk, opts) }
         : m
     ));
   }, []);
@@ -1348,9 +1417,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   }, [pendingApprovals.length]);
 
   // ── WS Event Handler ──
-  const handleWsEvent = useCallback((data: any) => {
+  const handleWsEvent = useCallback((rawData: any) => {
+    const data = normalizePortalStreamEventFromTurnEvent(rawData);
     const passthrough = ['connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended', 'run_resumed', 'exec_approval', 'exec_approval_resolved'];
-    const autoCreateBubbleTypes = ['text', 'thinking', 'tool_start', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
+    const autoCreateBubbleTypes = ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
     const waitForVisibleStreamTypes = ['status', 'thinking', 'done', 'error'];
     if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOrMaintenanceAssistantContent(data.content)) {
       return;
@@ -1406,6 +1476,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         appendThinkingChunk(
           assistantId,
           extractThinkingChunk('thinking', data.content, assembledRef.current.length > 0),
+          { replace: data.replace === true },
         );
         if (!assembledRef.current) setStreamingPhase('thinking');
         break;
@@ -1448,35 +1519,44 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         if (assembledRef.current && assembledRef.current.trim().length > 0) {
           lastSegmentStartRef.current = lastRawTextLenRef.current;
         }
-        setStatusText(getToolStatusText(toolName, data.content));
+        setStatusText(getToolStatusText(toolName));
         setStreamingPhase('tool');
         setActiveToolName(toolName);
         const toolId = 'tool-' + (++toolCounterRef.current);
         const toolArgs = data.toolArgs || undefined;
-        setMessages(prev => prev.map(m =>
-          m.id === assistantId
-            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: toolId, name: toolName, arguments: toolArgs, startedAt: Date.now(), status: 'running' as const }] }
-            : m
-        ));
+        setMessages(prev => appendToolCallToMessage(prev, assistantId, buildRunningToolCall({
+          id: toolId,
+          name: toolName,
+          arguments: toolArgs,
+        })).messages as ChatMessage[]);
+        break;
+      }
+      case 'tool_update': {
+        const toolName = resolveToolName(data.toolName, data.name, data.content, 'tool');
+        const toolResult = data.toolResult || data.content || '';
+        hasRealToolEventsRef.current = true;
+        setStreamingPhase('tool');
+        setActiveToolName(toolName);
+        setStatusText(getToolStatusText(toolName));
+        setMessages(prev => updateRunningToolCallInMessage(prev, assistantId, {
+          toolCallId: data.toolCallId,
+          toolName,
+          result: typeof toolResult === 'string' ? toolResult : String(toolResult),
+        }).messages as ChatMessage[]);
         break;
       }
       case 'tool_end': {
         lastSegmentStartRef.current = lastRawTextLenRef.current;
         const toolResult = data.toolResult || data.content || 'Completed';
         let nextRunningToolName: string | null = null;
-        setMessages(prev => prev.map(m => {
-          if (m.id !== assistantId) return m;
-          const calls = [...(m.toolCalls || [])];
-          for (let i = calls.length - 1; i >= 0; i--) {
-            if (calls[i].status === 'running') {
-              calls[i] = { ...calls[i], endedAt: Date.now(), result: toolResult, status: 'done' };
-              break;
-            }
-          }
-          const nextRunningTool = getLastRunningToolCall(calls);
-          nextRunningToolName = nextRunningTool ? resolveToolName(nextRunningTool.name) : null;
-          return { ...m, toolCalls: calls };
-        }));
+        setMessages(prev => {
+          const projection = finishRunningToolCallInMessage(prev, assistantId, {
+            result: String(toolResult),
+            status: data.status,
+          });
+          nextRunningToolName = projection.nextRunningToolName ? resolveToolName(projection.nextRunningToolName) : null;
+          return projection.messages as ChatMessage[];
+        });
         if (nextRunningToolName) {
           setStreamingPhase('tool');
           setActiveToolName(nextRunningToolName);
@@ -1492,18 +1572,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         if (hasRealToolEventsRef.current) break;
         const tn = resolveToolName(data.toolName, data.name, data.content, 'tool');
         setMessages(prev => {
-          const exists = prev.some(m =>
-            m.role === 'assistant' && (m.toolCalls || []).some(
-              tc => tc.status === 'done' && tc.name === tn && tc.endedAt && (Date.now() - tc.endedAt < 5000)
-            )
-          );
-          if (exists) return prev;
           const tid = 'tool-' + (++toolCounterRef.current);
           const now = Date.now();
-          return prev.map(m => m.id === assistantId
-            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: tid, name: tn, startedAt: now - 1000, endedAt: now, status: 'done' as const }] }
-            : m
-          );
+          return appendCompletedToolCallIfMissing(prev, assistantId, buildCompletedToolCall({
+            id: tid,
+            name: tn,
+            startedAt: now - 1000,
+            endedAt: now,
+          }), { now }).messages as ChatMessage[];
         });
         setStreamingPhase('tool');
         setActiveToolName(tn);
@@ -1517,26 +1593,27 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         const toolName = resolveToolName(data.toolName, data.name, 'tool');
         setActiveToolName(toolName);
         setStatusText(getToolStatusText(toolName));
-        setMessages(prev => prev.map(m =>
-          m.id === assistantId
-            ? { ...m, toolCalls: [...(m.toolCalls || []), { id: data.id || tid, name: toolName, arguments: data.arguments, startedAt: Date.now(), status: 'running' as const }] }
-            : m
-        ));
+        setMessages(prev => appendToolCallToMessage(prev, assistantId, buildRunningToolCall({
+          id: data.id || tid,
+          name: toolName,
+          arguments: data.arguments,
+        })).messages as ChatMessage[]);
         break;
       }
       case 'toolResult': {
         lastSegmentStartRef.current = lastRawTextLenRef.current;
         const resolvedToolName = resolveToolName(data.toolName, data.name, data.content, 'tool');
         let nextRunningToolName: string | null = null;
-        setMessages(prev => prev.map(m => {
-          if (m.id !== assistantId) return m;
-          const calls = [...(m.toolCalls || [])];
-          const idx = calls.findIndex(c => c.id === data.toolCallId || c.name === resolvedToolName);
-          if (idx >= 0) calls[idx] = { ...calls[idx], endedAt: Date.now(), result: data.content, status: 'done' };
-          const nextRunningTool = getLastRunningToolCall(calls);
-          nextRunningToolName = nextRunningTool ? resolveToolName(nextRunningTool.name) : null;
-          return { ...m, toolCalls: calls };
-        }));
+        setMessages(prev => {
+          const projection = finishMatchingToolCallInMessage(prev, assistantId, {
+            toolCallId: data.toolCallId,
+            toolName: resolvedToolName,
+            result: typeof data.content === 'string' ? data.content : undefined,
+            status: data.status,
+          });
+          nextRunningToolName = projection.nextRunningToolName ? resolveToolName(projection.nextRunningToolName) : null;
+          return projection.messages as ChatMessage[];
+        });
         if (nextRunningToolName) {
           setStreamingPhase('tool');
           setActiveToolName(nextRunningToolName);
@@ -2200,11 +2277,12 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         }
         const nextModel = canonicalizePortalModelId(rawArg);
         try {
-          setSelectedModel(nextModel);
-          modelRef.current = nextModel;
-          localStorage.setItem(`agent-model-${projectName}`, nextModel);
-          await client.post(`/projects/${encodeURIComponent(projectName)}/assistant/ensure-session`, { model: nextModel });
-          appendSystemMessage(`Model switched to ${nextModel}`);
+          const { data } = await client.post(`/projects/${encodeURIComponent(projectName)}/assistant/ensure-session`, { model: nextModel });
+          const resolvedModel = canonicalizePortalModelId(String(data?.model || nextModel));
+          setSelectedModel(resolvedModel);
+          modelRef.current = resolvedModel;
+          localStorage.setItem(`agent-model-${projectName}`, resolvedModel);
+          appendSystemMessage(data?.modelWarning || `Model switched to ${resolvedModel}`);
         } catch (err: any) {
           appendSystemMessage(`Failed to switch model to ${nextModel}: ${err?.response?.data?.error || err?.message || 'Unknown error'}`);
         }
@@ -2254,7 +2332,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     // Patch the session model only for an actual user-initiated model change.
     if (sessionKeyRef.current) {
       try {
-        await client.post(`/projects/${projectName}/assistant/ensure-session`, { model: normalizedModel });
+        const { data } = await client.post(`/projects/${projectName}/assistant/ensure-session`, { model: normalizedModel });
+        const resolvedModel = canonicalizePortalModelId(String(data?.model || normalizedModel));
+        setSelectedModel(resolvedModel);
+        modelRef.current = resolvedModel;
       } catch {}
     }
   }, [projectName]);
@@ -2272,6 +2353,18 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       setThinkingPending(false);
     }
   }, []);
+
+  const handleReasoningVisibilityChange = useCallback(async (nextLevel: ReasoningVisibility) => {
+    const sk = sessionKeyRef.current;
+    if (!sk) return;
+    setReasoningVisibility(nextLevel);
+    try {
+      await gatewayAPI.patchSession(sk, { reasoning: nextLevel }, 'OPENCLAW');
+    } catch (err) {
+      console.error('[ProjectChatPanel] Failed to patch reasoning visibility:', err);
+      appendSystemNotice('Failed to update reasoning visibility.');
+    }
+  }, [appendSystemNotice]);
 
   const handleFastModeToggle = useCallback(async () => {
     const sk = sessionKeyRef.current;
@@ -2405,6 +2498,29 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                   {thinkingPending && <span className="ml-2 text-slate-500">Saving…</span>}
                 </div>
               </div>
+              <div className="mb-3 rounded-lg border border-white/6 bg-black/20 px-2 py-2">
+                <div className="flex items-center gap-2 mb-2">
+                  <MessageSquare size={12} className={reasoningVisibility !== 'off' ? 'text-cyan-300' : 'text-slate-500'} />
+                  <div>
+                    <div className="text-[11px] font-medium text-white">Reasoning Visibility</div>
+                    <div className="text-[10px] text-slate-500">Shows readable OpenClaw reasoning summaries when the provider exposes them.</div>
+                  </div>
+                </div>
+                <select
+                  value={reasoningVisibility}
+                  onChange={(e) => { void handleReasoningVisibilityChange(e.target.value as ReasoningVisibility); }}
+                  disabled={!sessionKey}
+                  className="w-full rounded-lg border border-white/10 bg-[#111735] px-2 py-1.5 text-[11px] text-slate-200 disabled:opacity-50"
+                >
+                  <option value="off">Hidden</option>
+                  <option value="on">Visible / persistent</option>
+                  <option value="stream">Stream when supported</option>
+                </select>
+                <div className="mt-1 text-[10px] text-slate-400">
+                  Current: <span className="font-semibold uppercase text-cyan-300">{REASONING_VISIBILITY_LABELS[reasoningVisibility]}</span>
+                </div>
+              </div>
+
               {(supportsOpenClawFastModeModel(selectedModel) || fastModeEnabled) && (
                 <div className="mb-3 rounded-lg border border-white/6 bg-black/20 px-2 py-2">
                   <div className="flex items-center justify-between gap-2">
@@ -2556,16 +2672,21 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                   || !!activeToolName
                   || !!statusText
                 );
-                const visibleContent = suppressCurrentBubbleText ? '' : msg.content;
+                const rawVisibleContent = suppressCurrentBubbleText ? '' : msg.content;
                 const visibleThinkingContent = (isCurrentlyStreaming && thinkingContent.trim())
                   ? thinkingContent
                   : (msg.thinkingContent || '');
                 const hasThinkingContent = !!visibleThinkingContent.trim();
-                const hasContent = !!visibleContent;
+                const liveStatusPlaceholder = isCurrentlyStreaming && !rawVisibleContent.trim() && !hasThinkingContent
+                  ? String(statusText || (activeToolName ? getToolStatusText(activeToolName) : '') || '').trim()
+                  : '';
+                const visibleContent = rawVisibleContent || liveStatusPlaceholder;
+                const hasContent = !!visibleContent.trim();
+                const hasAssistantContent = !!rawVisibleContent.trim();
                 const modelLabel = msg.model ? modelDisplayName(msg.model) : '';
                 const timeLabel = msg.createdAt ? msg.createdAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
                 const showMessageBubble = hasContent || (isCurrentlyStreaming && !hasThinkingContent);
-                const showMeta = hasThinkingContent || hasContent || toolCalls.length > 0;
+                const showMeta = hasThinkingContent || hasAssistantContent || toolCalls.length > 0;
 
                 return (
                   <div key={msg.id} className="px-3 py-1.5 group">
@@ -2599,18 +2720,18 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                           {showMessageBubble && (
                             <div
                               className={`rounded-2xl rounded-bl-sm px-3 py-2 transition-all duration-500 ${
-                                hasContent && visibleContent.startsWith('⚠️')
+                                rawVisibleContent && visibleContent.startsWith('⚠️')
                                   ? 'bg-red-500/10 border border-red-500/20'
                                   : isCurrentlyStreaming
                                     ? 'border border-dashed bg-[var(--accent-bg-subtle)]'
                                     : 'bg-white/[0.06] border border-solid border-white/[0.08]'
                               }`}
-                              style={isCurrentlyStreaming && !(hasContent && visibleContent.startsWith('⚠️'))
+                              style={isCurrentlyStreaming && !(rawVisibleContent && visibleContent.startsWith('⚠️'))
                                 ? { borderColor: 'var(--accent-border-hover)', boxShadow: '0 0 12px var(--accent-shadow), inset 0 0 0 1px var(--accent-bg)' }
                                 : undefined
                               }
                             >
-                              {hasContent && visibleContent.startsWith('⚠️') ? (
+                              {rawVisibleContent && visibleContent.startsWith('⚠️') ? (
                                 <div className="flex items-start gap-1.5">
                                   <XCircle size={12} className="text-red-400 flex-shrink-0 mt-0.5" />
                                   <div className="text-[11px] text-red-300">{visibleContent.replace(/^⚠️\s*/, '')}</div>
@@ -2629,7 +2750,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                               {modelLabel ? <span className="text-[10px] text-slate-500 truncate">• {modelLabel}</span> : null}
                               {timeLabel ? <span className="text-[10px] text-slate-600 truncate">• {timeLabel}</span> : null}
                               <div className="flex items-center gap-1 ml-auto opacity-0 group-hover:opacity-100 transition-opacity">
-                                {hasContent && <CopyButton text={msg.content} />}
+                                {rawVisibleContent && <CopyButton text={msg.content} />}
                               </div>
                             </div>
                           )}

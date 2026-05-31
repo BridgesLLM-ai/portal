@@ -580,9 +580,13 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
       ? process.env[envKey] + target
       : req.protocol + "://" + req.get('host') + target;
 
-    // Check managed fullstack app port as secondary
+    // Check managed fullstack app port as secondary. runningApps is keyed by
+    // deployId (`${userId}-${appName}`), not by App DB id. If the in-memory
+    // registry is unavailable but the app record still has a port, try it and
+    // let the fetch fail cleanly if the process is actually down.
     if (!process.env[envKey]) {
-      const appPort = getAppPort(link.appId);
+      const deployId = `${link.userId}-${link.app.name}`;
+      const appPort = getAppPort(deployId) || link.app.port;
       if (appPort) {
         targetUrl = `http://127.0.0.1:${appPort}${target}`;
       }
@@ -643,8 +647,20 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
     });
 
     res.status(upstream.status);
+    const skippedProxyResponseHeaders = new Set([
+      'content-encoding',
+      'content-length',
+      'transfer-encoding',
+      'connection',
+      'keep-alive',
+      'proxy-authenticate',
+      'proxy-authorization',
+      'te',
+      'trailer',
+      'upgrade',
+    ]);
     upstream.headers.forEach((value, key) => {
-      if (key.toLowerCase() === 'content-encoding') return;
+      if (skippedProxyResponseHeaders.has(key.toLowerCase())) return;
       res.setHeader(key, value);
     });
 

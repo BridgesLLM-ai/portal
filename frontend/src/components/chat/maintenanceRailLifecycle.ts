@@ -20,6 +20,7 @@ const LIFECYCLE_FLUSH_RUNNING_RE = /\b(memory flush(?:ing)?|flush in progress|fl
 const LIFECYCLE_FLUSH_DONE_RE = /\b(memory flush complete(?:d)?|durable memor(?:y|ies) (?:stored|written)|context refreshed|context maintenance (?:finished|complete(?:d)?)|compaction (?:incomplete|did not complete)|heartbeat check complete(?:d)?|heartbeat_ok)\b/i;
 const LIFECYCLE_COMPACTING_RE = /^(?:compacting context[.…]*|auto-compaction(?: started| in progress)?[.…]*|context compaction(?: started| in progress)?[.…]*|compaction (?:in progress|started)\.?)$/i;
 const LIFECYCLE_COMPACTED_RE = /^(?:context compacted\.?|auto-compaction complete(?:d)?\.?|context compaction complete(?:d)?\.?|compaction (?:complete(?:d)?|finished)\.?)$/i;
+const RAIL_RUNTIME_STATUS_RE = /^(?:thinking[.…]*|connecting directly to openclaw[.…]*|reconnecting to stream[.…]*|resuming stream[.…]*|still responding[.…]*|still working[.…]*|starting codex runtime[.…]*|codex session ready\.?|starting codex turn[.…]*|codex accepted the turn\.?|codex is writing[.…]*|codex is working[.…]*|running tool[.…]*|preparing execution hooks[.…]*|execution hooks ready\.?|waiting for command approval[.…]*|command denied|command approved|approval did not complete|approval failed(?::.*)?)$/i;
 
 function normalizeLifecycleMarker(text: string): string {
   return String(text || '').replace(/\s+/g, ' ').trim().replace(/^[^\p{L}\p{N}]+/u, '').trim();
@@ -92,8 +93,17 @@ export function defaultLifecycleStatusText(signal: LifecycleMaintenanceSignal): 
   return 'Agent is thinking…';
 }
 
+export function getRailSafeStatusText(statusText?: string | null): string | null {
+  const normalized = normalizeLifecycleMarker(String(statusText || ''));
+  if (!normalized) return null;
+  if (inferLifecycleMaintenanceSignal('', normalized) !== 'idle') return normalized;
+  if (RAIL_RUNTIME_STATUS_RE.test(normalized)) return normalized;
+  return null;
+}
+
 export function resolveMaintenanceRailStatus(data: any): MaintenanceRailResolution {
-  const nextStatusText = typeof data?.content === 'string' ? data.content : extractLifecycleStatusText(data);
+  const candidateStatusText = typeof data?.content === 'string' ? data.content : extractLifecycleStatusText(data);
+  const nextStatusText = getRailSafeStatusText(candidateStatusText);
   const lifecyclePhase = String(data?.phase || data?.status || '').toLowerCase();
   const lifecycleSignal = data?.maintenanceKind === 'maintenance'
     ? inferLifecycleMaintenanceSignal(lifecyclePhase, nextStatusText || defaultLifecycleStatusText('maintenance'))
@@ -103,9 +113,9 @@ export function resolveMaintenanceRailStatus(data: any): MaintenanceRailResoluti
     || lifecycleSignal === 'maintenance_done'
     || lifecycleSignal === 'compacting'
     || lifecycleSignal === 'compacted';
-  const displayStatusText = nextStatusText || (isMaintenanceStatus
-    ? defaultLifecycleStatusText(lifecycleSignal === 'idle' ? 'maintenance' : lifecycleSignal)
-    : null);
+  const displayStatusText = isMaintenanceStatus
+    ? (nextStatusText || defaultLifecycleStatusText(lifecycleSignal === 'idle' ? 'maintenance' : lifecycleSignal))
+    : null;
 
   let update: MaintenanceRailResolution['update'] = null;
   if (isMaintenanceStatus) {

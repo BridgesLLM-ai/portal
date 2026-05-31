@@ -73,6 +73,14 @@ case "$ACTION" in
       fi
       exit 0
     fi
+    # Honor the administrative kill-switch before spawning a detached launcher.
+    for DISABLE_FILE in /etc/bridges-shared-chrome.disabled /run/bridges-shared-chrome.disabled; do
+      if [ -e "$DISABLE_FILE" ]; then
+        echo "ERROR: Shared browser launch disabled by ${DISABLE_FILE}: $(cat "$DISABLE_FILE" 2>/dev/null || true)" >&2
+        exit 75
+      fi
+    done
+
     # Launch via the launcher script
     LAUNCHER="/usr/local/bin/bridges-rd-shared-chrome.sh"
     if [ ! -x "$LAUNCHER" ]; then

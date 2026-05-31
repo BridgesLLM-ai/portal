@@ -104,6 +104,7 @@ rsync -a \
   --exclude='*-audit-*.md' \
   --exclude='*audit*.md' \
   --exclude='OPENCLAW-CHAT-BUGS.md' \
+  --exclude='OPENCLAW-RUNTIME-TRACKER.md' \
   --exclude='ARCHITECTURE-*.md' \
   --exclude='ROADMAP-*.md' \
   --exclude='ROADMAP_*.md' \

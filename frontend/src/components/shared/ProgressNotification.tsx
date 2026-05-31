@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { CheckCircle, AlertCircle, X, ChevronDown, ChevronUp, Square } from 'lucide-react';
 import sounds from '../../utils/sounds';
+import ViewportOverlay from '../ViewportOverlay';
 
 export interface ProgressNotificationProps {
   id: string;
@@ -15,7 +16,7 @@ export interface ProgressNotificationProps {
   onDismiss: () => void;
 }
 
-export function ProgressNotification({
+function ProgressNotificationCard({
   id,
   title,
   status,
@@ -79,7 +80,7 @@ export function ProgressNotification({
       animate={{ opacity: 1, y: 0, scale: 1, x: 0 }}
       exit={{ opacity: 0, y: -20, scale: 0.9 }}
       transition={{ type: 'spring', damping: 20, stiffness: 300 }}
-      className={`fixed bottom-4 right-4 z-50 w-80 overflow-hidden rounded-2xl border backdrop-blur-xl shadow-2xl ${
+      className={`w-[min(20rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border backdrop-blur-xl shadow-2xl ${
         isError ? 'bg-red-950/80 border-red-500/30' :
         isComplete ? 'bg-emerald-950/80 border-emerald-500/30' :
         'bg-slate-900/90 border-white/10'
@@ -247,14 +248,24 @@ export function ProgressNotification({
   );
 }
 
+export function ProgressNotification(props: ProgressNotificationProps) {
+  return (
+    <ViewportOverlay anchor="bottom-right" zIndex={1200} className="flex flex-col items-end overflow-y-auto overscroll-contain pr-1">
+      <ProgressNotificationCard {...props} />
+    </ViewportOverlay>
+  );
+}
+
 // Container for multiple notifications
 export function ProgressNotificationContainer({ 
   notifications 
 }: { 
   notifications: ProgressNotificationProps[] 
 }) {
+  if (notifications.length === 0) return null;
+
   return (
-    <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-3">
+    <ViewportOverlay anchor="bottom-right" zIndex={1200} className="flex flex-col items-end gap-3 overflow-y-auto overscroll-contain pr-1">
       <AnimatePresence mode="popLayout">
         {notifications.map((notif, index) => (
           <motion.div
@@ -264,11 +275,11 @@ export function ProgressNotificationContainer({
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, scale: 0.9 }}
           >
-            <ProgressNotification {...notif} />
+            <ProgressNotificationCard {...notif} />
           </motion.div>
         ))}
       </AnimatePresence>
-    </div>
+    </ViewportOverlay>
   );
 }
 

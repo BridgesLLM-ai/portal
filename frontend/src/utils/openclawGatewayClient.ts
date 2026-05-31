@@ -29,7 +29,7 @@ export interface GatewayEventPayload {
   errorMessage?: string;
   // Agent events (tool calls, etc.)
   seq?: number;
-  stream?: 'tool' | 'item' | 'compaction' | 'lifecycle';
+  stream?: 'assistant' | 'tool' | 'item' | 'thinking' | 'compaction' | 'lifecycle';
   ts?: number;
   data?: {
     phase?: 'start' | 'update' | 'result' | 'end';
@@ -100,6 +100,12 @@ interface PendingRequest {
 const REQUEST_TIMEOUT_MS = 30000;
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000];
 
+const DEBUG_GATEWAY_CLIENT = import.meta.env.DEV;
+const debugGatewayClient = (...args: unknown[]) => {
+  if (DEBUG_GATEWAY_CLIENT) console.debug('[OpenClawGatewayClient]', ...args);
+};
+
+
 export class OpenClawGatewayClient {
   private ws: WebSocket | null = null;
   private requestId = 0;
@@ -166,7 +172,7 @@ export class OpenClawGatewayClient {
     }
 
     this.ws.onopen = () => {
-      console.log('[OpenClawGatewayClient] WebSocket connected, waiting for challenge...');
+      debugGatewayClient('WebSocket connected, waiting for challenge...');
       this.connected = true;
       this.startPing();
       this.sendReconnectFrame();
@@ -188,7 +194,7 @@ export class OpenClawGatewayClient {
     };
 
     this.ws.onclose = (event) => {
-      console.log('[OpenClawGatewayClient] WebSocket closed:', event.code, event.reason);
+      debugGatewayClient('WebSocket closed:', event.code, event.reason);
       const wasAuthenticated = this.authenticated;
       this.cleanup();
 
@@ -242,7 +248,7 @@ export class OpenClawGatewayClient {
     }
 
     // Handle events
-    console.log('[GatewayClient] 📨 msg type:', msg.type, 'event:', msg.event, 'state:', msg.payload?.state);
+    debugGatewayClient('message', { type: msg.type, event: msg.event, state: msg.payload?.state });
     if (msg.type === 'event') {
       if (msg.event === 'connect.challenge') {
         // Gateway sends a challenge nonce — we need to send 'connect' with it
@@ -285,20 +291,20 @@ export class OpenClawGatewayClient {
     // The proxy will intercept this and inject the auth token
     this.request<{ protocol: number }>('connect', connectParams)
       .then((result) => {
-        console.log('[OpenClawGatewayClient] Connected with protocol:', result.protocol);
+        debugGatewayClient('Connected with protocol:', result.protocol);
         this.authenticated = true;
         void this.subscribeSessions().catch((error) => {
-          console.warn('[OpenClawGatewayClient] sessions.subscribe failed:', error);
+          debugGatewayClient('sessions.subscribe failed:', error);
         });
         if (this.currentSessionKey) {
           void this.subscribeSession(this.currentSessionKey).catch((error) => {
-            console.warn('[OpenClawGatewayClient] Failed to subscribe current session:', error);
+            debugGatewayClient('Failed to subscribe current session:', error);
           });
         }
         this.sendReconnectFrame();
         if (this.reconnecting && this.activeRunSessionKey) {
           void this.subscribeSession(this.activeRunSessionKey).catch((error) => {
-            console.warn('[OpenClawGatewayClient] Failed to re-subscribe after reconnect:', error);
+            debugGatewayClient('Failed to re-subscribe after reconnect:', error);
           });
         }
         this.reconnectAttempt = 0;
@@ -362,7 +368,7 @@ export class OpenClawGatewayClient {
     const attemptLabel = Number.isFinite(maxReconnectAttempts)
       ? `${this.reconnectAttempt}/${maxReconnectAttempts}`
       : `${this.reconnectAttempt}/∞`;
-    console.log(`[OpenClawGatewayClient] Reconnecting in ${delay}ms (attempt ${attemptLabel})`);
+    debugGatewayClient(`Reconnecting in ${delay}ms (attempt ${attemptLabel})`);
     this.onReconnecting?.(this.reconnectAttempt, delay);
 
     this.reconnectTimer = setTimeout(() => {
@@ -395,19 +401,36 @@ export class OpenClawGatewayClient {
 
   requestStreamResume(sessionKey?: string | null): void {
     if (typeof sessionKey === 'string' && sessionKey.trim()) {
-      this.activeRunSessionKey = sessionKey.trim();
+      const key = sessionKey.trim();
+      this.activeRunSessionKey = key;
+      void this.subscribeSession(key).catch((error) => {
+        debugGatewayClient('Failed to subscribe resumed session:', error);
+      });
     }
   }
 
   setCurrentSession(sessionKey: string | null): void {
-    this.currentSessionKey = sessionKey;
-    if (!sessionKey && this.activeRunSessionKey) {
+    const key = typeof sessionKey === 'string' && sessionKey.trim() ? sessionKey.trim() : null;
+    this.currentSessionKey = key;
+    if (!key && this.activeRunSessionKey) {
       this.activeRunSessionKey = null;
+      return;
+    }
+    if (key) {
+      void this.subscribeSession(key).catch((error) => {
+        debugGatewayClient('Failed to subscribe current session:', error);
+      });
     }
   }
 
   setActiveStreamSession(sessionKey: string | null): void {
-    this.activeRunSessionKey = sessionKey;
+    const key = typeof sessionKey === 'string' && sessionKey.trim() ? sessionKey.trim() : null;
+    this.activeRunSessionKey = key;
+    if (key) {
+      void this.subscribeSession(key).catch((error) => {
+        debugGatewayClient('Failed to subscribe active stream session:', error);
+      });
+    }
   }
 
   /**
@@ -451,6 +474,7 @@ export class OpenClawGatewayClient {
   async sendMessage(sessionKey: string, message: string): Promise<string | null> {
     this.currentSessionKey = sessionKey;
     this.activeRunSessionKey = sessionKey;
+    await this.subscribeSession(sessionKey);
     const idempotencyKey = clientRandomId();
     const sessionId = this.sessionIdsByKey.get(sessionKey);
 
@@ -489,6 +513,7 @@ export class OpenClawGatewayClient {
   async steerSession(sessionKey: string, message: string): Promise<{ runId: string | null; interruptedActiveRun: boolean }> {
     this.currentSessionKey = sessionKey;
     this.activeRunSessionKey = sessionKey;
+    await this.subscribeSession(sessionKey);
     const idempotencyKey = clientRandomId();
 
     const result = await this.request<{ runId?: string; interruptedActiveRun?: boolean }>('sessions.steer', {
@@ -508,6 +533,9 @@ export class OpenClawGatewayClient {
    */
   async loadHistory(sessionKey: string, limit = 200): Promise<GatewayHistoryResponse> {
     this.currentSessionKey = sessionKey;
+    void this.subscribeSession(sessionKey).catch((error) => {
+      debugGatewayClient('Failed to subscribe history session:', error);
+    });
     const result = await this.request<{ messages: GatewayChatMessage[]; sessionId?: string; thinkingLevel?: string }>('chat.history', {
       sessionKey,
       limit,
@@ -554,7 +582,7 @@ export class OpenClawGatewayClient {
     } catch (error) {
       // Older gateways may not expose per-session message subscriptions. The
       // broad sessions.subscribe channel still gives us session/change events.
-      console.warn('[OpenClawGatewayClient] sessions.messages.subscribe failed:', error);
+      debugGatewayClient('sessions.messages.subscribe failed:', error);
     }
   }
 
