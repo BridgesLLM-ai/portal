@@ -180,10 +180,13 @@ describe('gateway history readers', () => {
         seq,
         ts,
         visible: true,
-        source: { transport: 'portal-stream-event-bus', eventType: type === 'assistant_reasoning' ? 'thinking' : 'text' },
+        source: { transport: 'portal-stream-event-bus', eventType: type === 'assistant_reasoning' ? 'thinking' : (type === 'assistant_status' ? 'status' : 'text') },
         ...extra,
       });
 
+      recordRuntimeTurnEvent(sessionKey, event('assistant_status', 0, Date.parse('2026-05-30T04:00:00.500Z'), {
+        text: 'Starting Codex turn...',
+      }));
       recordRuntimeTurnEvent(sessionKey, event('assistant_reasoning', 1, Date.parse('2026-05-30T04:00:01.000Z'), {
         text: 'I need to inspect the file first.',
         replace: true,
@@ -208,6 +211,7 @@ describe('gateway history readers', () => {
 
       expect(assistant).toBeTruthy();
       expect(assistant.segments.map((segment: any) => segment.text)).toEqual([
+        'Starting Codex turn...',
         'I need to inspect the file first.',
         'Now I can answer with the verified detail.',
       ]);

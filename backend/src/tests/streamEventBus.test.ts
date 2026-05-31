@@ -91,6 +91,20 @@ describe('StreamEventBus', () => {
     expect(status?.statusText).toBe('Preparing context maintenance…');
   });
 
+  test('shows delayed Codex completion as recoverable status instead of hiding it', () => {
+    const bus = new StreamEventBus();
+    const sessionKey = 'agent:main:codex-idle-timeout-test';
+
+    bus.startStream(sessionKey, 'run-1');
+    bus.publish(sessionKey, {
+      type: 'status',
+      content: 'Codex turn completion is delayed; waiting for the final response…',
+    });
+
+    const status = bus.getStreamStatus(sessionKey);
+    expect(status?.statusText).toBe('Codex turn completion is delayed; waiting for the final response…');
+  });
+
   test('attaches normalized runtime turn events to outbound stream events', () => {
     const bus = new StreamEventBus();
     const sessionKey = 'agent:main:turn-event-test';

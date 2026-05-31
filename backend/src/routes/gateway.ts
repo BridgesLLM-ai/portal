@@ -1417,6 +1417,7 @@ type RuntimeHistorySegment = {
   text: string;
   position: 'before' | 'after' | 'between';
   kind: 'thinking' | 'text';
+  source?: 'status' | 'reasoning' | 'text';
   ts: number;
   order: number;
 };
@@ -1463,11 +1464,15 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
     let provenance: string | undefined;
     let lastTs = 0;
 
-    const appendSegment = (kind: 'thinking' | 'text', text: string, ts: number, replace?: boolean) => {
+    const appendSegment = (kind: 'thinking' | 'text', text: string, ts: number, replace?: boolean, source: RuntimeHistorySegment['source'] = kind === 'thinking' ? 'reasoning' : 'text') => {
       const value = sanitizeHistoryText(text || '');
       if (!value || isHiddenHistoryArtifactText(value)) return;
       const last = timeline[timeline.length - 1];
-      if (replace && last?.kind === 'segment' && last.segment.kind === kind) {
+      if (last?.kind === 'segment' && last.segment.kind === kind && last.segment.source === source && last.segment.text === value) {
+        last.segment.ts = ts;
+        return;
+      }
+      if (replace && last?.kind === 'segment' && last.segment.kind === kind && last.segment.source === source) {
         last.segment.text = value;
         last.segment.ts = ts;
         return;
@@ -1478,6 +1483,7 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
           text: value,
           position: 'before',
           kind,
+          source,
           ts,
           order: timeline.length,
         },
@@ -1524,8 +1530,10 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
       if (typeof event.model === 'string' && event.model.trim()) model = event.model.trim();
       if (typeof event.provenance === 'string' && event.provenance.trim()) provenance = event.provenance.trim();
 
-      if (event.type === 'assistant_reasoning') {
-        appendSegment('thinking', event.text || '', event.ts, event.replace === true);
+      if (event.type === 'assistant_status') {
+        if (event.visible && event.text) appendSegment('thinking', event.text, event.ts, event.replace === true, 'status');
+      } else if (event.type === 'assistant_reasoning') {
+        appendSegment('thinking', event.text || '', event.ts, event.replace === true, 'reasoning');
       } else if (event.type === 'tool_started' || event.type === 'tool_output') {
         upsertTool(event);
       } else if (event.type === 'assistant_delta') {

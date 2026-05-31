@@ -13,6 +13,7 @@ import {
   AlertTriangle, MemoryStick,
   ArrowDown, ArrowUp, RefreshCw,
   Gauge, Layers, Timer, Loader2,
+  ShieldAlert, Wrench,
 } from 'lucide-react';
 
 const LazyDashboardCharts = lazy(() => import('../components/dashboard/DashboardCharts'));
@@ -34,6 +35,63 @@ type OpenClawVersionStatus = {
   lightweight?: boolean;
   checkedAt?: string;
 };
+
+type MaintenanceSeverity = 'healthy' | 'info' | 'warning' | 'critical';
+type MaintenanceAction = {
+  id: string;
+  label: string;
+  description: string;
+  risk: 'safe' | 'scheduled' | 'manual';
+  downtimeExpected: boolean;
+  requiresOwner: boolean;
+};
+type MaintenanceIssue = {
+  id: string;
+  title: string;
+  detail: string;
+  severity: Exclude<MaintenanceSeverity, 'healthy'>;
+  category: 'security' | 'updates' | 'services' | 'disk' | 'backups' | 'system';
+  recommendation: string;
+  actionId?: string;
+  downtimeExpected?: boolean;
+  automationSafe: boolean;
+};
+type MaintenanceCompatibility = {
+  policy: 'guarded';
+  summary: string;
+  components: Array<{
+    id: string;
+    label: string;
+    installedVersion: string | null;
+    supportedVersion: string;
+    policy: 'self-update-only' | 'known-compatible' | 'manual-review' | 'blocked-until-confirmed';
+    status: 'ok' | 'review' | 'blocked' | 'unknown';
+    note: string;
+  }>;
+};
+type MaintenanceStatus = {
+  checkedAt: string;
+  status: MaintenanceSeverity;
+  summary: string;
+  host: { hostname: string; os: string; kernel: string; uptimeSeconds: number };
+  issues: MaintenanceIssue[];
+  actions: MaintenanceAction[];
+  reboot?: { required: boolean; packages: string[] };
+  compatibility?: MaintenanceCompatibility;
+};
+
+const MAINTENANCE_DISMISS_KEY = 'dashboard-maintenance-dismissed-signature';
+
+function maintenanceDismissSignature(status: MaintenanceStatus): string {
+  const issues = [...(status.issues || [])]
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map((issue) => `${issue.id}:${issue.severity}:${issue.actionId || ''}:${issue.detail}`)
+    .join('|');
+  const compatibility = status.compatibility?.components
+    .map((component) => `${component.id}:${component.status}:${component.installedVersion || ''}`)
+    .join('|') || '';
+  return `${status.status}::${issues}::${compatibility}`;
+}
 
 /* ─── helpers ──────────────────────────────────────────── */
 
@@ -71,6 +129,20 @@ function statusBg(v: number): string {
   if (v < 50) return 'bg-emerald-500';
   if (v < 80) return 'bg-amber-500';
   return 'bg-red-500';
+}
+
+function maintenanceTone(status: MaintenanceSeverity): string {
+  if (status === 'critical') return 'border-red-500/30 bg-red-500/10 text-red-100';
+  if (status === 'warning') return 'border-amber-500/30 bg-amber-500/10 text-amber-100';
+  if (status === 'info') return 'border-cyan-500/25 bg-cyan-500/10 text-cyan-100';
+  return 'border-emerald-500/20 bg-emerald-500/10 text-emerald-100';
+}
+
+function maintenanceDot(status: MaintenanceSeverity): string {
+  if (status === 'critical') return 'bg-red-400';
+  if (status === 'warning') return 'bg-amber-400';
+  if (status === 'info') return 'bg-cyan-400';
+  return 'bg-emerald-400';
 }
 
 /* ─── animation variants ───────────────────────────────── */
@@ -210,6 +282,14 @@ export default function DashboardPage() {
   const [openClawStatus, setOpenClawStatus] = useState<'checking' | 'connected' | 'misconfigured' | 'offline'>('checking');
   const [openClawIssues, setOpenClawIssues] = useState<string[]>([]);
   const [openClawVersion, setOpenClawVersion] = useState<OpenClawVersionStatus | null>(null);
+  const [maintenanceStatus, setMaintenanceStatus] = useState<MaintenanceStatus | null>(null);
+  const [maintenanceDismissedSignature, setMaintenanceDismissedSignature] = useState(() => {
+    try {
+      return localStorage.getItem(MAINTENANCE_DISMISS_KEY) || '';
+    } catch {
+      return '';
+    }
+  });
   const [reconnecting, setReconnecting] = useState(false);
   const [restartingGateway, setRestartingGateway] = useState(false);
   const [showCharts, setShowCharts] = useState(false);
@@ -343,7 +423,7 @@ export default function DashboardPage() {
     let forceProbeTimer: number | undefined;
     const timer = window.setTimeout(async () => {
       try {
-        const [al, upd, gateway] = await Promise.all([
+        const [al, upd, gateway, maintenance] = await Promise.all([
           alertsAPI.list({ limit: 10, severity: 'CRITICAL' }).catch(() => ({ alerts: [], total: 0 })),
           (canRunSelfUpdate
             ? client.post('/admin/check-updates', {}, { _silent: true } as any).then(r => r.data).catch(() =>
@@ -351,9 +431,11 @@ export default function DashboardPage() {
               )
             : client.get('/admin/update-status', { _silent: true } as any).then(r => r.data).catch(() => null)),
           client.get('/gateway/health', { _silent: true } as any).then(r => r.data).catch(() => null),
+          client.get('/system/maintenance', { _silent: true } as any).then(r => r.data).catch(() => null),
         ]);
         if (cancelled) return;
         applyGatewayHealth(gateway);
+        if (maintenance) setMaintenanceStatus(maintenance);
         if (needsForcedGatewayVersionProbe(gateway)) {
           forceProbeTimer = window.setTimeout(async () => {
             try {
@@ -463,12 +545,25 @@ export default function DashboardPage() {
   const loadAvg = systemStats ? [systemStats.loadAverage['1min'], systemStats.loadAverage['5min'], systemStats.loadAverage['15min']] : (metrics?.loadAverage || []);
 
   const showUpdateBanner = Boolean(updateStatus?.updateAvailable && updateStatus.latest && !updateBannerDismissed);
+  const visibleMaintenanceIssues = maintenanceStatus?.issues?.slice(0, 5) || [];
+  const maintenanceSignature = useMemo(() => (
+    maintenanceStatus ? maintenanceDismissSignature(maintenanceStatus) : ''
+  ), [maintenanceStatus]);
+  const showMaintenanceBanner = Boolean(maintenanceStatus && maintenanceSignature !== maintenanceDismissedSignature);
 
   const dismissUpdateBanner = () => {
     if (updateStatus?.latest) {
       localStorage.setItem(`dashboard-update-dismissed:${updateStatus.latest}`, 'true');
     }
     setUpdateBannerDismissed(true);
+  };
+
+  const dismissMaintenanceBanner = () => {
+    if (!maintenanceSignature) return;
+    try {
+      localStorage.setItem(MAINTENANCE_DISMISS_KEY, maintenanceSignature);
+    } catch {}
+    setMaintenanceDismissedSignature(maintenanceSignature);
   };
 
   const restartOpenClawGateway = useCallback(async () => {
@@ -605,6 +700,107 @@ export default function DashboardPage() {
               </button>
             </div>
           </div>
+        </motion.div>
+      )}
+
+      {showMaintenanceBanner && maintenanceStatus && (
+        <motion.div
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className={`rounded-2xl border p-5 backdrop-blur-xl ${maintenanceTone(maintenanceStatus.status)}`}
+        >
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                {maintenanceStatus.status === 'healthy' ? <ShieldAlert size={18} className="text-emerald-300" /> : <AlertTriangle size={18} />}
+                <p className="text-sm font-semibold">
+                  {maintenanceStatus.status === 'healthy' ? 'Maintenance healthy' : 'Server maintenance needs attention'}
+                </p>
+                <span className={`h-2 w-2 rounded-full ${maintenanceDot(maintenanceStatus.status)}`} />
+              </div>
+              <p className="mt-1 text-sm text-slate-300">{maintenanceStatus.summary}</p>
+              <p className="mt-1 text-xs text-slate-500">
+                {maintenanceStatus.host.os} · kernel {maintenanceStatus.host.kernel} · checked {new Date(maintenanceStatus.checkedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <a
+                href="/admin?tab=maintenance"
+                className="inline-flex items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-100 transition hover:bg-white/10"
+              >
+                <Wrench size={15} />
+                Admin Maintenance
+              </a>
+              <button
+                onClick={dismissMaintenanceBanner}
+                className="inline-flex items-center justify-center rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+
+          {maintenanceStatus.compatibility && (
+            <div className="mt-4 rounded-xl border border-amber-400/15 bg-amber-500/[0.04] p-3">
+              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-amber-100">Compatibility guarded</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-300">{maintenanceStatus.compatibility.summary}</p>
+                </div>
+                <a
+                  href="/admin?tab=maintenance"
+                  className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-slate-100 transition hover:bg-white/10"
+                >
+                  <Wrench size={13} />
+                  Open Admin
+                </a>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {maintenanceStatus.compatibility.components
+                  .filter((component) => component.status === 'blocked' || component.status === 'review')
+                  .slice(0, 3)
+                  .map((component) => (
+                    <span key={component.id} className="rounded-lg border border-white/10 bg-black/15 px-2.5 py-1 text-[11px] text-slate-200" title={component.note}>
+                      {component.label}: {component.status === 'blocked' ? 'blocked pending confirmation' : 'review before upgrade'}
+                    </span>
+                  ))}
+              </div>
+            </div>
+          )}
+
+          {visibleMaintenanceIssues.length > 0 && (
+            <div className="mt-4 grid gap-3 lg:grid-cols-2">
+              {visibleMaintenanceIssues.map((issue) => {
+                const action = maintenanceStatus.actions.find((candidate) => candidate.id === issue.actionId);
+                return (
+                  <div key={issue.id} className="rounded-xl border border-white/10 bg-black/15 p-3">
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className={`rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                            issue.severity === 'critical' ? 'bg-red-500/20 text-red-200'
+                            : issue.severity === 'warning' ? 'bg-amber-500/20 text-amber-200'
+                            : 'bg-cyan-500/20 text-cyan-200'
+                          }`}>
+                            {issue.severity}
+                          </span>
+                          <p className="text-sm font-medium text-white">{issue.title}</p>
+                        </div>
+                        <p className="mt-1 text-xs leading-5 text-slate-300">{issue.detail}</p>
+                        <p className="mt-1 text-xs leading-5 text-slate-400">{issue.recommendation}</p>
+                        {issue.downtimeExpected && <p className="mt-1 text-xs text-red-200">Downtime expected. Schedule a maintenance window.</p>}
+                      </div>
+                      {action ? (
+                        <span className="shrink-0 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-300" title={action.description}>
+                          Action in Admin
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </motion.div>
       )}
 

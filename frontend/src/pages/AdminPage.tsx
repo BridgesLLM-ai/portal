@@ -1,23 +1,80 @@
 import { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAuthStore } from '../contexts/AuthContext';
 import { adminAPI, AdminUser, RegistrationRequest } from '../api/admin';
+import client from '../api/client';
+import { agentJobsAPI, type AgentJob } from '../api/agentJobs';
 import { isElevated, isOwner } from '../utils/authz';
 import {
   Shield, Users, Clock, Settings, Trash2, Check, X,
-  ChevronLeft, ChevronRight, Search, Loader2
+  ChevronLeft, ChevronRight, Search, Loader2, ListTodo, Wrench, ClipboardCheck,
+  AlertTriangle, RefreshCw, Play, HardDrive, ShieldCheck
 } from 'lucide-react';
 import sounds from '../utils/sounds';
 import { DEFAULT_REGISTRATION_MODE } from '../utils/securityDefaults';
 
-type Tab = 'users' | 'pending' | 'settings';
+type Tab = 'users' | 'maintenance' | 'pending' | 'settings';
+type MaintenanceSeverity = 'healthy' | 'info' | 'warning' | 'critical';
+type MaintenanceAction = {
+  id: string;
+  label: string;
+  description: string;
+  risk: 'safe' | 'scheduled' | 'manual';
+  downtimeExpected: boolean;
+  requiresOwner: boolean;
+  changesSystem: boolean;
+  destructive: boolean;
+  requiresBackup: boolean;
+  requiresMaintenanceWindow: boolean;
+  automationLevel: 'read-only' | 'safe' | 'guarded' | 'manual';
+  impact: string;
+  recovery: string;
+};
+type MaintenanceIssue = {
+  id: string;
+  title: string;
+  detail: string;
+  severity: Exclude<MaintenanceSeverity, 'healthy'>;
+  category: 'security' | 'updates' | 'services' | 'disk' | 'backups' | 'system';
+  recommendation: string;
+  actionId?: string;
+  downtimeExpected?: boolean;
+  automationSafe: boolean;
+};
+type MaintenanceCompatibilityComponent = {
+  id: string;
+  label: string;
+  installedVersion: string | null;
+  supportedVersion: string;
+  policy: 'self-update-only' | 'known-compatible' | 'manual-review' | 'blocked-until-confirmed';
+  status: 'ok' | 'review' | 'blocked' | 'unknown';
+  note: string;
+};
+type MaintenanceStatus = {
+  checkedAt: string;
+  status: MaintenanceSeverity;
+  summary: string;
+  host: { hostname: string; os: string; kernel: string; uptimeSeconds: number };
+  issues: MaintenanceIssue[];
+  actions: MaintenanceAction[];
+  compatibility?: {
+    policy: 'guarded';
+    summary: string;
+    components: MaintenanceCompatibilityComponent[];
+  };
+  backup?: { path: string; createdAt: string; ageHours: number } | null;
+  reboot?: { required: boolean; packages: string[] };
+};
 
 export default function AdminPage() {
   const { user } = useAuthStore();
   const navigate = useNavigate();
-  const [activeTab, setActiveTab] = useState<Tab>('users');
+  const [searchParams, setSearchParams] = useSearchParams();
   const owner = isOwner(user);
+  const requestedTab = searchParams.get('tab');
+  const initialTab: Tab = requestedTab === 'maintenance' || requestedTab === 'pending' || requestedTab === 'settings' ? requestedTab : 'users';
+  const [activeTab, setActiveTab] = useState<Tab>(initialTab);
 
   useEffect(() => {
     if (user && !isElevated(user)) {
@@ -25,10 +82,25 @@ export default function AdminPage() {
     }
   }, [user, navigate]);
 
+  useEffect(() => {
+    if (user && !owner && (activeTab === 'pending' || activeTab === 'settings')) {
+      setActiveTab('users');
+      setSearchParams({});
+    }
+  }, [activeTab, owner, setSearchParams, user]);
+
+  useEffect(() => {
+    const tab = searchParams.get('tab');
+    if (tab === 'users' || tab === 'maintenance' || tab === 'pending' || tab === 'settings') {
+      if (tab !== activeTab) setActiveTab(tab);
+    }
+  }, [activeTab, searchParams]);
+
   if (!user || !isElevated(user)) return null;
 
   const tabs: { id: Tab; label: string; icon: typeof Users }[] = [
     { id: 'users', label: 'Users', icon: Users },
+    { id: 'maintenance', label: 'Maintenance', icon: Wrench },
     ...(owner ? [{ id: 'pending' as Tab, label: 'Pending Approvals', icon: Clock }] : []),
     ...(owner ? [{ id: 'settings' as Tab, label: 'Settings', icon: Settings }] : []),
   ];
@@ -49,7 +121,10 @@ export default function AdminPage() {
         {tabs.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
-            onClick={() => setActiveTab(id)}
+            onClick={() => {
+              setActiveTab(id);
+              setSearchParams(id === 'users' ? {} : { tab: id });
+            }}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all
               ${activeTab === id
                 ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
@@ -71,10 +146,359 @@ export default function AdminPage() {
           transition={{ duration: 0.15 }}
         >
           {activeTab === 'users' && <UsersTab currentUserId={user.id} isOwner={owner} />}
+          {activeTab === 'maintenance' && <MaintenanceTab owner={owner} />}
           {activeTab === 'pending' && owner && <PendingTab />}
           {activeTab === 'settings' && owner && <SettingsTab />}
         </motion.div>
       </AnimatePresence>
+    </div>
+  );
+}
+
+function maintenanceTone(status: MaintenanceSeverity): string {
+  return status === 'critical' ? 'border-red-500/20 bg-red-500/[0.06] text-red-100'
+    : status === 'warning' ? 'border-amber-500/20 bg-amber-500/[0.06] text-amber-100'
+      : status === 'info' ? 'border-cyan-500/20 bg-cyan-500/[0.06] text-cyan-100'
+        : 'border-emerald-500/20 bg-emerald-500/[0.06] text-emerald-100';
+}
+
+function riskTone(action: MaintenanceAction): string {
+  if (action.destructive) return 'border-red-500/25 bg-red-500/10 text-red-100';
+  if (action.automationLevel === 'guarded' || action.requiresMaintenanceWindow) return 'border-amber-500/25 bg-amber-500/10 text-amber-100';
+  if (action.changesSystem) return 'border-cyan-500/25 bg-cyan-500/10 text-cyan-100';
+  return 'border-emerald-500/25 bg-emerald-500/10 text-emerald-100';
+}
+
+function jobStatusLabel(status: AgentJob['status']): string {
+  return status === 'completed' ? 'done' : status === 'error' || status === 'killed' ? 'failed' : status;
+}
+
+function MaintenanceTab({ owner }: { owner: boolean }) {
+  const [status, setStatus] = useState<MaintenanceStatus | null>(null);
+  const [jobs, setJobs] = useState<AgentJob[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [runningAction, setRunningAction] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<MaintenanceAction | null>(null);
+
+  const loadMaintenance = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [statusResult, jobsResult] = await Promise.all([
+        client.get<MaintenanceStatus>('/system/maintenance'),
+        agentJobsAPI.list().catch(() => [] as AgentJob[]),
+      ]);
+      setStatus(statusResult.data);
+      setJobs(jobsResult.filter((job) => job.toolId === 'system-maintenance').slice(0, 6));
+      setMessage(null);
+    } catch (err: any) {
+      setMessage(err.response?.data?.error || err.message || 'Failed to load maintenance status');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadMaintenance(); }, [loadMaintenance]);
+
+  const requestAction = useCallback((action: MaintenanceAction) => {
+    if (!owner) {
+      setMessage('Owner access is required to run maintenance actions.');
+      return;
+    }
+    setPendingAction(action);
+  }, [owner]);
+
+  const runAction = useCallback(async (action: MaintenanceAction) => {
+    setPendingAction(null);
+    setRunningAction(action.id);
+    setMessage(null);
+    try {
+      const { data } = await client.post(`/system/maintenance/actions/${action.id}`);
+      setMessage(data?.job?.id ? `${action.label} started. Job ${data.job.id}` : `${action.label} started.`);
+      await loadMaintenance();
+    } catch (err: any) {
+      setMessage(err.response?.data?.error || err.message || `Failed to start ${action.label}`);
+    } finally {
+      setRunningAction(null);
+    }
+  }, [loadMaintenance]);
+
+  if (loading && !status) {
+    return (
+      <div className="flex items-center gap-2 rounded-xl border border-white/5 bg-white/[0.02] p-4 text-sm text-slate-300">
+        <Loader2 size={16} className="animate-spin" />
+        Loading maintenance state...
+      </div>
+    );
+  }
+
+  const issues = status?.issues || [];
+  const actions = status?.actions || [];
+
+  return (
+    <div className="space-y-4">
+      {message && (
+        <div className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-sm text-slate-200">
+          {message}
+        </div>
+      )}
+
+      {status && (
+        <div className={`rounded-xl border p-4 ${maintenanceTone(status.status)}`}>
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <div className="flex items-center gap-2">
+                {status.status === 'healthy' ? <ShieldCheck size={18} /> : <AlertTriangle size={18} />}
+                <h2 className="text-sm font-semibold text-white">
+                  {status.status === 'healthy' ? 'Server maintenance is healthy' : 'Server maintenance needs attention'}
+                </h2>
+              </div>
+              <p className="mt-1 text-sm text-slate-200">{status.summary}</p>
+              <p className="mt-1 text-xs text-slate-400">
+                {status.host.os} · kernel {status.host.kernel} · checked {new Date(status.checkedAt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={loadMaintenance}
+                disabled={loading}
+                className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-slate-100 transition hover:bg-white/10 disabled:opacity-60"
+              >
+                <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+                Recheck
+              </button>
+              <Link
+                to="/tasks"
+                className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-slate-100 transition hover:bg-white/10"
+              >
+                <ListTodo size={14} />
+                Job History
+              </Link>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="grid gap-4 xl:grid-cols-[1.3fr_1fr]">
+        <section className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
+          <div className="flex items-center gap-2">
+            <ClipboardCheck size={17} className="text-emerald-300" />
+            <h2 className="text-sm font-semibold text-white">Open Items</h2>
+          </div>
+          <div className="mt-3 space-y-3">
+            {issues.length === 0 ? (
+              <p className="text-sm text-slate-400">No maintenance issues are currently detected.</p>
+            ) : issues.map((issue) => {
+              const action = actions.find((candidate) => candidate.id === issue.actionId);
+              return (
+                <div key={issue.id} className="rounded-xl border border-white/8 bg-black/15 p-3">
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className={`rounded-md px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                          issue.severity === 'critical' ? 'bg-red-500/20 text-red-100'
+                            : issue.severity === 'warning' ? 'bg-amber-500/20 text-amber-100'
+                              : 'bg-cyan-500/20 text-cyan-100'
+                        }`}>
+                          {issue.severity}
+                        </span>
+                        <span className="rounded-md bg-slate-700/50 px-2 py-0.5 text-[10px] uppercase tracking-wide text-slate-300">{issue.category}</span>
+                        <h3 className="text-sm font-medium text-white">{issue.title}</h3>
+                      </div>
+                      <p className="mt-2 text-xs leading-5 text-slate-300">{issue.detail}</p>
+                      <p className="mt-1 text-xs leading-5 text-slate-400">{issue.recommendation}</p>
+                      {issue.downtimeExpected && <p className="mt-1 text-xs text-red-200">Downtime required. Schedule this instead of automating it blindly.</p>}
+                    </div>
+                    {action ? (
+                      <button
+                        onClick={() => requestAction(action)}
+                        disabled={!owner || runningAction === action.id}
+                        title={action.description}
+                        className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-emerald-400/25 bg-emerald-500/15 px-3 py-2 text-xs font-medium text-emerald-100 transition hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {runningAction === action.id ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+                        {action.label}
+                      </button>
+                    ) : (
+                      <span className="shrink-0 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-300">
+                        Manual review
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
+          <div className="flex items-center gap-2">
+            <ShieldCheck size={17} className="text-cyan-300" />
+            <h2 className="text-sm font-semibold text-white">Compatibility Guardrails</h2>
+          </div>
+          <p className="mt-2 text-xs leading-5 text-slate-400">
+            {status?.compatibility?.summary || 'Maintenance automation is guarded by Portal compatibility policy.'}
+          </p>
+          <div className="mt-3 space-y-2">
+            {status?.compatibility?.components.map((component) => (
+              <div key={component.id} className="rounded-lg border border-white/8 bg-black/15 px-3 py-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <p className="text-xs font-medium text-white">{component.label}</p>
+                    <p className="mt-0.5 text-[11px] text-slate-500">{component.installedVersion || 'Version unknown'} · {component.supportedVersion}</p>
+                  </div>
+                  <span className={`rounded-md px-2 py-0.5 text-[10px] font-semibold uppercase ${
+                    component.status === 'blocked' ? 'bg-red-500/15 text-red-100'
+                      : component.status === 'review' ? 'bg-amber-500/15 text-amber-100'
+                        : component.status === 'ok' ? 'bg-emerald-500/15 text-emerald-100'
+                          : 'bg-slate-500/15 text-slate-200'
+                  }`}>
+                    {component.status}
+                  </span>
+                </div>
+                <p className="mt-1 text-[11px] leading-4 text-slate-400">{component.note}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+
+      <section className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
+        <div className="flex items-center gap-2">
+          <Wrench size={17} className="text-amber-200" />
+          <h2 className="text-sm font-semibold text-white">Available Actions</h2>
+        </div>
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
+          {actions.map((action) => (
+            <div key={action.id} className={`rounded-xl border p-3 ${riskTone(action)}`}>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-white">{action.label}</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-300">{action.description}</p>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    <span className="rounded-md bg-black/20 px-2 py-0.5 text-[10px] uppercase tracking-wide">{action.automationLevel}</span>
+                    <span className="rounded-md bg-black/20 px-2 py-0.5 text-[10px]">{action.changesSystem ? 'changes server' : 'read-only'}</span>
+                    <span className="rounded-md bg-black/20 px-2 py-0.5 text-[10px]">{action.destructive ? 'destructive' : 'non-destructive'}</span>
+                    {action.requiresBackup && <span className="rounded-md bg-black/20 px-2 py-0.5 text-[10px]">backup first</span>}
+                    {action.requiresMaintenanceWindow && <span className="rounded-md bg-black/20 px-2 py-0.5 text-[10px]">maintenance window</span>}
+                  </div>
+                  <p className="mt-2 text-[11px] leading-4 text-slate-400"><span className="text-slate-300">Impact:</span> {action.impact}</p>
+                  <p className="mt-1 text-[11px] leading-4 text-slate-500"><span className="text-slate-400">Recovery:</span> {action.recovery}</p>
+                </div>
+                <button
+                  onClick={() => requestAction(action)}
+                  disabled={!owner || runningAction === action.id}
+                  className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {runningAction === action.id ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+                  Run
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <HardDrive size={17} className="text-blue-300" />
+            <h2 className="text-sm font-semibold text-white">Recent Maintenance Jobs</h2>
+          </div>
+          <Link to="/tasks" className="text-xs font-medium text-emerald-300 hover:text-emerald-200">Full history</Link>
+        </div>
+        <div className="mt-3 space-y-2">
+          {jobs.length === 0 ? (
+            <p className="text-sm text-slate-400">No maintenance jobs have run yet.</p>
+          ) : jobs.map((job) => (
+            <div key={job.id} className="flex flex-col gap-1 rounded-lg border border-white/8 bg-black/15 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <p className="truncate text-xs font-medium text-white">{job.title || job.toolId}</p>
+                <p className="text-[11px] text-slate-500">{new Date(job.startedAt || job.createdAt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</p>
+              </div>
+              <span className={`w-fit rounded-md px-2 py-0.5 text-[10px] font-semibold uppercase ${
+                job.status === 'completed' ? 'bg-emerald-500/15 text-emerald-100'
+                  : job.status === 'running' ? 'bg-blue-500/15 text-blue-100'
+                    : 'bg-red-500/15 text-red-100'
+              }`}>
+                {jobStatusLabel(job.status)}
+              </span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {pendingAction && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-sm">
+          <div className="w-full max-w-2xl overflow-hidden rounded-2xl border border-white/10 bg-[#0A0E27] shadow-2xl shadow-black/40">
+            <div className={`border-b px-5 py-4 ${riskTone(pendingAction)}`}>
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="rounded-md bg-black/25 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
+                      {pendingAction.automationLevel}
+                    </span>
+                    <span className="rounded-md bg-black/25 px-2 py-0.5 text-[10px]">
+                      {pendingAction.changesSystem ? 'changes server' : 'read-only'}
+                    </span>
+                    <span className="rounded-md bg-black/25 px-2 py-0.5 text-[10px]">
+                      {pendingAction.destructive ? 'destructive' : 'non-destructive'}
+                    </span>
+                  </div>
+                  <h3 className="mt-3 text-lg font-semibold text-white">{pendingAction.label}</h3>
+                  <p className="mt-1 text-sm leading-6 text-slate-300">{pendingAction.description}</p>
+                </div>
+                <button
+                  onClick={() => setPendingAction(null)}
+                  className="rounded-lg border border-white/10 bg-white/5 p-2 text-slate-300 transition hover:bg-white/10 hover:text-white"
+                  aria-label="Close maintenance action confirmation"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-4 px-5 py-5">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="rounded-xl border border-white/8 bg-white/[0.03] p-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Impact</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-300">{pendingAction.impact}</p>
+                </div>
+                <div className="rounded-xl border border-white/8 bg-white/[0.03] p-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Recovery</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-300">{pendingAction.recovery}</p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                {pendingAction.requiresBackup && <span className="rounded-lg border border-amber-400/20 bg-amber-500/10 px-2.5 py-1 text-xs text-amber-100">Backup first</span>}
+                {pendingAction.requiresMaintenanceWindow && <span className="rounded-lg border border-amber-400/20 bg-amber-500/10 px-2.5 py-1 text-xs text-amber-100">Maintenance window</span>}
+                {pendingAction.downtimeExpected && <span className="rounded-lg border border-red-400/20 bg-red-500/10 px-2.5 py-1 text-xs text-red-100">Downtime expected</span>}
+                {!pendingAction.requiresBackup && !pendingAction.requiresMaintenanceWindow && !pendingAction.downtimeExpected && (
+                  <span className="rounded-lg border border-emerald-400/20 bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-100">No downtime expected</span>
+                )}
+              </div>
+            </div>
+
+            <div className="flex flex-col-reverse gap-2 border-t border-white/8 bg-black/15 px-5 py-4 sm:flex-row sm:justify-end">
+              <button
+                onClick={() => setPendingAction(null)}
+                className="rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => runAction(pendingAction)}
+                disabled={runningAction === pendingAction.id}
+                className="inline-flex items-center justify-center gap-2 rounded-xl border border-emerald-400/25 bg-emerald-500/20 px-4 py-2 text-sm font-medium text-emerald-100 transition hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {runningAction === pendingAction.id ? <Loader2 size={15} className="animate-spin" /> : <Play size={15} />}
+                Start Background Job
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

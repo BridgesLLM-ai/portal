@@ -2,6 +2,25 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.16] — 2026-05-31
+
+### Added
+- **Admin Maintenance is now the control center for server drift**: admins get a guarded Maintenance tab with current OS/kernel/update/backup/service state, compatibility guardrails, action risk labels, impact/recovery notes, recent job history, and themed action confirmations.
+- **Dashboard maintenance alerts are useful without becoming the cockpit**: the Dashboard now surfaces maintenance/security drift as a dismissible notification and routes action to Admin Maintenance instead of exposing broad server controls in the daily dashboard.
+- **Safe maintenance actions run as background jobs**: owner-approved actions can generate a read-only maintenance plan, prepare a reboot checklist, refresh apt metadata, create a maintenance backup, or run guarded security-only updates.
+
+### Fixed
+- **Full-stack app stops now terminate the real listener**: full-stack app processes run in their own process group, and `stopApp()` signals that group, waits for the port to close, and falls back to SIGKILL when needed so `npm start` child processes cannot keep serving after the portal reports the app stopped.
+- **Agent Chat status/thought messages survive refreshes better**: assistant status events are now persisted and replayed with runtime history so refreshes no longer drop important progress/status context from active or recent turns.
+- **Codex app-server idle timeouts are handled more defensively**: if Codex reports a `turn/completed` idle timeout after visible assistant output already reached the portal, the turn is completed cleanly; otherwise the UI shows a recoverable delayed-completion status before failing.
+
+### Improved
+- **Maintenance automation respects Portal compatibility boundaries**: broad upgrades remain review-only, reboot remains scheduled/manual, and security automation now blocks when protected Portal-managed packages such as `bridgesllm*`, `openclaw*`, `stalwart*`, `stalwart-mail`, or `caddy` need compatibility review first.
+- **Background task discovery is cleaner**: maintenance jobs remain reachable from Admin Maintenance and job history, while the global sidebar avoids a Background Tasks destination that users do not need during normal portal work.
+
+### Maintenance
+- **Release validation now covers the real maintenance and app-process failure modes**: tests and live test-box validation cover maintenance UI/action flows, Codex idle-timeout handling, status-history replay, and full-stack app start/stop/start behavior through the live Portal API.
+
 ## [3.25.15] — 2026-05-30
 
 ### Fixed

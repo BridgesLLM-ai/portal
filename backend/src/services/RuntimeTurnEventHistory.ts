@@ -6,6 +6,7 @@ import type { RuntimeTurnEvent, RuntimeTurnEventType } from './RuntimeTurnEvents
 const DEFAULT_LIMIT = 1000;
 const MAX_TEXT_CHARS = 80_000;
 const PERSISTED_TYPES = new Set<RuntimeTurnEventType>([
+  'assistant_status',
   'assistant_reasoning',
   'tool_started',
   'tool_output',

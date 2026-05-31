@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, Command, File, Folder, Terminal, Layout, Rocket, Settings, X } from 'lucide-react';
+import { Search, Command, File, Folder, Terminal, Layout, Settings, X, Shield } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../contexts/AuthContext';
 import { isElevated } from '../utils/authz';
@@ -61,6 +61,14 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
           action: () => navigate('/terminal'),
           category: 'navigation' as const,
           keywords: ['shell', 'console', 'command'],
+        },
+        {
+          id: 'nav-admin-maintenance',
+          label: 'Go to Admin Maintenance',
+          icon: <Shield size={16} />,
+          action: () => navigate('/admin?tab=maintenance'),
+          category: 'navigation' as const,
+          keywords: ['admin', 'maintenance', 'security', 'updates', 'drift'],
         }]
       : []),
     {

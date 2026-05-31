@@ -7,6 +7,7 @@
 import { ChildProcess, spawn, execSync } from 'child_process';
 import path from 'path';
 import fs from 'fs';
+import net from 'net';
 import { PrismaClient } from '@prisma/client';
 
 const prisma = new PrismaClient();
@@ -119,6 +120,50 @@ function isPortInUseByProcess(port: number): boolean {
   return false;
 }
 
+function isTcpPortListening(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once('error', () => resolve(false));
+    socket.setTimeout(1000, () => {
+      socket.destroy();
+      resolve(false);
+    });
+  });
+}
+
+async function waitForPortClosed(port: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await isTcpPortListening(port))) return true;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  return !(await isTcpPortListening(port));
+}
+
+function signalAppProcess(app: ManagedApp, signal: NodeJS.Signals): boolean {
+  const pid = app.process.pid;
+  if (pid && process.platform !== 'win32') {
+    try {
+      process.kill(-pid, signal);
+      return true;
+    } catch (error: any) {
+      if (error?.code !== 'ESRCH') {
+        console.warn(`[AppProcess] Failed to signal process group for ${app.deployId}:`, error.message);
+      }
+    }
+  }
+
+  try {
+    return app.process.kill(signal);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Start a full-stack app process
  */
@@ -160,7 +205,7 @@ export async function startApp(appId: string, deployId: string, deployPath: stri
       NODE_ENV: 'production',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
-    detached: false,
+    detached: true,
   });
 
   const managed: ManagedApp = {
@@ -257,10 +302,10 @@ export async function stopApp(deployId: string): Promise<void> {
   if (app.restartTimer) { clearTimeout(app.restartTimer); app.restartTimer = undefined; }
 
   try {
-    app.process.kill('SIGTERM');
+    signalAppProcess(app, 'SIGTERM');
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
-        try { app.process.kill('SIGKILL'); } catch {}
+        signalAppProcess(app, 'SIGKILL');
         resolve();
       }, 5000);
 
@@ -270,6 +315,11 @@ export async function stopApp(deployId: string): Promise<void> {
       });
     });
   } catch {}
+
+  if (await isTcpPortListening(app.port)) {
+    signalAppProcess(app, 'SIGKILL');
+    await waitForPortClosed(app.port, 2500);
+  }
 
   runningApps.delete(deployId);
 
@@ -365,7 +415,8 @@ export async function shutdownAll(): Promise<void> {
   for (const [id, app] of runningApps) {
     try {
       if (app.restartTimer) clearTimeout(app.restartTimer);
-      app.process.kill('SIGTERM');
+      app.stopping = true;
+      signalAppProcess(app, 'SIGTERM');
       console.log(`[AppProcess] Killed ${id}`);
     } catch (e: any) {
       console.error(`[AppProcess] Failed to kill ${id}:`, e.message);

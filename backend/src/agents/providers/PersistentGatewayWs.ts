@@ -303,6 +303,12 @@ const recentlyCompletedDeliveryBySession: Map<string, {
   ts: number;
 }> = new Map();
 
+const pendingCodexIdleTimeoutBySession: Map<string, {
+  runId?: string;
+  errorText: string;
+  timer: ReturnType<typeof setTimeout>;
+}> = new Map();
+
 // Event listeners
 const approvalRequestListeners: Set<ApprovalRequestCallback> = new Set();
 const approvalResolvedListeners: Set<ApprovalResolvedCallback> = new Set();
@@ -423,6 +429,45 @@ function completeIdleTimedOutTurnIfVisible(sessionKey: string, runId: string | u
     runId,
   });
   cleanupCompletedRun(sessionKey, runId);
+  return true;
+}
+
+function clearPendingCodexIdleTimeout(sessionKey: string): void {
+  const pending = pendingCodexIdleTimeoutBySession.get(sessionKey);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pendingCodexIdleTimeoutBySession.delete(sessionKey);
+}
+
+function publishFatalRunError(sessionKey: string, content: string): void {
+  clearPendingCodexIdleTimeout(sessionKey);
+  streamEventBus.publish(sessionKey, { type: 'error', content });
+  streamEventBus.clearStream(sessionKey);
+  activeRunIds.delete(sessionKey);
+  assistantLastSeenTextMap.delete(sessionKey);
+  chatLastSeenTextMap.delete(sessionKey);
+  sessionsWithAssistantTextStream.delete(sessionKey);
+  lastToolPhaseBySession.delete(sessionKey);
+}
+
+function deferCodexIdleTimeoutError(sessionKey: string, runId: string | undefined, errorText: string): boolean {
+  if (!isCodexTurnCompletionIdleTimeoutError(errorText)) return false;
+  if (completeIdleTimedOutTurnIfVisible(sessionKey, runId, errorText)) return true;
+
+  clearPendingCodexIdleTimeout(sessionKey);
+  streamEventBus.publish(sessionKey, {
+    type: 'status',
+    content: 'Codex turn completion is delayed; waiting for the final response…',
+    runId,
+  });
+
+  const timer = setTimeout(() => {
+    pendingCodexIdleTimeoutBySession.delete(sessionKey);
+    if (completeIdleTimedOutTurnIfVisible(sessionKey, runId, errorText)) return;
+    publishFatalRunError(sessionKey, errorText);
+  }, 15000);
+  timer.unref?.();
+  pendingCodexIdleTimeoutBySession.set(sessionKey, { runId, errorText, timer });
   return true;
 }
 
@@ -684,6 +729,9 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
 
   // Ensure the stream is tracked
   streamEventBus.startStream(sessionKey, runId);
+  if (!(stream === 'lifecycle' && String(data.phase || '').toLowerCase() === 'error')) {
+    clearPendingCodexIdleTimeout(sessionKey);
+  }
 
   if (stream === 'item' && data.kind === 'preamble') {
     const content = extractPreambleProgressText(data);
@@ -845,12 +893,8 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
       const errMsg = typeof data.error === 'string'
         ? data.error
         : (typeof data.errorMessage === 'string' ? data.errorMessage : 'Agent error');
-      if (completeIdleTimedOutTurnIfVisible(sessionKey, runId, errMsg)) return;
-      streamEventBus.publish(sessionKey, { type: 'error', content: errMsg });
-      streamEventBus.clearStream(sessionKey);
-      activeRunIds.delete(sessionKey);
-      assistantLastSeenTextMap.delete(sessionKey);
-      lastToolPhaseBySession.delete(sessionKey);
+      if (deferCodexIdleTimeoutError(sessionKey, runId, errMsg)) return;
+      publishFatalRunError(sessionKey, errMsg);
     } else if (lifecycleSignal === 'compacting') {
       const status = lifecycleStatusText || 'Compacting context…';
       streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking', statusText: status, compactionPhase: 'compacting' });
@@ -1089,6 +1133,9 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
 
   // Ensure the stream is tracked
   streamEventBus.startStream(sessionKey, runId);
+  if (state !== 'error') {
+    clearPendingCodexIdleTimeout(sessionKey);
+  }
 
   if (state === 'delta') {
     // Newer OpenClaw builds may emit assistant text only through chat.delta,
@@ -1218,14 +1265,8 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     const errMsg = typeof payload.errorMessage === 'string'
       ? payload.errorMessage
       : (typeof payload.error === 'string' ? payload.error : 'Chat error');
-    if (completeIdleTimedOutTurnIfVisible(sessionKey, runId, errMsg)) return;
-    streamEventBus.publish(sessionKey, { type: 'error', content: errMsg });
-    streamEventBus.clearStream(sessionKey);
-    activeRunIds.delete(sessionKey);
-    assistantLastSeenTextMap.delete(sessionKey);
-    chatLastSeenTextMap.delete(sessionKey);
-    sessionsWithAssistantTextStream.delete(sessionKey);
-    lastToolPhaseBySession.delete(sessionKey);
+    if (deferCodexIdleTimeoutError(sessionKey, runId, errMsg)) return;
+    publishFatalRunError(sessionKey, errMsg);
     return;
   }
 
@@ -1895,3 +1936,19 @@ export function clearRun(sessionKey: string): void {
   assistantLastSeenTextMap.delete(sessionKey);
   lastToolPhaseBySession.delete(sessionKey);
 }
+
+export const __persistentGatewayWsTest = {
+  isCodexTurnCompletionIdleTimeoutError,
+  deferCodexIdleTimeoutError,
+  completeIdleTimedOutTurnIfVisible,
+  clearPendingCodexIdleTimeout,
+  resetSession(sessionKey: string): void {
+    clearPendingCodexIdleTimeout(sessionKey);
+    streamEventBus.clearStream(sessionKey);
+    activeRunIds.delete(sessionKey);
+    assistantLastSeenTextMap.delete(sessionKey);
+    chatLastSeenTextMap.delete(sessionKey);
+    sessionsWithAssistantTextStream.delete(sessionKey);
+    lastToolPhaseBySession.delete(sessionKey);
+  },
+};

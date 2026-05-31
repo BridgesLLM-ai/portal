@@ -15,6 +15,7 @@ import {
   ChevronUp,
 } from 'lucide-react';
 import client from '../api/client';
+import { agentJobsAPI, type AgentJob } from '../api/agentJobs';
 
 interface Task {
   id: string;
@@ -36,6 +37,36 @@ interface TasksResponse {
   ok?: boolean;
   tasks: Task[];
   error?: string;
+}
+
+function normalizeAgentJob(job: AgentJob): Task {
+  const status: Task['status'] = job.status === 'completed'
+    ? 'done'
+    : job.status === 'error' || job.status === 'killed'
+      ? 'failed'
+      : job.status === 'running'
+        ? 'running'
+        : 'unknown';
+  const updatedAt = job.finishedAt || job.startedAt || job.createdAt;
+  const started = toMillis(job.startedAt || job.createdAt);
+  const finished = toMillis(job.finishedAt || updatedAt);
+
+  return {
+    id: job.id,
+    name: job.title || `${job.toolId} job`,
+    status,
+    model: job.toolId,
+    kind: 'portal-job',
+    createdAt: job.createdAt,
+    updatedAt,
+    duration: started && finished ? Math.max(finished - started, 0) : undefined,
+    summary: job.status === 'running'
+      ? 'Portal background job is running.'
+      : job.exitCode === null || job.exitCode === undefined
+        ? undefined
+        : `Exited with code ${job.exitCode}`,
+    detail: 'Portal maintenance, tool install, or long-running server operation.',
+  };
 }
 
 function toMillis(timestamp: number | string | undefined): number | undefined {
@@ -80,13 +111,29 @@ function useTasksData() {
 
   const fetchTasks = useCallback(async () => {
     try {
-      const response = await client.get<TasksResponse>('/gateway/tasks');
-      if (response.data.ok) {
-        setTasks(Array.isArray(response.data.tasks) ? response.data.tasks : []);
-        setError(null);
+      const [gatewayResult, jobsResult] = await Promise.allSettled([
+        client.get<TasksResponse>('/gateway/tasks'),
+        agentJobsAPI.list(),
+      ]);
+      const nextTasks: Task[] = [];
+      const errors: string[] = [];
+
+      if (gatewayResult.status === 'fulfilled' && gatewayResult.value.data.ok) {
+        nextTasks.push(...(Array.isArray(gatewayResult.value.data.tasks) ? gatewayResult.value.data.tasks : []));
+      } else if (gatewayResult.status === 'fulfilled') {
+        errors.push(gatewayResult.value.data.error || 'OpenClaw task snapshot unavailable');
       } else {
-        setError(response.data.error || 'Failed to load tasks');
+        errors.push(gatewayResult.reason?.response?.data?.error || gatewayResult.reason?.message || 'OpenClaw task snapshot unavailable');
       }
+
+      if (jobsResult.status === 'fulfilled') {
+        nextTasks.push(...jobsResult.value.map(normalizeAgentJob));
+      } else {
+        errors.push(jobsResult.reason?.response?.data?.error || jobsResult.reason?.message || 'Portal background jobs unavailable');
+      }
+
+      setTasks(nextTasks);
+      setError(nextTasks.length === 0 && errors.length ? errors.join(' · ') : null);
     } catch (err: any) {
       console.error('Failed to fetch tasks:', err);
       setError(err.response?.data?.error || err.message || 'Failed to load tasks');
@@ -126,8 +173,7 @@ function EmptyState() {
       </div>
       <h3 className="text-lg font-medium text-white mb-2">No Tasks Yet</h3>
       <p className="text-sm text-slate-400 max-w-md">
-        Background tasks and subagents will appear here when they&apos;re running.
-        Start a conversation that spawns a subagent to see tasks.
+        Background jobs, maintenance operations, and subagents will appear here when they&apos;re running.
       </p>
     </div>
   );

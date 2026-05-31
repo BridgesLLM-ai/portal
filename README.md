@@ -98,6 +98,13 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.16 (May 31, 2026)
+- **Server maintenance drift is visible and actionable**: the Dashboard now shows dismissible maintenance/security alerts, while Admin Maintenance provides the full status, guardrails, job history, and action confirmations.
+- **Maintenance automation is guarded by compatibility policy**: security-only updates are allowed through a controlled path, but protected Portal-managed packages like OpenClaw, Stalwart, Caddy, and BridgesLLM components require a maintenance plan/review first.
+- **Full-stack app stops are reliable**: deployed full-stack apps now stop their whole process group and wait for the port to close, preventing child server processes from staying alive after the portal reports the app stopped.
+- **Agent Chat refresh and Codex timeout handling are sturdier**: status/thought events persist through reloads, and delayed Codex completion timeouts no longer strand turns when visible output has already arrived.
+- **Release validation includes live test-box coverage**: this release was checked against the real Admin Maintenance UI, Dashboard alert flow, background maintenance jobs, app-process start/stop/start behavior, and targeted backend regressions.
+
 ### v3.25.15 (May 30, 2026)
 - **Current OpenClaw runtime compatibility is restored**: Agent Chat and project agents keep live progress, tool activity, final replies, and refresh history aligned on newer OpenClaw releases.
 - **CLI-backed providers are usable out of the box again**: Claude Code, Codex CLI, and Gemini CLI now surface browser approval prompts when tool execution needs permission, with provider-specific retry behavior after approval.
