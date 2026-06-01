@@ -511,9 +511,20 @@ async function getAptState() {
   const lockCheck = await runShell(`for lock in ${APT_LOCKS.map(shellQuote).join(' ')}; do fuser "$lock" >/dev/null 2>&1 && echo "$lock"; done`, 4000);
   const upgradable = await runShell("apt list --upgradable 2>/dev/null | tail -n +2 | sed '/^$/d'", 12000);
   const lines = upgradable.stdout ? upgradable.stdout.split(/\r?\n/).filter(Boolean) : [];
-  const securityLines = lines.filter((line) => /(?:-security|security\.ubuntu\.com|Debian-Security|\/.*security)/i.test(line));
-  const protectedUpdatePackages = Array.from(new Set(lines
-    .map((line) => line.split('/')[0]?.trim())
+  const held = await runShell('apt-mark showhold 2>/dev/null || true', 12000);
+  const heldPackages = new Set(held.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+  const packageNameFromAptLine = (line: string): string => line.split('/')[0]?.trim() || '';
+  const actionableLines = lines.filter((line) => {
+    const name = packageNameFromAptLine(line);
+    return Boolean(name && !heldPackages.has(name));
+  });
+  const heldUpdatePackages = Array.from(new Set(lines
+    .map(packageNameFromAptLine)
+    .filter((name): name is string => Boolean(name && heldPackages.has(name)))))
+    .sort();
+  const securityLines = actionableLines.filter((line) => /(?:-security|security\.ubuntu\.com|Debian-Security|\/.*security)/i.test(line));
+  const protectedUpdatePackages = Array.from(new Set(actionableLines
+    .map(packageNameFromAptLine)
     .filter((name): name is string => Boolean(name && PROTECTED_PACKAGE_REGEX.test(name)))))
     .sort();
   const aptCheck = await runShell('if [ -x /usr/lib/update-notifier/apt-check ]; then /usr/lib/update-notifier/apt-check 2>/dev/null; fi', 12000);
@@ -525,9 +536,11 @@ async function getAptState() {
   return {
     available: true,
     cacheAgeHours,
-    upgradableCount: Number.isFinite(aptCheckUpgradableCount) ? aptCheckUpgradableCount : lines.length,
-    securityUpgradableCount: Number.isFinite(aptCheckSecurityCount) ? aptCheckSecurityCount : securityLines.length,
+    upgradableCount: heldUpdatePackages.length > 0 ? actionableLines.length : (Number.isFinite(aptCheckUpgradableCount) ? aptCheckUpgradableCount : actionableLines.length),
+    securityUpgradableCount: heldUpdatePackages.length > 0 ? securityLines.length : (Number.isFinite(aptCheckSecurityCount) ? aptCheckSecurityCount : securityLines.length),
     protectedUpdatePackages,
+    heldPackages: Array.from(heldPackages).sort(),
+    heldUpdatePackages,
     locksActive: Boolean(lockCheck.stdout.trim()),
     unattendedUpgradeAvailable,
   };

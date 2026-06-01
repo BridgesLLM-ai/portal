@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.16"
+readonly VERSION="3.25.17"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -2154,6 +2154,140 @@ auto_apply_openclaw_compatibility_hotfix() {
   ok "OpenClaw compatibility hotfix checked"
 }
 
+configure_openclaw_codex_harness_defaults() {
+  if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
+    return 0
+  fi
+
+  local oc_config="${HOME}/.openclaw/openclaw.json"
+  [[ -f "${oc_config}" ]] || return 0
+
+  if python3 - "$oc_config" >> "$LOG_FILE" 2>&1 <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    sys.exit(0)
+
+plugins = data.setdefault("plugins", {})
+plugins.setdefault("enabled", True)
+entries = plugins.setdefault("entries", {})
+codex = entries.setdefault("codex", {})
+codex.setdefault("enabled", True)
+config = codex.setdefault("config", {})
+app_server = config.setdefault("appServer", {})
+
+changed = False
+for key, value in {
+    "turnCompletionIdleTimeoutMs": 180000,
+    "postToolRawAssistantCompletionIdleTimeoutMs": 180000,
+}.items():
+    if app_server.get(key) != value:
+        app_server[key] = value
+        changed = True
+
+if changed:
+    path.write_text(json.dumps(data, indent=2) + "\n")
+PY
+  then
+    ok "OpenClaw Codex harness defaults checked"
+  else
+    warn "Could not update OpenClaw Codex harness defaults"
+  fi
+}
+
+configure_backup_timers() {
+  step_header "Configuring backup automation"
+  CURRENT_STEP="backup automation"
+
+  $DRY_RUN && { ok "[dry-run] Would configure backup timers"; return; }
+
+  local backup_script="${PORTAL_DIR}/backup-full.sh"
+  if [[ ! -f "${backup_script}" ]]; then
+    warn "Backup script missing at ${backup_script}; timers not enabled"
+    return 0
+  fi
+
+  chmod 750 "${backup_script}" 2>/dev/null || true
+  mkdir -p /root/backups/daily /root/backups/comprehensive /root/backups/monthly /root/backups/logs
+
+  cat > /etc/systemd/system/bridgesllm-backup@.service << BACKUPSERVICE
+[Unit]
+Description=BridgesLLM Portal %i backup
+After=docker.service bridgesllm-product.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Environment=PORTAL_ROOT=${PORTAL_DIR}
+Environment=INSTALL_ROOT=${INSTALL_ROOT}
+Environment=BACKUP_BASE=/root/backups
+ExecStart=/bin/bash ${backup_script} %i
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+BACKUPSERVICE
+
+  cat > /etc/systemd/system/bridgesllm-backup-daily.timer << 'BACKUPDAILY'
+[Unit]
+Description=Daily BridgesLLM Portal backup
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+Unit=bridgesllm-backup@daily.service
+
+[Install]
+WantedBy=timers.target
+BACKUPDAILY
+
+  cat > /etc/systemd/system/bridgesllm-backup-comprehensive.timer << 'BACKUPWEEKLY'
+[Unit]
+Description=Weekly comprehensive BridgesLLM Portal backup
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00:00
+Persistent=true
+Unit=bridgesllm-backup@comprehensive.service
+
+[Install]
+WantedBy=timers.target
+BACKUPWEEKLY
+
+  cat > /etc/systemd/system/bridgesllm-backup-monthly.timer << 'BACKUPMONTHLY'
+[Unit]
+Description=Monthly BridgesLLM Portal backup
+
+[Timer]
+OnCalendar=*-*-01 04:00:00
+Persistent=true
+Unit=bridgesllm-backup@monthly.service
+
+[Install]
+WantedBy=timers.target
+BACKUPMONTHLY
+
+  systemctl daemon-reload
+  systemctl enable --now bridgesllm-backup-daily.timer bridgesllm-backup-comprehensive.timer bridgesllm-backup-monthly.timer >> "$LOG_FILE" 2>&1 || true
+
+  local cron_tmp
+  cron_tmp="$(mktemp)"
+  if crontab -l > "${cron_tmp}" 2>/dev/null; then
+    if grep -q 'backup-full\.sh' "${cron_tmp}"; then
+      grep -v 'backup-full\.sh' "${cron_tmp}" | crontab -
+      ok "Removed stale backup cron entries"
+    fi
+  fi
+  rm -f "${cron_tmp}"
+
+  ok "Backup timers configured"
+}
+
 start_portal() {
   step_header "Starting portal"
   CURRENT_STEP="startup"
@@ -2162,6 +2296,7 @@ start_portal() {
   if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
     ensure_openclaw_sandbox_image
     auto_apply_openclaw_compatibility_hotfix
+    configure_openclaw_codex_harness_defaults
     ensure_openclaw_gateway_boots_cleanly || true
     sleep 3  # Let gateway fully initialize and write its config
 
@@ -2391,6 +2526,7 @@ do_update() {
   # Ensure Remote Desktop is properly set up (packages + services + VNC race fix)
   info "Checking Remote Desktop..."
   setup_remote_desktop
+  configure_backup_timers
 
   # Clear the safety-net trap — we're about to start the service ourselves
   trap - ERR
@@ -2399,6 +2535,7 @@ do_update() {
   if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
     ensure_openclaw_sandbox_image
     auto_apply_openclaw_compatibility_hotfix
+    configure_openclaw_codex_harness_defaults
     ensure_openclaw_gateway_boots_cleanly || true
     sleep 3
 
@@ -2564,6 +2701,7 @@ main() {
   setup_database
   build_portal
   configure_services
+  configure_backup_timers
   setup_remote_desktop
   start_portal
   print_success

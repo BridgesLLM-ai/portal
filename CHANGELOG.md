@@ -2,6 +2,18 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.17] - 2026-05-31
+
+### Fixed
+- **Portal backups are installed and scheduled again**: the release artifact now includes the canonical `backup-full.sh` runner, installer/update paths enable daily, weekly comprehensive, and monthly systemd backup timers, and stale cron entries pointing at old source-checkout paths are removed automatically.
+- **Manual normal and comprehensive backups work from Settings**: the backup API now calls the installed backup runner directly, preserves the `comprehensive` backup type instead of mapping it to weekly, and reports a clear install error if the runner is missing.
+- **Codex terminal-event false failures are handled more defensively**: if OpenClaw reports that Codex stopped before confirming `turn/completed` after assistant text is already visible, the Portal completes the turn instead of surfacing a misleading failure.
+- **Maintenance status ignores held package drift**: apt-held packages such as locally held `cloud-init` no longer keep the dashboard/Admin Maintenance view stuck on actionable package updates after real maintenance is complete.
+
+### Improved
+- **Backup schedule visibility now covers systemd timers**: the backups endpoint reports both legacy cron entries and the current `bridgesllm-backup*` timer/unit state.
+- **OpenClaw Codex harness defaults are less brittle for long turns**: installer/update configuration sets a longer Codex app-server completion idle window for supported OpenClaw installs.
+
 ## [3.25.16] — 2026-05-31
 
 ### Added

@@ -98,6 +98,13 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.17 (May 31, 2026)
+- **Portal backups are installed and scheduled again**: daily, weekly comprehensive, and monthly backups now use systemd timers, and stale cron entries from older source-checkout installs are cleaned up during update.
+- **Normal and comprehensive manual backups work again**: Settings now calls the installed backup runner directly and keeps the `comprehensive` backup type intact.
+- **Codex “stopped before confirming” false failures are handled better**: visible assistant replies are completed cleanly when OpenClaw misses the final Codex `turn/completed` event.
+- **Maintenance status is quieter after real maintenance**: held apt packages no longer make the dashboard report actionable package drift after updates/reboot are finished.
+- **Backup schedule reporting shows the real timers**: the backups endpoint now reports current `bridgesllm-backup*` systemd timer/unit state alongside legacy cron data.
+
 ### v3.25.16 (May 31, 2026)
 - **Server maintenance drift is visible and actionable**: the Dashboard now shows dismissible maintenance/security alerts, while Admin Maintenance provides the full status, guardrails, job history, and action confirmations.
 - **Maintenance automation is guarded by compatibility policy**: security-only updates are allowed through a controlled path, but protected Portal-managed packages like OpenClaw, Stalwart, Caddy, and BridgesLLM components require a maintenance plan/review first.

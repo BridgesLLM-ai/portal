@@ -242,24 +242,29 @@ router.post('/create', async (req: Request, res: Response) => {
       startedAt: new Date().toISOString(),
     };
 
+    const scriptPath = path.join(process.env.PORTAL_ROOT || '/opt/bridgesllm/portal', 'backup-full.sh');
+    if (!fs.existsSync(scriptPath)) {
+      currentBackup = null;
+      res.status(500).json({
+        error: 'Backup script is not installed',
+        details: scriptPath,
+      });
+      return;
+    }
+
     // Return immediately with running status
-    res.json({ 
-      status: 'running', 
+    res.json({
+      status: 'running',
       id: backupId,
       type: backupType,
       message: 'Backup started in background',
     });
 
-    // Choose script based on backup type (executed on HOST via SSH)
-    let command: string;
-    
-    // All backup types use the same canonical script
-    // Map 'comprehensive' → 'weekly' (full backup including node_modules)
-    const scriptType = backupType === 'comprehensive' ? 'weekly' : backupType;
-    command = `bash ${process.env.PORTAL_ROOT || '/opt/bridgesllm/portal'}/backup-full.sh ${scriptType}`;
+    // All backup types use the same canonical host script.
+    const scriptType = backupType;
 
     // Execute directly on host (portal runs as systemd service, not Docker)
-    const child = spawn('bash', ['-c', command], {
+    const child = spawn('bash', [scriptPath, scriptType], {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -346,14 +351,26 @@ router.get('/status', async (req: Request, res: Response) => {
 router.get('/cron-info', async (req: Request, res: Response) => {
   try {
 
-    // Read crontab directly (portal runs on host as systemd service)
+    // Read legacy cron and current systemd timers directly on the host.
     const { execSync } = require('child_process');
     let crontab = '';
+    let timers = '';
+    let unitFiles = '';
     try {
       crontab = execSync('crontab -l 2>/dev/null', { encoding: 'utf-8', timeout: 5000 });
     } catch (e: any) {
       console.error('Cron read error:', e.message);
       crontab = '';
+    }
+    try {
+      timers = execSync("systemctl list-timers --all 'bridgesllm-backup*' --no-pager --plain 2>/dev/null || true", { encoding: 'utf-8', timeout: 5000 });
+    } catch {
+      timers = '';
+    }
+    try {
+      unitFiles = execSync("systemctl list-unit-files 'bridgesllm-backup*' --no-pager --plain 2>/dev/null || true", { encoding: 'utf-8', timeout: 5000 });
+    } catch {
+      unitFiles = '';
     }
 
     const backupLines = crontab.split('\n').filter((l: string) => l.includes('backup') && !l.startsWith('#') && l.trim().length > 0);
@@ -363,6 +380,12 @@ router.get('/cron-info', async (req: Request, res: Response) => {
       active: backupLines,
       disabled: commentedLines,
       raw: crontab,
+      systemd: {
+        timers: timers.split('\n').filter((line: string) => line.trim().length > 0),
+        unitFiles: unitFiles.split('\n').filter((line: string) => line.trim().length > 0),
+        rawTimers: timers,
+        rawUnitFiles: unitFiles,
+      },
     });
   } catch (error: any) {
     console.error('Cron info error:', error);

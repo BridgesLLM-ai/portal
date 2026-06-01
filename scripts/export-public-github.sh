@@ -77,7 +77,6 @@ rsync -a \
   --exclude='uploads' \
   --exclude='assets/avatars' \
   --exclude='assets/branding' \
-  --exclude='backup-full.sh' \
   --exclude='scripts/build-release.sh' \
   --exclude='*.log' \
   --exclude='*.db' \

@@ -400,8 +400,11 @@ function takeRecentMessageToolReply(sessionKey: string, withinMs = 30000): strin
   return cached.text;
 }
 
-function isCodexTurnCompletionIdleTimeoutError(text: unknown): boolean {
-  return /\bcodex app-server turn idle timed out waiting for turn\/completed\b/i.test(String(text || ''));
+function isCodexTurnCompletionUnconfirmedError(text: unknown): boolean {
+  const normalized = String(text || '');
+  return /\bcodex app-server turn idle timed out waiting for turn\/completed\b/i.test(normalized)
+    || /\bCodex stopped before confirming the turn was complete\b/i.test(normalized)
+    || /\bcodex app-server run completed without .*terminal event\b/i.test(normalized);
 }
 
 function latestVisibleAssistantText(sessionKey: string): string {
@@ -414,7 +417,7 @@ function latestVisibleAssistantText(sessionKey: string): string {
 }
 
 function completeIdleTimedOutTurnIfVisible(sessionKey: string, runId: string | undefined, errorText: string): boolean {
-  if (!isCodexTurnCompletionIdleTimeoutError(errorText)) return false;
+  if (!isCodexTurnCompletionUnconfirmedError(errorText)) return false;
   if (hasRunningToolCall(sessionKey)) return false;
 
   const finalText = latestVisibleAssistantText(sessionKey);
@@ -451,7 +454,7 @@ function publishFatalRunError(sessionKey: string, content: string): void {
 }
 
 function deferCodexIdleTimeoutError(sessionKey: string, runId: string | undefined, errorText: string): boolean {
-  if (!isCodexTurnCompletionIdleTimeoutError(errorText)) return false;
+  if (!isCodexTurnCompletionUnconfirmedError(errorText)) return false;
   if (completeIdleTimedOutTurnIfVisible(sessionKey, runId, errorText)) return true;
 
   clearPendingCodexIdleTimeout(sessionKey);
@@ -1938,7 +1941,7 @@ export function clearRun(sessionKey: string): void {
 }
 
 export const __persistentGatewayWsTest = {
-  isCodexTurnCompletionIdleTimeoutError,
+  isCodexTurnCompletionUnconfirmedError,
   deferCodexIdleTimeoutError,
   completeIdleTimedOutTurnIfVisible,
   clearPendingCodexIdleTimeout,

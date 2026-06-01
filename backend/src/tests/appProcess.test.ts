@@ -16,6 +16,19 @@ jest.mock('child_process', () => ({
   execSync: jest.fn(),
 }));
 
+jest.mock('net', () => ({
+  createConnection: jest.fn(() => {
+    const socket: any = {};
+    socket.destroy = jest.fn();
+    socket.setTimeout = jest.fn();
+    socket.once = jest.fn((event: string, callback: (...args: any[]) => void) => {
+      if (event === 'error') callback(new Error('ECONNREFUSED'));
+      return socket;
+    });
+    return socket;
+  }),
+}));
+
 import { spawn } from 'child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import os from 'os';
