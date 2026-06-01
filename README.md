@@ -98,6 +98,9 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.18 (May 31, 2026)
+- **OpenClaw compatibility checks are quieter on current runtimes**: updater hotfix detection no longer reports a failed legacy relay patch when the installed OpenClaw bundle has already moved past that patch shape.
+
 ### v3.25.17 (May 31, 2026)
 - **Portal backups are installed and scheduled again**: daily, weekly comprehensive, and monthly backups now use systemd timers, and stale cron entries from older source-checkout installs are cleaned up during update.
 - **Normal and comprehensive manual backups work again**: Settings now calls the installed backup runner directly and keeps the `comprehensive` backup type intact.

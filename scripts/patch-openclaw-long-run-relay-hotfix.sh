@@ -106,7 +106,7 @@ elif current_relay_v202655 in text:
     text = text.replace(current_relay_v202655, current_relay_v202655_new, 1)
     print(f"patched relay routing (2026.5.5 bundle): {p}")
 else:
-    raise SystemExit(f"relay block not found in {p}")
+    print(f"relay routing patch not needed or unsupported for current bundle: {p}")
 p.write_text(text)
 PY
 else

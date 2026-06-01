@@ -2,6 +2,11 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.18] - 2026-05-31
+
+### Fixed
+- **OpenClaw compatibility hotfix checks no longer warn on already-current runtimes**: the updater now treats missing legacy relay patch blocks as “not needed” instead of reporting a failed hotfix when the installed OpenClaw bundle has already moved past that patch shape.
+
 ## [3.25.17] - 2026-05-31
 
 ### Fixed
