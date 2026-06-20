@@ -408,7 +408,7 @@ function normalizeProviderModel(provider: string, rawModel: string): string {
   if (provider === 'CLAUDE_CODE' && (lower.startsWith('anthropic/') || lower.startsWith('claude/'))) {
     return model.split('/').slice(1).join('/') || model;
   }
-  if (provider === 'CODEX' && (lower.startsWith('openai-codex/') || lower.startsWith('openai/'))) {
+  if (provider === 'CODEX' && (lower.startsWith('codex/') || lower.startsWith('openai-codex/') || lower.startsWith('openai/'))) {
     return model.split('/').slice(1).join('/') || model;
   }
   return model;
@@ -2418,7 +2418,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const raw = err instanceof Error ? err.message : String(err || '').trim();
     if (!raw) return fallback;
     if (/not logged in|please run \/login/i.test(raw)) return 'This provider is installed but not logged in on the server yet.';
-    if (/GEMINI_API_KEY|GOOGLE_GENAI_USE_VERTEXAI|GOOGLE_GENAI_USE_GCA|Auth method/i.test(raw)) return 'Gemini is installed but not authenticated on the server yet.';
+    if (/GEMINI_API_KEY|GOOGLE_GENAI_USE_VERTEXAI|GOOGLE_GENAI_USE_GCA|Auth method|Antigravity.*not signed in|please sign in/i.test(raw)) return 'Antigravity is installed but not authenticated on the server yet.';
     if (/ECONNREFUSED|Cannot connect to OpenClaw gateway|gateway.*not connected/i.test(raw)) return 'OpenClaw is reconnecting right now. Give it a few seconds and retry.';
     return raw;
   }, []);

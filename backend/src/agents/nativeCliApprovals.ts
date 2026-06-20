@@ -110,3 +110,20 @@ export function resolveNativeCliApproval(
 export function getPendingNativeCliApproval(approvalId: string): ExecApprovalRequest | null {
   return pending.get(approvalId)?.approval || null;
 }
+
+/**
+ * Snapshot of all currently-pending (non-expired) native CLI approvals.
+ *
+ * Used to replay in-flight approval requests to a client that connects (or
+ * reconnects) after the original request was emitted. Without this, a reload /
+ * chat switch / WS or SSE reconnect during a Claude Code turn that is parked
+ * awaiting approval would never re-deliver the popup, and the request would sit
+ * pending until it timed out and auto-denied.
+ */
+export function listPendingNativeCliApprovals(now = Date.now()): ExecApprovalRequest[] {
+  const approvals: ExecApprovalRequest[] = [];
+  for (const entry of pending.values()) {
+    if (entry.approval.expiresAtMs > now) approvals.push(entry.approval);
+  }
+  return approvals.sort((a, b) => a.createdAtMs - b.createdAtMs);
+}

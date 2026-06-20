@@ -6,6 +6,7 @@ interface OpenClawProviderPickerProps {
   statusMap: Map<string, ProviderStatus>;
   onSelect: (provider: ProviderUIConfig) => void;
   onDeviceFlow: () => void;
+  onNativeCliFlow: (provider: 'gemini') => void;
   onClose: () => void;
 }
 
@@ -17,6 +18,8 @@ function authLabel(provider: ProviderUIConfig) {
       return 'Setup token';
     case 'device_code':
       return 'Device code';
+    case 'native_cli':
+      return 'Native CLI';
     default:
       return 'API key';
   }
@@ -24,18 +27,20 @@ function authLabel(provider: ProviderUIConfig) {
 
 // Group: subscription-style first, then API key providers, then advanced
 function groupProviders() {
-  const subscription = PROVIDERS.filter((p) => p.primaryAuthType === 'oauth' || p.primaryAuthType === 'setup_token' || p.primaryAuthType === 'device_code');
+  const subscription = PROVIDERS.filter((p) => p.primaryAuthType === 'oauth' || p.primaryAuthType === 'setup_token' || p.primaryAuthType === 'device_code' || p.primaryAuthType === 'native_cli');
   const apiKey = PROVIDERS.filter((p) => p.primaryAuthType === 'api_key' && p.tier <= 2);
   const advanced = PROVIDERS.filter((p) => p.primaryAuthType === 'api_key' && p.tier > 2);
   return { subscription, apiKey, advanced };
 }
 
-export default function OpenClawProviderPicker({ statusMap, onSelect, onDeviceFlow, onClose }: OpenClawProviderPickerProps) {
+export default function OpenClawProviderPicker({ statusMap, onSelect, onDeviceFlow, onNativeCliFlow, onClose }: OpenClawProviderPickerProps) {
   const { subscription, apiKey, advanced } = groupProviders();
 
   const handleClick = (provider: ProviderUIConfig) => {
     if (provider.id === 'github-copilot') {
       onDeviceFlow();
+    } else if (provider.id === 'google-antigravity') {
+      onNativeCliFlow('gemini');
     } else {
       onSelect(provider);
     }

@@ -419,7 +419,7 @@ const AUTOCOMPLETE_DB: AutocompleteSuggestion[] = [
   { command: 'codex', description: 'Start Codex session', category: 'agents' },
   { command: 'codex exec "task"', description: 'One-shot Codex task', category: 'agents' },
   { command: 'codex --help', description: 'Show Codex CLI options', category: 'agents' },
-  { command: 'gemini', description: 'Start Gemini CLI session', category: 'agents' },
+  { command: 'agy', description: 'Start Antigravity CLI session', category: 'agents' },
   // ── Text Processing ───────────────────────────────────────────
   { command: 'wc -l', description: 'Count lines', category: 'text' },
   { command: 'sort | uniq -c | sort -rn', description: 'Frequency count', category: 'text' },

@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.18"
+readonly VERSION="3.25.19"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -28,7 +28,7 @@ readonly MIN_RAM_MB=3500
 readonly MIN_DISK_GB=35
 
 # Pinned versions
-# OpenClaw: use latest during development; pin to a stable version for releases
+readonly PIN_OPENCLAW_VERSION="2026.6.8"
 readonly PIN_NODE_MAJOR="22"
 readonly PIN_NODE_MIN_MINOR="16"
 
@@ -573,9 +573,9 @@ update_dependencies() {
     local current_oc
     current_oc="$(openclaw --version 2>/dev/null | head -1 | grep -oP '\d{4}\.\d+\.\d+' || echo '')"
     local latest_oc
-    latest_oc="$(npm view openclaw version 2>/dev/null || echo '')"
+    latest_oc="${PIN_OPENCLAW_VERSION}"
     if [[ -n "${latest_oc}" && "${current_oc}" != "${latest_oc}" ]]; then
-      spin "Updating OpenClaw (${current_oc} → ${latest_oc})"         "npm install -g openclaw@latest 2>/dev/null" || true
+      spin "Updating OpenClaw (${current_oc} → ${latest_oc})"         "npm install -g openclaw@${PIN_OPENCLAW_VERSION} 2>/dev/null" || true
     else
       ok "OpenClaw ${current_oc:-unknown} (current)"
     fi
@@ -609,7 +609,7 @@ update_dependencies() {
 
   # Coding tools — only update if already installed
   local pkg cmd current_ver latest_ver
-  for pkg_spec in "@openai/codex:codex" "@anthropic-ai/claude-code:claude" "@google/gemini-cli:gemini"; do
+  for pkg_spec in "@openai/codex:codex" "@anthropic-ai/claude-code:claude"; do
     pkg="${pkg_spec%%:*}"
     cmd="${pkg_spec##*:}"
     if command -v "${cmd}" &>/dev/null; then
@@ -622,6 +622,12 @@ update_dependencies() {
       fi
     fi
   done
+
+  if command -v agy &>/dev/null; then
+    local current_agy
+    current_agy="$(agy --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo 'unknown')"
+    spin "Updating Antigravity CLI (currently ${current_agy})" "curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin >/dev/null 2>&1" || true
+  fi
 
   # ── Tier 2: Minor/patch only (apt-based) ──
 
@@ -1416,7 +1422,7 @@ install_ai_tools() {
   elif command -v openclaw &>/dev/null; then
     ok "OpenClaw $(openclaw --version 2>/dev/null | head -1 || echo '')"
   else
-    spin "Installing OpenClaw (AI agent framework)" "npm install -g openclaw@latest"
+    spin "Installing OpenClaw (AI agent framework)" "npm install -g openclaw@${PIN_OPENCLAW_VERSION}"
     ok "OpenClaw"
   fi
 
@@ -2154,6 +2160,38 @@ auto_apply_openclaw_compatibility_hotfix() {
   ok "OpenClaw compatibility hotfix checked"
 }
 
+run_openclaw_doctor_repair() {
+  if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
+    return 0
+  fi
+
+  if ! spin "Migrating OpenClaw runtime state" "OPENCLAW_ALLOW_ROOT=1 openclaw doctor --fix --non-interactive --yes"; then
+    warn "OpenClaw doctor repair failed or is unsupported. Continuing install/update; AI provider logins may need manual repair."
+    return 0
+  fi
+
+  ok "OpenClaw runtime state checked"
+}
+
+repair_openclaw_portal_model_config() {
+  if $SKIP_OPENCLAW || ! command -v node &>/dev/null; then
+    return 0
+  fi
+
+  local helper="${PORTAL_DIR}/backend/dist/utils/openclawCli.js"
+  if [[ ! -f "${helper}" ]]; then
+    warn "Portal OpenClaw model repair helper is missing. Skipping model config normalization."
+    return 0
+  fi
+
+  if ! spin "Normalizing OpenClaw model configuration" "OPENCLAW_ALLOW_ROOT=1 NODE_PATH='${PORTAL_DIR}/backend/node_modules' node -e 'const helper = process.argv[1]; const mod = require(helper); const result = mod.repairClaudeSubscriptionConfig(); console.log(JSON.stringify(result));' '${helper}'"; then
+    warn "OpenClaw model configuration normalization failed. Continuing install/update; check ${LOG_FILE}."
+    return 0
+  fi
+
+  ok "OpenClaw model configuration checked"
+}
+
 configure_openclaw_codex_harness_defaults() {
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
@@ -2198,6 +2236,15 @@ PY
   else
     warn "Could not update OpenClaw Codex harness defaults"
   fi
+}
+
+prepare_openclaw_runtime_for_portal() {
+  ensure_openclaw_sandbox_image
+  run_openclaw_doctor_repair
+  auto_apply_openclaw_compatibility_hotfix
+  repair_openclaw_portal_model_config
+  configure_openclaw_codex_harness_defaults
+  ensure_openclaw_gateway_boots_cleanly || true
 }
 
 configure_backup_timers() {
@@ -2294,10 +2341,7 @@ start_portal() {
 
   # Start OpenClaw gateway first (portal connects to it)
   if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
-    ensure_openclaw_sandbox_image
-    auto_apply_openclaw_compatibility_hotfix
-    configure_openclaw_codex_harness_defaults
-    ensure_openclaw_gateway_boots_cleanly || true
+    prepare_openclaw_runtime_for_portal
     sleep 3  # Let gateway fully initialize and write its config
 
     # CRITICAL: Sync the gateway token into .env.production
@@ -2533,10 +2577,7 @@ do_update() {
 
   info "Starting OpenClaw gateway and portal..."
   if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
-    ensure_openclaw_sandbox_image
-    auto_apply_openclaw_compatibility_hotfix
-    configure_openclaw_codex_harness_defaults
-    ensure_openclaw_gateway_boots_cleanly || true
+    prepare_openclaw_runtime_for_portal
     sleep 3
 
     local oc_config_path="${HOME}/.openclaw/openclaw.json"

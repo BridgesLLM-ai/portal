@@ -2,6 +2,9 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'anthropic/sonnet-4.6': 'anthropic/claude-sonnet-4-6',
   'anthropic/claude-sonnet-4.6': 'anthropic/claude-sonnet-4-6',
   'anthropic/claude-sonnet-4-6': 'anthropic/claude-sonnet-4-6',
+  'anthropic/opus-4.8': 'anthropic/claude-opus-4-8',
+  'anthropic/claude-opus-4.8': 'anthropic/claude-opus-4-8',
+  'anthropic/claude-opus-4-8': 'anthropic/claude-opus-4-8',
   'anthropic/opus-4.6': 'anthropic/claude-opus-4-6',
   'anthropic/claude-opus-4.6': 'anthropic/claude-opus-4-6',
   'anthropic/claude-opus-4-6': 'anthropic/claude-opus-4-6',
@@ -11,12 +14,54 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'claude-cli/sonnet-4.6': 'anthropic/claude-sonnet-4-6',
   'claude-cli/claude-sonnet-4.6': 'anthropic/claude-sonnet-4-6',
   'claude-cli/claude-sonnet-4-6': 'anthropic/claude-sonnet-4-6',
+  'claude-cli/opus-4.8': 'anthropic/claude-opus-4-8',
+  'claude-cli/claude-opus-4.8': 'anthropic/claude-opus-4-8',
+  'claude-cli/claude-opus-4-8': 'anthropic/claude-opus-4-8',
   'claude-cli/opus-4.6': 'anthropic/claude-opus-4-6',
   'claude-cli/claude-opus-4.6': 'anthropic/claude-opus-4-6',
   'claude-cli/claude-opus-4-6': 'anthropic/claude-opus-4-6',
   'claude-cli/haiku-4.5': 'anthropic/claude-haiku-4-5',
   'claude-cli/claude-haiku-4.5': 'anthropic/claude-haiku-4-5',
   'claude-cli/claude-haiku-4-5': 'anthropic/claude-haiku-4-5',
+};
+
+const GOOGLE_MODEL_MAP: Record<string, string> = {
+  'gemini-3-flash': 'gemini-3-flash-preview',
+  'gemini-3.1-pro': 'gemini-3.1-pro-preview',
+  'gemini-3.1-flash': 'gemini-3-flash-preview',
+  'gemini-3.1-flash-preview': 'gemini-3-flash-preview',
+  'gemini-3.1-flash-lite-preview': 'gemini-3.1-flash-lite',
+  'gemini-3-flash-lite': 'gemini-3.1-flash-lite',
+  'google/gemini-3-flash': 'google/gemini-3-flash-preview',
+  'google/gemini-3.1-pro': 'google/gemini-3.1-pro-preview',
+  'google/gemini-3.1-flash': 'google/gemini-3-flash-preview',
+  'google/gemini-3.1-flash-preview': 'google/gemini-3-flash-preview',
+  'google/gemini-3.1-flash-lite-preview': 'google/gemini-3.1-flash-lite',
+  'google/gemini-3-flash-lite': 'google/gemini-3.1-flash-lite',
+  'google-gemini-cli/gemini-3-flash': 'google-gemini-cli/gemini-3-flash-preview',
+  'google-gemini-cli/gemini-3.1-pro': 'google-gemini-cli/gemini-3.1-pro-preview',
+  'google-gemini-cli/gemini-3.1-flash': 'google-gemini-cli/gemini-3-flash-preview',
+  'google-gemini-cli/gemini-3.1-flash-preview': 'google-gemini-cli/gemini-3-flash-preview',
+  'google-gemini-cli/gemini-3.1-flash-lite-preview': 'google-gemini-cli/gemini-3.1-flash-lite',
+  'google-gemini-cli/gemini-3-flash-lite': 'google-gemini-cli/gemini-3.1-flash-lite',
+  'google-antigravity/gemini-3.5-flash-preview': 'google-antigravity/gemini-3.5-flash',
+  'google-antigravity/gemini-3.1-pro-preview': 'google-antigravity/gemini-3.1-pro-high',
+  'google-antigravity/gemini-3-pro-preview': 'google-antigravity/gemini-3.1-pro-high',
+  'google-antigravity/gemini-3.1-flash-lite': 'google-antigravity/gemini-3.5-flash',
+  'google-antigravity/gemini-3.1-flash-lite-preview': 'google-antigravity/gemini-3.5-flash',
+};
+
+const OPENAI_CODEX_MODEL_MAP: Record<string, string> = {
+  'gpt-5.4-codex': 'gpt-5.4',
+  'openai-codex/gpt-5.5-pro': 'codex/gpt-5.5',
+  'openai-codex/gpt-5.4-pro': 'codex/gpt-5.4',
+  'openai-codex/gpt-5.4-codex': 'codex/gpt-5.4',
+  'openai-codex/gpt-5.2-codex': 'codex/gpt-5.2',
+  'codex/gpt-5.5-pro': 'codex/gpt-5.5',
+  'codex/gpt-5.4-pro': 'codex/gpt-5.4',
+  'openai/gpt-5.4-codex': 'codex/gpt-5.4',
+  'codex/gpt-5.2-codex': 'codex/gpt-5.2',
+  'codex/gpt-5.4-codex': 'codex/gpt-5.4',
 };
 
 function titleCase(value: string): string {
@@ -31,9 +76,13 @@ export function canonicalizePortalModelId(rawModel: unknown): string {
   if (typeof rawModel !== 'string') return '';
   const model = rawModel.trim();
   if (!model) return '';
-  const mapped = CLAUDE_MODEL_MAP[model.toLowerCase()] || model;
+  const lower = model.toLowerCase();
+  const mapped = CLAUDE_MODEL_MAP[lower] || GOOGLE_MODEL_MAP[lower] || OPENAI_CODEX_MODEL_MAP[lower] || model;
   if (mapped.startsWith('claude-cli/')) {
     return `anthropic/${mapped.slice('claude-cli/'.length)}`;
+  }
+  if (mapped.startsWith('openai-codex/')) {
+    return `codex/${mapped.slice('openai-codex/'.length)}`;
   }
   return mapped;
 }
@@ -53,19 +102,27 @@ export function getPortalModelCatalogAliases(rawModel: unknown): string[] {
     }
   };
 
+  addProviderAlias('openai-codex', 'codex');
   addProviderAlias('openai-codex', 'openai');
+  addProviderAlias('codex', 'openai-codex');
+  addProviderAlias('codex', 'openai');
   addProviderAlias('openai', 'openai-codex');
+  addProviderAlias('openai', 'codex');
   addProviderAlias('google-gemini-cli', 'google');
+  addProviderAlias('google-gemini-cli', 'google-antigravity');
   addProviderAlias('google', 'google-gemini-cli');
+  addProviderAlias('google', 'google-antigravity');
+  addProviderAlias('google-antigravity', 'google');
+  addProviderAlias('google-antigravity', 'google-gemini-cli');
   addProviderAlias('claude-cli', 'anthropic');
   addProviderAlias('anthropic', 'claude-cli');
 
   if (!normalized.includes('/')) {
     if (/^(gpt-|o\d|codex)/i.test(normalized)) {
-      aliases.push(`openai/${normalized}`, `openai-codex/${normalized}`);
+      aliases.push(`openai/${normalized}`, `openai-codex/${normalized}`, `codex/${normalized}`);
     }
     if (normalized.startsWith('gemini-')) {
-      aliases.push(`google/${normalized}`, `google-gemini-cli/${normalized}`);
+      aliases.push(`google/${normalized}`, `google-gemini-cli/${normalized}`, `google-antigravity/${normalized}`);
     }
   }
 
@@ -167,8 +224,10 @@ export function getModelProviderLabel(rawModel: unknown): string {
     case 'claude-cli': return 'Claude CLI';
     case 'openai': return 'OpenAI';
     case 'openai-codex': return 'Codex';
+    case 'codex': return 'Codex';
     case 'google': return 'Google';
     case 'google-gemini-cli': return 'Gemini CLI';
+    case 'google-antigravity': return 'Antigravity';
     case 'openrouter': return 'OpenRouter';
     case 'ollama': return 'Ollama';
     default: return provider ? titleCase(provider) : 'Model';
@@ -182,7 +241,9 @@ export function getModelRuntimeLabel(rawModel: unknown): string | null {
     case 'anthropic': return 'API/OAuth';
     case 'claude-cli': return 'CLI';
     case 'openai-codex': return 'CLI OAuth';
+    case 'codex': return 'CLI OAuth';
     case 'google-gemini-cli': return 'CLI OAuth';
+    case 'google-antigravity': return 'CLI OAuth';
     case 'ollama': return 'Local';
     case 'openrouter': return 'Router';
     default: return null;

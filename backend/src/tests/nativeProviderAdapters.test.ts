@@ -149,7 +149,7 @@ describe('native provider adapters', () => {
     expect(invocation.args).toContain('--dangerously-bypass-approvals-and-sandbox');
   });
 
-  test('Gemini adapter uses transcript prompts and accumulates deltas', () => {
+  test('Antigravity adapter uses transcript prompts and accumulates plain text output', () => {
     const prompt = buildTranscriptPrompt([
       { id: '1', role: 'user', content: 'Earlier question', timestamp: new Date().toISOString() },
       { id: '2', role: 'assistant', content: 'Earlier answer', timestamp: new Date().toISOString() },
@@ -158,45 +158,91 @@ describe('native provider adapters', () => {
     expect(prompt).toMatch(/Latest question/);
 
     const ctx = makeContext();
-    geminiAdapter.handleStdoutLine(JSON.stringify({ type: 'thought', subject: 'Searching docs' }), ctx);
-    geminiAdapter.handleStdoutLine(JSON.stringify({ type: 'tool_use', tool_name: 'run_shell_command', tool_id: 'tool-1', parameters: { command: 'echo hi' } }), ctx);
-    geminiAdapter.handleStdoutLine(JSON.stringify({ type: 'tool_result', tool_id: 'tool-1', status: 'success', output: 'hi\n' }), ctx);
-    geminiAdapter.handleStdoutLine(JSON.stringify({ type: 'message', role: 'assistant', content: 'Hel', delta: true }), ctx);
-    geminiAdapter.handleStdoutLine(JSON.stringify({ type: 'message', role: 'assistant', content: 'lo', delta: true }), ctx);
+    geminiAdapter.handleStdoutLine('Hel', ctx);
+    geminiAdapter.handleStdoutRemainder?.('lo', ctx);
 
-    expect(ctx.emitStatus).toHaveBeenCalledWith('Searching docs');
-    expect(ctx.onStatus).toHaveBeenCalledWith(expect.objectContaining({ type: 'tool_start', toolName: 'run_shell_command' }));
-    expect(ctx.onStatus).toHaveBeenCalledWith(expect.objectContaining({ type: 'tool_end', toolResult: 'hi\n' }));
-    expect(ctx.emitChunk).toHaveBeenNthCalledWith(1, 'Hel');
+    expect(ctx.emitChunk).toHaveBeenNthCalledWith(1, 'Hel\n');
     expect(ctx.emitChunk).toHaveBeenNthCalledWith(2, 'lo');
-    expect(ctx.fullText).toBe('Hello');
+    expect(ctx.fullText).toBe('Hel\nlo');
   });
 
-  test('Gemini adapter asks before enabling headless tool execution', async () => {
+  test('Antigravity adapter surfaces printed action lines as tool events', () => {
     const ctx = makeContext();
-    ctx.message = 'Write exactly hi to /tmp/gemini-approval.txt using a command.';
+
+    geminiAdapter.handleStdoutLine('I will list the current directory.', ctx);
+    geminiAdapter.handleStdoutLine('DONE', ctx);
+
+    expect(ctx.emitStatus).toHaveBeenCalledWith(
+      expect.stringMatching(/Antigravity: list the current directory/i),
+      expect.objectContaining({ type: 'tool_start', toolName: 'inspect' }),
+    );
+    expect(ctx.emitStatus).toHaveBeenCalledWith(
+      'list the current directory',
+      expect.objectContaining({ type: 'tool_end', toolName: 'inspect' }),
+    );
+    expect(ctx.emitChunk).toHaveBeenCalledTimes(1);
+    expect(ctx.emitChunk).toHaveBeenCalledWith('DONE\n');
+    expect(ctx.fullText).toBe('DONE\n');
+  });
+
+  test('Antigravity adapter asks before enabling trusted tool execution', async () => {
+    const ctx = makeContext();
+    ctx.message = 'Write exactly hi to /tmp/antigravity-approval.txt using a command.';
     (ctx.requestApproval as jest.Mock).mockResolvedValueOnce('allow-once');
 
     const invocation = await geminiAdapter.buildInvocation(ctx);
+    ctx.setFullText('done');
+    await geminiAdapter.finalizeTurn?.(ctx);
 
     expect(ctx.requestApproval).toHaveBeenCalledWith(expect.objectContaining({
-      command: 'Gemini CLI tool execution for this turn',
-      ask: expect.stringMatching(/Gemini CLI headless mode needs approval/i),
+      command: 'Antigravity tool execution for this turn',
+      ask: expect.stringMatching(/Antigravity can run file, shell, or tool actions/i),
       resolvedPath: '/tmp',
     }));
-    expect(invocation.args).toContain('--approval-mode');
-    expect(invocation.args).toContain('yolo');
+    expect(invocation.command).toBe('agy');
+    expect(invocation.args).toContain('--dangerously-skip-permissions');
+    expect(ctx.emitStatus).toHaveBeenCalledWith(
+      'Antigravity workspace tools approved',
+      expect.objectContaining({ type: 'tool_start', toolName: 'antigravity' }),
+    );
+    expect(ctx.emitStatus).toHaveBeenCalledWith(
+      'Antigravity workspace turn completed',
+      expect.objectContaining({ type: 'tool_end', toolName: 'antigravity' }),
+    );
   });
 
-  test('Gemini adapter falls back to plan mode when tool execution is denied', async () => {
+  test('Antigravity adapter maps stale model ids and places flags before print prompt', async () => {
+    const ctx = makeContext();
+    ctx.session.model = 'google-antigravity/gemini-3-flash-preview';
+    ctx.message = 'Reply exactly OK.';
+
+    const invocation = await geminiAdapter.buildInvocation(ctx);
+
+    expect(invocation.command).toBe('agy');
+    expect(invocation.args).toContain('--model');
+    expect(invocation.args[invocation.args.indexOf('--model') + 1]).toBe('gemini-3.5-flash');
+
+    const printIndex = invocation.args.indexOf('--print');
+    expect(printIndex).toBeGreaterThan(0);
+    expect(invocation.args.slice(printIndex)).toHaveLength(2);
+    expect(invocation.args.at(-1)).toMatch(/Reply exactly OK/);
+
+    for (const flag of ['--print-timeout', '--add-dir', '--model', '--sandbox']) {
+      expect(invocation.args.indexOf(flag)).toBeGreaterThanOrEqual(0);
+      expect(invocation.args.indexOf(flag)).toBeLessThan(printIndex);
+    }
+  });
+
+  test('Antigravity adapter stays sandboxed when tool execution is denied', async () => {
     const ctx = makeContext();
     ctx.message = 'Run a shell command to inspect /tmp.';
     (ctx.requestApproval as jest.Mock).mockResolvedValueOnce('deny');
 
     const invocation = await geminiAdapter.buildInvocation(ctx);
 
-    expect(ctx.state.geminiToolExecutionDenied).toBe(true);
-    expect(invocation.args).toContain('--approval-mode');
-    expect(invocation.args).toContain('plan');
+    expect(ctx.state.antigravityToolExecutionDenied).toBe(true);
+    expect(invocation.command).toBe('agy');
+    expect(invocation.args).toContain('--sandbox');
+    expect(invocation.args).not.toContain('--dangerously-skip-permissions');
   });
 });

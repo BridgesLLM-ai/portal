@@ -4,11 +4,14 @@ import { canonicalizePortalModelId } from '../../utils/modelId';
 export function getModelFamilyKey(modelId: string | null | undefined): string {
   const normalized = canonicalizePortalModelId(modelId || '');
   if (!normalized) return '';
-  if (normalized.startsWith('google-gemini-cli/')) {
-    return `google/${normalized.slice('google-gemini-cli/'.length)}`;
+  if (normalized.startsWith('google-gemini-cli/') || normalized.startsWith('google-antigravity/')) {
+    return `google/${normalized.replace(/^google-(?:gemini-cli|antigravity)\//, '')}`;
   }
   if (normalized.startsWith('openai-codex/')) {
     return `openai/${normalized.slice('openai-codex/'.length)}`;
+  }
+  if (normalized.startsWith('codex/')) {
+    return `openai/${normalized.slice('codex/'.length)}`;
   }
   return normalized;
 }

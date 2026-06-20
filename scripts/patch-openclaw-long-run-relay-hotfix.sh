@@ -51,6 +51,20 @@ elif [[ -f "$CLI_BACKEND_WRAPPER" ]]; then
 else
   CLI_BACKEND=""
 fi
+CLAUDE_CLI_SHARED="$(python3 - "$ROOT" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+for candidate in sorted(root.glob('cli-shared-*.js'), key=lambda p: (p.stat().st_size, p.name), reverse=True):
+    try:
+        text = candidate.read_text()
+    except Exception:
+        continue
+    if 'function resolveClaudePermissionMode(context)' in text and 'CLAUDE_BYPASS_PERMISSION_MODE' in text:
+        print(candidate)
+        break
+PY
+)"
 HEARTBEAT_DETECTOR_FILE="${HEARTBEAT_EVENTS_FILTER:-$HEARTBEAT_RUNNER}"
 GEMINI_PARSER_TARGET="${CLAUDE_LIVE_SESSION:-$EXECUTE_RUNTIME}"
 
@@ -94,7 +108,9 @@ current_relay = '\tconst responsePrefix = resolveEffectiveMessagesConfig(cfg, ag
 current_relay_new = '\tconst responsePrefix = resolveEffectiveMessagesConfig(cfg, agentId, {\n\t\tchannel: delivery.channel !== "none" ? delivery.channel : void 0,\n\t\taccountId: delivery.accountId\n\t}).responsePrefix;\n\tconst entryDeliveryChannel = entry?.deliveryContext?.channel ?? entry?.lastChannel ?? entry?.origin?.surface ?? entry?.origin?.provider;\n\tconst isDirectWebchatSession = entry?.chatType === "direct" && entryDeliveryChannel === "webchat";\n\tconst { prompt, hasExecCompletion, hasCronEvents } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser: Boolean(visibility.showAlerts && (delivery.channel !== "none" && delivery.to || delivery.channel === "none" && isDirectWebchatSession)),\n\t\tworkspaceDir: resolveAgentWorkspaceDir(cfg, agentId),\n\t\tstartedAt,\n\t\theartbeatFileContent: preflight.heartbeatFileContent\n\t});'
 current_relay_v202655 = '\tconst canRelayToUser = Boolean(delivery.channel !== "none" && delivery.to && visibility.showAlerts);\n\tconst workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n\tconst useHeartbeatResponseToolPrompt = shouldUseHeartbeatResponseToolPrompt({\n\t\tcfg,\n\t\tagentId,\n\t\theartbeat,\n\t\tentry\n\t});\n\tconst { prompt, hasExecCompletion, hasRelayableExecCompletion, hasCronEvents, hasDueCommitments, usesHeartbeatResponseTool } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser,\n\t\tworkspaceDir,\n\t\tstartedAt,\n\t\tdueTasks: dueHeartbeatTasks,'
 current_relay_v202655_new = '\tconst entryDeliveryChannel = entry?.deliveryContext?.channel ?? entry?.lastChannel ?? entry?.origin?.surface ?? entry?.origin?.provider;\n\tconst isDirectWebchatSession = entry?.chatType === "direct" && entryDeliveryChannel === "webchat";\n\tconst canRelayToUser = Boolean(visibility.showAlerts && (delivery.channel !== "none" && delivery.to || delivery.channel === "none" && isDirectWebchatSession));\n\tconst workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n\tconst useHeartbeatResponseToolPrompt = shouldUseHeartbeatResponseToolPrompt({\n\t\tcfg,\n\t\tagentId,\n\t\theartbeat,\n\t\tentry\n\t});\n\tconst { prompt, hasExecCompletion, hasRelayableExecCompletion, hasCronEvents, hasDueCommitments, usesHeartbeatResponseTool } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser,\n\t\tworkspaceDir,\n\t\tstartedAt,\n\t\tdueTasks: dueHeartbeatTasks,'
-if new_relay in text or current_relay_new in text or current_relay_v202655_new in text:
+current_relay_v202668 = '\tconst canRelayToUser = Boolean(delivery.channel !== "none" && delivery.to && visibility.showAlerts);\n\tconst workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n\tconst useHeartbeatResponseToolPrompt = shouldUseHeartbeatResponseToolPrompt({\n\t\tcfg,\n\t\tagentId,\n\t\theartbeat,\n\t\tentry,\n\t\tchatType: delivery.chatType\n\t});\n\tconst { prompt, hasExecCompletion, hasRelayableExecCompletion, hasCronEvents, hasDueCommitments, usesHeartbeatResponseTool } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser,\n\t\tworkspaceDir,\n\t\tstartedAt,\n\t\tdueTasks: dueHeartbeatTasks,'
+current_relay_v202668_new = '\tconst entryDeliveryChannel = entry?.deliveryContext?.channel ?? entry?.lastChannel ?? entry?.origin?.surface ?? entry?.origin?.provider;\n\tconst isDirectWebchatSession = entry?.chatType === "direct" && entryDeliveryChannel === "webchat";\n\tconst canRelayToUser = Boolean(visibility.showAlerts && (delivery.channel !== "none" && delivery.to || delivery.channel === "none" && isDirectWebchatSession));\n\tconst workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n\tconst useHeartbeatResponseToolPrompt = shouldUseHeartbeatResponseToolPrompt({\n\t\tcfg,\n\t\tagentId,\n\t\theartbeat,\n\t\tentry,\n\t\tchatType: delivery.chatType\n\t});\n\tconst { prompt, hasExecCompletion, hasRelayableExecCompletion, hasCronEvents, hasDueCommitments, usesHeartbeatResponseTool } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser,\n\t\tworkspaceDir,\n\t\tstartedAt,\n\t\tdueTasks: dueHeartbeatTasks,'
+if new_relay in text or current_relay_new in text or current_relay_v202655_new in text or current_relay_v202668_new in text:
     print(f"relay already patched: {p}")
 elif old_relay in text:
     text = text.replace(old_relay, new_relay, 1)
@@ -105,6 +121,9 @@ elif current_relay in text:
 elif current_relay_v202655 in text:
     text = text.replace(current_relay_v202655, current_relay_v202655_new, 1)
     print(f"patched relay routing (2026.5.5 bundle): {p}")
+elif current_relay_v202668 in text:
+    text = text.replace(current_relay_v202668, current_relay_v202668_new, 1)
+    print(f"patched relay routing (2026.6.8 bundle): {p}")
 else:
     print(f"relay routing patch not needed or unsupported for current bundle: {p}")
 p.write_text(text)
@@ -182,201 +201,58 @@ else
   echo "skipping Gemini CLI backend patch: backend bundle not found under $ROOT"
 fi
 
+if [[ -n "$CLAUDE_CLI_SHARED" && -f "$CLAUDE_CLI_SHARED" ]]; then
+python3 - "$CLAUDE_CLI_SHARED" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+text = p.read_text()
+marker = 'process.getuid() === 0'
+old = '''function resolveClaudePermissionMode(context) {
+\treturn isOpenClawRequestedYolo(context) ? {
+\t\tmode: CLAUDE_BYPASS_PERMISSION_MODE,
+\t\toverrideExisting: false
+\t} : { overrideExisting: false };
+}
+'''
+new = '''function resolveClaudePermissionMode(context) {
+\tif (isOpenClawRequestedYolo(context) && typeof process.getuid === "function" && process.getuid() === 0) return {
+\t\tmode: CLAUDE_DEFAULT_PERMISSION_MODE,
+\t\toverrideExisting: true
+\t};
+\treturn isOpenClawRequestedYolo(context) ? {
+\t\tmode: CLAUDE_BYPASS_PERMISSION_MODE,
+\t\toverrideExisting: false
+\t} : { overrideExisting: false };
+}
+'''
+if marker in text:
+    print(f"claude root permission mode already patched: {p}")
+elif old in text:
+    p.write_text(text.replace(old, new, 1))
+    print(f"patched claude root permission mode: {p}")
+else:
+    raise SystemExit(f"Claude permission resolver target not found in {p}")
+PY
+else
+  echo "skipping Claude root permission patch: cli-shared bundle not found under $ROOT"
+fi
+
 if [[ -n "$GEMINI_PARSER_TARGET" ]]; then
 python3 - "$GEMINI_PARSER_TARGET" <<'PY'
 from pathlib import Path
+import re
 import sys
 
 p = Path(sys.argv[1])
 text = p.read_text()
 record_fn = 'isRecord$1' if 'isRecord$1(' in text else 'isRecord'
 
-helper_old = 'function isClaudeCliProvider(providerId) {\n\treturn normalizeLowercaseStringOrEmpty(providerId) === "claude-cli";\n}\nfunction usesClaudeStreamJsonDialect(params) {\n\treturn params.backend.jsonlDialect === "claude-stream-json" || isClaudeCliProvider(params.providerId);\n}\n'
-helper_new = 'function isClaudeCliProvider(providerId) {\n\treturn normalizeLowercaseStringOrEmpty(providerId) === "claude-cli";\n}\nfunction isGeminiCliProvider(providerId) {\n\tconst normalized = normalizeLowercaseStringOrEmpty(providerId);\n\treturn normalized === "google-gemini-cli" || normalized === "gemini-cli";\n}\nfunction usesClaudeStreamJsonDialect(params) {\n\treturn params.backend.jsonlDialect === "claude-stream-json" || isClaudeCliProvider(params.providerId);\n}\nfunction usesGeminiStreamJsonDialect(params) {\n\treturn params.backend.jsonlDialect === "gemini-stream-json" || isGeminiCliProvider(params.providerId);\n}\n'
-parser_block = fr'''function parseClaudeCliStreamingDelta(params) {{
-	if (!usesClaudeStreamJsonDialect(params)) return null;
-	if (params.parsed.type !== "stream_event" || !{record_fn}(params.parsed.event)) return null;
-	const event = params.parsed.event;
-	if (event.type !== "content_block_delta" || !{record_fn}(event.delta)) return null;
-	const delta = event.delta;
-	if (delta.type !== "text_delta" || typeof delta.text !== "string") return null;
-	if (!delta.text) return null;
-	return {{
-		text: `${{params.textSoFar}}${{delta.text}}`,
-		delta: delta.text,
-		sessionId: params.sessionId,
-		usage: params.usage
-	}};
-}}
-function parseGeminiCliStreamingRecord(params) {{
-	if (!usesGeminiStreamJsonDialect(params)) return null;
-	if (params.parsed.type === "message" && params.parsed.role === "assistant" && typeof params.parsed.content === "string") {{
-		const chunk = params.parsed.content;
-		if (!chunk) return null;
-		const text = params.parsed.delta === true ? `${{params.textSoFar}}${{chunk}}` : chunk;
-		const delta = params.parsed.delta === true ? chunk : text.startsWith(params.textSoFar) ? text.slice(params.textSoFar.length) : text;
-		return {{
-			kind: "assistant",
-			event: {{
-				text,
-				delta,
-				sessionId: params.sessionId,
-				usage: params.usage
-			}}
-		}};
-	}}
-	if (params.parsed.type === "tool_use" && typeof params.parsed.tool_id === "string") return {{
-		kind: "tool",
-		event: {{
-			phase: "start",
-			name: typeof params.parsed.tool_name === "string" ? params.parsed.tool_name : "tool",
-			toolCallId: params.parsed.tool_id,
-			input: params.parsed.parameters,
-			args: params.parsed.parameters
-		}}
-	}};
-	if (params.parsed.type === "tool_result" && typeof params.parsed.tool_id === "string") {{
-		const output = typeof params.parsed.output === "string" ? params.parsed.output : collectCliText(params.parsed.output);
-		const errorMessage = {record_fn}(params.parsed.error) ? readNestedErrorMessage(params.parsed.error) : typeof params.parsed.error === "string" ? params.parsed.error : void 0;
-		return {{
-			kind: "tool",
-			event: {{
-				phase: "result",
-				toolCallId: params.parsed.tool_id,
-				output: output || errorMessage,
-				result: output || errorMessage,
-				isError: params.parsed.status === "error" || Boolean(errorMessage)
-			}}
-		}};
-	}}
-	return null;
-}}
-function createCliJsonlStreamingParser(params) {{
-	let lineBuffer = "";
-	let assistantText = "";
-	let sessionId;
-	let usage;
-	const toolNameById = new Map();
-	const handleParsedRecord = (parsed) => {{
-		sessionId = pickCliSessionId(parsed, params.backend) ?? sessionId;
-		if (!sessionId && typeof parsed.thread_id === "string") sessionId = parsed.thread_id.trim();
-		usage = readCliUsage(parsed) ?? usage;
-		const geminiRecord = parseGeminiCliStreamingRecord({{
-			backend: params.backend,
-			providerId: params.providerId,
-			parsed,
-			textSoFar: assistantText,
-			sessionId,
-			usage
-		}});
-		if (geminiRecord) {{
-			if (geminiRecord.kind === "assistant") {{
-				assistantText = geminiRecord.event.text;
-				params.onAssistantDelta(geminiRecord.event);
-				return;
-			}}
-			if (geminiRecord.kind === "tool") {{
-				const event = {{ ...geminiRecord.event }};
-				if (event.phase === "start" && typeof event.name === "string") toolNameById.set(event.toolCallId, event.name);
-				else if (!event.name && toolNameById.has(event.toolCallId)) event.name = toolNameById.get(event.toolCallId);
-				if (event.phase === "result") {{
-					if (!event.name && toolNameById.has(event.toolCallId)) event.name = toolNameById.get(event.toolCallId);
-					toolNameById.delete(event.toolCallId);
-				}}
-				params.onToolEvent?.(event);
-				return;
-			}}
-		}}
-		const delta = parseClaudeCliStreamingDelta({{
-			backend: params.backend,
-			providerId: params.providerId,
-			parsed,
-			textSoFar: assistantText,
-			sessionId,
-			usage
-		}});
-		if (!delta) return;
-		assistantText = delta.text;
-		params.onAssistantDelta(delta);
-	}};
-	const flushLines = (flushPartial) => {{
-		while (true) {{
-			const newlineIndex = lineBuffer.indexOf("\n");
-			if (newlineIndex < 0) break;
-			const line = lineBuffer.slice(0, newlineIndex).trim();
-			lineBuffer = lineBuffer.slice(newlineIndex + 1);
-			if (!line) continue;
-			for (const parsed of parseJsonRecordCandidates(line)) handleParsedRecord(parsed);
-		}}
-		if (!flushPartial) return;
-		const tail = lineBuffer.trim();
-		lineBuffer = "";
-		if (!tail) return;
-		for (const parsed of parseJsonRecordCandidates(tail)) handleParsedRecord(parsed);
-	}};
-	return {{
-		push(chunk) {{
-			if (!chunk) return;
-			lineBuffer += chunk;
-			flushLines(false);
-		}},
-		finish() {{
-			flushLines(true);
-		}}
-	}};
-}}
-'''.replace('{record_fn}', record_fn)
-parse_cli_jsonl_block = fr'''function parseCliJsonl(raw, backend, providerId) {{
-	const lines = raw.split(/\r?\n/g).map((line) => line.trim()).filter(Boolean);
-	if (lines.length === 0) return null;
-	let sessionId;
-	let usage;
-	let assistantText = "";
-	let sawStructuredOutput = false;
-	const texts = [];
-	for (const line of lines) for (const parsed of parseJsonRecordCandidates(line)) {{
-		if (!sessionId) sessionId = pickCliSessionId(parsed, backend);
-		if (!sessionId && typeof parsed.thread_id === "string") sessionId = parsed.thread_id.trim();
-		usage = readCliUsage(parsed) ?? usage;
-		const geminiRecord = parseGeminiCliStreamingRecord({{
-			backend,
-			providerId,
-			parsed,
-			textSoFar: assistantText,
-			sessionId,
-			usage
-		}});
-		if (geminiRecord) {{
-			sawStructuredOutput = true;
-			if (geminiRecord.kind === "assistant") assistantText = geminiRecord.event.text;
-			continue;
-		}}
-		const claudeResult = parseClaudeCliJsonlResult({{
-			backend,
-			providerId,
-			parsed,
-			sessionId,
-			usage
-		}});
-		if (claudeResult) return claudeResult;
-		const item = {record_fn}(parsed.item) ? parsed.item : null;
-		if (item && typeof item.text === "string") {{
-			const type = normalizeLowercaseStringOrEmpty(item.type);
-			if (!type || type.includes("message")) {{
-				texts.push(item.text);
-				sawStructuredOutput = true;
-			}}
-		}} else if (sessionId || usage) sawStructuredOutput = true;
-	}}
-	const text = assistantText.trim() || texts.join("\n").trim();
-	if (!text && !sawStructuredOutput) return null;
-	return {{
-		text,
-		sessionId,
-		usage
-	}};
-}}
-'''.replace('{record_fn}', record_fn)
+old_claude_live_root = 'permissionMode: security === "full" && ask === "off" ? "bypassPermissions" : "default"'
+new_claude_live_root = 'permissionMode: security === "full" && ask === "off" && !(typeof process.getuid === "function" && process.getuid() === 0) ? "bypassPermissions" : "default"'
+if new_claude_live_root not in text and old_claude_live_root in text:
+    text = text.replace(old_claude_live_root, new_claude_live_root, 1)
 
 def replace_exact(haystack: str, old: str, new: str, label: str) -> str:
     if new in haystack:
@@ -396,8 +272,204 @@ def replace_between(haystack: str, start: str, end: str, replacement: str, label
         raise SystemExit(f"Missing end marker for {label} in {p}")
     return haystack[:start_idx] + replacement + haystack[end_idx:]
 
-text = replace_exact(text, helper_old, helper_new, 'runtime dialect helpers')
-text = replace_between(text, 'function parseClaudeCliStreamingDelta(params) {', 'function parseCliJsonl(raw, backend, providerId) {', parser_block, 'runtime streaming parser block')
+def replace_after(haystack: str, section_start: str, old: str, new: str, label: str) -> str:
+    if new in haystack:
+        return haystack
+    start_idx = haystack.find(section_start)
+    if start_idx < 0:
+        raise SystemExit(f"Missing section marker for {label} in {p}")
+    old_idx = haystack.find(old, start_idx)
+    if old_idx < 0:
+        raise SystemExit(f"Missing expected snippet for {label} in {p}")
+    return haystack[:old_idx] + new + haystack[old_idx + len(old):]
+
+gemini_dialect_helpers = '''function isGeminiCliProvider(providerId) {
+\tconst normalized = normalizeLowercaseStringOrEmpty(providerId);
+\treturn normalized === "google-gemini-cli" || normalized === "gemini-cli";
+}
+function usesGeminiStreamJsonDialect(params) {
+\treturn params.backend.jsonlDialect === "gemini-stream-json" || isGeminiCliProvider(params.providerId);
+}
+'''
+if 'function isGeminiCliProvider(providerId)' not in text:
+    text, count = re.subn(
+        r'(function supportsCliJsonlToolEvents\(params\) \{[\s\S]*?\n\})(\nfunction isClaudeStreamJsonResult\(params\) \{)',
+        r'\1\n' + gemini_dialect_helpers + r'\2',
+        text,
+        count=1,
+    )
+    if count == 0:
+        text = replace_exact(
+            text,
+            'function usesClaudeStreamJsonDialect(params) {\n\treturn params.backend.jsonlDialect === "claude-stream-json" || isClaudeCliProvider(params.providerId);\n}\n',
+            'function usesClaudeStreamJsonDialect(params) {\n\treturn params.backend.jsonlDialect === "claude-stream-json" || isClaudeCliProvider(params.providerId);\n}\n' + gemini_dialect_helpers,
+            'runtime Gemini dialect helpers',
+        )
+
+gemini_parser_helpers = f'''function parseGeminiCliStreamingDelta(params) {{
+\tif (!usesGeminiStreamJsonDialect(params)) return null;
+\tif (params.parsed.type !== "message" || params.parsed.role !== "assistant" || typeof params.parsed.content !== "string") return null;
+\tconst chunk = params.parsed.content;
+\tif (!chunk) return null;
+\tconst text = params.parsed.delta === true ? `${{params.textSoFar}}${{chunk}}` : chunk;
+\tconst delta = params.parsed.delta === true ? chunk : text.startsWith(params.textSoFar) ? text.slice(params.textSoFar.length) : text;
+\treturn {{
+\t\ttext,
+\t\tdelta,
+\t\tsessionId: params.sessionId,
+\t\tusage: params.usage
+\t}};
+}}
+function dispatchGeminiCliStreamingToolEvent(params) {{
+\tif (!usesGeminiStreamJsonDialect(params)) return;
+\tconst tracker = params.tracker;
+\tif (params.parsed.type === "tool_use" && typeof params.parsed.tool_id === "string") {{
+\t\tconst toolCallId = params.parsed.tool_id.trim();
+\t\tconst name = typeof params.parsed.tool_name === "string" && params.parsed.tool_name.trim() ? params.parsed.tool_name.trim() : "tool";
+\t\tconst args = {record_fn}(params.parsed.parameters) ? params.parsed.parameters : {{}};
+\t\tif (!toolCallId) return;
+\t\ttracker.nameById.set(toolCallId, name);
+\t\tif (params.onToolUseStart) emitToolStartOnce(tracker, toolCallId, name, args, params.onToolUseStart);
+\t\telse params.onToolEvent?.({{ phase: "start", name, toolCallId, input: args, args }});
+\t\treturn;
+\t}}
+\tif (params.parsed.type === "tool_result" && typeof params.parsed.tool_id === "string") {{
+\t\tconst toolCallId = params.parsed.tool_id.trim();
+\t\tif (!toolCallId) return;
+\t\tconst name = tracker.nameById.get(toolCallId) ?? "";
+\t\tconst output = typeof params.parsed.output === "string" ? params.parsed.output : collectCliText(params.parsed.output) || collectCliText(params.parsed.result);
+\t\tconst errorMessage = {record_fn}(params.parsed.error) ? readNestedErrorMessage(params.parsed.error) : typeof params.parsed.error === "string" ? params.parsed.error : void 0;
+\t\tconst result = output || errorMessage;
+\t\tconst isError = params.parsed.status === "error" || Boolean(errorMessage);
+\t\tif (params.onToolResult) emitToolResultOnce(tracker, toolCallId, isError, result, params.onToolResult);
+\t\telse params.onToolEvent?.({{ phase: "result", name, toolCallId, output: result, result, isError }});
+\t\ttracker.nameById.delete(toolCallId);
+\t}}
+}}
+'''.replace('{record_fn}', record_fn)
+if 'function parseGeminiCliStreamingDelta(params)' not in text:
+    text = text.replace('function createToolUseTracker() {', gemini_parser_helpers + 'function createToolUseTracker() {', 1)
+
+# Earlier versions of this hotfix used a raw Python string for the Gemini
+# parser helpers, which wrote literal "\t" sequences into the JS bundle.
+# Normalize only line-leading escaped tabs so already-patched bundles recover.
+text = re.sub(r'(?m)^(?:\\t)+', lambda match: '\t' * (len(match.group(0)) // 2), text)
+
+streaming_claude_result = '''\t\tconst result = parseClaudeCliJsonlResult({
+\t\t\tbackend: params.backend,
+\t\t\tproviderId: params.providerId,
+\t\t\tparsed,
+\t\t\tsessionId,
+\t\t\tusage
+\t\t});
+\t\tif (result) {
+\t\t\toutput = result;
+\t\t\treturn;
+\t\t}
+'''
+streaming_claude_result_with_gemini = streaming_claude_result + '''\t\tconst geminiDelta = parseGeminiCliStreamingDelta({
+\t\t\tbackend: params.backend,
+\t\t\tproviderId: params.providerId,
+\t\t\tparsed,
+\t\t\ttextSoFar: assistantText,
+\t\t\tsessionId,
+\t\t\tusage
+\t\t});
+\t\tif (geminiDelta) {
+\t\t\tassistantText = geminiDelta.text;
+\t\t\tparams.onAssistantDelta(geminiDelta);
+\t\t\treturn;
+\t\t}
+'''
+text = replace_exact(text, streaming_claude_result, streaming_claude_result_with_gemini, 'runtime Gemini streaming delta insertion')
+
+streaming_tool_dispatch = '''\t\tif (params.onToolUseStart || params.onToolResult) dispatchClaudeCliStreamingToolEvent({
+\t\t\tbackend: params.backend,
+\t\t\tproviderId: params.providerId,
+\t\t\tparsed,
+\t\t\ttracker: toolTracker,
+\t\t\tonToolUseStart: params.onToolUseStart,
+\t\t\tonToolResult: params.onToolResult
+\t\t});
+'''
+streaming_tool_dispatch_with_gemini = '''\t\tif (params.onToolUseStart || params.onToolResult || params.onToolEvent) {
+\t\t\tdispatchGeminiCliStreamingToolEvent({
+\t\t\t\tbackend: params.backend,
+\t\t\t\tproviderId: params.providerId,
+\t\t\t\tparsed,
+\t\t\t\ttracker: toolTracker,
+\t\t\t\tonToolUseStart: params.onToolUseStart,
+\t\t\t\tonToolResult: params.onToolResult,
+\t\t\t\tonToolEvent: params.onToolEvent
+\t\t\t});
+\t\t\tdispatchClaudeCliStreamingToolEvent({
+\t\t\t\tbackend: params.backend,
+\t\t\t\tproviderId: params.providerId,
+\t\t\t\tparsed,
+\t\t\t\ttracker: toolTracker,
+\t\t\t\tonToolUseStart: params.onToolUseStart,
+\t\t\t\tonToolResult: params.onToolResult
+\t\t\t});
+\t\t}
+'''
+text = replace_exact(text, streaming_tool_dispatch, streaming_tool_dispatch_with_gemini, 'runtime Gemini tool event insertion')
+
+parse_cli_jsonl_block = f'''function parseCliJsonl(raw, backend, providerId) {{
+\tconst lines = normalizeStringEntries(raw.split(/\\r?\\n/g));
+\tif (lines.length === 0) return null;
+\tlet sessionId;
+\tlet usage;
+\tlet assistantText = "";
+\tlet sawStructuredOutput = false;
+\tconst texts = [];
+\tfor (const line of lines) for (const parsed of parseJsonRecordCandidates(line)) {{
+\t\tsessionId = pickCliSessionId(parsed, backend) ?? sessionId;
+\t\tif (!sessionId && typeof parsed.thread_id === "string") sessionId = parsed.thread_id.trim();
+\t\tconst nextUsage = readCliUsage(parsed);
+\t\tif (!isClaudeStreamJsonResult({{
+\t\t\tbackend,
+\t\t\tproviderId,
+\t\t\tparsed
+\t\t}}) || !usage) usage = nextUsage ?? usage;
+\t\tconst claudeResult = parseClaudeCliJsonlResult({{
+\t\t\tbackend,
+\t\t\tproviderId,
+\t\t\tparsed,
+\t\t\tsessionId,
+\t\t\tusage
+\t\t}});
+\t\tif (claudeResult) return claudeResult;
+\t\tconst geminiDelta = parseGeminiCliStreamingDelta({{
+\t\t\tbackend,
+\t\t\tproviderId,
+\t\t\tparsed,
+\t\t\ttextSoFar: assistantText,
+\t\t\tsessionId,
+\t\t\tusage
+\t\t}});
+\t\tif (geminiDelta) {{
+\t\t\tassistantText = geminiDelta.text;
+\t\t\tsawStructuredOutput = true;
+\t\t\tcontinue;
+\t\t}}
+\t\tconst item = {record_fn}(parsed.item) ? parsed.item : null;
+\t\tif (item && typeof item.text === "string") {{
+\t\t\tconst type = normalizeLowercaseStringOrEmpty(item.type);
+\t\t\tif (!type || type.includes("message")) {{
+\t\t\t\ttexts.push(item.text);
+\t\t\t\tsawStructuredOutput = true;
+\t\t\t}}
+\t\t}} else if (sessionId || usage) sawStructuredOutput = true;
+\t}}
+\tconst text = assistantText.trim() || texts.join("\\n").trim();
+\tif (!text && !sawStructuredOutput) return null;
+\treturn {{
+\t\ttext,
+\t\tsessionId,
+\t\tusage
+\t}};
+}}
+'''
 text = replace_between(text, 'function parseCliJsonl(raw, backend, providerId) {', 'function parseCliOutput(params) {', parse_cli_jsonl_block, 'runtime parseCliJsonl block')
 
 p.write_text(text)
@@ -415,6 +487,10 @@ import sys
 
 p = Path(sys.argv[1])
 text = p.read_text()
+
+if 'onToolUseStart: emitCliToolUseStart' in text and 'onToolResult: emitCliToolResult' in text:
+    print(f"runtime streaming wiring already native: {p}")
+    raise SystemExit(0)
 
 if 'onToolEvent: (event) => {' in text:
     print(f"runtime streaming wiring already patched: {p}")
@@ -455,10 +531,11 @@ if [[ -n "$CLI_BACKEND" && -f "$CLI_BACKEND" ]]; then
 fi
 if [[ -n "$GEMINI_PARSER_TARGET" ]]; then
   grep -nF 'function isGeminiCliProvider(providerId)' "$GEMINI_PARSER_TARGET"
-  grep -nF 'function parseGeminiCliStreamingRecord(params)' "$GEMINI_PARSER_TARGET"
+  grep -nF 'function parseGeminiCliStreamingDelta(params)' "$GEMINI_PARSER_TARGET"
+  grep -nF 'function dispatchGeminiCliStreamingToolEvent(params)' "$GEMINI_PARSER_TARGET"
 fi
 if [[ -n "$EXECUTE_RUNTIME" ]]; then
-  grep -nF 'onToolEvent: (event) => {' "$EXECUTE_RUNTIME"
+  grep -nF 'onToolUseStart: emitCliToolUseStart' "$EXECUTE_RUNTIME" || grep -nF 'onToolEvent: (event) => {' "$EXECUTE_RUNTIME"
 fi
 
 echo "Compatibility hotfix complete. Restart OpenClaw gateway for changes to take effect."

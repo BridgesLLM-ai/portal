@@ -282,8 +282,10 @@ verify_backups() {
       ok=false
       continue
     fi
-    tar tzf "$latest" | grep -Eq '(^|/|[.]/)MANIFEST[.]txt$' || { printf '  ERROR: MANIFEST.txt missing\n'; ok=false; }
-    tar tzf "$latest" | grep -Eq '(^|/|[.]/)database[.]sql$' || { printf '  ERROR: database.sql missing\n'; ok=false; }
+    local listing
+    listing="$(tar tzf "$latest")"
+    grep -Eq '(^|/|[.]/)MANIFEST[.]txt$' <<< "$listing" || { printf '  ERROR: MANIFEST.txt missing\n'; ok=false; }
+    grep -Eq '(^|/|[.]/)database[.]sql$' <<< "$listing" || { printf '  ERROR: database.sql missing\n'; ok=false; }
     printf '  OK\n'
   done
   $ok

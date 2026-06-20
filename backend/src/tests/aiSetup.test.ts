@@ -4,9 +4,9 @@ describe('ai-setup model normalization', () => {
   test('does not prefix providerHint onto already-prefixed string model ids', () => {
     expect(normalizeModelPayload(['openai-codex/gpt-5.4'], 'google-gemini-cli')).toEqual([
       {
-        id: 'openai-codex/gpt-5.4',
-        name: 'openai-codex/gpt-5.4',
-        provider: 'openai-codex',
+        id: 'codex/gpt-5.4',
+        name: 'codex/gpt-5.4',
+        provider: 'codex',
       },
     ]);
   });
@@ -43,10 +43,10 @@ describe('ai-setup model normalization', () => {
     ]);
   });
 
-  test('rewrites same-family OpenAI rows into the Codex namespace when filtering for Codex OAuth', () => {
+  test('rewrites same-family OpenAI rows into the current Codex namespace when filtering for Codex OAuth', () => {
     expect(normalizeModelPayload([{ id: 'openai/gpt-5.5', provider: 'openai', name: 'GPT-5.5' }], 'openai-codex')).toEqual([
       {
-        id: 'openai-codex/gpt-5.5',
+        id: 'codex/gpt-5.5',
         name: 'GPT-5.5',
         provider: 'openai-codex',
         raw: { id: 'openai/gpt-5.5', provider: 'openai', name: 'GPT-5.5' },
@@ -54,13 +54,13 @@ describe('ai-setup model normalization', () => {
     ]);
   });
 
-  test('rewrites same-family Gemini rows into the Gemini CLI namespace when filtering for Gemini OAuth', () => {
-    expect(normalizeModelPayload([{ id: 'google/gemini-2.5-flash', provider: 'google', name: 'Gemini 2.5 Flash' }], 'google-gemini-cli')).toEqual([
+  test('rewrites same-family Gemini rows into the Antigravity namespace when filtering for Antigravity', () => {
+    expect(normalizeModelPayload([{ id: 'google/gemini-3-flash', provider: 'google', name: 'Gemini 3 Flash' }], 'google-antigravity')).toEqual([
       {
-        id: 'google-gemini-cli/gemini-2.5-flash',
-        name: 'Gemini 2.5 Flash',
-        provider: 'google-gemini-cli',
-        raw: { id: 'google/gemini-2.5-flash', provider: 'google', name: 'Gemini 2.5 Flash' },
+        id: 'google-antigravity/gemini-3.5-flash',
+        name: 'Gemini 3 Flash',
+        provider: 'google-antigravity',
+        raw: { id: 'google/gemini-3-flash', provider: 'google', name: 'Gemini 3 Flash' },
       },
     ]);
   });
@@ -79,20 +79,20 @@ describe('ai-setup model normalization', () => {
         },
       },
     }, 'openai-codex', [
-      'openai-codex/gpt-5.5',
-      'openai-codex/gpt-5.4',
-      'openai-codex/gpt-5.4-mini',
+      'codex/gpt-5.5',
+      'codex/gpt-5.4',
+      'codex/gpt-5.4-mini',
     ]);
 
     expect(merged.changed).toBe(true);
-    expect(merged.addedAllowlist).toEqual(['openai-codex/gpt-5.4', 'openai-codex/gpt-5.4-mini']);
-    expect(merged.addedFallbacks).toEqual(['openai-codex/gpt-5.4-mini']);
+    expect(merged.addedAllowlist).toEqual(['codex/gpt-5.4', 'codex/gpt-5.4-mini']);
+    expect(merged.addedFallbacks).toEqual(['codex/gpt-5.4-mini']);
     expect(merged.config.agents.defaults.model.fallbacks).toEqual([
-      'openai-codex/gpt-5.4',
-      'openai-codex/gpt-5.4-mini',
+      'codex/gpt-5.4',
+      'codex/gpt-5.4-mini',
     ]);
-    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.5']).toEqual({ agentRuntime: { id: 'codex' } });
-    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.4']).toEqual({ agentRuntime: { id: 'codex' } });
+    expect(merged.config.agents.defaults.models['codex/gpt-5.5']).toEqual({ agentRuntime: { id: 'codex' } });
+    expect(merged.config.agents.defaults.models['codex/gpt-5.4']).toEqual({ agentRuntime: { id: 'codex' } });
   });
 
   test('register merge repairs Codex model-scoped runtime metadata', () => {
@@ -106,28 +106,28 @@ describe('ai-setup model normalization', () => {
           },
         },
       },
-    }, 'openai-codex', ['openai-codex/gpt-5.5']);
+    }, 'openai-codex', ['codex/gpt-5.5']);
 
     expect(merged.changed).toBe(true);
     expect(merged.addedAllowlist).toEqual([]);
     expect(merged.addedFallbacks).toEqual([]);
     expect(merged.config.agents.defaults.models['openai/gpt-5.5']).toEqual({});
-    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.5']).toEqual({ agentRuntime: { id: 'codex' } });
+    expect(merged.config.agents.defaults.models['codex/gpt-5.5']).toEqual({ agentRuntime: { id: 'codex' } });
   });
 
-  test('register merge preserves Gemini CLI provider namespace before persisting models', () => {
-    const merged = mergeDiscoveredProviderModelsIntoConfig({}, 'google-gemini-cli', [
-      'google-gemini-cli/gemini-3.1-flash',
-      'google-gemini-cli/gemini-3.1-pro-preview',
+  test('register merge preserves Antigravity provider namespace before persisting models', () => {
+    const merged = mergeDiscoveredProviderModelsIntoConfig({}, 'google-antigravity', [
+      'google-antigravity/gemini-3.5-flash',
+      'google-antigravity/gemini-3.1-pro-high',
     ]);
 
     expect(merged.config.agents.defaults.models).toMatchObject({
-      'google-gemini-cli/gemini-3-flash-preview': {},
-      'google-gemini-cli/gemini-3.1-pro-preview': {},
+      'google-antigravity/gemini-3.5-flash': {},
+      'google-antigravity/gemini-3.1-pro-high': {},
     });
     expect(merged.config.agents.defaults.model.fallbacks).toEqual([
-      'google-gemini-cli/gemini-3-flash-preview',
-      'google-gemini-cli/gemini-3.1-pro-preview',
+      'google-antigravity/gemini-3.5-flash',
+      'google-antigravity/gemini-3.1-pro-high',
     ]);
   });
 
@@ -141,13 +141,16 @@ describe('ai-setup model normalization', () => {
           },
         },
       },
-    }, 'anthropic', ['anthropic/claude-haiku-4-5']);
+    }, 'anthropic', ['anthropic/claude-haiku-4-5'], { version: 2, profiles: {} });
 
     expect(merged.changed).toBe(true);
     expect(merged.config.agents.defaults.models['anthropic/claude-haiku-4-5']).toEqual({});
   });
 
   test('provider filter accepts google runtime alias models from the gateway catalog', () => {
+    expect(matchesProviderModel('google-antigravity', 'google/gemini-3-flash')).toBe(true);
+    expect(matchesProviderModel('google-antigravity', 'google-gemini-cli/gemini-3-flash')).toBe(true);
+    expect(matchesProviderModel('google-antigravity', 'google-antigravity/gemini-3.5-flash')).toBe(true);
     expect(matchesProviderModel('google-gemini-cli', 'google/gemini-3.1-pro-preview')).toBe(true);
     expect(matchesProviderModel('google-gemini-cli', 'google-gemini-cli/gemini-3.1-pro-preview')).toBe(true);
     expect(matchesProviderModel('google-gemini-cli', 'openai/gpt-5.4')).toBe(false);
@@ -157,13 +160,14 @@ describe('ai-setup model normalization', () => {
   test('provider filter accepts OpenAI runtime alias models from the gateway catalog', () => {
     expect(matchesProviderModel('openai-codex', 'openai/gpt-5.4')).toBe(true);
     expect(matchesProviderModel('openai-codex', 'openai-codex/gpt-5.4')).toBe(true);
+    expect(matchesProviderModel('openai-codex', 'codex/gpt-5.4')).toBe(true);
     expect(matchesProviderModel('openai-codex', 'google/gemini-3.1-pro-preview')).toBe(false);
     expect(matchesProviderModel('openai-codex', 'openai-codex/google/gemini-3.1-pro-preview')).toBe(false);
   });
 
   test('setup model fallback exposes provider defaults without requiring OpenClaw model discovery', () => {
-    expect(getProviderDefaultModelPayload('openai-codex').map((model) => model.id)).toContain('openai-codex/gpt-5.5');
-    expect(getProviderDefaultModelPayload('google-gemini-cli').map((model) => model.id)).toContain('google-gemini-cli/gemini-3.1-pro-preview');
+    expect(getProviderDefaultModelPayload('openai-codex').map((model) => model.id)).toContain('codex/gpt-5.5');
+    expect(getProviderDefaultModelPayload('google-antigravity').map((model) => model.id)).toContain('google-antigravity/gemini-3.1-pro-high');
     expect(getProviderDefaultModelPayload(null)).toEqual([]);
   });
 });

@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { execFileSync } from 'child_process';
 import type { AgentProviderName } from './AgentProvider.interface';
 
 export type NativeCliAuthState = 'not_applicable' | 'authenticated' | 'needs_login' | 'unknown';
@@ -15,24 +16,26 @@ export interface NativeCliAuthStatus {
 const HOME_DIR = process.env.HOME || '/root';
 const CLAUDE_CREDENTIALS_PATH = path.join(HOME_DIR, '.claude', '.credentials.json');
 const CODEX_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
-const GEMINI_CONFIG_DIR = path.join(HOME_DIR, '.config', 'gemini');
-const GEMINI_OAUTH_CREDS_PATH = path.join(HOME_DIR, '.gemini', 'oauth_creds.json');
+const ANTIGRAVITY_CONFIG_DIR = path.join(HOME_DIR, '.gemini', 'antigravity-cli');
 
 const NATIVE_TO_OPENCLAW_PROVIDER_IDS: Record<AgentProviderName, string[]> = {
   OPENCLAW: [],
   CLAUDE_CODE: ['anthropic'],
   CODEX: ['openai-codex'],
   AGENT_ZERO: [],
-  GEMINI: ['google-gemini-cli', 'google'],
+  GEMINI: ['google-antigravity', 'google-gemini-cli', 'google'],
   OLLAMA: [],
 };
 
 const OPENCLAW_TO_NATIVE_PROVIDER: Record<string, AgentProviderName> = {
   anthropic: 'CLAUDE_CODE',
   'openai-codex': 'CODEX',
+  'google-antigravity': 'GEMINI',
   'google-gemini-cli': 'GEMINI',
   google: 'GEMINI',
 };
+
+let cachedGeminiAuth: { expiresAt: number; status: NativeCliAuthStatus } | null = null;
 
 function safeReadJson(targetPath: string): any | null {
   try {
@@ -51,19 +54,30 @@ function directoryHasEntries(targetPath: string): boolean {
   }
 }
 
-function fileHasJsonKey(targetPath: string, keys: string[]): boolean {
-  const parsed = safeReadJson(targetPath);
-  if (!parsed) return false;
-  for (const key of keys) {
-    const value = key.split('.').reduce<any>((acc, part) => (acc && typeof acc === 'object' ? acc[part] : undefined), parsed);
-    if (typeof value === 'string' && value.trim()) return true;
-  }
-  return false;
-}
-
 function hasEnvValue(name: string): boolean {
   const value = process.env[name];
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+function runAntigravityModels(): { ok: boolean; output: string } {
+  try {
+    const output = execFileSync('agy', ['models'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        NO_COLOR: '1',
+        SSH_CONNECTION: process.env.SSH_CONNECTION || 'portal-auth-check 127.0.0.1 127.0.0.1 0',
+      },
+      timeout: 8000,
+      maxBuffer: 1024 * 1024 * 2,
+    });
+    return { ok: true, output: output.trim() };
+  } catch (error: any) {
+    const stdout = typeof error?.stdout === 'string' ? error.stdout : error?.stdout?.toString?.('utf8') || '';
+    const stderr = typeof error?.stderr === 'string' ? error.stderr : error?.stderr?.toString?.('utf8') || '';
+    return { ok: false, output: `${stdout}\n${stderr}`.trim() };
+  }
 }
 
 function detectClaudeAuth(): NativeCliAuthStatus {
@@ -127,33 +141,63 @@ function detectCodexAuth(): NativeCliAuthStatus {
 }
 
 function detectGeminiAuth(): NativeCliAuthStatus {
+  if (cachedGeminiAuth && cachedGeminiAuth.expiresAt > Date.now()) {
+    return cachedGeminiAuth.status;
+  }
+
+  const cache = (status: NativeCliAuthStatus, ttlMs: number) => {
+    cachedGeminiAuth = { status, expiresAt: Date.now() + ttlMs };
+    return status;
+  };
+
   if (hasEnvValue('GEMINI_API_KEY') || hasEnvValue('GOOGLE_API_KEY')) {
-    return {
+    return cache({
       provider: 'GEMINI',
       status: 'authenticated',
-      message: 'Gemini CLI can authenticate from the current service environment.',
-      loginCommand: 'gemini',
+      message: 'Google environment credentials are present, but the preferred native Google agent is Antigravity.',
+      loginCommand: 'agy',
       requiresSeparateLogin: true,
-    };
+    }, 60_000);
   }
 
-  if (fileHasJsonKey(GEMINI_OAUTH_CREDS_PATH, ['access_token', 'refresh_token']) || directoryHasEntries(GEMINI_CONFIG_DIR)) {
-    return {
+  const agy = runAntigravityModels();
+  if (agy.ok) {
+    return cache({
       provider: 'GEMINI',
       status: 'authenticated',
-      message: 'Gemini CLI has local auth/config files on this server.',
-      loginCommand: 'gemini',
+      message: 'Google Antigravity is authenticated on this server.',
+      loginCommand: 'agy',
       requiresSeparateLogin: true,
-    };
+    }, 60_000);
   }
 
-  return {
+  if (/please sign in|not signed in|authentication required|launch the cli without arguments to sign in/i.test(agy.output)) {
+    return cache({
+      provider: 'GEMINI',
+      status: 'needs_login',
+      message: 'Google Antigravity is installed, but it is not signed in on this server. OpenClaw auth is separate.',
+      loginCommand: 'agy',
+      requiresSeparateLogin: true,
+    }, 5_000);
+  }
+
+  if (directoryHasEntries(ANTIGRAVITY_CONFIG_DIR)) {
+    return cache({
+      provider: 'GEMINI',
+      status: 'unknown',
+      message: 'Google Antigravity has config files on this server, but the portal could not verify a usable login.',
+      loginCommand: 'agy',
+      requiresSeparateLogin: true,
+    }, 5_000);
+  }
+
+  return cache({
     provider: 'GEMINI',
     status: 'needs_login',
-    message: 'Gemini is installed, but the local Gemini CLI has no usable auth. Start `gemini` and choose Google sign-in, or provide `GEMINI_API_KEY` / `GOOGLE_API_KEY` to the service. OpenClaw auth is separate.',
-    loginCommand: 'gemini',
+    message: 'Google Antigravity is installed, but the local `agy` CLI has no usable auth. Start `agy` and complete Google sign-in. OpenClaw auth is separate.',
+    loginCommand: 'agy',
     requiresSeparateLogin: true,
-  };
+  }, 5_000);
 }
 
 export function getNativeCliAuthStatus(provider: AgentProviderName): NativeCliAuthStatus {

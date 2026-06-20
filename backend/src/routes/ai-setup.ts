@@ -21,12 +21,14 @@ import {
 } from '../services/openclawConfigManager';
 import { listGatewayModels } from '../utils/openclawGatewayRpc';
 import { getNativeCliAuthStatus } from '../agents/nativeCliAuth';
+import { listAntigravityModelsFromCli } from '../agents/antigravityModels';
 import {
   buildOpenClawCliEnv,
   canonicalizeProviderModelId,
   extractJsonFromCliOutput,
   normalizePortalModelId,
   repairClaudeSubscriptionConfig,
+  usesClaudeCliAuthProfile,
 } from '../utils/openclawCli';
 
 const providerIdSchema = z.string().min(1).refine((value) => Boolean(getAiProviderMeta(value)), 'Unknown provider');
@@ -85,7 +87,7 @@ const oauthCallbackSchema = z.object({
 
 const OPENCLAW_BIN = 'openclaw';
 const GATEWAY_HEALTH_URL = process.env.OPENCLAW_API_URL || 'http://127.0.0.1:18789';
-const handledNativeCliDeviceCompletions = new Set<string>();
+const handledNativeCliCompletions = new Set<string>();
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -122,37 +124,40 @@ function runOpenClaw(args: string[], timeout = 30000) {
 
 const PROVIDER_MODEL_DISCOVERY_FALLBACKS: Record<string, string[]> = {
   anthropic: [
-    'anthropic/claude-opus-4-6',
+    'anthropic/claude-opus-4-8',
     'anthropic/claude-sonnet-4-6',
     'anthropic/claude-haiku-4-5',
   ],
   'openai-codex': [
-    'openai-codex/gpt-5.5',
-    'openai-codex/gpt-5.5-pro',
-    'openai-codex/gpt-5.4',
-    'openai-codex/gpt-5.4-pro',
-    'openai-codex/gpt-5.4-mini',
-    'openai-codex/gpt-5.3-codex',
-    'openai-codex/gpt-5.2',
-    'openai-codex/gpt-5.2-codex',
+    'codex/gpt-5.5',
+    'codex/gpt-5.4',
+    'codex/gpt-5.4-mini',
   ],
-  'google-gemini-cli': [
-    'google-gemini-cli/gemini-2.0-flash',
-    'google-gemini-cli/gemini-2.5-flash',
-    'google-gemini-cli/gemini-2.5-pro',
-    'google-gemini-cli/gemini-3-flash-preview',
-    'google-gemini-cli/gemini-3-pro-preview',
-    'google-gemini-cli/gemini-3.1-flash-lite-preview',
-    'google-gemini-cli/gemini-3.1-pro-preview',
+  'google-gemini-cli': [],
+  'google-antigravity': [
+    'google-antigravity/gemini-3.5-flash',
+    'google-antigravity/gemini-3.5-flash-high',
+    'google-antigravity/gemini-3.5-flash-low',
+    'google-antigravity/gemini-3.1-pro-high',
+    'google-antigravity/gemini-3.1-pro-low',
   ],
 };
 
+const DEFAULT_ONLY_MODEL_DISCOVERY_PROVIDERS = new Set([
+  'anthropic',
+  'openai-codex',
+  'codex',
+  'google-gemini-cli',
+]);
+
 
 const PROVIDER_MODEL_PREFIX_ALIASES: Record<string, string[]> = {
-  'google-gemini-cli': ['google-gemini-cli', 'google'],
-  google: ['google', 'google-gemini-cli'],
-  'openai-codex': ['openai-codex', 'openai'],
-  openai: ['openai', 'openai-codex'],
+  'google-gemini-cli': ['google-gemini-cli', 'google-antigravity', 'google'],
+  'google-antigravity': ['google-antigravity', 'google-gemini-cli', 'google'],
+  google: ['google', 'google-antigravity', 'google-gemini-cli'],
+  'openai-codex': ['openai-codex', 'codex', 'openai'],
+  codex: ['codex', 'openai-codex', 'openai'],
+  openai: ['openai', 'openai-codex', 'codex'],
 };
 
 function getProviderModelPrefixes(provider: string): string[] {
@@ -166,9 +171,11 @@ function bareModelLooksLikeProviderFamily(provider: string | null | undefined, r
   switch (provider) {
     case 'google':
     case 'google-gemini-cli':
+    case 'google-antigravity':
       return candidate.startsWith('gemini-');
     case 'openai':
     case 'openai-codex':
+    case 'codex':
       return /^(gpt-|o\d|codex)/i.test(candidate);
     case 'anthropic':
       return /^(claude-|sonnet|opus|haiku)/i.test(candidate);
@@ -225,7 +232,7 @@ export function matchesProviderModel(provider: string, rawModel: string | null |
     if (!canonical.startsWith(fullPrefix)) continue;
     const remainder = canonical.slice(fullPrefix.length);
 
-    if ((provider === 'google' || provider === 'google-gemini-cli' || provider === 'openai' || provider === 'openai-codex' || provider === 'anthropic') && remainder.includes('/')) {
+    if ((provider === 'google' || provider === 'google-gemini-cli' || provider === 'google-antigravity' || provider === 'openai' || provider === 'openai-codex' || provider === 'codex' || provider === 'anthropic') && remainder.includes('/')) {
       return false;
     }
 
@@ -254,25 +261,45 @@ function dedupeProviderModels(provider: string, models: Array<string | null | un
   return deduped;
 }
 
-function repairProviderModelRuntimeMetadata(config: any, provider: string): boolean {
+function repairProviderModelRuntimeMetadata(config: any, provider: string, authProfilesForRuntime = readAuthProfiles()): boolean {
   const models = config?.agents?.defaults?.models;
   if (!models || typeof models !== 'object') return false;
 
   let changed = false;
-  if (provider !== 'openai-codex' && provider !== 'anthropic') return changed;
+  if (provider !== 'openai-codex' && provider !== 'codex' && provider !== 'anthropic') return changed;
 
-  for (const [modelId, entry] of Object.entries(models) as Array<[string, any]>) {
+  for (const [modelId, rawEntry] of Object.entries(models) as Array<[string, any]>) {
+    let entry = rawEntry;
+    let effectiveModelId = modelId;
+
+    if (provider === 'openai-codex' && modelId.startsWith('openai-codex/')) {
+      effectiveModelId = `codex/${modelId.slice('openai-codex/'.length)}`;
+      models[effectiveModelId] = {
+        ...(models[effectiveModelId] && typeof models[effectiveModelId] === 'object' ? models[effectiveModelId] : {}),
+        ...(entry && typeof entry === 'object' ? entry : {}),
+      };
+      delete models[modelId];
+      entry = models[effectiveModelId];
+      changed = true;
+    }
+
     if (!entry || typeof entry !== 'object') continue;
 
     if (provider === 'anthropic') {
-      if (modelId.startsWith('anthropic/') && String(entry.agentRuntime?.id || '').trim() === 'claude-cli') {
+      if (effectiveModelId.startsWith('anthropic/') && usesClaudeCliAuthProfile(config, authProfilesForRuntime)) {
+        const runtimeId = String(entry.agentRuntime?.id || '').trim();
+        if (runtimeId !== 'claude-cli') {
+          entry.agentRuntime = { ...(entry.agentRuntime && typeof entry.agentRuntime === 'object' ? entry.agentRuntime : {}), id: 'claude-cli' };
+          changed = true;
+        }
+      } else if (effectiveModelId.startsWith('anthropic/') && String(entry.agentRuntime?.id || '').trim() === 'claude-cli') {
         delete entry.agentRuntime;
         changed = true;
       }
       continue;
     }
 
-    if (modelId.startsWith('openai-codex/')) {
+    if (effectiveModelId.startsWith('openai-codex/') || effectiveModelId.startsWith('codex/')) {
       const runtimeId = String(entry.agentRuntime?.id || '').trim();
       if (runtimeId !== 'codex') {
         entry.agentRuntime = { ...(entry.agentRuntime && typeof entry.agentRuntime === 'object' ? entry.agentRuntime : {}), id: 'codex' };
@@ -311,6 +338,17 @@ export function getProviderDefaultModelPayload(provider: string | null): any[] {
 }
 
 function readDiscoveredProviderModelsFromCli(provider: string): string[] {
+  if (provider === 'google-antigravity') {
+    const antigravityModels = listAntigravityModelsFromCli()
+      .map((model) => canonicalizeProviderModelId(provider, model.id))
+      .filter((modelId) => matchesProviderModel(provider, modelId));
+    if (antigravityModels.length) return dedupeProviderModels(provider, antigravityModels);
+  }
+
+  if (DEFAULT_ONLY_MODEL_DISCOVERY_PROVIDERS.has(provider)) {
+    return [];
+  }
+
   const attempts: Array<() => string> = [
     () => runOpenClaw(['models', 'list', '--all', '--provider', provider, '--json'], 20000),
     () => runOpenClaw(['models', 'list', '--all', '--json'], 20000),
@@ -332,6 +370,10 @@ function readDiscoveredProviderModelsFromCli(provider: string): string[] {
 }
 
 async function readDiscoveredProviderModelsFromGateway(provider: string): Promise<string[]> {
+  if (DEFAULT_ONLY_MODEL_DISCOVERY_PROVIDERS.has(provider) || provider === 'google-antigravity') {
+    return [];
+  }
+
   try {
     const rpcResult = await listGatewayModels();
     if (!rpcResult.ok) return [];
@@ -343,7 +385,7 @@ async function readDiscoveredProviderModelsFromGateway(provider: string): Promis
   }
 }
 
-export function mergeDiscoveredProviderModelsIntoConfig(config: any, provider: string, discoveredModels: string[]) {
+export function mergeDiscoveredProviderModelsIntoConfig(config: any, provider: string, discoveredModels: string[], authProfilesForRuntime: any = readAuthProfiles()) {
   const next = config && typeof config === 'object'
     ? JSON.parse(JSON.stringify(config))
     : {};
@@ -361,7 +403,7 @@ export function mergeDiscoveredProviderModelsIntoConfig(config: any, provider: s
   const fallbackSet = new Set(existingFallbacks);
   const addedAllowlist: string[] = [];
   const addedFallbacks: string[] = [];
-  let changed = repairProviderModelRuntimeMetadata(next, provider);
+  let changed = repairProviderModelRuntimeMetadata(next, provider, authProfilesForRuntime);
 
   for (const modelId of dedupeProviderModels(provider, discoveredModels)) {
     if (!next.agents.defaults.models[modelId] || typeof next.agents.defaults.models[modelId] !== 'object') {
@@ -372,7 +414,7 @@ export function mergeDiscoveredProviderModelsIntoConfig(config: any, provider: s
       changed = true;
     }
 
-    if (provider === 'openai-codex' && modelId.startsWith('openai-codex/')) {
+    if ((provider === 'openai-codex' || provider === 'codex') && (modelId.startsWith('openai-codex/') || modelId.startsWith('codex/'))) {
       const entry = next.agents.defaults.models[modelId];
       const runtimeId = String(entry.agentRuntime?.id || '').trim();
       if (runtimeId !== 'codex') {
@@ -425,6 +467,16 @@ async function registerProviderModels(provider: string) {
     return { changed: false, models: [] as string[], addedAllowlist: [] as string[], addedFallbacks: [] as string[] };
   }
 
+  if (provider === 'google-antigravity') {
+    console.log(`[AI-Setup] Discovered ${discoveredModels.length} ${provider} native models; not registering them into OpenClaw because Antigravity is handled by Portal's native GEMINI adapter.`);
+    return {
+      changed: false,
+      models: discoveredModels,
+      addedAllowlist: [] as string[],
+      addedFallbacks: [] as string[],
+    };
+  }
+
   const openclawConfig = readOpenClawConfig();
   const merged = mergeDiscoveredProviderModelsIntoConfig(openclawConfig, provider, discoveredModels);
   const runtimeModels = registerProviderRuntimeModels(provider, discoveredModels);
@@ -443,6 +495,12 @@ async function registerProviderModels(provider: string) {
 }
 
 function restartGatewayBySignal() {
+  const mainPid = readSystemdGatewayMainPid();
+  if (mainPid) {
+    process.kill(mainPid, 'SIGUSR1');
+    return;
+  }
+
   const output = execFileSync('pgrep', ['-f', 'openclaw.*gateway|gateway.*openclaw|/openclaw/dist/.*gateway|openclaw-gateway'], {
     encoding: 'utf8',
     timeout: 5000,
@@ -454,16 +512,69 @@ function restartGatewayBySignal() {
   process.kill(Number(pid), 'SIGUSR1');
 }
 
+function readSystemdGatewayMainPid(): number | null {
+  if (!fs.existsSync('/run/systemd/system') || !fs.existsSync('/bin/systemctl')) return null;
+  try {
+    const output = execFileSync('systemctl', ['show', 'openclaw-gateway.service', '--property=MainPID', '--value'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const pid = Number.parseInt(output, 10);
+    return Number.isFinite(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasSystemdGatewayService(): boolean {
+  if (!fs.existsSync('/run/systemd/system') || !fs.existsSync('/bin/systemctl')) return false;
+  try {
+    execFileSync('systemctl', ['cat', 'openclaw-gateway.service'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForGatewayHealth(timeoutMs = 60000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await fetchGatewayHealth()) return true;
+    await sleep(1000);
+  }
+  return false;
+}
+
 async function restartGateway() {
   const systemdAvailable = fs.existsSync('/run/systemd/system') && fs.existsSync('/bin/systemctl');
   if (!systemdAvailable) {
     restartGatewayBySignal();
-    await sleep(3000);
+    await waitForGatewayHealth(30000);
     return;
   }
 
+  if (hasSystemdGatewayService()) {
+    try {
+      execFileSync('systemctl', ['restart', 'openclaw-gateway.service'], {
+        encoding: 'utf8',
+        timeout: 60000,
+      });
+      if (!(await waitForGatewayHealth(60000))) {
+        throw new Error('OpenClaw gateway did not become healthy after systemd restart.');
+      }
+      return;
+    } catch (systemdError) {
+      console.warn('[AI-Setup] systemd gateway restart failed, falling back to OpenClaw CLI:', systemdError instanceof Error ? systemdError.message : String(systemdError));
+    }
+  }
+
   try {
-    runOpenClaw(['gateway', 'restart'], 8000);
+    runOpenClaw(['gateway', 'restart'], 60000);
   } catch (cliError) {
     try {
       restartGatewayBySignal();
@@ -473,7 +584,26 @@ async function restartGateway() {
       throw new Error(`Gateway restart failed via CLI (${cliMessage}) and SIGUSR1 fallback (${signalMessage}).`);
     }
   }
-  await sleep(3000);
+  if (!(await waitForGatewayHealth(60000))) {
+    throw new Error('OpenClaw gateway restart was requested, but the health check did not recover in time.');
+  }
+}
+
+async function finalizeNativeCliCompletion(status: any) {
+  if (!status?.id || status.status !== 'complete') return;
+  if (handledNativeCliCompletions.has(status.id)) return;
+
+  handledNativeCliCompletions.add(status.id);
+  try {
+    if (status.provider === 'gemini' || status.provider === 'google-gemini-cli') {
+      await registerProviderModels('google-antigravity');
+      return;
+    }
+    await restartGateway();
+  } catch (error) {
+    handledNativeCliCompletions.delete(status.id);
+    throw error;
+  }
 }
 
 async function fetchGatewayHealth() {
@@ -594,7 +724,7 @@ export function createAiSetupRouter(): Router {
       }
       const sessionStatus = getOAuthFlowStatus(parsed.data.sessionId);
       if (sessionStatus?.provider && sessionStatus.createdProfileId) {
-        pinProviderAuthProfile(sessionStatus.provider, sessionStatus.createdProfileId, 'oauth');
+        pinProviderAuthProfile(sessionStatus.authProvider || sessionStatus.provider, sessionStatus.createdProfileId, 'oauth');
       }
       if (sessionStatus?.provider) {
         await registerProviderModels(sessionStatus.provider);
@@ -856,6 +986,27 @@ export function createAiSetupRouter(): Router {
     const fallbackModels = getProviderDefaultModelPayload(providerFilter);
     const warnings: string[] = [];
 
+    if (providerFilter && DEFAULT_ONLY_MODEL_DISCOVERY_PROVIDERS.has(providerFilter)) {
+      res.json({ models: fallbackModels, source: 'defaults' });
+      return;
+    }
+
+    if (providerFilter === 'google-antigravity') {
+      const antigravityModels = listAntigravityModelsFromCli();
+      if (antigravityModels.length) {
+        const models = normalizeModelPayload(
+          antigravityModels.map((model) => ({
+            id: `google-antigravity/${model.id}`,
+            name: model.displayName,
+          })),
+          providerFilter,
+        ).filter((model) => matchesProviderModel(providerFilter, model.id || model.name || ''));
+        res.json({ models, source: 'native-cli' });
+        return;
+      }
+      warnings.push('Antigravity native model list unavailable; using defaults.');
+    }
+
     try {
       const rpcResult = await listGatewayModels();
       if (rpcResult.ok) {
@@ -1001,12 +1152,10 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
-    if (status.mode === 'device_code' && status.status === 'complete' && !handledNativeCliDeviceCompletions.has(status.id)) {
-      handledNativeCliDeviceCompletions.add(status.id);
+    if (status.status === 'complete' && !handledNativeCliCompletions.has(status.id)) {
       try {
-        await restartGateway();
+        await finalizeNativeCliCompletion(status);
       } catch (error: any) {
-        handledNativeCliDeviceCompletions.delete(status.id);
         console.error(`[NativeCLI] gateway restart failed after ${status.provider} login:`, error?.message || error);
         res.status(500).json({
           ...status,
@@ -1031,7 +1180,8 @@ export function createAiSetupRouter(): Router {
       const result = await completeNativeCliFlow(sessionId, callbackUrl);
       if (result?.success) {
         try {
-          await restartGateway();
+          const status = getOAuthFlowStatus(sessionId);
+          await finalizeNativeCliCompletion(status);
         } catch (error: any) {
           console.error('[NativeCLI] gateway restart failed after callback login:', error?.message || error);
           res.status(500).json({

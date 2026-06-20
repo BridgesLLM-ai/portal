@@ -651,10 +651,12 @@ router.get('/models/available', authenticateToken, requireApproved, async (_req:
     } else {
       res.json({ 
         models: [
-          { id: 'openai/gpt-5.4', name: 'Codex (5.4)', provider: 'openai-codex' },
+          { id: 'codex/gpt-5.5', name: 'GPT-5.5 Codex', provider: 'openai-codex' },
+          { id: 'codex/gpt-5.4', name: 'GPT-5.4 Codex', provider: 'openai-codex' },
+          { id: 'codex/gpt-5.4-mini', name: 'GPT-5.4 Mini', provider: 'openai-codex' },
+          { id: 'anthropic/claude-opus-4-8', name: 'Claude Opus 4.8', provider: 'anthropic' },
           { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6', provider: 'anthropic' },
           { id: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', provider: 'anthropic' },
-          { id: 'google/gemini-2.5-flash', name: 'Gemini 2.5 Flash', provider: 'google' },
         ],
         fallback: true,
       });
@@ -3100,11 +3102,12 @@ const MARCUS_MODEL_MAP: Record<string, string> = {
   'anthropic/claude-haiku-4-5': 'claude-haiku-4-5',
   'anthropic/claude-sonnet-4-6': 'claude-sonnet-4-6',
   'anthropic/claude-sonnet-4-5': 'claude-sonnet-4-6',  // upgrade 4.5 → 4.6
-  'anthropic/claude-opus-4-6': 'claude-opus-4-6',
+  'anthropic/claude-opus-4-8': 'claude-opus-4-8',
+  'anthropic/claude-opus-4-6': 'claude-opus-4-8',
   // Legacy aliases
   'anthropic/claude-3-5-haiku-20241022': 'claude-haiku-4-5',
-  'anthropic/claude-opus-4-5-20251101': 'claude-opus-4-6',
-  'anthropic/claude-opus-4-5': 'claude-opus-4-6',
+  'anthropic/claude-opus-4-5-20251101': 'claude-opus-4-8',
+  'anthropic/claude-opus-4-5': 'claude-opus-4-8',
 };
 
 function resolveAnthropicModel(frontendModel: string): string {
@@ -3161,11 +3164,14 @@ async function executeAssistantTool(toolName: string, input: any, projectDir: st
 // Auto-commit helper: commits any changes in project dir after assistant edits files
 function getModelDisplayName(model: string): string {
   const names: Record<string, string> = {
-    'anthropic/claude-opus-4-5-20251101': 'Claude Opus 4.5',
+    'anthropic/claude-opus-4-8': 'Claude Opus 4.8',
+    'anthropic/claude-opus-4-6': 'Claude Opus 4.8',
+    'anthropic/claude-opus-4-5-20251101': 'Claude Opus 4.8',
     'anthropic/claude-sonnet-4-6': 'Claude Sonnet 4.6',
     'anthropic/claude-sonnet-4-5': 'Claude Sonnet 4.5',
     'anthropic/claude-haiku-4-1': 'Claude Haiku 4.1',
     'anthropic/claude-haiku-4-20250514': 'Claude Haiku 4',
+    'anthropic/claude-haiku-4-5': 'Claude Haiku 4.5',
     'ollama/qwen2.5-coder:3b': 'Qwen Coder 3B',
     'ollama/qwen2.5-coder:7b': 'Qwen Coder 7B',
     'ollama/qwen3:1.7b': 'Qwen3 1.7B',
@@ -3173,6 +3179,9 @@ function getModelDisplayName(model: string): string {
     'ollama/qwen3:8b': 'Qwen3 8B',
     'ollama/gemma4:e2b': 'Gemma 4 E2B',
     'ollama/gemma4:e4b': 'Gemma 4 E4B',
+    'codex/gpt-5.5': 'GPT-5.5 Codex',
+    'codex/gpt-5.4': 'GPT-5.4 Codex',
+    'codex/gpt-5.4-mini': 'GPT-5.4 Mini',
     'openai/gpt-5.1': 'GPT-5.1',
     'openai-codex/gpt-5.1': 'GPT-5.1',
     'openai/gpt-5.2': 'GPT-5.2',
@@ -3182,7 +3191,7 @@ function getModelDisplayName(model: string): string {
     'openai/gpt-5.4': 'Codex (5.4)',
     'openai-codex/gpt-5.4': 'Codex (5.4)',
   };
-  return names[model] || model.replace(/^(anthropic|ollama|openai-codex|openai)\//, '');
+  return names[model] || model.replace(/^(anthropic|ollama|codex|openai-codex|openai)\//, '');
 }
 
 async function autoCommitProjectChanges(projectDir: string, userId: string, projectName: string, summary?: string, model?: string) {
@@ -3562,7 +3571,7 @@ function normalizeGatewayModelIds(models: any[] | undefined): string[] {
 async function resolveAllowedProjectModel(candidates: string[], requestedForWarning = ''): Promise<{ model: string; warning?: string }> {
   const normalizedCandidates = candidates.map((candidate) => normalizePortalModelId(candidate)).filter(Boolean);
   const requestedModel = normalizePortalModelId(requestedForWarning);
-  const hardFallback = 'openai/gpt-5.4';
+  const hardFallback = 'codex/gpt-5.5';
   const fallbackCandidates = [...normalizedCandidates, hardFallback];
 
   let availableModels: string[] = [];
@@ -3770,9 +3779,9 @@ router.get('/:name/assistant/active-model', authenticateToken, async (req: Reque
       result = await getSessionInfo(sessionKey);
     }
     
-    const configuredDefault = getDefaultModel() || 'openai/gpt-5.4';
+    const configuredDefault = getDefaultModel() || 'codex/gpt-5.5';
     const [defaultProvider, ...defaultModelParts] = configuredDefault.split('/');
-    const defaultModel = defaultModelParts.join('/') || 'gpt-5.4';
+    const defaultModel = defaultModelParts.join('/') || 'gpt-5.5';
 
     if (result.ok && result.data) {
       const session = result.data;

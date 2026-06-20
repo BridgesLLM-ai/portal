@@ -2,6 +2,18 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.19] - 2026-06-20
+
+### Fixed
+- **Agent Chat keeps pace with current OpenClaw model IDs**: Codex OAuth now uses the current `codex/...` model family, Claude recommendations include the current Opus option exposed by OpenClaw, and stale fallback IDs are repaired more consistently.
+- **Google subscription setup no longer points users at the retired Gemini CLI path**: Google Antigravity is treated as the native Gemini coding-agent path, with old Gemini CLI model IDs mapped away from dead selections.
+- **OpenClaw model pickers are smaller and less misleading**: unsupported Google/Gemini rows are hidden from the OpenClaw catalogue while Antigravity shows only the Gemini models reported by the native Antigravity CLI.
+- **Release packaging is stricter about private/internal files**: generated release archives exclude internal handoff notes, reports, development databases, logs, env files, source trees, and stale build output.
+
+### Improved
+- **Provider setup copy is more honest**: Antigravity carries a temporary “not fully supported for now” warning for OpenClaw-native OAuth while the Portal-native Antigravity flow remains available.
+- **Backup and OpenClaw compatibility maintenance are safer on updates**: backup runner/timer setup and OpenClaw long-run relay compatibility checks handle already-current runtimes more defensively.
+
 ## [3.25.18] - 2026-05-31
 
 ### Fixed

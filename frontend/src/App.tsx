@@ -6,6 +6,7 @@ import { ChatStateProvider } from './contexts/ChatStateProvider';
 import { activityAPI } from './api/endpoints';
 import { usePublicSettings } from './hooks/usePublicSettings';
 import Layout from './components/Layout';
+import ErrorBoundary from './components/ErrorBoundary';
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
 import SetupWizardPage from './pages/SetupWizardPage';
@@ -14,15 +15,60 @@ import DocsPage from './pages/DocsPage';
 import ForgotPasswordPage from './pages/ForgotPasswordPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
 
-const DesktopPage = lazy(() => import('./pages/DesktopPage'));
-const AppsPage = lazy(() => import('./pages/AppsPage'));
-const FilesPage = lazy(() => import('./pages/FilesPage'));
-const AgentChatPage = lazy(() => import('./pages/AgentChatPage'));
-const SettingsPage = lazy(() => import('./pages/SettingsPage'));
-const AdminPage = lazy(() => import('./pages/AdminPage'));
-const MailPage = lazy(() => import('./pages/MailPage'));
-const AgentToolsPage = lazy(() => import('./pages/AgentToolsPage'));
-const TasksPage = lazy(() => import('./pages/TasksPage'));
+const MODULE_RELOAD_PREFIX = 'portal-module-reload:';
+
+function isModuleLoadFailure(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /importing a module script failed|failed to fetch dynamically imported module|error loading dynamically imported module|unable to preload css|loading chunk \d+ failed/i.test(message);
+}
+
+function getReloadMarker(key: string) {
+  return `${MODULE_RELOAD_PREFIX}${key}`;
+}
+
+function lazyWithModuleRetry<T extends { default: React.ComponentType<unknown> }>(
+  key: string,
+  loader: () => Promise<T>
+) {
+  return lazy(async () => {
+    try {
+      const module = await loader();
+      try {
+        window.sessionStorage.removeItem(getReloadMarker(key));
+      } catch {
+        // Session storage may be unavailable in strict/private browser modes.
+      }
+      return module;
+    } catch (error) {
+      if (typeof window !== 'undefined' && isModuleLoadFailure(error)) {
+        try {
+          const marker = getReloadMarker(key);
+          if (window.sessionStorage.getItem(marker) !== '1') {
+            window.sessionStorage.setItem(marker, '1');
+            const url = new URL(window.location.href);
+            url.searchParams.set('reload', Date.now().toString());
+            window.location.replace(url.toString());
+            return new Promise<T>(() => {});
+          }
+        } catch {
+          window.location.reload();
+          return new Promise<T>(() => {});
+        }
+      }
+      throw error;
+    }
+  });
+}
+
+const DesktopPage = lazyWithModuleRetry('DesktopPage', () => import('./pages/DesktopPage'));
+const AppsPage = lazyWithModuleRetry('AppsPage', () => import('./pages/AppsPage'));
+const FilesPage = lazyWithModuleRetry('FilesPage', () => import('./pages/FilesPage'));
+const AgentChatPage = lazyWithModuleRetry('AgentChatPage', () => import('./pages/AgentChatPage'));
+const SettingsPage = lazyWithModuleRetry('SettingsPage', () => import('./pages/SettingsPage'));
+const AdminPage = lazyWithModuleRetry('AdminPage', () => import('./pages/AdminPage'));
+const MailPage = lazyWithModuleRetry('MailPage', () => import('./pages/MailPage'));
+const AgentToolsPage = lazyWithModuleRetry('AgentToolsPage', () => import('./pages/AgentToolsPage'));
+const TasksPage = lazyWithModuleRetry('TasksPage', () => import('./pages/TasksPage'));
 
 function buildLoginRedirectTarget(location: ReturnType<typeof useLocation>) {
   const target = `${location.pathname}${location.search}${location.hash}`;
@@ -54,6 +100,16 @@ function AdminRoute({ children }: { children: React.ReactNode }) {
 
 function RouteFallback() {
   return <div className="h-full w-full bg-theme-bg" />;
+}
+
+function LazyRoute({ children }: { children: React.ReactNode }) {
+  return (
+    <ErrorBoundary>
+      <Suspense fallback={<RouteFallback />}>
+        {children}
+      </Suspense>
+    </ErrorBoundary>
+  );
 }
 
 function BootstrapFallback() {
@@ -239,22 +295,22 @@ export default function App() {
           }
         >
           <Route path="dashboard" element={<DashboardPage />} />
-          <Route path="files" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><FilesPage /></Suspense></InteractiveRoute>} />
+          <Route path="files" element={<InteractiveRoute><LazyRoute><FilesPage /></LazyRoute></InteractiveRoute>} />
           {/* Terminal is rendered persistently in Layout.tsx — this route just prevents fallback */}
           <Route path="terminal" element={<AdminRoute><div /></AdminRoute>} />
-          <Route path="desktop" element={<AdminRoute><Suspense fallback={<RouteFallback />}><DesktopPage /></Suspense></AdminRoute>} />
+          <Route path="desktop" element={<AdminRoute><LazyRoute><DesktopPage /></LazyRoute></AdminRoute>} />
           <Route path="apps" element={<Navigate to="/projects" replace />} />
-          <Route path="projects" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><AppsPage /></Suspense></InteractiveRoute>} />
-          <Route path="agent-chats" element={<AdminRoute><Suspense fallback={<RouteFallback />}><AgentChatPage /></Suspense></AdminRoute>} />
-          <Route path="agent-tools" element={<AdminRoute><Suspense fallback={<RouteFallback />}><AgentToolsPage /></Suspense></AdminRoute>} />
-          <Route path="tasks" element={<AdminRoute><Suspense fallback={<RouteFallback />}><TasksPage /></Suspense></AdminRoute>} />
+          <Route path="projects" element={<InteractiveRoute><LazyRoute><AppsPage /></LazyRoute></InteractiveRoute>} />
+          <Route path="agent-chats" element={<AdminRoute><LazyRoute><AgentChatPage /></LazyRoute></AdminRoute>} />
+          <Route path="agent-tools" element={<AdminRoute><LazyRoute><AgentToolsPage /></LazyRoute></AdminRoute>} />
+          <Route path="tasks" element={<AdminRoute><LazyRoute><TasksPage /></LazyRoute></AdminRoute>} />
           {/* Backward compatibility redirects */}
           <Route path="automations" element={<LegacyAgentToolsRedirect tab="automations" />} />
           <Route path="usage" element={<LegacyAgentToolsRedirect tab="usage" />} />
           <Route path="skills" element={<LegacyAgentToolsRedirect tab="skills" />} />
-          <Route path="mail" element={<InteractiveRoute><Suspense fallback={<RouteFallback />}><MailPage /></Suspense></InteractiveRoute>} />
-          <Route path="settings" element={<Suspense fallback={<RouteFallback />}><SettingsPage /></Suspense>} />
-          <Route path="admin" element={<AdminRoute><Suspense fallback={<RouteFallback />}><AdminPage /></Suspense></AdminRoute>} />
+          <Route path="mail" element={<InteractiveRoute><LazyRoute><MailPage /></LazyRoute></InteractiveRoute>} />
+          <Route path="settings" element={<LazyRoute><SettingsPage /></LazyRoute>} />
+          <Route path="admin" element={<AdminRoute><LazyRoute><AdminPage /></LazyRoute></AdminRoute>} />
         </Route>
         <Route
           path="/setup"

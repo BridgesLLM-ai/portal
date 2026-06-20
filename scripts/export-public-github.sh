@@ -99,6 +99,9 @@ rsync -a \
   --exclude='AI-SETUP-WIZARD-PROGRESS.md' \
   --exclude='PROVIDER-AUTH-AUDIT.md' \
   --exclude='SECURITY_AUDIT_STEP10.md' \
+  --exclude='CLAUDE-CODE-*.md' \
+  --exclude='*-HANDOFF-*.md' \
+  --exclude='*PROMPT*.md' \
   --exclude='TASK-*.md' \
   --exclude='*-audit-*.md' \
   --exclude='*audit*.md' \
@@ -118,6 +121,8 @@ rsync -a \
   --exclude='docs/OPENCLAW-PORTAL-COMPAT-VERIFY-*.md' \
   --exclude='docs/SECURITY.md' \
   --exclude='docs/runtime-stabilization-checklist.md' \
+  --exclude='reports' \
+  --exclude='reports/**' \
   \
   `# Test & temp files` \
   --exclude='backend/test-*.js' \

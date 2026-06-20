@@ -38,7 +38,7 @@ const providerDisplayNames: Record<AgentProviderName, string> = {
   CLAUDE_CODE: 'Claude Code',
   CODEX: 'Codex',
   AGENT_ZERO: 'Agent Zero',
-  GEMINI: 'Gemini CLI',
+  GEMINI: 'Google Antigravity',
   OLLAMA: 'Ollama',
 };
 

@@ -57,11 +57,11 @@ const CODING_TOOL_CHECKS = [
     installCmd: 'npm install -g @anthropic-ai/claude-code',
   },
   {
-    id: 'gemini-cli',
-    name: 'Gemini CLI',
-    command: 'gemini --version',
-    description: 'Google coding agent — fast generation with large context windows',
-    installCmd: 'npm install -g @google/gemini-cli',
+    id: 'antigravity',
+    name: 'Google Antigravity',
+    command: 'agy --version',
+    description: 'Google coding agent — native replacement for Gemini CLI',
+    installCmd: 'curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin',
   },
 ] as const;
 

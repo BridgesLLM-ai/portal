@@ -382,7 +382,7 @@ function GeneralTab({ settings, draftSettings, updateSetting, setSettingValue, s
                 { key: 'CLAUDE_CODE', label: 'Claude' },
                 { key: 'CODEX', label: 'Codex' },
                 { key: 'AGENT_ZERO', label: 'Agent Zero' },
-                { key: 'GEMINI', label: 'Gemini' },
+                { key: 'GEMINI', label: 'Antigravity' },
                 { key: 'OLLAMA', label: 'Ollama' },
               ].map((a) => (
                 <button key={a.key} onClick={() => setAgentEditorOpen(a.key)} className="p-2 rounded-lg bg-white/[0.03] border border-white/[0.08] hover:bg-white/[0.06] text-left">

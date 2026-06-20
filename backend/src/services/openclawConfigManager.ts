@@ -63,19 +63,62 @@ function safeReadJson<T>(targetPath: string, fallback: T): T {
   }
 }
 
+function normalizeAuthProfile(profile: any): AuthProfile | null {
+  const provider = typeof profile?.provider === 'string' ? profile.provider.trim() : '';
+  if (!provider) return null;
+  const type = typeof profile?.type === 'string'
+    ? profile.type
+    : (typeof profile?.mode === 'string' ? profile.mode : 'oauth');
+  return {
+    ...profile,
+    provider,
+    type,
+  } as AuthProfile;
+}
+
+function normalizeAuthProfiles(rawProfiles: any): Record<string, AuthProfile> {
+  if (!rawProfiles || typeof rawProfiles !== 'object') return {};
+  const profiles: Record<string, AuthProfile> = {};
+  for (const [profileId, rawProfile] of Object.entries(rawProfiles)) {
+    const normalized = normalizeAuthProfile(rawProfile);
+    if (normalized) profiles[profileId] = normalized;
+  }
+  return profiles;
+}
+
+function writeAuthProfilesFile(authProfiles: AuthProfilesFile) {
+  fs.mkdirSync(path.dirname(AUTH_PROFILES_PATH), { recursive: true });
+  fs.writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(authProfiles, null, 2), 'utf8');
+}
+
 export function readOpenClawConfig(): any {
   repairClaudeSubscriptionConfig();
   return safeReadJson(CONFIG_PATH, {});
 }
 
 export function readAuthProfiles(): AuthProfilesFile {
-  return safeReadJson<AuthProfilesFile>(AUTH_PROFILES_PATH, { version: 2, profiles: {} });
+  const stored = safeReadJson<AuthProfilesFile>(AUTH_PROFILES_PATH, { version: 2, profiles: {} });
+  const config = safeReadJson<any>(CONFIG_PATH, {});
+  const configProfiles = normalizeAuthProfiles(config?.auth?.profiles);
+  const storedProfiles = normalizeAuthProfiles(stored.profiles);
+
+  return {
+    ...stored,
+    version: stored.version || 2,
+    profiles: {
+      ...configProfiles,
+      ...storedProfiles,
+    },
+  };
 }
 
 export function getProviderAuthAliases(provider: string): Set<string> {
   const normalized = String(provider || '').trim();
   if (normalized === 'anthropic' || normalized === 'claude-cli') {
     return new Set(['anthropic', 'claude-cli']);
+  }
+  if (normalized === 'google-antigravity' || normalized === 'google-gemini-cli') {
+    return new Set(['google-antigravity', 'google-gemini-cli']);
   }
   return new Set([normalized]);
 }
@@ -125,7 +168,7 @@ export function cleanupStaleProviderAuthProfiles(
     };
   }
 
-  fs.writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(authProfiles, null, 2), 'utf8');
+  writeAuthProfilesFile(authProfiles);
 
   const config = readOpenClawConfig();
   if (!config.auth) config.auth = {};
@@ -196,6 +239,8 @@ export function getFallbackModels(): string[] {
  * When a user saves an API key, we write provider config to models.json
  * so the gateway can actually reach the provider's API.
  */
+type ProviderRuntimeCatalogConfig = { baseUrl?: string; api?: string; auth?: string };
+
 const PROVIDER_API_CONFIG: Record<string, { baseUrl: string; api: string; auth?: string }> = {
   'anthropic': { baseUrl: 'https://api.anthropic.com', api: 'anthropic-messages' },
   'openai': { baseUrl: 'https://api.openai.com/v1', api: 'openai-completions' },
@@ -207,6 +252,19 @@ const PROVIDER_API_CONFIG: Record<string, { baseUrl: string; api: string; auth?:
   'together': { baseUrl: 'https://api.together.xyz/v1', api: 'openai-completions' },
   'xai': { baseUrl: 'https://api.x.ai/v1', api: 'openai-responses' },
 };
+
+const PROVIDER_RUNTIME_CATALOG_CONFIG: Record<string, ProviderRuntimeCatalogConfig> = {
+  // OpenClaw's Google CLI OAuth backends are local/runtime-managed. They still need
+  // a model catalog entry, but API/baseUrl fields would make it a custom HTTP provider.
+  'google-gemini-cli': {},
+  'google-antigravity': {},
+};
+
+const PROVIDERS_REQUIRING_RUNTIME_MODEL_CATALOG = new Set(['google-gemini-cli', 'google-antigravity']);
+
+function getProviderRuntimeCatalogConfig(provider: string): ProviderRuntimeCatalogConfig | null {
+  return PROVIDER_API_CONFIG[provider] || PROVIDER_RUNTIME_CATALOG_CONFIG[provider] || null;
+}
 
 function getProviderMeta(provider: string) {
   return AI_PROVIDERS.find((entry) => entry.id === provider) || null;
@@ -228,7 +286,7 @@ function writeProviderSecret(options: {
   authData.profiles[profileId] = authType === 'api_key'
     ? { type: 'api_key', provider, key: secret }
     : { type: 'token', provider, token: secret };
-  fs.writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(authData, null, 2), 'utf8');
+  writeAuthProfilesFile(authData);
 
   cleanupStaleProviderAuthProfiles(provider, profileId, authType);
 
@@ -274,8 +332,15 @@ function normalizeProviderRuntimeModelId(provider: string, modelId: string): str
   return raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
 }
 
-function mergeProviderRuntimeCatalog(provider: string, existingProviderConfig: Record<string, any>, modelIds: string[]) {
-  const apiConfig = PROVIDER_API_CONFIG[provider];
+export function mergeProviderRuntimeCatalog(provider: string, existingProviderConfig: Record<string, any>, modelIds: string[]) {
+  const runtimeConfig = getProviderRuntimeCatalogConfig(provider);
+  if (!runtimeConfig) {
+    return {
+      changed: false,
+      addedModels: [] as string[],
+      nextProviderConfig: existingProviderConfig,
+    };
+  }
   const existingModels = Array.isArray(existingProviderConfig.models) ? existingProviderConfig.models : [];
   const seen = new Set<string>();
   const nextModels: Array<Record<string, any>> = [];
@@ -299,7 +364,7 @@ function mergeProviderRuntimeCatalog(provider: string, existingProviderConfig: R
 
   const nextProviderConfig: Record<string, any> = {
     ...existingProviderConfig,
-    ...apiConfig,
+    ...runtimeConfig,
     models: nextModels,
   };
 
@@ -319,8 +384,8 @@ function mergeProviderRuntimeCatalog(provider: string, existingProviderConfig: R
 }
 
 export function registerProviderRuntimeModels(provider: string, modelIds: string[]): { changed: boolean; addedModels: string[] } {
-  const apiConfig = PROVIDER_API_CONFIG[provider];
-  if (!apiConfig) return { changed: false, addedModels: [] };
+  const runtimeConfig = getProviderRuntimeCatalogConfig(provider);
+  if (!runtimeConfig) return { changed: false, addedModels: [] };
 
   const modelsData = safeReadJson<any>(MODELS_JSON_PATH, { providers: {} });
   if (!modelsData.providers) modelsData.providers = {};
@@ -347,6 +412,17 @@ export function registerProviderRuntimeModels(provider: string, modelIds: string
   };
 }
 
+function providerCatalogContainsModel(provider: string, providerConfig: any, modelId: string | null): boolean {
+  if (!modelId || !providerConfig || typeof providerConfig !== 'object') return false;
+  const target = normalizeProviderRuntimeModelId(provider, modelId);
+  if (!target) return false;
+  const models = Array.isArray(providerConfig.models) ? providerConfig.models : [];
+  return models.some((entry: any) => {
+    const rawId = typeof entry === 'string' ? entry : String(entry?.id || '').trim();
+    return normalizeProviderRuntimeModelId(provider, rawId) === target;
+  });
+}
+
 export function pinProviderAuthProfile(provider: string, profileId: string, mode?: 'api_key' | 'token' | 'oauth') {
   cleanupStaleProviderAuthProfiles(provider, profileId, mode);
 }
@@ -363,7 +439,9 @@ export function getProviderStatuses(): ProviderStatus[] {
   const now = Date.now();
 
   return AI_PROVIDERS.map((provider) => {
-    const providerAliases = getProviderAuthAliases(provider.id);
+    const providerAliases = provider.id === 'openai-codex'
+      ? new Set(['openai-codex', 'codex', 'openai'])
+      : getProviderAuthAliases(provider.id);
     const matchingConfigProfileId = Object.keys(configProfiles).find((profileId) => providerAliases.has(configProfiles[profileId]?.provider)) || null;
     const matchingStoredProfileId = Object.keys(storedProfiles).find((profileId) => providerAliases.has(storedProfiles[profileId]?.provider)) || null;
     const hasRuntimeProviderConfig = Boolean(modelsData?.providers?.[provider.id]);
@@ -385,7 +463,11 @@ export function getProviderStatuses(): ProviderStatus[] {
     const excludedByAuthOrder = Array.isArray(providerOrder) && providerOrder.length === 0;
     const currentModel = provider.id === 'anthropic'
       ? (defaultModel && defaultModel.startsWith('anthropic/') ? defaultModel : null)
-      : (defaultModel && defaultModel.startsWith(`${provider.id}/`) ? defaultModel : null);
+      : provider.id === 'openai-codex'
+        ? (defaultModel && (defaultModel.startsWith('codex/') || defaultModel.startsWith('openai-codex/') || defaultModel.startsWith('openai/')) ? defaultModel : null)
+        : provider.id === 'google-antigravity'
+          ? (defaultModel && (defaultModel.startsWith('google-antigravity/') || defaultModel.startsWith('google-gemini-cli/')) ? defaultModel : null)
+          : (defaultModel && defaultModel.startsWith(`${provider.id}/`) ? defaultModel : null);
 
     let status: ProviderStatus['status'] = 'unconfigured';
     let error: string | null = null;
@@ -395,7 +477,17 @@ export function getProviderStatuses(): ProviderStatus[] {
     const nativeProvider = getNativeProviderLinkedToOpenClawProvider(provider.id);
     const nativeAuth = nativeProvider ? getNativeCliAuthStatus(nativeProvider) : null;
 
-    if (regularProfileConfigured) {
+    if (provider.primaryAuthType === 'native_cli') {
+      if (nativeAuth?.status === 'authenticated') {
+        status = 'configured';
+        effectiveAuthType = 'cli';
+      } else if (nativeAuth?.status === 'needs_login') {
+        status = 'unconfigured';
+      } else if (nativeAuth?.status === 'unknown') {
+        status = 'error';
+        error = nativeAuth.message;
+      }
+    } else if (regularProfileConfigured) {
       status = 'configured';
       effectiveProfileId = profileId;
       effectiveAuthType = storedProfile?.type || configProfiles[matchingConfigProfileId || '']?.mode || null;
@@ -415,8 +507,20 @@ export function getProviderStatuses(): ProviderStatus[] {
         error = `Provider has recorded ${errorCount} recent error${errorCount === 1 ? '' : 's'}.`;
       }
 
-      if (provider.id !== 'anthropic' && nativeAuth?.status === 'needs_login') {
+      if (provider.id !== 'anthropic' && nativeAuth?.status && !['authenticated', 'not_applicable'].includes(nativeAuth.status)) {
         warning = `${nativeAuth.message} OpenClaw can use this provider, but the portal's native ${nativeProvider} adapter still needs its own server-side auth.`;
+      }
+
+      if (
+        status === 'configured'
+        && PROVIDERS_REQUIRING_RUNTIME_MODEL_CATALOG.has(provider.id)
+        && currentModel
+        && currentModel.startsWith(`${provider.id}/`)
+        && !providerCatalogContainsModel(provider.id, modelsData?.providers?.[provider.id], currentModel)
+        && !providerCatalogContainsModel(provider.id, config?.models?.providers?.[provider.id], currentModel)
+      ) {
+        status = 'error';
+        error = `OpenClaw model catalog is missing ${currentModel}. Re-run provider model registration before using Agent Chat.`;
       }
     } else if (hasAnyProviderConfig || hasStoredProfile) {
       status = 'error';

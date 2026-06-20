@@ -105,6 +105,7 @@ const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
 };
 
 const OPENCLAW_FAST_MODE_MODELS = new Set([
+  'codex/gpt-5.4',
   'openai/gpt-5.4',
   'openai-codex/gpt-5.4',
 ]);

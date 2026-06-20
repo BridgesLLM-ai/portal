@@ -1,4 +1,12 @@
-import { extractClaudeAuthUrl, extractClaudeSetupToken, normalizeTerminalScreenText, squashPromptText, textContainsCallbackPastePrompt } from '../services/oauthFlowManager';
+import {
+  extractClaudeAuthUrl,
+  extractClaudeSetupToken,
+  getOpenClawOAuthProviderId,
+  normalizeTerminalScreenText,
+  outputLooksLikeClaudeCliAuthImportSuccess,
+  squashPromptText,
+  textContainsCallbackPastePrompt,
+} from '../services/oauthFlowManager';
 
 describe('oauthFlowManager terminal parsing', () => {
   test('squashes screen-control fragments that render prompts one glyph per line', () => {
@@ -33,5 +41,21 @@ describe('oauthFlowManager terminal parsing', () => {
     ].join('\r\n');
 
     expect(extractClaudeAuthUrl(raw)).toBe('https://claude.ai/oauth/authorize?code=true&state=abc123');
+  });
+
+  test('maps Portal Codex setup to OpenClaw 2026.6 auth provider id', () => {
+    expect(getOpenClawOAuthProviderId('openai-codex')).toBe('openai');
+    expect(getOpenClawOAuthProviderId('google-gemini-cli')).toBe('google-gemini-cli');
+  });
+
+  test('accepts Claude CLI auth import output even when wrapper exits non-zero', () => {
+    const raw = [
+      'Updated config: ~/.openclaw/openclaw.json',
+      'Auth profile: anthropic:claude-cli (claude-cli/oauth)',
+      'Default model available: anthropic/claude-opus-4-8 (use --set-default to apply)',
+      'Claude CLI auth detected; kept Anthropic model refs and selected the local Claude CLI runtime.',
+    ].join('\n');
+
+    expect(outputLooksLikeClaudeCliAuthImportSuccess(raw)).toBe(true);
   });
 });

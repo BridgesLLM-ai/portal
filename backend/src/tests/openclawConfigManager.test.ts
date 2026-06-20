@@ -3,6 +3,7 @@ import {
   getStaleProviderProfileIds,
   hasAnthropicClaudeCliReferences,
   isClaudeCliModelId,
+  mergeProviderRuntimeCatalog,
 } from '../services/openclawConfigManager';
 
 describe('openclawConfigManager Claude CLI helpers', () => {
@@ -69,5 +70,51 @@ describe('openclawConfigManager auth profile cleanup helpers', () => {
 
   test('uses the same Anthropic cleanup aliases when called from the Claude CLI provider side', () => {
     expect(Array.from(getProviderAuthAliases('claude-cli')).sort()).toEqual(['anthropic', 'claude-cli']);
+  });
+});
+
+describe('openclawConfigManager runtime model catalog helpers', () => {
+  test('registers Antigravity models without converting the runtime provider into an HTTP API provider', () => {
+    const merged = mergeProviderRuntimeCatalog('google-antigravity', {}, [
+      'google-antigravity/gemini-3.5-flash',
+      'google-antigravity/gemini-3.1-pro-high',
+    ]);
+
+    expect(merged.changed).toBe(true);
+    expect(merged.addedModels).toEqual([
+      'gemini-3.5-flash',
+      'gemini-3.1-pro-high',
+    ]);
+    expect(merged.nextProviderConfig).toEqual({
+      models: [
+        { id: 'gemini-3.5-flash', name: 'gemini-3.5-flash' },
+        { id: 'gemini-3.1-pro-high', name: 'gemini-3.1-pro-high' },
+      ],
+    });
+  });
+
+  test('keeps API provider endpoint config while adding runtime catalog models', () => {
+    const merged = mergeProviderRuntimeCatalog('google', { models: ['google/gemini-3.1-flash-lite'] }, [
+      'google/gemini-3.1-pro-preview',
+    ]);
+
+    expect(merged.nextProviderConfig).toMatchObject({
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      api: 'google-generative-ai',
+      auth: 'api-key',
+      models: [
+        { id: 'gemini-3.1-flash-lite', name: 'gemini-3.1-flash-lite' },
+        { id: 'gemini-3.1-pro-preview', name: 'gemini-3.1-pro-preview' },
+      ],
+    });
+  });
+
+  test('ignores unknown providers instead of creating invalid catalog entries', () => {
+    const existing = { models: [{ id: 'custom-model', name: 'Custom Model' }] };
+    const merged = mergeProviderRuntimeCatalog('unknown-provider', existing, ['unknown-provider/new-model']);
+
+    expect(merged.changed).toBe(false);
+    expect(merged.addedModels).toEqual([]);
+    expect(merged.nextProviderConfig).toBe(existing);
   });
 });

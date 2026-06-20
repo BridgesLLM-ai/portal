@@ -164,6 +164,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
             statusMap={statusMap}
             onSelect={(provider) => { setShowProviderPicker(false); setActiveSetup(provider); }}
             onDeviceFlow={() => { setShowProviderPicker(false); setActiveDeviceFlow(true); }}
+            onNativeCliFlow={(provider) => { setShowProviderPicker(false); setActiveNativeCliFlow(provider); }}
             onClose={() => setShowProviderPicker(false)}
           />
         ) : null}
@@ -277,6 +278,10 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
           onDeviceFlow={() => {
             setShowProviderPicker(false);
             setActiveDeviceFlow(true);
+          }}
+          onNativeCliFlow={(provider) => {
+            setShowProviderPicker(false);
+            setActiveNativeCliFlow(provider);
           }}
           onClose={() => setShowProviderPicker(false)}
         />

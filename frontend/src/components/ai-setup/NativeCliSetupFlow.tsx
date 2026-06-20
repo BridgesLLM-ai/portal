@@ -14,7 +14,7 @@ type Step = 'start' | 'waiting' | 'paste' | 'device' | 'done' | 'error';
 const PROVIDER_LABELS: Record<string, { name: string; color: string }> = {
   'claude-code': { name: 'Claude Code', color: 'emerald' },
   codex: { name: 'Codex', color: 'blue' },
-  gemini: { name: 'Gemini', color: 'purple' },
+  gemini: { name: 'Antigravity', color: 'purple' },
 };
 
 export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCancel }: NativeCliSetupFlowProps) {

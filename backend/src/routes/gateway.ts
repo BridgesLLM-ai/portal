@@ -8,6 +8,7 @@ import path from 'path';
 import { AgentRegistry, AgentProviderName } from '../agents';
 import { AgentAbortError } from '../agents/AgentProvider.interface';
 import { listProviderModels } from '../agents/providerModels';
+import { getProviderCapabilities } from '../agents/providerAvailability';
 import { getProviderCommandCatalog } from '../agents/providerCommandCatalog';
 import { resolveExecApproval, ExecApprovalRequest } from '../agents/providers/OpenClawProvider';
 import { appendNativeMessage, loadNativeSession, updateNativeSessionModel } from '../agents/providers/NativeSessionStore';
@@ -28,6 +29,7 @@ import {
   onNativeCliApprovalRequest,
   onNativeCliApprovalResolved,
   resolveNativeCliApproval,
+  listPendingNativeCliApprovals,
   type NativeCliApprovalDecision,
 } from '../agents/nativeCliApprovals';
 import { streamEventBus, type StreamEvent } from '../services/StreamEventBus';
@@ -425,8 +427,12 @@ function getOpenClawCompatibilityHotfixStatus() {
   const geminiCliYoloPatched = geminiCliBackendText.includes('"--yolo",');
   const geminiParserText = claudeLiveSessionText || executeRuntimeText;
   const geminiParserPatched = geminiParserText.includes('function isGeminiCliProvider(providerId) {')
-    && geminiParserText.includes('function parseGeminiCliStreamingRecord(params) {');
-  const executeRuntimeWiringPatched = executeRuntimeText.includes('onToolEvent: (event) => {');
+    && geminiParserText.includes('function parseGeminiCliStreamingDelta(params) {')
+    && geminiParserText.includes('function dispatchGeminiCliStreamingToolEvent(params) {');
+  const executeRuntimeNativeToolWiring = executeRuntimeText.includes('onToolUseStart: emitCliToolUseStart')
+    && executeRuntimeText.includes('onToolResult: emitCliToolResult');
+  const executeRuntimeWiringPatched = executeRuntimeNativeToolWiring
+    || executeRuntimeText.includes('onToolEvent: (event) => {');
   const geminiRuntimePatched = geminiParserPatched && executeRuntimeWiringPatched;
   const relaySupported = Boolean(heartbeatRunnerPath) && Boolean(replyBundlePath);
   const geminiSupported = Boolean(executeRuntimePath) && Boolean(geminiCliBackendPath);
@@ -449,6 +455,7 @@ function getOpenClawCompatibilityHotfixStatus() {
     geminiCliPatched,
     geminiCliYoloPatched,
     geminiRuntimePatched,
+    executeRuntimeNativeToolWiring,
     heartbeatRunner: heartbeatRunnerPath ? path.basename(heartbeatRunnerPath) : null,
     replyBundle: replyBundlePath ? path.basename(replyBundlePath) : null,
     executeRuntime: executeRuntimePath ? path.basename(executeRuntimePath) : null,
@@ -705,6 +712,21 @@ function normalizeProviderName(input: unknown): AgentProviderName {
   return (normalized || 'OPENCLAW') as AgentProviderName;
 }
 
+function routeProviderForRequestedModel(providerName: unknown, requestedModel: unknown): AgentProviderName {
+  const provider = normalizeProviderName(providerName);
+  if (provider !== 'OPENCLAW') return provider;
+
+  const normalizedModel = normalizePortalModelId(typeof requestedModel === 'string' ? requestedModel : '');
+  if (
+    normalizedModel.startsWith('google-antigravity/')
+    || normalizedModel.startsWith('google-gemini-cli/')
+  ) {
+    return 'GEMINI';
+  }
+
+  return provider;
+}
+
 function isNativeSessionPlaceholder(rawSession: unknown): boolean {
   const session = typeof rawSession === 'string' ? rawSession.trim() : '';
   return !session || session === 'main' || session.startsWith('new-') || session.startsWith('agent:');
@@ -730,7 +752,7 @@ function humanizeProviderError(providerName: AgentProviderName, rawMessage: stri
   }
 
   if (/GEMINI_API_KEY|GOOGLE_GENAI_USE_VERTEXAI|GOOGLE_GENAI_USE_GCA|Auth method/i.test(message)) {
-    return 'Gemini CLI is installed but not authenticated on the server. Configure Gemini auth (for example GEMINI_API_KEY) and try again.';
+    return 'Antigravity is installed but not authenticated on the server. Run the native Antigravity login flow in AI Setup and try again.';
   }
 
   if (/failed to connect to websocket: HTTP error: 500 Internal Server Error, url: wss:\/\/api\.openai\.com\/v1\/responses/i.test(message)) {
@@ -2922,6 +2944,7 @@ const PROVENANCE: Record<string, string> = {
   OPENCLAW: 'via OpenClaw',
   CLAUDE_CODE: 'via Claude CLI',
   CODEX: 'via Codex CLI',
+  GEMINI: 'via Antigravity',
   AGENT_ZERO: 'via Agent Zero',
 };
 
@@ -3135,43 +3158,16 @@ router.get('/providers', authenticateToken, async (_req: Request, res: Response)
 router.get('/models', authenticateToken, async (req: Request, res: Response) => {
   try {
     const providerName = ((req.query.provider as string) || 'OPENCLAW').trim().toUpperCase() as AgentProviderName;
-    const providerInfo = AgentRegistry.listProviders().find((p) => p.name === providerName);
-    if (!providerInfo) {
+    const capabilities = getProviderCapabilities(providerName);
+    if (!capabilities) {
       res.status(400).json({ error: `Unknown provider: ${providerName}` });
       return;
     }
 
-    let models = await listProviderModels(providerName);
-    if (providerName === 'OPENCLAW') {
-      try {
-        const live = await listGatewayModels();
-        if (live.ok && Array.isArray(live.models) && live.models.length > 0) {
-          const seen = new Set<string>();
-          models = live.models
-            .map((model: any) => {
-              const rawId = String(model?.id || model?.name || model?.model || '').trim();
-              const provider = String(model?.provider || '').trim();
-              const id = canonicalizeProviderModelId(provider, rawId) || normalizePortalModelId(rawId);
-              if (!id || seen.has(id)) return null;
-              seen.add(id);
-              const resolvedProvider = provider || id.split('/')[0] || 'other';
-              return {
-                id,
-                alias: typeof model?.alias === 'string' && model.alias.trim() ? model.alias.trim() : null,
-                provider: resolvedProvider,
-                displayName: String(model?.displayName || model?.name || id.split('/').slice(1).join('/') || id),
-                source: 'dynamic' as const,
-              };
-            })
-            .filter(Boolean) as any;
-        }
-      } catch {
-        // Fall back to config-derived catalog below.
-      }
-    }
+    const models = await listProviderModels(providerName);
     res.json({
       provider: providerName,
-      capabilities: providerInfo.capabilities,
+      capabilities,
       models,
     });
   } catch (err: any) {
@@ -4281,9 +4277,8 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
   const wantStream = req.query.stream === '1' || req.headers.accept === 'text/event-stream';
 
   try {
-    const provider = providerName
-      ? AgentRegistry.get(providerName as AgentProviderName)
-      : AgentRegistry.getDefault();
+    const routedProviderName = routeProviderForRequestedModel(providerName, requestedModel);
+    const provider = AgentRegistry.get(routedProviderName);
     const provenance = PROVENANCE[provider.providerName] || `via ${provider.displayName}`;
 
     const clientSession = typeof session === 'string' && session.trim().length > 0 ? session.trim() : '';
@@ -4963,6 +4958,11 @@ router.get('/approvals/stream', authenticateToken, requireAdmin, (req: Request, 
   let alive = true;
   const sseWrite = (data: string) => { if (!alive) return; try { res.write(data); if (typeof (res as any).flush === 'function') (res as any).flush(); } catch { alive = false; } };
   sseWrite(`data: ${JSON.stringify({ type: 'connected', persistentWsConnected: isPersistentWsConnected() })}\n\n`);
+  // Replay any in-flight approval requests so a reconnecting / late SSE client still
+  // renders the popup. The frontend upserts by id, so re-delivery is idempotent.
+  for (const approval of pendingApprovalsForUser(req.user!)) {
+    sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_requested', approval })}\n\n`);
+  }
   const keepaliveTimer = setInterval(() => { if (alive) sseWrite(': keepalive\n\n'); }, 15000);
   const unsubReq = onApprovalRequest((a: PersistentApprovalRequest) => sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_requested', approval: a })}\n\n`));
   const unsubRes = onApprovalResolved((r: ExecApprovalResolved) => sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_resolved', resolved: r })}\n\n`));
@@ -5194,12 +5194,11 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
 
   let streamKeepalive: ReturnType<typeof setInterval> | null = null;
   let resolvedSessionId: string | null = null;
-  let providerNameForError: AgentProviderName = normalizeProviderName(providerName);
+  const routedProviderName = routeProviderForRequestedModel(providerName, requestedModel);
+  let providerNameForError: AgentProviderName = routedProviderName;
 
   try {
-    const provider = providerName
-      ? AgentRegistry.get(providerName as AgentProviderName)
-      : AgentRegistry.getDefault();
+    const provider = AgentRegistry.get(routedProviderName);
     providerNameForError = provider.providerName;
     const provenance = PROVENANCE[provider.providerName] || `via ${provider.displayName}`;
     const isOpenClawProvider = provider.providerName === 'OPENCLAW';
@@ -5263,7 +5262,7 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       try {
         if (!requestedModel.includes('/')) {
           console.warn(`[gateway-ws] Rejecting bare model name without provider prefix: "${requestedModel}". Select a fully-qualified model ID.`);
-          wsSend(ws, { type: 'error', content: `Invalid model "${requestedModel}": must include provider prefix (e.g. openai-codex/gpt-5.4). Please reselect your model.` });
+          wsSend(ws, { type: 'error', content: `Invalid model "${requestedModel}": must include provider prefix (e.g. codex/gpt-5.4). Please reselect your model.` });
           return;
         }
         const resolvedModel = await resolveOpenClawPatchModel(requestedModel);
@@ -5627,6 +5626,23 @@ function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtP
 
 /* ─── WS connection handler ────────────────────────────────────────────── */
 
+// Pending native-CLI (e.g. Claude Code) approvals a given user is allowed to see.
+// Used to replay in-flight approval popups to a freshly (re)connected client so a
+// reload / chat switch / reconnect mid-turn does not silently drop the request.
+function pendingApprovalsForUser(user: JwtPayload): ExecApprovalRequest[] {
+  if (!isElevatedRole(user.role)) return [];
+  return listPendingNativeCliApprovals().filter((approval) => {
+    const sessionKey = approval?.request?.sessionKey;
+    if (!sessionKey) return true;
+    try {
+      assertGatewaySessionAccess(sessionKey, user);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
 function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
   (ws as any).__portalUser = user;
   portalWsClients.add(ws);
@@ -5696,6 +5712,12 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
   ws.on('error', (err: Error) => console.error(`[gateway-ws] Error (${user.email}):`, err.message));
 
   wsSend(ws, { type: 'connected' });
+
+  // Replay any in-flight approval requests so a reconnecting / late client still
+  // renders the popup. The frontend upserts by id, so re-delivery is idempotent.
+  for (const approval of pendingApprovalsForUser(user)) {
+    wsSend(ws, { type: 'exec_approval', approval });
+  }
 }
 
 /* ─── WS Server setup (called from server.ts) ─────────────────────────── */
@@ -6135,6 +6157,7 @@ function normalizeRequestedModel(providerName: AgentProviderName, rawModel: stri
   if (providerName === 'OPENCLAW' || providerName === 'OLLAMA') return normalizePortalModelId(model);
   if (providerName === 'GEMINI') {
     const normalized = normalizePortalModelId(model).replace(/^models\//, '');
+    if (normalized.startsWith('google-antigravity/')) return normalized.slice('google-antigravity/'.length);
     if (normalized.startsWith('google-gemini-cli/')) return normalized.slice('google-gemini-cli/'.length);
     if (normalized.startsWith('google/')) return normalized.slice('google/'.length);
     return normalized;
@@ -6147,7 +6170,7 @@ function normalizeRequestedModel(providerName: AgentProviderName, rawModel: stri
   if (providerName === 'CLAUDE_CODE' && (lower.startsWith('anthropic/') || lower.startsWith('claude/'))) {
     return parts.slice(1).join('/');
   }
-  if (providerName === 'CODEX' && (lower.startsWith('openai-codex/') || lower.startsWith('openai/'))) {
+  if (providerName === 'CODEX' && (lower.startsWith('codex/') || lower.startsWith('openai-codex/') || lower.startsWith('openai/'))) {
     return parts.slice(1).join('/');
   }
   return model;

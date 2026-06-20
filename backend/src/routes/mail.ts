@@ -46,6 +46,9 @@ const STALWART_SUPPORT_USER = process.env.STALWART_SUPPORT_USER || 'support';
 const STALWART_SUPPORT_PASS = process.env.STALWART_SUPPORT_PASS || '';
 const STALWART_NOREPLY_USER = process.env.STALWART_NOREPLY_USER || 'noreply';
 const STALWART_NOREPLY_PASS = process.env.STALWART_NOREPLY_PASS || '';
+const EXTRA_SHARED_MAIL_ACCOUNT_ID = process.env.EXTRA_SHARED_MAIL_ACCOUNT_ID || '';
+const EXTRA_SHARED_MAIL_LABEL = process.env.EXTRA_SHARED_MAIL_LABEL || 'Shared Mailbox';
+const EXTRA_SHARED_MAIL_AUTH_PATH = process.env.EXTRA_SHARED_MAIL_AUTH_PATH || '';
 const MAIL_DOMAIN = process.env.MAIL_DOMAIN || 'localhost';
 
 // Multer for file attachment uploads (max 25MB per file, max 10 files)
@@ -65,13 +68,37 @@ interface ResolvedAccount {
   email: string;
 }
 
+interface SharedMailCredentials {
+  user: string;
+  pass: string;
+  email: string;
+}
+
 function getRequestedAccountId(req: Request): string | undefined {
   const accountParam = typeof req.query.account === 'string' ? req.query.account : '';
   return accountParam || undefined;
 }
 
+function readExtraSharedMailCredentials(): SharedMailCredentials | null {
+  if (!EXTRA_SHARED_MAIL_AUTH_PATH) return null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(EXTRA_SHARED_MAIL_AUTH_PATH, 'utf8'));
+    const user = typeof raw.user === 'string' ? raw.user.trim() : '';
+    const pass = typeof raw.pass === 'string' ? raw.pass : '';
+    const email = typeof raw.email === 'string' && raw.email.trim()
+      ? raw.email.trim()
+      : `${EXTRA_SHARED_MAIL_ACCOUNT_ID || user}@${MAIL_DOMAIN}`;
+    if (!user || !pass) return null;
+    return { user, pass, email };
+  } catch {
+    return null;
+  }
+}
+
 function isSharedMailboxAccount(accountId?: string): boolean {
-  return accountId === 'support' || accountId === 'noreply';
+  return accountId === 'support'
+    || accountId === 'noreply'
+    || (!!EXTRA_SHARED_MAIL_ACCOUNT_ID && accountId === EXTRA_SHARED_MAIL_ACCOUNT_ID);
 }
 
 async function getSelectedPersonalMailboxCredentials(req: Request) {
@@ -84,7 +111,7 @@ async function getSelectedPersonalMailboxCredentials(req: Request) {
 
 /**
  * Resolve which Stalwart account to use for a request.
- * - ?account=support or ?account=noreply → admin only
+ * - ?account=support, ?account=noreply, or an optional extra shared mailbox → elevated users only
  * - Default: user's personal mailbox
  * - If user has no mailbox, returns 'no_mailbox' string
  */
@@ -97,6 +124,10 @@ async function resolveAccount(req: Request): Promise<ResolvedAccount | null | 'n
   }
   if (accountParam === 'noreply') {
     return isAdmin ? { user: STALWART_NOREPLY_USER, pass: STALWART_NOREPLY_PASS, email: `noreply@${MAIL_DOMAIN}` } : null;
+  }
+  if (EXTRA_SHARED_MAIL_ACCOUNT_ID && accountParam === EXTRA_SHARED_MAIL_ACCOUNT_ID) {
+    const extraSharedMailbox = readExtraSharedMailCredentials();
+    return isAdmin && extraSharedMailbox ? extraSharedMailbox : null;
   }
 
   const creds = await getSelectedPersonalMailboxCredentials(req);
@@ -136,10 +167,14 @@ router.get('/accounts', async (req: Request, res: Response) => {
     }
     
     if (isAdmin) {
+      const extraSharedMailbox = readExtraSharedMailCredentials();
       accounts.push(
         { id: 'support', label: 'Shared Support', email: `support@${MAIL_DOMAIN}` },
         { id: 'noreply', label: 'Shared No-Reply', email: `noreply@${MAIL_DOMAIN}` },
       );
+      if (EXTRA_SHARED_MAIL_ACCOUNT_ID && extraSharedMailbox) {
+        accounts.push({ id: EXTRA_SHARED_MAIL_ACCOUNT_ID, label: EXTRA_SHARED_MAIL_LABEL, email: extraSharedMailbox.email });
+      }
     }
     
     res.json({ accounts, hasMailbox: personalAccounts.length > 0 });

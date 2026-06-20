@@ -87,7 +87,7 @@ async function detectDependencyVersions(): Promise<DependencyVersions> {
   const claudeCode = detectCommandVersion('claude --version 2>/dev/null', /(\d+\.\d+\.\d+)/);
   if (claudeCode) deps.claudeCode = claudeCode;
 
-  const geminiCli = detectCommandVersion('gemini --version 2>/dev/null', /(\d+\.\d+\.\d+)/);
+  const geminiCli = detectCommandVersion('agy --version 2>/dev/null', /(\d+\.\d+\.\d+)/);
   if (geminiCli) deps.geminiCli = geminiCli;
 
   return deps;

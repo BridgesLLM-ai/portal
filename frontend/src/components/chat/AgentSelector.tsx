@@ -168,7 +168,7 @@ const PROVIDER_META: Record<string, { emoji: string; color: string; label: strin
   CLAUDE_CODE: { emoji: '🟣', color: 'text-violet-400',  label: 'Claude Code', initials: 'CL', avatarBg: 'bg-violet-600/20', avatarText: 'text-violet-300' },
   CODEX:       { emoji: '🔵', color: 'text-sky-400',     label: 'Codex', initials: 'CX', avatarBg: 'bg-sky-600/20', avatarText: 'text-sky-300' },
   AGENT_ZERO:  { emoji: '🟡', color: 'text-amber-400',   label: 'Agent Zero', initials: 'A0', avatarBg: 'bg-amber-600/20', avatarText: 'text-amber-300' },
-  GEMINI:      { emoji: '🔷', color: 'text-cyan-400',    label: 'Gemini', initials: 'GM', avatarBg: 'bg-cyan-600/20', avatarText: 'text-cyan-300' },
+  GEMINI:      { emoji: '🔷', color: 'text-cyan-400',    label: 'Antigravity', initials: 'AG', avatarBg: 'bg-cyan-600/20', avatarText: 'text-cyan-300' },
   OLLAMA:      { emoji: '🔴', color: 'text-rose-400',    label: 'Ollama', initials: 'OL', avatarBg: 'bg-rose-600/20', avatarText: 'text-rose-300' },
 };
 

@@ -34,7 +34,7 @@ export const SAFE_INSTALL_ALLOWLIST = new Set<string>([
   'command -v npm >/dev/null 2>&1 && npm install -g @openai/codex',
   'curl -fsSL https://ollama.ai/install.sh | sh',
   'docker pull agent0ai/agent-zero && docker run -d -p 50001:80 --name agent-zero --restart unless-stopped agent0ai/agent-zero',
-  'command -v npm >/dev/null 2>&1 && npm install -g @google/gemini-cli',
+  'curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin',
 ]);
 
 export const TOOL_ADAPTERS: ToolAdapter[] = [
@@ -146,22 +146,23 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
   },
   {
     id: 'gemini',
-    name: 'Gemini CLI',
-    description: 'Google Gemini CLI for interactive AI coding and generation sessions.',
-    detect: { command: 'gemini --version' },
+    name: 'Google Antigravity',
+    description: 'Google Antigravity CLI for native AI coding and generation sessions.',
+    detect: { command: 'agy --version' },
     install: [
       {
-        label: 'Install Gemini CLI globally',
-        command: 'command -v npm >/dev/null 2>&1 && npm install -g @google/gemini-cli',
+        label: 'Install Google Antigravity CLI',
+        command: 'curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin',
       },
     ],
     commands: [
-      { label: 'Gemini (interactive)', command: 'gemini', description: 'Start interactive Gemini session.' },
-      { label: 'Gemini Exec', command: 'gemini exec "Say hello briefly"', description: 'Run a one-shot Gemini task.' },
-      { label: 'Version Check', command: 'gemini --version', description: 'Verify installed version.' },
+      { label: 'Antigravity (interactive)', command: 'agy', description: 'Start interactive Antigravity session.' },
+      { label: 'Antigravity Print', command: 'agy --print "Say hello briefly"', description: 'Run a one-shot Antigravity task.' },
+      { label: 'List Models', command: 'agy models', description: 'Verify Google sign-in and list available models.' },
+      { label: 'Version Check', command: 'agy --version', description: 'Verify installed version.' },
     ],
     authRequired: true,
-    authHint: 'Requires GEMINI_API_KEY or Google Cloud auth',
+    authHint: "Run 'agy' first time to authenticate with Google, or use the portal native Antigravity login flow.",
     tier: 1,
   },
   {

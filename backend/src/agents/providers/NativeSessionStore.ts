@@ -163,7 +163,7 @@ function providerLabel(provider: AgentProviderName): string {
     case 'CLAUDE_CODE': return 'Claude';
     case 'CODEX': return 'Codex';
     case 'AGENT_ZERO': return 'Agent Zero';
-    case 'GEMINI': return 'Gemini';
+    case 'GEMINI': return 'Antigravity';
     case 'OLLAMA': return 'Ollama';
     default: return 'Agent';
   }

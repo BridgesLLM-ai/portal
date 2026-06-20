@@ -1,4 +1,4 @@
-export type AiProviderAuthType = 'api_key' | 'token' | 'oauth' | 'setup_token' | 'device_code';
+export type AiProviderAuthType = 'api_key' | 'token' | 'oauth' | 'setup_token' | 'device_code' | 'native_cli';
 export type AiProviderValidationMethod = 'bearer' | 'x-api-key' | 'query-param';
 
 export interface StepInstruction {
@@ -60,7 +60,7 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     onboardAuthChoice: 'anthropic-api-key',
     onboardKeyFlag: 'anthropic-api-key',
     defaultModels: [
-      { id: 'claude-opus-4-6', name: 'Claude Opus 4.6', tier: 'frontier', description: 'Most capable. Best for complex reasoning and difficult tasks.' },
+      { id: 'claude-opus-4-8', name: 'Claude Opus 4.8', tier: 'frontier', description: 'Most capable. Best for complex reasoning and difficult tasks.' },
       { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', tier: 'balanced', description: 'Balanced. Great all-rounder for most tasks.' },
       { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', tier: 'fast', description: 'Fastest and cheapest. Good for simple tasks.' },
     ],
@@ -116,9 +116,9 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     description: 'Use your ChatGPT subscription for AI. OpenAI explicitly supports this for external tools.',
     onboardAuthChoice: 'openai-codex',
     defaultModels: [
-      { id: 'openai-codex/gpt-5.5', name: 'GPT-5.5 Codex', tier: 'frontier', description: 'Current OpenClaw default Codex model.' },
-      { id: 'openai-codex/gpt-5.4', name: 'GPT-5.4 Codex', tier: 'balanced', description: 'Stable Codex fallback with broad compatibility.' },
-      { id: 'openai-codex/gpt-5.4-mini', name: 'GPT-5.4 Mini', tier: 'fast', description: 'Fastest currently exposed OpenAI Codex option.' },
+      { id: 'codex/gpt-5.5', name: 'GPT-5.5 Codex', tier: 'frontier', description: 'Current OpenClaw Codex runtime model.' },
+      { id: 'codex/gpt-5.4', name: 'GPT-5.4 Codex', tier: 'balanced', description: 'Stable Codex fallback with broad compatibility.' },
+      { id: 'codex/gpt-5.4-mini', name: 'GPT-5.4 Mini', tier: 'fast', description: 'Fastest currently exposed OpenAI Codex option.' },
     ],
     setupInstructions: [
       { stepNumber: 1, title: 'You need an active ChatGPT subscription', detail: 'ChatGPT Plus ($20/mo), Pro ($200/mo), or Team. Free accounts do NOT work. If you don\'t have one, subscribe at https://chatgpt.com/ → "Upgrade to Plus".', link: { url: 'https://chatgpt.com/', label: 'Open ChatGPT' } },
@@ -131,29 +131,27 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     ],
   },
   {
-    id: 'google-gemini-cli',
-    name: 'Google Gemini (Google Subscription)',
+    id: 'google-antigravity',
+    name: 'Google Antigravity',
     icon: 'globe',
     tier: 1,
-    authTypes: ['oauth'],
-    primaryAuthType: 'oauth',
+    authTypes: ['native_cli'],
+    primaryAuthType: 'native_cli',
     consoleUrl: 'https://gemini.google.com/',
     signupUrl: 'https://gemini.google.com/',
-    pricingNote: 'Uses your Google / Gemini account through OAuth instead of an API key.',
+    pricingNote: 'Uses your Google/Gemini subscription through the Antigravity CLI on the server.',
     freeTier: 'Depends on your Google Gemini plan/account',
-    description: 'Use the Google Gemini subscription/account login flow instead of creating an API key.',
-    onboardAuthChoice: 'google-gemini-cli',
+    description: 'Use Google Antigravity as the native Gemini coding agent. This replaces the older Gemini CLI OAuth path.',
     defaultModels: [
-      { id: 'google-gemini-cli/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', tier: 'frontier', description: 'Highest-capability Gemini CLI OAuth model currently exposed by OpenClaw.' },
-      { id: 'google-gemini-cli/gemini-3-flash-preview', name: 'Gemini 3 Flash Preview', tier: 'balanced', description: 'Current OpenClaw default Gemini CLI model.' },
-      { id: 'google-gemini-cli/gemini-3.1-flash-lite-preview', name: 'Gemini 3.1 Flash Lite Preview', tier: 'fast', description: 'Fastest light-weight Gemini CLI preview option currently exposed by OpenClaw.' },
+      { id: 'google-antigravity/gemini-3.1-pro-high', name: 'Gemini 3.1 Pro High', tier: 'frontier', description: 'Highest-capability Gemini model currently reported by Antigravity.' },
+      { id: 'google-antigravity/gemini-3.5-flash', name: 'Gemini 3.5 Flash', tier: 'balanced', description: 'Fast default Gemini model for most Antigravity tasks.' },
+      { id: 'google-antigravity/gemini-3.5-flash-low', name: 'Gemini 3.5 Flash Low', tier: 'fast', description: 'Fastest Antigravity Gemini option.' },
     ],
     setupInstructions: [
-      { stepNumber: 1, title: 'Start sign-in here', detail: 'Click the sign-in button here to open the Google Gemini authorization flow in a new tab.' },
-      { stepNumber: 2, title: 'Accept the Google warning prompt', detail: 'The portal handles the server-side confirmation step automatically. You just continue in your browser.' },
-      { stepNumber: 3, title: 'Sign in with your Google account', detail: 'Use the same Google account you want the portal to use for Gemini.' },
-      { stepNumber: 4, title: 'Copy the final localhost redirect URL', detail: 'After sign-in, your browser will land on a localhost callback URL that may fail to load. That is normal. Copy the full address bar URL.' },
-      { stepNumber: 5, title: 'Paste the full redirect URL back here', detail: 'Return to the portal and paste it to complete sign-in.' },
+      { stepNumber: 1, title: 'Start Antigravity sign-in', detail: 'Use the portal native CLI login flow to start Antigravity on the server.' },
+      { stepNumber: 2, title: 'Authorize with Google', detail: 'Open the Google authorization link and sign in with the Google account tied to your Gemini plan.' },
+      { stepNumber: 3, title: 'Paste the authorization code', detail: 'Copy the authorization code from Google and paste it back into the portal so `agy` can finish signing in.' },
+      { stepNumber: 4, title: 'Use Antigravity in Agent Chat', detail: 'After login, Portal registers Antigravity model IDs and Agent Chat can run the native Google agent.' },
     ],
   },
   {

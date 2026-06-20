@@ -98,6 +98,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.19 (June 20, 2026)
+- **OpenClaw OAuth model suggestions are current and smaller**: Codex uses the `codex/gpt-5.5`, `codex/gpt-5.4`, and `codex/gpt-5.4-mini` family, while Claude highlights Opus 4.8, Sonnet 4.6, and Haiku 4.5.
+- **Google Antigravity replaces the old Gemini CLI subscription path**: the Portal guides users toward the native Antigravity flow and labels OpenClaw-native Antigravity OAuth as not fully supported for now.
+- **Release packaging is cleaner**: private notes, reports, source trees, logs, env files, dev databases, and stale build output are excluded from the public installer archive.
+
 ### v3.25.18 (May 31, 2026)
 - **OpenClaw compatibility checks are quieter on current runtimes**: updater hotfix detection no longer reports a failed legacy relay patch when the installed OpenClaw bundle has already moved past that patch shape.
 

@@ -112,6 +112,11 @@ export function extractClaudeAuthUrl(text: string): string | null {
   return null;
 }
 
+export function outputLooksLikeClaudeCliAuthImportSuccess(text: string): boolean {
+  const normalizedOutput = normalizeTerminalScreenText(stripAnsi(text));
+  return /auth profile:|default model available:|claude cli auth detected/i.test(normalizedOutput);
+}
+
 function maybeCaptureClaudeSetupToken(session: OAuthSession) {
   if (session.provider !== 'anthropic') return null;
   const token = extractClaudeSetupToken(session.cleanOutput);
@@ -127,8 +132,18 @@ function maybeCaptureClaudeSetupToken(session: OAuthSession) {
 
 function readProviderProfileIds(provider: string) {
   const authProfiles = readAuthProfiles();
-  const aliases = provider === 'anthropic' ? new Set(['anthropic', 'claude-cli']) : new Set([provider]);
+  const aliases = getOAuthProfileProviderAliases(provider);
   return Object.keys(authProfiles.profiles || {}).filter((profileId) => aliases.has(authProfiles.profiles?.[profileId]?.provider));
+}
+
+export function getOpenClawOAuthProviderId(provider: string): string {
+  return provider === 'openai-codex' ? 'openai' : provider;
+}
+
+function getOAuthProfileProviderAliases(provider: string): Set<string> {
+  if (provider === 'anthropic') return new Set(['anthropic', 'claude-cli']);
+  if (provider === 'openai-codex' || provider === 'codex') return new Set(['openai', 'codex', 'openai-codex']);
+  return new Set([provider]);
 }
 
 function rewriteStoredAuthProfileProvider(profileId: string | null | undefined, provider: string) {
@@ -140,6 +155,7 @@ function rewriteStoredAuthProfileProvider(profileId: string | null | undefined, 
     ...existing,
     provider,
   };
+  fs.mkdirSync(path.dirname(AUTH_PROFILES_PATH), { recursive: true });
   fs.writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(authProfiles, null, 2));
 }
 
@@ -155,7 +171,8 @@ function buildPortalOAuthEnv(extraEnv?: Record<string, string>) {
 }
 
 function buildOAuthLoginArgs(provider: string): string[] {
-  const args = ['models', 'auth', 'login', '--provider', provider];
+  const authProvider = getOpenClawOAuthProviderId(provider);
+  const args = ['models', 'auth', 'login', '--provider', authProvider];
   if (provider === 'openai-codex') {
     args.push('--method', 'oauth');
   }
@@ -167,8 +184,11 @@ function isProviderAuthUrl(provider: string, url: string): boolean {
     const host = new URL(url).hostname.toLowerCase();
     switch (provider) {
       case 'openai-codex':
+      case 'openai':
+      case 'codex':
         return host === 'auth.openai.com';
       case 'google-gemini-cli':
+      case 'gemini':
         return host === 'accounts.google.com' || host === 'accounts.googleusercontent.com';
       case 'anthropic':
       case 'claude-code':
@@ -436,6 +456,11 @@ function waitForInitialOutput(session: OAuthSession, timeoutMs: number) {
       const text = session.cleanOutput;
       const normalizedText = normalizeTerminalScreenText(text);
       const squashedText = squashPromptText(text);
+      if (session.status === 'complete') {
+        clearInterval(timer);
+        resolve(session);
+        return;
+      }
       const oauthReady = session.mode === 'oauth' && (
         Boolean(session.authUrl)
         || /Open this URL in your LOCAL browser:/i.test(normalizedText)
@@ -600,7 +625,7 @@ export async function importClaudeCliAuthProfile(timeoutMs = 30000) {
 
     const normalizedOutput = normalizeTerminalScreenText(stripAnsi(rawOutput));
     const looksSuccessful = Boolean(createdProfileId)
-      && /auth profile:|default model available:|claude cli auth detected/i.test(normalizedOutput);
+      && outputLooksLikeClaudeCliAuthImportSuccess(normalizedOutput);
 
     if (!looksSuccessful) {
       const lastOutput = normalizedOutput.trim().split(/\n+/).slice(-12).join('\n').trim();
@@ -615,6 +640,9 @@ export async function importClaudeCliAuthProfile(timeoutMs = 30000) {
     return finalizeSuccess(rawOutput);
   } catch (scriptError: any) {
     const message = String(scriptError?.message || scriptError || '');
+    if (outputLooksLikeClaudeCliAuthImportSuccess(message)) {
+      return finalizeSuccess(message);
+    }
     if (!/\b(script: not found|ENOENT|Timed out waiting)\b/i.test(message)) {
       throw scriptError;
     }
@@ -751,6 +779,7 @@ export function getOAuthFlowStatus(sessionId: string) {
   return {
     id: session.id,
     provider: session.provider,
+    authProvider: getOpenClawOAuthProviderId(session.provider),
     mode: session.mode,
     status: session.status,
     authUrl: session.authUrl,
@@ -1032,14 +1061,12 @@ export async function saveClaudeToken(token: string) {
 }
 
 // ── Native CLI OAuth flows ──────────────────────────────────────────
-// Spawn native CLI binaries (claude, codex, gemini) in PTY to authenticate
+// Spawn native CLI binaries (claude, codex, agy) in PTY to authenticate
 // their own credential stores separate from OpenClaw auth profiles.
 
 const HOME_DIR = process.env.HOME || '/root';
 const CLAUDE_CREDENTIALS_PATH = path.join(HOME_DIR, '.claude', '.credentials.json');
 const CODEX_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
-const GEMINI_CONFIG_DIR = path.join(HOME_DIR, '.config', 'gemini');
-const GEMINI_OAUTH_CREDS_PATH = path.join(HOME_DIR, '.gemini', 'oauth_creds.json');
 
 function findCliBin(command: string): string {
   
@@ -1068,17 +1095,21 @@ function checkCredentialFile(filePath: string, requiredKeys: string[]): boolean 
   }
 }
 
-function checkCredentialDir(dirPath: string): boolean {
+function checkAntigravityCredentials(): boolean {
   try {
-    return fs.readdirSync(dirPath).length > 0;
+    execSync('agy models >/dev/null 2>&1', {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        NO_COLOR: '1',
+        SSH_CONNECTION: process.env.SSH_CONNECTION || 'portal-auth-check 127.0.0.1 127.0.0.1 0',
+      },
+      timeout: 8000,
+    });
+    return true;
   } catch {
     return false;
   }
-}
-
-function checkGeminiCredentials(): boolean {
-  // Check both the new ~/.gemini/oauth_creds.json and the legacy ~/.config/gemini/ directory
-  return checkCredentialFile(GEMINI_OAUTH_CREDS_PATH, ['access_token']) || checkCredentialDir(GEMINI_CONFIG_DIR);
 }
 
 export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'gemini') {
@@ -1195,35 +1226,39 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
     }
 
     case 'gemini': {
-      const geminiBin = findCliBin('gemini');
-      console.log(`[NativeCLI] Starting Gemini login, binary=${geminiBin}`);
+      const antigravityBin = findCliBin('agy');
+      console.log(`[NativeCLI] Starting Antigravity login, binary=${antigravityBin}`);
 
-      // Pre-configure Gemini to use Google OAuth (oauth-personal) so it skips the auth selector
-      const geminiDir = path.join(os.homedir(), '.gemini');
-      const geminiSettingsPath = path.join(geminiDir, 'settings.json');
+      // Pre-configure Antigravity to use Google OAuth so it skips any auth selector.
+      const antigravityDir = path.join(os.homedir(), '.gemini', 'antigravity-cli');
+      const antigravitySettingsPath = path.join(antigravityDir, 'settings.json');
       try {
-        fs.mkdirSync(geminiDir, { recursive: true });
+        fs.mkdirSync(antigravityDir, { recursive: true });
         let existingSettings: any = {};
         try {
-          existingSettings = JSON.parse(fs.readFileSync(geminiSettingsPath, 'utf-8'));
+          existingSettings = JSON.parse(fs.readFileSync(antigravitySettingsPath, 'utf-8'));
         } catch { /* file doesn't exist yet */ }
         if (!existingSettings.security?.auth?.selectedType) {
           existingSettings.security = existingSettings.security || {};
           existingSettings.security.auth = existingSettings.security.auth || {};
           existingSettings.security.auth.selectedType = 'oauth-personal';
-          fs.writeFileSync(geminiSettingsPath, JSON.stringify(existingSettings, null, 2));
-          console.log('[NativeCLI] Pre-configured Gemini auth type to oauth-personal');
+          fs.writeFileSync(antigravitySettingsPath, JSON.stringify(existingSettings, null, 2));
+          console.log('[NativeCLI] Pre-configured Antigravity auth type to oauth-personal');
         }
       } catch (err: any) {
-        console.log(`[NativeCLI] Warning: could not pre-configure Gemini settings: ${err.message}`);
+        console.log(`[NativeCLI] Warning: could not pre-configure Antigravity settings: ${err.message}`);
       }
 
-      const proc = pty.spawn(geminiBin, [], {
+      const proc = pty.spawn(antigravityBin, ['--print', 'Authentication setup complete. Reply exactly AUTH_OK.', '--print-timeout', '5m', '--sandbox'], {
         name: 'xterm-256color',
         cols: 120,
         rows: 40,
         cwd: '/tmp',
-        env: { ...process.env, NO_BROWSER: 'true' } as Record<string, string>,
+        env: {
+          ...process.env,
+          NO_BROWSER: 'true',
+          SSH_CONNECTION: process.env.SSH_CONNECTION || 'portal-antigravity-auth 127.0.0.1 127.0.0.1 0',
+        } as Record<string, string>,
       });
 
       session = {
@@ -1256,21 +1291,18 @@ export async function startNativeCliFlow(provider: 'claude-code' | 'codex' | 'ge
       });
 
       proc.onExit(({ exitCode }) => {
-        console.log(`[NativeCLI] Gemini PTY exited: code=${exitCode} status=${session.status}`);
-        if (checkGeminiCredentials()) {
+        console.log(`[NativeCLI] Antigravity PTY exited: code=${exitCode} status=${session.status}`);
+        if (checkAntigravityCredentials()) {
           session.status = 'complete';
           session.completedAt = Date.now();
-          console.log('[NativeCLI] Gemini credentials verified');
-        } else if (exitCode === 199) {
-          // Gemini relaunch code — the wrapper should respawn, not an error
-          console.log('[NativeCLI] Gemini exited with relaunch code 199, waiting for respawn...');
+          console.log('[NativeCLI] Antigravity credentials verified');
         } else if (session.status !== 'complete' && !session.error) {
           session.status = 'error';
-          session.error = `Gemini CLI exited with code ${exitCode}`;
+          session.error = `Antigravity CLI exited with code ${exitCode}`;
         }
       });
 
-      // Gemini needs extra time: it relaunches itself after saving auth config
+      // Antigravity can take a few seconds before it prints the Google authorization URL.
       await waitForInitialOutput(session, 45000);
       break;
     }
@@ -1348,7 +1380,7 @@ export async function completeNativeCliFlow(sessionId: string, callbackValue: st
       return { success: false, error: session.error };
     }
   } else if (session.provider === 'gemini' || session.provider === 'google-gemini-cli') {
-    // Gemini: write the auth code to PTY stdin (readline is waiting for it)
+    // Antigravity: write the auth code to PTY stdin (readline is waiting for it)
     let ptyAlive = false;
     try {
       session.process.write('');
@@ -1358,11 +1390,11 @@ export async function completeNativeCliFlow(sessionId: string, callbackValue: st
     }
 
     if (!ptyAlive) {
-      return { success: false, error: 'Gemini CLI process is no longer running. Try restarting the flow.' };
+      return { success: false, error: 'Antigravity CLI process is no longer running. Try restarting the flow.' };
     }
 
     const code = callbackValue.trim();
-    console.log(`[NativeCLI] Writing auth code to Gemini stdin (${code.length} chars)`);
+    console.log(`[NativeCLI] Writing auth code to Antigravity stdin (${code.length} chars)`);
     session.process.write(`${code}\r`);
   }
 
@@ -1372,7 +1404,7 @@ export async function completeNativeCliFlow(sessionId: string, callbackValue: st
     const timer = setInterval(() => {
       const credCheck = session.provider === 'claude-code'
         ? checkCredentialFile(CLAUDE_CREDENTIALS_PATH, ['claudeAiOauth.accessToken'])
-        : checkGeminiCredentials();
+        : checkAntigravityCredentials();
 
       if (credCheck || session.status === 'complete') {
         clearInterval(timer);

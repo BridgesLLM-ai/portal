@@ -1,5 +1,5 @@
 export type ProviderTier = 1 | 2 | 3;
-export type ProviderAuthType = 'api_key' | 'oauth' | 'setup_token' | 'device_code';
+export type ProviderAuthType = 'api_key' | 'oauth' | 'setup_token' | 'device_code' | 'native_cli';
 export type ModelTier = 'frontier' | 'balanced' | 'fast';
 
 export interface ProviderInstruction {
@@ -75,7 +75,7 @@ export const PROVIDERS: ProviderUIConfig[] = [
       { stepNumber: 5, title: 'Pick your default Claude model', detail: 'Choose Opus, Sonnet, or Haiku. OpenClaw will keep normal Anthropic model IDs for runtime use.' },
     ],
     defaultModels: [
-      { id: 'anthropic/claude-opus-4-6', name: 'Claude Opus 4.6', tier: 'frontier', description: 'Most capable Claude model.' },
+      { id: 'anthropic/claude-opus-4-8', name: 'Claude Opus 4.8', tier: 'frontier', description: 'Most capable Claude model currently exposed by OpenClaw.' },
       { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6', tier: 'balanced', description: 'Best all-round default for most users.' },
       { id: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', tier: 'fast', description: 'Fastest and lowest-cost Claude model.' },
     ],
@@ -135,9 +135,9 @@ export const PROVIDERS: ProviderUIConfig[] = [
       { stepNumber: 5, title: 'Paste the redirect URL back here', detail: 'Return to the portal and paste the full callback URL to complete sign-in.' },
     ],
     defaultModels: [
-      { id: 'openai-codex/gpt-5.5', name: 'GPT-5.5 Codex', tier: 'frontier', description: 'Current OpenClaw default Codex model.' },
-      { id: 'openai-codex/gpt-5.4', name: 'GPT-5.4 Codex', tier: 'balanced', description: 'Stable Codex fallback with broad compatibility.' },
-      { id: 'openai-codex/gpt-5.4-mini', name: 'GPT-5.4 Mini', tier: 'fast', description: 'Fastest currently exposed OpenAI Codex option.' },
+      { id: 'codex/gpt-5.5', name: 'GPT-5.5 Codex', tier: 'frontier', description: 'Current OpenClaw Codex runtime model.' },
+      { id: 'codex/gpt-5.4', name: 'GPT-5.4 Codex', tier: 'balanced', description: 'Stable Codex fallback with broad compatibility.' },
+      { id: 'codex/gpt-5.4-mini', name: 'GPT-5.4 Mini', tier: 'fast', description: 'Fastest currently exposed OpenAI Codex option.' },
     ],
     onboardingNotes: {
       intro: 'This connects the portal to your existing paid ChatGPT account. You are not creating an API key and you are not paying per-token through the developer platform.',
@@ -153,40 +153,44 @@ export const PROVIDERS: ProviderUIConfig[] = [
     },
   },
   {
-    id: 'google-gemini-cli',
-    name: 'Google Gemini (Google Subscription)',
+    id: 'google-antigravity',
+    name: 'Google Antigravity',
     tier: 1,
     icon: 'globe',
-    primaryAuthType: 'oauth',
+    primaryAuthType: 'native_cli',
     consoleUrl: 'https://gemini.google.com/',
     signupUrl: 'https://gemini.google.com/',
-    pricingNote: 'Uses your Google / Gemini account through OAuth instead of an API key.',
+    pricingNote: 'Uses your Google/Gemini subscription through the Antigravity CLI on the server.',
     freeTier: 'Depends on your Google Gemini plan/account',
-    description: 'Use the Google Gemini subscription/account login flow instead of creating an API key.',
+    description: 'Use Google Antigravity as the native Gemini coding agent. This replaces the older Gemini CLI OAuth path.',
+    dangerNote: {
+      title: 'Not fully supported for now',
+      detail: 'OpenClaw Antigravity OAuth is not fully supported for now. Use the native Antigravity flow while upstream support comes downstream.',
+      compactDetail: 'Not fully supported for now.',
+    },
     setupInstructions: [
-      { stepNumber: 1, title: 'Start sign-in here', detail: 'Click the sign-in button here to open the Google Gemini authorization flow in a new tab.' },
-      { stepNumber: 2, title: 'Accept the Google warning prompt', detail: 'The portal handles the server-side confirmation step automatically. You just continue in your browser.' },
-      { stepNumber: 3, title: 'Sign in with your Google account', detail: 'Use the same Google account you want the portal to use for Gemini.' },
-      { stepNumber: 4, title: 'Copy the final localhost redirect URL', detail: 'After sign-in, your browser will land on a localhost callback URL that may fail to load. That is normal. Copy the full address bar URL.' },
-      { stepNumber: 5, title: 'Paste the full redirect URL back here', detail: 'Return to the portal and paste it to complete sign-in.' },
+      { stepNumber: 1, title: 'Start Antigravity sign-in', detail: 'Click the sign-in button here to start the server-side Antigravity login flow.' },
+      { stepNumber: 2, title: 'Open the Google authorization link', detail: 'The portal will open Google sign-in in a new tab. Use the Google account tied to your Gemini plan.' },
+      { stepNumber: 3, title: 'Copy the authorization code', detail: 'After Google approves the request, copy the authorization code shown by the flow.' },
+      { stepNumber: 4, title: 'Paste the code back here', detail: 'Return to the portal and paste the authorization code so Antigravity can finish signing in on the server.' },
     ],
     defaultModels: [
-      { id: 'google-gemini-cli/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', tier: 'frontier', description: 'Highest-capability Gemini CLI OAuth model currently exposed by OpenClaw.' },
-      { id: 'google-gemini-cli/gemini-3-flash-preview', name: 'Gemini 3 Flash Preview', tier: 'balanced', description: 'Current OpenClaw default Gemini CLI model.' },
-      { id: 'google-gemini-cli/gemini-3.1-flash-lite-preview', name: 'Gemini 3.1 Flash Lite Preview', tier: 'fast', description: 'Fastest light-weight Gemini CLI preview option currently exposed by OpenClaw.' },
+      { id: 'google-antigravity/gemini-3.1-pro-high', name: 'Gemini 3.1 Pro High', tier: 'frontier', description: 'Highest-capability Gemini model currently reported by Antigravity.' },
+      { id: 'google-antigravity/gemini-3.5-flash', name: 'Gemini 3.5 Flash', tier: 'balanced', description: 'Fast default Gemini model for most Antigravity tasks.' },
+      { id: 'google-antigravity/gemini-3.5-flash-low', name: 'Gemini 3.5 Flash Low', tier: 'fast', description: 'Fastest Antigravity Gemini option.' },
     ],
     onboardingNotes: {
-      intro: 'This uses your Google/Gemini account login for Gemini CLI OAuth. It is the subscription-style path, not the Google AI Studio API-key path.',
-      exactGoal: 'Authorize the portal to use your Google Gemini login, then copy the final localhost redirect URL back here so the server can complete the connection.',
+      intro: 'This uses your Google/Gemini account through Antigravity on the server. It is the subscription-style path, not the Google AI Studio API-key path.',
+      exactGoal: 'Authorize Antigravity with Google, then paste the authorization code back here so the server-side CLI can finish signing in.',
       expectedConfusions: [
         'You are not supposed to generate an API key for this flow.',
-        'Google may show extra consent or project-related language that feels technical. We only need the final successful browser redirect URL.',
-        'The localhost page at the end may fail to load. That is normal in a remote portal setup.',
+        'This is separate from OpenClaw provider OAuth. Antigravity keeps its own server-side credentials.',
+        'The old Gemini CLI OAuth path is legacy and is not the supported setup path anymore.',
         'If Google asks you to approve access, continue with the same Google account you want the portal to use.'
       ],
-      callbackLabel: 'Paste the full Google localhost redirect URL',
-      callbackExample: 'http://localhost:8085/oauth2callback?code=...&state=...',
-      afterLoginLabel: 'When Google finishes, copy the entire final localhost URL from the address bar and paste it back here.'
+      callbackLabel: 'Paste the Google authorization code',
+      callbackExample: '4/0AfJohX...',
+      afterLoginLabel: 'When Google finishes, copy the authorization code and paste it back here.'
     },
   },
   {

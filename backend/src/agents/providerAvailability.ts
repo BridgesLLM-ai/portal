@@ -152,19 +152,19 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
   GEMINI: {
     native: true,
     implemented: true,
-    commands: ['gemini'],
+    commands: ['agy'],
     versionArgs: ['--version'],
     capabilities: {
       implemented: true,
       requiresGateway: false,
       adapterFamily: 'native-cli',
-      adapterKey: 'gemini',
+      adapterKey: 'antigravity',
       supportsHistory: true,
       supportsModelSelection: true,
       modelSelectionMode: 'launch',
       supportsCustomModelInput: true,
-      canEnumerateModels: false,
-      modelCatalogKind: 'declared',
+      canEnumerateModels: true,
+      modelCatalogKind: 'dynamic',
       supportsSessionList: true,
       supportsExecApproval: true,
       supportsInTurnSteering: false,
@@ -222,6 +222,10 @@ function detectVersion(command: string, args?: string[]): string | undefined {
   const out = tryExec(command, args);
   if (!out) return undefined;
   return out.split(/\r?\n/).find(Boolean)?.trim();
+}
+
+export function getProviderCapabilities(name: AgentProviderName): ProviderCapabilitySummary | null {
+  return DEFINITIONS[name]?.capabilities || null;
 }
 
 export function getProviderAvailability(name: AgentProviderName): ProviderAvailability {

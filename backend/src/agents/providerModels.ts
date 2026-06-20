@@ -5,6 +5,7 @@ import { config } from '../config/env';
 import { readOpenClawConfig } from '../services/openclawConfigManager';
 import type { AgentProviderName } from './AgentProvider.interface';
 import { normalizePortalModelId } from '../utils/openclawCli';
+import { listAntigravityModelsFromCli } from './antigravityModels';
 
 export interface ProviderModelDescriptor {
   id: string;
@@ -15,12 +16,23 @@ export interface ProviderModelDescriptor {
 }
 
 const GEMINI_DECLARED_FALLBACK = [
-  'gemini-3-flash-preview',
-  'gemini-3.1-pro-preview',
-  'gemini-3-pro-preview',
-  'gemini-2.5-flash',
-  'gemini-2.5-pro',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-high',
+  'gemini-3.5-flash-low',
+  'gemini-3.1-pro-high',
+  'gemini-3.1-pro-low',
 ];
+
+const OPENCLAW_VISIBLE_MODEL_IDS = [
+  'codex/gpt-5.5',
+  'codex/gpt-5.4',
+  'codex/gpt-5.4-mini',
+  'anthropic/claude-sonnet-4-6',
+  'anthropic/claude-opus-4-8',
+  'anthropic/claude-haiku-4-5',
+];
+
+const OPENCLAW_VISIBLE_MODEL_SET = new Set(OPENCLAW_VISIBLE_MODEL_IDS);
 
 function toTitleCase(value: string): string {
   return value
@@ -47,8 +59,19 @@ function declaredModels(ids: string[], provider: string): ProviderModelDescripto
 }
 
 const DECLARED_MODELS: Partial<Record<AgentProviderName, ProviderModelDescriptor[]>> = {
+  OPENCLAW: declaredModels(OPENCLAW_VISIBLE_MODEL_IDS, 'openclaw'),
   GEMINI: declaredModels(GEMINI_DECLARED_FALLBACK, 'gemini'),
 };
+
+export function curateOpenClawModelDescriptors(models: ProviderModelDescriptor[]): ProviderModelDescriptor[] {
+  const byId = new Map(models.map((model) => [normalizePortalModelId(model.id), model]));
+  const curated: ProviderModelDescriptor[] = [];
+  for (const id of OPENCLAW_VISIBLE_MODEL_IDS) {
+    const existing = byId.get(id);
+    if (existing) curated.push({ ...existing, id });
+  }
+  return curated;
+}
 
 function listOpenClawModels(): ProviderModelDescriptor[] {
   const openclawConfig = readOpenClawConfig();
@@ -82,19 +105,13 @@ function listOpenClawModels(): ProviderModelDescriptor[] {
     for (const id of fallbacks) addModel(id);
   }
 
-  const hasConfiguredGeminiCli = Array.from(deduped.keys()).some((id) => id.startsWith('google-gemini-cli/'));
-  if (hasConfiguredGeminiCli) {
-    for (const id of GEMINI_DECLARED_FALLBACK) {
-      addModel(`google-gemini-cli/${id}`);
-    }
-  }
-
-  return Array.from(deduped.values());
+  const configured = curateOpenClawModelDescriptors(Array.from(deduped.values()).filter((model) => OPENCLAW_VISIBLE_MODEL_SET.has(model.id)));
+  return configured.length ? configured : [...DECLARED_MODELS.OPENCLAW!];
 }
 
 function listGeminiDeclaredModels(): ProviderModelDescriptor[] {
   const ids = new Map<string, ProviderModelDescriptor>();
-  const add = (id: string, alias?: string | null) => {
+  const add = (id: string, alias?: string | null, source: 'dynamic' | 'declared' = 'declared') => {
     const clean = String(id || '').trim();
     if (!clean) return;
     if (!ids.has(clean)) {
@@ -103,34 +120,41 @@ function listGeminiDeclaredModels(): ProviderModelDescriptor[] {
         alias: alias || null,
         provider: 'gemini',
         displayName: displayNameFromId(clean),
-        source: 'declared',
+        source,
       });
     } else if (alias && !ids.get(clean)?.alias) {
       ids.get(clean)!.alias = alias;
     }
   };
 
-  for (const model of GEMINI_DECLARED_FALLBACK) add(model);
-
-  for (const model of listOpenClawModels()) {
-    if (model.id.startsWith('google-gemini-cli/')) {
-      add(model.id.replace(/^google-gemini-cli\//, ''), model.alias || null);
-    }
+  const liveAntigravityModels = listAntigravityModelsFromCli();
+  for (const model of liveAntigravityModels) {
+    add(model.id, model.displayName, 'dynamic');
   }
 
-  const openclawConfig = path.join(process.env.HOME || '/root', '.openclaw', 'openclaw.json');
-  if (existsSync(openclawConfig)) {
-    try {
-      const raw = JSON.parse(readFileSync(openclawConfig, 'utf8'));
-      const configured = raw?.agents?.defaults?.models || {};
-      for (const [key, value] of Object.entries(configured)) {
-        if (!key.startsWith('google-gemini-cli/')) continue;
-        const id = key.replace(/^google-gemini-cli\//, '');
-        const alias = value && typeof value === 'object' && 'alias' in value ? String((value as any).alias || '') : '';
-        add(id, alias || null);
+  for (const model of GEMINI_DECLARED_FALLBACK) add(model);
+
+  if (liveAntigravityModels.length === 0) {
+    for (const model of listOpenClawModels()) {
+      if (model.id.startsWith('google-antigravity/') || model.id.startsWith('google-gemini-cli/')) {
+        add(model.id.replace(/^google-(?:antigravity|gemini-cli)\//, ''), model.alias || null);
       }
-    } catch {
-      // Ignore malformed config; fallback models still apply.
+    }
+
+    const openclawConfig = path.join(process.env.HOME || '/root', '.openclaw', 'openclaw.json');
+    if (existsSync(openclawConfig)) {
+      try {
+        const raw = JSON.parse(readFileSync(openclawConfig, 'utf8'));
+        const configured = raw?.agents?.defaults?.models || {};
+        for (const [key, value] of Object.entries(configured)) {
+          if (!key.startsWith('google-antigravity/') && !key.startsWith('google-gemini-cli/')) continue;
+          const id = key.replace(/^google-(?:antigravity|gemini-cli)\//, '');
+          const alias = value && typeof value === 'object' && 'alias' in value ? String((value as any).alias || '') : '';
+          add(id, alias || null);
+        }
+      } catch {
+        // Ignore malformed config; fallback models still apply.
+      }
     }
   }
 

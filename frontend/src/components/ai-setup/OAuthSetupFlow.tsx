@@ -24,9 +24,9 @@ function nativeCliBridgeNote(providerId: string): { title: string; body: string;
       };
     case 'google-gemini-cli':
       return {
-        title: 'Native Gemini login is separate',
-        body: 'This flow links OpenClaw only. The native Gemini adapter still needs its own login or API-key environment on the server; OpenClaw credentials are not copied into the Gemini CLI automatically.',
-        command: 'gemini',
+        title: 'Native Antigravity login is separate',
+        body: 'This flow links OpenClaw only. The native Google adapter used by Agent Chat now runs Antigravity, so it still needs its own server-side Google login.',
+        command: 'agy',
       };
     default:
       return null;

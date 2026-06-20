@@ -137,8 +137,8 @@ const AGENTS: AgentIdentity[] = [
     provenance: 'via Agent Zero',
   },
   {
-    name: 'Gemini',
-    initials: 'GM',
+    name: 'Antigravity',
+    initials: 'AG',
     providerName: 'GEMINI',
     color: 'text-cyan-400',
     bgLight: 'bg-cyan-500/[0.06]',
@@ -149,7 +149,7 @@ const AGENTS: AgentIdentity[] = [
     sendBg: 'bg-cyan-500',
     sendHover: 'hover:bg-cyan-600',
     sendShadow: 'shadow-cyan-500/20',
-    provenance: 'via Gemini CLI',
+    provenance: 'via Antigravity',
   },
   {
     name: 'Ollama',
@@ -175,13 +175,18 @@ function getAgent(providerName: string): AgentIdentity {
 /* ─── Provider model catalogs ───────────────────────────────────────────── */
 
 const OPENCLAW_MODEL_FALLBACK = [
-  'anthropic/claude-opus-4-6', 'anthropic/claude-sonnet-4-6', 'anthropic/claude-sonnet-4-5',
-  'anthropic/claude-haiku-4-5', 'anthropic/claude-opus-4-5',
-  'google/gemini-2.5-flash', 'google/gemini-2.5-pro',
-  'openai-codex/gpt-5.1', 'openai-codex/gpt-5.2', 'openai-codex/gpt-5.3-codex', 'openai-codex/gpt-5.4', 'openai-codex/gpt-5.4-mini',
-  'openrouter/moonshotai/kimi-k2', 'openrouter/moonshotai/kimi-k2.5',
-  'openrouter/deepseek/deepseek-v3.2', 'openrouter/meta-llama/llama-4-maverick',
+  'codex/gpt-5.5',
+  'codex/gpt-5.4',
+  'codex/gpt-5.4-mini',
+  'anthropic/claude-sonnet-4-6',
+  'anthropic/claude-opus-4-8',
+  'anthropic/claude-haiku-4-5',
 ];
+
+function isKnownOpenClawCatalogModel(modelId: string): boolean {
+  const normalized = canonicalizePortalModelId(modelId);
+  return /^(anthropic|codex|google|google-gemini-cli|google-antigravity|openai|openai-codex|openrouter)\//.test(normalized);
+}
 
 function modelDisplayName(modelId: string): string {
   return getModelDisplayName(modelId, modelId || 'Default model');
@@ -612,6 +617,7 @@ const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
 };
 
 const OPENCLAW_FAST_MODE_MODELS = new Set([
+  'codex/gpt-5.4',
   'openai/gpt-5.4',
   'openai-codex/gpt-5.4',
 ]);
@@ -856,7 +862,7 @@ function SessionControls({
                 <div className="text-[10px] text-slate-400">
                   {fastModeSupported
                     ? `Current: ${fastModeEnabled ? 'enabled' : 'disabled'} for ${shortModel}`
-                    : 'Available when the session model is openai/gpt-5.4 or openai-codex/gpt-5.4.'}
+                    : 'Available when the session model is codex/gpt-5.4, openai/gpt-5.4, or openai-codex/gpt-5.4.'}
                 </div>
               </div>
 
@@ -2439,6 +2445,14 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     : providerMeta.slashCommandsLoading
       ? 'Loading provider commands…'
       : 'Provider commands on demand';
+
+  useEffect(() => {
+    if (provider !== 'OPENCLAW' || !selectedModel || !availableModels.length) return;
+    const normalized = canonicalizePortalModelId(selectedModel);
+    if (normalized && isKnownOpenClawCatalogModel(normalized) && !availableModels.includes(normalized)) {
+      setSelectedModel('');
+    }
+  }, [availableModels, provider, selectedModel, setSelectedModel]);
 
   const publicSettings = usePublicSettings();
   const userAvatarUrl = useUserAvatarUrl();

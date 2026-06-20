@@ -37,9 +37,9 @@ const cards = [
   },
   {
     id: 'native-gemini',
-    title: 'Gemini',
+    title: 'Antigravity',
     subtitle: 'Native CLI agent',
-    description: 'Sign in with Google to use the Gemini CLI as a native agent in Agent Chat.',
+    description: 'Sign in with Google to use Antigravity as a native agent in Agent Chat.',
     color: 'bg-violet-500',
     isNativeCli: true,
     nativeCliProvider: 'gemini' as const,
@@ -50,7 +50,7 @@ const cards = [
 const NATIVE_CLI_PROVIDER_MAP: Record<string, string> = {
   'native-claude-code': 'anthropic',
   'native-codex': 'openai-codex',
-  'native-gemini': 'google-gemini-cli',
+  'native-gemini': 'google-antigravity',
 };
 
 function getNativeCliStatus(statusMap: Map<string, ProviderStatus> | undefined, cardId: string): ProviderStatus['nativeCliAuthStatus'] | null {

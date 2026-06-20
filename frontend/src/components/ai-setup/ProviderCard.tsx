@@ -83,6 +83,8 @@ function authLabel(provider: ProviderUIConfig, status?: ProviderStatus | null) {
       return 'Setup Token';
     case 'device_code':
       return 'Device Code';
+    case 'native_cli':
+      return 'Native CLI';
     default:
       return provider.id === 'ollama' ? 'Local' : 'API Key';
   }
