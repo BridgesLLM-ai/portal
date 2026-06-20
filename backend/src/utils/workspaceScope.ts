@@ -1,6 +1,6 @@
 import { prisma } from '../config/database';
 import type { JwtPayload } from './jwt';
-import { isOwnerRole } from './authz';
+import { isElevatedRole, isOwnerRole } from './authz';
 
 let cachedAdminId: string | null = null;
 
@@ -20,10 +20,15 @@ async function getPrimaryAdminId(): Promise<string> {
 
 export async function getWorkspaceOwnerId(user: JwtPayload): Promise<string> {
   if (isOwnerRole(user.role)) return user.userId;
+
+  // Customer/user accounts must never fall through into the owner's workspace.
+  // Shared workspace access is an explicit elevated-role capability only.
+  if (!isElevatedRole(user.role)) return user.userId;
+
   if (user.sandboxEnabled) return user.userId;
   return getPrimaryAdminId();
 }
 
 export function shouldIsolateUser(user: JwtPayload): boolean {
-  return !isOwnerRole(user.role) && !!user.sandboxEnabled;
+  return !isElevatedRole(user.role) || !!user.sandboxEnabled;
 }

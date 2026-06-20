@@ -685,7 +685,7 @@ function isSandboxProjectAgentIdForUser(agentId: string, user: JwtPayload): bool
 
 function isSandboxProjectSessionKeyForUser(sessionKey: string, user: JwtPayload): boolean {
   const normalized = String(sessionKey || '').trim();
-  if (!normalized || !user?.sandboxEnabled) return false;
+  if (!normalized || !shouldIsolateUser(user)) return false;
 
   const match = normalized.match(/^agent:([^:]+):(portal-[^:]+)$/);
   if (!match) return false;
