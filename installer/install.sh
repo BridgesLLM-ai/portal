@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.22"
+readonly VERSION="3.25.23"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -28,7 +28,7 @@ readonly MIN_RAM_MB=3500
 readonly MIN_DISK_GB=35
 
 # Pinned versions
-readonly PIN_OPENCLAW_VERSION="2026.6.8"
+readonly PIN_OPENCLAW_VERSION="2026.6.9"
 readonly PIN_NODE_MAJOR="22"
 readonly PIN_NODE_MIN_MINOR="16"
 
@@ -37,9 +37,11 @@ DOMAIN=""
 DRY_RUN=false
 UPDATE_MODE=false
 UNINSTALL_MODE=false
+FORCE_FRESH=false
 SKIP_OLLAMA=false
 SKIP_OPENCLAW=false
 INSTALL_PROFILE="server"
+OPENCLAW_PACKAGE_UPDATED=false
 
 # Generated during install
 DB_PASSWORD=""
@@ -575,7 +577,11 @@ update_dependencies() {
     local latest_oc
     latest_oc="${PIN_OPENCLAW_VERSION}"
     if [[ -n "${latest_oc}" && "${current_oc}" != "${latest_oc}" ]]; then
-      spin "Updating OpenClaw (${current_oc} → ${latest_oc})"         "npm install -g openclaw@${PIN_OPENCLAW_VERSION} 2>/dev/null" || true
+      if spin "Updating OpenClaw (${current_oc} → ${latest_oc})" "npm install -g openclaw@${PIN_OPENCLAW_VERSION} 2>/dev/null"; then
+        OPENCLAW_PACKAGE_UPDATED=true
+      else
+        warn "OpenClaw update failed. Continuing with installed version ${current_oc:-unknown}."
+      fi
     else
       ok "OpenClaw ${current_oc:-unknown} (current)"
     fi
@@ -1055,6 +1061,20 @@ portal_setup_url() {
 }
 
 write_caddy_config() {
+  # Defense-in-depth: if no domain was provided but the box is already serving a
+  # domain over HTTPS, recover it from the existing Caddyfile so we never
+  # silently downgrade a working HTTPS site to an HTTP-only config.
+  if [[ -z "$DOMAIN" ]] && ! use_local_profile && [[ -f /etc/caddy/Caddyfile ]]; then
+    local recovered_domain
+    recovered_domain="$(grep -vE '^[[:space:]]*#' /etc/caddy/Caddyfile \
+      | grep -oiE '^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}' | head -1 || true)"
+    if [[ -n "${recovered_domain}" ]]; then
+      recovered_domain="${recovered_domain#www.}"
+      DOMAIN="${recovered_domain}"
+      info "Recovered existing domain from Caddyfile: ${DOMAIN} (preserving HTTPS)"
+    fi
+  fi
+
   if [[ -n "$DOMAIN" ]]; then
     cat > /etc/caddy/Caddyfile <<CADDYEOF
 # BridgesLLM Portal — managed by installer
@@ -1121,7 +1141,10 @@ Options:
   --local           Experimental local install profile for Windows / WSL testing (used automatically on WSL)
   --skip-ollama     Don't install Ollama
   --skip-openclaw   Don't install OpenClaw
-  --update          Update existing installation
+  --update          Force update of an existing installation
+                    (re-running the installer on an existing install
+                     auto-updates, so this flag is usually optional)
+  --reinstall       Force a fresh install over an existing one
   --uninstall       Remove BridgesLLM portal
   --dry-run         Print actions without executing
   -h, --help        Show this help
@@ -1142,6 +1165,7 @@ parse_args() {
       --skip-ollama)    SKIP_OLLAMA=true; shift ;;
       --skip-openclaw)  SKIP_OPENCLAW=true; shift ;;
       --update)         UPDATE_MODE=true; shift ;;
+      --reinstall)      FORCE_FRESH=true; shift ;;
       --uninstall)      UNINSTALL_MODE=true; shift ;;
       --dry-run)        DRY_RUN=true; shift ;;
       -h|--help)        usage; exit 0 ;;
@@ -1539,8 +1563,13 @@ build_portal() {
   mkdir -p "${PORTAL_DIR}/projects" "${PORTAL_DIR}/upload-temp"
   chmod 755 "${PORTAL_DIR}/projects" "${PORTAL_DIR}/upload-temp"
 
-  # Download or copy portal
-  if [[ -d "${RELEASE_FALLBACK_DIR}" ]] && [[ -f "${RELEASE_FALLBACK_DIR}/backend/package.json" ]]; then
+  # Download or copy portal.
+  # Only use the local fallback dir as a SOURCE when it is a different path from
+  # the install target. RELEASE_FALLBACK_DIR defaults to PORTAL_DIR, so on an
+  # existing install this would otherwise rsync the live dir onto itself and
+  # silently deploy nothing — prefer the release tarball in that case.
+  if [[ -d "${RELEASE_FALLBACK_DIR}" ]] && [[ -f "${RELEASE_FALLBACK_DIR}/backend/package.json" ]] \
+     && [[ "$(readlink -f "${RELEASE_FALLBACK_DIR}" 2>/dev/null)" != "$(readlink -f "${PORTAL_DIR}" 2>/dev/null)" ]]; then
     spin "Copying portal files from local source" "rsync -a --delete --exclude='node_modules' --exclude='.git' --exclude='.env' --exclude='.env.production' --exclude='/projects' --exclude='/assets' --exclude='/upload-temp' --exclude='/.data' '${RELEASE_FALLBACK_DIR}/' '${PORTAL_DIR}/'"
   elif curl -fsSL --head "${RELEASE_URL}" &>/dev/null 2>&1; then
     mkdir -p /tmp/blp-download
@@ -2071,6 +2100,63 @@ ensure_openclaw_gateway_boots_cleanly() {
   return 1
 }
 
+openclaw_cli_version() {
+  command -v openclaw >/dev/null 2>&1 || return 1
+  OPENCLAW_ALLOW_ROOT=1 openclaw --version 2>/dev/null | head -1 | grep -oP '\d{4}\.\d+\.\d+' || true
+}
+
+openclaw_gateway_version() {
+  command -v openclaw >/dev/null 2>&1 || return 1
+  OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --deep --json 2>/dev/null | node -e '
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  try {
+    const data = JSON.parse(input);
+    console.log((data.gateway && data.gateway.version) || data.runningVersion || "");
+  } catch (_) {
+    console.log("");
+  }
+});
+' 2>/dev/null || true
+}
+
+ensure_openclaw_gateway_matches_cli() {
+  if $SKIP_OPENCLAW || ! command -v openclaw >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
+    return 0
+  fi
+
+  local cli_version gateway_version
+  cli_version="$(openclaw_cli_version)"
+  gateway_version="$(openclaw_gateway_version)"
+
+  if [[ -n "${cli_version}" && -n "${gateway_version}" && "${cli_version}" == "${gateway_version}" ]]; then
+    ok "OpenClaw gateway ${gateway_version} matches CLI"
+    return 0
+  fi
+
+  warn "OpenClaw gateway version mismatch detected (CLI: ${cli_version:-unknown}, gateway: ${gateway_version:-unknown}). Restarting gateway."
+  if ! spin "Restarting OpenClaw gateway for version parity" "systemctl restart openclaw-gateway"; then
+    warn "OpenClaw gateway restart failed."
+    return 1
+  fi
+
+  sleep 4
+  cli_version="$(openclaw_cli_version)"
+  gateway_version="$(openclaw_gateway_version)"
+
+  if [[ -n "${cli_version}" && -n "${gateway_version}" && "${cli_version}" == "${gateway_version}" ]]; then
+    ok "OpenClaw gateway ${gateway_version} matches CLI"
+    return 0
+  fi
+
+  warn "OpenClaw gateway still mismatched after restart (CLI: ${cli_version:-unknown}, gateway: ${gateway_version:-unknown})."
+  return 1
+}
+
 ensure_openclaw_sandbox_image() {
   if $SKIP_OPENCLAW; then
     return 0
@@ -2308,6 +2394,12 @@ prepare_openclaw_runtime_for_portal() {
   ensure_openclaw_codex_plugin_compatible
   configure_openclaw_codex_harness_defaults
   ensure_openclaw_gateway_boots_cleanly || true
+  if ! ensure_openclaw_gateway_matches_cli; then
+    if $OPENCLAW_PACKAGE_UPDATED; then
+      fail "OpenClaw was updated, but the gateway did not restart into the installed version. Check: systemctl status openclaw-gateway"
+    fi
+    warn "OpenClaw gateway version parity could not be verified. Continuing with existing runtime."
+  fi
 }
 
 configure_backup_timers() {
@@ -2780,6 +2872,28 @@ main() {
     mkdir -p "$LOG_DIR"
     touch "$LOG_FILE"
     chmod 600 "$LOG_FILE"
+    do_update
+    exit 0
+  fi
+
+  # Auto-detect an existing installation and update it instead of reinstalling.
+  # The advertised one-liner (curl ... | sudo bash) carries no --update flag, so
+  # a re-run on an existing box would otherwise take the fresh-install path —
+  # which rsyncs the live dir onto itself (RELEASE_FALLBACK_DIR == PORTAL_DIR),
+  # silently no-ops the deploy, and still reports "Installation complete!". It
+  # would also rewrite a working HTTPS Caddyfile to HTTP-only when DOMAIN is
+  # blank in .env.production. Routing to do_update fixes both. Use --reinstall
+  # to force the fresh path on top of an existing install.
+  if ! $FORCE_FRESH \
+     && [[ -f "${PORTAL_DIR}/backend/package.json" ]] \
+     && [[ -f "${PORTAL_DIR}/backend/.env.production" ]]; then
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "Must run as root. Use: sudo bash ${SCRIPT_NAME}"
+    mkdir -p "$LOG_DIR"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+    info "Existing installation detected at ${PORTAL_DIR} — updating instead of reinstalling."
+    info "(Use --reinstall to force a fresh install.)"
+    UPDATE_MODE=true
     do_update
     exit 0
   fi

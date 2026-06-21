@@ -71,6 +71,18 @@ describe('openclawConfigManager auth profile cleanup helpers', () => {
   test('uses the same Anthropic cleanup aliases when called from the Claude CLI provider side', () => {
     expect(Array.from(getProviderAuthAliases('claude-cli')).sort()).toEqual(['anthropic', 'claude-cli']);
   });
+
+  test('keeps Gemini CLI and Antigravity auth profiles separate', () => {
+    expect(Array.from(getProviderAuthAliases('google-gemini-cli'))).toEqual(['google-gemini-cli']);
+    expect(Array.from(getProviderAuthAliases('google-antigravity'))).toEqual(['google-antigravity']);
+
+    const stale = getStaleProviderProfileIds({
+      'google-gemini-cli:default': { provider: 'google-gemini-cli' },
+      'google-antigravity:default': { provider: 'google-antigravity' },
+    }, 'google-gemini-cli', 'google-gemini-cli:default');
+
+    expect(stale).toEqual([]);
+  });
 });
 
 describe('openclawConfigManager runtime model catalog helpers', () => {

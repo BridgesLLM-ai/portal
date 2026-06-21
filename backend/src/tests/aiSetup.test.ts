@@ -1,4 +1,4 @@
-import { getProviderDefaultModelPayload, matchesProviderModel, mergeDiscoveredProviderModelsIntoConfig, normalizeModelPayload } from '../routes/ai-setup';
+import { classifyProviderRuntimeFailure, getProviderDefaultModelPayload, matchesProviderModel, mergeDiscoveredProviderModelsIntoConfig, normalizeModelPayload } from '../routes/ai-setup';
 
 describe('ai-setup model normalization', () => {
   test('does not prefix providerHint onto already-prefixed string model ids', () => {
@@ -169,5 +169,10 @@ describe('ai-setup model normalization', () => {
     expect(getProviderDefaultModelPayload('openai-codex').map((model) => model.id)).toContain('codex/gpt-5.5');
     expect(getProviderDefaultModelPayload('google-antigravity').map((model) => model.id)).toContain('google-antigravity/gemini-3.1-pro-high');
     expect(getProviderDefaultModelPayload(null)).toEqual([]);
+  });
+
+  test('Gemini CLI smoke failures get user-actionable messages', () => {
+    expect(classifyProviderRuntimeFailure('FatalAuthenticationError: Manual authorization is required but the current session is non-interactive.')).toContain('server-side auth is not usable headlessly');
+    expect(classifyProviderRuntimeFailure('IneligibleTierError: UNSUPPORTED_CLIENT')).toContain('Google rejected this Gemini CLI account/client');
   });
 });

@@ -1,38 +1,23 @@
-import { curateOpenClawModelDescriptors, type ProviderModelDescriptor } from '../agents/providerModels';
-
-function model(id: string): ProviderModelDescriptor {
-  return {
-    id,
-    alias: null,
-    provider: id.split('/')[0] || 'other',
-    displayName: id,
-    source: 'dynamic',
-  };
-}
+import { parseOpenClawModelsListPayload } from '../agents/providerModels';
 
 describe('provider model catalog curation', () => {
-  test('OpenClaw visible catalog filters stale and unsupported registered models', () => {
-    const curated = curateOpenClawModelDescriptors([
-      model('google-gemini-cli/gemini-3.1-pro-preview'),
-      model('google/gemini-2.5-pro'),
-      model('google-antigravity/gemini-3.1-pro-high'),
-      model('openai/gpt-5.5'),
-      model('openai-codex/gpt-5.4'),
-      model('codex/gpt-5.5'),
-      model('codex/gpt-5.4-mini'),
-      model('anthropic/claude-opus-4-8'),
-      model('anthropic/claude-sonnet-4-6'),
-      model('anthropic/claude-haiku-4-5'),
-      model('openrouter/deepseek/deepseek-v3.2'),
-    ]).map((entry) => entry.id);
+  test('OpenClaw live catalog parser keeps all available models and skips unavailable rows', () => {
+    const models = parseOpenClawModelsListPayload({
+      models: [
+        { key: 'google-gemini-cli/gemini-3.1-pro-preview', name: 'gemini-3.1-pro-preview', available: true, missing: false },
+        { key: 'google/gemini-2.5-pro', name: 'gemini-2.5-pro', available: true, missing: false },
+        { key: 'google-antigravity/gemini-3.1-pro-high', name: 'gemini-3.1-pro-high', available: true, missing: false },
+        { key: 'openrouter/deepseek/deepseek-v3.2', name: 'DeepSeek V3.2', available: true, missing: false },
+        { key: 'anthropic/claude-old', name: 'Claude Old', available: false, missing: false },
+        { key: 'google-gemini-cli/retired-model', name: 'Retired', available: true, missing: true },
+      ],
+    }).map((entry) => entry.id);
 
-    expect(curated).toEqual([
-      'codex/gpt-5.5',
-      'codex/gpt-5.4',
-      'codex/gpt-5.4-mini',
-      'anthropic/claude-sonnet-4-6',
-      'anthropic/claude-opus-4-8',
-      'anthropic/claude-haiku-4-5',
+    expect(models).toEqual([
+      'google-gemini-cli/gemini-3.1-pro-preview',
+      'google/gemini-2.5-pro',
+      'google-antigravity/gemini-3.1-pro-high',
+      'openrouter/deepseek/deepseek-v3.2',
     ]);
   });
 });

@@ -136,6 +136,43 @@ function readProviderProfileIds(provider: string) {
   return Object.keys(authProfiles.profiles || {}).filter((profileId) => aliases.has(authProfiles.profiles?.[profileId]?.provider));
 }
 
+export function googleGeminiCliProfileHasUsableCredential(profile: any): boolean {
+  if (!profile || typeof profile !== 'object') return false;
+  const type = String(profile.type || profile.mode || 'oauth').trim();
+  if ((type === 'api_key' || type === 'token') && typeof profile.key === 'string' && profile.key.trim()) {
+    return true;
+  }
+  if (type === 'oauth') {
+    return typeof profile.access === 'string'
+      && profile.access.trim().length > 0
+      && typeof profile.refresh === 'string'
+      && profile.refresh.trim().length > 0
+      && typeof profile.expires === 'number'
+      && Number.isFinite(profile.expires);
+  }
+  return false;
+}
+
+function getProviderProfile(provider: string, profileId: string | null | undefined): any | null {
+  if (!profileId) return null;
+  const authProfiles = readAuthProfiles();
+  const profile = authProfiles.profiles?.[profileId];
+  if (!profile) return null;
+  const aliases = getOAuthProfileProviderAliases(provider);
+  return aliases.has(profile.provider) ? profile : null;
+}
+
+function validateCompletedProviderProfile(session: OAuthSession): string | null {
+  if (session.provider !== 'google-gemini-cli') return null;
+  const profileIds = readProviderProfileIds(session.provider);
+  const createdProfileId = profileIds.find((profileId) => !session.profileKeyBefore.includes(profileId))
+    || profileIds[0]
+    || null;
+  const profile = getProviderProfile(session.provider, createdProfileId);
+  if (googleGeminiCliProfileHasUsableCredential(profile)) return null;
+  return 'Google Gemini CLI sign-in did not produce reusable credential material. Re-run the sign-in, or configure GEMINI_API_KEY/Application Default Credentials for the server runtime.';
+}
+
 export function getOpenClawOAuthProviderId(provider: string): string {
   return provider === 'openai-codex' ? 'openai' : provider;
 }
@@ -689,6 +726,12 @@ export async function completeOAuthFlow(sessionId: string, callbackUrl: string) 
   if (session.mode !== 'oauth') throw new Error('Session is not waiting for a callback URL');
 
   if (session.status === 'complete' || checkForNewProviderProfile(session)) {
+    const validationError = validateCompletedProviderProfile(session);
+    if (validationError) {
+      session.status = 'error';
+      session.error = validationError;
+      return { success: false, error: validationError };
+    }
     return { success: true };
   }
 
@@ -763,6 +806,15 @@ export async function completeOAuthFlow(sessionId: string, callbackUrl: string) 
       }
     }, 250);
   });
+
+  if (result.success) {
+    const validationError = validateCompletedProviderProfile(session);
+    if (validationError) {
+      session.status = 'error';
+      session.error = validationError;
+      return { success: false, error: validationError };
+    }
+  }
 
   return result;
 }

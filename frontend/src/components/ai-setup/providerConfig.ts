@@ -153,6 +153,47 @@ export const PROVIDERS: ProviderUIConfig[] = [
     },
   },
   {
+    id: 'google-gemini-cli',
+    name: 'Google Gemini CLI (OpenClaw)',
+    tier: 1,
+    icon: 'terminal',
+    primaryAuthType: 'oauth',
+    consoleUrl: 'https://gemini.google.com/',
+    signupUrl: 'https://gemini.google.com/',
+    pricingNote: 'Uses Gemini CLI OAuth through OpenClaw. This is an unofficial Google integration.',
+    freeTier: 'Depends on your Google Gemini plan/account',
+    description: 'Use OpenClaw\'s bundled Gemini CLI backend with Google OAuth. This is separate from the native Antigravity path.',
+    dangerNote: {
+      title: 'Unofficial Google OAuth path',
+      detail: 'OpenClaw docs warn that Gemini CLI OAuth is unofficial and some users have reported Google account restrictions after third-party clients. Use a non-critical Google account if you are risk-sensitive.',
+      compactDetail: 'Unofficial OAuth path; account risk is possible.',
+    },
+    setupInstructions: [
+      { stepNumber: 1, title: 'Confirm Gemini CLI is installed', detail: 'The server needs the gemini binary available on PATH before OpenClaw can run this backend.' },
+      { stepNumber: 2, title: 'Start Gemini CLI sign-in', detail: 'Click the sign-in button here to start OpenClaw\'s Gemini CLI OAuth flow.' },
+      { stepNumber: 3, title: 'Authorize with Google', detail: 'Use the Google account tied to the Gemini access you want the portal to use.' },
+      { stepNumber: 4, title: 'Copy the localhost callback URL', detail: 'After Google redirects to localhost, copy the full URL from the browser address bar and paste it back here.' },
+    ],
+    defaultModels: [
+      { id: 'google-gemini-cli/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', tier: 'frontier', description: 'Highest-capability Gemini CLI model currently normalized by OpenClaw.' },
+      { id: 'google-gemini-cli/gemini-3-flash-preview', name: 'Gemini 3 Flash Preview', tier: 'balanced', description: 'OpenClaw\'s default Gemini CLI model.' },
+      { id: 'google-gemini-cli/gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', tier: 'fast', description: 'Fastest Gemini CLI preset exposed by OpenClaw.' },
+    ],
+    onboardingNotes: {
+      intro: 'This uses Google Gemini through OpenClaw\'s Gemini CLI backend. It is the OpenClaw path, not the native Antigravity CLI flow.',
+      exactGoal: 'Authorize Gemini CLI with Google, then paste the final localhost callback URL so OpenClaw can store the provider auth profile.',
+      expectedConfusions: [
+        'This is separate from Google AI Studio API keys.',
+        'This is also separate from Antigravity, which keeps its own native CLI credentials.',
+        'The final localhost callback page may fail to load. Copy the full address bar URL anyway.',
+        'OpenClaw docs describe this OAuth route as unofficial, so avoid using a critical Google account if that risk matters.'
+      ],
+      callbackLabel: 'Paste the full Google localhost callback URL',
+      callbackExample: 'http://localhost:8085/oauth2callback?code=...&state=...',
+      afterLoginLabel: 'After Google login finishes, copy the entire localhost callback URL from the address bar.'
+    },
+  },
+  {
     id: 'google-antigravity',
     name: 'Google Antigravity',
     tier: 1,

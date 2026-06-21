@@ -98,6 +98,12 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.23 (June 21, 2026)
+- **The public installer is safe to rerun on existing installs**: the standard one-line install command now detects an existing Portal and performs an update instead of a no-op copy over itself.
+- **Caddy HTTPS config is protected**: updates do not rewrite Caddy, and forced reinstalls recover the existing domain before writing proxy config.
+- **OpenClaw 2026.6.9 support is wired through the Portal**: the installer pins the matching OpenClaw/Codex versions, verifies gateway parity after package changes, and Agent Chat lists the live OpenClaw model catalog, including Codex, Gemini CLI, and Antigravity rows.
+- **Gemini CLI setup is more truthful**: empty OAuth profiles no longer show as configured, and setup includes a smoke check for usable credentials.
+
 ### v3.25.22 (June 20, 2026)
 - **Codex compatibility repair now includes the plugin layer**: updates remove stale legacy `@openclaw/codex` install metadata, quarantine old global plugin copies, and enforce the compatible `2026.6.8` Codex plugin before restarting OpenClaw.
 - **Regression coverage catches the stale-plugin failure mode**: tests now cover the exact state that made OpenClaw reject valid `openai:codex-cli` auth as the wrong profile type.
@@ -114,7 +120,6 @@ One-click updates from the browser. Admin dashboard with user management, storag
 ### v3.25.19 (June 20, 2026)
 - **OpenClaw OAuth model suggestions are current and smaller**: Codex uses the `codex/gpt-5.5`, `codex/gpt-5.4`, and `codex/gpt-5.4-mini` family, while Claude highlights Opus 4.8, Sonnet 4.6, and Haiku 4.5.
 - **Google Antigravity replaces the old Gemini CLI subscription path**: the Portal guides users toward the native Antigravity flow and labels OpenClaw-native Antigravity OAuth as not fully supported for now.
-- **Release packaging is cleaner**: private notes, reports, source trees, logs, env files, dev databases, and stale build output are excluded from the public installer archive.
 
 ### v3.25.18 (May 31, 2026)
 - **OpenClaw compatibility checks are quieter on current runtimes**: updater hotfix detection no longer reports a failed legacy relay patch when the installed OpenClaw bundle has already moved past that patch shape.

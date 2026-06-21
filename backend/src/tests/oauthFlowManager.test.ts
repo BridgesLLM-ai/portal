@@ -2,6 +2,7 @@ import {
   extractClaudeAuthUrl,
   extractClaudeSetupToken,
   getOpenClawOAuthProviderId,
+  googleGeminiCliProfileHasUsableCredential,
   normalizeTerminalScreenText,
   outputLooksLikeClaudeCliAuthImportSuccess,
   squashPromptText,
@@ -46,6 +47,17 @@ describe('oauthFlowManager terminal parsing', () => {
   test('maps Portal Codex setup to OpenClaw 2026.6 auth provider id', () => {
     expect(getOpenClawOAuthProviderId('openai-codex')).toBe('openai');
     expect(getOpenClawOAuthProviderId('google-gemini-cli')).toBe('google-gemini-cli');
+  });
+
+  test('requires reusable credential material for Gemini CLI OAuth profiles', () => {
+    expect(googleGeminiCliProfileHasUsableCredential({ type: 'oauth' })).toBe(false);
+    expect(googleGeminiCliProfileHasUsableCredential({
+      type: 'oauth',
+      access: 'access-token',
+      refresh: 'refresh-token',
+      expires: Date.now() + 3600_000,
+    })).toBe(true);
+    expect(googleGeminiCliProfileHasUsableCredential({ type: 'api_key', key: 'AIza-test' })).toBe(true);
   });
 
   test('accepts Claude CLI auth import output even when wrapper exits non-zero', () => {

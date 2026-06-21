@@ -67,6 +67,7 @@ const saveSetupTokenSchema = z.object({
 const setFallbacksSchema = z.object({
   fallbacks: z.array(z.string().max(200).refine((value) => value.includes('/'), 'Fallback model must include provider prefix')).max(10),
 });
+const smokeProviderSchema = z.enum(['google-gemini-cli']);
 const oauthStartSchema = z.object({
   provider: z.enum(['openai-codex', 'google-gemini-cli', 'qwen-portal']),
   googleProjectId: z.string().min(1).optional(),
@@ -656,6 +657,59 @@ function buildSaveCommand(provider: string, apiKey: string): string[] {
   return [...commonArgs, '--auth-choice', meta.onboardAuthChoice, `--${meta.onboardKeyFlag}`, apiKey];
 }
 
+export function classifyProviderRuntimeFailure(output: string): string {
+  const normalized = output.replace(/\s+/g, ' ').trim();
+  if (/manual authorization is required|non-interactive|run the Gemini CLI in an interactive terminal/i.test(normalized)) {
+    return 'Gemini CLI is installed, but server-side auth is not usable headlessly. Re-run Gemini CLI sign-in from Portal or provide GEMINI_API_KEY/Application Default Credentials.';
+  }
+  if (/IneligibleTierError|UNSUPPORTED_CLIENT|not eligible|unsupported client/i.test(normalized)) {
+    return 'Google rejected this Gemini CLI account/client. Use a different Google account or the API-key Gemini provider instead.';
+  }
+  if (/command not found|ENOENT|not recognized/i.test(normalized)) {
+    return 'Gemini CLI is not installed or is not on PATH for the Portal service.';
+  }
+  if (/quota|rate limit|resource exhausted/i.test(normalized)) {
+    return 'Gemini CLI auth worked, but Google rejected the request for quota or rate-limit reasons.';
+  }
+  return normalized.slice(0, 600) || 'Provider runtime smoke test failed.';
+}
+
+function runGoogleGeminiCliSmoke() {
+  try {
+    const output = execFileSync('gemini', [
+      '-p',
+      'Reply with exactly GEMINI_OK.',
+      '--model',
+      'gemini-3-flash-preview',
+      '--output-format',
+      'json',
+    ], {
+      timeout: 75000,
+      encoding: 'utf8',
+      env: buildOpenClawCliEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 1024 * 1024 * 4,
+    });
+
+    return {
+      ok: /GEMINI_OK/i.test(output),
+      provider: 'google-gemini-cli',
+      model: 'google-gemini-cli/gemini-3-flash-preview',
+      error: /GEMINI_OK/i.test(output) ? null : 'Gemini CLI returned without the expected smoke-test response.',
+    };
+  } catch (error: any) {
+    const stdout = typeof error?.stdout === 'string' ? error.stdout : error?.stdout?.toString?.('utf8') || '';
+    const stderr = typeof error?.stderr === 'string' ? error.stderr : error?.stderr?.toString?.('utf8') || '';
+    const combined = `${stdout}\n${stderr}`.trim() || error?.message || 'Gemini CLI smoke test failed.';
+    return {
+      ok: false,
+      provider: 'google-gemini-cli',
+      model: 'google-gemini-cli/gemini-3-flash-preview',
+      error: classifyProviderRuntimeFailure(combined),
+    };
+  }
+}
+
 export function normalizeModelPayload(models: any[], providerHint?: string | null): any[] {
   return models.map((model) => {
     if (typeof model === 'string') {
@@ -781,6 +835,22 @@ export function createAiSetupRouter(): Router {
       configuredProfileCount: getConfiguredProfileCount(),
       activeProfiles: getActiveProfiles(),
     });
+  });
+
+  router.post('/provider/:id/smoke', async (req: Request, res: Response) => {
+    const parsed = smokeProviderSchema.safeParse(req.params.id);
+    if (!parsed.success) {
+      res.status(400).json({ ok: false, error: 'Runtime smoke test is not available for this provider yet.' });
+      return;
+    }
+
+    if (parsed.data === 'google-gemini-cli') {
+      const result = runGoogleGeminiCliSmoke();
+      res.status(result.ok ? 200 : 502).json(result);
+      return;
+    }
+
+    res.status(400).json({ ok: false, error: 'Runtime smoke test is not available for this provider yet.' });
   });
 
   router.post('/validate-key', async (req: Request, res: Response) => {

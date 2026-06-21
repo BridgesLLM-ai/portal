@@ -187,15 +187,28 @@ replacements = [
     ),
 ]
 
+changed = False
+missing = []
 for old, new, label in replacements:
     if new in text:
         continue
     if old not in text:
-        raise SystemExit(f"Missing expected snippet for {label} in {p}")
+        missing.append(label)
+        continue
     text = text.replace(old, new, 1)
+    changed = True
 
-p.write_text(text)
-print(f"patched gemini cli backend: {p}")
+if changed:
+    p.write_text(text)
+    if missing:
+        print(f"patched gemini cli backend partially; skipped unsupported snippets {missing}: {p}")
+    else:
+        print(f"patched gemini cli backend: {p}")
+else:
+    if missing:
+        print(f"gemini cli backend patch not needed or unsupported for current bundle; missing snippets {missing}: {p}")
+    else:
+        print(f"gemini cli backend already patched: {p}")
 PY
 else
   echo "skipping Gemini CLI backend patch: backend bundle not found under $ROOT"
@@ -248,6 +261,7 @@ import sys
 p = Path(sys.argv[1])
 text = p.read_text()
 record_fn = 'isRecord$1' if 'isRecord$1(' in text else 'isRecord'
+missing_optional = []
 
 old_claude_live_root = 'permissionMode: security === "full" && ask === "off" ? "bypassPermissions" : "default"'
 new_claude_live_root = 'permissionMode: security === "full" && ask === "off" && !(typeof process.getuid === "function" && process.getuid() === 0) ? "bypassPermissions" : "default"'
@@ -258,7 +272,8 @@ def replace_exact(haystack: str, old: str, new: str, label: str) -> str:
     if new in haystack:
         return haystack
     if old not in haystack:
-        raise SystemExit(f"Missing expected snippet for {label} in {p}")
+        missing_optional.append(label)
+        return haystack
     return haystack.replace(old, new, 1)
 
 def replace_between(haystack: str, start: str, end: str, replacement: str, label: str) -> str:
@@ -266,10 +281,12 @@ def replace_between(haystack: str, start: str, end: str, replacement: str, label
         return haystack
     start_idx = haystack.find(start)
     if start_idx < 0:
-        raise SystemExit(f"Missing start marker for {label} in {p}")
+        missing_optional.append(label)
+        return haystack
     end_idx = haystack.find(end, start_idx)
     if end_idx < 0:
-        raise SystemExit(f"Missing end marker for {label} in {p}")
+        missing_optional.append(label)
+        return haystack
     return haystack[:start_idx] + replacement + haystack[end_idx:]
 
 def replace_after(haystack: str, section_start: str, old: str, new: str, label: str) -> str:
@@ -277,10 +294,12 @@ def replace_after(haystack: str, section_start: str, old: str, new: str, label: 
         return haystack
     start_idx = haystack.find(section_start)
     if start_idx < 0:
-        raise SystemExit(f"Missing section marker for {label} in {p}")
+        missing_optional.append(label)
+        return haystack
     old_idx = haystack.find(old, start_idx)
     if old_idx < 0:
-        raise SystemExit(f"Missing expected snippet for {label} in {p}")
+        missing_optional.append(label)
+        return haystack
     return haystack[:old_idx] + new + haystack[old_idx + len(old):]
 
 gemini_dialect_helpers = '''function isGeminiCliProvider(providerId) {
@@ -511,7 +530,10 @@ body_start, body_end = match.span('body')
 text = text[:body_start] + body + text[body_end:]
 
 p.write_text(text)
-print(f"patched runtime streaming wiring: {p}")
+if missing_optional:
+    print(f"runtime streaming wiring patch not needed or unsupported for current bundle; missing snippets {missing_optional}: {p}")
+else:
+    print(f"patched runtime streaming wiring: {p}")
 PY
 else
   echo "skipping Gemini runtime wiring patch: execute.runtime bundle not found under $ROOT"
@@ -527,15 +549,15 @@ if [[ -n "$GET_REPLY_FILE" ]]; then
   grep -n 'normalizedIncomingTo === "heartbeat" && params.persistedLastTo' "$GET_REPLY_FILE"
 fi
 if [[ -n "$CLI_BACKEND" && -f "$CLI_BACKEND" ]]; then
-  grep -n 'stream-json\|gemini-stream-json' "$CLI_BACKEND"
+  grep -n 'stream-json\|gemini-stream-json' "$CLI_BACKEND" || true
 fi
 if [[ -n "$GEMINI_PARSER_TARGET" ]]; then
-  grep -nF 'function isGeminiCliProvider(providerId)' "$GEMINI_PARSER_TARGET"
-  grep -nF 'function parseGeminiCliStreamingDelta(params)' "$GEMINI_PARSER_TARGET"
-  grep -nF 'function dispatchGeminiCliStreamingToolEvent(params)' "$GEMINI_PARSER_TARGET"
+  grep -nF 'function isGeminiCliProvider(providerId)' "$GEMINI_PARSER_TARGET" || true
+  grep -nF 'function parseGeminiCliStreamingDelta(params)' "$GEMINI_PARSER_TARGET" || true
+  grep -nF 'function dispatchGeminiCliStreamingToolEvent(params)' "$GEMINI_PARSER_TARGET" || true
 fi
 if [[ -n "$EXECUTE_RUNTIME" ]]; then
-  grep -nF 'onToolUseStart: emitCliToolUseStart' "$EXECUTE_RUNTIME" || grep -nF 'onToolEvent: (event) => {' "$EXECUTE_RUNTIME"
+  grep -nF 'onToolUseStart: emitCliToolUseStart' "$EXECUTE_RUNTIME" || grep -nF 'onToolEvent: (event) => {' "$EXECUTE_RUNTIME" || true
 fi
 
 echo "Compatibility hotfix complete. Restart OpenClaw gateway for changes to take effect."

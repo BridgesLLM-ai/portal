@@ -2,6 +2,17 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.23] - 2026-06-21
+
+### Fixed
+- **The public installer now updates existing installs safely**: running the standard one-line installer on an existing Portal now routes into the update flow instead of silently rsyncing the install directory onto itself.
+- **Caddy HTTPS config is preserved during updates and reinstalls**: normal updates no longer touch Caddy, and forced reinstalls recover the existing domain before writing proxy config so a blank `DOMAIN` cannot downgrade a working HTTPS site.
+- **OpenClaw/Codex package parity is enforced after updates**: the installer pins OpenClaw and the Codex plugin to `2026.6.9`, restarts the gateway when the package changes, and verifies the running gateway version before reporting success.
+
+### Improved
+- **Agent Chat now uses OpenClaw's live model catalog**: OpenClaw model pickers include the currently reported Codex/OpenAI, Gemini CLI, and Antigravity models instead of relying on a maintained shortlist.
+- **Google Gemini CLI setup reports credential state more honestly**: empty OAuth profiles no longer appear configured, and the setup flow includes a smoke check that distinguishes missing credentials from runtime model issues.
+
 ## [3.25.22] - 2026-06-20
 
 ### Fixed
@@ -31,7 +42,6 @@ All notable changes to BridgesLLM Portal are documented here.
 - **Agent Chat keeps pace with current OpenClaw model IDs**: Codex OAuth now uses the current `codex/...` model family, Claude recommendations include the current Opus option exposed by OpenClaw, and stale fallback IDs are repaired more consistently.
 - **Google subscription setup no longer points users at the retired Gemini CLI path**: Google Antigravity is treated as the native Gemini coding-agent path, with old Gemini CLI model IDs mapped away from dead selections.
 - **OpenClaw model pickers are smaller and less misleading**: unsupported Google/Gemini rows are hidden from the OpenClaw catalogue while Antigravity shows only the Gemini models reported by the native Antigravity CLI.
-- **Release packaging is stricter about private/internal files**: generated release archives exclude internal handoff notes, reports, development databases, logs, env files, source trees, and stale build output.
 
 ### Improved
 - **Provider setup copy is more honest**: Antigravity carries a temporary “not fully supported for now” warning for OpenClaw-native OAuth while the Portal-native Antigravity flow remains available.

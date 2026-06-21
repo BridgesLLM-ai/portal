@@ -18,7 +18,7 @@ export const MODELS_JSON_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agen
 export const CODEX_EXTERNAL_CLI_PROFILE_ID = 'openai:codex-cli';
 export const CODEX_CLI_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
 export const OPENCLAW_CODEX_HOME_AUTH_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'codex-home', 'auth.json');
-export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.6.8';
+export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.6.9';
 const LEGACY_PLUGIN_INSTALLS_PATH = path.join(OPENCLAW_HOME, 'plugins', 'installs.json');
 const LEGACY_GLOBAL_CODEX_PLUGIN_DIR = path.join(OPENCLAW_HOME, 'npm', 'node_modules', '@openclaw', 'codex');
 const OPENCLAW_SQLITE_PATH = path.join(OPENCLAW_HOME, 'state', 'openclaw.sqlite');
@@ -310,9 +310,6 @@ export function getProviderAuthAliases(provider: string): Set<string> {
   if (normalized === 'anthropic' || normalized === 'claude-cli') {
     return new Set(['anthropic', 'claude-cli']);
   }
-  if (normalized === 'google-antigravity' || normalized === 'google-gemini-cli') {
-    return new Set(['google-antigravity', 'google-gemini-cli']);
-  }
   return new Set([normalized]);
 }
 
@@ -465,6 +462,23 @@ function getProviderMeta(provider: string) {
 
 function isApiKeyProvider(provider: string): boolean {
   return Boolean(getProviderMeta(provider)?.authTypes.includes('api_key'));
+}
+
+function googleGeminiCliProfileHasUsableCredential(profile: any): boolean {
+  if (!profile || typeof profile !== 'object') return false;
+  const type = String(profile.type || profile.mode || 'oauth').trim();
+  if ((type === 'api_key' || type === 'token') && typeof profile.key === 'string' && profile.key.trim()) {
+    return true;
+  }
+  if (type === 'oauth') {
+    return typeof profile.access === 'string'
+      && profile.access.trim().length > 0
+      && typeof profile.refresh === 'string'
+      && profile.refresh.trim().length > 0
+      && typeof profile.expires === 'number'
+      && Number.isFinite(profile.expires);
+  }
+  return false;
 }
 
 function writeProviderSecret(options: {
@@ -744,7 +758,7 @@ export function getProviderStatuses(): ProviderStatus[] {
       : provider.id === 'openai-codex'
         ? (defaultModel && (defaultModel.startsWith('codex/') || defaultModel.startsWith('openai-codex/') || defaultModel.startsWith('openai/')) ? defaultModel : null)
         : provider.id === 'google-antigravity'
-          ? (defaultModel && (defaultModel.startsWith('google-antigravity/') || defaultModel.startsWith('google-gemini-cli/')) ? defaultModel : null)
+          ? (defaultModel && defaultModel.startsWith('google-antigravity/') ? defaultModel : null)
           : (defaultModel && defaultModel.startsWith(`${provider.id}/`) ? defaultModel : null);
 
     let status: ProviderStatus['status'] = 'unconfigured';
@@ -772,6 +786,9 @@ export function getProviderStatuses(): ProviderStatus[] {
       if (excludedByAuthOrder) {
         status = 'error';
         error = 'Provider is excluded by auth.order (empty provider order), so no credentials are eligible.';
+      } else if (provider.id === 'google-gemini-cli' && !googleGeminiCliProfileHasUsableCredential(storedProfile)) {
+        status = 'error';
+        error = 'Google Gemini CLI profile exists, but it does not contain reusable credential material. Re-run sign-in or configure GEMINI_API_KEY/Application Default Credentials.';
       } else if (expiresAt && expiresAt <= now && !storedProfile?.refresh) {
         status = 'expired';
         error = 'Stored OAuth credentials expired.';
@@ -799,6 +816,10 @@ export function getProviderStatuses(): ProviderStatus[] {
       ) {
         status = 'error';
         error = `OpenClaw model catalog is missing ${currentModel}. Re-run provider model registration before using Agent Chat.`;
+      }
+
+      if (status === 'configured' && provider.id === 'google-gemini-cli') {
+        warning = warning || 'Gemini CLI OAuth is configured, but headless runtime auth can still fail. Run a smoke test before making it the default provider.';
       }
     } else if (hasAnyProviderConfig || hasStoredProfile) {
       status = 'error';
