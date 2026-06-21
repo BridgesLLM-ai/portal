@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.20"
+readonly VERSION="3.25.21"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -2191,6 +2191,30 @@ repair_openclaw_portal_model_config() {
   ok "OpenClaw model configuration checked"
 }
 
+bridge_openclaw_codex_cli_auth() {
+  if $SKIP_OPENCLAW || ! command -v node &>/dev/null; then
+    return 0
+  fi
+
+  local helper="${PORTAL_DIR}/backend/dist/services/openclawConfigManager.js"
+  if [[ ! -f "${helper}" ]]; then
+    warn "Portal OpenClaw Codex auth bridge helper is missing. Skipping Codex auth bridge."
+    return 0
+  fi
+
+  if [[ ! -f "${HOME}/.codex/auth.json" ]]; then
+    ok "OpenClaw Codex auth bridge skipped (no external Codex CLI auth found)"
+    return 0
+  fi
+
+  if ! spin "Bridging Codex CLI auth into OpenClaw" "OPENCLAW_ALLOW_ROOT=1 NODE_PATH='${PORTAL_DIR}/backend/node_modules' node -e 'const helper = process.argv[1]; const mod = require(helper); const result = mod.pinCodexExternalCliAuthProfile(); console.log(JSON.stringify(result));' '${helper}'"; then
+    warn "OpenClaw Codex auth bridge failed. Continuing update; re-run Codex setup in Settings if needed."
+    return 0
+  fi
+
+  ok "OpenClaw Codex auth bridge checked"
+}
+
 configure_openclaw_codex_harness_defaults() {
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
@@ -2242,6 +2266,7 @@ prepare_openclaw_runtime_for_portal() {
   run_openclaw_state_repair_notice
   auto_apply_openclaw_compatibility_hotfix
   repair_openclaw_portal_model_config
+  bridge_openclaw_codex_cli_auth
   configure_openclaw_codex_harness_defaults
   ensure_openclaw_gateway_boots_cleanly || true
 }

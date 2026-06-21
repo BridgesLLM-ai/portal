@@ -2,6 +2,12 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.21] - 2026-06-20
+
+### Fixed
+- **Dashboard updates now repair existing Codex/OpenClaw auth drift before restart**: the installer/update prep path bridges a usable native Codex CLI OAuth file into OpenClaw's current `openai:codex-cli` profile, removes stale `openai-codex:*` auth-order entries through the Portal helper, and then validates the gateway. This makes existing machines recover the same way fresh Settings-based Codex setup does.
+- **OpenClaw repair remains scoped**: the updater still avoids `openclaw doctor --fix` and Caddy auto-upgrades; the new repair step only touches the Codex auth bridge managed by the Portal.
+
 ## [3.25.20] - 2026-06-20
 
 ### Fixed

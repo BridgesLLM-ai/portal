@@ -98,6 +98,10 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.21 (June 20, 2026)
+- **Dashboard updates now repair existing Codex auth drift**: during update, the installer bridges a valid native Codex CLI OAuth file into OpenClaw's current `openai:codex-cli` profile and removes stale `openai-codex:*` auth-order entries.
+- **The OpenClaw repair path stays narrow**: updates still avoid broad `openclaw doctor --fix` mutations and still leave Caddy upgrades behind manual review.
+
 ### v3.25.20 (June 20, 2026)
 - **Portal updates are safer around host infrastructure**: the installer no longer runs `openclaw doctor --fix` during normal updates and no longer auto-upgrades Caddy.
 - **Codex subscription setup uses the reliable device-login path**: Codex login now bridges the native Codex CLI credential store into OpenClaw's current `openai` auth slot without overwriting OpenAI API-key profiles.
