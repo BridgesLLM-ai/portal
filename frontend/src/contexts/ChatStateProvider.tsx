@@ -2423,6 +2423,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     return raw;
   }, []);
 
+  const isAbortTerminalError = useCallback((payload: any) => {
+    if (!payload || payload.aborted !== true) return false;
+    const raw = String(payload.errorMessage || payload.error || '').trim();
+    return !raw || /Agent couldn't generate a response|Agent couldn.t generate a response|aborted|cancelled|canceled/i.test(raw);
+  }, []);
+
   // Stream watchdog
   const resetStreamWatchdog = useCallback(() => {
     if (streamWatchdogRef.current) clearTimeout(streamWatchdogRef.current);
@@ -4127,6 +4133,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           }
           const errorMsg = normalizeAgentError(payload.errorMessage, 'Unknown error');
           const cid = streamingAssistantIdRef.current;
+          const abortedTerminalError = isAbortTerminalError(payload);
+          const currentText = assembledRef.current;
 
           setStatusText(null);
           setStreamingPhase('idle');
@@ -4144,7 +4152,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
           if (cid) {
             setMessages(prev => prev.map(m =>
-              m.id === cid ? { ...m, content: '⚠️ ' + errorMsg } : m
+              m.id === cid ? { ...m, content: abortedTerminalError ? `${currentText || m.content || ''}\n\n*(cancelled)*`.trim() : '⚠️ ' + errorMsg } : m
             ));
           }
           break;
@@ -4479,7 +4487,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
       }
     }
-  }, [clearDirectPendingEmptyFinal, clearSuppressedRunId, completeDirectAssistantTurn, ensureStreamingAssistantBubble, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, clearPendingTextRender, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, resolveCurrentStreamModel, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase]);
+  }, [clearDirectPendingEmptyFinal, clearSuppressedRunId, completeDirectAssistantTurn, ensureStreamingAssistantBubble, isAbortTerminalError, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, clearPendingTextRender, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, resolveCurrentStreamModel, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase]);
 
   // WS setup — runs once on mount, survives entire app lifetime
   // Handler registration MUST happen in the same effect that creates the manager,
@@ -4771,8 +4779,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     hasRealToolEventsRef.current = false;
     activeStreamToolCallsRef.current = [];
     streamingAssistantIdRef.current = null;
+    currentRunIdRef.current = null;
     isStreamActiveRef.current = false;
     streamTransportRef.current = null;
+    directClientRef.current?.setActiveStreamSession(null);
     isQueueDrainActiveRef.current = false;
     if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
     if (streamWatchdogRef.current) { clearTimeout(streamWatchdogRef.current); streamWatchdogRef.current = null; }

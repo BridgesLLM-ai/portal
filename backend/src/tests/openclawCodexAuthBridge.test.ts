@@ -75,6 +75,69 @@ describe('OpenClaw Codex auth bridge', () => {
     expect(JSON.parse(fs.readFileSync(openclawCodexAuthPath, 'utf8')).tokens.access_token).toBe('access-token');
   });
 
+  test('removes legacy Codex OAuth profiles while preserving real OpenAI API-key profiles', () => {
+    const openclawHome = process.env.OPENCLAW_HOME as string;
+    const authProfilesPath = path.join(openclawHome, 'agents', 'main', 'agent', 'auth-profiles.json');
+    const configPath = path.join(openclawHome, 'openclaw.json');
+    const codexAuthPath = path.join(process.env.HOME as string, '.codex', 'auth.json');
+
+    fs.mkdirSync(path.dirname(authProfilesPath), { recursive: true });
+    fs.mkdirSync(path.dirname(codexAuthPath), { recursive: true });
+    fs.writeFileSync(authProfilesPath, JSON.stringify({
+      version: 2,
+      profiles: {
+        'openai:default': { type: 'api_key', provider: 'openai', key: 'sk-test' },
+        'openai:codex-cli': { type: 'oauth', provider: 'openai', access: 'current', refresh: 'current' },
+        'openai-codex:default': { type: 'oauth', provider: 'openai-codex' },
+        'openai-codex:user@example.com': { type: 'oauth', provider: 'openai-codex', access: 'stale', refresh: 'stale' },
+        'openai:user@example.com': { type: 'oauth', provider: 'openai-codex', access: 'stale', refresh: 'stale' },
+      },
+      usageStats: {
+        'openai-codex:user@example.com': { errorCount: 2 },
+      },
+      lastGood: {
+        'openai-codex': 'openai-codex:user@example.com',
+      },
+    }, null, 2));
+    fs.writeFileSync(configPath, JSON.stringify({
+      auth: {
+        order: {
+          openai: ['openai-codex:user@example.com', 'openai:default'],
+          'openai-codex': ['openai-codex:default'],
+          codex: ['codex:default'],
+        },
+        profiles: {
+          'openai:default': { provider: 'openai', mode: 'api_key' },
+          'openai:codex-cli': { provider: 'openai', mode: 'oauth' },
+          'openai-codex:user@example.com': { provider: 'openai-codex', mode: 'oauth' },
+          'codex:default': { provider: 'codex', mode: 'oauth' },
+        },
+      },
+    }, null, 2));
+    fs.writeFileSync(codexAuthPath, JSON.stringify({
+      tokens: {
+        access_token: 'access-token',
+        refresh_token: 'refresh-token',
+      },
+    }, null, 2));
+
+    const manager = require('../services/openclawConfigManager');
+    manager.pinCodexExternalCliAuthProfile();
+
+    const authProfiles = JSON.parse(fs.readFileSync(authProfilesPath, 'utf8'));
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+
+    expect(authProfiles.profiles['openai:default']).toMatchObject({ type: 'api_key', provider: 'openai', key: 'sk-test' });
+    expect(authProfiles.profiles['openai:codex-cli']).toMatchObject({ type: 'oauth', provider: 'openai' });
+    expect(Object.keys(authProfiles.profiles).sort()).toEqual(['openai:codex-cli', 'openai:default']);
+    expect(authProfiles.usageStats).not.toHaveProperty('openai-codex:user@example.com');
+    expect(authProfiles.lastGood).not.toHaveProperty('openai-codex');
+    expect(config.auth.order.openai).toEqual(['openai:codex-cli', 'openai:default']);
+    expect(config.auth.order).not.toHaveProperty('openai-codex');
+    expect(config.auth.order).not.toHaveProperty('codex');
+    expect(Object.keys(config.auth.profiles).sort()).toEqual(['openai:codex-cli', 'openai:default']);
+  });
+
   test('removes stale legacy Codex plugin state without touching current project installs', () => {
     const openclawHome = process.env.OPENCLAW_HOME as string;
     const installsPath = path.join(openclawHome, 'plugins', 'installs.json');

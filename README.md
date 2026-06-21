@@ -98,6 +98,10 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.25 (June 21, 2026)
+- **Dashboard updates recover the Portal before exiting**: if OpenClaw prep fails after the updater stops the service, the installer now restarts `bridgesllm-product` and waits for `/health` before exiting.
+- **Agent switching no longer kills active runs**: changing OpenClaw agents or providers detaches the visible chat instead of sending an abort; only explicit Stop/New Chat cancels a run.
+
 ### v3.25.24 (June 21, 2026)
 - **OpenClaw update recovery is stricter**: compatibility hotfixes now repair duplicate Gemini stream helpers, validate OpenClaw bundles as ES modules, and fail the update if the gateway cannot boot cleanly.
 - **Agent Chat stays responsive during model discovery**: OpenClaw model lists now use the gateway catalog first with a short async CLI fallback, avoiding backend freezes when the OpenClaw CLI is slow.

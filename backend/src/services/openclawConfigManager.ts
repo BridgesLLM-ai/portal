@@ -536,6 +536,31 @@ function uniqueOrder(profileIds: string[]): string[] {
   return Array.from(new Set(profileIds.map((profileId) => String(profileId || '').trim()).filter(Boolean)));
 }
 
+function isLegacyCodexProfile(profileId: string, rawProfile: any, keepProfileId: string): boolean {
+  if (profileId === keepProfileId) return false;
+  const provider = String(rawProfile?.provider || '').trim();
+  const type = String(rawProfile?.type || rawProfile?.mode || '').trim();
+  if (provider === 'openai' && type === 'api_key') return false;
+  return provider === 'openai-codex'
+    || provider === 'codex'
+    || provider === 'codex-cli'
+    || profileId.startsWith('openai-codex:')
+    || profileId.startsWith('codex:')
+    || profileId.includes(':codex')
+    || profileId.includes('codex-cli');
+}
+
+function removeLegacyCodexProfiles(profiles: Record<string, any> | undefined, keepProfileId: string): string[] {
+  if (!profiles || typeof profiles !== 'object') return [];
+  const removed: string[] = [];
+  for (const [profileId, rawProfile] of Object.entries(profiles)) {
+    if (!isLegacyCodexProfile(profileId, rawProfile, keepProfileId)) continue;
+    delete profiles[profileId];
+    removed.push(profileId);
+  }
+  return removed;
+}
+
 export function syncCodexCliAuthToOpenClawCodexHome(): boolean {
   if (!fs.existsSync(CODEX_CLI_AUTH_PATH)) return false;
   const parsed = safeReadJson<any>(CODEX_CLI_AUTH_PATH, null);
@@ -568,6 +593,17 @@ export function pinCodexExternalCliAuthProfile(profileId = CODEX_EXTERNAL_CLI_PR
 
   const authData = readAuthProfiles();
   authData.version = authData.version || 2;
+  const removedStoredProfiles = removeLegacyCodexProfiles(authData.profiles, profileId);
+  if (authData.usageStats) {
+    for (const removedProfileId of removedStoredProfiles) delete authData.usageStats[removedProfileId];
+  }
+  if (authData.lastGood) {
+    for (const [provider, lastGoodProfileId] of Object.entries(authData.lastGood)) {
+      if (provider === 'openai-codex' || provider === 'codex' || removedStoredProfiles.includes(lastGoodProfileId)) {
+        delete authData.lastGood[provider];
+      }
+    }
+  }
   authData.profiles[profileId] = {
     ...(authData.profiles[profileId] || {}),
     type: 'oauth',
@@ -579,6 +615,7 @@ export function pinCodexExternalCliAuthProfile(profileId = CODEX_EXTERNAL_CLI_PR
   if (!config.auth) config.auth = {};
   if (!config.auth.profiles) config.auth.profiles = {};
   if (!config.auth.order) config.auth.order = {};
+  removeLegacyCodexProfiles(config.auth.profiles, profileId);
 
   config.auth.profiles[profileId] = {
     ...(config.auth.profiles[profileId] || {}),
@@ -588,8 +625,13 @@ export function pinCodexExternalCliAuthProfile(profileId = CODEX_EXTERNAL_CLI_PR
   const currentOpenAiOrder = Array.isArray(config.auth.order.openai) ? config.auth.order.openai : [];
   config.auth.order.openai = uniqueOrder([
     profileId,
-    ...currentOpenAiOrder.filter((candidate: unknown) => !String(candidate || '').startsWith('openai-codex:')),
+    ...currentOpenAiOrder.filter((candidate: unknown) => {
+      const candidateId = String(candidate || '');
+      return !isLegacyCodexProfile(candidateId, config.auth.profiles?.[candidateId], profileId);
+    }),
   ]);
+  delete config.auth.order.codex;
+  delete config.auth.order['codex-cli'];
   delete config.auth.order['openai-codex'];
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
 

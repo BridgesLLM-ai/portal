@@ -2974,9 +2974,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       const providerChanged = selection.provider !== provider;
       const agentChanged = selection.agentId !== agentId;
       if (!providerChanged && !agentChanged) return;
-      if (isRunning) {
-        await chatState.cancelStream();
-      }
+      // Detach the visible chat from the active stream without aborting it.
+      // Switching agents/providers is navigation, not an implicit Stop click.
       // Fix: Clear messages FIRST to prevent stale history from showing.
       // The sequence must be: clear → update state atomically → load new history.
       // clearMessages() increments historyGenRef which invalidates any in-flight loads.
@@ -2986,7 +2985,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       setAgentId(selection.agentId);
       setSession('main');
     },
-    [provider, agentId, isRunning, chatState, clearMessages, setProvider, setAgentId, setSession],
+    [provider, agentId, clearMessages, setProvider, setAgentId, setSession],
   );
 
   const handleNewChat = useCallback(async () => {

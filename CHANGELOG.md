@@ -2,6 +2,12 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.25] - 2026-06-21
+
+### Fixed
+- **Dashboard updates now restart the Portal if OpenClaw prep fails**: the installer keeps its recovery trap armed until after `bridgesllm-product` starts and `/health` passes, so a failed OpenClaw compatibility step cannot leave a customer portal stopped.
+- **Switching Agent Chat providers or OpenClaw agents no longer aborts the active run**: changing the visible agent now detaches the UI from the current stream instead of sending `chat.abort`; explicit Stop and New Chat still cancel intentionally.
+
 ## [3.25.24] - 2026-06-21
 
 ### Fixed

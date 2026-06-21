@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.24"
+readonly VERSION="3.25.25"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -59,6 +59,7 @@ CURRENT_STEP_NUM=0
 INSTALL_START_TIME=""
 PACKAGE_MANAGER_REPAIR_ACTIVE=false
 PACKAGE_MANAGER_LONG_WAIT_SECONDS=1800
+UPDATE_RECOVERY_ARMED=false
 
 # OS detection
 OS_ID=""
@@ -116,6 +117,10 @@ fail() {
     tail -5 "$LOG_FILE" 2>/dev/null | sed 's/^/    /'
   fi
   echo ""
+  if [[ "${UPDATE_RECOVERY_ARMED:-false}" == "true" ]] && declare -F recover_interrupted_update >/dev/null 2>&1; then
+    UPDATE_RECOVERY_ARMED=false
+    recover_interrupted_update
+  fi
   exit 1
 }
 
@@ -563,6 +568,36 @@ verify_portal_service_health() {
   if [[ -t 1 ]]; then printf "\r%-120s\r" ""; fi
   journalctl -u "${service_name}" -n 50 --no-pager >> "$LOG_FILE" 2>&1 || true
   return 1
+}
+
+UPDATE_RECOVERY_BACKUP_DIR=""
+UPDATE_RECOVERY_ROLLBACK_RUNTIME=false
+
+recover_interrupted_update() {
+  echo ""
+  echo -e "  ${YELLOW}⚠ Update interrupted before portal health verification — recovering portal...${NC}"
+
+  if [[ "${UPDATE_RECOVERY_ROLLBACK_RUNTIME:-false}" == "true" \
+        && -n "${UPDATE_RECOVERY_BACKUP_DIR:-}" \
+        && -d "${UPDATE_RECOVERY_BACKUP_DIR}/portal-runtime" ]]; then
+    warn "Restoring previous portal runtime before restart"
+    rsync -a --delete \
+      --exclude='node_modules' \
+      --exclude='.git' \
+      --exclude='.env' \
+      --exclude='.env.production' \
+      --exclude='/projects' \
+      --exclude='/assets' \
+      --exclude='/upload-temp' \
+      --exclude='/.data' \
+      "${UPDATE_RECOVERY_BACKUP_DIR}/portal-runtime/" "${PORTAL_DIR}/" >> "$LOG_FILE" 2>&1 || true
+    cp "${UPDATE_RECOVERY_BACKUP_DIR}/.env.production" "${PORTAL_DIR}/backend/" 2>/dev/null || true
+    cp "${UPDATE_RECOVERY_BACKUP_DIR}/.env" "${PORTAL_DIR}/frontend/" 2>/dev/null || true
+    ln -sf .env.production "${PORTAL_DIR}/backend/.env" 2>/dev/null || true
+  fi
+
+  systemctl start bridgesllm-product 2>/dev/null || true
+  verify_portal_service_health "bridgesllm-product" "http://127.0.0.1:4001/health" 60 >/dev/null 2>&1 || true
 }
 
 update_dependencies() {
@@ -2619,15 +2654,9 @@ do_update() {
   mkdir -p "${backup_dir}"
   cp "${PORTAL_DIR}/backend/.env.production" "${backup_dir}/" 2>/dev/null || true
   cp "${PORTAL_DIR}/frontend/.env" "${backup_dir}/" 2>/dev/null || true
+  UPDATE_RECOVERY_BACKUP_DIR="${backup_dir}"
 
   load_existing_telemetry_install_id
-
-  info "Stopping portal..."
-  systemctl stop bridgesllm-product 2>/dev/null || true
-
-  # Safety net: if the update fails for ANY reason after stopping the service,
-  # always try to restart it so the user doesn't lose their portal.
-  trap 'echo ""; echo -e "  ${YELLOW}⚠ Update failed — restarting portal with previous version...${NC}"; systemctl start bridgesllm-product 2>/dev/null || true' ERR
 
   # Read existing DATABASE_URL directly — do NOT reconstruct it (port may differ)
   local existing_db_url=""
@@ -2639,25 +2668,42 @@ do_update() {
     [[ -n "${existing_install_profile}" ]] && INSTALL_PROFILE="${existing_install_profile}"
   fi
 
-  # Download update — always prefer the tarball over local fallback dir.
+  # Stage update payload before stopping the portal. Network, tar, and source
+  # validation failures should not create user-visible downtime.
   # The fallback dir may contain unbuilt source (dev repos), which would nuke
   # the production build via --delete. Only use fallback if download fails.
-  local update_applied=false
+  local staged_update_dir=""
   if curl -fsSL --head "${RELEASE_URL}" &>/dev/null 2>&1; then
+    rm -rf /tmp/blp-download
     mkdir -p /tmp/blp-download
     spin_download "Downloading update" "${RELEASE_URL}" "/tmp/blp-download/portal.tar.gz"
-    spin "Extracting update" "tar -xzf /tmp/blp-download/portal.tar.gz -C /tmp/blp-download && rsync -a --delete --exclude='/projects' --exclude='/assets' --exclude='/upload-temp' --exclude='/.data' --exclude='.env.production' --exclude='.env' /tmp/blp-download/portal/ '${PORTAL_DIR}/' && rm -rf /tmp/blp-download"
-    update_applied=true
+    spin "Extracting update" "tar -xzf /tmp/blp-download/portal.tar.gz -C /tmp/blp-download"
+    [[ -f /tmp/blp-download/portal/backend/dist/server.js ]] || fail "Downloaded update is missing backend build artifacts"
+    staged_update_dir="/tmp/blp-download/portal"
   elif [[ -d "${RELEASE_FALLBACK_DIR}" ]] && [[ -f "${RELEASE_FALLBACK_DIR}/backend/dist/server.js" ]]; then
     # Fallback to local source ONLY if it has built artifacts (dist/server.js)
     warn "Download unavailable — falling back to local source at ${RELEASE_FALLBACK_DIR}"
-    spin "Syncing updated portal files" "rsync -a --delete --exclude='node_modules' --exclude='.git' --exclude='.env' --exclude='.env.production' --exclude='/projects' --exclude='/assets' --exclude='/upload-temp' --exclude='/.data' '${RELEASE_FALLBACK_DIR}/' '${PORTAL_DIR}/'"
-    update_applied=true
+    staged_update_dir="${RELEASE_FALLBACK_DIR}"
   fi
 
-  if ! $update_applied; then
+  if [[ -z "${staged_update_dir}" ]]; then
     fail "Cannot find update source (download failed and no local fallback with built artifacts)"
   fi
+
+  info "Stopping portal..."
+  systemctl stop bridgesllm-product 2>/dev/null || true
+
+  # Safety net: keep production/customer portals reachable if anything fails
+  # after the service has been stopped. Leave this armed until health passes.
+  trap 'recover_interrupted_update' ERR
+  trap 'recover_interrupted_update; handle_sigint' SIGINT
+  trap 'recover_interrupted_update; exit 143' TERM
+  UPDATE_RECOVERY_ARMED=true
+
+  UPDATE_RECOVERY_ROLLBACK_RUNTIME=false
+  spin "Backing up current portal runtime" "rsync -a --delete --exclude='node_modules' --exclude='.git' --exclude='.env' --exclude='.env.production' --exclude='/projects' --exclude='/assets' --exclude='/upload-temp' --exclude='/.data' '${PORTAL_DIR}/' '${backup_dir}/portal-runtime/'"
+  UPDATE_RECOVERY_ROLLBACK_RUNTIME=true
+  spin "Syncing updated portal files" "rsync -a --delete --exclude='node_modules' --exclude='.git' --exclude='.env' --exclude='.env.production' --exclude='/projects' --exclude='/assets' --exclude='/upload-temp' --exclude='/.data' '${staged_update_dir}/' '${PORTAL_DIR}/'"
 
   # Restore config
   cp "${backup_dir}/.env.production" "${PORTAL_DIR}/backend/" 2>/dev/null || true
@@ -2709,6 +2755,7 @@ do_update() {
   fi
 
   install_backend_runtime_dependencies
+  UPDATE_RECOVERY_ROLLBACK_RUNTIME=false
 
   # Use the existing DATABASE_URL if available, otherwise construct a default
   local db_url="${existing_db_url:-postgresql://blp:${DB_PASSWORD}@127.0.0.1:5432/bridgesllm_portal}"
@@ -2728,9 +2775,6 @@ do_update() {
   info "Checking Remote Desktop..."
   setup_remote_desktop
   configure_backup_timers
-
-  # Clear the safety-net trap — we're about to start the service ourselves
-  trap - ERR
 
   info "Starting OpenClaw gateway and portal..."
   if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
@@ -2768,6 +2812,13 @@ except: pass
   if ! verify_portal_service_health "bridgesllm-product" "http://127.0.0.1:4001/health" 60; then
     fail "Update verification failed — service did not become healthy. Check: journalctl -u bridgesllm-product -n 50"
   fi
+
+  # The portal is back and verified. Restore the global traps for any later work.
+  trap 'handle_err $LINENO' ERR
+  trap handle_sigint SIGINT
+  trap - TERM
+  UPDATE_RECOVERY_ARMED=false
+  rm -rf /tmp/blp-download
 
   echo ""
   echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
