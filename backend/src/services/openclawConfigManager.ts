@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { execFileSync } from 'child_process';
 import type { AgentProviderName } from '../agents/AgentProvider.interface';
 import {
   getNativeCliAuthStatus,
@@ -17,6 +18,10 @@ export const MODELS_JSON_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agen
 export const CODEX_EXTERNAL_CLI_PROFILE_ID = 'openai:codex-cli';
 export const CODEX_CLI_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
 export const OPENCLAW_CODEX_HOME_AUTH_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'codex-home', 'auth.json');
+export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.6.8';
+const LEGACY_PLUGIN_INSTALLS_PATH = path.join(OPENCLAW_HOME, 'plugins', 'installs.json');
+const LEGACY_GLOBAL_CODEX_PLUGIN_DIR = path.join(OPENCLAW_HOME, 'npm', 'node_modules', '@openclaw', 'codex');
+const OPENCLAW_SQLITE_PATH = path.join(OPENCLAW_HOME, 'state', 'openclaw.sqlite');
 
 export interface AuthProfile {
   type: 'api_key' | 'token' | 'oauth';
@@ -36,6 +41,17 @@ interface AuthProfilesFile {
   profiles: Record<string, AuthProfile>;
   lastGood?: Record<string, string>;
   usageStats?: Record<string, { lastUsed?: number; errorCount?: number; cooldownUntil?: number }>;
+}
+
+interface CodexPluginStateRepairResult {
+  expectedVersion: string;
+  removedLegacyInstallRecord: boolean;
+  removedLegacyPluginEntries: number;
+  quarantinedGlobalPluginDir: string | null;
+  globalPluginVersion: string | null;
+  sqliteRemoved: boolean;
+  sqliteBackupPath: string | null;
+  warnings: string[];
 }
 
 export interface ProviderStatus {
@@ -93,6 +109,179 @@ function normalizeAuthProfiles(rawProfiles: any): Record<string, AuthProfile> {
 function writeAuthProfilesFile(authProfiles: AuthProfilesFile) {
   fs.mkdirSync(path.dirname(AUTH_PROFILES_PATH), { recursive: true });
   fs.writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(authProfiles, null, 2), 'utf8');
+}
+
+function parseVersionParts(version: string): number[] {
+  return String(version || '')
+    .split(/[.-]/)
+    .map((part) => Number.parseInt(part, 10))
+    .filter((part) => Number.isFinite(part));
+}
+
+function isOlderVersion(version: string | undefined, expectedVersion: string): boolean {
+  const actualParts = parseVersionParts(version || '');
+  const expectedParts = parseVersionParts(expectedVersion);
+  if (actualParts.length === 0 || expectedParts.length === 0) return true;
+  const length = Math.max(actualParts.length, expectedParts.length);
+  for (let i = 0; i < length; i += 1) {
+    const actual = actualParts[i] || 0;
+    const expected = expectedParts[i] || 0;
+    if (actual < expected) return true;
+    if (actual > expected) return false;
+  }
+  return false;
+}
+
+function isLegacyGlobalCodexSource(source: unknown): boolean {
+  const normalized = String(source || '').replace(/\\/g, '/');
+  const openClawHome = OPENCLAW_HOME.replace(/\\/g, '/');
+  return normalized.includes(`${openClawHome}/npm/node_modules/@openclaw/codex`)
+    || normalized.includes('~/.openclaw/npm/node_modules/@openclaw/codex');
+}
+
+function shouldRemoveCodexInstallEntry(entry: any, expectedVersion: string): boolean {
+  if (!entry || entry.pluginId !== 'codex') return false;
+  return isOlderVersion(entry.packageVersion, expectedVersion) || isLegacyGlobalCodexSource(entry.source);
+}
+
+function timestampForBackup(): string {
+  return new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+}
+
+function uniqueBackupPath(basePath: string): string {
+  if (!fs.existsSync(basePath)) return basePath;
+  for (let index = 1; index < 100; index += 1) {
+    const candidate = `${basePath}-${index}`;
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  return `${basePath}-${process.pid}`;
+}
+
+function sqlite3Available(): boolean {
+  try {
+    execFileSync('sqlite3', ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function repairCodexSqlitePluginIndex(expectedVersion: string, warnings: string[]): { removed: boolean; backupPath: string | null } {
+  if (!fs.existsSync(OPENCLAW_SQLITE_PATH) || !sqlite3Available()) {
+    return { removed: false, backupPath: null };
+  }
+
+  let rows = '';
+  try {
+    rows = execFileSync('sqlite3', [
+      '-separator',
+      '\t',
+      OPENCLAW_SQLITE_PATH,
+      `select coalesce(json_extract(value,'$.source'),''),
+              coalesce(json_extract(value,'$.packageVersion'),'')
+         from installed_plugin_index, json_each(plugins_json)
+        where index_key='installed-plugin-index'
+          and json_extract(value,'$.pluginId')='codex';`,
+    ], { encoding: 'utf8' });
+  } catch (error) {
+    warnings.push(`Could not inspect OpenClaw SQLite plugin registry: ${error instanceof Error ? error.message : String(error)}`);
+    return { removed: false, backupPath: null };
+  }
+
+  const staleRegistryEntry = rows
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .some((line) => {
+      const [source, version] = line.split('\t');
+      return isLegacyGlobalCodexSource(source) || isOlderVersion(version, expectedVersion);
+    });
+
+  if (!staleRegistryEntry) return { removed: false, backupPath: null };
+
+  const backupPath = uniqueBackupPath(`${OPENCLAW_SQLITE_PATH}.bak-codex-plugin-${timestampForBackup()}`);
+  try {
+    execFileSync('sqlite3', [OPENCLAW_SQLITE_PATH, `.backup '${backupPath.replace(/'/g, "''")}'`], { stdio: 'ignore' });
+    execFileSync('sqlite3', [
+      OPENCLAW_SQLITE_PATH,
+      `update installed_plugin_index
+          set install_records_json = json_remove(install_records_json, '$.codex'),
+              plugins_json = coalesce((
+                select json_group_array(json(j.value))
+                  from json_each(installed_plugin_index.plugins_json) as j
+                 where json_extract(j.value,'$.pluginId') != 'codex'
+              ), '[]'),
+              refresh_reason = 'portal-remove-stale-codex-plugin',
+              updated_at_ms = cast(strftime('%s','now') as integer) * 1000
+        where index_key = 'installed-plugin-index';`,
+    ], { stdio: 'ignore' });
+    return { removed: true, backupPath };
+  } catch (error) {
+    warnings.push(`Could not repair OpenClaw SQLite plugin registry: ${error instanceof Error ? error.message : String(error)}`);
+    return { removed: false, backupPath };
+  }
+}
+
+export function repairOpenClawCodexPluginInstallState(expectedVersion = OPENCLAW_CODEX_PLUGIN_VERSION): CodexPluginStateRepairResult {
+  const warnings: string[] = [];
+  let removedLegacyInstallRecord = false;
+  let removedLegacyPluginEntries = 0;
+  let quarantinedGlobalPluginDir: string | null = null;
+  let globalPluginVersion: string | null = null;
+
+  const installs = safeReadJson<any>(LEGACY_PLUGIN_INSTALLS_PATH, null);
+  if (installs && typeof installs === 'object') {
+    if (installs.installRecords?.codex && shouldRemoveCodexInstallEntry({
+      ...(installs.installRecords?.codex || {}),
+      pluginId: 'codex',
+    }, expectedVersion)) {
+      delete installs.installRecords.codex;
+      removedLegacyInstallRecord = true;
+    }
+
+    if (Array.isArray(installs.plugins)) {
+      const nextPlugins = installs.plugins.filter((entry: any) => {
+        const remove = shouldRemoveCodexInstallEntry(entry, expectedVersion);
+        if (remove) removedLegacyPluginEntries += 1;
+        return !remove;
+      });
+      installs.plugins = nextPlugins;
+    }
+
+    if (removedLegacyInstallRecord || removedLegacyPluginEntries > 0) {
+      fs.mkdirSync(path.dirname(LEGACY_PLUGIN_INSTALLS_PATH), { recursive: true });
+      fs.writeFileSync(LEGACY_PLUGIN_INSTALLS_PATH, JSON.stringify(installs, null, 2), 'utf8');
+    }
+  }
+
+  if (fs.existsSync(LEGACY_GLOBAL_CODEX_PLUGIN_DIR)) {
+    const pkg = safeReadJson<any>(path.join(LEGACY_GLOBAL_CODEX_PLUGIN_DIR, 'package.json'), {});
+    globalPluginVersion = typeof pkg.version === 'string' ? pkg.version : null;
+    if (isOlderVersion(globalPluginVersion || '', expectedVersion)) {
+      const backupDir = path.join(
+        OPENCLAW_HOME,
+        'plugin-backups',
+        `openclaw-codex-${globalPluginVersion || 'unknown'}-${timestampForBackup()}`,
+      );
+      const targetDir = uniqueBackupPath(backupDir);
+      fs.mkdirSync(path.dirname(targetDir), { recursive: true });
+      fs.renameSync(LEGACY_GLOBAL_CODEX_PLUGIN_DIR, targetDir);
+      quarantinedGlobalPluginDir = targetDir;
+    }
+  }
+
+  const sqliteRepair = repairCodexSqlitePluginIndex(expectedVersion, warnings);
+
+  return {
+    expectedVersion,
+    removedLegacyInstallRecord,
+    removedLegacyPluginEntries,
+    quarantinedGlobalPluginDir,
+    globalPluginVersion,
+    sqliteRemoved: sqliteRepair.removed,
+    sqliteBackupPath: sqliteRepair.backupPath,
+    warnings,
+  };
 }
 
 export function readOpenClawConfig(): any {

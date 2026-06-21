@@ -2,6 +2,12 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.22] - 2026-06-20
+
+### Fixed
+- **Dashboard updates now harden Codex plugin compatibility, not just auth order**: the updater removes stale legacy `@openclaw/codex` install records, quarantines old global Codex plugin directories, and installs the compatible `@openclaw/codex@2026.6.8` plugin when inspection shows an unsafe source/version.
+- **Codex auth repair is protected against stale plugin resurrection**: regression coverage now reproduces the legacy `plugins/installs.json` plus global `npm/node_modules/@openclaw/codex` state that caused OpenClaw to reject `openai:codex-cli` profiles.
+
 ## [3.25.21] - 2026-06-20
 
 ### Fixed

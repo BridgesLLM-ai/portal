@@ -98,6 +98,10 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.22 (June 20, 2026)
+- **Codex compatibility repair now includes the plugin layer**: updates remove stale legacy `@openclaw/codex` install metadata, quarantine old global plugin copies, and enforce the compatible `2026.6.8` Codex plugin before restarting OpenClaw.
+- **Regression coverage catches the stale-plugin failure mode**: tests now cover the exact state that made OpenClaw reject valid `openai:codex-cli` auth as the wrong profile type.
+
 ### v3.25.21 (June 20, 2026)
 - **Dashboard updates now repair existing Codex auth drift**: during update, the installer bridges a valid native Codex CLI OAuth file into OpenClaw's current `openai:codex-cli` profile and removes stale `openai-codex:*` auth-order entries.
 - **The OpenClaw repair path stays narrow**: updates still avoid broad `openclaw doctor --fix` mutations and still leave Caddy upgrades behind manual review.

@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.21"
+readonly VERSION="3.25.22"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -2215,6 +2215,44 @@ bridge_openclaw_codex_cli_auth() {
   ok "OpenClaw Codex auth bridge checked"
 }
 
+ensure_openclaw_codex_plugin_compatible() {
+  if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
+    return 0
+  fi
+
+  local helper="${PORTAL_DIR}/backend/dist/services/openclawConfigManager.js"
+  if [[ -f "${helper}" ]] && command -v node &>/dev/null; then
+    if ! spin "Repairing stale OpenClaw Codex plugin state" "OPENCLAW_ALLOW_ROOT=1 PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION='${PIN_OPENCLAW_VERSION}' NODE_PATH='${PORTAL_DIR}/backend/node_modules' node -e 'const helper = process.argv[1]; const expected = process.argv[2]; const mod = require(helper); const result = mod.repairOpenClawCodexPluginInstallState(expected); console.log(JSON.stringify(result));' '${helper}' '${PIN_OPENCLAW_VERSION}'"; then
+      warn "OpenClaw Codex plugin state repair failed. Continuing with compatibility check."
+    fi
+  fi
+
+  local inspect_output plugin_version plugin_source
+  inspect_output="$(OPENCLAW_ALLOW_ROOT=1 openclaw plugins inspect codex 2>>"${LOG_FILE}" || true)"
+  plugin_version="$(printf '%s\n' "${inspect_output}" | awk -F': ' '/^Version:/{print $2; exit}')"
+  plugin_source="$(printf '%s\n' "${inspect_output}" | awk -F': ' '/^Source:/{print $2; exit}')"
+
+  if [[ "${plugin_version}" == "${PIN_OPENCLAW_VERSION}" && "${plugin_source}" != *"/.openclaw/npm/node_modules/@openclaw/codex/"* && "${plugin_source}" != "~/.openclaw/npm/node_modules/@openclaw/codex/"* ]]; then
+    ok "OpenClaw Codex plugin ${plugin_version} checked"
+    return 0
+  fi
+
+  if ! spin "Installing compatible OpenClaw Codex plugin" "OPENCLAW_ALLOW_ROOT=1 openclaw plugins install '@openclaw/codex@${PIN_OPENCLAW_VERSION}' --force --pin"; then
+    warn "OpenClaw Codex plugin install failed. Codex may require manual plugin repair."
+    return 0
+  fi
+
+  inspect_output="$(OPENCLAW_ALLOW_ROOT=1 openclaw plugins inspect codex 2>>"${LOG_FILE}" || true)"
+  plugin_version="$(printf '%s\n' "${inspect_output}" | awk -F': ' '/^Version:/{print $2; exit}')"
+  plugin_source="$(printf '%s\n' "${inspect_output}" | awk -F': ' '/^Source:/{print $2; exit}')"
+
+  if [[ "${plugin_version}" == "${PIN_OPENCLAW_VERSION}" && "${plugin_source}" != *"/.openclaw/npm/node_modules/@openclaw/codex/"* && "${plugin_source}" != "~/.openclaw/npm/node_modules/@openclaw/codex/"* ]]; then
+    ok "OpenClaw Codex plugin ${plugin_version} checked"
+  else
+    warn "OpenClaw Codex plugin still looks incompatible (${plugin_version:-unknown}, ${plugin_source:-unknown})"
+  fi
+}
+
 configure_openclaw_codex_harness_defaults() {
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
@@ -2267,6 +2305,7 @@ prepare_openclaw_runtime_for_portal() {
   auto_apply_openclaw_compatibility_hotfix
   repair_openclaw_portal_model_config
   bridge_openclaw_codex_cli_auth
+  ensure_openclaw_codex_plugin_compatible
   configure_openclaw_codex_harness_defaults
   ensure_openclaw_gateway_boots_cleanly || true
 }
