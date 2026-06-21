@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import path from 'path';
 import { prisma } from '../config/database';
@@ -6,6 +6,7 @@ import { config } from '../config/env';
 import { readOpenClawConfig } from '../services/openclawConfigManager';
 import type { AgentProviderName } from './AgentProvider.interface';
 import { buildOpenClawCliEnv, normalizePortalModelId } from '../utils/openclawCli';
+import { listGatewayModels } from '../utils/openclawGatewayRpc';
 import { listAntigravityModelsFromCli } from './antigravityModels';
 
 export interface ProviderModelDescriptor {
@@ -65,6 +66,10 @@ const DECLARED_MODELS: Partial<Record<AgentProviderName, ProviderModelDescriptor
   GEMINI: declaredModels(GEMINI_DECLARED_FALLBACK, 'gemini'),
 };
 
+const OPENCLAW_MODEL_CACHE_TTL_MS = 60_000;
+let openClawModelCache: { at: number; models: ProviderModelDescriptor[] } | null = null;
+let openClawModelRefresh: Promise<ProviderModelDescriptor[]> | null = null;
+
 function aliasFromTags(tags: unknown): string | null {
   if (!Array.isArray(tags)) return null;
   const aliasTag = tags.map((tag) => String(tag || '')).find((tag) => tag.startsWith('alias:'));
@@ -81,7 +86,9 @@ export function parseOpenClawModelsListPayload(payload: any): ProviderModelDescr
     if (entry.missing === true || entry.available === false) continue;
 
     const rawId = String(entry.key || entry.id || entry.model || '').trim();
-    const id = normalizePortalModelId(rawId);
+    const rawProvider = String(entry.provider || '').trim();
+    const qualifiedId = rawId && !rawId.includes('/') && rawProvider ? `${rawProvider}/${rawId}` : rawId;
+    const id = normalizePortalModelId(qualifiedId);
     if (!id || deduped.has(id)) continue;
 
     const alias = aliasFromTags(entry.tags) || (typeof entry.alias === 'string' && entry.alias.trim() ? entry.alias.trim() : null);
@@ -98,23 +105,55 @@ export function parseOpenClawModelsListPayload(payload: any): ProviderModelDescr
   return Array.from(deduped.values());
 }
 
-function listOpenClawModelsFromCli(): ProviderModelDescriptor[] {
+async function listOpenClawModelsFromGateway(): Promise<ProviderModelDescriptor[]> {
   try {
-    const raw = execFileSync('openclaw', ['models', 'list', '--json'], {
-      encoding: 'utf8',
-      timeout: 15000,
-      env: buildOpenClawCliEnv(),
-      stdio: ['ignore', 'pipe', 'ignore'],
-      maxBuffer: 1024 * 1024 * 8,
-    });
-    return parseOpenClawModelsListPayload(JSON.parse(raw));
+    const result = await listGatewayModels();
+    if (!result.ok) return [];
+    return parseOpenClawModelsListPayload({ models: result.models || [] });
   } catch (error: any) {
-    console.warn(`[providerModels] OpenClaw CLI model catalog unavailable: ${error?.message || error}`);
+    console.warn(`[providerModels] OpenClaw gateway model catalog unavailable: ${error?.message || error}`);
     return [];
   }
 }
 
-function listOpenClawModels(): ProviderModelDescriptor[] {
+function listOpenClawModelsFromCli(): Promise<ProviderModelDescriptor[]> {
+  return new Promise((resolve) => {
+    execFile('openclaw', ['models', 'list', '--json'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      env: buildOpenClawCliEnv(),
+      maxBuffer: 1024 * 1024 * 8,
+    }, (error, stdout) => {
+      if (error) {
+        console.warn(`[providerModels] OpenClaw CLI model catalog unavailable: ${(error as any)?.message || error}`);
+        resolve([]);
+        return;
+      }
+      try {
+        resolve(parseOpenClawModelsListPayload(JSON.parse(String(stdout || ''))));
+      } catch {
+        resolve([]);
+      }
+    });
+  });
+}
+
+async function listOpenClawModels(): Promise<ProviderModelDescriptor[]> {
+  const now = Date.now();
+  if (openClawModelCache && now - openClawModelCache.at < OPENCLAW_MODEL_CACHE_TTL_MS) {
+    return openClawModelCache.models;
+  }
+  if (openClawModelRefresh) return openClawModelRefresh;
+
+  openClawModelRefresh = resolveOpenClawModels();
+  try {
+    return await openClawModelRefresh;
+  } finally {
+    openClawModelRefresh = null;
+  }
+}
+
+async function resolveOpenClawModels(): Promise<ProviderModelDescriptor[]> {
   const openclawConfig = readOpenClawConfig();
   const deduped = new Map<string, ProviderModelDescriptor>();
 
@@ -158,15 +197,18 @@ function listOpenClawModels(): ProviderModelDescriptor[] {
     for (const id of fallbacks) addModel(id);
   }
 
-  const cliModels = listOpenClawModelsFromCli();
+  let cliModels = await listOpenClawModelsFromGateway();
+  if (cliModels.length === 0) cliModels = await listOpenClawModelsFromCli();
   for (const model of Array.from(deduped.values())) {
     if (!cliModels.some((entry) => entry.id === model.id)) cliModels.push(model);
   }
 
-  return cliModels.length ? cliModels : [...DECLARED_MODELS.OPENCLAW!];
+  const models = cliModels.length ? cliModels : [...DECLARED_MODELS.OPENCLAW!];
+  openClawModelCache = { at: Date.now(), models };
+  return models;
 }
 
-function listGeminiDeclaredModels(): ProviderModelDescriptor[] {
+async function listGeminiDeclaredModels(): Promise<ProviderModelDescriptor[]> {
   const ids = new Map<string, ProviderModelDescriptor>();
   const add = (id: string, alias?: string | null, source: 'dynamic' | 'declared' = 'declared') => {
     const clean = String(id || '').trim();
@@ -192,7 +234,7 @@ function listGeminiDeclaredModels(): ProviderModelDescriptor[] {
   for (const model of GEMINI_DECLARED_FALLBACK) add(model);
 
   if (liveAntigravityModels.length === 0) {
-    for (const model of listOpenClawModels()) {
+    for (const model of await listOpenClawModels()) {
       if (model.id.startsWith('google-antigravity/') || model.id.startsWith('google-gemini-cli/')) {
         add(model.id.replace(/^google-(?:antigravity|gemini-cli)\//, ''), model.alias || null);
       }

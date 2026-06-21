@@ -302,6 +302,53 @@ def replace_after(haystack: str, section_start: str, old: str, new: str, label: 
         return haystack
     return haystack[:old_idx] + new + haystack[old_idx + len(old):]
 
+def function_spans(haystack: str, function_name: str) -> list[tuple[int, int, str]]:
+    spans = []
+    needle = f'function {function_name}('
+    search_from = 0
+    while True:
+        start = haystack.find(needle, search_from)
+        if start < 0:
+            break
+        brace_start = haystack.find('{', start)
+        if brace_start < 0:
+            break
+        depth = 0
+        end = None
+        for idx in range(brace_start, len(haystack)):
+            ch = haystack[idx]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end = idx + 1
+                    if end < len(haystack) and haystack[end] == '\n':
+                        end += 1
+                    break
+        if end is None:
+            break
+        spans.append((start, end, haystack[start:end]))
+        search_from = end
+    return spans
+
+def remove_duplicate_function_definitions(haystack: str, function_name: str) -> str:
+    spans = function_spans(haystack, function_name)
+    if len(spans) <= 1:
+        return haystack
+    preferred = next(
+        (span for span in spans if 'isGeminiStreamJsonDialect(params)' in span[2]),
+        spans[0],
+    )
+    remove_ranges = [(start, end) for start, end, _ in spans if (start, end) != (preferred[0], preferred[1])]
+    for start, end in sorted(remove_ranges, reverse=True):
+        haystack = haystack[:start] + haystack[end:]
+    print(f"removed duplicate {function_name} definitions: kept 1, removed {len(remove_ranges)}")
+    return haystack
+
+text = remove_duplicate_function_definitions(text, 'parseGeminiCliStreamingDelta')
+text = remove_duplicate_function_definitions(text, 'dispatchGeminiCliStreamingToolEvent')
+
 gemini_dialect_helpers = '''function isGeminiCliProvider(providerId) {
 \tconst normalized = normalizeLowercaseStringOrEmpty(providerId);
 \treturn normalized === "google-gemini-cli" || normalized === "gemini-cli";
@@ -325,8 +372,9 @@ if 'function isGeminiCliProvider(providerId)' not in text:
             'runtime Gemini dialect helpers',
         )
 
-gemini_parser_helpers = f'''function parseGeminiCliStreamingDelta(params) {{
-\tif (!usesGeminiStreamJsonDialect(params)) return null;
+gemini_dialect_check = '(typeof isGeminiStreamJsonDialect === "function" ? isGeminiStreamJsonDialect(params) : usesGeminiStreamJsonDialect(params))'
+gemini_delta_helper = f'''function parseGeminiCliStreamingDelta(params) {{
+\tif (!{gemini_dialect_check}) return null;
 \tif (params.parsed.type !== "message" || params.parsed.role !== "assistant" || typeof params.parsed.content !== "string") return null;
 \tconst chunk = params.parsed.content;
 \tif (!chunk) return null;
@@ -339,9 +387,11 @@ gemini_parser_helpers = f'''function parseGeminiCliStreamingDelta(params) {{
 \t\tusage: params.usage
 \t}};
 }}
-function dispatchGeminiCliStreamingToolEvent(params) {{
-\tif (!usesGeminiStreamJsonDialect(params)) return;
-\tconst tracker = params.tracker;
+'''
+gemini_dispatch_helper = f'''function dispatchGeminiCliStreamingToolEvent(params) {{
+\tif (!{gemini_dialect_check}) return;
+'''
+gemini_dispatch_helper += f'''\tconst tracker = params.tracker;
 \tif (params.parsed.type === "tool_use" && typeof params.parsed.tool_id === "string") {{
 \t\tconst toolCallId = params.parsed.tool_id.trim();
 \t\tconst name = typeof params.parsed.tool_name === "string" && params.parsed.tool_name.trim() ? params.parsed.tool_name.trim() : "tool";
@@ -366,8 +416,13 @@ function dispatchGeminiCliStreamingToolEvent(params) {{
 \t}}
 }}
 '''.replace('{record_fn}', record_fn)
+gemini_parser_helpers = gemini_delta_helper
+if 'function dispatchGeminiCliStreamingToolEvent(params)' not in text:
+    gemini_parser_helpers += gemini_dispatch_helper
 if 'function parseGeminiCliStreamingDelta(params)' not in text:
     text = text.replace('function createToolUseTracker() {', gemini_parser_helpers + 'function createToolUseTracker() {', 1)
+elif 'function dispatchGeminiCliStreamingToolEvent(params)' not in text:
+    text = text.replace('function createToolUseTracker() {', gemini_dispatch_helper + 'function createToolUseTracker() {', 1)
 
 # Earlier versions of this hotfix used a raw Python string for the Gemini
 # parser helpers, which wrote literal "\t" sequences into the JS bundle.
@@ -559,5 +614,29 @@ fi
 if [[ -n "$EXECUTE_RUNTIME" ]]; then
   grep -nF 'onToolUseStart: emitCliToolUseStart' "$EXECUTE_RUNTIME" || grep -nF 'onToolEvent: (event) => {' "$EXECUTE_RUNTIME" || true
 fi
+
+validate_js_bundle() {
+  local file="$1"
+  [[ -n "$file" && -f "$file" ]] || return 0
+  node --input-type=module --check < "$file" >/dev/null
+}
+
+validate_no_duplicate_function() {
+  local file="$1"
+  local fn="$2"
+  [[ -n "$file" && -f "$file" ]] || return 0
+  local count
+  count="$(grep -cF "function ${fn}(" "$file" || true)"
+  if [[ "$count" -gt 1 ]]; then
+    echo "duplicate ${fn} definitions remain in ${file}: ${count}" >&2
+    return 1
+  fi
+}
+
+for bundle in "$HEARTBEAT_EVENTS_FILTER" "$HEARTBEAT_RUNNER" "$GET_REPLY_FILE" "$CLI_BACKEND" "$CLAUDE_CLI_SHARED" "$GEMINI_PARSER_TARGET" "$EXECUTE_RUNTIME"; do
+  validate_js_bundle "$bundle"
+done
+validate_no_duplicate_function "$GEMINI_PARSER_TARGET" "parseGeminiCliStreamingDelta"
+validate_no_duplicate_function "$GEMINI_PARSER_TARGET" "dispatchGeminiCliStreamingToolEvent"
 
 echo "Compatibility hotfix complete. Restart OpenClaw gateway for changes to take effect."

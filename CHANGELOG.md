@@ -2,6 +2,17 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.24] - 2026-06-21
+
+### Fixed
+- **OpenClaw compatibility hotfixes are now idempotent on current runtimes**: the bundled hotfix repairs duplicate Gemini streaming helper definitions left by earlier update attempts, validates OpenClaw bundles as ES modules, and refuses to report success if duplicate parser/dispatcher functions remain.
+- **Portal updates now fail loudly if OpenClaw cannot boot**: the installer no longer ignores a failed OpenClaw gateway boot check after compatibility preparation, preventing updates from leaving Agent Chat broken while reporting success.
+- **Agent Chat model loading no longer blocks the Portal backend**: OpenClaw model discovery now uses the gateway catalog first and only falls back to a short async CLI probe, so a slow `openclaw models list` cannot freeze the Portal health endpoint or UI.
+- **OpenClaw model IDs remain provider-qualified**: gateway catalog rows that report bare model IDs plus provider metadata are normalized back to `provider/model`, preserving Codex, Claude, Gemini CLI, and Antigravity routing clarity.
+
+### Validation
+- Repaired the broken test-box OpenClaw bundle that failed ES-module parsing with duplicate Gemini helper definitions, restarted the gateway, and verified a Codex smoke turn completed through `codex/gpt-5.4-mini`.
+
 ## [3.25.23] - 2026-06-21
 
 ### Fixed

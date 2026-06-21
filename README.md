@@ -98,6 +98,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.24 (June 21, 2026)
+- **OpenClaw update recovery is stricter**: compatibility hotfixes now repair duplicate Gemini stream helpers, validate OpenClaw bundles as ES modules, and fail the update if the gateway cannot boot cleanly.
+- **Agent Chat stays responsive during model discovery**: OpenClaw model lists now use the gateway catalog first with a short async CLI fallback, avoiding backend freezes when the OpenClaw CLI is slow.
+- **Codex routing remains explicit**: OpenClaw gateway model rows are normalized to provider-qualified IDs so Codex, Claude, Gemini CLI, and Antigravity selections do not collapse into ambiguous bare model names.
+
 ### v3.25.23 (June 21, 2026)
 - **The public installer is safe to rerun on existing installs**: the standard one-line install command now detects an existing Portal and performs an update instead of a no-op copy over itself.
 - **Caddy HTTPS config is protected**: updates do not rewrite Caddy, and forced reinstalls recover the existing domain before writing proxy config.

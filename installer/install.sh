@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.23"
+readonly VERSION="3.25.24"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -2393,7 +2393,9 @@ prepare_openclaw_runtime_for_portal() {
   bridge_openclaw_codex_cli_auth
   ensure_openclaw_codex_plugin_compatible
   configure_openclaw_codex_harness_defaults
-  ensure_openclaw_gateway_boots_cleanly || true
+  if ! ensure_openclaw_gateway_boots_cleanly; then
+    fail "OpenClaw gateway did not boot cleanly after Portal compatibility preparation. Check: journalctl -u openclaw-gateway -n 100 --no-pager"
+  fi
   if ! ensure_openclaw_gateway_matches_cli; then
     if $OPENCLAW_PACKAGE_UPDATED; then
       fail "OpenClaw was updated, but the gateway did not restart into the installed version. Check: systemctl status openclaw-gateway"
