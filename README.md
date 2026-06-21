@@ -98,6 +98,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.20 (June 20, 2026)
+- **Portal updates are safer around host infrastructure**: the installer no longer runs `openclaw doctor --fix` during normal updates and no longer auto-upgrades Caddy.
+- **Codex subscription setup uses the reliable device-login path**: Codex login now bridges the native Codex CLI credential store into OpenClaw's current `openai` auth slot without overwriting OpenAI API-key profiles.
+- **Provider status is more truthful**: OpenAI API keys and ChatGPT/Codex subscription OAuth are tracked separately, reducing false "configured" states after provider changes.
+
 ### v3.25.19 (June 20, 2026)
 - **OpenClaw OAuth model suggestions are current and smaller**: Codex uses the `codex/gpt-5.5`, `codex/gpt-5.4`, and `codex/gpt-5.4-mini` family, while Claude highlights Opus 4.8, Sonnet 4.6, and Haiku 4.5.
 - **Google Antigravity replaces the old Gemini CLI subscription path**: the Portal guides users toward the native Antigravity flow and labels OpenClaw-native Antigravity OAuth as not fully supported for now.

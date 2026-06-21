@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.19"
+readonly VERSION="3.25.20"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -643,9 +643,13 @@ update_dependencies() {
     fi
   fi
 
-  # Caddy — minor/patch
+  # Caddy terminates HTTPS and may carry local/beta site config. Do not mutate it
+  # from a Portal app update; the admin maintenance UI treats Caddy as protected
+  # infrastructure and installer updates must follow that same boundary.
   if command -v caddy &>/dev/null; then
-    spin "Updating Caddy (minor/patch)"       "apt-get install -y -qq --only-upgrade caddy 2>/dev/null" || true
+    local current_caddy
+    current_caddy="$(caddy version 2>/dev/null | awk '{print $1}' || echo 'installed')"
+    ok "Caddy ${current_caddy:-installed} (manual review)"
   fi
 
   # ── Tier 3: Notify only ──
@@ -2160,17 +2164,12 @@ auto_apply_openclaw_compatibility_hotfix() {
   ok "OpenClaw compatibility hotfix checked"
 }
 
-run_openclaw_doctor_repair() {
+run_openclaw_state_repair_notice() {
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
   fi
 
-  if ! spin "Migrating OpenClaw runtime state" "OPENCLAW_ALLOW_ROOT=1 openclaw doctor --fix --non-interactive --yes"; then
-    warn "OpenClaw doctor repair failed or is unsupported. Continuing install/update; AI provider logins may need manual repair."
-    return 0
-  fi
-
-  ok "OpenClaw runtime state checked"
+  ok "OpenClaw state repair skipped (manual/admin action only)"
 }
 
 repair_openclaw_portal_model_config() {
@@ -2240,7 +2239,7 @@ PY
 
 prepare_openclaw_runtime_for_portal() {
   ensure_openclaw_sandbox_image
-  run_openclaw_doctor_repair
+  run_openclaw_state_repair_notice
   auto_apply_openclaw_compatibility_hotfix
   repair_openclaw_portal_model_config
   configure_openclaw_codex_harness_defaults

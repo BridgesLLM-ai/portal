@@ -13,6 +13,7 @@ import {
   getDefaultModel,
   getFallbackModels,
   getProviderStatuses,
+  pinCodexExternalCliAuthProfile,
   pinProviderAuthProfile,
   readAuthProfiles,
   readOpenClawConfig,
@@ -599,6 +600,12 @@ async function finalizeNativeCliCompletion(status: any) {
       await registerProviderModels('google-antigravity');
       return;
     }
+    if (status.provider === 'codex') {
+      pinCodexExternalCliAuthProfile();
+      await registerProviderModels('openai-codex');
+      await restartGateway();
+      return;
+    }
     await restartGateway();
   } catch (error) {
     handledNativeCliCompletions.delete(status.id);
@@ -724,7 +731,11 @@ export function createAiSetupRouter(): Router {
       }
       const sessionStatus = getOAuthFlowStatus(parsed.data.sessionId);
       if (sessionStatus?.provider && sessionStatus.createdProfileId) {
-        pinProviderAuthProfile(sessionStatus.authProvider || sessionStatus.provider, sessionStatus.createdProfileId, 'oauth');
+        if (sessionStatus.provider === 'openai-codex') {
+          pinCodexExternalCliAuthProfile(sessionStatus.createdProfileId);
+        } else {
+          pinProviderAuthProfile(sessionStatus.authProvider || sessionStatus.provider, sessionStatus.createdProfileId, 'oauth');
+        }
       }
       if (sessionStatus?.provider) {
         await registerProviderModels(sessionStatus.provider);

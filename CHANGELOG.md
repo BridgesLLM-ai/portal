@@ -2,6 +2,17 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.20] - 2026-06-20
+
+### Fixed
+- **Portal updates no longer run broad OpenClaw state repair**: installer/update runs now skip `openclaw doctor --fix` entirely, avoiding root-owned auth/profile rewrites, CLI relinking, and state migration side effects during a normal Portal update.
+- **Caddy is protected during Portal updates**: the installer now reports the installed Caddy version but does not auto-upgrade it, keeping reverse-proxy/beta-site changes behind manual compatibility review.
+- **Codex setup matches OpenClaw 2026.6 auth semantics**: the Portal uses the native Codex device-login flow, syncs the Codex auth file into OpenClaw's agent Codex home, and pins OpenClaw to a dedicated `openai:codex-cli` bridge profile instead of stale `openai-codex:*` auth-order entries.
+- **OpenAI API keys and Codex subscription auth no longer collide**: provider status and auth pinning keep OpenAI API-key profiles separate from ChatGPT/Codex OAuth profiles so setting up one does not silently break the other.
+
+### Maintenance
+- **Regression coverage now guards the Codex auth bridge**: tests verify that Codex login preserves existing OpenAI API-key profiles, removes stale `openai-codex` auth order, and copies usable Codex credentials for OpenClaw runtime use.
+
 ## [3.25.19] - 2026-06-20
 
 ### Fixed

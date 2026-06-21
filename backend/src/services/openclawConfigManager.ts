@@ -9,10 +9,14 @@ import {
 import { AI_PROVIDERS } from '../config/aiProviders';
 import { normalizePortalModelId, repairClaudeSubscriptionConfig } from '../utils/openclawCli';
 
-const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(process.env.HOME || '/root', '.openclaw');
+const HOME_DIR = process.env.HOME || '/root';
+const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(HOME_DIR, '.openclaw');
 export const CONFIG_PATH = path.join(OPENCLAW_HOME, 'openclaw.json');
 export const AUTH_PROFILES_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'auth-profiles.json');
 export const MODELS_JSON_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'models.json');
+export const CODEX_EXTERNAL_CLI_PROFILE_ID = 'openai:codex-cli';
+export const CODEX_CLI_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
+export const OPENCLAW_CODEX_HOME_AUTH_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'codex-home', 'auth.json');
 
 export interface AuthProfile {
   type: 'api_key' | 'token' | 'oauth';
@@ -325,6 +329,70 @@ export function saveProviderToken(provider: string, token: string): { profileId:
   return { profileId };
 }
 
+function uniqueOrder(profileIds: string[]): string[] {
+  return Array.from(new Set(profileIds.map((profileId) => String(profileId || '').trim()).filter(Boolean)));
+}
+
+export function syncCodexCliAuthToOpenClawCodexHome(): boolean {
+  if (!fs.existsSync(CODEX_CLI_AUTH_PATH)) return false;
+  const parsed = safeReadJson<any>(CODEX_CLI_AUTH_PATH, null);
+  const hasUsableCredential = Boolean(
+    parsed?.tokens?.access_token
+      || parsed?.tokens?.refresh_token
+      || (typeof parsed?.OPENAI_API_KEY === 'string' && parsed.OPENAI_API_KEY.trim())
+      || (parsed?.OPENAI_API_KEY && typeof parsed.OPENAI_API_KEY === 'object' && Object.keys(parsed.OPENAI_API_KEY).length > 0),
+  );
+  if (!hasUsableCredential) return false;
+
+  fs.mkdirSync(path.dirname(OPENCLAW_CODEX_HOME_AUTH_PATH), { recursive: true });
+  fs.copyFileSync(CODEX_CLI_AUTH_PATH, OPENCLAW_CODEX_HOME_AUTH_PATH);
+  try {
+    fs.chmodSync(OPENCLAW_CODEX_HOME_AUTH_PATH, 0o600);
+  } catch {
+    // Best effort only; the copy itself is the important part.
+  }
+  return true;
+}
+
+/**
+ * OpenClaw 2026.6 runs Codex app-server auth through the canonical OpenAI
+ * auth namespace, while the Portal still presents this as "OpenAI Codex".
+ * Keep the Portal-facing provider separate, but pin OpenClaw to a dedicated
+ * external-CLI bootstrap profile so Codex OAuth never overwrites OpenAI API keys.
+ */
+export function pinCodexExternalCliAuthProfile(profileId = CODEX_EXTERNAL_CLI_PROFILE_ID): { profileId: string; syncedCodexHomeAuth: boolean } {
+  const syncedCodexHomeAuth = syncCodexCliAuthToOpenClawCodexHome();
+
+  const authData = readAuthProfiles();
+  authData.version = authData.version || 2;
+  authData.profiles[profileId] = {
+    ...(authData.profiles[profileId] || {}),
+    type: 'oauth',
+    provider: 'openai',
+  };
+  writeAuthProfilesFile(authData);
+
+  const config = readOpenClawConfig();
+  if (!config.auth) config.auth = {};
+  if (!config.auth.profiles) config.auth.profiles = {};
+  if (!config.auth.order) config.auth.order = {};
+
+  config.auth.profiles[profileId] = {
+    ...(config.auth.profiles[profileId] || {}),
+    provider: 'openai',
+    mode: 'oauth',
+  };
+  const currentOpenAiOrder = Array.isArray(config.auth.order.openai) ? config.auth.order.openai : [];
+  config.auth.order.openai = uniqueOrder([
+    profileId,
+    ...currentOpenAiOrder.filter((candidate: unknown) => !String(candidate || '').startsWith('openai-codex:')),
+  ]);
+  delete config.auth.order['openai-codex'];
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+
+  return { profileId, syncedCodexHomeAuth };
+}
+
 function normalizeProviderRuntimeModelId(provider: string, modelId: string): string | null {
   const raw = String(modelId || '').trim();
   if (!raw) return null;
@@ -440,10 +508,31 @@ export function getProviderStatuses(): ProviderStatus[] {
 
   return AI_PROVIDERS.map((provider) => {
     const providerAliases = provider.id === 'openai-codex'
-      ? new Set(['openai-codex', 'codex', 'openai'])
+      ? new Set(['openai-codex', 'codex', 'codex-cli', 'openai'])
       : getProviderAuthAliases(provider.id);
-    const matchingConfigProfileId = Object.keys(configProfiles).find((profileId) => providerAliases.has(configProfiles[profileId]?.provider)) || null;
-    const matchingStoredProfileId = Object.keys(storedProfiles).find((profileId) => providerAliases.has(storedProfiles[profileId]?.provider)) || null;
+    const authOrderKeys = provider.id === 'openai-codex' ? ['openai', 'openai-codex'] : [provider.id];
+    const profileMatchesProvider = (profileId: string, rawProfile: any): boolean => {
+      const profileProvider = String(rawProfile?.provider || '').trim();
+      const profileType = String(rawProfile?.type || rawProfile?.mode || '').trim();
+      if (!providerAliases.has(profileProvider)) return false;
+      if (provider.id === 'openai') return profileType === 'api_key';
+      if (provider.id === 'openai-codex') {
+        return profileType === 'oauth'
+          || profileType === 'token'
+          || profileId === CODEX_EXTERNAL_CLI_PROFILE_ID
+          || profileId.startsWith('openai-codex:')
+          || profileId.includes('codex');
+      }
+      return true;
+    };
+    const orderedProfileIds = uniqueOrder(authOrderKeys.flatMap((key) => Array.isArray(authOrder?.[key]) ? authOrder[key] : []));
+    const findMatchingProfileId = (profiles: Record<string, any>) => (
+      orderedProfileIds.find((profileId) => profileMatchesProvider(profileId, profiles[profileId]))
+      || Object.keys(profiles).find((profileId) => profileMatchesProvider(profileId, profiles[profileId]))
+      || null
+    );
+    const matchingConfigProfileId = findMatchingProfileId(configProfiles);
+    const matchingStoredProfileId = findMatchingProfileId(storedProfiles);
     const hasRuntimeProviderConfig = Boolean(modelsData?.providers?.[provider.id]);
     const profileId = matchingConfigProfileId && matchingStoredProfileId && matchingConfigProfileId === matchingStoredProfileId
       ? matchingConfigProfileId
@@ -459,7 +548,7 @@ export function getProviderStatuses(): ProviderStatus[] {
     const hasStoredProfile = Boolean(matchingStoredProfileId);
     const hasAnyProviderConfig = hasConfigProfile || (provider.authTypes.includes('api_key') && hasRuntimeProviderConfig);
     const regularProfileConfigured = Boolean(profileId && hasAnyProviderConfig && hasStoredProfile);
-    const providerOrder = authOrder?.[provider.id];
+    const providerOrder = authOrderKeys.map((key) => authOrder?.[key]).find((value) => Array.isArray(value));
     const excludedByAuthOrder = Array.isArray(providerOrder) && providerOrder.length === 0;
     const currentModel = provider.id === 'anthropic'
       ? (defaultModel && defaultModel.startsWith('anthropic/') ? defaultModel : null)

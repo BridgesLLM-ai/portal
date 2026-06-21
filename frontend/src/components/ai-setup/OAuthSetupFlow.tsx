@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { AlertTriangle, CheckCircle2, ChevronRight, ClipboardPaste, ExternalLink, Loader2, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronRight, ClipboardPaste, Copy, ExternalLink, Loader2, X } from 'lucide-react';
 import client from '../../api/client';
 import ModelSelector, { type SelectableModel } from './ModelSelector';
 import type { ProviderUIConfig } from './providerConfig';
@@ -12,15 +12,16 @@ interface OAuthSetupFlowProps {
   onCancel: () => void;
 }
 
-type Step = 'prereqs' | 'start' | 'waiting' | 'paste' | 'model' | 'done' | 'error';
+type Step = 'prereqs' | 'start' | 'waiting' | 'device' | 'paste' | 'model' | 'done' | 'error';
+type FlowKind = 'oauth' | 'native-cli';
 
 function nativeCliBridgeNote(providerId: string): { title: string; body: string; command?: string } | null {
   switch (providerId) {
     case 'openai-codex':
       return {
-        title: 'Native Codex login is separate',
-        body: 'This portal flow links OpenClaw only. The native Codex adapter used by Agent Chat still needs its own server-side auth; those tokens are not copied into the Codex CLI automatically.',
-        command: 'codex auth',
+        title: 'Codex login powers both paths',
+        body: 'This signs in the server Codex CLI, then links OpenClaw to that same credential store for Agent Chat.',
+        command: 'codex login',
       };
     case 'google-gemini-cli':
       return {
@@ -36,7 +37,10 @@ function nativeCliBridgeNote(providerId: string): { title: string; body: string;
 export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel }: OAuthSetupFlowProps) {
   const [step, setStep] = useState<Step>('prereqs');
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [flowKind, setFlowKind] = useState<FlowKind>('oauth');
   const [authUrl, setAuthUrl] = useState<string | null>(null);
+  const [deviceCode, setDeviceCode] = useState<string | null>(null);
+  const [verificationUrl, setVerificationUrl] = useState<string | null>(null);
   const [callbackUrl, setCallbackUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [popupBlocked, setPopupBlocked] = useState(false);
@@ -118,28 +122,64 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
   // Poll for auto-completion (local callback server may catch the redirect directly on VPS)
   const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
   React.useEffect(() => {
-    if ((step === 'waiting' || step === 'paste') && sessionId) {
+    if ((step === 'waiting' || step === 'device' || step === 'paste') && sessionId) {
       pollRef.current = setInterval(async () => {
         try {
-          const { data } = await client.get(`${apiBase}/oauth/status/${sessionId}`);
+          const statusPath = flowKind === 'native-cli'
+            ? `${apiBase}/native-cli/status/${sessionId}`
+            : `${apiBase}/oauth/status/${sessionId}`;
+          const { data } = await client.get(statusPath);
           if (data?.status === 'complete') {
             if (pollRef.current) clearInterval(pollRef.current);
             setStep('model');
+          } else if (data?.status === 'error' && data?.error) {
+            if (pollRef.current) clearInterval(pollRef.current);
+            setFatalError(data.error);
+            setStep('error');
           }
-        } catch {
-          // ignore poll errors
+        } catch (err: any) {
+          if (flowKind === 'native-cli') {
+            if (pollRef.current) clearInterval(pollRef.current);
+            setFatalError(err?.response?.data?.error || err?.message || 'Provider login completed, but final setup failed.');
+            setStep('error');
+          }
         }
       }, 2000);
     }
     return () => {
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
     };
-  }, [step, sessionId, apiBase]);
+  }, [step, sessionId, apiBase, flowKind]);
 
   const startFlow = async () => {
     setLoading(true);
     setError(null);
     try {
+      if (isOpenAI) {
+        const { data } = await client.post(`${apiBase}/native-cli/start`, { provider: 'codex' });
+        if (data.success === false && data.error) {
+          setFatalError(data.error);
+          setStep('error');
+          return;
+        }
+        setFlowKind('native-cli');
+        setSessionId(data.sessionId);
+        const url = data.verificationUrl || 'https://auth.openai.com/codex/device';
+        setVerificationUrl(url);
+        setDeviceCode(data.deviceCode || null);
+        setAuthUrl(url);
+        if (url) {
+          try {
+            const win = window.open(url, '_blank', 'noopener,noreferrer');
+            if (!win) setPopupBlocked(true);
+          } catch {
+            setPopupBlocked(true);
+          }
+        }
+        setStep('device');
+        return;
+      }
+
       const body: Record<string, string> = { provider: provider.id };
       if (isGoogle && googleProjectId.trim()) body.googleProjectId = googleProjectId.trim();
       const { data } = await client.post(`${apiBase}/oauth/start`, body);
@@ -148,6 +188,7 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
         setStep('error');
         return;
       }
+      setFlowKind('oauth');
       setSessionId(data.sessionId);
       const url = data.authUrl || null;
       setAuthUrl(url);
@@ -333,7 +374,9 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
 
               {nativeCliNote ? (
                 <div className="rounded-lg border border-slate-700/50 bg-slate-800/30 px-4 py-3 text-sm text-slate-300">
-                  This connects {provider.id === 'openai-codex' ? 'Codex' : 'Gemini'} through OpenClaw. To use it as a native agent, set it up from its own card in the AI Providers page.
+                  {provider.id === 'openai-codex'
+                    ? 'This signs in Codex on the server and links that credential to OpenClaw.'
+                    : 'This connects Gemini through OpenClaw. To use it as a native agent, set it up from its own card in the AI Providers page.'}
                 </div>
               ) : null}
 
@@ -442,6 +485,51 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                 <ClipboardPaste className="h-4 w-4" />
                 I copied the URL — paste it now
               </button>
+
+              <button type="button" onClick={onCancel} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition">
+                Cancel
+              </button>
+            </div>
+          ) : null}
+
+          {/* ── Step: Device Code ── */}
+          {step === 'device' ? (
+            <div className="space-y-5">
+              {popupBlocked && verificationUrl ? (
+                <div className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                  Your browser blocked the popup. Use the link below to open sign-in.
+                </div>
+              ) : (
+                <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
+                  <strong>A new tab opened.</strong> Enter the code there, then come back.
+                </div>
+              )}
+
+              <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-5 text-center">
+                <p className="text-sm text-slate-400">Go to</p>
+                <a
+                  href={verificationUrl || 'https://auth.openai.com/codex/device'}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-1 inline-block text-base font-semibold text-sky-300 underline"
+                >
+                  {verificationUrl || 'https://auth.openai.com/codex/device'}
+                </a>
+                <div className="mt-5 text-xs font-semibold uppercase tracking-wide text-slate-500">Enter this code</div>
+                <div className="mt-3 inline-flex items-center gap-3 rounded-xl border border-sky-500/30 bg-sky-500/10 px-5 py-4">
+                  <span className="text-2xl font-semibold tracking-widest text-white">{deviceCode || 'Waiting...'}</span>
+                  {deviceCode ? (
+                    <button
+                      type="button"
+                      onClick={() => navigator.clipboard.writeText(deviceCode)}
+                      className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300 transition hover:border-slate-600 hover:bg-slate-800"
+                    >
+                      <Copy className="h-4 w-4" />
+                    </button>
+                  ) : null}
+                </div>
+                <p className="mt-4 text-sm text-slate-400">Waiting for authorization...</p>
+              </div>
 
               <button type="button" onClick={onCancel} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition">
                 Cancel
