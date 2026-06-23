@@ -10,9 +10,21 @@ function getAllowedOrigins(): string[] {
     .filter(Boolean);
 }
 
-export function isAllowedWebSocketOrigin(originHeader?: string | null): boolean {
+function normalizeHost(host: string): string {
+  return host.trim().toLowerCase();
+}
+
+export function isAllowedWebSocketOrigin(originHeader?: string | null, hostHeader?: string | null): boolean {
   if (!originHeader) return false;
   const origin = normalizeOrigin(originHeader);
   const allowedOrigins = getAllowedOrigins();
-  return allowedOrigins.includes(origin);
+  if (allowedOrigins.includes(origin)) return true;
+
+  if (!hostHeader) return false;
+  try {
+    const originUrl = new URL(origin);
+    return normalizeHost(originUrl.host) === normalizeHost(hostHeader);
+  } catch {
+    return false;
+  }
 }

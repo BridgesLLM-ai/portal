@@ -20,6 +20,7 @@ import {
   onApprovalRequest,
   onApprovalResolved,
   subscribeGatewaySessionMessages,
+  registerRun,
   isConnected as isPersistentWsConnected,
   reconnectNow as reconnectPersistentWs,
   type ExecApprovalRequest as PersistentApprovalRequest,
@@ -32,7 +33,7 @@ import {
   listPendingNativeCliApprovals,
   type NativeCliApprovalDecision,
 } from '../agents/nativeCliApprovals';
-import { streamEventBus, type StreamEvent } from '../services/StreamEventBus';
+import { streamEventBus, type StreamEvent, type StreamInfo } from '../services/StreamEventBus';
 import { readRuntimeTurnEvents } from '../services/RuntimeTurnEventHistory';
 import type { RuntimeTurnEvent } from '../services/RuntimeTurnEvents';
 import { verifyAccessToken, JwtPayload } from '../utils/jwt';
@@ -1411,6 +1412,216 @@ function getLatestMeaningfulConversationMarker(messages: any[]): { role: 'user' 
   return latest;
 }
 
+type OpenClawActiveStreamSnapshot = {
+  active: boolean;
+  inactiveReason?: 'idle' | 'stale' | 'terminal' | 'unknown';
+  safeToClear?: boolean;
+  phase?: StreamInfo['phase'];
+  toolName?: string | null;
+  toolCalls?: StreamInfo['toolCalls'];
+  statusText?: string | null;
+  provenance?: string | null;
+  model?: string | null;
+  compactionPhase?: StreamInfo['compactionPhase'];
+  startedAt?: number;
+  runId?: string | null;
+  content?: string;
+  lastEventAt?: number;
+  staleAfterMs?: number;
+};
+
+function inactiveOpenClawSnapshot(
+  inactiveReason: NonNullable<OpenClawActiveStreamSnapshot['inactiveReason']>,
+  safeToClear = inactiveReason === 'terminal' || inactiveReason === 'stale',
+): OpenClawActiveStreamSnapshot {
+  return { active: false, inactiveReason, safeToClear };
+}
+
+function getOpenClawRunIdFromSessionInfo(sess: any): string | null {
+  for (const key of ['runId', 'activeRunId', 'currentRunId']) {
+    const value = sess?.[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function normalizeOpenClawChatState(sess: any): 'streaming' | 'thinking' | 'tool' | '' {
+  const rawChatState = typeof sess?.chatState === 'string' ? sess.chatState.trim().toLowerCase() : '';
+  if (rawChatState === 'streaming' || rawChatState === 'thinking' || rawChatState === 'tool') return rawChatState;
+
+  const rawStatus = typeof sess?.status === 'string' ? sess.status.trim().toLowerCase() : '';
+  if (/^(?:running|active|streaming|thinking|tool)$/.test(rawStatus)) return 'thinking';
+  return '';
+}
+
+function getOpenClawSessionLastActivity(sess: any): number | undefined {
+  return [
+    sess?.lastActivity,
+    sess?.lastActivityMs,
+    sess?.updatedAt,
+    sess?.updatedAtMs,
+    sess?.startedAt,
+    sess?.createdAt,
+  ].find((value) => typeof value === 'number' && Number.isFinite(value) && value > 0) as number | undefined;
+}
+
+function getOpenClawRuntimeActiveStreamSnapshot(
+  sessionKey: string,
+  latestMarker?: { role: 'user' | 'assistant'; timestamp: number; content: string } | null,
+): OpenClawActiveStreamSnapshot | null {
+  const events = readRuntimeTurnEvents(sessionKey, 250);
+  const latest = events[events.length - 1];
+  if (!latest) return null;
+
+  if (latest.terminal || latest.type === 'assistant_final' || latest.type === 'turn_done' || latest.type === 'turn_error') {
+    return inactiveOpenClawSnapshot('terminal', true);
+  }
+
+  // If the durable transcript already has a newer assistant message, the runtime
+  // overlay is no longer the live authority. This prevents stale non-terminal
+  // tool/status events from keeping Agent Chat in a fake running state forever.
+  if (latestMarker?.role === 'assistant' && latestMarker.timestamp >= latest.ts - 30_000) {
+    return inactiveOpenClawSnapshot('terminal', true);
+  }
+
+  const hasRunningTool = latest.type === 'tool_started' || latest.tool?.status === 'running';
+  const staleCutoffMs = latest.type === 'assistant_delta'
+    ? 180_000
+    : hasRunningTool
+      ? 30 * 60_000
+      : 15 * 60_000;
+
+  if ((Date.now() - latest.ts) > staleCutoffMs) {
+    return inactiveOpenClawSnapshot('stale', true);
+  }
+
+  const phase: StreamInfo['phase'] = hasRunningTool
+    ? 'tool'
+    : latest.type === 'assistant_delta'
+      ? 'streaming'
+      : 'thinking';
+  const statusText = latest.type === 'assistant_status' && latest.text ? latest.text : null;
+  const content = latest.type === 'assistant_delta' && latest.text ? latest.text : undefined;
+
+  return {
+    active: true,
+    phase,
+    toolName: latest.tool?.name || null,
+    toolCalls: latest.tool
+      ? [{
+          id: latest.tool.id || `runtime-tool-${latest.ts}`,
+          name: latest.tool.name,
+          arguments: latest.tool.arguments,
+          result: latest.tool.result,
+          startedAt: latest.ts,
+          status: latest.tool.status || (hasRunningTool ? 'running' : 'done'),
+        }]
+      : [],
+    statusText,
+    provenance: latest.provenance || null,
+    model: latest.model || null,
+    compactionPhase: 'idle',
+    startedAt: latest.ts,
+    runId: latest.runId || null,
+    content,
+    lastEventAt: latest.ts,
+    staleAfterMs: staleCutoffMs,
+  };
+}
+
+async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<OpenClawActiveStreamSnapshot> {
+  if (!sessionKey) return inactiveOpenClawSnapshot('unknown', false);
+
+  const latestMarker = getLatestMeaningfulConversationMarker(readSessionMessagesEnhancedForSessionKey(sessionKey, 20));
+
+  const info = streamEventBus.getStreamStatus(sessionKey);
+  if (info) {
+    const lastEvent = info.lastEventAt || info.startedAt;
+    const hasRunningTool = Array.isArray(info.toolCalls) && info.toolCalls.some((toolCall: any) => toolCall?.status === 'running');
+    const staleCutoffMs = info.phase === 'streaming'
+      ? 180_000
+      : (hasRunningTool || info.phase === 'tool' || info.compactionPhase === 'compacting')
+        ? 15 * 60_000
+        : 10 * 60_000;
+
+    if (lastEvent && (Date.now() - lastEvent) > staleCutoffMs) {
+      debugLog(`[stream-status] StreamEventBus has entry but lastEvent=${new Date(lastEvent).toISOString()} exceeded cutoff=${staleCutoffMs}ms for phase=${info.phase} — clearing stale entry`);
+      streamEventBus.clearStream(sessionKey);
+    } else if (latestMarker?.role === 'assistant' && lastEvent && latestMarker.timestamp >= lastEvent - 30_000) {
+      debugLog(`[stream-status] StreamEventBus reports active, but latest durable assistant message is terminal at ${new Date(latestMarker.timestamp).toISOString()} — reporting inactive`);
+      streamEventBus.clearStream(sessionKey);
+      return inactiveOpenClawSnapshot('terminal', true);
+    } else {
+      const content = info.phase === 'streaming'
+        ? (streamEventBus.getLatestText(sessionKey) || info.latestText || '')
+        : '';
+      return {
+        active: true,
+        phase: info.phase,
+        toolName: info.toolName || null,
+        toolCalls: Array.isArray(info.toolCalls) ? info.toolCalls : [],
+        statusText: info.statusText || null,
+        provenance: info.provenance || null,
+        model: info.model || null,
+        compactionPhase: info.compactionPhase || 'idle',
+        startedAt: info.startedAt,
+        runId: info.runId || null,
+        content: content || undefined,
+        lastEventAt: lastEvent,
+        staleAfterMs: staleCutoffMs,
+      };
+    }
+  }
+
+  // StreamEventBus is process memory. After a Portal backend restart it can be
+  // empty while OpenClaw is still running the turn, so ask the gateway before
+  // telling the browser the stream ended.
+  try {
+    const sessResult = await getSessionInfo(sessionKey);
+    if (sessResult.ok && sessResult.data) {
+      const sess = sessResult.data;
+      const chatState = normalizeOpenClawChatState(sess);
+      const lastActivity = getOpenClawSessionLastActivity(sess);
+      if (chatState) {
+        const fallbackStaleCutoffMs = chatState === 'streaming' ? 180_000 : 15 * 60_000;
+        if (lastActivity && (Date.now() - lastActivity) > fallbackStaleCutoffMs) {
+          debugLog(`[stream-status] Gateway reports chatState=${chatState} but lastActivity=${new Date(lastActivity).toISOString()} exceeded fallback cutoff=${fallbackStaleCutoffMs}ms`);
+        } else {
+          const latestAssistantLooksTerminal = latestMarker?.role === 'assistant' && Boolean(latestMarker.content?.trim());
+          if (latestAssistantLooksTerminal && (!lastActivity || latestMarker.timestamp >= lastActivity - 30_000)) {
+            debugLog(`[stream-status] Gateway reports chatState=${chatState}, but latest durable meaningful message is assistant at ${new Date(latestMarker.timestamp).toISOString()} — reporting inactive`);
+            return inactiveOpenClawSnapshot('terminal', true);
+          }
+
+          debugLog(`[stream-status] StreamEventBus empty but gateway reports chatState=${chatState} within fallback cutoff and latest durable turn is not terminal assistant — reporting active`);
+          return {
+            active: true,
+            phase: chatState === 'tool' ? 'tool' : chatState === 'streaming' ? 'streaming' : 'thinking',
+            toolName: null,
+            toolCalls: [],
+            statusText: null,
+            provenance: null,
+            model: normalizeGatewayModelId(sess.model || sess.currentModel || sess.defaultModel) || null,
+            compactionPhase: 'idle',
+            startedAt: lastActivity || Date.now(),
+            lastEventAt: lastActivity || undefined,
+            runId: getOpenClawRunIdFromSessionInfo(sess),
+            staleAfterMs: fallbackStaleCutoffMs,
+          };
+        }
+      }
+    }
+  } catch {
+    // Fall through to runtime-turn-event recovery. Gateway status can be
+    // temporarily unavailable during the exact reconnect path we are trying to heal.
+  }
+
+  const runtimeSnapshot = getOpenClawRuntimeActiveStreamSnapshot(sessionKey, latestMarker);
+  if (runtimeSnapshot) return runtimeSnapshot;
+
+  return inactiveOpenClawSnapshot('unknown', false);
+}
+
 function normalizeRuntimeHistoryMatchText(text: unknown): string {
   return sanitizeHistoryText(typeof text === 'string' ? text : '')
     .replace(/\s+/g, ' ')
@@ -1634,12 +1845,14 @@ function mergeRuntimeTurnEventHistory(sessionKey: string, messages: any[], limit
       const runtimeSegments = Array.isArray(runtimeMessage.segments) ? runtimeMessage.segments : [];
       const existingTools = Array.isArray(existing.toolCalls) ? existing.toolCalls : [];
       const runtimeTools = Array.isArray(runtimeMessage.toolCalls) ? runtimeMessage.toolCalls : [];
+      const mergedSegments = mergeHistorySegments(existingSegments, runtimeSegments);
+      const mergedTools = mergeHistoryToolCalls(existingTools, runtimeTools);
       combined[matchIndex] = {
         ...existing,
         model: existing.model || runtimeMessage.model,
         provenance: existing.provenance || runtimeMessage.provenance,
-        segments: existingSegments.length > 0 ? existingSegments : (runtimeSegments.length > 0 ? runtimeSegments : existing.segments),
-        toolCalls: existingTools.length > 0 ? existingTools : (runtimeTools.length > 0 ? runtimeTools : existing.toolCalls),
+        segments: mergedSegments.length > 0 ? mergedSegments : existing.segments,
+        toolCalls: mergedTools.length > 0 ? mergedTools : existing.toolCalls,
       };
       continue;
     }
@@ -1691,13 +1904,117 @@ function isDuplicateToolOnlyAssistantHistoryMessage(message: any, index: number,
   });
 }
 
+function mergeHistorySegments(existing: any[] | undefined, incoming: any[]): any[] {
+  const merged: any[] = [];
+  const seen = new Set<string>();
+  const add = (segment: any) => {
+    if (!segment || typeof segment !== 'object') return;
+    const text = typeof segment.text === 'string' ? segment.text.trim() : '';
+    if (!text) return;
+    const kind = segment.kind === 'thinking' ? 'thinking' : 'text';
+    const key = `${kind}:${normalizeRuntimeHistoryMatchText(text)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push({
+      ...segment,
+      text,
+      kind,
+      position: segment.position === 'after' || segment.position === 'between' ? segment.position : 'before',
+      order: merged.length,
+    });
+  };
+
+  for (const segment of Array.isArray(existing) ? existing : []) add(segment);
+  for (const segment of incoming) add(segment);
+
+  return merged
+    .sort((a, b) => {
+      const aTs = typeof a.ts === 'number' && Number.isFinite(a.ts) ? a.ts : Number.POSITIVE_INFINITY;
+      const bTs = typeof b.ts === 'number' && Number.isFinite(b.ts) ? b.ts : Number.POSITIVE_INFINITY;
+      if (Number.isFinite(aTs) && Number.isFinite(bTs) && aTs !== bTs) return aTs - bTs;
+      const aOrder = typeof a.order === 'number' && Number.isFinite(a.order) ? a.order : 0;
+      const bOrder = typeof b.order === 'number' && Number.isFinite(b.order) ? b.order : 0;
+      return aOrder - bOrder;
+    })
+    .map((segment, index) => ({ ...segment, order: index }));
+}
+
+function mergeHistoryToolCalls(existing: any[] | undefined, incoming: any[]): any[] {
+  const merged: any[] = [];
+  const seen = new Set<string>();
+  const add = (toolCall: any) => {
+    if (!toolCall || typeof toolCall !== 'object') return;
+    const id = typeof toolCall.id === 'string' ? toolCall.id.trim() : '';
+    const fallbackKey = [
+      typeof toolCall.name === 'string' ? toolCall.name.trim() : '',
+      typeof toolCall.startedAt === 'number' ? toolCall.startedAt : '',
+      typeof toolCall.endedAt === 'number' ? toolCall.endedAt : '',
+    ].join(':');
+    const key = id || fallbackKey;
+    if (key && seen.has(key)) return;
+    if (key) seen.add(key);
+    merged.push(toolCall);
+  };
+
+  for (const toolCall of Array.isArray(existing) ? existing : []) add(toolCall);
+  for (const toolCall of incoming) add(toolCall);
+  return merged;
+}
+
+function collapseFragmentedToolOnlyAssistantHistory(messages: any[]): any[] {
+  const collapsed: any[] = [];
+  let pendingToolOnly: any[] = [];
+
+  const flushPendingAsAggregate = () => {
+    if (pendingToolOnly.length === 0) return;
+    const first = pendingToolOnly[0];
+    const last = pendingToolOnly[pendingToolOnly.length - 1];
+    const toolCalls = pendingToolOnly.flatMap((message) => Array.isArray(message?.toolCalls) ? message.toolCalls : []);
+    collapsed.push({
+      ...last,
+      id: `tool-history-${createHash('sha256')
+        .update(pendingToolOnly.map((message) => String(message?.id || message?.timestamp || '')).join('|'))
+        .digest('hex')
+        .slice(0, 24)}`,
+      role: 'assistant',
+      content: '',
+      timestamp: first?.timestamp || last?.timestamp,
+      toolCalls: mergeHistoryToolCalls(undefined, toolCalls),
+    });
+    pendingToolOnly = [];
+  };
+
+  for (const message of messages) {
+    if (isToolOnlyAssistantHistoryMessage(message)) {
+      pendingToolOnly.push(message);
+      continue;
+    }
+
+    if (message?.role === 'assistant' && pendingToolOnly.length > 0) {
+      const toolCalls = pendingToolOnly.flatMap((entry) => Array.isArray(entry?.toolCalls) ? entry.toolCalls : []);
+      collapsed.push({
+        ...message,
+        toolCalls: mergeHistoryToolCalls(message.toolCalls, toolCalls),
+      });
+      pendingToolOnly = [];
+      continue;
+    }
+
+    flushPendingAsAggregate();
+    collapsed.push(message);
+  }
+
+  flushPendingAsAggregate();
+  return collapsed;
+}
+
 function finalizeEnhancedHistoryMessages(sessionKey: string, messages: any[], limit = 200): any[] {
   const mergeLimit = Math.max(limit * 250, 25000);
-  return mergeRuntimeTurnEventHistory(
+  return collapseFragmentedToolOnlyAssistantHistory(mergeRuntimeTurnEventHistory(
     sessionKey,
     mergeMaintenanceHistoryMarkers(sessionKey, messages, mergeLimit),
     limit,
-  );
+  ));
 }
 
 function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
@@ -1822,6 +2139,7 @@ function isHiddenHistoryArtifactText(text: string): boolean {
     /^Heartbeat check complete(?:d)?\.?$/i,
     /^Pre-compaction memory flush\./i,
     /^Memory flush complete(?:d)?\.?$/i,
+    /^\[System\]\s+Your previous turn was interrupted by a gateway restart/i,
     /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i,
     /Handle the result internally\./i,
     /Sender \(untrusted metadata\):/i,
@@ -1915,6 +2233,10 @@ function summarizeHiddenHistoryArtifactText(text: string): string | null {
 
   if (/^An async command you ran earlier has completed\./i.test(normalized)) {
     return 'Earlier async command completed';
+  }
+
+  if (/^\[System\]\s+Your previous turn was interrupted by a gateway restart/i.test(normalized)) {
+    return 'Previous turn interrupted by gateway restart';
   }
 
   if (/^Read HEARTBEAT\.md if it exists/i.test(normalized)) {
@@ -2297,6 +2619,7 @@ export const __gatewayHistoryTest = {
   readSessionMessagesEnhanced,
   readSessionMessagesEnhancedForSessionKey,
   readBestOpenClawSessionMessagesForSessionKey,
+  getOpenClawRuntimeActiveStreamSnapshot,
 };
 
 /**
@@ -4204,6 +4527,9 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
     const enhanced = req.query.enhanced === '1';
 
     assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
+    if (!providerName || providerName === 'OPENCLAW') {
+      subscribeBackendToLiveSessionEvents(sessionKey);
+    }
 
     // For non-OPENCLAW providers use the provider abstraction
     if (providerName && providerName !== 'OPENCLAW') {
@@ -4241,25 +4567,7 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
     }
 
     const activeStream = providerName === 'OPENCLAW'
-      ? (() => {
-          const info = streamEventBus.getStreamStatus(sessionKey);
-          if (!info) return { active: false };
-          const latestText = info.phase === 'streaming'
-            ? (info.latestText || streamEventBus.getLatestText(sessionKey) || '')
-            : '';
-          return {
-            active: true,
-            phase: info.phase,
-            toolName: info.toolName || null,
-            toolCalls: Array.isArray(info.toolCalls) ? info.toolCalls : [],
-            statusText: info.statusText || null,
-            provenance: info.provenance || null,
-            model: info.model || null,
-            compactionPhase: info.compactionPhase || 'idle',
-            content: latestText,
-            runId: info.runId || null,
-          };
-        })()
+      ? await getOpenClawActiveStreamSnapshot(sessionKey)
       : null;
 
     res.json({ messages, sessionId, activeStream });
@@ -4764,87 +5072,7 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
     res.json({ active: false });
     return;
   }
-  const info = streamEventBus.getStreamStatus(sessionKey);
-  if (info) {
-    // Long-running tool/research/codegen work can legitimately go quiet for a while.
-    // Keep tool/maintenance snapshots alive much longer than text streaming so the UI
-    // does not hide the rail mid-run just because the agent is busy.
-    const lastEvent = (info as any).lastEventAt || info.startedAt;
-    const hasRunningTool = Array.isArray(info.toolCalls) && info.toolCalls.some((toolCall: any) => toolCall?.status === 'running');
-    const staleCutoffMs = info.phase === 'streaming'
-      ? 180_000
-      : (hasRunningTool || info.phase === 'tool' || info.compactionPhase === 'compacting')
-        ? 15 * 60_000
-        : 10 * 60_000;
-    if (lastEvent && (Date.now() - lastEvent) > staleCutoffMs) {
-      debugLog(`[stream-status] StreamEventBus has entry but lastEvent=${new Date(lastEvent).toISOString()} exceeded cutoff=${staleCutoffMs}ms for phase=${info.phase} — reporting inactive`);
-      streamEventBus.clearStream(sessionKey);
-      res.json({ active: false });
-      return;
-    }
-    const content = info.phase === 'streaming'
-      ? streamEventBus.getLatestText(sessionKey)
-      : '';
-    res.json({
-      active: true,
-      phase: info.phase,
-      toolName: info.toolName || null,
-      toolCalls: Array.isArray(info.toolCalls) ? info.toolCalls : [],
-      statusText: info.statusText || null,
-      provenance: info.provenance || null,
-      model: info.model || null,
-      compactionPhase: info.compactionPhase || 'idle',
-      startedAt: info.startedAt,
-      runId: info.runId || null,
-      content: content || undefined,
-      lastEventAt: lastEvent,
-      staleAfterMs: staleCutoffMs,
-    });
-  } else {
-    // StreamEventBus has no active stream — but the gateway might still be running
-    // (e.g., after backend restart when PersistentGatewayWs hasn't forwarded events yet).
-    // Query the gateway's session state as a fallback.
-    // GUARD: only trust the gateway's chatState if there's been recent activity.
-    // Stale chatState (from interrupted turns) causes the UI to show "thinking..." forever.
-    try {
-      const sessResult = await getSessionInfo(sessionKey);
-      if (sessResult.ok && sessResult.data) {
-        const sess = sessResult.data;
-        const chatState = typeof sess.chatState === 'string' ? sess.chatState : '';
-        if (chatState === 'streaming' || chatState === 'thinking' || chatState === 'tool') {
-          // This fallback is only used when StreamEventBus has no live snapshot, for example
-          // after a browser refresh while direct-gateway streaming is in progress. Be conservative:
-          // stale gateway chatState otherwise leaves the UI stuck in a fake running state.
-          const lastActivity = typeof sess.lastActivity === 'number' ? sess.lastActivity : 0;
-          const fallbackStaleCutoffMs = chatState === 'streaming' ? 180_000 : 15 * 60_000;
-          if (lastActivity && (Date.now() - lastActivity) > fallbackStaleCutoffMs) {
-            debugLog(`[stream-status] Gateway reports chatState=${chatState} but lastActivity=${new Date(lastActivity).toISOString()} exceeded fallback cutoff=${fallbackStaleCutoffMs}ms — reporting inactive`);
-            res.json({ active: false });
-            return;
-          }
-          const latestMarker = getLatestMeaningfulConversationMarker(readSessionMessagesEnhancedForSessionKey(sessionKey, 20));
-          if (latestMarker?.role === 'assistant' && (!lastActivity || latestMarker.timestamp >= lastActivity - 30_000)) {
-            debugLog(`[stream-status] Gateway reports chatState=${chatState}, but latest durable meaningful message is assistant at ${new Date(latestMarker.timestamp).toISOString()} — reporting inactive`);
-            res.json({ active: false });
-            return;
-          }
-          debugLog(`[stream-status] StreamEventBus empty but gateway reports chatState=${chatState} within fallback cutoff and latest durable turn is not assistant — reporting active`);
-          res.json({
-            active: true,
-            phase: chatState === 'tool' ? 'tool' : chatState === 'streaming' ? 'streaming' : 'thinking',
-            toolName: null,
-            startedAt: lastActivity || Date.now(),
-            lastEventAt: lastActivity || undefined,
-            runId: typeof sess.runId === 'string' ? sess.runId : null,
-          });
-          return;
-        }
-      }
-    } catch {
-      // Gateway RPC failed — fall through to inactive
-    }
-    res.json({ active: false });
-  }
+  res.json(await getOpenClawActiveStreamSnapshot(sessionKey));
 });
 
 router.post('/chat/abort', authenticateToken, requireApproved, async (req: Request, res: Response): Promise<void> => {
@@ -5073,7 +5301,7 @@ function subscribeBackendToLiveSessionEvents(sessionKey: string): void {
 function attachBrowserWsToSessionStream(params: {
   ws: WebSocket;
   sessionKey: string;
-  streamInfo?: ReturnType<typeof streamEventBus.getTrackedStream> | null;
+  streamInfo?: StreamInfo | OpenClawActiveStreamSnapshot | null;
   sendResume?: boolean;
   keepSubscriptionAfterDone?: boolean;
   onEvent?: (evt: StreamEvent) => void;
@@ -5094,13 +5322,20 @@ function attachBrowserWsToSessionStream(params: {
 
   if (sendResume) {
     if (status.active) {
-      const latestText = status.phase === 'streaming'
-        ? streamEventBus.getLatestText(sessionKey)
+      const phase = status.phase || 'thinking';
+      const snapshotContent = 'content' in status && typeof status.content === 'string'
+        ? status.content
+        : '';
+      const snapshotLatestText = 'latestText' in status && typeof status.latestText === 'string'
+        ? status.latestText
+        : '';
+      const latestText = phase === 'streaming'
+        ? (snapshotContent || streamEventBus.getLatestText(sessionKey) || snapshotLatestText || '')
         : '';
       wsSend(ws, {
         type: 'stream_resume',
         sessionKey,
-        phase: status.phase,
+        phase,
         toolName: status.toolName || null,
         toolCalls: Array.isArray(status.toolCalls) ? status.toolCalls : [],
         statusText: status.statusText || null,
@@ -5176,13 +5411,17 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
 
     // After sending history, check if there's an active stream on this session.
     // If so, send a stream_resume event and subscribe to StreamEventBus.
-    attachBrowserWsToSessionStream({
-      ws,
-      sessionKey,
-      sendResume: true,
-      // Keep subscription alive after done so resumed runs continue forwarding.
-      keepSubscriptionAfterDone: true,
-    });
+    const activeStream = await getOpenClawActiveStreamSnapshot(sessionKey);
+    if (activeStream.active) {
+      attachBrowserWsToSessionStream({
+        ws,
+        sessionKey,
+        streamInfo: activeStream,
+        sendResume: true,
+        // Keep subscription alive after done so resumed runs continue forwarding.
+        keepSubscriptionAfterDone: true,
+      });
+    }
   } catch (err: any) {
     wsSend(ws, { type: 'error', content: err?.message === 'Admin access required' ? 'Admin access required' : `History failed: ${err.message}`, requestId });
   }
@@ -5262,7 +5501,7 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       try {
         if (!requestedModel.includes('/')) {
           console.warn(`[gateway-ws] Rejecting bare model name without provider prefix: "${requestedModel}". Select a fully-qualified model ID.`);
-          wsSend(ws, { type: 'error', content: `Invalid model "${requestedModel}": must include provider prefix (e.g. codex/gpt-5.4). Please reselect your model.` });
+          wsSend(ws, { type: 'error', content: `Invalid model "${requestedModel}": must include provider prefix (e.g. codex/gpt-5.5). Please reselect your model.` });
           return;
         }
         const resolvedModel = await resolveOpenClawPatchModel(requestedModel);
@@ -5583,7 +5822,7 @@ async function denyExecApprovalForUnauthorizedUser(approval: ExecApprovalRequest
   }
 }
 
-function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtPayload): void {
+async function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtPayload): Promise<void> {
   const sessionKey = resolveOpenClawSessionKey(msg.session, user);
   if (!sessionKey) {
     wsSend(ws, { type: 'error', content: 'reconnect requires session' });
@@ -5598,16 +5837,17 @@ function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtP
     return;
   }
 
-  const streamInfo = streamEventBus.getTrackedStream(sessionKey);
-  if (!streamInfo) {
-    wsSend(ws, { type: 'stream_ended' });
-    return;
-  }
-
+  const streamInfo = await getOpenClawActiveStreamSnapshot(sessionKey);
   if (!streamInfo.active) {
     runWsStreamCleanup(ws, sessionKey);
-    wsSend(ws, { type: 'stream_ended', sessionKey });
-    debugLog(`[gateway-ws] Ignoring reconnect for dormant stream: ${sessionKey}`);
+    wsSend(ws, {
+      type: 'stream_status',
+      sessionKey,
+      active: false,
+      inactiveReason: streamInfo.inactiveReason || 'unknown',
+      safeToClear: streamInfo.safeToClear === true,
+    });
+    debugLog(`[gateway-ws] Reconnect found no active stream for ${sessionKey}: reason=${streamInfo.inactiveReason || 'unknown'} safeToClear=${streamInfo.safeToClear === true}`);
     return;
   }
 
@@ -5698,7 +5938,7 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
       case 'abort':   await handleWsAbort(ws, msg, user);   break;
       case 'inject':  await handleWsInject(ws, msg, user);  break;
       case 'exec_approval_resolve': await handleWsExecApproval(ws, msg, user); break;
-      case 'reconnect': handleWsReconnect(ws, msg, user);   break;
+      case 'reconnect': await handleWsReconnect(ws, msg, user);   break;
       default: wsSend(ws, { type: 'error', content: `Unknown type: ${msg.type}` });
     }
   });
@@ -5841,6 +6081,13 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
         if (msg.ok && meta?.method === 'chat.history' && meta.sessionKey) {
           msg.payload = augmentDirectHistoryPayload(msg.payload, meta.sessionKey, meta.limit || 200);
         }
+        if (msg.ok && meta?.sessionKey && (meta.method === 'chat.send' || meta.method === 'sessions.steer')) {
+          const runId = typeof msg.payload?.runId === 'string' && msg.payload.runId.trim()
+            ? msg.payload.runId.trim()
+            : undefined;
+          registerRun(meta.sessionKey, runId);
+          subscribeBackendToLiveSessionEvents(meta.sessionKey);
+        }
         requestMeta.delete(gatewayId);
         msg.id = idMap.get(gatewayId)!;
         idMap.delete(gatewayId);
@@ -5971,6 +6218,19 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       return;
     }
 
+    const frameMethod = typeof frame.method === 'string' ? frame.method : '';
+    const frameSessionKey = typeof frame.params?.sessionKey === 'string' && frame.params.sessionKey.trim()
+      ? frame.params.sessionKey.trim()
+      : (typeof frame.params?.key === 'string' && frame.params.key.trim()
+          ? frame.params.key.trim()
+          : (typeof frame.params?.session === 'string' && frame.params.session.trim()
+              ? frame.params.session.trim()
+              : undefined));
+    if (frameSessionKey && (frameMethod === 'chat.send' || frameMethod === 'sessions.steer')) {
+      registerRun(frameSessionKey);
+      subscribeBackendToLiveSessionEvents(frameSessionKey);
+    }
+
     // Pass through request frames — coerce id to string (gateway requires string IDs)
     if (typeof frame.id === 'number') {
       const numericId = frame.id;
@@ -5979,9 +6239,7 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       idMap.set(stringId, numericId);
       requestMeta.set(stringId, {
         method: frame.method,
-        sessionKey: typeof frame.params?.sessionKey === 'string'
-          ? frame.params.sessionKey
-          : (typeof frame.params?.session === 'string' ? frame.params.session : undefined),
+        sessionKey: frameSessionKey,
         limit: typeof frame.params?.limit === 'number' && Number.isFinite(frame.params.limit)
           ? frame.params.limit
           : undefined,
@@ -5997,9 +6255,7 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       if (stringId) {
         requestMeta.set(stringId, {
           method: frame.method,
-          sessionKey: typeof frame.params?.sessionKey === 'string'
-            ? frame.params.sessionKey
-            : (typeof frame.params?.session === 'string' ? frame.params.session : undefined),
+          sessionKey: frameSessionKey,
           limit: typeof frame.params?.limit === 'number' && Number.isFinite(frame.params.limit)
             ? frame.params.limit
             : undefined,
@@ -6092,7 +6348,7 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
     if (!isPortalWs && !isDirectProxy) return; // Let other upgrade handlers proceed
 
     const origin = req.headers.origin;
-    if (!isAllowedWebSocketOrigin(origin)) {
+    if (!isAllowedWebSocketOrigin(origin, req.headers.host)) {
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       socket.destroy();
       return;

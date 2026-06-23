@@ -12,7 +12,10 @@ const email = process.env.PORTAL_TEST_EMAIL;
 const password = process.env.PORTAL_TEST_PASSWORD;
 const chromeBin = process.env.CHROME_BIN || '/usr/bin/google-chrome';
 const resultPath = process.env.RESULT_PATH || '';
-const validationModel = process.env.PORTAL_VALIDATION_MODEL || 'openai-codex/gpt-5.4-mini';
+const validationModel = process.env.PORTAL_VALIDATION_MODEL || 'codex/gpt-5.5';
+const replyPolls = Number.parseInt(process.env.PORTAL_REPLY_POLLS || '420', 10);
+const reloadPolls = Number.parseInt(process.env.PORTAL_RELOAD_POLLS || '90', 10);
+const traceCookies = process.env.PORTAL_TRACE_COOKIES === '1';
 if (!baseUrl) throw new Error('PORTAL_BASE_URL is required, e.g. https://your-test-portal.example');
 if (!email || !password) throw new Error('PORTAL_TEST_EMAIL and PORTAL_TEST_PASSWORD are required');
 
@@ -42,6 +45,18 @@ process.on('SIGINT', () => { cleanup(); process.exit(130); });
 process.on('SIGTERM', () => { cleanup(); process.exit(143); });
 function get(path){return new Promise((res,rej)=>http.get({host:'127.0.0.1',port,path},r=>{let b='';r.on('data',d=>b+=d);r.on('end',()=>res(b));}).on('error',rej));}
 function containsArtifacts(text){ return /message_tool_only|sourceReplyDeliveryMode|delivery-mirror|delivery mirror|toolResult|sourceReply|THINKING\s+Thinking|Thinking…\s+via OpenClaw/i.test(text || ''); }
+function summarizeCookieHeader(header){
+  return String(header || '')
+    .split(';')
+    .map(part => part.trim())
+    .filter(Boolean)
+    .map(part => {
+      const idx = part.indexOf('=');
+      const name = idx >= 0 ? part.slice(0, idx) : part;
+      const valueLen = idx >= 0 ? part.length - idx - 1 : 0;
+      return { name, valueLen };
+    });
+}
 
 (async()=>{let ws; try{
   let page;
@@ -54,6 +69,7 @@ function containsArtifacts(text){ return /message_tool_only|sourceReplyDeliveryM
   let id=0;
   const pending=new Map();
   const frames=[];
+  const networkEvents=[];
   const consoleEvents=[];
   ws.addEventListener('message', ev => {
     const m = JSON.parse(String(ev.data));
@@ -62,6 +78,33 @@ function containsArtifacts(text){ return /message_tool_only|sourceReplyDeliveryM
     if(m.method==='Network.webSocketFrameReceived'){
       const payload=m.params.response?.payloadData||'';
       if(payload.includes(runId) || payload.includes('turnEvent') || payload.includes('session.message') || payload.includes('chat.delta') || payload.includes('session_status')) frames.push({t:Date.now(),payload:payload.slice(0,4000)});
+    }
+    if(m.method==='Network.webSocketCreated'){
+      networkEvents.push({t:Date.now(),type:'webSocketCreated',requestId:m.params.requestId,url:m.params.url});
+    }
+    if(m.method==='Network.webSocketFrameSent'){
+      const payload=m.params.response?.payloadData||'';
+      networkEvents.push({t:Date.now(),type:'webSocketFrameSent',requestId:m.params.requestId,payload:payload.slice(0,1200)});
+    }
+    if(m.method==='Network.webSocketFrameReceived'){
+      const payload=m.params.response?.payloadData||'';
+      networkEvents.push({t:Date.now(),type:'webSocketFrameReceived',requestId:m.params.requestId,payload:payload.slice(0,1200)});
+    }
+    if(m.method==='Network.webSocketClosed'){
+      networkEvents.push({t:Date.now(),type:'webSocketClosed',requestId:m.params.requestId});
+    }
+    if(m.method==='Network.webSocketFrameError'){
+      networkEvents.push({t:Date.now(),type:'webSocketFrameError',requestId:m.params.requestId,errorMessage:m.params.errorMessage});
+    }
+    if(m.method==='Network.requestWillBeSentExtraInfo'){
+      const cookieHeader=m.params.headers?.Cookie || m.params.headers?.cookie || '';
+      const cookies=summarizeCookieHeader(cookieHeader);
+      if(traceCookies && cookies.some(c => c.name === 'accessToken')){
+        networkEvents.push({t:Date.now(),type:'requestExtraInfo',requestId:m.params.requestId,cookies});
+      }
+    }
+    if(m.method==='Network.loadingFailed' && String(m.params.type||'').toLowerCase()==='websocket'){
+      networkEvents.push({t:Date.now(),type:'loadingFailed',requestId:m.params.requestId,errorText:m.params.errorText,canceled:m.params.canceled});
     }
     if(m.id && pending.has(m.id)){
       const p=pending.get(m.id); pending.delete(m.id);
@@ -79,6 +122,7 @@ function containsArtifacts(text){ return /message_tool_only|sourceReplyDeliveryM
     const create=await fetch('/api/projects',{method:'POST',credentials:'include',headers:{'content-type':'application/json'},body:JSON.stringify({name:${JSON.stringify(projectName)},template:'static-html'})}).then(async r=>({ok:r.ok,status:r.status,json:await r.json().catch(e=>({error:String(e)}))}));
     localStorage.setItem('projects-last-selected',${JSON.stringify(projectName)});
     localStorage.setItem('agentChats.lastModel.OPENCLAW', ${JSON.stringify(validationModel)});
+    localStorage.setItem(${JSON.stringify(`agent-model-${projectName}`)}, ${JSON.stringify(validationModel)});
     return {login,create};
   })()`, true);
   await cdp('Page.navigate',{url: `${baseUrl}/apps`});
@@ -116,7 +160,7 @@ function containsArtifacts(text){ return /message_tool_only|sourceReplyDeliveryM
   }
   const samples=[];
   let sawProgress=false, sawArtifacts=false, replySeen=null;
-  for(let i=0;i<420;i++){
+  for(let i=0;i<replyPolls;i++){
     await wait(500);
     const s=await sample('wait-reply'); samples.push(s);
     sawProgress = sawProgress || s.progressVisible;
@@ -128,7 +172,7 @@ function containsArtifacts(text){ return /message_tool_only|sourceReplyDeliveryM
   sawArtifacts = sawArtifacts || finalSample.hasArtifacts;
   await cdp('Page.reload', { ignoreCache: true });
   let reloadSample=null;
-  for(let i=0;i<90;i++){
+  for(let i=0;i<reloadPolls;i++){
     await wait(500);
     reloadSample=await sample('reload');
     if(reloadSample.hasUser && reloadSample.hasReply) break;
@@ -169,7 +213,9 @@ function containsArtifacts(text){ return /message_tool_only|sourceReplyDeliveryM
   const noArtifacts=!sawArtifacts && !reloadSample.hasArtifacts && !containsArtifacts(histText);
   const staleConnectionNotice = /Connection lost|still reconnecting|Retry now/i.test(stableReloadSample.tail || '');
   const ok=Boolean(setup.login.ok && setup.create.ok && projectLoaded && projectSelected.ok && selectedProjectReady && chatOpened.ok && composerReady && sent.ok && replySeen && finalSample.hasUser && finalSample.hasReply && reloadSample.hasUser && reloadSample.hasReply && stableReloadSample.hasUser && stableReloadSample.hasReply && !staleConnectionNotice && sawProgress && hasTurnSpine && noArtifacts && history.ok && histText.includes(userToken) && histText.includes(replyToken));
-  const result={ok,baseUrl,runId,projectName,sessionKey,setup,projectLoaded,projectSelected,selectedProjectReady,chatOpened,composerReady,sent,timing:{replySeen},visibleSignals:{sawProgress,noArtifacts,staleConnectionNotice},turnEventTypes,turnEvents:turnEvents.slice(-30),finalSample,reloadSample,stableReloadSample,historyStatus:{ok:history.ok,status:history.status,hasUser:histText.includes(userToken),hasReply:histText.includes(replyToken),messageCount:Array.isArray(history.json?.messages)?history.json.messages.length:null},historyPreview:histText.slice(-4000),frames:frames.slice(-40),consoleEvents:consoleEvents.slice(-50)};
+  const allCookies=await cdp('Network.getAllCookies').catch(()=>({cookies:[]}));
+  const cookieSummary=(allCookies.cookies||[]).filter(c=>['accessToken','refreshToken'].includes(c.name)).map(c=>({name:c.name,domain:c.domain,path:c.path,expires:c.expires,httpOnly:c.httpOnly,secure:c.secure,sameSite:c.sameSite,valueLen:String(c.value||'').length}));
+  const result={ok,baseUrl,runId,projectName,sessionKey,setup,projectLoaded,projectSelected,selectedProjectReady,chatOpened,composerReady,sent,timing:{replySeen},visibleSignals:{sawProgress,noArtifacts,staleConnectionNotice},turnEventTypes,turnEvents:turnEvents.slice(-30),finalSample,reloadSample,stableReloadSample,historyStatus:{ok:history.ok,status:history.status,hasUser:histText.includes(userToken),hasReply:histText.includes(replyToken),messageCount:Array.isArray(history.json?.messages)?history.json.messages.length:null},historyPreview:histText.slice(-4000),frames:frames.slice(-40),networkEvents:networkEvents.slice(-100),cookieSummary,consoleEvents:consoleEvents.slice(-50)};
   const output=JSON.stringify(result, null, 2);
   if (resultPath) fs.writeFileSync(resultPath, output + '\n');
   console.log(output);

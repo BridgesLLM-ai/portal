@@ -98,6 +98,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.26 (June 22, 2026)
+- **Agent Chat reconnects recover visibly**: dead live-stream states now clear stale running/tool UI, reload durable history, and show an interruption notice instead of sitting forever on reconnect.
+- **Project Agent Chat works behind real HTTPS domains**: same-origin websocket upgrades are accepted by request host, fixing 403 failures on installs whose `CORS_ORIGIN` still points at an old IP.
+- **Project chat history catch-up no longer hides the active prompt**: local user/assistant bubbles are preserved while durable history catches up after reconnects.
+
 ### v3.25.25 (June 21, 2026)
 - **Dashboard updates recover the Portal before exiting**: if OpenClaw prep fails after the updater stops the service, the installer now restarts `bridgesllm-product` and waits for `/health` before exiting.
 - **Agent switching no longer kills active runs**: changing OpenClaw agents or providers detaches the visible chat instead of sending an abort; only explicit Stop/New Chat cancels a run.
@@ -127,7 +132,7 @@ One-click updates from the browser. Admin dashboard with user management, storag
 - **Provider status is more truthful**: OpenAI API keys and ChatGPT/Codex subscription OAuth are tracked separately, reducing false "configured" states after provider changes.
 
 ### v3.25.19 (June 20, 2026)
-- **OpenClaw OAuth model suggestions are current and smaller**: Codex uses the `codex/gpt-5.5`, `codex/gpt-5.4`, and `codex/gpt-5.4-mini` family, while Claude highlights Opus 4.8, Sonnet 4.6, and Haiku 4.5.
+- **OpenClaw OAuth model suggestions are current and smaller**: Codex uses the current `codex/gpt-5.5` runtime, while Claude highlights Opus 4.8, Sonnet 4.6, and Haiku 4.5.
 - **Google Antigravity replaces the old Gemini CLI subscription path**: the Portal guides users toward the native Antigravity flow and labels OpenClaw-native Antigravity OAuth as not fully supported for now.
 
 ### v3.25.18 (May 31, 2026)

@@ -939,7 +939,7 @@ const startServer = async () => {
     httpServer.on('upgrade', (req, socket, head) => {
       if (req.url?.startsWith('/novnc/websockify')) {
         const origin = req.headers.origin;
-        if (!isAllowedWebSocketOrigin(origin)) {
+        if (!isAllowedWebSocketOrigin(origin, req.headers.host)) {
           socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
           socket.destroy();
           return;
@@ -977,7 +977,7 @@ const startServer = async () => {
       } else if (req.url?.startsWith('/novnc/audio')) {
         // Audio WebSocket upgrade — same auth as VNC
         const origin = req.headers.origin;
-        if (!isAllowedWebSocketOrigin(origin)) {
+        if (!isAllowedWebSocketOrigin(origin, req.headers.host)) {
           socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
           socket.destroy();
           return;

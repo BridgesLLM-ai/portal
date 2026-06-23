@@ -4,6 +4,7 @@ import {
   hasAnthropicClaudeCliReferences,
   isClaudeCliModelId,
   mergeProviderRuntimeCatalog,
+  removeInvalidRuntimeOnlyModelProviderConfigs,
 } from '../services/openclawConfigManager';
 
 describe('openclawConfigManager Claude CLI helpers', () => {
@@ -128,5 +129,43 @@ describe('openclawConfigManager runtime model catalog helpers', () => {
     expect(merged.changed).toBe(false);
     expect(merged.addedModels).toEqual([]);
     expect(merged.nextProviderConfig).toBe(existing);
+  });
+
+  test('removes runtime-only providers that would make OpenClaw config.patch invalid', () => {
+    const cleanup = removeInvalidRuntimeOnlyModelProviderConfigs({
+      models: {
+        providers: {
+          anthropic: { baseUrl: 'https://api.anthropic.com', models: [] },
+          'google-gemini-cli': {
+            models: [{ id: 'gemini-3-flash-preview', name: 'gemini-3-flash-preview' }],
+          },
+          'google-antigravity': {
+            models: [{ id: 'gemini-3.5-flash', name: 'gemini-3.5-flash' }],
+          },
+        },
+      },
+    });
+
+    expect(cleanup.removedProviders).toEqual(['google-gemini-cli', 'google-antigravity']);
+    expect(cleanup.config.models.providers).toEqual({
+      anthropic: { baseUrl: 'https://api.anthropic.com', models: [] },
+    });
+  });
+
+  test('keeps explicit runtime-provider HTTP configs intact', () => {
+    const cleanup = removeInvalidRuntimeOnlyModelProviderConfigs({
+      models: {
+        providers: {
+          'google-gemini-cli': {
+            baseUrl: 'https://example.invalid/v1',
+            api: 'google-generative-ai',
+            models: [],
+          },
+        },
+      },
+    });
+
+    expect(cleanup.removedProviders).toEqual([]);
+    expect(cleanup.config.models.providers['google-gemini-cli'].baseUrl).toBe('https://example.invalid/v1');
   });
 });

@@ -2,6 +2,18 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.26] - 2026-06-22
+
+### Fixed
+- **Agent Chat reconnects now fail visible instead of hanging silently**: stale live-stream reconnect states have a recovery fuse that clears dead running/tool UI, restores durable history, and shows an interruption notice instead of leaving users stuck on a ghost bash/tool bubble.
+- **Project Agent Chat works on domain-based installs with stale CORS settings**: WebSocket origin checks now allow authenticated same-origin upgrades by request host, so installs reached through Caddy HTTPS domains do not reject `/api/gateway/ws` with 403 just because `CORS_ORIGIN` still names an old IP.
+- **Project Agent Chat preserves visible turn continuity during history catch-up**: local user/assistant bubbles survive short history refresh races until durable history catches up, preventing the user prompt from disappearing mid-turn.
+- **OpenClaw runtime-only model catalogs no longer poison project-agent setup**: Gemini CLI and Antigravity runtime catalog entries are kept out of strict OpenClaw provider config unless they include a real provider endpoint, and stale invalid entries are cleaned before project-agent config patches.
+- **OpenClaw agent session selection is more stable**: selected agents now persist concrete `agent:<agentId>:main` session keys, and stale `agent-chat-agentId=main` state self-heals instead of drifting back to the wrong session.
+
+### Validation
+- Live test-box validation covered websocket auth probes, Project Agent Chat send/reload/history recovery, main Agent Chat rail/tool/thought streaming, and concurrent Project Chat + Agent Chat stress runs.
+
 ## [3.25.25] - 2026-06-21
 
 ### Fixed

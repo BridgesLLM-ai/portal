@@ -249,8 +249,8 @@ function MessageBubble({ entry, toolId, isStreaming }: { entry: TranscriptEntry;
   // Agent / tool output
   const safeText = sanitizeTerminalText(entry.text);
   const asciiFallback = (entry.text || '')
-    .replace(//g, '')
-    .replace(/[ -]/g, ' ')
+    .replace(/\u001B/g, '')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
   const displayText = safeText.trim().length > 0 ? safeText : asciiFallback;

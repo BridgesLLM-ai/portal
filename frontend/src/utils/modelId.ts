@@ -52,16 +52,23 @@ const GOOGLE_MODEL_MAP: Record<string, string> = {
 };
 
 const OPENAI_CODEX_MODEL_MAP: Record<string, string> = {
-  'gpt-5.4-codex': 'gpt-5.4',
+  'gpt-5.4-codex': 'codex/gpt-5.5',
   'openai-codex/gpt-5.5-pro': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.4-pro': 'codex/gpt-5.4',
-  'openai-codex/gpt-5.4-codex': 'codex/gpt-5.4',
+  'openai-codex/gpt-5.4': 'codex/gpt-5.5',
+  'openai-codex/gpt-5.4-mini': 'codex/gpt-5.5',
+  'openai-codex/gpt-5.4-pro': 'codex/gpt-5.5',
+  'openai-codex/gpt-5.4-codex': 'codex/gpt-5.5',
   'openai-codex/gpt-5.2-codex': 'codex/gpt-5.2',
   'codex/gpt-5.5-pro': 'codex/gpt-5.5',
-  'codex/gpt-5.4-pro': 'codex/gpt-5.4',
-  'openai/gpt-5.4-codex': 'codex/gpt-5.4',
+  'codex/gpt-5.4': 'codex/gpt-5.5',
+  'codex/gpt-5.4-mini': 'codex/gpt-5.5',
+  'codex/gpt-5.4-pro': 'codex/gpt-5.5',
+  'openai/gpt-5.4': 'codex/gpt-5.5',
+  'openai/gpt-5.4-mini': 'codex/gpt-5.5',
+  'openai/gpt-5.4-pro': 'codex/gpt-5.5',
+  'openai/gpt-5.4-codex': 'codex/gpt-5.5',
   'codex/gpt-5.2-codex': 'codex/gpt-5.2',
-  'codex/gpt-5.4-codex': 'codex/gpt-5.4',
+  'codex/gpt-5.4-codex': 'codex/gpt-5.5',
 };
 
 function titleCase(value: string): string {

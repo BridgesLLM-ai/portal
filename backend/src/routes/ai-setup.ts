@@ -132,8 +132,6 @@ const PROVIDER_MODEL_DISCOVERY_FALLBACKS: Record<string, string[]> = {
   ],
   'openai-codex': [
     'codex/gpt-5.5',
-    'codex/gpt-5.4',
-    'codex/gpt-5.4-mini',
   ],
   'google-gemini-cli': [],
   'google-antigravity': [
@@ -400,6 +398,7 @@ export function mergeDiscoveredProviderModelsIntoConfig(config: any, provider: s
   const currentDefault = canonicalizeDiscoveredProviderModelId(provider, next.agents.defaults.model.primary || '');
   const existingFallbacks = Array.isArray(next.agents.defaults.model.fallbacks)
     ? dedupeProviderModels(provider, next.agents.defaults.model.fallbacks)
+      .filter((modelId) => !currentDefault || modelId !== currentDefault)
     : [];
 
   const fallbackSet = new Set(existingFallbacks);

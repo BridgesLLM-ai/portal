@@ -136,8 +136,6 @@ export const PROVIDERS: ProviderUIConfig[] = [
     ],
     defaultModels: [
       { id: 'codex/gpt-5.5', name: 'GPT-5.5 Codex', tier: 'frontier', description: 'Current OpenClaw Codex runtime model.' },
-      { id: 'codex/gpt-5.4', name: 'GPT-5.4 Codex', tier: 'balanced', description: 'Stable Codex fallback with broad compatibility.' },
-      { id: 'codex/gpt-5.4-mini', name: 'GPT-5.4 Mini', tier: 'fast', description: 'Fastest currently exposed OpenAI Codex option.' },
     ],
     onboardingNotes: {
       intro: 'This connects the portal to your existing paid ChatGPT account. You are not creating an API key and you are not paying per-token through the developer platform.',

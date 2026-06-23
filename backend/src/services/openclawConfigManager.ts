@@ -451,6 +451,7 @@ const PROVIDER_RUNTIME_CATALOG_CONFIG: Record<string, ProviderRuntimeCatalogConf
 };
 
 const PROVIDERS_REQUIRING_RUNTIME_MODEL_CATALOG = new Set(['google-gemini-cli', 'google-antigravity']);
+const RUNTIME_ONLY_MODEL_PROVIDERS = new Set(Object.keys(PROVIDER_RUNTIME_CATALOG_CONFIG));
 
 function getProviderRuntimeCatalogConfig(provider: string): ProviderRuntimeCatalogConfig | null {
   return PROVIDER_API_CONFIG[provider] || PROVIDER_RUNTIME_CATALOG_CONFIG[provider] || null;
@@ -696,6 +697,38 @@ export function mergeProviderRuntimeCatalog(provider: string, existingProviderCo
   return { changed, addedModels, nextProviderConfig };
 }
 
+export function removeInvalidRuntimeOnlyModelProviderConfigs(config: any): { config: any; removedProviders: string[] } {
+  const nextConfig = config && typeof config === 'object'
+    ? JSON.parse(JSON.stringify(config))
+    : {};
+  const providers = nextConfig?.models?.providers;
+  if (!providers || typeof providers !== 'object' || Array.isArray(providers)) {
+    return { config: nextConfig, removedProviders: [] };
+  }
+
+  const removedProviders: string[] = [];
+  for (const provider of RUNTIME_ONLY_MODEL_PROVIDERS) {
+    const providerConfig = providers[provider];
+    if (!providerConfig || typeof providerConfig !== 'object' || Array.isArray(providerConfig)) continue;
+    const baseUrl = typeof providerConfig.baseUrl === 'string' ? providerConfig.baseUrl.trim() : '';
+    const api = typeof providerConfig.api === 'string' ? providerConfig.api.trim() : '';
+    if (baseUrl || api) continue;
+    delete providers[provider];
+    removedProviders.push(provider);
+  }
+
+  return { config: nextConfig, removedProviders };
+}
+
+export function cleanupInvalidRuntimeOnlyModelProvidersFromOpenClawConfig(): string[] {
+  const current = readOpenClawConfig();
+  const cleanup = removeInvalidRuntimeOnlyModelProviderConfigs(current);
+  if (cleanup.removedProviders.length > 0) {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cleanup.config, null, 2), 'utf8');
+  }
+  return cleanup.removedProviders;
+}
+
 export function registerProviderRuntimeModels(provider: string, modelIds: string[]): { changed: boolean; addedModels: string[] } {
   const runtimeConfig = getProviderRuntimeCatalogConfig(provider);
   if (!runtimeConfig) return { changed: false, addedModels: [] };
@@ -710,6 +743,17 @@ export function registerProviderRuntimeModels(provider: string, modelIds: string
   }
 
   const config = readOpenClawConfig();
+  if (RUNTIME_ONLY_MODEL_PROVIDERS.has(provider) && !runtimeConfig.baseUrl) {
+    const cleanup = removeInvalidRuntimeOnlyModelProviderConfigs(config);
+    if (cleanup.removedProviders.length > 0) {
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(cleanup.config, null, 2), 'utf8');
+    }
+    return {
+      changed: modelsMerge.changed || cleanup.removedProviders.length > 0,
+      addedModels: modelsMerge.addedModels,
+    };
+  }
+
   if (!config.models || typeof config.models !== 'object') config.models = {};
   if (!config.models.providers || typeof config.models.providers !== 'object') config.models.providers = {};
   const configMerge = mergeProviderRuntimeCatalog(provider, config.models.providers[provider] || {}, modelIds);

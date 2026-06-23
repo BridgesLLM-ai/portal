@@ -4,8 +4,8 @@ describe('ai-setup model normalization', () => {
   test('does not prefix providerHint onto already-prefixed string model ids', () => {
     expect(normalizeModelPayload(['openai-codex/gpt-5.4'], 'google-gemini-cli')).toEqual([
       {
-        id: 'codex/gpt-5.4',
-        name: 'codex/gpt-5.4',
+        id: 'codex/gpt-5.5',
+        name: 'codex/gpt-5.5',
         provider: 'codex',
       },
     ]);
@@ -80,19 +80,15 @@ describe('ai-setup model normalization', () => {
       },
     }, 'openai-codex', [
       'codex/gpt-5.5',
-      'codex/gpt-5.4',
-      'codex/gpt-5.4-mini',
+      'openai/gpt-5.4',
+      'openai/gpt-5.4-mini',
     ]);
 
     expect(merged.changed).toBe(true);
-    expect(merged.addedAllowlist).toEqual(['codex/gpt-5.4', 'codex/gpt-5.4-mini']);
-    expect(merged.addedFallbacks).toEqual(['codex/gpt-5.4-mini']);
-    expect(merged.config.agents.defaults.model.fallbacks).toEqual([
-      'codex/gpt-5.4',
-      'codex/gpt-5.4-mini',
-    ]);
+    expect(merged.addedAllowlist).toEqual([]);
+    expect(merged.addedFallbacks).toEqual([]);
+    expect(merged.config.agents.defaults.model.fallbacks).toEqual([]);
     expect(merged.config.agents.defaults.models['codex/gpt-5.5']).toEqual({ agentRuntime: { id: 'codex' } });
-    expect(merged.config.agents.defaults.models['codex/gpt-5.4']).toEqual({ agentRuntime: { id: 'codex' } });
   });
 
   test('register merge repairs Codex model-scoped runtime metadata', () => {

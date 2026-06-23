@@ -105,9 +105,7 @@ const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
 };
 
 const OPENCLAW_FAST_MODE_MODELS = new Set([
-  'codex/gpt-5.4',
-  'openai/gpt-5.4',
-  'openai-codex/gpt-5.4',
+  'codex/gpt-5.5',
 ]);
 
 function supportsOpenClawFastModeModel(model?: string | null): boolean {
@@ -155,13 +153,10 @@ function createLocalWsManager(url: string): LocalWsManager {
     }
 
     ws.onopen = () => {
-      const isReconnect = wasConnectedBefore;
       wasConnectedBefore = true;
       reconnectAttempts = 0;
-      if (isReconnect) {
-        for (const cb of reconnectCallbacks) {
-          try { cb(); } catch (err) { console.error('[project-ws] reconnect callback error:', err); }
-        }
+      for (const cb of reconnectCallbacks) {
+        try { cb(); } catch (err) { console.error('[project-ws] reconnect callback error:', err); }
       }
     };
 
@@ -1262,7 +1257,25 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     if (isStaleSessionLoad(session, expectedGen)) return null;
 
     const loaded = data?.messages ? data.messages.map(parseHistoryMessage).filter(Boolean) as ChatMessage[] : [];
-    setMessages(dedupeHistoryMessages(loaded));
+    setMessages(prev => {
+      const next = dedupeHistoryMessages(loaded);
+
+      const historyUserContent = new Set(
+        next
+          .filter(message => message.role === 'user')
+          .map(message => String(message.content || '').trim())
+          .filter(Boolean)
+      );
+      const liveAssistantId = streamingAssistantIdRef.current;
+      const activeLocalMessages = prev.filter(message => {
+        if (isStreamActiveRef.current && liveAssistantId && message.id === liveAssistantId) return true;
+        if (message.role !== 'user') return false;
+        const content = String(message.content || '').trim();
+        return Boolean(content) && !historyUserContent.has(content);
+      });
+
+      return activeLocalMessages.length > 0 ? dedupeHistoryMessages([...next, ...activeLocalMessages]) : next;
+    });
     setSessionError(null);
 
     if (options.hydrateActiveStream !== false && data?.activeStream?.active) {
@@ -1420,7 +1433,9 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   // ── WS Event Handler ──
   const handleWsEvent = useCallback((rawData: any) => {
     const data = normalizePortalStreamEventFromTurnEvent(rawData);
-    const passthrough = ['connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended', 'run_resumed', 'exec_approval', 'exec_approval_resolved'];
+    setWsConnected(true);
+    setConnectionNotice(null);
+    const passthrough = ['connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_status', 'stream_ended', 'run_resumed', 'exec_approval', 'exec_approval_resolved'];
     const autoCreateBubbleTypes = ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
     const waitForVisibleStreamTypes = ['status', 'thinking', 'done', 'error'];
     if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOrMaintenanceAssistantContent(data.content)) {
@@ -1795,10 +1810,29 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         finalizeStreamingAssistant();
         requestAutoCommit(modelRef.current);
         break;
+      case 'stream_status':
+        if (data.active) {
+          applyActiveStreamSnapshot(data, sessionKeyRef.current || '', historyGenRef.current, wsRef.current);
+          break;
+        }
+        if (isStreamActiveRef.current && (data.safeToClear === true || data.inactiveReason === 'terminal' || data.inactiveReason === 'stale')) {
+          clearWatchdog();
+          isStreamActiveRef.current = false;
+          setIsRunning(false);
+          setStreamingPhase('idle');
+          setStatusText(null);
+          setThinkingContent('');
+          setPendingApprovals([]);
+          setActiveToolName(null);
+          streamingAssistantIdRef.current = null;
+          resumeSeededContentRef.current = false;
+          suppressLiveBubbleContentRef.current = false;
+        }
+        break;
       case 'keepalive':
         break;
     }
-  }, [activeToolName, applyMaintenanceState, clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent, finalizeStreamingAssistant, requestAutoCommit]);
+  }, [activeToolName, applyActiveStreamSnapshot, applyMaintenanceState, clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent, finalizeStreamingAssistant, requestAutoCommit]);
 
   const handleWsEventRef = useRef(handleWsEvent);
   useEffect(() => { handleWsEventRef.current = handleWsEvent; }, [handleWsEvent]);
@@ -1868,6 +1902,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           unsubDisconnect();
           unsubReconnect();
         };
+        manager.addHandler(stableHandler);
 
         const waitForInitialConnect = new Promise<void>((resolve) => {
           if (manager.isConnected()) { resolve(); return; }
@@ -1894,7 +1929,6 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           return;
         }
 
-        manager.addHandler(stableHandler);
         await waitForInitialConnect;
 
         if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) {
@@ -2529,7 +2563,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                       <Radio size={12} className={fastModeEnabled ? 'text-amber-300' : 'text-slate-500'} />
                       <div>
                         <div className="text-[11px] font-medium text-white">Codex Fast Mode</div>
-                        <div className="text-[10px] text-slate-500">Native OpenClaw fast mode for GPT-5.4 and Codex project sessions.</div>
+                        <div className="text-[10px] text-slate-500">Native OpenClaw fast mode for Codex project sessions.</div>
                       </div>
                     </div>
                     <button

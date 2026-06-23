@@ -643,9 +643,13 @@ function hasRunningToolCall(sessionKey: string): boolean {
 }
 
 function shouldProcessTrackedSessionEvent(sessionKey: string): boolean {
-  return streamEventBus.hasSubscribers(sessionKey)
-    || Boolean(streamEventBus.getTrackedStream(sessionKey))
-    || activeRunIds.has(sessionKey);
+  const key = String(sessionKey || '').trim();
+  if (!key) return false;
+  return streamEventBus.hasSubscribers(key)
+    || Boolean(streamEventBus.getTrackedStream(key))
+    || activeRunIds.has(key)
+    || desiredSessionMessageSubscriptions.has(key)
+    || activeSessionMessageSubscriptions.has(key);
 }
 
 function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
@@ -727,7 +731,7 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
     streamEventBus.setLastSeenText(sessionKey, '');
     streamEventBus.setLatestText(sessionKey, '');
     // Signal the frontend that a new run segment has started
-    streamEventBus.publish(sessionKey, { type: 'run_resumed', content: '' });
+    streamEventBus.publish(sessionKey, { type: 'run_resumed', content: '', runId });
   }
 
   // Ensure the stream is tracked
@@ -1130,7 +1134,7 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     streamEventBus.setLatestText(sessionKey, '');
     // If the session was recently done, signal resumption
     if (wasRecent) {
-      streamEventBus.publish(sessionKey, { type: 'run_resumed', content: '' });
+      streamEventBus.publish(sessionKey, { type: 'run_resumed', content: '', runId });
     }
   }
 
@@ -1668,8 +1672,7 @@ export async function callGatewayRpc(method: string, params: Record<string, any>
         const sessionKey = typeof params.sessionKey === 'string' ? params.sessionKey : '';
         const runId = typeof payload?.runId === 'string' ? payload.runId : '';
         if (method === 'chat.send' && sessionKey && runId) {
-          activeRunIds.set(sessionKey, runId);
-          streamEventBus.startStream(sessionKey, runId);
+          registerRun(sessionKey, runId);
           debugLog(`chat.send accepted via generic RPC: sessionKey=${sessionKey} runId=${runId}`);
         }
         resolve(payload);
@@ -1724,8 +1727,10 @@ export async function sendChatMessage(
         clearTimeout(timeoutTimer);
         const runId = payload?.runId || '';
         if (runId) {
-          activeRunIds.set(sessionKey, runId);
+          registerRun(sessionKey, runId);
           debugLog(`chat.send accepted: sessionKey=${sessionKey} runId=${runId}`);
+        } else {
+          registerRun(sessionKey);
         }
         resolve({ runId });
       },
@@ -1821,6 +1826,14 @@ export async function steerSessionMessage(sessionKey: string, text: string): Pro
     pendingResponses.set(requestId, {
       resolve: (payload: any) => {
         clearTimeout(timeoutTimer);
+        const runId = typeof payload?.runId === 'string' && payload.runId.trim()
+          ? payload.runId.trim()
+          : '';
+        if (runId) {
+          registerRun(sessionKey, runId);
+        } else {
+          registerRun(sessionKey);
+        }
         resolve(payload && typeof payload === 'object' ? payload : {});
       },
       reject: (err: Error) => {
@@ -1927,8 +1940,16 @@ export function reconnectNow(): void {
  * Register a run for a session — used when we need to track a runId
  * that was obtained externally (e.g. via REST RPC fallback).
  */
-export function registerRun(sessionKey: string, runId: string): void {
-  activeRunIds.set(sessionKey, runId);
+export function registerRun(sessionKey: string, runId?: string): void {
+  const key = String(sessionKey || '').trim();
+  if (!key) return;
+  const normalizedRunId = typeof runId === 'string' && runId.trim() ? runId.trim() : undefined;
+  desiredSessionMessageSubscriptions.add(key);
+  if (normalizedRunId) activeRunIds.set(key, normalizedRunId);
+  streamEventBus.startStream(key, normalizedRunId);
+  if (isConnected()) {
+    void subscribeGatewaySessionMessageNow(key);
+  }
 }
 
 /**
@@ -1945,13 +1966,23 @@ export const __persistentGatewayWsTest = {
   deferCodexIdleTimeoutError,
   completeIdleTimedOutTurnIfVisible,
   clearPendingCodexIdleTimeout,
+  handleAgentEvent,
+  handleChatEvent,
+  registerRun,
+  shouldProcessTrackedSessionEvent,
   resetSession(sessionKey: string): void {
+    clearPendingEmptyFinal(sessionKey);
     clearPendingCodexIdleTimeout(sessionKey);
     streamEventBus.clearStream(sessionKey);
     activeRunIds.delete(sessionKey);
+    desiredSessionMessageSubscriptions.delete(sessionKey);
+    activeSessionMessageSubscriptions.delete(sessionKey);
     assistantLastSeenTextMap.delete(sessionKey);
     chatLastSeenTextMap.delete(sessionKey);
     sessionsWithAssistantTextStream.delete(sessionKey);
     lastToolPhaseBySession.delete(sessionKey);
+    messageToolReplyBySession.delete(sessionKey);
+    recentlyCompletedRunBySession.delete(sessionKey);
+    recentlyCompletedDeliveryBySession.delete(sessionKey);
   },
 };

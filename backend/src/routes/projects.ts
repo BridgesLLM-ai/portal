@@ -14,7 +14,7 @@ import { detectDeployType, allocatePort, startApp, stopApp, getAppStatus, getApp
 import { getWorkspaceOwnerId } from '../utils/workspaceScope';
 import extract from 'extract-zip';
 import { desktopExec, desktopExecDetached } from '../utils/desktopEnv';
-import { getDefaultModel, getProviderStatuses } from '../services/openclawConfigManager';
+import { cleanupInvalidRuntimeOnlyModelProvidersFromOpenClawConfig, getDefaultModel, getProviderStatuses } from '../services/openclawConfigManager';
 import { canonicalizeProviderModelId, modelForOpenClawSessionPatch, normalizePortalModelId, resolvePortalModelFromCatalog } from '../utils/openclawCli';
 
 /** Shell-escape a filename for safe use in execSync commands */
@@ -258,6 +258,7 @@ async function updateProjectAgentBindIfPresent(userId: string, stableSlug: strin
   const expectedBind = `${PROJECTS_DIR}/${userId}/${projectDirName}:/workspace/project:rw`;
   const expectedWorkdir = '/workspace';
   const expectedWorkspaceAccess = 'rw';
+  cleanupInvalidRuntimeOnlyModelProvidersFromOpenClawConfig();
   const configResult = await gatewayRpcCall('config.get', {});
   if (!configResult.ok) return;
 
@@ -652,8 +653,6 @@ router.get('/models/available', authenticateToken, requireApproved, async (_req:
       res.json({ 
         models: [
           { id: 'codex/gpt-5.5', name: 'GPT-5.5 Codex', provider: 'openai-codex' },
-          { id: 'codex/gpt-5.4', name: 'GPT-5.4 Codex', provider: 'openai-codex' },
-          { id: 'codex/gpt-5.4-mini', name: 'GPT-5.4 Mini', provider: 'openai-codex' },
           { id: 'anthropic/claude-opus-4-8', name: 'Claude Opus 4.8', provider: 'anthropic' },
           { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6', provider: 'anthropic' },
           { id: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', provider: 'anthropic' },
@@ -3180,16 +3179,15 @@ function getModelDisplayName(model: string): string {
     'ollama/gemma4:e2b': 'Gemma 4 E2B',
     'ollama/gemma4:e4b': 'Gemma 4 E4B',
     'codex/gpt-5.5': 'GPT-5.5 Codex',
-    'codex/gpt-5.4': 'GPT-5.4 Codex',
-    'codex/gpt-5.4-mini': 'GPT-5.4 Mini',
+    'openai/gpt-5.4': 'GPT-5.4 Codex',
+    'openai/gpt-5.4-mini': 'GPT-5.4 Mini',
     'openai/gpt-5.1': 'GPT-5.1',
     'openai-codex/gpt-5.1': 'GPT-5.1',
     'openai/gpt-5.2': 'GPT-5.2',
     'openai-codex/gpt-5.2': 'GPT-5.2',
     'openai/gpt-5.3-codex': 'Codex (5.3)',
     'openai-codex/gpt-5.3-codex': 'Codex (5.3)',
-    'openai/gpt-5.4': 'Codex (5.4)',
-    'openai-codex/gpt-5.4': 'Codex (5.4)',
+    'openai-codex/gpt-5.4': 'GPT-5.4 Codex',
   };
   return names[model] || model.replace(/^(anthropic|ollama|codex|openai-codex|openai)\//, '');
 }
@@ -3361,6 +3359,7 @@ async function ensureProjectAgent(
   const agentId = getProjectAgentId(userId, stableSlug);
 
   const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  cleanupInvalidRuntimeOnlyModelProvidersFromOpenClawConfig();
 
   // Fast path: already known from this process lifetime
   if (knownAgentIds.has(agentId)) {

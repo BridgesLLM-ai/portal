@@ -60,22 +60,27 @@ const GOOGLE_MODEL_MAP: Record<string, string> = {
 };
 
 const OPENAI_CODEX_MODEL_MAP: Record<string, string> = {
-  'gpt-5.4-codex': 'gpt-5.4',
+  'gpt-5.4-codex': 'codex/gpt-5.5',
   'openai-codex/gpt-5.5-pro': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.4-pro': 'codex/gpt-5.4',
-  'openai-codex/gpt-5.4-codex': 'codex/gpt-5.4',
+  'openai-codex/gpt-5.4-pro': 'codex/gpt-5.5',
+  'openai-codex/gpt-5.4-codex': 'codex/gpt-5.5',
+  'openai-codex/gpt-5.4': 'codex/gpt-5.5',
+  'openai-codex/gpt-5.4-mini': 'codex/gpt-5.5',
   'openai-codex/gpt-5.2-codex': 'codex/gpt-5.2',
   'codex/gpt-5.5-pro': 'codex/gpt-5.5',
-  'codex/gpt-5.4-pro': 'codex/gpt-5.4',
-  'openai/gpt-5.4-codex': 'codex/gpt-5.4',
+  'codex/gpt-5.4': 'codex/gpt-5.5',
+  'codex/gpt-5.4-mini': 'codex/gpt-5.5',
+  'codex/gpt-5.4-pro': 'codex/gpt-5.5',
+  'openai/gpt-5.4': 'codex/gpt-5.5',
+  'openai/gpt-5.4-mini': 'codex/gpt-5.5',
+  'openai/gpt-5.4-pro': 'codex/gpt-5.5',
+  'openai/gpt-5.4-codex': 'codex/gpt-5.5',
   'codex/gpt-5.2-codex': 'codex/gpt-5.2',
-  'codex/gpt-5.4-codex': 'codex/gpt-5.4',
+  'codex/gpt-5.4-codex': 'codex/gpt-5.5',
 };
 
 const CURRENT_CODEX_RUNTIME_MODELS = new Set([
   'gpt-5.5',
-  'gpt-5.4',
-  'gpt-5.4-mini',
   'gpt-5.3-codex',
   'gpt-5.2',
 ]);
@@ -368,8 +373,21 @@ export function getOpenClawRuntimeHint(sessionInfo: any): string {
   ].map((value) => String(value || '').trim().toLowerCase()).filter(Boolean).join(' ');
 }
 
+function modelForCurrentCodexRuntime(normalized: string): string {
+  if (!normalized) return '';
+  const provider = normalized.includes('/') ? normalized.split('/')[0] : '';
+  const modelName = normalized.includes('/') ? normalized.slice(provider.length + 1) : normalized;
+  const openAiFamily = provider === 'openai' || provider === 'openai-codex' || provider === 'codex' || !provider;
+  if (!openAiFamily) return normalized;
+
+  if (modelName === 'gpt-5.5' || modelName === 'gpt-5.5-pro') return 'codex/gpt-5.5';
+  if (/^gpt-5\.4(?:-|$)/.test(modelName)) return 'codex/gpt-5.5';
+  if (CURRENT_CODEX_RUNTIME_MODELS.has(modelName)) return `codex/${modelName}`;
+  return normalized;
+}
+
 export function modelForOpenClawSessionPatch(sessionInfo: any, portalModel: string): string {
-  const normalized = normalizePortalModelId(portalModel);
+  const normalized = modelForCurrentCodexRuntime(normalizePortalModelId(portalModel));
   if (!normalized) return '';
 
   // OpenClaw 2026.6 exposes the Codex app-server runtime as the codex provider.
@@ -379,7 +397,6 @@ export function modelForOpenClawSessionPatch(sessionInfo: any, portalModel: stri
   const codexRuntime = /\bcodex\b/.test(runtimeHint) || normalized.startsWith('codex/');
   if (codexRuntime) {
     if (normalized.startsWith('codex/')) return normalized;
-    if (normalized.startsWith('openai/')) return `codex/${normalized.slice('openai/'.length)}`;
     if (normalized.startsWith('openai-codex/')) return `codex/${normalized.slice('openai-codex/'.length)}`;
     if (/^(gpt-|o\d|codex)/i.test(normalized)) return `codex/${normalized}`;
   }

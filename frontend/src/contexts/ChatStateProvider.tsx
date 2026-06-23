@@ -16,8 +16,6 @@ import React, {
 import client from '../api/client';
 import { gatewayAPI } from '../api/endpoints';
 import { authAPI } from '../api/auth';
-import { useAuthStore } from './AuthContext';
-import { isOwner } from '../utils/authz';
 import {
   extractThinkingChunk,
   isControlOnlyAssistantContent,
@@ -102,6 +100,9 @@ interface StreamSegment {
   ts: number;
   kind: 'text' | 'thinking';
 }
+
+const STEERING_INTERRUPTED_MARKER = '*(interrupted by steering message)*';
+const STREAM_RECOVERY_GRACE_MS = 45_000;
 
 export interface ChatMessage {
   id: string;
@@ -352,6 +353,7 @@ function isHiddenHistoryArtifactText(text: string): boolean {
     /^Heartbeat check complete(?:d)?\.?$/i,
     /^Pre-compaction memory flush\./i,
     /^Memory flush complete(?:d)?\.?$/i,
+    /^\[System\]\s+Your previous turn was interrupted by a gateway restart/i,
     /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i,
     /Handle the result internally\./i,
     /Sender \(untrusted metadata\):/i,
@@ -375,6 +377,10 @@ function summarizeHiddenHistoryArtifactText(text: string): string | null {
     return 'Earlier async command completed';
   }
 
+  if (/^\[System\]\s+Your previous turn was interrupted by a gateway restart/i.test(normalized)) {
+    return 'Previous turn interrupted by gateway restart';
+  }
+
   if (/^Read HEARTBEAT\.md if it exists/i.test(normalized)) {
     return 'Heartbeat check started';
   }
@@ -396,6 +402,21 @@ function summarizeHiddenHistoryArtifactText(text: string): string | null {
 
 const MODEL_STORAGE_PREFIX = 'agentChats.lastModel.';
 const CHAT_HISTORY_OMITTED_PLACEHOLDER = '[chat.history omitted: message too large]';
+
+function normalizeStoredAgentId(rawAgentId: string | null | undefined): string | undefined {
+  const value = String(rawAgentId || '').trim();
+  return value && value !== 'main' ? value : undefined;
+}
+
+function readStoredAgentId(): string | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const storedAgentId = localStorage.getItem('agent-chat-agentId');
+  const normalizedAgentId = normalizeStoredAgentId(storedAgentId);
+  if (!normalizedAgentId && storedAgentId !== null) {
+    localStorage.removeItem('agent-chat-agentId');
+  }
+  return normalizedAgentId;
+}
 
 function normalizeProviderModel(provider: string, rawModel: string): string {
   const model = String(rawModel || '').trim();
@@ -1336,6 +1357,92 @@ function enrichAssistantHistoryFromLocalProjection(historyMessage: ChatMessage, 
   });
 }
 
+function mergeToolCallSnapshots(existing: ToolCall[] | undefined, incoming: ToolCall[]): ToolCall[] | undefined {
+  if ((!existing || existing.length === 0) && incoming.length === 0) return existing;
+
+  const merged: ToolCall[] = [];
+  const seen = new Set<string>();
+  const add = (tool: ToolCall | undefined) => {
+    if (!tool) return;
+    const key = tool.id || `${resolveToolName(tool.name)}:${tool.startedAt}`;
+    if (key && seen.has(key)) return;
+    if (key) seen.add(key);
+    merged.push(tool);
+  };
+
+  for (const tool of existing || []) add(tool);
+  for (const tool of incoming) add(tool);
+  return merged.length > 0 ? merged : undefined;
+}
+
+function appendSteeringInterruptedMarker(content: string): string {
+  const current = String(content || '').trim();
+  if (!current) return STEERING_INTERRUPTED_MARKER;
+  if (current.includes(STEERING_INTERRUPTED_MARKER)) return String(content || '');
+  return `${String(content || '').trimEnd()}\n\n${STEERING_INTERRUPTED_MARKER}`;
+}
+
+function preserveInterruptedLiveTurnSnapshot(
+  message: ChatMessage,
+  snapshot: {
+    text: string;
+    thinking: string;
+    segments: StreamSegment[];
+    toolCalls: ToolCall[];
+  },
+): ChatMessage {
+  const segments: TextSegment[] = [];
+  const seenSegments = new Set<string>();
+  const addSegment = (
+    text: string,
+    kind: 'text' | 'thinking',
+    ts?: number,
+    position: TextSegment['position'] = 'before',
+  ) => {
+    const value = String(text || '').trim();
+    if (!value) return;
+    const key = `${kind}|${normalizeHistoryReplayContent(value)}`;
+    if (seenSegments.has(key)) return;
+    seenSegments.add(key);
+    segments.push({
+      text: value,
+      position,
+      kind,
+      ...(typeof ts === 'number' && Number.isFinite(ts) ? { ts } : {}),
+      order: segments.length,
+    });
+  };
+
+  for (const segment of message.segments || []) {
+    addSegment(
+      segment.text,
+      segment.kind === 'thinking' ? 'thinking' : 'text',
+      segment.ts,
+      segment.position || 'before',
+    );
+  }
+  if (message.thinkingContent) {
+    addSegment(message.thinkingContent, 'thinking', message.createdAt.getTime(), 'before');
+  }
+  for (const segment of snapshot.segments) {
+    addSegment(segment.text, segment.kind, segment.ts, 'before');
+  }
+  if (snapshot.thinking) {
+    addSegment(snapshot.thinking, 'thinking', Date.now(), 'before');
+  }
+
+  const nextContent = snapshot.text.trim()
+    ? appendSteeringInterruptedMarker(snapshot.text)
+    : appendSteeringInterruptedMarker(message.content);
+
+  return {
+    ...message,
+    content: nextContent,
+    segments: segments.length > 0 ? segments : message.segments,
+    toolCalls: mergeToolCallSnapshots(message.toolCalls, snapshot.toolCalls),
+  };
+}
+
 function assistantToolSignature(message: ChatMessage): string {
   const calls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
   return calls.map((tool) => resolveToolName(tool.name)).filter(Boolean).join('|');
@@ -1657,28 +1764,30 @@ function getProviderSessionStorageKey(provider: string): string {
   return `${SESSION_STORAGE_PREFIX}${String(provider || 'OPENCLAW').trim().toUpperCase() || 'OPENCLAW'}`;
 }
 
-function normalizeInitialSession(provider: string, session: string): string {
+function normalizeInitialSession(provider: string, session: string, agentId?: string | null): string {
   const p = String(provider || '').trim().toUpperCase();
   const aliased = normalizePortalNewSessionAlias(String(session || '').trim() || 'main');
   const s = aliased || 'main';
-  if (p === 'OPENCLAW' && s === 'main') return 'agent:main:main';
-  if (p === 'OPENCLAW' && s.startsWith('new-')) return `agent:main:${s}`;
+  const agentKey = normalizeStoredAgentId(agentId) || 'main';
+  if (p === 'OPENCLAW' && s === 'main') return `agent:${agentKey}:main`;
+  if (p === 'OPENCLAW' && s === 'agent:main:main' && agentKey !== 'main') return `agent:${agentKey}:main`;
+  if (p === 'OPENCLAW' && s.startsWith('new-')) return `agent:${agentKey}:${s}`;
   if (p !== 'OPENCLAW' && s.startsWith('agent:')) return 'main';
   return s;
 }
 
-function readStoredSession(provider: string): string {
-  if (typeof window === 'undefined') return normalizeInitialSession(provider, 'main');
+function readStoredSession(provider: string, agentId?: string | null): string {
+  if (typeof window === 'undefined') return normalizeInitialSession(provider, 'main', agentId);
   const providerScoped = localStorage.getItem(getProviderSessionStorageKey(provider));
   if (providerScoped && providerScoped.trim()) {
-    return normalizeInitialSession(provider, providerScoped);
+    return normalizeInitialSession(provider, providerScoped, agentId);
   }
   const legacy = localStorage.getItem(LEGACY_SESSION_STORAGE_KEY) || 'main';
-  return normalizeInitialSession(provider, legacy);
+  return normalizeInitialSession(provider, legacy, agentId);
 }
 
-function persistStoredSession(provider: string, session: string): string {
-  const normalized = normalizeInitialSession(provider, session);
+function persistStoredSession(provider: string, session: string, agentId?: string | null): string {
+  const normalized = normalizeInitialSession(provider, session, agentId);
   if (typeof window !== 'undefined') {
     localStorage.setItem(getProviderSessionStorageKey(provider), normalized);
     localStorage.setItem(LEGACY_SESSION_STORAGE_KEY, normalized);
@@ -1888,11 +1997,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   );
   const [session, setSessionRaw] = useState(() => {
     const storedProvider = localStorage.getItem('agent-chat-provider') || 'OPENCLAW';
-    return readStoredSession(storedProvider);
+    const storedAgentId = readStoredAgentId();
+    return readStoredSession(storedProvider, storedAgentId);
   });
-  const [agentId, setAgentIdRaw] = useState<string | undefined>(
-    () => localStorage.getItem('agent-chat-agentId') || undefined,
-  );
+  const [agentId, setAgentIdRaw] = useState<string | undefined>(() => readStoredAgentId());
   const [selectedModel, setSelectedModelRaw] = useState(() => {
     const p = localStorage.getItem('agent-chat-provider') || 'OPENCLAW';
     const stored = normalizeProviderModel(p, localStorage.getItem(MODEL_STORAGE_PREFIX + p) || '');
@@ -1903,13 +2011,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
     return stored;
   });
-  const user = useAuthStore((state) => state.user);
 
   // Wrapped setters with localStorage persistence
   const setProvider = useCallback((p: string) => {
     localStorage.setItem('agent-chat-provider', p);
     setProviderRaw(p);
-    const nextSession = readStoredSession(p);
+    const nextSession = readStoredSession(p, agentIdRef.current);
     sessionRef.current = nextSession;
     setSessionRaw(nextSession);
     const stored = normalizeProviderModel(p, localStorage.getItem(MODEL_STORAGE_PREFIX + p) || '');
@@ -1922,14 +2029,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
   const setSession = useCallback((s: string) => {
-    const normalized = persistStoredSession(providerRef.current, s);
+    const normalized = persistStoredSession(providerRef.current, s, agentIdRef.current);
     sessionRef.current = normalized;
     setSessionRaw(normalized);
   }, []);
   const setAgentId = useCallback((a: string | undefined) => {
-    if (a) localStorage.setItem('agent-chat-agentId', a);
+    const normalized = normalizeStoredAgentId(a);
+    if (normalized) localStorage.setItem('agent-chat-agentId', normalized);
     else localStorage.removeItem('agent-chat-agentId');
-    setAgentIdRaw(a);
+    setAgentIdRaw(normalized);
   }, []);
   const setSelectedModel = useCallback((m: string) => {
     const normalized = normalizeProviderModel(provider, m);
@@ -1939,15 +2047,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   }, [provider]);
 
   useEffect(() => {
-    const normalized = normalizeInitialSession(provider, session);
+    const normalized = normalizeInitialSession(provider, session, agentId);
     if (normalized !== session) {
-      persistStoredSession(provider, normalized);
+      persistStoredSession(provider, normalized, agentId);
       sessionRef.current = normalized;
       setSessionRaw(normalized);
       return;
     }
-    persistStoredSession(provider, session);
-  }, [provider, session]);
+    persistStoredSession(provider, session, agentId);
+  }, [provider, session, agentId]);
 
   const deriveSessionModel = useCallback((sessionInfo: any): string => {
     const joinModel = (providerName: string, modelName: string): string => {
@@ -2083,6 +2191,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   // Refs
   const streamWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamRecoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamRecoveryStartedAtRef = useRef<number | null>(null);
   const compactionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionTelemetryRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const postTurnHistorySyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2119,6 +2229,91 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const textThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingTextUpdateRef = useRef<string | null>(null);
   const TEXT_THROTTLE_MS = 50; // 20fps is plenty smooth for text streaming
+
+  const clearStreamRecoveryTimer = useCallback(() => {
+    if (streamRecoveryTimerRef.current) {
+      clearTimeout(streamRecoveryTimerRef.current);
+      streamRecoveryTimerRef.current = null;
+    }
+    streamRecoveryStartedAtRef.current = null;
+  }, []);
+
+  const markStreamRecovery = useCallback((status = 'Reconnecting to stream…') => {
+    if (!streamRecoveryStartedAtRef.current) {
+      streamRecoveryStartedAtRef.current = Date.now();
+    }
+    setStatusText(status);
+    if (streamRecoveryTimerRef.current) return;
+
+    streamRecoveryTimerRef.current = setTimeout(() => {
+      streamRecoveryTimerRef.current = null;
+      if (!isStreamActiveRef.current) {
+        streamRecoveryStartedAtRef.current = null;
+        return;
+      }
+
+      const sessionKey = sessionRef.current || 'main';
+      const providerName = providerRef.current;
+      const assistantId = streamingAssistantIdRef.current;
+      const recoveredText = assembledRef.current.trim();
+      const recoveredThinking = thinkingContentRef.current.trim();
+      const recoveredSegments = streamSegmentsRef.current;
+      const recoveredToolCalls = activeStreamToolCallsRef.current;
+
+      console.warn('[ChatState] Stream recovery grace period expired — clearing stale live state and reloading history');
+      streamRecoveryStartedAtRef.current = null;
+      isStreamActiveRef.current = false;
+      streamTransportRef.current = null;
+      currentRunIdRef.current = null;
+      streamingAssistantIdRef.current = null;
+      assembledRef.current = '';
+      lastSegmentStartRef.current = 0;
+      lastRawTextLenRef.current = 0;
+      directClientRef.current?.setActiveStreamSession(null);
+      setIsRunning(false);
+      setStreamingPhase('idle');
+      setStatusText(null);
+      setThinkingContent('');
+      setStreamSegments([]);
+      setActiveToolName(null);
+      activeStreamToolCallsRef.current = [];
+      compactionPhaseRef.current = 'idle';
+      setCompactionPhase('idle');
+
+      if (assistantId) {
+        setMessages(prev => prev.map(message => {
+          if (message.id !== assistantId) return message;
+          const fallbackContent = message.content || 'Live stream connection interrupted; history reloaded.';
+          const nextContent = recoveredText
+            ? `${recoveredText}\n\n*(live stream connection interrupted; history reloaded)*`
+            : appendSteeringInterruptedMarker(fallbackContent);
+          return {
+            ...message,
+            content: nextContent,
+            thinkingContent: recoveredThinking || message.thinkingContent,
+            segments: recoveredSegments.length > 0
+              ? recoveredSegments.map((segment, index) => ({
+                  text: segment.text,
+                  position: 'before' as const,
+                  kind: segment.kind,
+                  ts: segment.ts,
+                  order: index,
+                }))
+              : message.segments,
+            toolCalls: mergeToolCallSnapshots(message.toolCalls, recoveredToolCalls),
+          };
+        }));
+      }
+
+      setMessages(prev => {
+        const content = 'Live stream connection interrupted; reloaded latest history.';
+        const last = prev[prev.length - 1];
+        if (last?.role === 'system' && last.content === content) return prev;
+        return [...prev, { id: nextId(), role: 'system', content, createdAt: new Date(), provenance: 'stream-recovery-timeout' }];
+      });
+      void loadHistoryInternalRef.current?.(sessionKey, providerName, { force: true, refreshActiveSnapshot: true });
+    }, STREAM_RECOVERY_GRACE_MS);
+  }, []);
 
   // Sync refs immediately when state changes. Note: the refs are ALSO updated
   // synchronously in the event handlers (see case 'session' below) to avoid races.
@@ -2447,9 +2642,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         directClient?.connect();
         setIsRunning(true);
         setStreamingPhase(prev => prev === 'idle' ? (activeToolName ? 'tool' : 'thinking') : prev);
-        setStatusText(prev => prev || 'Reconnecting to stream…');
+        markStreamRecovery(activeToolName ? getToolStatusText(activeToolName) : 'Reconnecting to stream…');
       } else if (!usingDirectOpenClaw && wsManagerRef.current && !wsManagerRef.current.isConnected()) {
         wsManagerRef.current.reconnect();
+        markStreamRecovery('Reconnecting to stream…');
       }
 
       try {
@@ -2488,7 +2684,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (usingDirectOpenClaw && (currentRunIdRef.current || activeToolName || hasRealToolEventsRef.current)) {
           setIsRunning(true);
           setStreamingPhase(prev => prev === 'idle' ? (activeToolName ? 'tool' : 'thinking') : prev);
-          setStatusText(prev => prev || (activeToolName ? getToolStatusText(activeToolName) : 'Reconnecting to stream…'));
+          markStreamRecovery(activeToolName ? getToolStatusText(activeToolName) : 'Reconnecting to stream…');
           resetStreamWatchdog();
           return;
         }
@@ -2503,6 +2699,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           || hasRealToolEventsRef.current
         );
 
+      clearStreamRecoveryTimer();
       isStreamActiveRef.current = false;
       streamTransportRef.current = null;
       setIsRunning(false);
@@ -2531,7 +2728,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         ));
       }
     }, timeoutMs);
-  }, [activeToolName, getRunningToolName, getStreamWatchdogTimeoutMs, useDirectGateway]);
+  }, [activeToolName, getRunningToolName, getStreamWatchdogTimeoutMs, markStreamRecovery, useDirectGateway]);
   const clearStreamWatchdog = useCallback(() => {
     if (streamWatchdogRef.current) { clearTimeout(streamWatchdogRef.current); streamWatchdogRef.current = null; }
   }, []);
@@ -2541,13 +2738,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (providerRef.current !== 'OPENCLAW') return sessionKey;
     if (sessionKey.startsWith('agent:')) return sessionKey;
     if (!sessionKey || sessionKey === 'main') {
-      return isOwner(user) ? 'agent:main:main' : toConcreteOpenClawSessionKey('main', agentIdRef.current);
+      return toConcreteOpenClawSessionKey('main', agentIdRef.current);
     }
     if (sessionKey.startsWith('new-')) {
       return toConcreteOpenClawSessionKey(sessionKey, agentIdRef.current);
     }
     return sessionKey;
-  }, [user]);
+  }, []);
 
   const appendSystemNotice = useCallback((content: string, provenance?: string) => {
     const now = Date.now();
@@ -2794,6 +2991,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       directPendingEmptyFinalRef.current = null;
     }
     clearStreamWatchdog();
+    clearStreamRecoveryTimer();
     clearPendingTextRender();
     isStreamActiveRef.current = false;
     streamTransportRef.current = null;
@@ -2811,7 +3009,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setActiveToolName(null);
     activeStreamToolCallsRef.current = [];
     applyCompactionSnapshotState('idle');
-  }, [applyCompactionSnapshotState, clearPendingTextRender, clearStreamWatchdog]);
+  }, [applyCompactionSnapshotState, clearPendingTextRender, clearStreamRecoveryTimer, clearStreamWatchdog]);
 
   const applyOpenClawActiveStreamSnapshot = useCallback((snapshot: any, options?: {
     statusTextWhenNoTool?: string | null;
@@ -2846,10 +3044,19 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const hasStatusSignal = Boolean(rawStatusText && !isMaintenanceStatusOnly);
     const hasMaintenanceSignal = isMaintenanceStatusOnly
       || snapshot.compactionPhase === 'compacting';
+    const hasStructuralActiveSignal = snapshot.active === true && (
+      Boolean(snapshot.runId)
+      || typeof snapshot.lastEventAt === 'number'
+      || typeof snapshot.startedAt === 'number'
+      || snapshot.phase === 'thinking'
+      || snapshot.phase === 'tool'
+      || snapshot.phase === 'streaming'
+    );
     const hasLiveSnapshotSignal = Boolean(effectiveSnapshotContent)
       || Boolean(snapshotToolName)
       || effectiveToolCalls.length > 0
-      || hasStatusSignal;
+      || hasStatusSignal
+      || hasStructuralActiveSignal;
     if (!hasLiveSnapshotSignal && hasMaintenanceSignal) {
       applyCompactionSnapshotState(snapshot.compactionPhase);
       return true;
@@ -2943,13 +3150,17 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       if (
         sessionRef.current !== expectedSession
         || providerRef.current !== expectedProvider
-        || historyGenRef.current !== expectedHistoryGen
       ) {
         debugLog('[ChatState] Ignoring stale active-stream snapshot', {
           expectedSession,
           currentSession: sessionRef.current,
           expectedProvider,
           currentProvider: providerRef.current,
+        });
+        return false;
+      }
+      if (historyGenRef.current !== expectedHistoryGen && !data?.active) {
+        debugLog('[ChatState] Ignoring stale inactive active-stream snapshot', {
           expectedHistoryGen,
           currentHistoryGen: historyGenRef.current,
         });
@@ -2958,6 +3169,26 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       const manager = wsManagerRef.current;
       if (!data?.active) {
         if (options?.clearIfInactive && isStreamActiveRef.current) {
+          const canSafelyClear = data?.safeToClear === true || data?.inactiveReason === 'terminal' || data?.inactiveReason === 'stale';
+          const hasLocalLiveEvidence = Boolean(
+            currentRunIdRef.current
+            || streamingAssistantIdRef.current
+            || activeToolNameRef.current
+            || hasRealToolEventsRef.current
+            || assembledRef.current.trim()
+            || thinkingContentRef.current.trim()
+            || streamSegmentsRef.current.length > 0
+          );
+          if (!canSafelyClear && hasLocalLiveEvidence) {
+            debugLog('[ChatState] Inactive stream snapshot is ambiguous — preserving local active stream state', {
+              inactiveReason: data?.inactiveReason || 'unknown',
+            });
+            setIsRunning(true);
+            setStreamingPhase(prev => prev === 'idle' ? (activeToolNameRef.current ? 'tool' : 'thinking') : prev);
+            markStreamRecovery(activeToolNameRef.current ? getToolStatusText(activeToolNameRef.current) : 'Checking stream status…');
+            resetStreamWatchdog();
+            return true;
+          }
           debugLog('[ChatState] Active-stream snapshot is idle — clearing stale stream UI');
           clearActiveStreamState();
         }
@@ -2985,7 +3216,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     } catch {
       return false;
     }
-  }, [applyOpenClawActiveStreamSnapshot, clearActiveStreamState, resetStreamWatchdog, useDirectGateway]);
+  }, [applyOpenClawActiveStreamSnapshot, clearActiveStreamState, markStreamRecovery, resetStreamWatchdog, useDirectGateway]);
 
   // History loader
   const loadHistoryInternal = useCallback(async (sessionKey: string, prov?: string, options?: { force?: boolean; refreshActiveSnapshot?: boolean; preserveLocalMessages?: boolean }): Promise<boolean> => {
@@ -3013,7 +3244,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       if (resolvedSessionKey && resolvedSessionKey !== sessionRef.current) {
         sessionRef.current = resolvedSessionKey;
         setSessionRaw(resolvedSessionKey);
-        persistStoredSession(prov || providerRef.current, resolvedSessionKey);
+        persistStoredSession(prov || providerRef.current, resolvedSessionKey, agentIdRef.current);
       }
       const targetSessionKey = resolvedSessionKey || sessionKey;
       const [result, streamStatusResult] = await Promise.all([
@@ -3171,7 +3402,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setMessageQueue([]);
     sessionRef.current = sessionKey;
     setSessionRaw(sessionKey);
-    persistStoredSession(providerRef.current, sessionKey);
+    persistStoredSession(providerRef.current, sessionKey, agentIdRef.current);
     directClientRef.current?.setCurrentSession(sessionKey);
     // Force-load history bypassing the isStreamActive guard, but do not preserve
     // transient local messages from the previously selected session.
@@ -3188,7 +3419,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const directClient = directClientRef.current;
     if (usingDirectGateway && isStreamActiveRef.current && !directClient?.isConnected) {
       directClient?.connect();
-      setStatusText('Reconnecting to stream…');
+      markStreamRecovery('Reconnecting to stream…');
     }
     try {
       await loadHistoryInternal(currentSession, currentProvider, { force: true, refreshActiveSnapshot: true });
@@ -3196,7 +3427,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       console.error('[ChatState] Refresh error:', err);
       try { await loadHistoryInternal(currentSession, currentProvider); } catch {}
     }
-  }, [loadHistoryInternal, useDirectGateway]);
+  }, [loadHistoryInternal, markStreamRecovery, useDirectGateway]);
 
   // Load history when session/provider changes.
   // We intentionally do NOT call clearMessages here — the caller (handleSelectSession,
@@ -3279,7 +3510,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         return; // Direct gateway already handling this
       }
     }
-    const portalStreamTypes = ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'status', 'segment_break', 'done', 'error', 'stream_resume', 'stream_ended', 'run_resumed'];
+    const portalStreamTypes = ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'status', 'stream_status', 'segment_break', 'done', 'error', 'stream_resume', 'stream_ended', 'run_resumed'];
+    if (portalStreamTypes.includes(data?.type) && data?.type !== 'stream_status') {
+      clearStreamRecoveryTimer();
+    }
     if (incomingPortalRunId && portalStreamTypes.includes(data?.type)) {
       if (!currentRunIdRef.current || !isStreamActiveRef.current) {
         currentRunIdRef.current = incomingPortalRunId;
@@ -3318,7 +3552,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     // Only process stream events if we have an active assistant message.
     // Some event types are allowed without a bubble so we can wait for visible
     // content before materializing a resumed turn.
-    const passthrough = ['session', 'exec_approval', 'exec_approval_resolved', 'connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_ended', 'run_resumed'];
+    const passthrough = ['session', 'exec_approval', 'exec_approval_resolved', 'connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_status', 'stream_ended', 'run_resumed'];
     const autoCreateBubbleTypes = ['text', 'thinking', 'status', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
     const waitForVisibleStreamTypes = ['thinking', 'done', 'error'];
     if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOrMaintenanceAssistantContent(data.content)) {
@@ -3347,7 +3581,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (data.sessionId) {
           setSessionAvailability('present');
           setSessionRaw(data.sessionId);
-          persistStoredSession(providerRef.current, data.sessionId);
+          persistStoredSession(providerRef.current, data.sessionId, agentIdRef.current);
         }
         if (data.provenance) setLastProvenance(data.provenance);
         if (data.model) {
@@ -3694,6 +3928,25 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         applyOpenClawActiveStreamSnapshot({ ...data, active: true }, { statusTextWhenNoTool: 'Reconnecting to stream…', source: 'portal' });
         break;
       }
+      case 'stream_status': {
+        if (data.active) {
+          applyOpenClawActiveStreamSnapshot({ ...data, active: true }, { statusTextWhenNoTool: 'Reconnecting to stream…', source: 'portal' });
+          break;
+        }
+        const canSafelyClear = data.safeToClear === true || data.inactiveReason === 'terminal' || data.inactiveReason === 'stale';
+        if (providerRef.current === 'OPENCLAW' && isStreamActiveRef.current && !canSafelyClear) {
+          setIsRunning(true);
+          setStreamingPhase(prev => prev === 'idle' ? (activeToolNameRef.current ? 'tool' : 'thinking') : prev);
+          markStreamRecovery(activeToolNameRef.current ? getToolStatusText(activeToolNameRef.current) : 'Reconnecting to stream…');
+          resetStreamWatchdog();
+          break;
+        }
+        if (canSafelyClear && isStreamActiveRef.current) {
+          clearActiveStreamState();
+          schedulePostTurnHistorySync(900);
+        }
+        break;
+      }
       case 'run_resumed': {
         debugLog(streamingAssistantIdRef.current ? 'run_resumed agent continuing after sub-agent' : 'run_resumed resumed without visible bubble');
         isStreamActiveRef.current = true;
@@ -3728,7 +3981,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'keepalive':
         break;
     }
-  }, [applyOpenClawActiveStreamSnapshot, clearSuppressedRunId, ensureStreamingAssistantBubble, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, mergeStreamText, scheduleSessionTelemetryRefresh, setLiveRunPhase, upsertStreamingAssistant]);
+  }, [applyOpenClawActiveStreamSnapshot, clearActiveStreamState, clearStreamRecoveryTimer, clearSuppressedRunId, ensureStreamingAssistantBubble, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, mergeStreamText, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, setLiveRunPhase, upsertStreamingAssistant]);
 
   // Keep handleWsEvent in a ref so the WS handler always calls the latest version
   const handleWsEventRef = useRef(handleWsEvent);
@@ -3846,6 +4099,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
    */
   const handleDirectGatewayEvent = useCallback((evt: GatewayEvent) => {
     const isStreamEvent = evt.event === 'chat' || evt.event === 'agent';
+    if (isStreamEvent) {
+      clearStreamRecoveryTimer();
+    }
     const payload = evt.payload;
     const currentSession = resolveOpenClawSessionKey(sessionRef.current);
     const payloadSession = typeof payload?.sessionKey === 'string'
@@ -4487,7 +4743,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
       }
     }
-  }, [clearDirectPendingEmptyFinal, clearSuppressedRunId, completeDirectAssistantTurn, ensureStreamingAssistantBubble, isAbortTerminalError, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, clearPendingTextRender, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, resolveCurrentStreamModel, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase]);
+  }, [clearDirectPendingEmptyFinal, clearStreamRecoveryTimer, clearSuppressedRunId, completeDirectAssistantTurn, ensureStreamingAssistantBubble, isAbortTerminalError, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, clearPendingTextRender, mergeStreamText, upsertStreamingAssistant, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, resolveCurrentStreamModel, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase]);
 
   // WS setup — runs once on mount, survives entire app lifetime
   // Handler registration MUST happen in the same effect that creates the manager,
@@ -4524,7 +4780,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         console.warn('[ChatState] WS disconnected during active stream');
         setIsRunning(true);
         setStreamingPhase(prev => prev === 'idle' ? 'thinking' : prev);
-        setStatusText('Reconnecting to stream…');
+        markStreamRecovery('Reconnecting to stream…');
       }
     });
     // On reconnect: for OpenClaw, reconcile from HTTP history first so one request
@@ -4625,7 +4881,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           if (currentSession && currentSession !== sessionRef.current) {
             sessionRef.current = currentSession;
             setSessionRaw(currentSession);
-            persistStoredSession(currentProvider, currentSession);
+            persistStoredSession(currentProvider, currentSession, agentIdRef.current);
           }
           if (currentSession) {
             directClient.setCurrentSession(currentSession);
@@ -4640,7 +4896,16 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             console.warn('[ChatState] Direct gateway disconnected during active stream');
             setIsRunning(true);
             setStreamingPhase(prev => prev === 'idle' ? 'thinking' : prev);
-            setStatusText('Reconnecting to stream…');
+            markStreamRecovery('Reconnecting to stream…');
+          }
+        },
+        onAuthFailure: async () => {
+          try {
+            await authAPI.refresh();
+            return true;
+          } catch (err) {
+            console.warn('[ChatState] Direct gateway auth refresh failed:', err);
+            return false;
           }
         },
         onError: (err) => {
@@ -4662,7 +4927,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         directClientRef.current = null;
       }
     };
-  }, [directGatewayBootstrapReady, provider, handleDirectGatewayEvent, loadHistoryInternal, resolveOpenClawSessionKey, startupReady, useDirectGateway]);
+  }, [directGatewayBootstrapReady, provider, handleDirectGatewayEvent, loadHistoryInternal, markStreamRecovery, resolveOpenClawSessionKey, startupReady, useDirectGateway]);
 
   // Fresh page loads can race transport/session setup. Give OpenClaw a short retry window
   // to detect an already-active stream so second-device reopen reliably attaches mid-turn.
@@ -4715,7 +4980,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (usingDirectGateway) {
           directClient?.connect();
           if (isStreamActiveRef.current) {
-            setStatusText('Reconnecting to stream…');
+            markStreamRecovery('Reconnecting to stream…');
           }
         } else {
           manager?.reconnect();
@@ -4750,7 +5015,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [loadHistoryInternal, resetStreamWatchdog, resolveOpenClawSessionKey, useDirectGateway]);
+  }, [loadHistoryInternal, markStreamRecovery, resetStreamWatchdog, resolveOpenClawSessionKey, useDirectGateway]);
 
   // Clear messages helper — also invalidates any in-flight history load and
   // resets transient stream UI so switching sessions always starts clean.
@@ -4869,15 +5134,17 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         markRunIdSuppressed(interruptedRunId);
       }
       const interruptedAssistantId = streamingAssistantIdRef.current;
-      const interruptedText = assembledRef.current;
+      const interruptedSnapshot = {
+        text: assembledRef.current,
+        thinking: thinkingContentRef.current,
+        segments: [...streamSegmentsRef.current],
+        toolCalls: [...activeStreamToolCallsRef.current],
+      };
       clearActiveStreamState();
       if (interruptedAssistantId) {
         setMessages(prev => prev.map((message) => {
           if (message.id !== interruptedAssistantId) return message;
-          if (interruptedText.trim()) {
-            return { ...message, content: `${interruptedText}\n\n*(interrupted by steering message)*` };
-          }
-          return { ...message, content: message.content || '*(interrupted by steering message)*' };
+          return preserveInterruptedLiveTurnSnapshot(message, interruptedSnapshot);
         }));
       }
     }
@@ -4957,7 +5224,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (currentSession !== sessionRef.current) {
           sessionRef.current = currentSession;
           setSessionRaw(currentSession);
-          persistStoredSession(providerRef.current, currentSession);
+          persistStoredSession(providerRef.current, currentSession, agentIdRef.current);
         }
         debugLog('[ChatState] Sending via direct gateway to session:', currentSession);
         const steerResult = shouldSteerActiveTurn
@@ -5124,7 +5391,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             if (evt.sessionId) {
               setSessionAvailability('present');
               setSessionRaw(evt.sessionId);
-              persistStoredSession(providerRef.current, evt.sessionId);
+              persistStoredSession(providerRef.current, evt.sessionId, agentIdRef.current);
             }
             if (evt.provenance) setLastProvenance(evt.provenance);
           } else if (evt.type === 'text') {

@@ -7,7 +7,7 @@ const email = process.env.PORTAL_TEST_EMAIL;
 const password = process.env.PORTAL_TEST_PASSWORD;
 const chromeBin = process.env.CHROME_BIN || '/usr/bin/google-chrome';
 const resultPath = process.env.RESULT_PATH || '';
-const validationModel = process.env.PORTAL_VALIDATION_MODEL || 'openai-codex/gpt-5.4-mini';
+const validationModel = process.env.PORTAL_VALIDATION_MODEL || 'codex/gpt-5.5';
 if (!baseUrl) throw new Error('PORTAL_BASE_URL is required');
 if (!email || !password) throw new Error('PORTAL_TEST_EMAIL and PORTAL_TEST_PASSWORD are required');
 

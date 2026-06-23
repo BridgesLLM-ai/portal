@@ -182,6 +182,11 @@ const AGENT_IDENTITY_FALLBACK: Record<string, string> = {
 
 /* ─── Helpers ───────────────────────────────────────────────────────────── */
 
+function normalizeOpenClawAgentId(rawAgentId?: string | null): string | undefined {
+  const value = String(rawAgentId || '').trim();
+  return value && value !== 'main' ? value : undefined;
+}
+
 function getAgentEmoji(agent: OpenClawAgent): string {
   if (agent.identity) return agent.identity;
   return AGENT_IDENTITY_FALLBACK[agent.id] || '🤖';
@@ -477,18 +482,16 @@ export default function AgentSelector({
         if (!cancelled && data.providers) {
           setProviders(data.providers);
           const saved = localStorage.getItem(STORAGE_KEY);
-          const savedAgent = localStorage.getItem(AGENT_STORAGE_KEY);
-          const preferredOpenClawAgent = (savedAgent && savedAgent !== 'main')
-            ? savedAgent
-            : (defaultOpenClawAgentId || savedAgent || 'main');
+          const savedAgent = normalizeOpenClawAgentId(localStorage.getItem(AGENT_STORAGE_KEY));
+          const defaultAgent = normalizeOpenClawAgentId(defaultOpenClawAgentId);
+          const preferredOpenClawAgent = savedAgent || defaultAgent;
           const usableProviders = data.providers.filter((p: ProviderInfo) => p.usable !== false);
-          if (saved && usableProviders.some((p: ProviderInfo) => p.name === saved)) {
-            onChange({ provider: saved, agentId: saved === 'OPENCLAW' ? preferredOpenClawAgent : undefined });
-          } else if (usableProviders.length > 0) {
-            const fallback = usableProviders[0].name;
-            if (!value || !usableProviders.some((p: ProviderInfo) => p.name === value)) {
-              onChange({ provider: fallback, agentId: fallback === 'OPENCLAW' ? preferredOpenClawAgent : undefined });
-            }
+          const currentProviderUsable = value && usableProviders.some((p: ProviderInfo) => p.name === value);
+          if (!currentProviderUsable && usableProviders.length > 0) {
+            const fallback = saved && usableProviders.some((p: ProviderInfo) => p.name === saved)
+              ? saved
+              : usableProviders[0].name;
+            onChange({ provider: fallback, agentId: fallback === 'OPENCLAW' ? preferredOpenClawAgent : undefined });
           }
         }
       } catch {
@@ -500,17 +503,6 @@ export default function AgentSelector({
     void fetchProviders();
     return () => { cancelled = true; };
   }, [open, defaultOpenClawAgentId, onChange, value]);
-
-  useEffect(() => {
-    if (value !== 'OPENCLAW' || !defaultOpenClawAgentId || !agents.length) return;
-    const savedAgent = localStorage.getItem(AGENT_STORAGE_KEY);
-    const shouldPromoteDefault = !savedAgent || savedAgent === 'main';
-    if (!shouldPromoteDefault) return;
-    if ((agentId || 'main') !== 'main') return;
-    if (!agents.some((agent) => agent.id === defaultOpenClawAgentId)) return;
-    onChange({ provider: 'OPENCLAW', agentId: defaultOpenClawAgentId });
-    localStorage.setItem(AGENT_STORAGE_KEY, defaultOpenClawAgentId);
-  }, [value, agentId, agents, defaultOpenClawAgentId, onChange]);
 
   // Fetch OpenClaw sub-agents lazily when the selector opens. Cache still seeds the
   // UI immediately, but we do not spend first-load bandwidth on hidden dropdown data.
@@ -624,10 +616,13 @@ export default function AgentSelector({
   }, [open]);
 
   const handleSelect = useCallback((provider: string, selectedAgentId?: string) => {
-    onChange({ provider, agentId: selectedAgentId });
+    const normalizedAgentId = provider === 'OPENCLAW'
+      ? normalizeOpenClawAgentId(selectedAgentId)
+      : undefined;
+    onChange({ provider, agentId: normalizedAgentId });
     localStorage.setItem(STORAGE_KEY, provider);
-    if (selectedAgentId) {
-      localStorage.setItem(AGENT_STORAGE_KEY, selectedAgentId);
+    if (normalizedAgentId) {
+      localStorage.setItem(AGENT_STORAGE_KEY, normalizedAgentId);
     } else {
       localStorage.removeItem(AGENT_STORAGE_KEY);
     }
@@ -655,14 +650,13 @@ export default function AgentSelector({
   let displayBg: string;
   let displayTextClass: string;
 
-  if (value === 'OPENCLAW' && agentId) {
-    const matchedAgent = agents.find(a => a.id === agentId);
-    displayLabel = matchedAgent ? getAgentLabel(matchedAgent, assistantName) : (agentId.charAt(0).toUpperCase() + agentId.slice(1));
-    displayAvatarUrl = matchedAgent ? getSubAgentAvatarUrl(matchedAgent) : subAgentAvatars[agentId];
-    if (agentId === 'main' && !displayAvatarUrl) {
-      displayAvatarUrl = agentAvatars.OPENCLAW || undefined;
-    }
-    displayFallback = matchedAgent ? getAgentEmoji(matchedAgent) : (AGENT_IDENTITY_FALLBACK[agentId] || '🤖');
+  const effectiveAgentId = value === 'OPENCLAW' ? normalizeOpenClawAgentId(agentId) : undefined;
+
+  if (value === 'OPENCLAW' && effectiveAgentId) {
+    const matchedAgent = agents.find(a => a.id === effectiveAgentId);
+    displayLabel = matchedAgent ? getAgentLabel(matchedAgent, assistantName) : (effectiveAgentId.charAt(0).toUpperCase() + effectiveAgentId.slice(1));
+    displayAvatarUrl = matchedAgent ? getSubAgentAvatarUrl(matchedAgent) : subAgentAvatars[effectiveAgentId];
+    displayFallback = matchedAgent ? getAgentEmoji(matchedAgent) : (AGENT_IDENTITY_FALLBACK[effectiveAgentId] || '🤖');
     displayBg = currentMeta.avatarBg;
     displayTextClass = currentMeta.avatarText;
   } else {
@@ -753,7 +747,7 @@ export default function AgentSelector({
                       className={`w-full flex items-center gap-2.5 px-4 py-2.5 text-sm transition-colors ${
                         !isUsable
                           ? 'text-slate-500 cursor-not-allowed opacity-60'
-                          : isSelectedProvider && !agentId
+                          : isSelectedProvider && !effectiveAgentId
                             ? 'bg-emerald-500/10 text-emerald-300'
                             : 'text-slate-300 hover:bg-white/[0.04] hover:text-white'
                       }`}
@@ -775,7 +769,7 @@ export default function AgentSelector({
                       {agentsLoading && (
                         <Loader2 size={11} className="text-slate-600 animate-spin ml-auto flex-shrink-0" />
                       )}
-                      {isSelectedProvider && !agentId && isUsable && (
+                      {isSelectedProvider && !effectiveAgentId && isUsable && (
                         <Check size={14} className="text-emerald-400 flex-shrink-0" />
                       )}
                     </button>
@@ -786,7 +780,7 @@ export default function AgentSelector({
                       className={`w-full flex items-center gap-2.5 px-4 py-2.5 text-sm transition-colors ${
                         !isUsable
                           ? 'text-slate-500 cursor-not-allowed opacity-60'
-                          : isSelectedProvider && !agentId
+                          : isSelectedProvider && !effectiveAgentId
                             ? 'bg-emerald-500/10 text-emerald-300'
                             : 'text-slate-300 hover:bg-white/[0.04] hover:text-white'
                       }`}
@@ -805,7 +799,7 @@ export default function AgentSelector({
                         </div>
                         {detailLabel && <div className="text-[10px] text-slate-500 truncate">{detailLabel}</div>}
                       </div>
-                      {isSelectedProvider && !agentId && isUsable && (
+                      {isSelectedProvider && !effectiveAgentId && isUsable && (
                         <Check size={14} className="text-emerald-400" />
                       )}
                     </button>
@@ -814,7 +808,7 @@ export default function AgentSelector({
                   {isOpenClaw && agents.filter(a => a.id !== 'main').length > 0 && (
                     <div className="pb-1">
                       {agents.filter(a => a.id !== 'main').map((agent) => {
-                        const isSelected = value === 'OPENCLAW' && agentId === agent.id;
+                        const isSelected = value === 'OPENCLAW' && effectiveAgentId === agent.id;
                         const agentAvUrl = getSubAgentAvatarUrl(agent);
                         const resolvedAvUrl = agent.id === 'main' ? (agentAvUrl || agentAvatars.OPENCLAW || undefined) : agentAvUrl;
                         return (

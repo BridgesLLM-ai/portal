@@ -27,8 +27,6 @@ const GEMINI_DECLARED_FALLBACK = [
 
 const OPENCLAW_VISIBLE_MODEL_IDS = [
   'codex/gpt-5.5',
-  'codex/gpt-5.4',
-  'codex/gpt-5.4-mini',
   'google-gemini-cli/gemini-3.1-pro-preview',
   'google-gemini-cli/gemini-3-flash-preview',
   'google-gemini-cli/gemini-3.1-flash-lite',
@@ -59,6 +57,18 @@ function declaredModels(ids: string[], provider: string): ProviderModelDescripto
     displayName: displayNameFromId(id),
     source: 'declared' as const,
   }));
+}
+
+export function isOpenClawSessionSelectableModelId(id: string): boolean {
+  const normalizedId = normalizePortalModelId(id);
+  return normalizedId.startsWith('codex/')
+    || normalizedId.startsWith('anthropic/')
+    || normalizedId.startsWith('google-gemini-cli/')
+    || normalizedId.startsWith('google-antigravity/');
+}
+
+export function filterOpenClawSessionModelCatalog(models: ProviderModelDescriptor[]): ProviderModelDescriptor[] {
+  return models.filter((model) => isOpenClawSessionSelectableModelId(model.id));
 }
 
 const DECLARED_MODELS: Partial<Record<AgentProviderName, ProviderModelDescriptor[]>> = {
@@ -203,7 +213,9 @@ async function resolveOpenClawModels(): Promise<ProviderModelDescriptor[]> {
     if (!cliModels.some((entry) => entry.id === model.id)) cliModels.push(model);
   }
 
-  const models = cliModels.length ? cliModels : [...DECLARED_MODELS.OPENCLAW!];
+  const catalog = cliModels.length ? cliModels : [...DECLARED_MODELS.OPENCLAW!];
+  const curated = filterOpenClawSessionModelCatalog(catalog);
+  const models = curated.length ? curated : [...DECLARED_MODELS.OPENCLAW!];
   openClawModelCache = { at: Date.now(), models };
   return models;
 }

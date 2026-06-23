@@ -93,6 +93,34 @@ describe('gateway history readers', () => {
     ]);
   });
 
+  test('enhanced history summarizes gateway restart recovery prompts as system markers', () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-history-'));
+    const sessionId = 'gateway-restart-marker-session';
+    const filePath = path.join(sessionsDir, `${sessionId}.jsonl`);
+
+    fs.writeFileSync(filePath, JSON.stringify({
+      id: 'restart-1',
+      type: 'message',
+      timestamp: '2026-05-25T20:00:00.000Z',
+      message: {
+        role: 'user',
+        content: '[System] Your previous turn was interrupted by a gateway restart while OpenClaw was waiting on tool/model work. Continue from the existing transcript and finish the interrupted response.',
+      },
+    }) + '\n');
+
+    const messages = __gatewayHistoryTest.readSessionMessagesEnhanced(sessionId, 10, sessionsDir);
+
+    expect(messages).toEqual([
+      {
+        id: 'restart-1',
+        role: 'system',
+        content: 'Previous turn interrupted by gateway restart',
+        provenance: 'hidden-history-artifact',
+        timestamp: '2026-05-25T20:00:00.000Z',
+      },
+    ]);
+  });
+
   test('best OpenClaw history filters stale trajectory snapshots around canonical transcript span', () => {
     const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-history-'));
     const sessionKey = 'agent:main:trajectory-window-test';
@@ -229,6 +257,131 @@ describe('gateway history readers', () => {
     }
   });
 
+  test('enhanced session history merges recovered runtime reasoning into assistant messages that already have tool calls', () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-history-'));
+    const eventDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-turn-events-'));
+    const previousEventDir = process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+    process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = eventDir;
+
+    try {
+      const sessionKey = 'agent:main:runtime-merge-existing-segments-test';
+      const filePath = path.join(sessionsDir, `${sessionKey}.jsonl`);
+      fs.writeFileSync(filePath, [
+        JSON.stringify({
+          id: 'u1',
+          type: 'message',
+          timestamp: '2026-05-30T04:10:00.000Z',
+          message: { role: 'user', content: 'steer while the tool is running' },
+        }),
+        JSON.stringify({
+          id: 'a1',
+          type: 'message',
+          timestamp: '2026-05-30T04:10:05.000Z',
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'Existing local segment.' },
+              { type: 'toolCall', id: 'tool-read', name: 'read', arguments: { path: 'README.md' } },
+              { type: 'text', text: 'Partial answer after steering.' },
+            ],
+            model: 'openai-codex/gpt-5.5',
+          },
+        }),
+      ].join('\n'));
+
+      const event = (type: RuntimeTurnEvent['type'], seq: number, ts: number, extra: Partial<RuntimeTurnEvent> = {}): RuntimeTurnEvent => ({
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type,
+        sessionKey,
+        runId: 'run-merge-existing',
+        seq,
+        ts,
+        visible: true,
+        source: { transport: 'portal-stream-event-bus', eventType: type === 'assistant_reasoning' ? 'thinking' : (type === 'tool_started' ? 'tool_start' : 'text') },
+        ...extra,
+      });
+
+      recordRuntimeTurnEvent(sessionKey, event('assistant_reasoning', 1, Date.parse('2026-05-30T04:10:02.000Z'), {
+        text: 'Recovered reasoning that used to disappear after steering.',
+      }));
+      recordRuntimeTurnEvent(sessionKey, event('tool_started', 2, Date.parse('2026-05-30T04:10:03.000Z'), {
+        tool: { id: 'tool-read', name: 'read', status: 'running', arguments: { path: 'README.md' } },
+      }));
+      recordRuntimeTurnEvent(sessionKey, event('assistant_final', 3, Date.parse('2026-05-30T04:10:05.000Z'), {
+        text: 'Partial answer after steering.',
+        terminal: true,
+      }));
+
+      const messages = __gatewayHistoryTest.readSessionMessagesEnhancedForSessionKey(sessionKey, 20, sessionsDir);
+      const assistant = messages.find((message: any) => message.id === 'a1');
+
+      expect(assistant).toBeTruthy();
+      expect(assistant.segments.map((segment: any) => segment.text)).toEqual(expect.arrayContaining([
+        'Existing local segment.',
+        'Recovered reasoning that used to disappear after steering.',
+      ]));
+      expect(assistant.toolCalls).toEqual([
+        expect.objectContaining({
+          id: 'tool-read',
+          name: 'read',
+        }),
+      ]);
+    } finally {
+      if (previousEventDir === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+      else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previousEventDir;
+    }
+  });
+
+  test('active stream snapshot can recover from recent non-terminal runtime events', () => {
+    const eventDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-turn-events-'));
+    const previousEventDir = process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+    process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = eventDir;
+
+    try {
+      const sessionKey = 'agent:main:runtime-active-recovery-test';
+      const now = Date.now();
+      const event = (type: RuntimeTurnEvent['type'], seq: number, ts: number, extra: Partial<RuntimeTurnEvent> = {}): RuntimeTurnEvent => ({
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type,
+        sessionKey,
+        runId: 'run-active-recovery',
+        seq,
+        ts,
+        visible: true,
+        source: { transport: 'portal-stream-event-bus', eventType: type === 'tool_started' ? 'tool_start' : 'status' },
+        ...extra,
+      });
+
+      recordRuntimeTurnEvent(sessionKey, event('assistant_status', 0, now - 1000, {
+        text: 'Codex is working...',
+      }));
+      recordRuntimeTurnEvent(sessionKey, event('tool_started', 1, now, {
+        tool: { id: 'tool-audit', name: 'bash', status: 'running', arguments: { cmd: 'npm run build' } },
+      }));
+
+      expect(__gatewayHistoryTest.getOpenClawRuntimeActiveStreamSnapshot(sessionKey)).toEqual(expect.objectContaining({
+        active: true,
+        phase: 'tool',
+        runId: 'run-active-recovery',
+        toolName: 'bash',
+      }));
+
+      recordRuntimeTurnEvent(sessionKey, event('turn_done', 2, now + 1, {
+        terminal: true,
+        visible: false,
+      }));
+
+      expect(__gatewayHistoryTest.getOpenClawRuntimeActiveStreamSnapshot(sessionKey)).toEqual(expect.objectContaining({
+        active: false,
+        inactiveReason: 'terminal',
+        safeToClear: true,
+      }));
+    } finally {
+      if (previousEventDir === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+      else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previousEventDir;
+    }
+  });
+
   test('enhanced session history keeps prompt and final after long tool-heavy runtime overlay', () => {
     const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-history-'));
     const eventDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-turn-events-'));
@@ -309,5 +462,45 @@ describe('gateway history readers', () => {
       if (previousEventDir === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
       else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previousEventDir;
     }
+  });
+
+  test('enhanced session history collapses fragmented tool-only assistant messages without runtime overlay', () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-history-'));
+    const sessionKey = 'agent:main:fragmented-tool-history-test';
+    const filePath = path.join(sessionsDir, `${sessionKey}.jsonl`);
+    const toolBaseTs = Date.parse('2026-05-30T05:00:00.000Z');
+
+    fs.writeFileSync(filePath, [
+      JSON.stringify({
+        id: 'u1',
+        type: 'message',
+        timestamp: '2026-05-30T04:59:58.000Z',
+        message: { role: 'user', content: 'audit the server' },
+      }),
+      ...Array.from({ length: 5 }, (_, index) => JSON.stringify({
+        id: `tool-only-${index}`,
+        type: 'message',
+        timestamp: new Date(toolBaseTs + index * 1000).toISOString(),
+        message: {
+          role: 'assistant',
+          content: [{ type: 'toolCall', id: `tool-${index}`, name: 'bash', arguments: { index } }],
+        },
+      })),
+      JSON.stringify({
+        id: 'a-final',
+        type: 'message',
+        timestamp: new Date(toolBaseTs + 6000).toISOString(),
+        message: { role: 'assistant', content: 'Server audit complete.', model: 'openai-codex/gpt-5.5' },
+      }),
+    ].join('\n'));
+
+    const messages = __gatewayHistoryTest.readSessionMessagesEnhancedForSessionKey(sessionKey, 20, sessionsDir);
+    const final = messages.find((message: any) => message.id === 'a-final');
+
+    expect(messages.map((message: any) => message.content)).toContain('audit the server');
+    expect(final).toBeTruthy();
+    expect(final.toolCalls).toHaveLength(5);
+    expect(final.toolCalls.map((toolCall: any) => toolCall.id)).toEqual(['tool-0', 'tool-1', 'tool-2', 'tool-3', 'tool-4']);
+    expect(messages.filter((message: any) => message.role === 'assistant' && !message.content && Array.isArray(message.toolCalls))).toHaveLength(0);
   });
 });

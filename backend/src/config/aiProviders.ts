@@ -117,8 +117,6 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     onboardAuthChoice: 'openai-codex',
     defaultModels: [
       { id: 'codex/gpt-5.5', name: 'GPT-5.5 Codex', tier: 'frontier', description: 'Current OpenClaw Codex runtime model.' },
-      { id: 'codex/gpt-5.4', name: 'GPT-5.4 Codex', tier: 'balanced', description: 'Stable Codex fallback with broad compatibility.' },
-      { id: 'codex/gpt-5.4-mini', name: 'GPT-5.4 Mini', tier: 'fast', description: 'Fastest currently exposed OpenAI Codex option.' },
     ],
     setupInstructions: [
       { stepNumber: 1, title: 'You need an active ChatGPT subscription', detail: 'ChatGPT Plus ($20/mo), Pro ($200/mo), or Team. Free accounts do NOT work. If you don\'t have one, subscribe at https://chatgpt.com/ → "Upgrade to Plus".', link: { url: 'https://chatgpt.com/', label: 'Open ChatGPT' } },

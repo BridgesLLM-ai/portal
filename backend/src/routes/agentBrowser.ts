@@ -353,7 +353,7 @@ export function attachAgentBrowserWebSocket(httpServer: import('http').Server) {
     if (!url.startsWith('/api/agent-browser/stream')) return;
 
     const origin = req.headers.origin;
-    if (!isAllowedWebSocketOrigin(origin)) {
+    if (!isAllowedWebSocketOrigin(origin, req.headers.host)) {
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       socket.destroy();
       return;

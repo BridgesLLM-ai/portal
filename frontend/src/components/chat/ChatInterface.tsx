@@ -172,12 +172,21 @@ function getAgent(providerName: string): AgentIdentity {
   return AGENTS.find((a) => a.providerName === providerName) || AGENTS[0];
 }
 
+function normalizeOpenClawAgentSelection(providerName: string, rawAgentId?: string | null): string | undefined {
+  if (providerName !== 'OPENCLAW') return undefined;
+  const agentId = String(rawAgentId || '').trim();
+  return agentId && agentId !== 'main' ? agentId : undefined;
+}
+
+function getInitialSessionForAgentSelection(providerName: string, agentId?: string): string {
+  if (providerName !== 'OPENCLAW') return 'main';
+  return `agent:${agentId || 'main'}:main`;
+}
+
 /* ─── Provider model catalogs ───────────────────────────────────────────── */
 
 const OPENCLAW_MODEL_FALLBACK = [
   'codex/gpt-5.5',
-  'codex/gpt-5.4',
-  'codex/gpt-5.4-mini',
   'anthropic/claude-sonnet-4-6',
   'anthropic/claude-opus-4-8',
   'anthropic/claude-haiku-4-5',
@@ -617,9 +626,7 @@ const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
 };
 
 const OPENCLAW_FAST_MODE_MODELS = new Set([
-  'codex/gpt-5.4',
-  'openai/gpt-5.4',
-  'openai-codex/gpt-5.4',
+  'codex/gpt-5.5',
 ]);
 
 function supportsOpenClawFastModeModel(model?: string | null): boolean {
@@ -840,7 +847,7 @@ function SessionControls({
                     <Radio size={14} className={fastModeEnabled ? 'text-amber-400' : 'text-slate-500'} />
                     <div>
                       <div className="text-xs font-medium text-white">Codex Fast Mode</div>
-                      <div className="text-[10px] text-slate-500">Toggles OpenClaw session fast mode for GPT-5.4 and Codex sessions.</div>
+                      <div className="text-[10px] text-slate-500">Toggles OpenClaw session fast mode for Codex sessions.</div>
                     </div>
                   </div>
                   <button
@@ -862,7 +869,7 @@ function SessionControls({
                 <div className="text-[10px] text-slate-400">
                   {fastModeSupported
                     ? `Current: ${fastModeEnabled ? 'enabled' : 'disabled'} for ${shortModel}`
-                    : 'Available when the session model is codex/gpt-5.4, openai/gpt-5.4, or openai-codex/gpt-5.4.'}
+                    : 'Available when the session model is codex/gpt-5.5.'}
                 </div>
               </div>
 
@@ -2972,7 +2979,9 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const handleSelectAgent = useCallback(
     async (selection: AgentSelection) => {
       const providerChanged = selection.provider !== provider;
-      const agentChanged = selection.agentId !== agentId;
+      const nextAgentId = normalizeOpenClawAgentSelection(selection.provider, selection.agentId);
+      const currentAgentId = normalizeOpenClawAgentSelection(provider, agentId);
+      const agentChanged = nextAgentId !== currentAgentId;
       if (!providerChanged && !agentChanged) return;
       // Detach the visible chat from the active stream without aborting it.
       // Switching agents/providers is navigation, not an implicit Stop click.
@@ -2982,8 +2991,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       clearMessages();
       // Context setters handle localStorage persistence
       setProvider(selection.provider);
-      setAgentId(selection.agentId);
-      setSession('main');
+      setAgentId(nextAgentId);
+      setSession(getInitialSessionForAgentSelection(selection.provider, nextAgentId));
     },
     [provider, agentId, clearMessages, setProvider, setAgentId, setSession],
   );

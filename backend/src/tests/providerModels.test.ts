@@ -1,4 +1,4 @@
-import { parseOpenClawModelsListPayload } from '../agents/providerModels';
+import { filterOpenClawSessionModelCatalog, parseOpenClawModelsListPayload } from '../agents/providerModels';
 
 describe('provider model catalog curation', () => {
   test('OpenClaw live catalog parser keeps all available models and skips unavailable rows', () => {
@@ -20,6 +20,24 @@ describe('provider model catalog curation', () => {
       'google/gemini-2.5-pro',
       'google-antigravity/gemini-3.1-pro-high',
       'openrouter/deepseek/deepseek-v3.2',
+    ]);
+  });
+
+  test('OpenClaw Agent Chat catalog hides models that sessions.patch cannot select', () => {
+    const models = parseOpenClawModelsListPayload({
+      models: [
+        { key: 'codex/gpt-5.5', name: 'GPT-5.5', available: true },
+        { key: 'openai/gpt-5.4-mini', name: 'GPT-5.4 Mini', available: true },
+        { key: 'openai/gpt-5.5', name: 'GPT-5.5 OpenAI', available: true },
+        { key: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', available: true },
+        { key: 'google-gemini-cli/gemini-3-flash-preview', name: 'Gemini 3 Flash', available: true },
+      ],
+    });
+
+    expect(filterOpenClawSessionModelCatalog(models).map((entry) => entry.id)).toEqual([
+      'codex/gpt-5.5',
+      'anthropic/claude-haiku-4-5',
+      'google-gemini-cli/gemini-3-flash-preview',
     ]);
   });
 });

@@ -75,4 +75,68 @@ describe('PersistentGatewayWs Codex idle timeout handling', () => {
       unsubscribe();
     }
   });
+
+  it('processes lifecycle events for a direct-proxy session before a run id is known', () => {
+    const directSessionKey = 'test-direct-proxy-session-tracking';
+    const events: StreamEvent[] = [];
+    const unsubscribe = streamEventBus.subscribe(directSessionKey, (event) => events.push(event));
+
+    try {
+      __persistentGatewayWsTest.registerRun(directSessionKey);
+
+      expect(__persistentGatewayWsTest.shouldProcessTrackedSessionEvent(directSessionKey)).toBe(true);
+
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey: directSessionKey,
+        runId: 'run-direct-1',
+        stream: 'lifecycle',
+        data: {
+          phase: 'started',
+          statusText: 'Codex is working...',
+        },
+      });
+
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'run_resumed', runId: 'run-direct-1' }),
+        expect.objectContaining({ type: 'status', content: 'Codex is working...' }),
+      ]));
+      expect(streamEventBus.getStreamStatus(directSessionKey)).toEqual(expect.objectContaining({
+        active: true,
+        runId: 'run-direct-1',
+        phase: 'thinking',
+      }));
+    } finally {
+      unsubscribe();
+      __persistentGatewayWsTest.resetSession(directSessionKey);
+    }
+  });
+
+  it('completes chat events for a direct-proxy run registered from chat.send ack', () => {
+    const directSessionKey = 'test-direct-proxy-final-tracking';
+    const events: StreamEvent[] = [];
+    const unsubscribe = streamEventBus.subscribe(directSessionKey, (event) => events.push(event));
+
+    try {
+      __persistentGatewayWsTest.registerRun(directSessionKey, 'run-direct-final');
+
+      __persistentGatewayWsTest.handleChatEvent({
+        sessionKey: directSessionKey,
+        runId: 'run-direct-final',
+        state: 'final',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Recovered final answer.' }],
+        },
+      });
+
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'text', content: 'Recovered final answer.', replace: true }),
+        expect.objectContaining({ type: 'done', content: 'Recovered final answer.' }),
+      ]));
+      expect(streamEventBus.getStreamStatus(directSessionKey)).toBeNull();
+    } finally {
+      unsubscribe();
+      __persistentGatewayWsTest.resetSession(directSessionKey);
+    }
+  });
 });

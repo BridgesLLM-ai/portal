@@ -87,6 +87,8 @@ export interface OpenClawGatewayClientOptions {
   onDisconnected: () => void;
   /** Called when a reconnect attempt is scheduled */
   onReconnecting?: (attempt: number, delayMs: number) => void;
+  /** Called when the direct gateway reports an auth failure before giving up */
+  onAuthFailure?: () => Promise<boolean>;
   /** Called on connection error */
   onError?: (error: Error) => void;
 }
@@ -128,6 +130,7 @@ export class OpenClawGatewayClient {
   private readonly onConnected: () => void;
   private readonly onDisconnected: () => void;
   private readonly onReconnecting?: (attempt: number, delayMs: number) => void;
+  private readonly onAuthFailure?: () => Promise<boolean>;
   private readonly onError?: (error: Error) => void;
 
   constructor(options: OpenClawGatewayClientOptions) {
@@ -136,6 +139,7 @@ export class OpenClawGatewayClient {
     this.onConnected = options.onConnected;
     this.onDisconnected = options.onDisconnected;
     this.onReconnecting = options.onReconnecting;
+    this.onAuthFailure = options.onAuthFailure;
     this.onError = options.onError;
   }
 
@@ -198,12 +202,39 @@ export class OpenClawGatewayClient {
       const wasAuthenticated = this.authenticated;
       this.cleanup();
 
-      // Check for auth failures — don't auto-reconnect
-      if (event.code === 4001 || event.code === 4003 ||
-          event.reason?.toLowerCase().includes('unauthorized') ||
-          event.reason?.toLowerCase().includes('forbidden')) {
-        console.warn('[OpenClawGatewayClient] Auth failure, not reconnecting');
-        this.intentionallyClosed = true;
+      const reason = event.reason?.toLowerCase() || '';
+      const isAuthFailure = event.code === 4001 || event.code === 4003 ||
+        reason.includes('unauthorized') ||
+        reason.includes('forbidden') ||
+        reason.includes('expired');
+
+      if (isAuthFailure && !this.intentionallyClosed) {
+        if (wasAuthenticated) {
+          this.onDisconnected();
+        }
+        const recoverAuth = this.onAuthFailure;
+        if (!recoverAuth) {
+          console.warn('[OpenClawGatewayClient] Auth failure, not reconnecting');
+          this.intentionallyClosed = true;
+          return;
+        }
+
+        console.warn('[OpenClawGatewayClient] Auth failure, attempting session refresh before reconnect');
+        void recoverAuth()
+          .then((recovered) => {
+            if (!recovered || this.intentionallyClosed) {
+              this.intentionallyClosed = true;
+              return;
+            }
+            this.reconnectAttempt = 0;
+            this.reconnecting = true;
+            this.scheduleReconnect();
+          })
+          .catch((err) => {
+            console.warn('[OpenClawGatewayClient] Auth refresh failed, not reconnecting:', err);
+            this.intentionallyClosed = true;
+          });
+        return;
       }
 
       if (wasAuthenticated) {
