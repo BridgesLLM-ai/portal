@@ -8,13 +8,20 @@ const router = Router();
 router.use(authenticateToken, requireAdmin);
 
 const OLLAMA_CTRL_URL = process.env.OLLAMA_CTRL_URL || 'http://host.docker.internal:19123';
-const OLLAMA_CTRL_SECRET = process.env.OLLAMA_CTRL_SECRET || 'ollama-ctrl-8f3k2j';
+const LEGACY_OLLAMA_CTRL_SECRET = 'ollama-ctrl-8f3k2j';
+
+function getOllamaCtrlSecret(): string {
+  // Existing installs and the host-side control helper both supported this
+  // loopback-only legacy secret before the hardening pass. Keep it as a
+  // compatibility fallback until the installer provisions a per-install secret.
+  return process.env.OLLAMA_CTRL_SECRET || LEGACY_OLLAMA_CTRL_SECRET;
+}
 
 // Call the host-side Ollama control API
 async function ollamaCtrl(path: string, method: 'GET' | 'POST' = 'GET'): Promise<any> {
   const resp = await fetch(`${OLLAMA_CTRL_URL}${path}`, {
     method,
-    headers: { 'X-Secret': OLLAMA_CTRL_SECRET },
+    headers: { 'X-Secret': getOllamaCtrlSecret() },
     signal: AbortSignal.timeout(30000)
   });
   if (!resp.ok) {

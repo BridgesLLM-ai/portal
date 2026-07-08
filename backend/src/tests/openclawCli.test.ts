@@ -1,5 +1,6 @@
 import {
   canonicalizeProviderModelId,
+  ensureMemoryFlushMaintenanceModel,
   extractJsonFromCliOutput,
   modelForOpenClawSessionPatch,
   normalizeOpenClawConfigModelId,
@@ -50,6 +51,65 @@ describe('openclawCli helpers', () => {
       },
     })).toBe(true);
     expect(usesClaudeCliAuthProfile({ auth: { profiles: { 'anthropic:api': { provider: 'anthropic', mode: 'api_key' } } } })).toBe(false);
+  });
+
+  test('ensureMemoryFlushMaintenanceModel pins flushes to the compaction model when omitted', () => {
+    const config: any = {
+      agents: {
+        defaults: {
+          compaction: {
+            model: 'codex/gpt-5.5',
+            memoryFlush: { enabled: true, softThresholdTokens: 6000 },
+          },
+        },
+      },
+    };
+
+    expect(ensureMemoryFlushMaintenanceModel(config)).toEqual({ changed: true, model: 'codex/gpt-5.5' });
+    expect(config.agents.defaults.compaction.memoryFlush.model).toBe('codex/gpt-5.5');
+  });
+
+  test('ensureMemoryFlushMaintenanceModel creates a maintenance flush model from a configured Codex fallback', () => {
+    const config: any = {
+      auth: {
+        order: {
+          openai: ['openai:codex-cli'],
+        },
+      },
+      agents: {
+        defaults: {
+          model: {
+            primary: 'anthropic/claude-sonnet-4-6',
+            fallbacks: ['anthropic/claude-haiku-4-5', 'codex/gpt-5.5'],
+          },
+        },
+      },
+    };
+
+    expect(ensureMemoryFlushMaintenanceModel(config)).toEqual({ changed: true, model: 'codex/gpt-5.5' });
+    expect(config.agents.defaults.compaction).toEqual({
+      model: 'codex/gpt-5.5',
+      memoryFlush: {
+        model: 'codex/gpt-5.5',
+      },
+    });
+  });
+
+  test('ensureMemoryFlushMaintenanceModel normalizes existing flush model aliases without inventing a fallback', () => {
+    const config = {
+      agents: {
+        defaults: {
+          compaction: {
+            model: 'codex/gpt-5.5',
+            memoryFlush: { enabled: true, model: 'openai/gpt-5.5' },
+          },
+        },
+      },
+    };
+
+    expect(ensureMemoryFlushMaintenanceModel(config)).toEqual({ changed: true, model: 'codex/gpt-5.5' });
+    expect(config.agents.defaults.compaction.memoryFlush.model).toBe('codex/gpt-5.5');
+    expect(ensureMemoryFlushMaintenanceModel({ agents: { defaults: {} } })).toEqual({ changed: false, model: null });
   });
 
   test('resolvePortalModelFromCatalog chooses live catalog aliases and rejects unavailable full ids', () => {

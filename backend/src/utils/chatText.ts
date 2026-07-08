@@ -47,8 +47,28 @@ function stripAssistantControlLines(text: string): string {
     .trim();
 }
 
+function stripAssistantControlLinesPreserveWhitespace(text: string): string {
+  const normalized = String(text || '').replace(/\r\n/g, '\n');
+  if (!normalized) return normalized;
+  return normalized
+    .split('\n')
+    .filter((line) => !CONTROL_ONLY_ASSISTANT_OUTPUTS.has(line.trim().toUpperCase()))
+    .join('\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
 export function sanitizeAssistantText(text: string): string {
   return stripAssistantControlLines(text || '');
+}
+
+export function sanitizeAssistantChunk(text: string): string {
+  if (!text) return text;
+  const withoutReplyTags = text.replace(
+    /\[\[\s*(?:reply_to_current|reply_to|reply_to_message|reply_to_user|route_to|delegate_to)\b[^\]]*\]\]/gi,
+    '',
+  );
+  return stripAssistantControlLinesPreserveWhitespace(withoutReplyTags);
 }
 
 export function isControlOnlyAssistantText(text: string): boolean {

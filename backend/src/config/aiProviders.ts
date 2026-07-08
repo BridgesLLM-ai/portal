@@ -61,6 +61,7 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     onboardKeyFlag: 'anthropic-api-key',
     defaultModels: [
       { id: 'claude-opus-4-8', name: 'Claude Opus 4.8', tier: 'frontier', description: 'Most capable. Best for complex reasoning and difficult tasks.' },
+      { id: 'claude-fable-5', name: 'Claude Fable 5', tier: 'frontier', description: 'Large-context Claude model exposed through OpenClaw.' },
       { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', tier: 'balanced', description: 'Balanced. Great all-rounder for most tasks.' },
       { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', tier: 'fast', description: 'Fastest and cheapest. Good for simple tasks.' },
     ],

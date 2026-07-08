@@ -2366,7 +2366,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const getStreamWatchdogTimeoutMs = useCallback(() => {
     if (getRunningToolName()) return 15 * 60_000;
     if (compactionPhaseRef.current !== 'idle') return 10 * 60_000;
-    if (assembledRef.current.trim()) return 180_000;
+    // Assembled text does not mean the turn is nearly done: Claude CLI runtimes
+    // routinely go quiet for minutes between a text delta and the next tool or
+    // reasoning burst. A short window here fires the fuse mid-healthy-turn.
     return 10 * 60_000;
   }, [getRunningToolName]);
 
@@ -2631,7 +2633,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const timeoutMs = getStreamWatchdogTimeoutMs();
     streamWatchdogRef.current = setTimeout(async () => {
       if (!isStreamActiveRef.current) return;
-      console.warn('[ChatState] Stream watchdog: no activity for 180s — verifying stream status');
+      console.warn(`[ChatState] Stream watchdog: no activity for ${Math.round(timeoutMs / 1000)}s — verifying stream status`);
 
       const currentSession = sessionRef.current || 'main';
       const currentProvider = providerRef.current;
@@ -3011,6 +3013,33 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     applyCompactionSnapshotState('idle');
   }, [applyCompactionSnapshotState, clearPendingTextRender, clearStreamRecoveryTimer, clearStreamWatchdog]);
 
+  // Clear live stream UI without discarding visible turn output. Recovery paths
+  // (stream_status safeToClear, idle active-stream snapshots) can fire while the
+  // bubble still holds un-graduated thinking/text/tool state; dropping it makes
+  // thought bubbles vanish until a manual refresh reloads durable history.
+  const preserveLiveTurnThenClear = useCallback(() => {
+    const interruptedAssistantId = streamingAssistantIdRef.current;
+    const interruptedSnapshot = {
+      text: assembledRef.current,
+      thinking: thinkingContentRef.current,
+      segments: [...streamSegmentsRef.current],
+      toolCalls: [...activeStreamToolCallsRef.current],
+    };
+    clearActiveStreamState();
+    const hasVisibleLiveState = Boolean(
+      interruptedSnapshot.text.trim()
+      || interruptedSnapshot.thinking.trim()
+      || interruptedSnapshot.segments.length > 0
+      || interruptedSnapshot.toolCalls.length > 0,
+    );
+    if (interruptedAssistantId && hasVisibleLiveState) {
+      setMessages(prev => prev.map((message) => {
+        if (message.id !== interruptedAssistantId) return message;
+        return preserveInterruptedLiveTurnSnapshot(message, interruptedSnapshot);
+      }));
+    }
+  }, [clearActiveStreamState]);
+
   const applyOpenClawActiveStreamSnapshot = useCallback((snapshot: any, options?: {
     statusTextWhenNoTool?: string | null;
     source?: 'portal' | 'direct';
@@ -3077,6 +3106,26 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       currentRunIdRef.current = String(snapshot.runId);
     }
     directClientRef.current?.setActiveStreamSession(sessionRef.current || null);
+
+    // Resume snapshots carry recent normalized turn events. When local thinking
+    // state was lost (reconnect, fuse clear), replay assistant_reasoning events
+    // through the same merge as the live path so thought bubbles reappear
+    // without requiring a manual page refresh.
+    const snapshotTurnEvents: any[] = Array.isArray(snapshot.turnEvents) ? snapshot.turnEvents : [];
+    const hasLocalThinking = Boolean(thinkingContentRef.current.trim())
+      || streamSegmentsRef.current.some((segment) => segment.kind === 'thinking');
+    if (!hasLocalThinking && snapshotTurnEvents.length > 0) {
+      const reasoningEvents = snapshotTurnEvents
+        .filter((event) => event?.type === 'assistant_reasoning' && typeof event?.text === 'string' && event.text.trim())
+        .sort((a, b) => (Number(a?.seq) || 0) - (Number(b?.seq) || 0));
+      for (const event of reasoningEvents) {
+        appendThinkingChunk(
+          null,
+          extractThinkingChunk('thinking', event.text, Boolean(assembledRef.current)),
+          { replace: event.replace === true },
+        );
+      }
+    }
     const snapshotPhase = runningToolCall
       ? 'tool'
       : snapshot.phase === 'tool'
@@ -3127,7 +3176,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
     resetStreamWatchdog();
     return true;
-  }, [applyCompactionSnapshotState, ensureStreamingAssistantBubble, mergeStreamText, resetStreamWatchdog]);
+  }, [appendThinkingChunk, applyCompactionSnapshotState, ensureStreamingAssistantBubble, mergeStreamText, resetStreamWatchdog]);
 
   const hydrateActiveStream = useCallback(async (
     sessionKey: string,
@@ -3190,7 +3239,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             return true;
           }
           debugLog('[ChatState] Active-stream snapshot is idle — clearing stale stream UI');
-          clearActiveStreamState();
+          preserveLiveTurnThenClear();
         }
         return false;
       }
@@ -3216,7 +3265,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     } catch {
       return false;
     }
-  }, [applyOpenClawActiveStreamSnapshot, clearActiveStreamState, markStreamRecovery, resetStreamWatchdog, useDirectGateway]);
+  }, [applyOpenClawActiveStreamSnapshot, preserveLiveTurnThenClear, markStreamRecovery, resetStreamWatchdog, useDirectGateway]);
 
   // History loader
   const loadHistoryInternal = useCallback(async (sessionKey: string, prov?: string, options?: { force?: boolean; refreshActiveSnapshot?: boolean; preserveLocalMessages?: boolean }): Promise<boolean> => {
@@ -3942,7 +3991,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           break;
         }
         if (canSafelyClear && isStreamActiveRef.current) {
-          clearActiveStreamState();
+          preserveLiveTurnThenClear();
           schedulePostTurnHistorySync(900);
         }
         break;
@@ -3981,7 +4030,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'keepalive':
         break;
     }
-  }, [applyOpenClawActiveStreamSnapshot, clearActiveStreamState, clearStreamRecoveryTimer, clearSuppressedRunId, ensureStreamingAssistantBubble, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, mergeStreamText, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, setLiveRunPhase, upsertStreamingAssistant]);
+  }, [applyOpenClawActiveStreamSnapshot, preserveLiveTurnThenClear, clearStreamRecoveryTimer, clearSuppressedRunId, ensureStreamingAssistantBubble, isRunIdSuppressed, normalizeAgentError, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, mergeStreamText, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, setLiveRunPhase, upsertStreamingAssistant]);
 
   // Keep handleWsEvent in a ref so the WS handler always calls the latest version
   const handleWsEventRef = useRef(handleWsEvent);

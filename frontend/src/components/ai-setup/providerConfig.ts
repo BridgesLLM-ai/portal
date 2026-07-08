@@ -76,6 +76,7 @@ export const PROVIDERS: ProviderUIConfig[] = [
     ],
     defaultModels: [
       { id: 'anthropic/claude-opus-4-8', name: 'Claude Opus 4.8', tier: 'frontier', description: 'Most capable Claude model currently exposed by OpenClaw.' },
+      { id: 'anthropic/claude-fable-5', name: 'Claude Fable 5', tier: 'frontier', description: 'Large-context Claude model exposed through OpenClaw.' },
       { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6', tier: 'balanced', description: 'Best all-round default for most users.' },
       { id: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', tier: 'fast', description: 'Fastest and lowest-cost Claude model.' },
     ],

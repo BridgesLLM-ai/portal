@@ -40,11 +40,20 @@ function trimText(value: unknown): string | undefined {
   return trimmed.length > MAX_TEXT_CHARS ? trimmed.slice(0, MAX_TEXT_CHARS) : trimmed;
 }
 
+// Delta/reasoning text keeps its exact whitespace so chunk boundaries can be
+// reassembled without fusing words or inventing separators. Length is still
+// capped to bound the history file.
+function capText(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value) return undefined;
+  return value.length > MAX_TEXT_CHARS ? value.slice(0, MAX_TEXT_CHARS) : value;
+}
+
 function sanitizeEvent(event: RuntimeTurnEvent): RuntimeTurnEvent | null {
   if (!event || event.schema !== 'bridgesllm.runtime-turn-event.v1') return null;
   if (!event.sessionKey || !PERSISTED_TYPES.has(event.type)) return null;
 
-  const text = trimText(event.text);
+  const preserveExactText = event.type === 'assistant_delta' || event.type === 'assistant_reasoning';
+  const text = preserveExactText ? capText(event.text) : trimText(event.text);
   const toolResult = trimText(event.tool?.result);
   return {
     ...event,

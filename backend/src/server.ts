@@ -56,6 +56,7 @@ import { canAccessPortal, canUseInteractivePortal, isElevatedRole } from './util
 import { isAllowedWebSocketOrigin } from './utils/websocketOrigin';
 import { startTelemetryService, stopTelemetryService } from './services/telemetryService';
 import { startAudioProxy, stopAudioProxy } from './services/audioProxy';
+import { isBlockedAppStaticPath, isPathWithin } from './utils/appFileSecurity';
 
 const app = express();
 const httpServer = createServer(app);
@@ -508,6 +509,12 @@ app.use('/hosted/:deployId/api/*', browserAuthRedirect, async (req: any, res: an
 // That preserves correct MIME behavior while keeping private app bundles private.
 const STATIC_ASSET_RE = /\.(js|css|png|jpg|jpeg|gif|webp|svg|ico|woff|woff2|ttf|eot|map|json)$/i;
 app.use('/hosted', async (req, res, next) => {
+  const requestParts = getHostedRequestParts(req);
+  if (requestParts.length >= 2 && isBlockedAppStaticPath(requestParts.slice(1).join('/'))) {
+    res.status(404).send('Not found');
+    return;
+  }
+
   if (!STATIC_ASSET_RE.test(req.path)) {
     next();
     return;
@@ -515,17 +522,18 @@ app.use('/hosted', async (req, res, next) => {
 
   try {
     await browserAssetAuth(req, res, async () => {
-      const parts = getHostedRequestParts(req);
+      const parts = requestParts;
       if (parts.length < 2) { next(); return; }
       const appId = parts[0];
       const appDir = path.resolve(path.join(HOSTED_APPS_DIR, appId));
-      if (!appDir.startsWith(path.resolve(HOSTED_APPS_DIR))) { res.status(403).send('Forbidden'); return; }
+      if (!isPathWithin(HOSTED_APPS_DIR, appDir)) { res.status(403).send('Forbidden'); return; }
       // Check dist/ first, then root
-      const distDir = path.join(appDir, 'dist');
+      const distDir = path.resolve(path.join(appDir, 'dist'));
       const contentRoot = (fs.existsSync(path.join(distDir, 'index.html'))) ? distDir : appDir;
       const filePath = parts.slice(1).join('/');
+      if (isBlockedAppStaticPath(filePath)) { res.status(404).send('Not found'); return; }
       const fullPath = path.resolve(path.join(contentRoot, filePath));
-      if (!fullPath.startsWith(path.resolve(contentRoot))) { res.status(403).send('Forbidden'); return; }
+      if (!isPathWithin(contentRoot, fullPath)) { res.status(403).send('Forbidden'); return; }
       if (fs.existsSync(fullPath) && !fs.statSync(fullPath).isDirectory()) {
         res.sendFile(fullPath);
       } else {
@@ -540,6 +548,8 @@ app.use('/hosted', async (req, res, next) => {
   if (parts.length === 0) { res.status(404).send('Not found'); return; }
 
   const appId = parts[0];
+  const filePath = parts.slice(1).join('/') || 'index.html';
+  if (isBlockedAppStaticPath(filePath)) { res.status(404).send('Not found'); return; }
 
   // Check if fullstack app with running process
   const appPort = getAppPort(appId);
@@ -569,7 +579,7 @@ app.use('/hosted', async (req, res, next) => {
     resolvedAppDir = fallbackAppDir;
   }
 
-  if (!resolvedAppDir.startsWith(path.resolve(HOSTED_APPS_DIR))) {
+  if (!isPathWithin(HOSTED_APPS_DIR, resolvedAppDir)) {
     res.status(403).send('Forbidden'); return;
   }
 
@@ -579,14 +589,13 @@ app.use('/hosted', async (req, res, next) => {
 
   // Prefer built artifacts (dist/) over source root — same logic as share handler.
   // Source-root index.html often references /src/main.tsx (Vite dev entry) which won't work.
-  const distDir = path.join(resolvedAppDir, 'dist');
+  const distDir = path.resolve(path.join(resolvedAppDir, 'dist'));
   const contentRoot = (fs.existsSync(path.join(distDir, 'index.html'))) ? distDir : resolvedAppDir;
 
-  const filePath = parts.slice(1).join('/') || 'index.html';
   const fullPath = path.join(contentRoot, filePath);
   const resolvedPath = path.resolve(fullPath);
 
-  if (!resolvedPath.startsWith(path.resolve(contentRoot))) {
+  if (!isPathWithin(contentRoot, resolvedPath)) {
     res.status(403).send('Forbidden'); return;
   }
 

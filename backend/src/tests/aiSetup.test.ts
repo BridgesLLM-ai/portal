@@ -163,8 +163,29 @@ describe('ai-setup model normalization', () => {
 
   test('setup model fallback exposes provider defaults without requiring OpenClaw model discovery', () => {
     expect(getProviderDefaultModelPayload('openai-codex').map((model) => model.id)).toContain('codex/gpt-5.5');
+    expect(getProviderDefaultModelPayload('anthropic').map((model) => model.id)).toContain('anthropic/claude-fable-5');
     expect(getProviderDefaultModelPayload('google-antigravity').map((model) => model.id)).toContain('google-antigravity/gemini-3.1-pro-high');
     expect(getProviderDefaultModelPayload(null)).toEqual([]);
+  });
+
+  test('register merge pins Fable 5 to the Claude CLI runtime when Claude OAuth is available', () => {
+    const merged = mergeDiscoveredProviderModelsIntoConfig({
+      agents: {
+        defaults: {
+          model: { primary: 'codex/gpt-5.5', fallbacks: [] },
+          models: {},
+        },
+      },
+    }, 'anthropic', ['anthropic/claude-fable-5'], {
+      version: 2,
+      profiles: {
+        'anthropic:claude-cli': { provider: 'anthropic', type: 'oauth' },
+      },
+    });
+
+    expect(merged.changed).toBe(true);
+    expect(merged.config.agents.defaults.models['anthropic/claude-fable-5']).toEqual({ agentRuntime: { id: 'claude-cli' } });
+    expect(merged.config.agents.defaults.model.fallbacks).toEqual(['anthropic/claude-fable-5']);
   });
 
   test('Gemini CLI smoke failures get user-actionable messages', () => {

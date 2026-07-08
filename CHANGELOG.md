@@ -2,6 +2,18 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.25.27] - 2026-07-08
+
+### Fixed
+- **Mail auto-forwarding is now true delivery-time forwarding**: Portal mail forwarding config installs a Stalwart Sieve `redirect :copy` rule, so incoming mail forwards as it arrives instead of waiting for someone to open or poll the Mail page.
+- **Agent Chat preserves whitespace and live turn state during long OpenClaw runs**: runtime deltas keep exact chunk whitespace, long silent reasoning/tool gaps have wider stale windows, and recovery clears preserve visible thinking/tool bubbles instead of wiping them mid-turn.
+- **OpenClaw update parity now targets the current stable runtime**: the installer and Codex plugin pin move to OpenClaw `2026.6.11`, with narrower config repair for current auth-store and Claude CLI provider metadata.
+- **Various security improvements**: hosted apps, shared links, update packaging, and runtime configuration paths now apply stricter public/private boundaries.
+
+### Maintenance
+- **Release artifact building is stricter**: update artifacts now rebuild from fresh backend/frontend output and apply the same private-file exclusions consistently.
+- **Regression coverage now guards mail forwarding, app file blocking, OpenClaw config repair, runtime history reassembly, and persistent gateway whitespace preservation.**
+
 ## [3.25.26] - 2026-06-22
 
 ### Fixed

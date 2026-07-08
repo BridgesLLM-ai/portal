@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.25.26"
+readonly VERSION="3.25.27"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -28,7 +28,7 @@ readonly MIN_RAM_MB=3500
 readonly MIN_DISK_GB=35
 
 # Pinned versions
-readonly PIN_OPENCLAW_VERSION="2026.6.9"
+readonly PIN_OPENCLAW_VERSION="2026.6.11"
 readonly PIN_NODE_MAJOR="22"
 readonly PIN_NODE_MIN_MINOR="16"
 

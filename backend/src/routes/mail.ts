@@ -36,7 +36,7 @@ import {
   getSignature,
   saveSignature,
   getUnreadCount,
-  processAutoForward,
+  syncAutoForwardRule,
 } from '../services/mailService';
 import { getUserUploadDir } from './files';
 
@@ -155,7 +155,7 @@ router.get('/accounts', async (req: Request, res: Response) => {
     const isAdmin = isElevatedRole(req.user?.role);
     const personalAccounts = await getUserMailAccounts(req.user!.userId);
 
-    const accounts: { id: string; label: string; email: string; isPrimary?: boolean }[] = [];
+    const accounts: { id: string; label: string; email: string; isPrimary?: boolean; kind: 'personal' | 'shared' }[] = [];
 
     for (const account of personalAccounts) {
       accounts.push({
@@ -163,17 +163,18 @@ router.get('/accounts', async (req: Request, res: Response) => {
         label: account.username,
         email: `${account.username}@${MAIL_DOMAIN}`,
         isPrimary: account.isPrimary,
+        kind: 'personal',
       });
     }
     
     if (isAdmin) {
       const extraSharedMailbox = readExtraSharedMailCredentials();
       accounts.push(
-        { id: 'support', label: 'Shared Support', email: `support@${MAIL_DOMAIN}` },
-        { id: 'noreply', label: 'Shared No-Reply', email: `noreply@${MAIL_DOMAIN}` },
+        { id: 'support', label: 'Shared Support', email: `support@${MAIL_DOMAIN}`, kind: 'shared' },
+        { id: 'noreply', label: 'Shared No-Reply', email: `noreply@${MAIL_DOMAIN}`, kind: 'shared' },
       );
       if (EXTRA_SHARED_MAIL_ACCOUNT_ID && extraSharedMailbox) {
-        accounts.push({ id: EXTRA_SHARED_MAIL_ACCOUNT_ID, label: EXTRA_SHARED_MAIL_LABEL, email: extraSharedMailbox.email });
+        accounts.push({ id: EXTRA_SHARED_MAIL_ACCOUNT_ID, label: EXTRA_SHARED_MAIL_LABEL, email: extraSharedMailbox.email, kind: 'shared' });
       }
     }
     
@@ -243,22 +244,6 @@ router.get('/messages', async (req: Request, res: Response) => {
       sort: sort === 'date-asc' ? 'date-asc' : 'date-desc',
     });
     res.json(result);
-
-    // Auto-forward: trigger in background after response (non-blocking)
-    if (result.emails?.length && effectiveRole === 'inbox') {
-      const creds = await getSelectedPersonalMailboxCredentials(req);
-      if (creds) {
-        const mailbox = await prisma.mailboxAccount.findFirst({
-          where: { id: creds.accountId },
-          select: { autoForwardTo: true },
-        });
-        if (mailbox?.autoForwardTo) {
-          processAutoForward(result.emails, mailbox.autoForwardTo, account.user, account.pass).catch(err => {
-            console.error('[mail] auto-forward error:', err.message);
-          });
-        }
-      }
-    }
   } catch (error: any) {
     console.error('[mail] listEmails error:', error.message);
     res.status(500).json({ error: 'Failed to list emails' });
@@ -714,7 +699,8 @@ router.put('/forward-settings', async (req: Request, res: Response) => {
       return;
     }
 
-    const { autoForwardTo } = req.body;
+    const requestedForwardTo = typeof req.body?.autoForwardTo === 'string' ? req.body.autoForwardTo.trim() : '';
+    const autoForwardTo = requestedForwardTo || null;
     const creds = await getSelectedPersonalMailboxCredentials(req);
 
     if (!creds) {
@@ -736,12 +722,25 @@ router.put('/forward-settings', async (req: Request, res: Response) => {
       }
     }
 
-    await prisma.mailboxAccount.update({
+    const existingMailbox = await prisma.mailboxAccount.findUnique({
       where: { id: creds.accountId },
-      data: { autoForwardTo: autoForwardTo || null },
+      select: { autoForwardTo: true },
     });
+    await syncAutoForwardRule(autoForwardTo, creds.username, creds.password);
 
-    res.json({ success: true, autoForwardTo: autoForwardTo || null });
+    try {
+      await prisma.mailboxAccount.update({
+        where: { id: creds.accountId },
+        data: { autoForwardTo },
+      });
+    } catch (dbError) {
+      await syncAutoForwardRule(existingMailbox?.autoForwardTo || null, creds.username, creds.password).catch((rollbackError) => {
+        console.error('[mail] forward-settings rollback failed:', rollbackError.message);
+      });
+      throw dbError;
+    }
+
+    res.json({ success: true, autoForwardTo, deliveryMode: 'server-side-sieve' });
   } catch (error: any) {
     console.error('[mail] forward-settings put error:', error.message);
     res.status(500).json({ error: 'Failed to update forward settings' });

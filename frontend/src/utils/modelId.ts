@@ -11,6 +11,8 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'anthropic/haiku-4.5': 'anthropic/claude-haiku-4-5',
   'anthropic/claude-haiku-4.5': 'anthropic/claude-haiku-4-5',
   'anthropic/claude-haiku-4-5': 'anthropic/claude-haiku-4-5',
+  'anthropic/fable-5': 'anthropic/claude-fable-5',
+  'anthropic/claude-fable-5': 'anthropic/claude-fable-5',
   'claude-cli/sonnet-4.6': 'anthropic/claude-sonnet-4-6',
   'claude-cli/claude-sonnet-4.6': 'anthropic/claude-sonnet-4-6',
   'claude-cli/claude-sonnet-4-6': 'anthropic/claude-sonnet-4-6',
@@ -23,6 +25,8 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'claude-cli/haiku-4.5': 'anthropic/claude-haiku-4-5',
   'claude-cli/claude-haiku-4.5': 'anthropic/claude-haiku-4-5',
   'claude-cli/claude-haiku-4-5': 'anthropic/claude-haiku-4-5',
+  'claude-cli/fable-5': 'anthropic/claude-fable-5',
+  'claude-cli/claude-fable-5': 'anthropic/claude-fable-5',
 };
 
 const GOOGLE_MODEL_MAP: Record<string, string> = {
@@ -212,7 +216,7 @@ export function getModelDisplayName(rawModel: unknown, fallback = 'Default model
   const slug = parts.length >= 2 ? parts.slice(1).join('/') : parts[0];
   return slug
     .replace(/^claude-/, '')
-    .replace(/(^|[-_/])(opus|sonnet|haiku)(?=$|[-_/])/gi, (_, prefix, word) => `${prefix}${word.charAt(0).toUpperCase()}${word.slice(1).toLowerCase()}`)
+    .replace(/(^|[-_/])(opus|sonnet|haiku|fable)(?=$|[-_/])/gi, (_, prefix, word) => `${prefix}${word.charAt(0).toUpperCase()}${word.slice(1).toLowerCase()}`)
     .replace(/(^|[-_/])(gpt|gemini|llama|kimi|qwen|grok|deepseek)(?=$|[-_/])/gi, (_, prefix, word) => `${prefix}${word.charAt(0).toUpperCase()}${word.slice(1).toLowerCase()}`)
     .replace(/[-_/]+/g, ' ')
     .replace(/\b(\d) (\d)\b/g, '$1.$2')

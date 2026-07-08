@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { __gatewayHistoryTest } from '../routes/gateway';
+import { streamEventBus } from '../services/StreamEventBus';
 import { recordRuntimeTurnEvent } from '../services/RuntimeTurnEventHistory';
 import type { RuntimeTurnEvent } from '../services/RuntimeTurnEvents';
 
@@ -502,5 +503,89 @@ describe('gateway history readers', () => {
     expect(final.toolCalls).toHaveLength(5);
     expect(final.toolCalls.map((toolCall: any) => toolCall.id)).toEqual(['tool-0', 'tool-1', 'tool-2', 'tool-3', 'tool-4']);
     expect(messages.filter((message: any) => message.role === 'assistant' && !message.content && Array.isArray(message.toolCalls))).toHaveLength(0);
+  });
+
+  test('runtime history reassembles append-style deltas without corrupting words', () => {
+    const baseTs = Date.parse('2026-07-07T12:00:00.000Z');
+    const deltaEvent = (seq: number, text: string): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_delta',
+      sessionKey: 'agent:main:main',
+      runId: 'run-delta-reassembly',
+      seq,
+      ts: baseTs + seq,
+      text,
+      visible: true,
+      source: { transport: 'portal-stream-event-bus', eventType: 'text' },
+    });
+
+    // Claude CLI append-style chunks split mid-word and carry their own spacing.
+    const messages = __gatewayHistoryTest.buildRuntimeHistoryMessages([
+      deltaEvent(1, 'The qu'),
+      deltaEvent(2, 'ick brown'),
+      deltaEvent(3, ' '),
+      deltaEvent(4, 'fox jum'),
+      deltaEvent(5, 'ps.'),
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toBe('The quick brown fox jumps.');
+  });
+
+  test('mergeRuntimeText keeps short repeated chunks and cumulative snapshots', () => {
+    const { mergeRuntimeText } = __gatewayHistoryTest;
+
+    // Short chunks that repeat earlier text are legitimate append deltas.
+    expect(mergeRuntimeText('the cat sat on ', 'the')).toBe('the cat sat on the');
+    expect(mergeRuntimeText('Hello', ' ')).toBe('Hello ');
+
+    // Cumulative streams still grow via prefix replacement.
+    expect(mergeRuntimeText('Hello wor', 'Hello world!')).toBe('Hello world!');
+
+    // Long replayed snapshots are still deduped.
+    const paragraph = 'This is a complete paragraph that was already streamed.';
+    expect(mergeRuntimeText(paragraph, paragraph)).toBe(paragraph);
+    expect(mergeRuntimeText(`${paragraph}\n`, paragraph)).toBe(`${paragraph}\n`);
+
+    // Replace snapshots win outright.
+    expect(mergeRuntimeText('partial', 'replacement', true)).toBe('replacement');
+  });
+
+  test('active stream status keeps quiet streaming turns active inside the 10-minute window', async () => {
+    const sessionKey = 'agent:main:quiet-streaming-window-test';
+    const now = Date.now();
+
+    try {
+      streamEventBus.clearStream(sessionKey);
+      streamEventBus.updateStreamPhase(sessionKey, {
+        phase: 'streaming',
+        startedAt: now - 4 * 60_000,
+        runId: 'run-quiet-stream',
+        model: 'anthropic/claude-sonnet-4-6',
+      });
+      streamEventBus.publish(sessionKey, {
+        type: 'text',
+        content: 'Partial answer before a long reasoning pause.',
+      });
+
+      const tracked = streamEventBus.getTrackedStream(sessionKey);
+      expect(tracked).toBeTruthy();
+      if (tracked) {
+        tracked.lastEventAt = now - 4 * 60_000;
+        tracked.startedAt = now - 4 * 60_000;
+      }
+
+      const snapshot = await __gatewayHistoryTest.getOpenClawActiveStreamSnapshot(sessionKey);
+
+      expect(snapshot).toEqual(expect.objectContaining({
+        active: true,
+        phase: 'streaming',
+        runId: 'run-quiet-stream',
+        content: 'Partial answer before a long reasoning pause.',
+        staleAfterMs: 10 * 60_000,
+      }));
+    } finally {
+      streamEventBus.clearStream(sessionKey);
+    }
   });
 });

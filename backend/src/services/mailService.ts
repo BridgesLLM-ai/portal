@@ -49,6 +49,20 @@ interface JmapSession {
   accountId: string;
 }
 
+const PORTAL_AUTO_FORWARD_SCRIPT_NAME = 'bridgesllm-auto-forward';
+const JMAP_CORE_CAPABILITIES = ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission'];
+const JMAP_MAIL_CAPABILITY = 'urn:ietf:params:jmap:mail';
+const JMAP_SIEVE_CAPABILITY = 'urn:ietf:params:jmap:sieve';
+
+type JmapPreferredAccount = 'mail' | 'sieve';
+
+interface SieveScriptInfo {
+  id: string;
+  name: string | null;
+  isActive: boolean;
+  blobId: string;
+}
+
 interface MailboxInfo {
   id: string;
   name: string;
@@ -110,7 +124,22 @@ export interface SendEmailParams {
 
 // ── JMAP helpers ──────────────────────────────────────────────
 
-async function getSession(user: string, pass: string): Promise<JmapSession> {
+function selectJmapAccountId(session: any, preferred: JmapPreferredAccount): string {
+  const preferredCapability = preferred === 'sieve' ? JMAP_SIEVE_CAPABILITY : JMAP_MAIL_CAPABILITY;
+  const primary = session.primaryAccounts || {};
+  const accounts = session.accounts || {};
+  const accountWithCapability = Object.entries(accounts).find(([, account]: any) => {
+    return !!account?.accountCapabilities?.[preferredCapability];
+  })?.[0];
+
+  return primary[preferredCapability]
+    || accountWithCapability
+    || primary[JMAP_MAIL_CAPABILITY]
+    || Object.keys(accounts)[0]
+    || '';
+}
+
+async function getSession(user: string, pass: string, preferred: JmapPreferredAccount = 'mail'): Promise<JmapSession> {
   const res = await fetch(`${getStalwartUrl()}/jmap/session`, {
     headers: {
       'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64'),
@@ -119,7 +148,7 @@ async function getSession(user: string, pass: string): Promise<JmapSession> {
   if (!res.ok) throw new Error(`JMAP session failed: ${res.status} ${res.statusText}`);
   const session = await res.json() as any;
   
-  const accountId = Object.keys(session.accounts || {})[0];
+  const accountId = selectJmapAccountId(session, preferred);
   if (!accountId) throw new Error('No JMAP account found');
 
   // Always use getStalwartUrl() — Stalwart returns its public hostname (mail.bridgesllm.com:8080)
@@ -132,7 +161,13 @@ async function getSession(user: string, pass: string): Promise<JmapSession> {
   };
 }
 
-async function jmapCall(session: JmapSession, user: string, pass: string, methodCalls: any[]): Promise<any> {
+async function jmapCall(
+  session: JmapSession,
+  user: string,
+  pass: string,
+  methodCalls: any[],
+  extraUsing: string[] = [],
+): Promise<any> {
   const res = await fetch(session.apiUrl, {
     method: 'POST',
     headers: {
@@ -140,7 +175,7 @@ async function jmapCall(session: JmapSession, user: string, pass: string, method
       'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64'),
     },
     body: JSON.stringify({
-      using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission'],
+      using: [...new Set([...JMAP_CORE_CAPABILITIES, ...extraUsing])],
       methodCalls,
     }),
   });
@@ -149,6 +184,161 @@ async function jmapCall(session: JmapSession, user: string, pass: string, method
     throw new Error(`JMAP call failed: ${res.status} ${text}`);
   }
   return res.json();
+}
+
+function formatJmapMethodError(error: any): string {
+  const type = typeof error?.type === 'string' ? error.type : 'unknown';
+  const description = typeof error?.description === 'string' && error.description.trim()
+    ? `: ${error.description.trim()}`
+    : '';
+  return `${type}${description}`;
+}
+
+function getJmapMethodResponse(result: any, callId: string, methodName: string, action: string): any {
+  const responses = result.methodResponses || [];
+  const entry = responses.find((response: any[]) => response?.[2] === callId)
+    || responses.find((response: any[]) => response?.[0] === methodName);
+
+  if (!entry) {
+    const errorEntry = responses.find((response: any[]) => response?.[0] === 'error');
+    if (errorEntry) throw new Error(`JMAP ${action} failed: ${formatJmapMethodError(errorEntry[1])}`);
+    throw new Error(`JMAP ${action} returned no ${methodName} response`);
+  }
+
+  if (entry[0] === 'error') {
+    throw new Error(`JMAP ${action} failed: ${formatJmapMethodError(entry[1])}`);
+  }
+
+  if (entry[0] !== methodName) {
+    throw new Error(`JMAP ${action} returned unexpected response ${entry[0] || 'unknown'}`);
+  }
+
+  return entry[1] || {};
+}
+
+function escapeSieveString(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, ' ');
+}
+
+export function buildAutoForwardSieveScript(forwardTo: string): string {
+  return [
+    '# Managed by BridgesLLM Portal. Changes made outside Portal may be overwritten.',
+    'require ["copy"];',
+    `redirect :copy "${escapeSieveString(forwardTo)}";`,
+    '',
+  ].join('\n');
+}
+
+async function uploadSieveScript(session: JmapSession, user: string, pass: string, content: string): Promise<string> {
+  const res = await fetch(session.uploadUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/sieve; charset=utf-8',
+      'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64'),
+    },
+    body: Buffer.from(content, 'utf8'),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Sieve upload failed: ${res.status} ${text}`);
+  }
+
+  const uploaded = await res.json() as any;
+  const blobId = typeof uploaded.blobId === 'string' ? uploaded.blobId : '';
+  if (!blobId) throw new Error('Sieve upload did not return a blobId');
+  return blobId;
+}
+
+async function getSieveScripts(session: JmapSession, user: string, pass: string): Promise<SieveScriptInfo[]> {
+  const result = await jmapCall(session, user, pass, [
+    ['SieveScript/get', {
+      accountId: session.accountId,
+      properties: ['id', 'name', 'isActive', 'blobId'],
+    }, 'sieve-get'],
+  ], [JMAP_SIEVE_CAPABILITY, 'urn:ietf:params:jmap:blob']);
+
+  const response = getJmapMethodResponse(result, 'sieve-get', 'SieveScript/get', 'SieveScript/get');
+  return (response.list || []).map((script: any) => ({
+    id: String(script.id || ''),
+    name: typeof script.name === 'string' ? script.name : null,
+    isActive: !!script.isActive,
+    blobId: String(script.blobId || ''),
+  })).filter((script: any) => script.id);
+}
+
+function assertSieveSetSucceeded(result: any, action: string): void {
+  for (const entry of result.methodResponses || []) {
+    if (entry?.[0] === 'error') {
+      throw new Error(`Sieve ${action} failed: ${formatJmapMethodError(entry[1])}`);
+    }
+  }
+
+  const responses = (result.methodResponses || []).filter((entry: any[]) => entry?.[0] === 'SieveScript/set');
+  if (!responses.length) throw new Error(`Sieve ${action} returned no SieveScript/set response`);
+  for (const entry of responses) {
+    const response = entry[1];
+    const failed = response.notCreated || response.notUpdated || response.notDestroyed;
+    if (failed && Object.keys(failed).length > 0) {
+      throw new Error(`Sieve ${action} failed: ${JSON.stringify(failed)}`);
+    }
+  }
+}
+
+export async function syncAutoForwardRule(forwardTo: string | null | undefined, user: string, pass: string): Promise<void> {
+  const target = typeof forwardTo === 'string' ? forwardTo.trim() : '';
+  const session = await getSession(user, pass, 'sieve');
+  const scripts = await getSieveScripts(session, user, pass);
+  const managedScript = scripts.find((script) => script.name === PORTAL_AUTO_FORWARD_SCRIPT_NAME);
+  const activeNonPortalScript = scripts.find((script) => script.isActive && script.name !== PORTAL_AUTO_FORWARD_SCRIPT_NAME);
+
+  if (!target) {
+    if (!managedScript) return;
+    const methodCalls: any[] = [];
+    if (managedScript.isActive) {
+      methodCalls.push(['SieveScript/set', {
+        accountId: session.accountId,
+        onSuccessDeactivateScript: true,
+      }, 'deactivate']);
+    }
+    methodCalls.push(['SieveScript/set', {
+      accountId: session.accountId,
+      destroy: [managedScript.id],
+    }, 'destroy']);
+    const result = await jmapCall(session, user, pass, methodCalls, [JMAP_SIEVE_CAPABILITY, 'urn:ietf:params:jmap:blob']);
+    assertSieveSetSucceeded(result, 'disable');
+    return;
+  }
+
+  if (activeNonPortalScript) {
+    throw new Error(`Mailbox already has an active non-Portal Sieve script (${activeNonPortalScript.name || activeNonPortalScript.id}); refusing to overwrite it`);
+  }
+
+  const blobId = await uploadSieveScript(session, user, pass, buildAutoForwardSieveScript(target));
+  const scriptSet = managedScript
+    ? {
+      update: {
+        [managedScript.id]: { blobId },
+      },
+      onSuccessActivateScript: managedScript.id,
+    }
+    : {
+      create: {
+        portalAutoForward: {
+          name: PORTAL_AUTO_FORWARD_SCRIPT_NAME,
+          blobId,
+        },
+      },
+      onSuccessActivateScript: '#portalAutoForward',
+    };
+
+  const result = await jmapCall(session, user, pass, [
+    ['SieveScript/set', {
+      accountId: session.accountId,
+      ...scriptSet,
+    }, 'sieve-set'],
+  ], [JMAP_SIEVE_CAPABILITY, 'urn:ietf:params:jmap:blob']);
+  assertSieveSetSucceeded(result, managedScript ? 'update' : 'create');
 }
 
 // ── Sanitization ──────────────────────────────────────────────
@@ -865,65 +1055,6 @@ export async function sendSystemAlert(to: string[], subject: string, htmlBody: s
     htmlBody,
     textBody: textBody || htmlBody.replace(/<[^>]+>/g, ''),
   });
-}
-
-/**
- * Auto-forward a single email to another address
- */
-export async function autoForwardEmail(emailId: string, forwardTo: string, user: string, pass: string): Promise<void> {
-  const email = await getEmail(emailId, user, pass);
-  const textPart = email.textBody?.[0];
-  const htmlPart = email.htmlBody?.[0];
-  const textBody = textPart && email.bodyValues[textPart.partId] ? email.bodyValues[textPart.partId].value : email.preview;
-  const htmlBody = htmlPart && email.bodyValues[htmlPart.partId] ? email.bodyValues[htmlPart.partId].value : undefined;
-
-  await sendEmail({
-    from: `${user}@${getMailDomain()}`,
-    to: [{ email: forwardTo }],
-    subject: `Fwd: ${email.subject}`,
-    textBody: `---------- Forwarded from ${user}@${getMailDomain()} ----------\nFrom: ${email.from.map((f: any) => f.email).join(', ')}\nDate: ${new Date(email.receivedAt).toLocaleString()}\nSubject: ${email.subject}\n\n${textBody}`,
-    htmlBody: htmlBody || undefined,
-  }, user, pass);
-}
-
-/**
- * Process auto-forwarding for new inbox emails.
- * Checks for $forwarded keyword to avoid re-forwarding.
- * Max 5 emails per batch, only emails from last 24 hours.
- */
-export async function processAutoForward(emails: EmailSummary[], forwardTo: string, user: string, pass: string): Promise<void> {
-  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const toForward = emails.filter(e => e.isUnread && new Date(e.receivedAt) > cutoff);
-
-  for (const email of toForward.slice(0, 5)) {
-    try {
-      const session = await getSession(user, pass);
-      // Check if already forwarded
-      const detail = await jmapCall(session, user, pass, [
-        ['Email/get', {
-          accountId: session.accountId,
-          ids: [email.id],
-          properties: ['keywords'],
-        }, '0'],
-      ]);
-      const keywords = detail.methodResponses[0][1].list?.[0]?.keywords || {};
-      if (keywords['$forwarded']) continue;
-
-      // Forward the email
-      await autoForwardEmail(email.id, forwardTo, user, pass);
-
-      // Mark as forwarded so we don't re-forward
-      await jmapCall(session, user, pass, [
-        ['Email/set', {
-          accountId: session.accountId,
-          update: { [email.id]: { 'keywords/$forwarded': true } },
-        }, '0'],
-      ]);
-      console.log(`[mail] Auto-forwarded email ${email.id} to ${forwardTo}`);
-    } catch (err: any) {
-      console.error(`[mail] Auto-forward failed for ${email.id}:`, err.message);
-    }
-  }
 }
 
 /**

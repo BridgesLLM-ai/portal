@@ -1430,6 +1430,11 @@ type OpenClawActiveStreamSnapshot = {
   staleAfterMs?: number;
 };
 
+const OPENCLAW_STREAMING_STALE_CUTOFF_MS = 10 * 60_000;
+const OPENCLAW_THINKING_STALE_CUTOFF_MS = 10 * 60_000;
+const OPENCLAW_TOOL_STALE_CUTOFF_MS = 15 * 60_000;
+const OPENCLAW_RUNNING_TOOL_STALE_CUTOFF_MS = 30 * 60_000;
+
 function inactiveOpenClawSnapshot(
   inactiveReason: NonNullable<OpenClawActiveStreamSnapshot['inactiveReason']>,
   safeToClear = inactiveReason === 'terminal' || inactiveReason === 'stale',
@@ -1485,11 +1490,15 @@ function getOpenClawRuntimeActiveStreamSnapshot(
   }
 
   const hasRunningTool = latest.type === 'tool_started' || latest.tool?.status === 'running';
+  // assistant_delta cutoff must tolerate long silent reasoning gaps after a text
+  // delta (Claude CLI runtimes routinely pause >3min mid-turn); a tight cutoff
+  // here makes stream-status report stale/safeToClear during healthy runs and
+  // the browser fuse then wipes live thought bubbles mid-turn.
   const staleCutoffMs = latest.type === 'assistant_delta'
-    ? 180_000
+    ? OPENCLAW_STREAMING_STALE_CUTOFF_MS
     : hasRunningTool
-      ? 30 * 60_000
-      : 15 * 60_000;
+      ? OPENCLAW_RUNNING_TOOL_STALE_CUTOFF_MS
+      : OPENCLAW_TOOL_STALE_CUTOFF_MS;
 
   if ((Date.now() - latest.ts) > staleCutoffMs) {
     return inactiveOpenClawSnapshot('stale', true);
@@ -1539,10 +1548,10 @@ async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<Open
     const lastEvent = info.lastEventAt || info.startedAt;
     const hasRunningTool = Array.isArray(info.toolCalls) && info.toolCalls.some((toolCall: any) => toolCall?.status === 'running');
     const staleCutoffMs = info.phase === 'streaming'
-      ? 180_000
+      ? OPENCLAW_STREAMING_STALE_CUTOFF_MS
       : (hasRunningTool || info.phase === 'tool' || info.compactionPhase === 'compacting')
-        ? 15 * 60_000
-        : 10 * 60_000;
+        ? OPENCLAW_TOOL_STALE_CUTOFF_MS
+        : OPENCLAW_THINKING_STALE_CUTOFF_MS;
 
     if (lastEvent && (Date.now() - lastEvent) > staleCutoffMs) {
       debugLog(`[stream-status] StreamEventBus has entry but lastEvent=${new Date(lastEvent).toISOString()} exceeded cutoff=${staleCutoffMs}ms for phase=${info.phase} — clearing stale entry`);
@@ -1583,7 +1592,9 @@ async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<Open
       const chatState = normalizeOpenClawChatState(sess);
       const lastActivity = getOpenClawSessionLastActivity(sess);
       if (chatState) {
-        const fallbackStaleCutoffMs = chatState === 'streaming' ? 180_000 : 15 * 60_000;
+        const fallbackStaleCutoffMs = chatState === 'streaming'
+          ? OPENCLAW_STREAMING_STALE_CUTOFF_MS
+          : OPENCLAW_TOOL_STALE_CUTOFF_MS;
         if (lastActivity && (Date.now() - lastActivity) > fallbackStaleCutoffMs) {
           debugLog(`[stream-status] Gateway reports chatState=${chatState} but lastActivity=${new Date(lastActivity).toISOString()} exceeded fallback cutoff=${fallbackStaleCutoffMs}ms`);
         } else {
@@ -1630,10 +1641,15 @@ function normalizeRuntimeHistoryMatchText(text: unknown): string {
 }
 
 function mergeRuntimeText(current: string, incoming: string, replace?: boolean): string {
-  const chunk = sanitizeHistoryText(incoming || '');
+  // Deltas are recorded with exact whitespace. Claude CLI streams append-style
+  // chunks that can split mid-word, so non-overlapping chunks must concatenate
+  // verbatim — inserting a newline (markdown-rendered as a space) or trimming
+  // per chunk puts phantom spaces inside words. The final assembled text is
+  // sanitized once by the caller.
+  const chunk = incoming || '';
   if (!chunk) return current;
   if (replace || !current) return chunk;
-  if (chunk === current || current.includes(chunk)) return current;
+  if (chunk === current) return current;
   if (chunk.startsWith(current)) return chunk;
 
   const minOverlap = 8;
@@ -1643,7 +1659,11 @@ function mergeRuntimeText(current: string, incoming: string, replace?: boolean):
       return current + chunk.slice(overlap);
     }
   }
-  return `${current}\n${chunk}`.trim();
+  // Substring dedupe guards against replayed full snapshots, but only for long
+  // chunks: short append deltas (single words, spaces, letters) legitimately
+  // repeat inside earlier text and must never be dropped.
+  if (chunk.length >= 24 && current.includes(chunk)) return current;
+  return current + chunk;
 }
 
 type RuntimeHistorySegment = {
@@ -2620,6 +2640,9 @@ export const __gatewayHistoryTest = {
   readSessionMessagesEnhancedForSessionKey,
   readBestOpenClawSessionMessagesForSessionKey,
   getOpenClawRuntimeActiveStreamSnapshot,
+  getOpenClawActiveStreamSnapshot,
+  buildRuntimeHistoryMessages,
+  mergeRuntimeText,
 };
 
 /**

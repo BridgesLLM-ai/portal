@@ -111,6 +111,45 @@ describe('PersistentGatewayWs Codex idle timeout handling', () => {
     }
   });
 
+  it('preserves whitespace-only assistant deltas from the persistent gateway mirror', () => {
+    const deltaSessionKey = 'test-assistant-delta-whitespace';
+    const events: StreamEvent[] = [];
+    const unsubscribe = streamEventBus.subscribe(deltaSessionKey, (event) => events.push(event));
+
+    try {
+      __persistentGatewayWsTest.registerRun(deltaSessionKey, 'run-delta-whitespace');
+
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey: deltaSessionKey,
+        runId: 'run-delta-whitespace',
+        stream: 'assistant',
+        data: { delta: 'Hello' },
+      });
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey: deltaSessionKey,
+        runId: 'run-delta-whitespace',
+        stream: 'assistant',
+        data: { delta: ' ' },
+      });
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey: deltaSessionKey,
+        runId: 'run-delta-whitespace',
+        stream: 'assistant',
+        data: { delta: 'world' },
+      });
+
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'text', content: 'Hello' }),
+        expect.objectContaining({ type: 'text', content: ' ' }),
+        expect.objectContaining({ type: 'text', content: 'world' }),
+      ]));
+      expect(streamEventBus.getLatestText(deltaSessionKey)).toBe('Hello world');
+    } finally {
+      unsubscribe();
+      __persistentGatewayWsTest.resetSession(deltaSessionKey);
+    }
+  });
+
   it('completes chat events for a direct-proxy run registered from chat.send ack', () => {
     const directSessionKey = 'test-direct-proxy-final-tracking';
     const events: StreamEvent[] = [];

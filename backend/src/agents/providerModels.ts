@@ -32,6 +32,7 @@ const OPENCLAW_VISIBLE_MODEL_IDS = [
   'google-gemini-cli/gemini-3.1-flash-lite',
   'anthropic/claude-sonnet-4-6',
   'anthropic/claude-opus-4-8',
+  'anthropic/claude-fable-5',
   'anthropic/claude-haiku-4-5',
 ];
 

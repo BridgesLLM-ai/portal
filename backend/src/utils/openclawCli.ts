@@ -19,6 +19,8 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'anthropic/haiku-4.5': 'anthropic/claude-haiku-4-5',
   'anthropic/claude-haiku-4.5': 'anthropic/claude-haiku-4-5',
   'anthropic/claude-haiku-4-5': 'anthropic/claude-haiku-4-5',
+  'anthropic/fable-5': 'anthropic/claude-fable-5',
+  'anthropic/claude-fable-5': 'anthropic/claude-fable-5',
   'claude-cli/sonnet-4.6': 'anthropic/claude-sonnet-4-6',
   'claude-cli/claude-sonnet-4.6': 'anthropic/claude-sonnet-4-6',
   'claude-cli/claude-sonnet-4-6': 'anthropic/claude-sonnet-4-6',
@@ -31,6 +33,8 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'claude-cli/haiku-4.5': 'anthropic/claude-haiku-4-5',
   'claude-cli/claude-haiku-4.5': 'anthropic/claude-haiku-4-5',
   'claude-cli/claude-haiku-4-5': 'anthropic/claude-haiku-4-5',
+  'claude-cli/fable-5': 'anthropic/claude-fable-5',
+  'claude-cli/claude-fable-5': 'anthropic/claude-fable-5',
 };
 
 const GOOGLE_MODEL_MAP: Record<string, string> = {
@@ -179,6 +183,92 @@ export function usesClaudeCliAuthProfile(config: any, authProfiles?: any): boole
     const mode = String(profile?.mode || profile?.type || '').trim();
     return profileId.includes('claude-cli') || provider === 'claude-cli' || (provider === 'anthropic' && mode === 'claude-cli');
   });
+}
+
+function collectConfiguredMaintenanceModelCandidates(config: any): string[] {
+  const candidates: string[] = [];
+  const modelDefaults = config?.agents?.defaults?.model;
+  const primary = normalizeOpenClawConfigModelId(modelDefaults?.primary || '');
+  if (primary) candidates.push(primary);
+  if (Array.isArray(modelDefaults?.fallbacks)) {
+    candidates.push(...modelDefaults.fallbacks.map((model: unknown) => normalizeOpenClawConfigModelId(String(model || ''))));
+  }
+  const modelsRegistry = config?.agents?.defaults?.models;
+  if (modelsRegistry && typeof modelsRegistry === 'object' && !Array.isArray(modelsRegistry)) {
+    candidates.push(...Object.keys(modelsRegistry).map((model) => normalizeOpenClawConfigModelId(model)));
+  }
+  return uniqueStrings(candidates.filter(Boolean));
+}
+
+function hasCodexAuthProfile(config: any): boolean {
+  const openAiOrder = Array.isArray(config?.auth?.order?.openai) ? config.auth.order.openai : [];
+  if (openAiOrder.some((profileId: unknown) => String(profileId || '').includes('codex'))) return true;
+  const profiles = config?.auth?.profiles && typeof config.auth.profiles === 'object' ? config.auth.profiles : {};
+  return Object.entries<any>(profiles).some(([profileId, profile]) => {
+    const provider = String(profile?.provider || '').trim();
+    return profileId.includes('codex') || provider === 'codex' || provider === 'openai-codex';
+  });
+}
+
+function resolveSafeMaintenanceModel(config: any): string | null {
+  const compactionModel = normalizeOpenClawConfigModelId(config?.agents?.defaults?.compaction?.model || '');
+  if (compactionModel) return compactionModel;
+
+  const candidates = collectConfiguredMaintenanceModelCandidates(config);
+  const codexCandidate = candidates.find((model) => model.startsWith('codex/'));
+  if (codexCandidate) return codexCandidate;
+  if (hasCodexAuthProfile(config)) return 'codex/gpt-5.5';
+
+  return candidates.find((model) => !model.startsWith('anthropic/') && !model.startsWith('claude-cli/')) || null;
+}
+
+export function ensureMemoryFlushMaintenanceModel(config: any): { changed: boolean; model: string | null } {
+  const defaults = config?.agents?.defaults;
+  if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) {
+    return { changed: false, model: null };
+  }
+
+  const maintenanceModel = resolveSafeMaintenanceModel(config);
+  let changed = false;
+  let compaction = defaults.compaction;
+  if (!compaction || typeof compaction !== 'object' || Array.isArray(compaction)) {
+    if (!maintenanceModel) return { changed: false, model: null };
+    compaction = { model: maintenanceModel };
+    defaults.compaction = compaction;
+    changed = true;
+  }
+
+  if (!normalizeOpenClawConfigModelId(compaction.model || '') && maintenanceModel) {
+    compaction.model = maintenanceModel;
+    changed = true;
+  }
+
+  let memoryFlush = compaction.memoryFlush;
+  if (!memoryFlush || typeof memoryFlush !== 'object' || Array.isArray(memoryFlush)) {
+    if (!maintenanceModel) return { changed, model: normalizeOpenClawConfigModelId(compaction.model || '') || null };
+    memoryFlush = {};
+    compaction.memoryFlush = memoryFlush;
+    changed = true;
+  }
+
+  if (memoryFlush.enabled === false) {
+    return { changed, model: normalizeOpenClawConfigModelId(memoryFlush.model || compaction.model || '') || null };
+  }
+
+  const existingModel = normalizeOpenClawConfigModelId(memoryFlush.model || '');
+  if (existingModel) {
+    if (existingModel !== memoryFlush.model) {
+      memoryFlush.model = existingModel;
+      return { changed: true, model: existingModel };
+    }
+    return { changed, model: existingModel };
+  }
+
+  const compactionModel = normalizeOpenClawConfigModelId(compaction.model || '') || maintenanceModel;
+  if (!compactionModel) return { changed, model: null };
+
+  memoryFlush.model = compactionModel;
+  return { changed: true, model: compactionModel };
 }
 
 export function getPortalModelCatalogAliases(rawModel: string | null | undefined): string[] {
@@ -511,6 +601,25 @@ export function repairClaudeSubscriptionConfig(preferredModel?: string | null): 
     config.agents.defaults.model = config.agents.defaults.model || {};
     config.agents.defaults.model.fallbacks = repairedFallbacks;
     changed = true;
+  }
+
+  const memoryFlushRepair = ensureMemoryFlushMaintenanceModel(config);
+  if (memoryFlushRepair.changed) changed = true;
+
+  // Claude CLI oauth credentials are stored by OpenClaw with provider
+  // "claude-cli". The runtime refuses to resolve a profile whose config
+  // declaration names a different provider, so a declaration of "anthropic"
+  // for a claude-cli profile fails with "No credentials found" despite a
+  // valid token. Align existing declarations during install/update repair.
+  if (useClaudeCliRuntime && config?.auth?.profiles && typeof config.auth.profiles === 'object') {
+    for (const [profileId, profile] of Object.entries<any>(config.auth.profiles)) {
+      if (!profileId.includes('claude-cli')) continue;
+      if (!profile || typeof profile !== 'object') continue;
+      if (String(profile.provider || '').trim() !== 'claude-cli') {
+        profile.provider = 'claude-cli';
+        changed = true;
+      }
+    }
   }
 
   if (changed) writeJson(CONFIG_PATH, config);

@@ -8,7 +8,7 @@ import {
   type NativeCliAuthState,
 } from '../agents/nativeCliAuth';
 import { AI_PROVIDERS } from '../config/aiProviders';
-import { normalizePortalModelId, repairClaudeSubscriptionConfig } from '../utils/openclawCli';
+import { buildOpenClawCliEnv, extractJsonFromCliOutput, normalizePortalModelId, repairClaudeSubscriptionConfig } from '../utils/openclawCli';
 
 const HOME_DIR = process.env.HOME || '/root';
 const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(HOME_DIR, '.openclaw');
@@ -18,10 +18,13 @@ export const MODELS_JSON_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agen
 export const CODEX_EXTERNAL_CLI_PROFILE_ID = 'openai:codex-cli';
 export const CODEX_CLI_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
 export const OPENCLAW_CODEX_HOME_AUTH_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'codex-home', 'auth.json');
-export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.6.9';
+export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.6.11';
 const LEGACY_PLUGIN_INSTALLS_PATH = path.join(OPENCLAW_HOME, 'plugins', 'installs.json');
 const LEGACY_GLOBAL_CODEX_PLUGIN_DIR = path.join(OPENCLAW_HOME, 'npm', 'node_modules', '@openclaw', 'codex');
 const OPENCLAW_SQLITE_PATH = path.join(OPENCLAW_HOME, 'state', 'openclaw.sqlite');
+const OPENCLAW_AUTH_STORE_MANAGER = 'openclaw-auth-store';
+const OPENCLAW_AUTH_STORE_CACHE_MS = 30_000;
+let openClawAuthStoreProfilesCache: { expiresAt: number; profiles: Record<string, AuthProfile> } | null = null;
 
 export interface AuthProfile {
   type: 'api_key' | 'token' | 'oauth';
@@ -108,7 +111,13 @@ function normalizeAuthProfiles(rawProfiles: any): Record<string, AuthProfile> {
 
 function writeAuthProfilesFile(authProfiles: AuthProfilesFile) {
   fs.mkdirSync(path.dirname(AUTH_PROFILES_PATH), { recursive: true });
-  fs.writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(authProfiles, null, 2), 'utf8');
+  const serializable: AuthProfilesFile = {
+    ...authProfiles,
+    profiles: Object.fromEntries(
+      Object.entries(authProfiles.profiles || {}).filter(([, profile]) => profile?.managedBy !== OPENCLAW_AUTH_STORE_MANAGER),
+    ),
+  };
+  fs.writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(serializable, null, 2), 'utf8');
 }
 
 function parseVersionParts(version: string): number[] {
@@ -289,11 +298,90 @@ export function readOpenClawConfig(): any {
   return safeReadJson(CONFIG_PATH, {});
 }
 
+function normalizeAuthStoreType(rawType: unknown): AuthProfile['type'] {
+  const type = String(rawType || '').trim();
+  if (type === 'api_key' || type === 'token' || type === 'oauth') return type;
+  return 'oauth';
+}
+
+function parseAuthStoreExpires(rawExpires: unknown): number | undefined {
+  if (typeof rawExpires === 'number' && Number.isFinite(rawExpires)) {
+    return rawExpires < 10_000_000_000 ? rawExpires * 1000 : rawExpires;
+  }
+  if (typeof rawExpires === 'string' && rawExpires.trim()) {
+    const parsed = Date.parse(rawExpires);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function normalizeOpenClawAuthStoreProfile(profileId: string, rawProfile: any): AuthProfile | null {
+  const id = String(profileId || rawProfile?.id || rawProfile?.profileId || '').trim();
+  if (!id) return null;
+  const provider = String(rawProfile?.provider || id.split(':')[0] || '').trim();
+  if (!provider) return null;
+
+  const profile: AuthProfile = {
+    type: normalizeAuthStoreType(rawProfile?.type || rawProfile?.mode || rawProfile?.authType),
+    provider,
+    managedBy: OPENCLAW_AUTH_STORE_MANAGER,
+  };
+
+  const expires = parseAuthStoreExpires(rawProfile?.expiresAt ?? rawProfile?.expires ?? rawProfile?.expiry);
+  if (typeof expires === 'number') profile.expires = expires;
+  if (typeof rawProfile?.email === 'string' && rawProfile.email.trim()) profile.email = rawProfile.email.trim();
+  if (typeof rawProfile?.accountId === 'string' && rawProfile.accountId.trim()) profile.accountId = rawProfile.accountId.trim();
+
+  return profile;
+}
+
+function readOpenClawAuthStoreProfiles(): Record<string, AuthProfile> {
+  if (!process.env.PORTAL_ENABLE_OPENCLAW_AUTH_STORE_PROBE && process.env.NODE_ENV === 'test') {
+    return {};
+  }
+
+  const now = Date.now();
+  if (openClawAuthStoreProfilesCache && openClawAuthStoreProfilesCache.expiresAt > now) {
+    return openClawAuthStoreProfilesCache.profiles;
+  }
+
+  try {
+    const raw = execFileSync('openclaw', ['models', 'auth', 'list', '--json'], {
+      encoding: 'utf8',
+      env: buildOpenClawCliEnv(),
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 10_000,
+    });
+    const parsed = JSON.parse(extractJsonFromCliOutput(raw));
+    const profiles: Record<string, AuthProfile> = {};
+    const entries: Array<[string, any]> = Array.isArray(parsed)
+      ? parsed.map((entry: any) => [String(entry?.id || entry?.profileId || ''), entry])
+      : Array.isArray(parsed?.profiles)
+        ? parsed.profiles.map((entry: any) => [String(entry?.id || entry?.profileId || ''), entry])
+        : (parsed?.profiles && typeof parsed.profiles === 'object')
+          ? Object.entries(parsed.profiles)
+          : [];
+
+    for (const [profileId, rawProfile] of entries) {
+      const id = String(profileId || rawProfile?.id || rawProfile?.profileId || '').trim();
+      const normalized = normalizeOpenClawAuthStoreProfile(id, rawProfile);
+      if (normalized && id) profiles[id] = normalized;
+    }
+
+    openClawAuthStoreProfilesCache = { expiresAt: now + OPENCLAW_AUTH_STORE_CACHE_MS, profiles };
+    return profiles;
+  } catch {
+    if (openClawAuthStoreProfilesCache) return openClawAuthStoreProfilesCache.profiles;
+    return {};
+  }
+}
+
 export function readAuthProfiles(): AuthProfilesFile {
   const stored = safeReadJson<AuthProfilesFile>(AUTH_PROFILES_PATH, { version: 2, profiles: {} });
   const config = safeReadJson<any>(CONFIG_PATH, {});
   const configProfiles = normalizeAuthProfiles(config?.auth?.profiles);
   const storedProfiles = normalizeAuthProfiles(stored.profiles);
+  const authStoreProfiles = readOpenClawAuthStoreProfiles();
 
   return {
     ...stored,
@@ -301,6 +389,7 @@ export function readAuthProfiles(): AuthProfilesFile {
     profiles: {
       ...configProfiles,
       ...storedProfiles,
+      ...authStoreProfiles,
     },
   };
 }
@@ -351,12 +440,15 @@ export function cleanupStaleProviderAuthProfiles(
     }
   }
 
-  if (preferredProfile && preferredProfile.provider !== provider && aliases.has(preferredProfile.provider)) {
-    authProfiles.profiles[preferredProfileId] = {
-      ...preferredProfile,
-      provider,
-    };
-  }
+  // OpenClaw only resolves a profile credential when the config declaration's
+  // provider matches the provider recorded on the stored credential. Claude CLI
+  // oauth credentials are recorded with provider "claude-cli", so declaring the
+  // profile as "anthropic" makes runtime resolution fail with "No credentials
+  // found" even while a valid token exists. Follow the credential's own provider
+  // whenever it is a known alias of the requested provider family.
+  const declaredProvider = preferredProfile?.provider && aliases.has(preferredProfile.provider)
+    ? preferredProfile.provider
+    : provider;
 
   writeAuthProfilesFile(authProfiles);
 
@@ -374,7 +466,7 @@ export function cleanupStaleProviderAuthProfiles(
   const existingProfile = config.auth.profiles[preferredProfileId] || {};
   config.auth.profiles[preferredProfileId] = {
     ...existingProfile,
-    provider,
+    provider: declaredProvider,
     mode: mode || preferredProfile?.type || existingProfile.mode || 'oauth',
   };
 
@@ -828,14 +920,16 @@ export function getProviderStatuses(): ProviderStatus[] {
       : (matchingStoredProfileId || matchingConfigProfileId);
 
     const storedProfile = profileId ? storedProfiles[profileId] : undefined;
+    const isOpenClawAuthStoreProfile = storedProfile?.managedBy === OPENCLAW_AUTH_STORE_MANAGER;
     const usage = profileId ? usageStats[profileId] : undefined;
     const expiresAt = storedProfile?.expires ?? null;
     const cooldownUntil = usage?.cooldownUntil ?? null;
     const lastUsed = usage?.lastUsed ?? null;
     const errorCount = usage?.errorCount ?? 0;
     const hasConfigProfile = Boolean(matchingConfigProfileId);
+    const hasOrderedProfile = Boolean(profileId && orderedProfileIds.includes(profileId));
     const hasStoredProfile = Boolean(matchingStoredProfileId);
-    const hasAnyProviderConfig = hasConfigProfile || (provider.authTypes.includes('api_key') && hasRuntimeProviderConfig);
+    const hasAnyProviderConfig = hasConfigProfile || hasOrderedProfile || (provider.authTypes.includes('api_key') && hasRuntimeProviderConfig);
     const regularProfileConfigured = Boolean(profileId && hasAnyProviderConfig && hasStoredProfile);
     const providerOrder = authOrderKeys.map((key) => authOrder?.[key]).find((value) => Array.isArray(value));
     const excludedByAuthOrder = Array.isArray(providerOrder) && providerOrder.length === 0;
@@ -872,13 +966,13 @@ export function getProviderStatuses(): ProviderStatus[] {
       if (excludedByAuthOrder) {
         status = 'error';
         error = 'Provider is excluded by auth.order (empty provider order), so no credentials are eligible.';
-      } else if (provider.id === 'google-gemini-cli' && !googleGeminiCliProfileHasUsableCredential(storedProfile)) {
+      } else if (provider.id === 'google-gemini-cli' && !isOpenClawAuthStoreProfile && !googleGeminiCliProfileHasUsableCredential(storedProfile)) {
         status = 'error';
         error = 'Google Gemini CLI profile exists, but it does not contain reusable credential material. Re-run sign-in or configure GEMINI_API_KEY/Application Default Credentials.';
-      } else if (expiresAt && expiresAt <= now && !storedProfile?.refresh) {
+      } else if (expiresAt && expiresAt <= now && !storedProfile?.refresh && !isOpenClawAuthStoreProfile) {
         status = 'expired';
         error = 'Stored OAuth credentials expired.';
-      } else if (expiresAt && expiresAt <= now && storedProfile?.refresh) {
+      } else if (expiresAt && expiresAt <= now && (storedProfile?.refresh || isOpenClawAuthStoreProfile)) {
         warning = 'Stored access token is expired, but a refresh token is present. The provider can usually refresh on next use.';
       } else if (cooldownUntil && cooldownUntil > now) {
         status = 'cooldown';
@@ -910,8 +1004,8 @@ export function getProviderStatuses(): ProviderStatus[] {
     } else if (hasAnyProviderConfig || hasStoredProfile) {
       status = 'error';
       error = hasAnyProviderConfig && !hasStoredProfile
-        ? 'Provider configuration exists but credentials are missing from auth-profiles.json.'
-        : 'Stored credentials exist in auth-profiles.json but provider config is missing.';
+        ? 'Provider configuration exists but credentials are missing from the OpenClaw auth store.'
+        : 'Stored credentials exist in the OpenClaw auth store but provider config is missing.';
     }
 
     return {

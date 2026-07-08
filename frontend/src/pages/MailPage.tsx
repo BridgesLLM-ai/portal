@@ -248,6 +248,7 @@ export default function MailPage() {
   const inboxUnread = mailboxes.find(m => m.role === 'inbox')?.unreadEmails || 0;
   const showDetail = selectedId !== null;
   const currentAccount = accounts.find(a => a.id === activeAccount);
+  const isSharedActiveAccount = currentAccount?.kind === 'shared';
 
   // ── No-mailbox state ──────────────────────────────────────
     if (error && mailboxes.length === 0 && !noMailbox) {
@@ -316,8 +317,8 @@ export default function MailPage() {
         isOpen={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
         isMobile={isMobile}
-        onSetupGuide={handleOpenSetupGuide}
-        onForwardSettings={handleOpenForwardSettings}
+        onSetupGuide={isSharedActiveAccount ? undefined : handleOpenSetupGuide}
+        onForwardSettings={isSharedActiveAccount ? undefined : handleOpenForwardSettings}
       >
         {/* Account switcher — rendered inside sidebar above folders */}
         {accounts.length > 1 && (

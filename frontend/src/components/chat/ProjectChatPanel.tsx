@@ -1046,7 +1046,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   }, [isRunning, scrollToBottom]);
 
   // ── Watchdog ──
-  const STREAM_TIMEOUT_MS = 180_000;
+  // Claude/fable turns can go quiet for several minutes between text, tool, and
+  // thinking bursts. Keep Project Chat aligned with main Agent Chat so it does
+  // not clear a healthy long-running turn at the old 3-minute cliff.
+  const STREAM_TIMEOUT_MS = 10 * 60_000;
 
   const resetWatchdog = useCallback(() => {
     if (watchdogRef.current) clearTimeout(watchdogRef.current);

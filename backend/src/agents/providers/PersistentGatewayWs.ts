@@ -17,7 +17,7 @@ import WebSocket from 'ws';
 import { buildSignedDevice, getOrCreateDeviceKeys } from '../../utils/deviceIdentity';
 import { getOpenClawWsUrl } from '../../config/openclaw';
 import { streamEventBus } from '../../services/StreamEventBus';
-import { sanitizeAssistantText, isControlOnlyAssistantText } from '../../utils/chatText';
+import { sanitizeAssistantChunk, sanitizeAssistantText, isControlOnlyAssistantText } from '../../utils/chatText';
 import { getGatewayToken } from '../../utils/gatewayToken';
 
 const DEBUG_GATEWAY_WS = process.env.DEBUG_GATEWAY_WS === '1';
@@ -552,6 +552,12 @@ function sanitizeAssistantDelta(text: string): string {
   return isControlOnlyAssistantText(sanitized) ? '' : sanitized;
 }
 
+function sanitizeAssistantDeltaChunk(text: string): string {
+  if (!text) return '';
+  const sanitized = sanitizeAssistantChunk(text);
+  return isControlOnlyAssistantText(sanitized) ? '' : sanitized;
+}
+
 function getToolIcon(name: string): string {
   const icons: Record<string, string> = {
     Read: '📖', read: '📖', Write: '✏️', write: '✏️', Edit: '✏️', edit: '✏️',
@@ -768,7 +774,7 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
 
   if (stream === 'assistant') {
     const text = typeof data.text === 'string' ? sanitizeAssistantDelta(data.text) : undefined;
-    const delta = typeof data.delta === 'string' ? sanitizeAssistantDelta(data.delta) : undefined;
+    const delta = typeof data.delta === 'string' ? sanitizeAssistantDeltaChunk(data.delta) : undefined;
     debugLog(`assistant event: session=${sessionKey} runId=${runId || '-'} keys=${Object.keys(data).join(',')} textLen=${text?.length || 0} deltaLen=${delta?.length || 0}`);
 
     const assistantLastSeen = assistantLastSeenTextMap.get(sessionKey) || '';

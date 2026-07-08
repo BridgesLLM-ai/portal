@@ -29,6 +29,21 @@ HEARTBEAT_RUNNER="$(resolve_optional_bundle heartbeat-runner-)"
 GET_REPLY_FILE="$(resolve_optional_bundle get-reply- reply-)"
 CLAUDE_LIVE_SESSION="$(resolve_optional_bundle claude-live-session-)"
 EXECUTE_RUNTIME="$(resolve_optional_bundle execute.runtime-)"
+AGENT_RUNNER_RUNTIME="$(resolve_optional_bundle agent-runner.runtime-)"
+COMPACT_TOOLS_BUNDLE="$(python3 - "$ROOT" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+for candidate in sorted(root.glob('compact-*.js'), key=lambda p: (p.stat().st_size, p.name), reverse=True):
+    try:
+        text = candidate.read_text()
+    except Exception:
+        continue
+    if 'createOpenClawCodingTools({' in text:
+        print(candidate)
+        break
+PY
+)"
 CLI_BACKEND_BUNDLE="$(python3 - "$ROOT" <<'PY'
 from pathlib import Path
 import sys
@@ -67,6 +82,64 @@ PY
 )"
 HEARTBEAT_DETECTOR_FILE="${HEARTBEAT_EVENTS_FILTER:-$HEARTBEAT_RUNNER}"
 GEMINI_PARSER_TARGET="${CLAUDE_LIVE_SESSION:-$EXECUTE_RUNTIME}"
+
+if [[ -n "$COMPACT_TOOLS_BUNDLE" && -f "$COMPACT_TOOLS_BUNDLE" ]]; then
+python3 - "$COMPACT_TOOLS_BUNDLE" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+p = Path(sys.argv[1])
+text = p.read_text()
+
+if 'memoryFlushWritePath: params.memoryFlushWritePath' in text:
+    print(f"memory flush compaction tool metadata already patched: {p}")
+    raise SystemExit(0)
+
+old = 'const toolsRaw = createOpenClawCodingTools({\n\t\t\texec: {'
+new = 'const toolsRaw = createOpenClawCodingTools({\n\t\t\ttrigger: params.trigger,\n\t\t\tmemoryFlushWritePath: params.memoryFlushWritePath,\n\t\t\texec: {'
+if old in text:
+    p.write_text(text.replace(old, new, 1))
+    print(f"patched memory flush compaction tool metadata: {p}")
+    raise SystemExit(0)
+
+pattern = re.compile(r'(const toolsRaw = createOpenClawCodingTools\(\{\n)(?P<indent>\s*)exec: \{')
+match = pattern.search(text)
+if not match:
+    raise SystemExit(f"memory flush compaction tool block not found in {p}")
+
+indent = match.group('indent')
+replacement = f"{match.group(1)}{indent}trigger: params.trigger,\n{indent}memoryFlushWritePath: params.memoryFlushWritePath,\n{indent}exec: {{"
+text = text[:match.start()] + replacement + text[match.end():]
+p.write_text(text)
+print(f"patched memory flush compaction tool metadata: {p}")
+PY
+else
+  echo "skipping memory flush compaction tool metadata patch: compact tools bundle not found under $ROOT"
+fi
+
+if [[ -n "$AGENT_RUNNER_RUNTIME" && -f "$AGENT_RUNNER_RUNTIME" ]]; then
+python3 - "$AGENT_RUNNER_RUNTIME" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+text = p.read_text()
+marker = 'canAttemptFlush && shouldForceFlushByTranscriptSize && entry != null && !hasAlreadyFlushedForCurrentCompaction(entry)'
+old = '}) || shouldForceFlushByTranscriptSize && entry != null && !hasAlreadyFlushedForCurrentCompaction(entry))) return entry ?? params.sessionEntry;'
+new = '}) || canAttemptFlush && shouldForceFlushByTranscriptSize && entry != null && !hasAlreadyFlushedForCurrentCompaction(entry))) return entry ?? params.sessionEntry;'
+
+if marker in text:
+    print(f"memory flush transcript-size guard already patched: {p}")
+elif old in text:
+    p.write_text(text.replace(old, new, 1))
+    print(f"patched memory flush transcript-size guard: {p}")
+else:
+    raise SystemExit(f"memory flush transcript-size guard target not found in {p}")
+PY
+else
+  echo "skipping memory flush transcript-size guard patch: agent runner runtime bundle not found under $ROOT"
+fi
 
 if [[ -n "$HEARTBEAT_DETECTOR_FILE" ]]; then
 python3 - "$HEARTBEAT_DETECTOR_FILE" <<'PY'
@@ -606,6 +679,12 @@ fi
 if [[ -n "$CLI_BACKEND" && -f "$CLI_BACKEND" ]]; then
   grep -n 'stream-json\|gemini-stream-json' "$CLI_BACKEND" || true
 fi
+if [[ -n "$COMPACT_TOOLS_BUNDLE" && -f "$COMPACT_TOOLS_BUNDLE" ]]; then
+  grep -nF 'memoryFlushWritePath: params.memoryFlushWritePath' "$COMPACT_TOOLS_BUNDLE" || true
+fi
+if [[ -n "$AGENT_RUNNER_RUNTIME" && -f "$AGENT_RUNNER_RUNTIME" ]]; then
+  grep -nF 'canAttemptFlush && shouldForceFlushByTranscriptSize' "$AGENT_RUNNER_RUNTIME" || true
+fi
 if [[ -n "$GEMINI_PARSER_TARGET" ]]; then
   grep -nF 'function isGeminiCliProvider(providerId)' "$GEMINI_PARSER_TARGET" || true
   grep -nF 'function parseGeminiCliStreamingDelta(params)' "$GEMINI_PARSER_TARGET" || true
@@ -633,7 +712,7 @@ validate_no_duplicate_function() {
   fi
 }
 
-for bundle in "$HEARTBEAT_EVENTS_FILTER" "$HEARTBEAT_RUNNER" "$GET_REPLY_FILE" "$CLI_BACKEND" "$CLAUDE_CLI_SHARED" "$GEMINI_PARSER_TARGET" "$EXECUTE_RUNTIME"; do
+for bundle in "$HEARTBEAT_EVENTS_FILTER" "$HEARTBEAT_RUNNER" "$GET_REPLY_FILE" "$COMPACT_TOOLS_BUNDLE" "$AGENT_RUNNER_RUNTIME" "$CLI_BACKEND" "$CLAUDE_CLI_SHARED" "$GEMINI_PARSER_TARGET" "$EXECUTE_RUNTIME"; do
   validate_js_bundle "$bundle"
 done
 validate_no_duplicate_function "$GEMINI_PARSER_TARGET" "parseGeminiCliStreamingDelta"

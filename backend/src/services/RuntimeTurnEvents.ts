@@ -106,13 +106,21 @@ export function normalizeRuntimeTurnEvent(params: {
   });
 
   switch (event.type) {
-    case 'text':
-      if (!text) return null;
-      return base('assistant_delta', { text, visible: true });
+    // Streaming deltas must keep their exact whitespace: a chunk can split a
+    // word in half or carry the only space/newline between two words, so
+    // trimming here makes faithful reassembly impossible downstream (words
+    // fuse together or grow phantom separators).
+    case 'text': {
+      const rawText = typeof event.content === 'string' ? event.content : '';
+      if (!rawText) return null;
+      return base('assistant_delta', { text: rawText, visible: true });
+    }
 
-    case 'thinking':
-      if (!text) return null;
-      return base('assistant_reasoning', { text, visible: true });
+    case 'thinking': {
+      const rawThinking = typeof event.content === 'string' ? event.content : '';
+      if (!rawThinking.trim()) return null;
+      return base('assistant_reasoning', { text: rawThinking, visible: true });
+    }
 
     case 'status':
     case 'run_resumed':

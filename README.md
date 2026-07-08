@@ -98,6 +98,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.25.27 (July 8, 2026)
+- **Mail auto-forwarding now happens as mail arrives**: forwarding settings install a Stalwart Sieve `redirect :copy` rule instead of waiting for the Mail UI to check the inbox.
+- **Long OpenClaw chats are less fragile**: whitespace-preserving stream history, longer stale windows, and safer recovery keep thinking/tool bubbles and final text intact during long turns.
+- **Update safety is tightened around OpenClaw and app hosting**: the installer pins OpenClaw/Codex to `2026.6.11`, release artifacts rebuild from clean output directories, and various security improvements tighten public/private boundaries.
+
 ### v3.25.26 (June 22, 2026)
 - **Agent Chat reconnects recover visibly**: dead live-stream states now clear stale running/tool UI, reload durable history, and show an interruption notice instead of sitting forever on reconnect.
 - **Project Agent Chat works behind real HTTPS domains**: same-origin websocket upgrades are accepted by request host, fixing 403 failures on installs whose `CORS_ORIGIN` still points at an old IP.

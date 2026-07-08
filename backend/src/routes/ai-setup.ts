@@ -127,6 +127,7 @@ function runOpenClaw(args: string[], timeout = 30000) {
 const PROVIDER_MODEL_DISCOVERY_FALLBACKS: Record<string, string[]> = {
   anthropic: [
     'anthropic/claude-opus-4-8',
+    'anthropic/claude-fable-5',
     'anthropic/claude-sonnet-4-6',
     'anthropic/claude-haiku-4-5',
   ],
@@ -404,6 +405,7 @@ export function mergeDiscoveredProviderModelsIntoConfig(config: any, provider: s
   const fallbackSet = new Set(existingFallbacks);
   const addedAllowlist: string[] = [];
   const addedFallbacks: string[] = [];
+  const shouldPinAnthropicCliRuntime = provider === 'anthropic' && usesClaudeCliAuthProfile(next, authProfilesForRuntime);
   let changed = repairProviderModelRuntimeMetadata(next, provider, authProfilesForRuntime);
 
   for (const modelId of dedupeProviderModels(provider, discoveredModels)) {
@@ -420,6 +422,15 @@ export function mergeDiscoveredProviderModelsIntoConfig(config: any, provider: s
       const runtimeId = String(entry.agentRuntime?.id || '').trim();
       if (runtimeId !== 'codex') {
         entry.agentRuntime = { ...(entry.agentRuntime && typeof entry.agentRuntime === 'object' ? entry.agentRuntime : {}), id: 'codex' };
+        changed = true;
+      }
+    }
+
+    if (shouldPinAnthropicCliRuntime && modelId.startsWith('anthropic/')) {
+      const entry = next.agents.defaults.models[modelId];
+      const runtimeId = String(entry.agentRuntime?.id || '').trim();
+      if (runtimeId !== 'claude-cli') {
+        entry.agentRuntime = { ...(entry.agentRuntime && typeof entry.agentRuntime === 'object' ? entry.agentRuntime : {}), id: 'claude-cli' };
         changed = true;
       }
     }

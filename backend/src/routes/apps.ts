@@ -13,6 +13,7 @@ import extract from 'extract-zip';
 import { scanFile } from '../services/virusScan';
 import { prisma } from '../config/database';
 import { config } from '../config/env';
+import { escapeHtml, isBlockedAppStaticPath, isPathWithin } from '../utils/appFileSecurity';
 
 const router = Router();
 
@@ -323,7 +324,7 @@ async function recordShareUse(linkId: string): Promise<void> {
 }
 
 function renderPasswordLandingPage(token: string, projectName?: string): string {
-  const name = projectName || 'Shared Project';
+  const name = escapeHtml(projectName || 'Shared Project');
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -460,7 +461,7 @@ async function serveAppFile(app: { zipPath: string }, requestedPath: string, res
     // Prefer built artifacts when app root contains source + dist/ output.
     // Some shared apps are stored as full project folders (root index.html points to /src/main.tsx),
     // which white-screens when served by the portal runtime.
-    const distDir = path.join(resolvedAppDir, 'dist');
+    const distDir = path.resolve(path.join(resolvedAppDir, 'dist'));
     const contentRoot = fs.existsSync(path.join(distDir, 'index.html')) ? distDir : resolvedAppDir;
 
     if (contentRoot !== resolvedAppDir) {
@@ -480,11 +481,17 @@ async function serveAppFile(app: { zipPath: string }, requestedPath: string, res
 
     // Determine file to serve
     const filePath = requestedPath || 'index.html';
+    if (isBlockedAppStaticPath(filePath)) {
+      console.warn(`[Share] Blocked private app artifact request: ${filePath}`);
+      res.status(404).send('Not found');
+      return true;
+    }
+
     const fullPath = path.join(contentRoot, filePath);
     const resolvedPath = path.resolve(fullPath);
 
     // Directory traversal protection
-    if (!resolvedPath.startsWith(contentRoot)) {
+    if (!isPathWithin(contentRoot, resolvedPath)) {
       console.error(`[Share] Directory traversal attempt: ${resolvedPath}`);
       res.status(403).send('Forbidden');
       return true;
@@ -822,10 +829,15 @@ shareRouter.get('/:token/*', async (req: Request, res: Response) => {
       return;
     }
 
+    const requestedPath = req.params[0];
+    if (isBlockedAppStaticPath(requestedPath)) {
+      res.status(404).send('Not found');
+      return;
+    }
+
     // If password-protected, check session access
     if (!shareLink.isPublic && shareLink.passwordHash) {
       if (!hasSessionAccess(req, token)) {
-        const requestedPath = req.params[0];
         // For non-HTML asset requests, return 401 instead of the landing page
         // This prevents browsers from caching HTML as CSS/JS
         if (requestedPath && /\.(css|js|mjs|jsx|ts|tsx|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|map|json|webp|avif|mp4|webm|ogg|mp3|wav)$/i.test(requestedPath)) {
@@ -838,7 +850,6 @@ shareRouter.get('/:token/*', async (req: Request, res: Response) => {
       }
     }
 
-    const requestedPath = req.params[0];
     if (shouldCountShareUse(requestedPath)) {
       await recordShareUse(shareLink.id);
     }

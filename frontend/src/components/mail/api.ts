@@ -50,6 +50,7 @@ export interface MailAccount {
   id: string;
   label: string;
   email: string;
+  kind?: 'personal' | 'shared';
   isPrimary?: boolean;
 }
 
