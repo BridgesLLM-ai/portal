@@ -38,7 +38,7 @@ describe('provider model catalog curation', () => {
     });
 
     expect(filterOpenClawSessionModelCatalog(models).map((entry) => entry.id)).toEqual([
-      'codex/gpt-5.5',
+      'openai/gpt-5.5',
       'anthropic/claude-haiku-4-5',
       'anthropic/claude-fable-5',
       'google-gemini-cli/gemini-3-flash-preview',

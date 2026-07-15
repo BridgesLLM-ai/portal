@@ -98,6 +98,14 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.26.0 (July 15, 2026)
+- **New recommended models**: Claude Fable 5 for Anthropic; the GPT-5.6 suite (Sol, Terra, Luna) for ChatGPT/Codex subscriptions, with GPT-5.5 as the compatibility fallback.
+- **OpenClaw runtime updated to 2026.7.1**: reasoning-streaming Claude models show live thinking natively; the canonical Codex model route moves to `openai/*` with automatic migration of legacy references.
+- **Agent Chat reliability overhaul**: reconnecting mid-turn re-attaches to the live stream instead of reporting a false interruption, long quiet turns no longer die to a CLI no-output watchdog, pre-tool text survives reloads, tool calls pair with their results, approval popups can no longer lock the page, and updates no longer erase chat runtime history.
+- **Remote Desktop copy/paste**: one-click "Send clipboard"/"Get clipboard" buttons plus an always-on VNC clipboard bridge; screen blanking and window-fit fixes ride along.
+- **Faster everywhere**: session switching, Session Controls, Agent Tools, and dashboard checks drop from multi-second stalls to milliseconds.
+- **Security hardening**: loopback-by-default portal bind behind the HTTPS proxy, root-only chat runtime data, and a sweep of dependency security updates.
+
 ### v3.25.27 (July 8, 2026)
 - **Mail auto-forwarding now happens as mail arrives**: forwarding settings install a Stalwart Sieve `redirect :copy` rule instead of waiting for the Mail UI to check the inbox.
 - **Long OpenClaw chats are less fragile**: whitespace-preserving stream history, longer stale windows, and safer recovery keep thinking/tool bubbles and final text intact during long turns.

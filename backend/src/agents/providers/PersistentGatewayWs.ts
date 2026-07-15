@@ -219,6 +219,11 @@ const pendingResponses: Map<string, { resolve: (value: any) => void; reject: (er
 // Separate text accumulator for assistant stream events (resets per segment after tool calls).
 const assistantLastSeenTextMap: Map<string, string> = new Map();
 
+// Thinking/reasoning events carry cumulative snapshot text on OpenClaw 2026.7.1
+// (claude-cli thinking lane and the embedded runtime both send { text: full,
+// delta: suffix }). Track the last snapshot so only new text is published.
+const thinkingLastSeenTextMap: Map<string, string> = new Map();
+
 // Chat events carry cumulative assistant text on newer OpenClaw builds. Use them
 // as the fallback live-text source when assistant stream events are metadata-only.
 const chatLastSeenTextMap: Map<string, string> = new Map();
@@ -336,6 +341,7 @@ function cleanupCompletedRun(sessionKey: string, runId?: string): void {
   streamEventBus.softClearStream(sessionKey);
   activeRunIds.delete(sessionKey);
   assistantLastSeenTextMap.delete(sessionKey);
+  thinkingLastSeenTextMap.delete(sessionKey);
   chatLastSeenTextMap.delete(sessionKey);
   sessionsWithAssistantTextStream.delete(sessionKey);
   lastToolPhaseBySession.delete(sessionKey);
@@ -448,6 +454,7 @@ function publishFatalRunError(sessionKey: string, content: string): void {
   streamEventBus.clearStream(sessionKey);
   activeRunIds.delete(sessionKey);
   assistantLastSeenTextMap.delete(sessionKey);
+  thinkingLastSeenTextMap.delete(sessionKey);
   chatLastSeenTextMap.delete(sessionKey);
   sessionsWithAssistantTextStream.delete(sessionKey);
   lastToolPhaseBySession.delete(sessionKey);
@@ -731,6 +738,7 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
     debugLog(`Adopted new runId=${runId} for session ${sessionKey} (resumed after yield)`);
     // Reset text accumulators for the new run
     assistantLastSeenTextMap.delete(sessionKey);
+    thinkingLastSeenTextMap.delete(sessionKey);
     chatLastSeenTextMap.delete(sessionKey);
     sessionsWithAssistantTextStream.delete(sessionKey);
     lastToolPhaseBySession.delete(sessionKey);
@@ -815,16 +823,43 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   }
 
   if (stream === 'thinking') {
-    const thinkingText = typeof data.text === 'string'
-      ? data.text
-      : (typeof data.delta === 'string' ? data.delta : (typeof data.content === 'string' ? data.content : ''));
-    if (thinkingText) {
+    // OpenClaw 2026.7.1 sends { text: <cumulative snapshot>, delta: <suffix> }
+    // for both the claude-cli thinking lane (isReasoningSnapshot) and the
+    // embedded runtime. Publishing the snapshot as an append chunk duplicates
+    // the whole thought on every event, so diff against the last snapshot and
+    // emit only new text. Events with only progressTokens carry no text.
+    const snapshotText = typeof data.text === 'string' ? data.text : '';
+    const chunkText = typeof data.delta === 'string'
+      ? data.delta
+      : (typeof data.content === 'string' ? data.content : '');
+    let thinkingContent = '';
+    let thinkingReplace = false;
+    if (snapshotText) {
+      const lastSeenThinking = thinkingLastSeenTextMap.get(sessionKey) || '';
+      if (snapshotText === lastSeenThinking) return;
+      thinkingContent = snapshotText;
+      // A snapshot that extends the previous one is the same thought growing:
+      // replace the current thinking segment in place. A snapshot that does
+      // not extend it is a new thinking phase (new assistant message), which
+      // must start a fresh segment instead of overwriting the prior thought.
+      thinkingReplace = Boolean(lastSeenThinking) && snapshotText.startsWith(lastSeenThinking);
+      thinkingLastSeenTextMap.set(sessionKey, snapshotText);
+    } else if (chunkText) {
+      thinkingLastSeenTextMap.set(sessionKey, (thinkingLastSeenTextMap.get(sessionKey) || '') + chunkText);
+      thinkingContent = chunkText;
+    }
+    if (thinkingContent) {
       // Thought deltas can arrive while a tool card is still active. Do not
       // discard them; just avoid overwriting the visible tool phase/status.
       if (!hasRunningToolCall(sessionKey)) {
         streamEventBus.updateStreamPhase(sessionKey, { phase: 'thinking' });
       }
-      streamEventBus.publish(sessionKey, { type: 'thinking', content: thinkingText, runId });
+      streamEventBus.publish(sessionKey, {
+        type: 'thinking',
+        content: thinkingContent,
+        runId,
+        ...(thinkingReplace ? { replace: true } : {}),
+      });
     }
     return;
   }
@@ -1133,6 +1168,7 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     debugLog(`Adopted new runId=${runId} for session ${sessionKey} via chat event (wasRecentlyDone=${wasRecent})`);
     // Reset text accumulators for the new run
     assistantLastSeenTextMap.delete(sessionKey);
+    thinkingLastSeenTextMap.delete(sessionKey);
     chatLastSeenTextMap.delete(sessionKey);
     sessionsWithAssistantTextStream.delete(sessionKey);
     lastToolPhaseBySession.delete(sessionKey);
@@ -1292,6 +1328,7 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
     streamEventBus.clearStream(sessionKey);
     activeRunIds.delete(sessionKey);
     assistantLastSeenTextMap.delete(sessionKey);
+    thinkingLastSeenTextMap.delete(sessionKey);
     chatLastSeenTextMap.delete(sessionKey);
     sessionsWithAssistantTextStream.delete(sessionKey);
     lastToolPhaseBySession.delete(sessionKey);
@@ -1964,6 +2001,7 @@ export function registerRun(sessionKey: string, runId?: string): void {
 export function clearRun(sessionKey: string): void {
   activeRunIds.delete(sessionKey);
   assistantLastSeenTextMap.delete(sessionKey);
+  thinkingLastSeenTextMap.delete(sessionKey);
   lastToolPhaseBySession.delete(sessionKey);
 }
 
@@ -1984,6 +2022,7 @@ export const __persistentGatewayWsTest = {
     desiredSessionMessageSubscriptions.delete(sessionKey);
     activeSessionMessageSubscriptions.delete(sessionKey);
     assistantLastSeenTextMap.delete(sessionKey);
+    thinkingLastSeenTextMap.delete(sessionKey);
     chatLastSeenTextMap.delete(sessionKey);
     sessionsWithAssistantTextStream.delete(sessionKey);
     lastToolPhaseBySession.delete(sessionKey);

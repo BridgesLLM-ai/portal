@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
-import { spawnSync } from 'child_process';
+import { execFile } from 'child_process';
 
 const router = Router();
 
@@ -9,28 +9,60 @@ router.use(authenticateToken, requireAdmin);
 
 /* ─── Helpers ────────────────────────────────────────────── */
 
-function runCli(command: string, args: string[], timeout = 15000) {
-  const result = spawnSync(command, args, {
-    timeout,
-    encoding: 'utf-8',
-    maxBuffer: 10 * 1024 * 1024,
-    env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+// CLI calls run async so multi-second skills/plugins listings cannot block the
+// event loop (the old spawnSync version stalled every other request while a
+// listing ran).
+function runCli(command: string, args: string[], timeout = 15000): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, {
+      timeout,
+      encoding: 'utf-8',
+      maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+    }, (error, stdout, stderr) => {
+      if (error && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+        reject(error);
+        return;
+      }
+      if (error && (error as any).code !== 0 && !stdout) {
+        reject(new Error(stderr || stdout || `${command} ${args.join(' ')} failed`));
+        return;
+      }
+      if (error && !stdout && !stderr) {
+        reject(error);
+        return;
+      }
+      resolve({ stdout: stdout || '', stderr: stderr || '' });
+    });
   });
-  if (result.error) throw result.error;
-  if (result.status && result.status !== 0) {
-    throw new Error(result.stderr || result.stdout || `${command} ${args.join(' ')} failed`);
-  }
-  return { stdout: result.stdout || '', stderr: result.stderr || '' };
 }
 
-function runOpenClaw(args: string[], timeout = 15000): string {
-  const { stdout, stderr } = runCli('openclaw', args, timeout);
+async function runOpenClaw(args: string[], timeout = 15000): Promise<string> {
+  const { stdout, stderr } = await runCli('openclaw', args, timeout);
   return stdout || stderr;
 }
 
-function runClawHub(args: string[], timeout = 30000): string {
-  const { stdout, stderr } = runCli('clawhub', args, timeout);
+async function runClawHub(args: string[], timeout = 30000): Promise<string> {
+  const { stdout, stderr } = await runCli('clawhub', args, timeout);
   return stdout || stderr;
+}
+
+// Skills/plugins listings shell out to the OpenClaw CLI and take seconds; the
+// results only change when something is installed, so serve a short cache and
+// bust it on any mutation.
+const SKILLS_CACHE_TTL_MS = 60_000;
+const skillsListCache = new Map<string, { at: number; payload: any }>();
+
+function bustSkillsCache(): void {
+  skillsListCache.clear();
+}
+
+async function cachedListing<T>(key: string, loader: () => Promise<T>): Promise<T> {
+  const cached = skillsListCache.get(key);
+  if (cached && Date.now() - cached.at < SKILLS_CACHE_TTL_MS) return cached.payload as T;
+  const payload = await loader();
+  skillsListCache.set(key, { at: Date.now(), payload });
+  return payload;
 }
 
 function isMissingClawHubError(err: unknown): boolean {
@@ -95,14 +127,14 @@ function normalizeMarketplaceItem(item: any) {
   };
 }
 
-function enrichMarketplaceResults(results: any[], inspectLimit = 8) {
-  return results.map((item, index) => {
+async function enrichMarketplaceResults(results: any[], inspectLimit = 8) {
+  const enrichedItems = await Promise.all(results.map(async (item, index) => {
     const normalized = normalizeMarketplaceItem(item);
     if ((normalized.description && normalized.author) || !normalized.slug || index >= inspectLimit) {
       return normalized;
     }
     try {
-      const raw = runClawHub(['inspect', normalized.slug, '--json'], 15000);
+      const raw = await runClawHub(['inspect', normalized.slug, '--json'], 15000);
       const parsed = parseJson(raw);
       const enriched = normalizeMarketplaceItem(parsed);
       return {
@@ -113,7 +145,8 @@ function enrichMarketplaceResults(results: any[], inspectLimit = 8) {
     } catch {
       return normalized;
     }
-  }).filter(item => item.name);
+  }));
+  return enrichedItems.filter(item => item.name);
 }
 
 /* ─── Routes ─────────────────────────────────────────────── */
@@ -121,7 +154,7 @@ function enrichMarketplaceResults(results: any[], inspectLimit = 8) {
 /** GET /api/skills — list all locally available skills (openclaw skills list --json) */
 router.get('/', async (_req: Request, res: Response) => {
   try {
-    const raw = runOpenClaw(['skills', 'list', '--json']);
+    const raw = await cachedListing('skills', () => runOpenClaw(['skills', 'list', '--json']));
     const parsed = parseJson(raw);
     const skills = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.skills) ? parsed.skills : []);
     res.json({ skills });
@@ -141,8 +174,8 @@ router.get('/search', async (req: Request, res: Response) => {
     }
 
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '20'), 10) || 20, 1), 50);
-    const raw = runClawHub(['search', query, '--limit', String(limit)]);
-    const results = enrichMarketplaceResults(parseSearchOutput(raw), Math.min(limit, 10));
+    const raw = await runClawHub(['search', query, '--limit', String(limit)]);
+    const results = await enrichMarketplaceResults(parseSearchOutput(raw), Math.min(limit, 10));
     res.json({ available: true, results });
   } catch (err) {
     if (isMissingClawHubError(err)) {
@@ -166,7 +199,7 @@ router.get('/explore', async (req: Request, res: Response) => {
 
     // Try explore first (needs clawhub auth)
     try {
-      const raw = runClawHub(['explore', '--json', '--limit', String(limit), '--sort', safeSort]);
+      const raw = await runClawHub(['explore', '--json', '--limit', String(limit), '--sort', safeSort]);
       const parsed = parseJson(raw);
       const items = Array.isArray(parsed) ? parsed : (parsed?.items ?? parsed?.skills ?? []);
       if (Array.isArray(items) && items.length > 0) {
@@ -183,7 +216,7 @@ router.get('/explore', async (req: Request, res: Response) => {
       for (const q of fallbackQueries) {
         if (results.length >= limit) break;
         try {
-          const raw = runClawHub(['search', q, '--limit', '10']);
+          const raw = await runClawHub(['search', q, '--limit', '10']);
           for (const item of parseSearchOutput(raw)) {
             if (!seen.has(item.name)) {
               seen.add(item.name);
@@ -197,7 +230,7 @@ router.get('/explore', async (req: Request, res: Response) => {
       results = results.slice(0, limit);
     }
 
-    res.json({ results: enrichMarketplaceResults(results, Math.min(limit, 10)) });
+    res.json({ results: await enrichMarketplaceResults(results, Math.min(limit, 10)) });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Marketplace explore failed';
     res.status(500).json({ error: message });
@@ -213,7 +246,7 @@ router.get('/inspect/:slug', async (req: Request, res: Response) => {
       return;
     }
 
-    const raw = runClawHub(['inspect', slug, '--json']);
+    const raw = await runClawHub(['inspect', slug, '--json']);
     const parsed = parseJson(raw);
     res.json(parsed);
   } catch (err) {
@@ -237,7 +270,8 @@ router.post('/install', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = runClawHub(['install', name], 60000);
+    const result = await runClawHub(['install', name], 60000);
+    bustSkillsCache();
     res.json({ ok: true, output: result });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Install failed';
@@ -259,7 +293,8 @@ router.post('/uninstall', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = runClawHub(['uninstall', name], 30000);
+    const result = await runClawHub(['uninstall', name], 30000);
+    bustSkillsCache();
     res.json({ ok: true, output: result });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Uninstall failed';
@@ -270,7 +305,7 @@ router.post('/uninstall', async (req: Request, res: Response) => {
 /** GET /api/skills/plugins — list installed plugins (openclaw plugins list --json) */
 router.get('/plugins', async (_req: Request, res: Response) => {
   try {
-    const raw = runOpenClaw(['plugins', 'list', '--json']);
+    const raw = await cachedListing('plugins', () => runOpenClaw(['plugins', 'list', '--json']));
     const parsed = parseJson(raw);
     const plugins = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.plugins) ? parsed.plugins : []);
     res.json({ plugins });
@@ -289,7 +324,8 @@ router.post('/plugins/install', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = runOpenClaw(['plugins', 'install', spec], 120000);
+    const result = await runOpenClaw(['plugins', 'install', spec], 120000);
+    bustSkillsCache();
     res.json({ ok: true, output: result });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Plugin install failed';

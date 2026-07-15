@@ -80,11 +80,13 @@ for candidate in sorted(root.glob('cli-shared-*.js'), key=lambda p: (p.stat().st
         break
 PY
 )"
+FAILED_PATCHES=()
+
 HEARTBEAT_DETECTOR_FILE="${HEARTBEAT_EVENTS_FILTER:-$HEARTBEAT_RUNNER}"
 GEMINI_PARSER_TARGET="${CLAUDE_LIVE_SESSION:-$EXECUTE_RUNTIME}"
 
 if [[ -n "$COMPACT_TOOLS_BUNDLE" && -f "$COMPACT_TOOLS_BUNDLE" ]]; then
-python3 - "$COMPACT_TOOLS_BUNDLE" <<'PY'
+python3 - "$COMPACT_TOOLS_BUNDLE" <<'PY' || FAILED_PATCHES+=("compaction-flush-metadata")
 from pathlib import Path
 import re
 import sys
@@ -103,6 +105,15 @@ if old in text:
     print(f"patched memory flush compaction tool metadata: {p}")
     raise SystemExit(0)
 
+# OpenClaw 2026.7.1 gates the same call site behind toolsEnabled but still
+# omits trigger/memoryFlushWritePath forwarding.
+old_2026_7 = 'const toolsRaw = toolsEnabled ? createOpenClawCodingTools({\n\t\t\texec: {'
+new_2026_7 = 'const toolsRaw = toolsEnabled ? createOpenClawCodingTools({\n\t\t\ttrigger: params.trigger,\n\t\t\tmemoryFlushWritePath: params.memoryFlushWritePath,\n\t\t\texec: {'
+if old_2026_7 in text:
+    p.write_text(text.replace(old_2026_7, new_2026_7, 1))
+    print(f"patched memory flush compaction tool metadata (2026.7.1 bundle): {p}")
+    raise SystemExit(0)
+
 pattern = re.compile(r'(const toolsRaw = createOpenClawCodingTools\(\{\n)(?P<indent>\s*)exec: \{')
 match = pattern.search(text)
 if not match:
@@ -119,7 +130,7 @@ else
 fi
 
 if [[ -n "$AGENT_RUNNER_RUNTIME" && -f "$AGENT_RUNNER_RUNTIME" ]]; then
-python3 - "$AGENT_RUNNER_RUNTIME" <<'PY'
+python3 - "$AGENT_RUNNER_RUNTIME" <<'PY' || FAILED_PATCHES+=("flush-transcript-guard")
 from pathlib import Path
 import sys
 
@@ -128,12 +139,21 @@ text = p.read_text()
 marker = 'canAttemptFlush && shouldForceFlushByTranscriptSize && entry != null && !hasAlreadyFlushedForCurrentCompaction(entry)'
 old = '}) || shouldForceFlushByTranscriptSize && entry != null && !hasAlreadyFlushedForCurrentCompaction(entry))) return entry ?? params.sessionEntry;'
 new = '}) || canAttemptFlush && shouldForceFlushByTranscriptSize && entry != null && !hasAlreadyFlushedForCurrentCompaction(entry))) return entry ?? params.sessionEntry;'
+# OpenClaw 2026.7.1 inlined canAttemptFlush (memoryFlushWritable &&
+# !params.isHeartbeat && !isCli) and returns a structured skip outcome, but
+# the transcript-size OR branch still bypasses that gate.
+marker_2026_7 = '!isCli && shouldForceFlushByTranscriptSize && entry != null && !hasAlreadyFlushedForCurrentCompaction(entry)'
+old_2026_7 = '}) || shouldForceFlushByTranscriptSize && entry != null && !hasAlreadyFlushedForCurrentCompaction(entry))) return {'
+new_2026_7 = '}) || memoryFlushWritable && !params.isHeartbeat && !isCli && shouldForceFlushByTranscriptSize && entry != null && !hasAlreadyFlushedForCurrentCompaction(entry))) return {'
 
-if marker in text:
+if marker in text or marker_2026_7 in text:
     print(f"memory flush transcript-size guard already patched: {p}")
 elif old in text:
     p.write_text(text.replace(old, new, 1))
     print(f"patched memory flush transcript-size guard: {p}")
+elif old_2026_7 in text:
+    p.write_text(text.replace(old_2026_7, new_2026_7, 1))
+    print(f"patched memory flush transcript-size guard (2026.7.1 bundle): {p}")
 else:
     raise SystemExit(f"memory flush transcript-size guard target not found in {p}")
 PY
@@ -142,7 +162,7 @@ else
 fi
 
 if [[ -n "$HEARTBEAT_DETECTOR_FILE" ]]; then
-python3 - "$HEARTBEAT_DETECTOR_FILE" <<'PY'
+python3 - "$HEARTBEAT_DETECTOR_FILE" <<'PY' || FAILED_PATCHES+=("heartbeat-exec-detector")
 from pathlib import Path
 import sys
 p = Path(sys.argv[1])
@@ -170,11 +190,15 @@ else
 fi
 
 if [[ -n "$HEARTBEAT_RUNNER" ]]; then
-python3 - "$HEARTBEAT_RUNNER" <<'PY'
+python3 - "$HEARTBEAT_RUNNER" <<'PY' || FAILED_PATCHES+=("heartbeat-webchat-relay")
 from pathlib import Path
 import sys
 p = Path(sys.argv[1])
 text = p.read_text()
+# OpenClaw 2026.7.1 assigns resolveHeartbeatRunPrompt with let and extra
+# params, so patch only the canRelayToUser line itself.
+line_old_2026_7 = '\tconst canRelayToUser = Boolean(delivery.channel !== "none" && delivery.to && visibility.showAlerts);\n\tconst workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n\tlet useHeartbeatResponseToolPrompt'
+line_new_2026_7 = '\tconst entryDeliveryChannel = entry?.deliveryContext?.channel ?? entry?.lastChannel ?? entry?.origin?.surface ?? entry?.origin?.provider;\n\tconst isDirectWebchatSession = entry?.chatType === "direct" && entryDeliveryChannel === "webchat";\n\tconst canRelayToUser = Boolean(visibility.showAlerts && (delivery.channel !== "none" && delivery.to || delivery.channel === "none" && isDirectWebchatSession));\n\tconst workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n\tlet useHeartbeatResponseToolPrompt'
 old_relay = '\tconst canRelayToUser = Boolean(visibility.showAlerts && delivery.channel !== "none" && (delivery.to || delivery.channel === "webchat" && entry?.chatType === "direct"));\n\tconst { prompt, hasExecCompletion, hasCronEvents } = resolveHeartbeatRunPrompt({'
 new_relay = '\tconst entryDeliveryChannel = entry?.deliveryContext?.channel ?? entry?.lastChannel ?? entry?.origin?.surface ?? entry?.origin?.provider;\n\tconst isDirectWebchatSession = entry?.chatType === "direct" && entryDeliveryChannel === "webchat";\n\tconst canRelayToUser = Boolean(visibility.showAlerts && (delivery.channel !== "none" && (delivery.to || delivery.channel === "webchat" && entry?.chatType === "direct") || delivery.channel === "none" && isDirectWebchatSession));\n\tconst { prompt, hasExecCompletion, hasCronEvents } = resolveHeartbeatRunPrompt({'
 current_relay = '\tconst responsePrefix = resolveEffectiveMessagesConfig(cfg, agentId, {\n\t\tchannel: delivery.channel !== "none" ? delivery.channel : void 0,\n\t\taccountId: delivery.accountId\n\t}).responsePrefix;\n\tconst { prompt, hasExecCompletion, hasCronEvents } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser: Boolean(delivery.channel !== "none" && delivery.to && visibility.showAlerts),\n\t\tworkspaceDir: resolveAgentWorkspaceDir(cfg, agentId),\n\t\tstartedAt,\n\t\theartbeatFileContent: preflight.heartbeatFileContent\n\t});'
@@ -183,8 +207,11 @@ current_relay_v202655 = '\tconst canRelayToUser = Boolean(delivery.channel !== "
 current_relay_v202655_new = '\tconst entryDeliveryChannel = entry?.deliveryContext?.channel ?? entry?.lastChannel ?? entry?.origin?.surface ?? entry?.origin?.provider;\n\tconst isDirectWebchatSession = entry?.chatType === "direct" && entryDeliveryChannel === "webchat";\n\tconst canRelayToUser = Boolean(visibility.showAlerts && (delivery.channel !== "none" && delivery.to || delivery.channel === "none" && isDirectWebchatSession));\n\tconst workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n\tconst useHeartbeatResponseToolPrompt = shouldUseHeartbeatResponseToolPrompt({\n\t\tcfg,\n\t\tagentId,\n\t\theartbeat,\n\t\tentry\n\t});\n\tconst { prompt, hasExecCompletion, hasRelayableExecCompletion, hasCronEvents, hasDueCommitments, usesHeartbeatResponseTool } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser,\n\t\tworkspaceDir,\n\t\tstartedAt,\n\t\tdueTasks: dueHeartbeatTasks,'
 current_relay_v202668 = '\tconst canRelayToUser = Boolean(delivery.channel !== "none" && delivery.to && visibility.showAlerts);\n\tconst workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n\tconst useHeartbeatResponseToolPrompt = shouldUseHeartbeatResponseToolPrompt({\n\t\tcfg,\n\t\tagentId,\n\t\theartbeat,\n\t\tentry,\n\t\tchatType: delivery.chatType\n\t});\n\tconst { prompt, hasExecCompletion, hasRelayableExecCompletion, hasCronEvents, hasDueCommitments, usesHeartbeatResponseTool } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser,\n\t\tworkspaceDir,\n\t\tstartedAt,\n\t\tdueTasks: dueHeartbeatTasks,'
 current_relay_v202668_new = '\tconst entryDeliveryChannel = entry?.deliveryContext?.channel ?? entry?.lastChannel ?? entry?.origin?.surface ?? entry?.origin?.provider;\n\tconst isDirectWebchatSession = entry?.chatType === "direct" && entryDeliveryChannel === "webchat";\n\tconst canRelayToUser = Boolean(visibility.showAlerts && (delivery.channel !== "none" && delivery.to || delivery.channel === "none" && isDirectWebchatSession));\n\tconst workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n\tconst useHeartbeatResponseToolPrompt = shouldUseHeartbeatResponseToolPrompt({\n\t\tcfg,\n\t\tagentId,\n\t\theartbeat,\n\t\tentry,\n\t\tchatType: delivery.chatType\n\t});\n\tconst { prompt, hasExecCompletion, hasRelayableExecCompletion, hasCronEvents, hasDueCommitments, usesHeartbeatResponseTool } = resolveHeartbeatRunPrompt({\n\t\tcfg,\n\t\theartbeat,\n\t\tpreflight,\n\t\tcanRelayToUser,\n\t\tworkspaceDir,\n\t\tstartedAt,\n\t\tdueTasks: dueHeartbeatTasks,'
-if new_relay in text or current_relay_new in text or current_relay_v202655_new in text or current_relay_v202668_new in text:
+if new_relay in text or current_relay_new in text or current_relay_v202655_new in text or current_relay_v202668_new in text or line_new_2026_7 in text:
     print(f"relay already patched: {p}")
+elif line_old_2026_7 in text:
+    text = text.replace(line_old_2026_7, line_new_2026_7, 1)
+    print(f"patched relay routing (2026.7.1 bundle): {p}")
 elif old_relay in text:
     text = text.replace(old_relay, new_relay, 1)
     print(f"patched relay routing: {p}")
@@ -206,7 +233,7 @@ else
 fi
 
 if [[ -n "$GET_REPLY_FILE" ]]; then
-python3 - "$GET_REPLY_FILE" <<'PY'
+python3 - "$GET_REPLY_FILE" <<'PY' || FAILED_PATCHES+=("reply-routing")
 from pathlib import Path
 import sys
 p = Path(sys.argv[1])
@@ -231,7 +258,7 @@ else
 fi
 
 if [[ -n "$CLI_BACKEND" && -f "$CLI_BACKEND" ]]; then
-python3 - "$CLI_BACKEND" <<'PY'
+python3 - "$CLI_BACKEND" <<'PY' || FAILED_PATCHES+=("gemini-cli-backend")
 from pathlib import Path
 import sys
 
@@ -288,7 +315,7 @@ else
 fi
 
 if [[ -n "$CLAUDE_CLI_SHARED" && -f "$CLAUDE_CLI_SHARED" ]]; then
-python3 - "$CLAUDE_CLI_SHARED" <<'PY'
+python3 - "$CLAUDE_CLI_SHARED" <<'PY' || FAILED_PATCHES+=("claude-root-permission")
 from pathlib import Path
 import sys
 
@@ -326,7 +353,7 @@ else
 fi
 
 if [[ -n "$GEMINI_PARSER_TARGET" ]]; then
-python3 - "$GEMINI_PARSER_TARGET" <<'PY'
+python3 - "$GEMINI_PARSER_TARGET" <<'PY' || FAILED_PATCHES+=("gemini-stream-parser")
 from pathlib import Path
 import re
 import sys
@@ -627,7 +654,7 @@ else
 fi
 
 if [[ -n "$EXECUTE_RUNTIME" ]]; then
-python3 - "$EXECUTE_RUNTIME" <<'PY'
+python3 - "$EXECUTE_RUNTIME" <<'PY' || FAILED_PATCHES+=("runtime-streaming-wiring")
 from pathlib import Path
 import re
 import sys
@@ -665,6 +692,94 @@ else:
 PY
 else
   echo "skipping Gemini runtime wiring patch: execute.runtime bundle not found under $ROOT"
+fi
+
+# OpenClaw 2026.7.1: `openclaw models list` crashes with "Cannot read
+# properties of undefined (reading 'input')" when a configured
+# anthropic/claude-sonnet-5 declaration has no catalog cost metadata.
+# Guard the cost comparison so declared-but-uncatalogued rows adopt the
+# resolved Sonnet 5 cost instead of crashing the whole CLI.
+REGISTER_RUNTIME_BUNDLE="$(python3 - "$ROOT" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+for candidate in sorted(root.glob('register.runtime-*.js'), key=lambda p: (p.stat().st_size, p.name), reverse=True):
+    try:
+        text = candidate.read_text()
+    except Exception:
+        continue
+    if 'function applyAnthropicSonnet5Cost' in text:
+        print(candidate)
+        break
+PY
+)"
+if [[ -n "$REGISTER_RUNTIME_BUNDLE" && -f "$REGISTER_RUNTIME_BUNDLE" ]]; then
+python3 - "$REGISTER_RUNTIME_BUNDLE" <<'PY' || FAILED_PATCHES+=("sonnet5-cost-guard")
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+text = p.read_text()
+marker = 'if (params.model.cost && params.model.cost.input === cost.input'
+old = 'if (params.model.cost.input === cost.input && params.model.cost.output === cost.output && params.model.cost.cacheRead === cost.cacheRead && params.model.cost.cacheWrite === cost.cacheWrite) return;'
+new = 'if (params.model.cost && params.model.cost.input === cost.input && params.model.cost.output === cost.output && params.model.cost.cacheRead === cost.cacheRead && params.model.cost.cacheWrite === cost.cacheWrite) return;'
+
+if marker in text:
+    print(f"sonnet5 cost guard already patched: {p}")
+elif old in text:
+    p.write_text(text.replace(old, new, 1))
+    print(f"patched sonnet5 cost guard: {p}")
+else:
+    print(f"sonnet5 cost guard target not found (bundle may be fixed upstream): {p}")
+PY
+else
+  echo "skipping sonnet5 cost guard patch: register runtime bundle not found under $ROOT"
+fi
+
+# Raise the CLI no-output watchdog floors/caps. Claude models with long
+# non-streamed reasoning stretches emit zero CLI output for minutes; the stock
+# resume profile hard-caps silence at 180s, so healthy turns die with
+# "CLI produced no output for 180s and was terminated." A config-level
+# cliBackends override is not viable on 2026.7.1 (a sparse entry displaces the
+# plugin's backend definition), so patch the default constants instead. The
+# effective window stays capped by the run timeout (~runTimeout-1s).
+WATCHDOG_DEFAULTS_BUNDLE="$(python3 - "$ROOT" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+for candidate in sorted(root.glob('cli-watchdog-defaults-*.js'), key=lambda p: (p.stat().st_size, p.name), reverse=True):
+    try:
+        text = candidate.read_text()
+    except Exception:
+        continue
+    if 'CLI_RESUME_WATCHDOG_DEFAULTS' in text:
+        print(candidate)
+        break
+PY
+)"
+if [[ -n "$WATCHDOG_DEFAULTS_BUNDLE" && -f "$WATCHDOG_DEFAULTS_BUNDLE" ]]; then
+python3 - "$WATCHDOG_DEFAULTS_BUNDLE" <<'PY' || FAILED_PATCHES+=("cli-no-output-watchdog")
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+text = p.read_text()
+
+fresh_old = "const CLI_FRESH_WATCHDOG_DEFAULTS = {\n\tnoOutputTimeoutRatio: .8,\n\tminMs: 18e4,\n\tmaxMs: 6e5\n};"
+fresh_new = "const CLI_FRESH_WATCHDOG_DEFAULTS = {\n\tnoOutputTimeoutRatio: .8,\n\tminMs: 9e5,\n\tmaxMs: 9e5\n};"
+resume_old = "const CLI_RESUME_WATCHDOG_DEFAULTS = {\n\tnoOutputTimeoutRatio: .3,\n\tminMs: 6e4,\n\tmaxMs: 18e4\n};"
+resume_new = "const CLI_RESUME_WATCHDOG_DEFAULTS = {\n\tnoOutputTimeoutRatio: .3,\n\tminMs: 9e5,\n\tmaxMs: 9e5\n};"
+
+if fresh_new in text and resume_new in text:
+    print(f"cli no-output watchdog already patched: {p}")
+elif fresh_old in text and resume_old in text:
+    p.write_text(text.replace(fresh_old, fresh_new, 1).replace(resume_old, resume_new, 1))
+    print(f"patched cli no-output watchdog defaults: {p}")
+else:
+    print(f"cli no-output watchdog target not found (bundle may differ upstream): {p}")
+PY
+else
+  echo "skipping cli no-output watchdog patch: defaults bundle not found under $ROOT"
 fi
 
 if [[ -n "$HEARTBEAT_DETECTOR_FILE" ]]; then
@@ -717,5 +832,11 @@ for bundle in "$HEARTBEAT_EVENTS_FILTER" "$HEARTBEAT_RUNNER" "$GET_REPLY_FILE" "
 done
 validate_no_duplicate_function "$GEMINI_PARSER_TARGET" "parseGeminiCliStreamingDelta"
 validate_no_duplicate_function "$GEMINI_PARSER_TARGET" "dispatchGeminiCliStreamingToolEvent"
+
+if (( ${#FAILED_PATCHES[@]} > 0 )); then
+  echo "Compatibility hotfix finished with failed patches: ${FAILED_PATCHES[*]}" >&2
+  echo "All other patches were still attempted; review the log above for details." >&2
+  exit 1
+fi
 
 echo "Compatibility hotfix complete. Restart OpenClaw gateway for changes to take effect."

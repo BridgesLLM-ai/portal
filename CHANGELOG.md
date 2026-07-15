@@ -2,6 +2,47 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.26.0] - 2026-07-15
+
+### Added
+- **New recommended models**: Anthropic setup now recommends Claude Fable 5 alongside Opus 4.8. ChatGPT/Codex subscription setup now offers the GPT-5.6 suite (Sol, Terra, Luna) with GPT-5.5 as the compatibility choice for accounts without GPT-5.6 access.
+- **Live reasoning for Claude models**: Agent Chat streams Claude's thinking in real time on OpenClaw 2026.7.1's native thinking lane for models that stream reasoning (e.g. Sonnet 4.6). Fable 5 turns run fully; their thought text is not streamed by the current upstream runtime.
+- **Remote Desktop clipboard that actually works**: new "Send clipboard" and "Get clipboard" buttons on the Desktop page move text between your computer's clipboard and the remote desktop in one click, with clear success and error feedback. The in-session VNC clipboard bridge now starts automatically, so the classic VNC clipboard panel works too.
+
+### Changed
+- **OpenClaw runtime updated to 2026.7.1** (Codex plugin pinned to match). Includes upstream fixes for Claude CLI streamed replies, silent maintenance runs, and startup recovery.
+- **Canonical Codex model route is now `openai/*`**: legacy `codex/*` and `openai-codex/*` references keep working and are migrated automatically during update.
+- **Fast mode** is now available on all GPT (openai/*) Codex-runtime models, not just GPT-5.5.
+
+### Fixed
+- **Dashboard gauges no longer stall behind background scans**: OpenClaw, update, and maintenance checks run independently in a dedicated "System checks" section with per-check progress, and maintenance results are served from a short cache with background refresh.
+- **Agent Tools is fast**: provider availability probes, skills and plugin listings no longer block the server while they run (async + cached) — the section opens in milliseconds instead of many seconds.
+- **Automations no longer flag successful runs as errors**: portal-created jobs use no-target delivery, so run history reflects the actual agent turn result.
+- **Codex Fast Mode** now applies to every supporting GPT model and is hidden entirely for models that do not support it.
+- **Remote Desktop black screen fixed**: display power/screensaver blanking is disabled durably (a desktop component was re-enabling a 10-minute blank timer after startup), with a keep-awake guard for the session's lifetime.
+- **Remote Desktop windows now stay reachable after resizes**: a window-fit watcher clamps any window stranded outside the new screen bounds back into view when the desktop resolution changes.
+- **Session switching is dramatically faster**: chat history loading no longer rescans every session log on each request. Multi-second switch delays drop to near-instant on installs with long histories.
+- **Session Controls are model-aware and fast**: the thinking slider now reads each model's supported levels from OpenClaw (including the new Ultra and Max levels for GPT-5.6 and Max/Adaptive for Claude models), the panel no longer takes many seconds to load, and thinking changes are validated against the session's own model instead of the global default.
+- **Thinking-level changes no longer fail portal-wide when the default model has a restricted thinking profile**; unusable Claude 5 defaults are automatically demoted to a working model during update repair.
+- **OpenClaw CLI recovery**: guards a 2026.7.1 crash in `openclaw models list` triggered by declared models without catalog pricing metadata.
+- **Duplicated or fragmented thought bubbles**: cumulative reasoning snapshots are deduplicated and merged in place, in both live streaming and reloaded history.
+- **Reasoning history growth**: streamed thinking no longer bloats the on-disk turn-event history during long thoughts.
+- **Compatibility hotfix hardening**: per-patch isolation so one inapplicable patch can no longer block the remaining compatibility fixes; patches ported to OpenClaw 2026.7.1 bundles.
+- **Long quiet turns no longer die with "CLI produced no output for 180s and was terminated"**: the CLI runtime's no-output watchdog window is raised so long silent reasoning stretches and slow tool calls complete instead of being killed mid-turn.
+- **Assistant text written before a tool call no longer disappears on reload**: pre-tool message segments are preserved in durable history and render in their correct position in the timeline.
+- **Tool calls and their results now pair correctly** instead of occasionally rendering as two separate entries.
+- **Tool activity pills recognize the full current tool vocabulary** (CamelCase and MCP-prefixed tool names included), so actions show as styled, descriptive pills instead of a generic "Tool" badge.
+- **Command approval popups no longer lock up**: approval dialogs reset cleanly between queued requests, a stuck submission can no longer freeze the page, failures show a clear retry/deny message, and approvals that already expired are dismissed automatically instead of lingering as dead popups.
+- **Stale "Thinking…" bubbles purged**: transient status placeholders are no longer replayed into chat history as thought bubbles.
+- **Reconnecting to a running chat no longer reports a false interruption**: coming back mid-turn re-attaches to the live stream instead of showing "interrupted by steering message" while the agent is still working, and sending a message to a session that is actually mid-turn now delivers it as a graceful steering message instead of interrupting the run.
+- **Updates no longer erase chat runtime history**: persisted turn events (thinking segments, tool cards, stream recovery state) now survive portal updates.
+- **Fresh installs and reinstalls hardened**: the generated web server config no longer references assets that do not exist on customer machines (which made the front page a 404 for logged-out visitors), the configured domain is preserved into the environment on reinstalls, and reinstalling over an existing account no longer resurrects the setup wizard in place of the login page.
+
+### Security
+- **Portal binds to loopback by default**: external access is served exclusively through the HTTPS reverse proxy. Existing installs are repaired during update; set HOST explicitly if you intentionally need a wider bind.
+- **Persisted chat runtime data is now root-only** (0700 directories, 0600 files), with an update-time repair for existing installs.
+- **Dependency security updates**: all non-breaking fixes applied, including axios (SSRF/auth bypass advisories), ws, form-data, lodash, path-to-regexp, http-proxy-middleware, and undici.
+
 ## [3.25.27] - 2026-07-08
 
 ### Fixed

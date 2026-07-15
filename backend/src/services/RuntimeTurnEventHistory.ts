@@ -69,6 +69,29 @@ function sanitizeEvent(event: RuntimeTurnEvent): RuntimeTurnEvent | null {
   };
 }
 
+// Reasoning snapshots on OpenClaw 2026.7.1 stream as replace-style events that
+// each carry the full thought so far. Persisting every intermediate snapshot
+// would bloat the JSONL history by orders of magnitude on long thoughts, so
+// consecutive replace snapshots for the same run collapse into one pending
+// event that is flushed when the thought settles (next non-replace event,
+// turn end, or a history read).
+const pendingReasoningBySession = new Map<string, RuntimeTurnEvent>();
+
+function appendEventLine(sessionKey: string, dir: string, event: RuntimeTurnEvent): void {
+  // Persisted turn events hold conversation content; keep them out of reach
+  // of non-root local accounts (modes apply at creation only — the installer
+  // repairs pre-existing files).
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  appendFileSync(historyPathForSession(sessionKey, dir), JSON.stringify(event) + '\n', { encoding: 'utf8', mode: 0o600 });
+}
+
+function flushPendingReasoning(sessionKey: string, dir: string): void {
+  const pending = pendingReasoningBySession.get(sessionKey);
+  if (!pending) return;
+  pendingReasoningBySession.delete(sessionKey);
+  appendEventLine(sessionKey, dir, pending);
+}
+
 export function recordRuntimeTurnEvent(sessionKey: string, event: RuntimeTurnEvent): void {
   if (!sessionKey || process.env.PORTAL_DISABLE_RUNTIME_TURN_EVENT_HISTORY === '1') return;
   const dir = resolveHistoryDir();
@@ -78,8 +101,19 @@ export function recordRuntimeTurnEvent(sessionKey: string, event: RuntimeTurnEve
   if (!sanitized) return;
 
   try {
-    mkdirSync(dir, { recursive: true });
-    appendFileSync(historyPathForSession(sessionKey, dir), JSON.stringify(sanitized) + '\n', 'utf8');
+    if (sanitized.type === 'assistant_reasoning') {
+      const pending = pendingReasoningBySession.get(sessionKey);
+      if (sanitized.replace === true && pending && (pending.runId || '') === (sanitized.runId || '')) {
+        pendingReasoningBySession.set(sessionKey, sanitized);
+        return;
+      }
+      flushPendingReasoning(sessionKey, dir);
+      pendingReasoningBySession.set(sessionKey, sanitized);
+      return;
+    }
+
+    flushPendingReasoning(sessionKey, dir);
+    appendEventLine(sessionKey, dir, sanitized);
   } catch (err: any) {
     console.warn('[runtime-turn-event-history] Failed to record turn event:', err?.message || err);
   }
@@ -89,6 +123,13 @@ export function readRuntimeTurnEvents(sessionKey: string, limit = DEFAULT_LIMIT)
   if (!sessionKey || limit <= 0) return [];
   const dir = resolveHistoryDir();
   if (!dir) return [];
+
+  // Mid-turn reads (resume replay, history fetch) must see the live thought.
+  try {
+    flushPendingReasoning(sessionKey, dir);
+  } catch (err: any) {
+    console.warn('[runtime-turn-event-history] Failed to flush pending reasoning:', err?.message || err);
+  }
 
   const filePath = historyPathForSession(sessionKey, dir);
   if (!existsSync(filePath)) return [];

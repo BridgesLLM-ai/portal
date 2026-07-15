@@ -13,7 +13,7 @@ import {
   AlertTriangle, MemoryStick,
   ArrowDown, ArrowUp, RefreshCw,
   Gauge, Layers, Timer, Loader2,
-  ShieldAlert, Wrench,
+  ShieldAlert, Wrench, CheckCircle2,
 } from 'lucide-react';
 
 const LazyDashboardCharts = lazy(() => import('../components/dashboard/DashboardCharts'));
@@ -283,6 +283,15 @@ export default function DashboardPage() {
   const [openClawIssues, setOpenClawIssues] = useState<string[]>([]);
   const [openClawVersion, setOpenClawVersion] = useState<OpenClawVersionStatus | null>(null);
   const [maintenanceStatus, setMaintenanceStatus] = useState<MaintenanceStatus | null>(null);
+  // Background system checks run independently of the metric gauges. Each one
+  // reports its own progress so slow scans (apt, OpenClaw probes) read as
+  // "checks running" instead of a stalled dashboard.
+  type SystemCheckState = 'pending' | 'done' | 'error';
+  const [systemChecks, setSystemChecks] = useState<Record<'openclaw' | 'updates' | 'maintenance', SystemCheckState>>({
+    openclaw: 'pending',
+    updates: 'pending',
+    maintenance: 'pending',
+  });
   const [maintenanceDismissedSignature, setMaintenanceDismissedSignature] = useState(() => {
     try {
       return localStorage.getItem(MAINTENANCE_DISMISS_KEY) || '';
@@ -417,45 +426,20 @@ export default function DashboardPage() {
     return Boolean(status?.lightweight || reason.includes('probe scheduled') || reason.includes('probe already running'));
   }, []);
 
-  // Defer non-critical startup checks so the main dashboard cards can settle first
+  // Defer non-critical startup checks so the main dashboard cards can settle
+  // first, then run every check INDEPENDENTLY: one slow scan (apt, OpenClaw
+  // version probes) must never hold back the others or the metric gauges.
   useEffect(() => {
     let cancelled = false;
     let forceProbeTimer: number | undefined;
-    const timer = window.setTimeout(async () => {
-      try {
-        const [al, upd, gateway, maintenance] = await Promise.all([
-          alertsAPI.list({ limit: 10, severity: 'CRITICAL' }).catch(() => ({ alerts: [], total: 0 })),
-          (canRunSelfUpdate
-            ? client.post('/admin/check-updates', {}, { _silent: true } as any).then(r => r.data).catch(() =>
-                client.get('/admin/update-status', { _silent: true } as any).then(r => r.data).catch(() => null)
-              )
-            : client.get('/admin/update-status', { _silent: true } as any).then(r => r.data).catch(() => null)),
-          client.get('/gateway/health', { _silent: true } as any).then(r => r.data).catch(() => null),
-          client.get('/system/maintenance', { _silent: true } as any).then(r => r.data).catch(() => null),
-        ]);
-        if (cancelled) return;
-        applyGatewayHealth(gateway);
-        if (maintenance) setMaintenanceStatus(maintenance);
-        if (needsForcedGatewayVersionProbe(gateway)) {
-          forceProbeTimer = window.setTimeout(async () => {
-            try {
-              const { data } = await client.get('/gateway/health?forceVersion=1', { _silent: true } as any);
-              if (!cancelled) applyGatewayHealth(data);
-            } catch (err) {
-              if (!cancelled) console.error('[Dashboard] Forced OpenClaw version probe failed:', err);
-            }
-          }, 1600);
-        }
-        if (upd) {
-          setUpdateStatus(upd);
-          const latest = typeof upd?.latest === 'string' ? upd.latest : null;
-          if (latest && localStorage.getItem(`dashboard-update-dismissed:${latest}`) === 'true') {
-            setUpdateBannerDismissed(true);
-          } else {
-            setUpdateBannerDismissed(false);
-          }
-        }
-        if (al.alerts?.length) {
+    const markCheck = (key: 'openclaw' | 'updates' | 'maintenance', state: SystemCheckState) => {
+      if (!cancelled) setSystemChecks(prev => (prev[key] === state ? prev : { ...prev, [key]: state }));
+    };
+
+    const timer = window.setTimeout(() => {
+      alertsAPI.list({ limit: 10, severity: 'CRITICAL' })
+        .then((al) => {
+          if (cancelled || !al.alerts?.length) return;
           setActiveAlerts(prev => {
             const ids = new Set(prev.map(p => p.id));
             const merged = [...prev];
@@ -464,10 +448,54 @@ export default function DashboardPage() {
             }
             return merged.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).slice(0, 20);
           });
-        }
-      } catch (err) {
-        if (!cancelled) console.error('[Dashboard] Failed to fetch secondary data:', err);
-      }
+        })
+        .catch(() => {});
+
+      (canRunSelfUpdate
+        ? client.post('/admin/check-updates', {}, { _silent: true } as any).then(r => r.data).catch(() =>
+            client.get('/admin/update-status', { _silent: true } as any).then(r => r.data).catch(() => null)
+          )
+        : client.get('/admin/update-status', { _silent: true } as any).then(r => r.data).catch(() => null))
+        .then((upd) => {
+          if (cancelled) return;
+          if (upd) {
+            setUpdateStatus(upd);
+            const latest = typeof upd?.latest === 'string' ? upd.latest : null;
+            if (latest && localStorage.getItem(`dashboard-update-dismissed:${latest}`) === 'true') {
+              setUpdateBannerDismissed(true);
+            } else {
+              setUpdateBannerDismissed(false);
+            }
+          }
+          markCheck('updates', upd ? 'done' : 'error');
+        })
+        .catch(() => markCheck('updates', 'error'));
+
+      client.get('/gateway/health', { _silent: true } as any)
+        .then(({ data: gateway }) => {
+          if (cancelled) return;
+          applyGatewayHealth(gateway);
+          markCheck('openclaw', 'done');
+          if (needsForcedGatewayVersionProbe(gateway)) {
+            forceProbeTimer = window.setTimeout(async () => {
+              try {
+                const { data } = await client.get('/gateway/health?forceVersion=1', { _silent: true } as any);
+                if (!cancelled) applyGatewayHealth(data);
+              } catch (err) {
+                if (!cancelled) console.error('[Dashboard] Forced OpenClaw version probe failed:', err);
+              }
+            }, 1600);
+          }
+        })
+        .catch(() => markCheck('openclaw', 'error'));
+
+      client.get('/system/maintenance', { _silent: true } as any)
+        .then(({ data: maintenance }) => {
+          if (cancelled) return;
+          if (maintenance) setMaintenanceStatus(maintenance);
+          markCheck('maintenance', maintenance ? 'done' : 'error');
+        })
+        .catch(() => markCheck('maintenance', 'error'));
     }, 1200);
 
     return () => {
@@ -699,6 +727,47 @@ export default function DashboardPage() {
                 Dismiss
               </button>
             </div>
+          </div>
+        </motion.div>
+      )}
+
+      {Object.values(systemChecks).some((state) => state === 'pending') && (
+        <motion.div
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="rounded-2xl border border-white/[0.08] bg-white/[0.03] p-5 backdrop-blur-xl"
+        >
+          <div className="flex items-center gap-2">
+            <Loader2 size={16} className="animate-spin text-violet-300" />
+            <h3 className="text-sm font-semibold text-white">System checks running</h3>
+            <span className="text-xs text-slate-500">Server metrics load independently — these background scans can take a moment on a busy host.</span>
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-3">
+            {([
+              { key: 'openclaw' as const, label: 'OpenClaw gateway' },
+              { key: 'updates' as const, label: 'Portal updates' },
+              { key: 'maintenance' as const, label: 'Server maintenance' },
+            ]).map(({ key, label }) => (
+              <div key={key} className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-medium text-slate-200">{label}</span>
+                  {systemChecks[key] === 'pending' ? (
+                    <span className="text-[10px] uppercase tracking-wide text-violet-300">Scanning</span>
+                  ) : systemChecks[key] === 'done' ? (
+                    <CheckCircle2 size={14} className="text-emerald-400" />
+                  ) : (
+                    <AlertTriangle size={14} className="text-amber-400" />
+                  )}
+                </div>
+                <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-white/[0.06]">
+                  {systemChecks[key] === 'pending' ? (
+                    <div className="h-full w-1/2 animate-pulse rounded-full bg-gradient-to-r from-violet-500/40 via-violet-400 to-violet-500/40" />
+                  ) : (
+                    <div className={`h-full w-full rounded-full ${systemChecks[key] === 'done' ? 'bg-emerald-500/60' : 'bg-amber-500/60'}`} />
+                  )}
+                </div>
+              </div>
+            ))}
           </div>
         </motion.div>
       )}

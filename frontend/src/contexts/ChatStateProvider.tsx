@@ -102,6 +102,7 @@ interface StreamSegment {
 }
 
 const STEERING_INTERRUPTED_MARKER = '*(interrupted by steering message)*';
+const LIVE_VIEW_DETACHED_MARKER = '*(live view detached — the agent may still be working; latest history reloaded)*';
 const STREAM_RECOVERY_GRACE_MS = 45_000;
 
 export interface ChatMessage {
@@ -1375,11 +1376,14 @@ function mergeToolCallSnapshots(existing: ToolCall[] | undefined, incoming: Tool
   return merged.length > 0 ? merged : undefined;
 }
 
-function appendSteeringInterruptedMarker(content: string): string {
+function appendTurnMarker(content: string, marker: string): string {
   const current = String(content || '').trim();
-  if (!current) return STEERING_INTERRUPTED_MARKER;
-  if (current.includes(STEERING_INTERRUPTED_MARKER)) return String(content || '');
-  return `${String(content || '').trimEnd()}\n\n${STEERING_INTERRUPTED_MARKER}`;
+  if (!current) return marker;
+  // Never stack markers: a snapshot already labeled (by either path) stays as-is.
+  if (current.includes(STEERING_INTERRUPTED_MARKER) || current.includes(LIVE_VIEW_DETACHED_MARKER)) {
+    return String(content || '');
+  }
+  return `${String(content || '').trimEnd()}\n\n${marker}`;
 }
 
 function preserveInterruptedLiveTurnSnapshot(
@@ -1390,6 +1394,10 @@ function preserveInterruptedLiveTurnSnapshot(
     segments: StreamSegment[];
     toolCalls: ToolCall[];
   },
+  // Only the real steer path may claim a steering interruption; recovery
+  // paths detach the live VIEW while the agent keeps working, and labeling
+  // that "interrupted by steering" reads as a false interruption.
+  marker: string = STEERING_INTERRUPTED_MARKER,
 ): ChatMessage {
   const segments: TextSegment[] = [];
   const seenSegments = new Set<string>();
@@ -1432,8 +1440,8 @@ function preserveInterruptedLiveTurnSnapshot(
   }
 
   const nextContent = snapshot.text.trim()
-    ? appendSteeringInterruptedMarker(snapshot.text)
-    : appendSteeringInterruptedMarker(message.content);
+    ? appendTurnMarker(snapshot.text, marker)
+    : appendTurnMarker(message.content, marker);
 
   return {
     ...message,
@@ -1731,8 +1739,9 @@ export interface ChatStateContextValue {
   wsManager: WsManager | null;
   reconnectSocket: () => void;
   // Session controls (OpenClaw session thinking + fast mode)
-  thinkingLevel: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
-  setThinkingLevel: (level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive') => Promise<void>;
+  thinkingLevel: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive' | 'max' | 'ultra';
+  sessionThinkingOptions: string[];
+  setThinkingLevel: (level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive' | 'max' | 'ultra') => Promise<void>;
   reasoningVisibility: 'off' | 'on' | 'stream';
   setReasoningVisibility: (level: 'off' | 'on' | 'stream') => Promise<void>;
   fastModeEnabled: boolean;
@@ -1742,7 +1751,7 @@ export interface ChatStateContextValue {
   compactionModelLoading: boolean;
   compactionModelError: string | null;
   sessionControlsSupported: boolean;
-  ensureSessionControlsMetadataLoaded: () => Promise<void>;
+  ensureSessionControlsMetadataLoaded: (options?: { force?: boolean }) => Promise<void>;
   sessionTelemetry: OpenClawSessionTelemetry | null;
   sessionAvailability: 'unknown' | 'present' | 'missing';
 }
@@ -1984,9 +1993,9 @@ function getCodexAppServerProgressStatus(stream: unknown, data: any): string | n
 }
 
 export function ChatStateProvider({ children }: { children: React.ReactNode }) {
-  type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
+  type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive' | 'max' | 'ultra';
   type ReasoningVisibility = 'off' | 'on' | 'stream';
-  const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive'];
+  const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'adaptive', 'high', 'xhigh', 'max', 'ultra'];
   const REASONING_VISIBILITY_LEVELS: ReasoningVisibility[] = ['off', 'on', 'stream'];
   const publicSettings = usePublicSettings();
   const useDirectGateway = publicSettings?.useDirectGateway ?? BUILD_TIME_USE_DIRECT_GATEWAY;
@@ -2105,8 +2114,28 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       return { deferred: true };
     }
 
+    // The session-model response includes the refreshed session row, whose
+    // thinkingOptions/thinkingLevel reflect the newly resolved model profile
+    // (e.g. ultra appears when switching to GPT-5.6 Sol). Apply it so the
+    // Session Controls slider updates without reopening the panel.
+    const applyPatchedSessionProfile = (patchResponse: any) => {
+      const patchedSession = patchResponse?.session;
+      if (!patchedSession || typeof patchedSession !== 'object') return;
+      const options = Array.isArray(patchedSession.thinkingOptions)
+        ? (patchedSession.thinkingOptions as unknown[])
+            .map((entry) => String(entry || '').trim().toLowerCase())
+            .filter((entry) => THINKING_LEVELS.includes(entry as ThinkingLevel))
+        : [];
+      setSessionThinkingOptions(options);
+      const patchedThinking = String(patchedSession.thinkingLevel || '').trim().toLowerCase();
+      if (patchedThinking && THINKING_LEVELS.includes(patchedThinking as ThinkingLevel)) {
+        setThinkingLevelState(patchedThinking as ThinkingLevel);
+      }
+    };
+
     try {
-      await gatewayAPI.patchSessionModel(currentSession, m, currentProvider);
+      const patched = await gatewayAPI.patchSessionModel(currentSession, m, currentProvider);
+      applyPatchedSessionProfile(patched);
       return { deferred: false };
     } catch (err: any) {
       const status = err?.response?.status;
@@ -2115,7 +2144,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         && currentSession.includes(':new-');
       if ((status === 404 || status === 409) && isSyntheticOpenClawSession) {
         await gatewayAPI.createSession(currentSession, currentProvider);
-        await gatewayAPI.patchSessionModel(currentSession, m, currentProvider);
+        const patched = await gatewayAPI.patchSessionModel(currentSession, m, currentProvider);
+        applyPatchedSessionProfile(patched);
         return { deferred: false };
       }
       throw err;
@@ -2182,6 +2212,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   // Session controls state (thinking/fast mode)
   const [thinkingLevel, setThinkingLevelState] = useState<ThinkingLevel>('high');
+  // Per-model thinking profile from the gateway session row (OpenClaw 2026.7.1
+  // exposes thinkingOptions/thinkingDefault per resolved model, e.g. ultra on
+  // GPT-5.6 Sol/Terra and adaptive on Claude models).
+  const [sessionThinkingOptions, setSessionThinkingOptions] = useState<string[]>([]);
   const [reasoningVisibility, setReasoningVisibilityState] = useState<ReasoningVisibility>('stream');
   const [fastModeEnabled, setFastModeEnabled] = useState(false);
   const [compactionModelOverride, setCompactionModelOverrideState] = useState<string>('');
@@ -2238,6 +2272,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     streamRecoveryStartedAtRef.current = null;
   }, []);
 
+  // Self-reference so the grace-timer callback can re-arm the recovery window
+  // after the backend confirms a quiet run is still live.
+  const markStreamRecoveryRef = useRef<((status?: string) => void) | null>(null);
+
   const markStreamRecovery = useCallback((status = 'Reconnecting to stream…') => {
     if (!streamRecoveryStartedAtRef.current) {
       streamRecoveryStartedAtRef.current = Date.now();
@@ -2245,7 +2283,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setStatusText(status);
     if (streamRecoveryTimerRef.current) return;
 
-    streamRecoveryTimerRef.current = setTimeout(() => {
+    streamRecoveryTimerRef.current = setTimeout(async () => {
       streamRecoveryTimerRef.current = null;
       if (!isStreamActiveRef.current) {
         streamRecoveryStartedAtRef.current = null;
@@ -2254,6 +2292,37 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
       const sessionKey = sessionRef.current || 'main';
       const providerName = providerRef.current;
+
+      // Anthropic turns routinely go silent for minutes (long reasoning, no
+      // surfaced thinking deltas). Before declaring the turn dead, ask the
+      // backend — while it confirms the run is live, keep waiting instead of
+      // wiping the view of a working agent.
+      if (providerName === 'OPENCLAW') {
+        try {
+          const probeSession = resolveOpenClawSessionKey(sessionKey) || sessionKey;
+          const { data } = await client.get('/gateway/stream-status', {
+            params: { session: probeSession, provider: providerName },
+            timeout: 8000,
+            _silent: true,
+          } as any);
+          if (data?.active && isStreamActiveRef.current) {
+            debugLog('[ChatState] Recovery grace expired but backend confirms the run is live — extending');
+            if (streamRecoveryTimerRef.current === null && streamRecoveryStartedAtRef.current) {
+              streamRecoveryStartedAtRef.current = Date.now();
+              markStreamRecoveryRef.current?.('Agent is still working…');
+            }
+            return;
+          }
+        } catch {
+          // Probe unavailable — fall through to the existing give-up path so a
+          // genuinely dead stream cannot spin forever.
+        }
+        if (!isStreamActiveRef.current) {
+          streamRecoveryStartedAtRef.current = null;
+          return;
+        }
+      }
+
       const assistantId = streamingAssistantIdRef.current;
       const recoveredText = assembledRef.current.trim();
       const recoveredThinking = thinkingContentRef.current.trim();
@@ -2286,7 +2355,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           const fallbackContent = message.content || 'Live stream connection interrupted; history reloaded.';
           const nextContent = recoveredText
             ? `${recoveredText}\n\n*(live stream connection interrupted; history reloaded)*`
-            : appendSteeringInterruptedMarker(fallbackContent);
+            : appendTurnMarker(fallbackContent, LIVE_VIEW_DETACHED_MARKER);
           return {
             ...message,
             content: nextContent,
@@ -2314,6 +2383,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       void loadHistoryInternalRef.current?.(sessionKey, providerName, { force: true, refreshActiveSnapshot: true });
     }, STREAM_RECOVERY_GRACE_MS);
   }, []);
+  useEffect(() => { markStreamRecoveryRef.current = markStreamRecovery; }, [markStreamRecovery]);
 
   // Sync refs immediately when state changes. Note: the refs are ALSO updated
   // synchronously in the event handlers (see case 'session' below) to avoid races.
@@ -2494,9 +2564,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     };
   }, [provider, refreshSessionTelemetry, session]);
 
-  const ensureSessionControlsMetadataLoaded = useCallback(async () => {
+  const ensureSessionControlsMetadataLoaded = useCallback(async (options?: { force?: boolean }) => {
     if (!startupReady || provider !== 'OPENCLAW' || !session || !session.startsWith('agent:')) return;
-    if (sessionControlsMetadataLoaded) return;
+    // Session Controls opens force a refresh: session-info is cheap (~40ms)
+    // and the per-model thinking profile must reflect the current model even
+    // if an earlier load raced the session-key normalization reset.
+    if (sessionControlsMetadataLoaded && !options?.force) return;
     if (sessionControlsMetadataPromiseRef.current) {
       await sessionControlsMetadataPromiseRef.current;
       return;
@@ -2530,8 +2603,29 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           || '',
         ).toLowerCase();
 
+        // Per-model thinking profile: the gateway declares the exact level set
+        // for the resolved model. Drive pickers from this instead of guessing.
+        const hasProfileOptions = Array.isArray(data?.session?.thinkingOptions);
+        const profileOptions = hasProfileOptions
+          ? (data.session.thinkingOptions as unknown[])
+              .map((entry) => String(entry || '').trim().toLowerCase())
+              .filter((entry) => THINKING_LEVELS.includes(entry as ThinkingLevel))
+          : [];
+        // Stale local-registry fallbacks (gateway busy) omit thinkingOptions
+        // entirely; keep the previously loaded profile instead of clobbering
+        // it — session switches already reset it to [].
+        if (hasProfileOptions) setSessionThinkingOptions(profileOptions);
+        const profileDefault = String(data?.session?.thinkingDefault || '').trim().toLowerCase();
+
+        const supportsLevel = (level: string) => profileOptions.length === 0 || profileOptions.includes(level);
+        const preferredDefaultThinking = profileDefault && supportsLevel(profileDefault)
+          ? profileDefault
+          : (supportsLevel('high') ? 'high' : profileOptions.find((level) => level !== 'off') || '');
+
         const defaultPatch: Record<string, string> = {};
-        if (!sessionThinking || sessionThinking === 'none') defaultPatch.thinking = 'high';
+        if ((!sessionThinking || sessionThinking === 'none') && preferredDefaultThinking) {
+          defaultPatch.thinking = preferredDefaultThinking;
+        }
         if (!sessionReasoning || sessionReasoning === 'none') defaultPatch.reasoning = 'stream';
         if (Object.keys(defaultPatch).length > 0) {
           try {
@@ -2545,6 +2639,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
         if (THINKING_LEVELS.includes(sessionThinking as ThinkingLevel)) {
           setThinkingLevelState(sessionThinking as ThinkingLevel);
+        } else if (preferredDefaultThinking && THINKING_LEVELS.includes(preferredDefaultThinking as ThinkingLevel)) {
+          setThinkingLevelState(preferredDefaultThinking as ThinkingLevel);
         } else {
           const modelStr = String(actualModel || '').toLowerCase();
           const isAdaptiveDefault = /claude-(opus|sonnet)-4[._-](5|6|7|8|9)|claude-(opus|sonnet)-[5-9]/.test(modelStr);
@@ -2589,6 +2685,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setSessionControlsMetadataLoaded(false);
     sessionControlsMetadataPromiseRef.current = null;
     setThinkingLevelState('high');
+    setSessionThinkingOptions([]);
     setReasoningVisibilityState('stream');
     setFastModeEnabled(false);
     setCompactionModelOverrideState('');
@@ -3035,7 +3132,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (interruptedAssistantId && hasVisibleLiveState) {
       setMessages(prev => prev.map((message) => {
         if (message.id !== interruptedAssistantId) return message;
-        return preserveInterruptedLiveTurnSnapshot(message, interruptedSnapshot);
+        return preserveInterruptedLiveTurnSnapshot(message, interruptedSnapshot, LIVE_VIEW_DETACHED_MARKER);
       }));
     }
   }, [clearActiveStreamState]);
@@ -5176,7 +5273,29 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const normalized = String(text || '').trim();
     if (!normalized) return;
 
-    const shouldSteerActiveTurn = providerRef.current === 'OPENCLAW' && isStreamActiveRef.current;
+    let shouldSteerActiveTurn = providerRef.current === 'OPENCLAW' && isStreamActiveRef.current;
+
+    // The frontend can believe a turn ended while OpenClaw is still running it
+    // (stream recovery gave up, or stream-status briefly misreported). A blind
+    // chat.send would then interrupt the in-flight turn — probe once and
+    // convert the send into a graceful steer instead.
+    if (providerRef.current === 'OPENCLAW' && !shouldSteerActiveTurn) {
+      try {
+        const probeSession = resolveOpenClawSessionKey(sessionRef.current || 'main') || 'main';
+        const { data } = await client.get('/gateway/stream-status', {
+          params: { session: probeSession, provider: 'OPENCLAW' },
+          timeout: 4000,
+          _silent: true,
+        } as any);
+        if (data?.active) {
+          debugLog('[ChatState] Pre-send probe: session still mid-turn — sending as steering message');
+          shouldSteerActiveTurn = true;
+        }
+      } catch {
+        // Best-effort probe; a normal send proceeds when it cannot answer.
+      }
+    }
+
     const interruptedRunId = shouldSteerActiveTurn ? currentRunIdRef.current : null;
     if (shouldSteerActiveTurn) {
       if (interruptedRunId) {
@@ -5863,6 +5982,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     reconnectSocket,
     // Session controls
     thinkingLevel,
+    sessionThinkingOptions,
     setThinkingLevel,
     reasoningVisibility,
     setReasoningVisibility,

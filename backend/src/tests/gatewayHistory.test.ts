@@ -3,10 +3,37 @@ import os from 'os';
 import path from 'path';
 import { __gatewayHistoryTest } from '../routes/gateway';
 import { streamEventBus } from '../services/StreamEventBus';
-import { recordRuntimeTurnEvent } from '../services/RuntimeTurnEventHistory';
+import { readRuntimeTurnEvents, recordRuntimeTurnEvent } from '../services/RuntimeTurnEventHistory';
 import type { RuntimeTurnEvent } from '../services/RuntimeTurnEvents';
 
 describe('gateway history readers', () => {
+  test('mergeHistoryToolCalls collapses metadata-free ghost duplicates of the same tool', () => {
+    const merged = __gatewayHistoryTest.mergeHistoryToolCalls(
+      [
+        { id: 'toolu_rich', name: 'exec', arguments: { command: 'echo RAIL_TOOL' }, result: 'RAIL_TOOL', startedAt: 1000, endedAt: 5900, status: 'done' },
+      ],
+      [
+        // Same call arriving from the stream lane with a different id and no metadata.
+        { id: 'tool-ghost-1', name: 'tool', startedAt: 1200, endedAt: 1200, status: 'done' },
+      ],
+    );
+    expect(merged).toHaveLength(1);
+    expect(merged[0].id).toBe('toolu_rich');
+
+    // Two genuinely distinct substantive calls survive.
+    const distinct = __gatewayHistoryTest.mergeHistoryToolCalls(
+      [{ id: 'a', name: 'exec', arguments: { command: 'ls' }, startedAt: 1000 }],
+      [{ id: 'b', name: 'exec', arguments: { command: 'pwd' }, startedAt: 2000 }],
+    );
+    expect(distinct).toHaveLength(2);
+
+    // A lone metadata-free call (no rich sibling) is preserved.
+    const lone = __gatewayHistoryTest.mergeHistoryToolCalls(undefined, [
+      { id: 'only', name: 'tool', startedAt: 1000 },
+    ]);
+    expect(lone).toHaveLength(1);
+  });
+
   test('legacy history converts reasoning mirrors into thinkingContent instead of assistant content', async () => {
     const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-history-'));
     const sessionId = 'reasoning-mirror-session';
@@ -175,6 +202,86 @@ describe('gateway history readers', () => {
     expect(contents).toContain('nearby recovered tool card');
     expect(contents).not.toContain('stale recovered tool card from yesterday');
     expect(messages.some((message: any) => message.model === 'openai/gpt-5.2')).toBe(false);
+  });
+
+  test('collapses replace-style reasoning snapshots into one persisted event per thought', () => {
+    const eventDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-turn-events-'));
+    const previousEventDir = process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+    process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = eventDir;
+
+    try {
+      const sessionKey = 'agent:main:reasoning-collapse-test';
+      const event = (type: RuntimeTurnEvent['type'], seq: number, extra: Partial<RuntimeTurnEvent> = {}): RuntimeTurnEvent => ({
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type,
+        sessionKey,
+        runId: 'run-collapse',
+        seq,
+        ts: Date.parse('2026-07-14T12:00:00.000Z') + seq * 100,
+        visible: true,
+        source: { transport: 'portal-stream-event-bus', eventType: type === 'assistant_reasoning' ? 'thinking' : 'text' },
+        ...extra,
+      });
+
+      // A claude-cli thought streams as many growing snapshots; only the first
+      // (segment start) and the settled snapshot should reach disk.
+      recordRuntimeTurnEvent(sessionKey, event('assistant_reasoning', 0, { text: 'Plan' }));
+      recordRuntimeTurnEvent(sessionKey, event('assistant_reasoning', 1, { text: 'Plan the', replace: true }));
+      recordRuntimeTurnEvent(sessionKey, event('assistant_reasoning', 2, { text: 'Plan the fix', replace: true }));
+      recordRuntimeTurnEvent(sessionKey, event('assistant_reasoning', 3, { text: 'Plan the fix carefully', replace: true }));
+      recordRuntimeTurnEvent(sessionKey, event('assistant_final', 4, { text: 'Done.', terminal: true }));
+
+      const digest = require('crypto').createHash('sha256').update(sessionKey).digest('hex').slice(0, 32);
+      const persistedLines = fs.readFileSync(path.join(eventDir, `${digest}.jsonl`), 'utf8')
+        .split('\n')
+        .filter((line: string) => line.trim())
+        .map((line: string) => JSON.parse(line));
+      const reasoningLines = persistedLines.filter((entry: any) => entry.type === 'assistant_reasoning');
+
+      // Intermediate snapshots collapsed: the pending snapshot replaced in
+      // memory and only the settled thought was flushed by assistant_final.
+      expect(reasoningLines).toHaveLength(1);
+      expect(reasoningLines[0].text).toBe('Plan the fix carefully');
+
+      const replayed = readRuntimeTurnEvents(sessionKey, 50);
+      expect(replayed.filter((entry) => entry.type === 'assistant_reasoning')).toHaveLength(1);
+    } finally {
+      if (previousEventDir === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+      else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previousEventDir;
+    }
+  });
+
+  test('history reads flush the pending reasoning snapshot mid-turn', () => {
+    const eventDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-turn-events-'));
+    const previousEventDir = process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+    process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = eventDir;
+
+    try {
+      const sessionKey = 'agent:main:reasoning-pending-read-test';
+      const event = (seq: number, extra: Partial<RuntimeTurnEvent> = {}): RuntimeTurnEvent => ({
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type: 'assistant_reasoning',
+        sessionKey,
+        runId: 'run-pending-read',
+        seq,
+        ts: Date.parse('2026-07-14T12:10:00.000Z') + seq * 100,
+        visible: true,
+        source: { transport: 'portal-stream-event-bus', eventType: 'thinking' },
+        ...extra,
+      });
+
+      recordRuntimeTurnEvent(sessionKey, event(0, { text: 'Live thought' }));
+      recordRuntimeTurnEvent(sessionKey, event(1, { text: 'Live thought still going', replace: true }));
+
+      // Resume replay while the turn is still streaming must see the thought.
+      const replayed = readRuntimeTurnEvents(sessionKey, 50);
+      const reasoning = replayed.filter((entry) => entry.type === 'assistant_reasoning');
+      expect(reasoning).toHaveLength(1);
+      expect(reasoning[0].text).toBe('Live thought still going');
+    } finally {
+      if (previousEventDir === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+      else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previousEventDir;
+    }
   });
 
   test('enhanced session history restores runtime thinking segments after refresh', () => {
@@ -532,6 +639,105 @@ describe('gateway history readers', () => {
     expect(messages[0].content).toBe('The quick brown fox jumps.');
   });
 
+  test('runtime history keeps pre-tool text and pairs a tool result carrying a different id', () => {
+    const baseTs = Date.parse('2026-07-15T04:00:00.000Z');
+    const event = (seq: number, extra: Partial<RuntimeTurnEvent>): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_delta',
+      sessionKey: 'agent:main:rail-regression',
+      runId: 'run-pre-tool-text',
+      seq,
+      ts: baseTs + seq * 100,
+      visible: true,
+      source: { transport: 'portal-stream-event-bus', eventType: 'text' },
+      ...extra,
+    });
+
+    // Live shape from the sonnet-4-6 rail probe: preamble text streams, a
+    // tool_started arrives with a synthesized id, the tool_output carries the
+    // provider's real id, and the final replaces deltas with only the
+    // post-tool block.
+    const messages = __gatewayHistoryTest.buildRuntimeHistoryMessages([
+      event(1, { text: 'RAIL_PRE preamble before the tool call.' }),
+      event(2, { type: 'tool_started', tool: { id: 'tool-1784091230064-1', name: 'Bash', arguments: { command: 'echo RAIL_TOOL' }, status: 'running' } }),
+      event(3, { type: 'tool_output', tool: { id: 'toolu_011Kq5cti6VBSRpxGS3XHeMj', name: 'Bash', result: 'RAIL_TOOL' } }),
+      event(4, { type: 'assistant_final', text: 'RAIL_POST\n\nRAIL_FINAL', replace: true, terminal: true }),
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toBe('RAIL_POST\n\nRAIL_FINAL');
+
+    const textSegments = (messages[0].segments || []).filter((segment: any) => segment.kind === 'text');
+    expect(textSegments).toHaveLength(1);
+    expect(textSegments[0].text).toBe('RAIL_PRE preamble before the tool call.');
+    expect(textSegments[0].ts).toBe(baseTs + 100);
+
+    const toolCalls = messages[0].toolCalls || [];
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0].id).toBe('toolu_011Kq5cti6VBSRpxGS3XHeMj');
+    expect(toolCalls[0].arguments).toEqual({ command: 'echo RAIL_TOOL' });
+    expect(toolCalls[0].result).toBe('RAIL_TOOL');
+    expect(toolCalls[0].status).toBe('done');
+  });
+
+  test('runtime history drops placeholder status events but keeps substantive statuses', () => {
+    const baseTs = Date.parse('2026-07-15T05:00:00.000Z');
+    const event = (seq: number, extra: Partial<RuntimeTurnEvent>): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_status',
+      sessionKey: 'agent:main:status-placeholder-test',
+      runId: 'run-status-placeholder',
+      seq,
+      ts: baseTs + seq * 100,
+      visible: true,
+      source: { transport: 'portal-stream-event-bus', eventType: 'status' },
+      ...extra,
+    });
+
+    // "Thinking…"/compaction statuses are rail strip material; replaying them
+    // as durable segments resurrects the pre-rail thinking bubble in history.
+    const messages = __gatewayHistoryTest.buildRuntimeHistoryMessages([
+      event(1, { text: 'Thinking…' }),
+      event(2, { text: 'thinking...' }),
+      event(3, { text: 'Compacting context…' }),
+      event(4, { text: 'Context compacted' }),
+      event(5, { text: 'Analyzing the failing migration files' }),
+      event(6, { type: 'assistant_final', text: 'All done.', terminal: true }),
+    ]);
+
+    expect(messages).toHaveLength(1);
+    const segments = messages[0].segments || [];
+    expect(segments.map((segment: any) => segment.text)).toEqual(['Analyzing the failing migration files']);
+  });
+
+  test('runtime history drops a flushed pre-tool segment the final already repeats', () => {
+    const baseTs = Date.parse('2026-07-15T04:10:00.000Z');
+    const event = (seq: number, extra: Partial<RuntimeTurnEvent>): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_delta',
+      sessionKey: 'agent:main:rail-regression-full-final',
+      runId: 'run-full-final',
+      seq,
+      ts: baseTs + seq * 100,
+      visible: true,
+      source: { transport: 'portal-stream-event-bus', eventType: 'text' },
+      ...extra,
+    });
+
+    // Some providers replay the whole turn text in the final event; the
+    // flushed pre-tool segment must not render that text twice.
+    const messages = __gatewayHistoryTest.buildRuntimeHistoryMessages([
+      event(1, { text: 'Preamble before the tool call.' }),
+      event(2, { type: 'tool_started', tool: { id: 'call-1', name: 'Bash', arguments: { command: 'true' }, status: 'running' } }),
+      event(3, { type: 'tool_output', tool: { id: 'call-1', name: 'Bash', result: 'ok' } }),
+      event(4, { type: 'assistant_final', text: 'Preamble before the tool call.\n\nAll done.', replace: true, terminal: true }),
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toBe('Preamble before the tool call.\n\nAll done.');
+    expect((messages[0].segments || []).filter((segment: any) => segment.kind === 'text')).toHaveLength(0);
+  });
+
   test('mergeRuntimeText keeps short repeated chunks and cumulative snapshots', () => {
     const { mergeRuntimeText } = __gatewayHistoryTest;
 
@@ -549,6 +755,69 @@ describe('gateway history readers', () => {
 
     // Replace snapshots win outright.
     expect(mergeRuntimeText('partial', 'replacement', true)).toBe('replacement');
+  });
+
+  test('conversation marker ignores the portal runtime overlay so live state cannot fake completion', () => {
+    const now = Date.now();
+    // Mid-turn shape: durable transcript has only the user prompt; the enhanced
+    // reader merged in the runtime overlay (portal-synthesized live state whose
+    // timestamp tracks the newest stream event). The overlay must not become
+    // the "latest durable assistant message" — that made the terminal
+    // heuristics compare the live lane against itself and report healthy
+    // Anthropic mid-turn sessions as finished on every reconnect.
+    const marker = __gatewayHistoryTest.getLatestMeaningfulConversationMarker([
+      { role: 'user', content: 'run the long migration', timestamp: new Date(now - 120_000).toISOString() },
+      {
+        role: 'assistant',
+        content: 'Working through the steps.',
+        timestamp: new Date(now - 1_000).toISOString(),
+        toolCalls: [{ id: 'call-1', name: 'Bash', status: 'running', startedAt: now - 5_000 }],
+        __portal: { kind: 'runtime-turn-event-history', runId: 'run-live' },
+      },
+    ]);
+    expect(marker).toEqual(expect.objectContaining({ role: 'user' }));
+
+    // A real transcript assistant message still wins as usual.
+    const finished = __gatewayHistoryTest.getLatestMeaningfulConversationMarker([
+      { role: 'user', content: 'run the long migration', timestamp: new Date(now - 120_000).toISOString() },
+      { role: 'assistant', content: 'Done — migration applied.', timestamp: new Date(now - 500).toISOString() },
+    ]);
+    expect(finished).toEqual(expect.objectContaining({ role: 'assistant' }));
+  });
+
+  test('runtime snapshot stays active mid-turn when the durable marker is the user prompt', () => {
+    const eventDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-turn-events-'));
+    const previousEventDir = process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+    process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = eventDir;
+
+    try {
+      const sessionKey = 'agent:main:midturn-marker-test';
+      const now = Date.now();
+      recordRuntimeTurnEvent(sessionKey, {
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type: 'tool_started',
+        sessionKey,
+        runId: 'run-midturn',
+        seq: 1,
+        ts: now - 60_000,
+        visible: true,
+        source: { transport: 'portal-stream-event-bus', eventType: 'tool_start' },
+        tool: { id: 'call-1', name: 'Bash', arguments: { command: 'sleep 300' }, status: 'running' },
+      });
+
+      const userMarker = { role: 'user' as const, timestamp: now - 120_000, content: 'run the long migration' };
+      const active = __gatewayHistoryTest.getOpenClawRuntimeActiveStreamSnapshot(sessionKey, userMarker);
+      expect(active).toEqual(expect.objectContaining({ active: true, phase: 'tool' }));
+
+      // A durable transcript assistant final at/after the runtime lane still
+      // flips the leaked overlay to terminal.
+      const finalMarker = { role: 'assistant' as const, timestamp: now - 55_000, content: 'All done.' };
+      const terminal = __gatewayHistoryTest.getOpenClawRuntimeActiveStreamSnapshot(sessionKey, finalMarker);
+      expect(terminal).toEqual(expect.objectContaining({ active: false, inactiveReason: 'terminal' }));
+    } finally {
+      if (previousEventDir === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+      else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previousEventDir;
+    }
   });
 
   test('active stream status keeps quiet streaming turns active inside the 10-minute window', async () => {

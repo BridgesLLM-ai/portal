@@ -61,19 +61,28 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
     decision: 'allow-once' | 'deny' | 'allow-always',
   ) => {
     try {
+      // Bounded so a wedged backend can never leave the modal buttons
+      // spinning until the approval expires (the backend resolvers cap at
+      // ~10s themselves).
       const response = await client.post('/gateway/exec-approval/resolve', {
         approvalId,
         decision,
-      });
+      }, { timeout: 15000 });
       if (response.data?.ok) {
         debugLog('[useExecApprovals] Approval resolved:', decision);
         setPendingApprovals((prev) => removeExecApproval(prev, approvalId));
         return;
       }
       throw new Error('Approval did not complete');
-    } catch (err) {
+    } catch (err: any) {
       console.error('[useExecApprovals] Failed to resolve approval:', err);
-      // Keep the pending approval visible on failure so the user can retry or deny explicitly.
+      // The approval no longer exists anywhere server-side (expired, resolved
+      // elsewhere, or backend restarted): keeping the popup would show a
+      // zombie no click can ever satisfy.
+      if (err?.response?.status === 404) {
+        setPendingApprovals((prev) => removeExecApproval(prev, approvalId));
+      }
+      // Otherwise keep the pending approval visible so the user can retry or deny explicitly.
       throw err;
     }
   }, []);

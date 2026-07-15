@@ -10,9 +10,9 @@ import { AgentAbortError } from '../agents/AgentProvider.interface';
 import { listProviderModels } from '../agents/providerModels';
 import { getProviderCapabilities } from '../agents/providerAvailability';
 import { getProviderCommandCatalog } from '../agents/providerCommandCatalog';
-import { resolveExecApproval, ExecApprovalRequest } from '../agents/providers/OpenClawProvider';
+import { ExecApprovalRequest } from '../agents/providers/OpenClawProvider';
 import { appendNativeMessage, loadNativeSession, updateNativeSessionModel } from '../agents/providers/NativeSessionStore';
-import { gatewayRpcCall, patchSessionModel, getSessionInfo, isGatewayTransportError, chatSend, createSession, listGatewayModels } from '../utils/openclawGatewayRpc';
+import { gatewayRpcCall, patchSessionModel, getSessionInfo, isGatewayTransportError, chatSend, createSession, listGatewayModels, readLocalSessionRegistryEntry } from '../utils/openclawGatewayRpc';
 import {
   sendApprovalDecision,
   injectChatMessage,
@@ -1388,6 +1388,12 @@ function getLatestMeaningfulConversationMarker(messages: any[]): { role: 'user' 
   };
   for (const message of messages) {
     if (!message || typeof message !== 'object') continue;
+    // The runtime-turn-event overlay is portal-synthesized LIVE state whose
+    // timestamp tracks the newest stream event. Treating it as durable-turn
+    // evidence made the terminal heuristics compare the live lane against
+    // itself and declare healthy mid-turn Anthropic sessions finished on
+    // every reconnect (the false "interrupted" reports).
+    if (message?.__portal?.kind === 'runtime-turn-event-history') continue;
     const timestampMs = toHistoryTimestampMs(message?.timestamp);
     if (!timestampMs) continue;
 
@@ -1485,6 +1491,8 @@ function getOpenClawRuntimeActiveStreamSnapshot(
   // If the durable transcript already has a newer assistant message, the runtime
   // overlay is no longer the live authority. This prevents stale non-terminal
   // tool/status events from keeping Agent Chat in a fake running state forever.
+  // (latestMarker excludes the portal runtime overlay itself, so mid-turn
+  // overlay state can no longer masquerade as durable completion evidence.)
   if (latestMarker?.role === 'assistant' && latestMarker.timestamp >= latest.ts - 30_000) {
     return inactiveOpenClawSnapshot('terminal', true);
   }
@@ -1557,9 +1565,41 @@ async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<Open
       debugLog(`[stream-status] StreamEventBus has entry but lastEvent=${new Date(lastEvent).toISOString()} exceeded cutoff=${staleCutoffMs}ms for phase=${info.phase} — clearing stale entry`);
       streamEventBus.clearStream(sessionKey);
     } else if (latestMarker?.role === 'assistant' && lastEvent && latestMarker.timestamp >= lastEvent - 30_000) {
-      debugLog(`[stream-status] StreamEventBus reports active, but latest durable assistant message is terminal at ${new Date(latestMarker.timestamp).toISOString()} — reporting inactive`);
-      streamEventBus.clearStream(sessionKey);
-      return inactiveOpenClawSnapshot('terminal', true);
+      // A durable transcript assistant message at/after the live lane usually
+      // means the turn finished and the bus entry leaked — but transcripts can
+      // also record assistant entries mid-turn (steer boundaries, some
+      // harnesses). Ask the gateway which one it is instead of guessing.
+      let gatewayLooksLive = false;
+      try {
+        const sessResult = await getSessionInfo(sessionKey);
+        const chatState = sessResult.ok && sessResult.data ? normalizeOpenClawChatState(sessResult.data) : '';
+        const lastActivity = sessResult.ok && sessResult.data ? getOpenClawSessionLastActivity(sessResult.data) : undefined;
+        gatewayLooksLive = Boolean(chatState) && (!lastActivity || (Date.now() - lastActivity) <= OPENCLAW_TOOL_STALE_CUTOFF_MS);
+      } catch {
+        // Gateway unreachable: keep the stream alive; the stale cutoff above
+        // still bounds how long a genuinely dead entry can linger.
+        gatewayLooksLive = true;
+      }
+      if (!gatewayLooksLive) {
+        debugLog(`[stream-status] StreamEventBus reports active, but durable assistant message at ${new Date(latestMarker.timestamp).toISOString()} and gateway reports no active run — reporting inactive`);
+        streamEventBus.clearStream(sessionKey);
+        return inactiveOpenClawSnapshot('terminal', true);
+      }
+      debugLog('[stream-status] Durable assistant marker near live lane but gateway confirms the run is live — still active');
+      return {
+        active: true,
+        phase: info.phase,
+        toolName: info.toolName || null,
+        toolCalls: Array.isArray(info.toolCalls) ? info.toolCalls : [],
+        statusText: info.statusText || null,
+        provenance: info.provenance || null,
+        model: info.model || null,
+        compactionPhase: info.compactionPhase || 'idle',
+        startedAt: info.startedAt,
+        runId: info.runId || null,
+        lastEventAt: lastEvent,
+        staleAfterMs: staleCutoffMs,
+      };
     } else {
       const content = info.phase === 'streaming'
         ? (streamEventBus.getLatestText(sessionKey) || info.latestText || '')
@@ -1598,6 +1638,10 @@ async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<Open
         if (lastActivity && (Date.now() - lastActivity) > fallbackStaleCutoffMs) {
           debugLog(`[stream-status] Gateway reports chatState=${chatState} but lastActivity=${new Date(lastActivity).toISOString()} exceeded fallback cutoff=${fallbackStaleCutoffMs}ms`);
         } else {
+          // latestMarker now reflects only the durable transcript (the portal
+          // runtime overlay is excluded), so an assistant marker at/after the
+          // gateway's activity signal genuinely indicates a completed turn
+          // behind a stale chatState.
           const latestAssistantLooksTerminal = latestMarker?.role === 'assistant' && Boolean(latestMarker.content?.trim());
           if (latestAssistantLooksTerminal && (!lastActivity || latestMarker.timestamp >= lastActivity - 30_000)) {
             debugLog(`[stream-status] Gateway reports chatState=${chatState}, but latest durable meaningful message is assistant at ${new Date(latestMarker.timestamp).toISOString()} — reporting inactive`);
@@ -1686,6 +1730,16 @@ type RuntimeHistoryToolCall = {
   order: number;
 };
 
+// Rail placeholders ("Thinking…") and maintenance notices are transient status
+// strip material; persisted status events replaying them as durable thought
+// bubbles resurrects the pre-rail thinking bubble in history.
+function isGenericStatusPlaceholderText(text: string): boolean {
+  const normalized = String(text || '').trim();
+  if (!normalized) return true;
+  if (/^(thinking|working|reasoning|processing|responding|running|typing)\s*(…|\.{1,3})?$/i.test(normalized)) return true;
+  return isCompactionNoticeText(normalized);
+}
+
 function runtimeTurnEventGroupKey(event: RuntimeTurnEvent, fallbackIndex: number): string {
   const runId = typeof event.runId === 'string' && event.runId.trim() ? event.runId.trim() : '';
   if (runId) return runId;
@@ -1743,6 +1797,17 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
       });
     };
 
+    let pendingTextTs = 0;
+    // Claude/Codex finals replace the accumulated deltas with only the last
+    // post-tool text block, so text streamed before a tool call would vanish
+    // from durable history. Flush it as a timestamped text segment instead.
+    const flushPendingTextBeforeTool = (ts: number) => {
+      const value = sanitizeHistoryText(finalText || '');
+      finalText = '';
+      if (!value || isHiddenHistoryArtifactText(value)) return;
+      appendSegment('text', value, pendingTextTs || ts);
+    };
+
     const upsertTool = (event: RuntimeTurnEvent) => {
       const rawName = typeof event.tool?.name === 'string' ? event.tool.name.trim() : '';
       if (!rawName) return;
@@ -1753,9 +1818,8 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
           : event.type === 'tool_output'
             ? 'done'
             : 'running';
-      const key = typeof event.tool?.id === 'string' && event.tool.id.trim()
-        ? event.tool.id.trim()
-        : `${rawName}:${toolsByKey.size}`;
+      const rawId = typeof event.tool?.id === 'string' && event.tool.id.trim() ? event.tool.id.trim() : '';
+      const key = rawId || `${rawName}:${toolsByKey.size}`;
       const existing = toolsByKey.get(key);
       if (existing) {
         existing.arguments = existing.arguments ?? event.tool?.arguments;
@@ -1763,6 +1827,27 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
         existing.endedAt = eventStatus === 'running' ? existing.endedAt : event.ts;
         existing.status = eventStatus;
         return;
+      }
+      // The stream lane synthesizes an id when a tool_started event arrives
+      // without one, while the matching tool_output can carry the provider's
+      // real id. Land the result on the open call of the same name instead of
+      // rendering a second, unpaired entry.
+      if (event.type === 'tool_output') {
+        const open = [...toolsByKey.values()].reverse().find((tool) => (
+          tool.name === rawName && tool.status === 'running' && tool.result === undefined
+        ));
+        if (open) {
+          open.arguments = open.arguments ?? event.tool?.arguments;
+          open.result = typeof event.tool?.result === 'string' ? event.tool.result : open.result;
+          open.endedAt = eventStatus === 'running' ? open.endedAt : event.ts;
+          open.status = eventStatus;
+          if (rawId && open.id !== rawId) {
+            toolsByKey.delete(open.id);
+            open.id = rawId;
+            toolsByKey.set(rawId, open);
+          }
+          return;
+        }
       }
       const tool: RuntimeHistoryToolCall = {
         id: key,
@@ -1784,13 +1869,17 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
       if (typeof event.provenance === 'string' && event.provenance.trim()) provenance = event.provenance.trim();
 
       if (event.type === 'assistant_status') {
-        if (event.visible && event.text) appendSegment('thinking', event.text, event.ts, event.replace === true, 'status');
+        if (event.visible && event.text && !isGenericStatusPlaceholderText(event.text)) {
+          appendSegment('thinking', event.text, event.ts, event.replace === true, 'status');
+        }
       } else if (event.type === 'assistant_reasoning') {
         appendSegment('thinking', event.text || '', event.ts, event.replace === true, 'reasoning');
       } else if (event.type === 'tool_started' || event.type === 'tool_output') {
+        flushPendingTextBeforeTool(event.ts);
         upsertTool(event);
       } else if (event.type === 'assistant_delta') {
         finalText = mergeRuntimeText(finalText, event.text || '', event.replace === true);
+        pendingTextTs = event.ts;
       } else if (event.type === 'assistant_final') {
         finalText = mergeRuntimeText(finalText, event.text || '', event.replace === true);
       } else if (event.type === 'turn_error' && !finalText) {
@@ -1798,16 +1887,27 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
       }
     }
 
+    const content = sanitizeHistoryText(finalText || '');
+    const normalizedContent = normalizeRuntimeHistoryMatchText(content);
     const segments = timeline
       .filter((item): item is { kind: 'segment'; segment: RuntimeHistorySegment } => item.kind === 'segment')
-      .map((item, index) => ({ ...item.segment, order: index }));
+      .map((item) => item.segment)
+      // A provider final that repeats the streamed text (rather than only the
+      // post-tool block) would render a flushed text segment twice.
+      .filter((segment) => {
+        if (segment.kind !== 'text' || segment.source !== 'text') return true;
+        const normalized = normalizeRuntimeHistoryMatchText(segment.text);
+        if (!normalized) return false;
+        if (normalized === normalizedContent) return false;
+        return !(normalized.length >= 12 && normalizedContent.includes(normalized));
+      })
+      .map((segment, index) => ({ ...segment, order: index }));
     const toolCalls = [...toolsByKey.values()].map((tool) => ({
       ...tool,
       status: tool.status === 'running' ? 'done' : tool.status,
       endedAt: tool.endedAt ?? lastTs,
     }));
 
-    const content = sanitizeHistoryText(finalText || '');
     if (!content && segments.length === 0 && toolCalls.length === 0) return [];
 
     const timestamp = new Date(lastTs || Date.now()).toISOString();
@@ -1978,7 +2078,29 @@ function mergeHistoryToolCalls(existing: any[] | undefined, incoming: any[]): an
 
   for (const toolCall of Array.isArray(existing) ? existing : []) add(toolCall);
   for (const toolCall of incoming) add(toolCall);
-  return merged;
+
+  // The same tool call can arrive from two event lanes (stream tool events vs
+  // transcript blocks) with different ids: one rich (arguments/result) and one
+  // metadata-free ghost with a generic name. Id-based dedupe misses those, so
+  // collapse ghosts that shadow a substantive call of a related name.
+  const hasSubstance = (tool: any) => Boolean(
+    (tool?.arguments && (typeof tool.arguments !== 'object' || Object.keys(tool.arguments).length > 0))
+    || (typeof tool?.result === 'string' && tool.result.trim()),
+  );
+  return merged.filter((tool, index) => {
+    if (hasSubstance(tool)) return true;
+    const name = String(tool?.name || '').trim().toLowerCase();
+    const started = typeof tool?.startedAt === 'number' ? tool.startedAt : null;
+    return !merged.some((other, otherIndex) => {
+      if (otherIndex === index || !hasSubstance(other)) return false;
+      const otherName = String(other?.name || '').trim().toLowerCase();
+      const namesRelated = !name || name === 'tool' || name === 'command' || name === otherName;
+      if (!namesRelated) return false;
+      const otherStarted = typeof other?.startedAt === 'number' ? other.startedAt : null;
+      if (started === null || otherStarted === null) return true;
+      return Math.abs(started - otherStarted) < 20_000;
+    });
+  });
 }
 
 function collapseFragmentedToolOnlyAssistantHistory(messages: any[]): any[] {
@@ -2638,11 +2760,13 @@ export const __gatewayHistoryTest = {
   readSessionMessages,
   readSessionMessagesEnhanced,
   readSessionMessagesEnhancedForSessionKey,
+  mergeHistoryToolCalls,
   readBestOpenClawSessionMessagesForSessionKey,
   getOpenClawRuntimeActiveStreamSnapshot,
   getOpenClawActiveStreamSnapshot,
   buildRuntimeHistoryMessages,
   mergeRuntimeText,
+  getLatestMeaningfulConversationMarker,
 };
 
 /**
@@ -3007,12 +3131,56 @@ function addSessionFileCandidate(candidates: string[], seen: Set<string>, sessio
   candidates.push(normalized);
 }
 
-function findTrajectorySessionFileIdsForSessionKey(sessionKey: string, sessionsDir = SESSIONS_DIR): string[] {
-  const variants = new Set(getSessionKeyLookupVariants(sessionKey));
-  if (variants.size === 0 || !existsSync(sessionsDir)) return [];
+// Trajectory logs are large (tens of MB across a session dir) and history /
+// stream-status requests used to re-read every file on every call, which cost
+// multiple seconds per session switch and blocked the event loop. Index which
+// session keys each trajectory file contains, keyed by mtime+size, so requests
+// only read the few files that actually mention the requested session.
+type TrajectoryFileIndexEntry = {
+  mtimeMs: number;
+  size: number;
+  sessionKeys: Set<string>;
+};
+const trajectoryFileIndexCache = new Map<string, TrajectoryFileIndexEntry>();
+const TRAJECTORY_SESSION_KEY_RE = /"sessionKey"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
 
-  const candidates: string[] = [];
-  const seen = new Set<string>();
+function getTrajectoryFileIndex(filePath: string): TrajectoryFileIndexEntry | null {
+  let stat: ReturnType<typeof statSync>;
+  try {
+    stat = statSync(filePath);
+  } catch {
+    trajectoryFileIndexCache.delete(filePath);
+    return null;
+  }
+
+  const cached = trajectoryFileIndexCache.get(filePath);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached;
+
+  let raw = '';
+  try {
+    raw = readFileSync(filePath, 'utf-8');
+  } catch {
+    trajectoryFileIndexCache.delete(filePath);
+    return null;
+  }
+
+  const sessionKeys = new Set<string>();
+  TRAJECTORY_SESSION_KEY_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = TRAJECTORY_SESSION_KEY_RE.exec(raw))) {
+    try {
+      sessionKeys.add(JSON.parse(`"${match[1]}"`));
+    } catch {
+      sessionKeys.add(match[1]);
+    }
+  }
+
+  const entry: TrajectoryFileIndexEntry = { mtimeMs: stat.mtimeMs, size: stat.size, sessionKeys };
+  trajectoryFileIndexCache.set(filePath, entry);
+  return entry;
+}
+
+function listTrajectoryFilesForSessionVariants(variants: Set<string>, sessionsDir: string): string[] {
   let entries: any[] = [];
   try {
     entries = readdirSync(sessionsDir, { withFileTypes: true }) as any[];
@@ -3020,28 +3188,123 @@ function findTrajectorySessionFileIdsForSessionKey(sessionKey: string, sessionsD
     return [];
   }
 
+  const matching: string[] = [];
   for (const entry of entries) {
     if (!entry.isFile?.() || !entry.name.endsWith('.trajectory.jsonl')) continue;
     const filePath = path.join(sessionsDir, entry.name);
-    let raw = '';
+    const index = getTrajectoryFileIndex(filePath);
+    if (!index) continue;
+    for (const variant of variants) {
+      if (index.sessionKeys.has(variant)) {
+        matching.push(filePath);
+        break;
+      }
+    }
+  }
+  return matching;
+}
+
+// Long-lived sessions (agent:main:main) appear in nearly every trajectory file,
+// so the key index alone cannot skip reads for them. Cache each file's parsed
+// per-session extraction keyed by mtime+size: finished trajectory files parse
+// once for the process lifetime and only the actively-written file re-parses.
+type TrajectoryParsedExtraction = {
+  candidateSessionIds: string[];
+  messages: any[];
+};
+type TrajectoryParsedCacheEntry = {
+  mtimeMs: number;
+  size: number;
+  bySessionKey: Map<string, TrajectoryParsedExtraction>;
+};
+const trajectoryParsedCache = new Map<string, TrajectoryParsedCacheEntry>();
+const TRAJECTORY_PARSED_CACHE_MAX_SESSION_KEYS_PER_FILE = 8;
+
+function readTrajectoryFileExtraction(filePath: string, sessionKey: string, variants: Set<string>): TrajectoryParsedExtraction | null {
+  let stat: ReturnType<typeof statSync>;
+  try {
+    stat = statSync(filePath);
+  } catch {
+    trajectoryParsedCache.delete(filePath);
+    return null;
+  }
+
+  let entry = trajectoryParsedCache.get(filePath);
+  if (!entry || entry.mtimeMs !== stat.mtimeMs || entry.size !== stat.size) {
+    entry = { mtimeMs: stat.mtimeMs, size: stat.size, bySessionKey: new Map() };
+    trajectoryParsedCache.set(filePath, entry);
+  }
+
+  const cached = entry.bySessionKey.get(sessionKey);
+  if (cached) {
+    return {
+      candidateSessionIds: [...cached.candidateSessionIds],
+      messages: structuredClone(cached.messages),
+    };
+  }
+
+  let raw = '';
+  try {
+    raw = readFileSync(filePath, 'utf-8');
+  } catch {
+    trajectoryParsedCache.delete(filePath);
+    return null;
+  }
+
+  const fileName = path.basename(filePath);
+  const variantList = Array.from(variants);
+  const candidateSessionIds: string[] = [];
+  const seenCandidates = new Set<string>();
+  const messages: any[] = [];
+
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line || !variantList.some((key) => line.includes(key))) continue;
     try {
-      raw = readFileSync(filePath, 'utf-8');
+      const parsed = JSON.parse(line);
+      const key = typeof parsed?.sessionKey === 'string' ? parsed.sessionKey.trim() : '';
+      if (!key || !variants.has(key)) continue;
+
+      for (const candidate of [parsed?.sessionId, parsed?.data?.sessionId]) {
+        const clean = typeof candidate === 'string' ? candidate.trim() : '';
+        if (clean && !seenCandidates.has(clean)) {
+          seenCandidates.add(clean);
+          candidateSessionIds.push(clean);
+        }
+      }
+
+      const snapshot = Array.isArray(parsed?.data?.messagesSnapshot) ? parsed.data.messagesSnapshot : [];
+      snapshot.forEach((message: any, index: number) => {
+        const mapped = mapTrajectoryRuntimeMessage(message, `trajectory-${parsed.runId || fileName}-${index}`, message?.timestamp || parsed.ts);
+        if (mapped) messages.push(mapped);
+      });
     } catch {
       continue;
     }
-    if (![...variants].some((key) => raw.includes(key))) continue;
+  }
 
-    for (const line of raw.split(/\r?\n/)) {
-      if (!line || ![...variants].some((key) => line.includes(key))) continue;
-      try {
-        const parsed = JSON.parse(line);
-        const key = typeof parsed?.sessionKey === 'string' ? parsed.sessionKey.trim() : '';
-        if (!key || !variants.has(key)) continue;
-        addSessionFileCandidate(candidates, seen, parsed?.sessionId, sessionsDir);
-        addSessionFileCandidate(candidates, seen, parsed?.data?.sessionId, sessionsDir);
-      } catch {
-        continue;
-      }
+  if (entry.bySessionKey.size >= TRAJECTORY_PARSED_CACHE_MAX_SESSION_KEYS_PER_FILE) {
+    entry.bySessionKey.clear();
+  }
+  entry.bySessionKey.set(sessionKey, {
+    candidateSessionIds: [...candidateSessionIds],
+    messages: structuredClone(messages),
+  });
+
+  return { candidateSessionIds, messages };
+}
+
+function findTrajectorySessionFileIdsForSessionKey(sessionKey: string, sessionsDir = SESSIONS_DIR): string[] {
+  const variants = new Set(getSessionKeyLookupVariants(sessionKey));
+  if (variants.size === 0 || !existsSync(sessionsDir)) return [];
+
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  for (const filePath of listTrajectoryFilesForSessionVariants(variants, sessionsDir)) {
+    const extraction = readTrajectoryFileExtraction(filePath, sessionKey, variants);
+    if (!extraction) continue;
+    for (const candidateSessionId of extraction.candidateSessionIds) {
+      addSessionFileCandidate(candidates, seen, candidateSessionId, sessionsDir);
     }
   }
 
@@ -3153,40 +3416,11 @@ function readTrajectoryMessagesForSessionKey(sessionKey: string, limit = 200, se
   if (variants.size === 0 || !existsSync(sessionsDir)) return [];
 
   const rawMessages: any[] = [];
-  let entries: any[] = [];
-  try {
-    entries = readdirSync(sessionsDir, { withFileTypes: true }) as any[];
-  } catch {
-    return [];
-  }
 
-  for (const entry of entries) {
-    if (!entry.isFile?.() || !entry.name.endsWith('.trajectory.jsonl')) continue;
-    const filePath = path.join(sessionsDir, entry.name);
-    let raw = '';
-    try {
-      raw = readFileSync(filePath, 'utf-8');
-    } catch {
-      continue;
-    }
-    const variantList = Array.from(variants);
-    if (!variantList.some((key) => raw.includes(key))) continue;
-
-    for (const line of raw.split(/\r?\n/)) {
-      if (!line || !variantList.some((key) => line.includes(key))) continue;
-      try {
-        const parsed = JSON.parse(line);
-        const key = typeof parsed?.sessionKey === 'string' ? parsed.sessionKey.trim() : '';
-        if (!key || !variants.has(key)) continue;
-        const snapshot = Array.isArray(parsed?.data?.messagesSnapshot) ? parsed.data.messagesSnapshot : [];
-        snapshot.forEach((message: any, index: number) => {
-          const mapped = mapTrajectoryRuntimeMessage(message, `trajectory-${parsed.runId || entry.name}-${index}`, message?.timestamp || parsed.ts);
-          if (mapped) rawMessages.push(mapped);
-        });
-      } catch {
-        continue;
-      }
-    }
+  for (const filePath of listTrajectoryFilesForSessionVariants(variants, sessionsDir)) {
+    const extraction = readTrajectoryFileExtraction(filePath, sessionKey, variants);
+    if (!extraction) continue;
+    rawMessages.push(...extraction.messages);
   }
 
   const seen = new Set<string>();
@@ -4195,7 +4429,10 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
     const patch: Record<string, any> = { key: sessionKey };
 
     if (thinking) {
-      const allowedThinking = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive']);
+      // Full OpenClaw 2026.7.1 ladder. Per-model support (e.g. ultra on
+      // GPT-5.6 Sol/Terra, adaptive on Claude) is validated by the gateway
+      // against the model's provider profile, which returns the valid options.
+      const allowedThinking = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive', 'max', 'ultra']);
       if (!allowedThinking.has(thinking)) {
         res.status(400).json({ error: `Unsupported thinking level: ${thinking}` });
         return;
@@ -4241,6 +4478,25 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
     if (Object.keys(patch).length === 1) {
       res.json({ ok: true, session: null });
       return;
+    }
+
+    // OpenClaw validates thinkingLevel patches against the agent DEFAULT model
+    // unless the patch carries a model. Sessions with their own model override
+    // must validate against that override (e.g. ultra is valid on a GPT-5.6
+    // session even when the default model is a Claude model), so attach the
+    // session's recorded override when patching thinking without a model.
+    if (patch.thinkingLevel && !patch.model) {
+      try {
+        const registryEntry = readLocalSessionRegistryEntry(sessionKey);
+        const overrideModel = typeof registryEntry?.model === 'string' ? registryEntry.model.trim() : '';
+        if (overrideModel) {
+          const overrideProvider = typeof registryEntry?.modelProvider === 'string' ? registryEntry.modelProvider.trim() : '';
+          const qualified = overrideModel.includes('/')
+            ? overrideModel
+            : (overrideProvider ? `${overrideProvider}/${overrideModel}` : '');
+          if (qualified) patch.model = qualified;
+        }
+      } catch {}
     }
 
     const result = await gatewayRpcCall('sessions.patch', patch);
@@ -5170,17 +5426,25 @@ router.post('/session-steer', authenticateToken, requireApproved, async (req: Re
 async function resolveAnyExecApproval(
   approvalId: string,
   decision: NativeCliApprovalDecision,
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; notFound?: boolean }> {
   const nativeResult = resolveNativeCliApproval(approvalId, decision);
   if (nativeResult.ok) return nativeResult;
 
-  if (isPersistentWsConnected()) {
-    const persistentResult = await sendApprovalDecision(approvalId, decision);
-    if (persistentResult.ok) return persistentResult;
-    console.warn(`[gateway] Persistent WS resolution failed: ${persistentResult.error}`);
+  // Native-prefixed ids live only in the in-process registry; a miss means
+  // the approval expired, was resolved elsewhere, or the backend restarted.
+  if (approvalId.startsWith('native-')) {
+    return { ok: false, error: 'Approval no longer pending', notFound: true };
   }
 
-  return resolveExecApproval(approvalId, decision);
+  if (!isPersistentWsConnected()) {
+    return { ok: false, error: 'OpenClaw gateway connection is down' };
+  }
+
+  const persistentResult = await sendApprovalDecision(approvalId, decision);
+  if (persistentResult.ok) return persistentResult;
+  console.warn(`[gateway] Persistent WS resolution failed: ${persistentResult.error}`);
+  const message = String(persistentResult.error || 'Failed to resolve approval');
+  return { ok: false, error: message, notFound: /not.?found|unknown|expired|no such/i.test(message) };
 }
 
 router.post('/exec-approval/resolve', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<void> => {
@@ -5189,7 +5453,12 @@ router.post('/exec-approval/resolve', authenticateToken, requireAdmin, async (re
   if (!decision || !['allow-once', 'deny', 'allow-always'].includes(decision)) { res.status(400).json({ error: 'Invalid decision' }); return; }
   try {
     const result = await resolveAnyExecApproval(approvalId, decision);
-    if (!result.ok) { res.status(404).json({ error: result.error || 'Failed' }); return; }
+    if (!result.ok) {
+      // 404 tells the client the approval is gone for good (safe to drop the
+      // popup); 502 means delivery failed and a retry can still succeed.
+      res.status(result.notFound ? 404 : 502).json({ error: result.error || 'Failed' });
+      return;
+    }
     res.json({ ok: true, approvalId, decision });
   } catch (err: any) {
     res.status(500).json({ error: 'Internal error', detail: err.message });
@@ -5524,7 +5793,7 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       try {
         if (!requestedModel.includes('/')) {
           console.warn(`[gateway-ws] Rejecting bare model name without provider prefix: "${requestedModel}". Select a fully-qualified model ID.`);
-          wsSend(ws, { type: 'error', content: `Invalid model "${requestedModel}": must include provider prefix (e.g. codex/gpt-5.5). Please reselect your model.` });
+          wsSend(ws, { type: 'error', content: `Invalid model "${requestedModel}": must include provider prefix (e.g. openai/gpt-5.5). Please reselect your model.` });
           return;
         }
         const resolvedModel = await resolveOpenClawPatchModel(requestedModel);

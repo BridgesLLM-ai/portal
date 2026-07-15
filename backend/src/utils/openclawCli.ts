@@ -63,27 +63,39 @@ const GOOGLE_MODEL_MAP: Record<string, string> = {
   'google-antigravity/gemini-3.1-flash-lite-preview': 'google-antigravity/gemini-3.5-flash',
 };
 
+// OpenClaw 2026.7.1 makes `openai/*` the canonical Codex-runtime route;
+// `codex/*` and `openai-codex/*` are legacy refs that still resolve upstream
+// but should normalize to the canonical ids everywhere in the portal.
 const OPENAI_CODEX_MODEL_MAP: Record<string, string> = {
-  'gpt-5.4-codex': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.5-pro': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.4-pro': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.4-codex': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.4': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.4-mini': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.2-codex': 'codex/gpt-5.2',
-  'codex/gpt-5.5-pro': 'codex/gpt-5.5',
-  'codex/gpt-5.4': 'codex/gpt-5.5',
-  'codex/gpt-5.4-mini': 'codex/gpt-5.5',
-  'codex/gpt-5.4-pro': 'codex/gpt-5.5',
-  'openai/gpt-5.4': 'codex/gpt-5.5',
-  'openai/gpt-5.4-mini': 'codex/gpt-5.5',
-  'openai/gpt-5.4-pro': 'codex/gpt-5.5',
-  'openai/gpt-5.4-codex': 'codex/gpt-5.5',
-  'codex/gpt-5.2-codex': 'codex/gpt-5.2',
-  'codex/gpt-5.4-codex': 'codex/gpt-5.5',
+  // Bare GPT-5.6 resolves to Sol, matching OpenClaw's fresh-setup default.
+  'gpt-5.6': 'openai/gpt-5.6-sol',
+  'openai/gpt-5.6': 'openai/gpt-5.6-sol',
+  'codex/gpt-5.6': 'openai/gpt-5.6-sol',
+  'openai-codex/gpt-5.6': 'openai/gpt-5.6-sol',
+  // Retired 5.4-era refs map onto the closest current runtime model.
+  'gpt-5.4-codex': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.5-pro': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.4-pro': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.4-codex': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.4': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.4-mini': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.2-codex': 'openai/gpt-5.2',
+  'codex/gpt-5.5-pro': 'openai/gpt-5.5',
+  'codex/gpt-5.4': 'openai/gpt-5.5',
+  'codex/gpt-5.4-mini': 'openai/gpt-5.5',
+  'codex/gpt-5.4-pro': 'openai/gpt-5.5',
+  'openai/gpt-5.4': 'openai/gpt-5.5',
+  'openai/gpt-5.4-mini': 'openai/gpt-5.5',
+  'openai/gpt-5.4-pro': 'openai/gpt-5.5',
+  'openai/gpt-5.4-codex': 'openai/gpt-5.5',
+  'codex/gpt-5.2-codex': 'openai/gpt-5.2',
+  'codex/gpt-5.4-codex': 'openai/gpt-5.5',
 };
 
 const CURRENT_CODEX_RUNTIME_MODELS = new Set([
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
   'gpt-5.5',
   'gpt-5.3-codex',
   'gpt-5.2',
@@ -126,7 +138,10 @@ export function normalizePortalModelId(rawModel: string | null | undefined): str
     return `anthropic/${mapped.slice('claude-cli/'.length)}`;
   }
   if (mapped.startsWith('openai-codex/')) {
-    return `codex/${mapped.slice('openai-codex/'.length)}`;
+    return `openai/${mapped.slice('openai-codex/'.length)}`;
+  }
+  if (mapped.startsWith('codex/')) {
+    return `openai/${mapped.slice('codex/'.length)}`;
   }
   return mapped;
 }
@@ -142,19 +157,12 @@ export function normalizeOpenClawConfigModelId(rawModel: string | null | undefin
     }
   }
 
-  if (normalized.startsWith('openai/')) {
-    const modelName = normalized.slice('openai/'.length);
-    if (CURRENT_CODEX_RUNTIME_MODELS.has(modelName)) {
-      return `codex/${modelName}`;
-    }
-  }
-
   if (!normalized.includes('/') && normalized.startsWith('gemini-3')) {
     return `google-antigravity/${normalized}`;
   }
 
   if (!normalized.includes('/') && CURRENT_CODEX_RUNTIME_MODELS.has(normalized)) {
-    return `codex/${normalized}`;
+    return `openai/${normalized}`;
   }
 
   return normalized;
@@ -215,9 +223,9 @@ function resolveSafeMaintenanceModel(config: any): string | null {
   if (compactionModel) return compactionModel;
 
   const candidates = collectConfiguredMaintenanceModelCandidates(config);
-  const codexCandidate = candidates.find((model) => model.startsWith('codex/'));
+  const codexCandidate = candidates.find((model) => model.startsWith('openai/') || model.startsWith('codex/'));
   if (codexCandidate) return codexCandidate;
-  if (hasCodexAuthProfile(config)) return 'codex/gpt-5.5';
+  if (hasCodexAuthProfile(config)) return 'openai/gpt-5.5';
 
   return candidates.find((model) => !model.startsWith('anthropic/') && !model.startsWith('claude-cli/')) || null;
 }
@@ -238,8 +246,13 @@ export function ensureMemoryFlushMaintenanceModel(config: any): { changed: boole
     changed = true;
   }
 
-  if (!normalizeOpenClawConfigModelId(compaction.model || '') && maintenanceModel) {
+  const normalizedCompactionModel = normalizeOpenClawConfigModelId(compaction.model || '');
+  if (!normalizedCompactionModel && maintenanceModel) {
     compaction.model = maintenanceModel;
+    changed = true;
+  } else if (normalizedCompactionModel && compaction.model !== normalizedCompactionModel) {
+    // Migrate legacy refs (codex/* → openai/*) in place during repair.
+    compaction.model = normalizedCompactionModel;
     changed = true;
   }
 
@@ -371,22 +384,7 @@ function translateProviderOwnedAlias(provider: string, normalized: string): stri
     }
   }
 
-  if (provider === 'openai-codex' || provider === 'codex') {
-    if (normalized.startsWith('codex/')) {
-      return normalized;
-    }
-    if (normalized.startsWith('openai/')) {
-      return `codex/${normalized.slice('openai/'.length)}`;
-    }
-    if (normalized.startsWith('openai-codex/')) {
-      return `codex/${normalized.slice('openai-codex/'.length)}`;
-    }
-    if (!normalized.includes('/') && /^(gpt-|o\d|codex)/i.test(normalized)) {
-      return `codex/${normalized}`;
-    }
-  }
-
-  if (provider === 'openai') {
+  if (provider === 'openai-codex' || provider === 'codex' || provider === 'openai') {
     if (normalized.startsWith('codex/')) {
       return `openai/${normalized.slice('codex/'.length)}`;
     }
@@ -470,9 +468,9 @@ function modelForCurrentCodexRuntime(normalized: string): string {
   const openAiFamily = provider === 'openai' || provider === 'openai-codex' || provider === 'codex' || !provider;
   if (!openAiFamily) return normalized;
 
-  if (modelName === 'gpt-5.5' || modelName === 'gpt-5.5-pro') return 'codex/gpt-5.5';
-  if (/^gpt-5\.4(?:-|$)/.test(modelName)) return 'codex/gpt-5.5';
-  if (CURRENT_CODEX_RUNTIME_MODELS.has(modelName)) return `codex/${modelName}`;
+  if (modelName === 'gpt-5.5-pro') return 'openai/gpt-5.5';
+  if (/^gpt-5\.4(?:-|$)/.test(modelName)) return 'openai/gpt-5.5';
+  if (CURRENT_CODEX_RUNTIME_MODELS.has(modelName)) return `openai/${modelName}`;
   return normalized;
 }
 
@@ -480,15 +478,16 @@ export function modelForOpenClawSessionPatch(sessionInfo: any, portalModel: stri
   const normalized = modelForCurrentCodexRuntime(normalizePortalModelId(portalModel));
   if (!normalized) return '';
 
-  // OpenClaw 2026.6 exposes the Codex app-server runtime as the codex provider.
-  // Older Portal settings may still say openai-codex/*, so keep those readable
-  // but send current codex/* ids back to OpenClaw.
+  // OpenClaw 2026.7.1 makes openai/* the canonical Codex-runtime route.
+  // Older Portal settings may still say codex/* or openai-codex/*, so keep
+  // those readable but send canonical openai/* ids back to OpenClaw.
   const runtimeHint = getOpenClawRuntimeHint(sessionInfo);
-  const codexRuntime = /\bcodex\b/.test(runtimeHint) || normalized.startsWith('codex/');
+  const codexRuntime = /\bcodex\b/.test(runtimeHint) || normalized.startsWith('codex/') || normalized.startsWith('openai/');
   if (codexRuntime) {
-    if (normalized.startsWith('codex/')) return normalized;
-    if (normalized.startsWith('openai-codex/')) return `codex/${normalized.slice('openai-codex/'.length)}`;
-    if (/^(gpt-|o\d|codex)/i.test(normalized)) return `codex/${normalized}`;
+    if (normalized.startsWith('openai/')) return normalized;
+    if (normalized.startsWith('codex/')) return `openai/${normalized.slice('codex/'.length)}`;
+    if (normalized.startsWith('openai-codex/')) return `openai/${normalized.slice('openai-codex/'.length)}`;
+    if (/^(gpt-|o\d|codex)/i.test(normalized)) return `openai/${normalized}`;
   }
 
   const claudeCliRuntime = /\bclaude-cli\b/.test(runtimeHint) || usesClaudeCliAuthProfile(readJson<any>(CONFIG_PATH, {}), readJson<any>(AUTH_PROFILES_PATH, { version: 2, profiles: {} }));
@@ -541,6 +540,64 @@ export function normalizePortalModelList(models: string[] | null | undefined): s
   return normalized;
 }
 
+// Recommended model declarations for already-authenticated providers. OpenClaw
+// 2026.7.1 rejects sessions.patch for models missing from the
+// agents.defaults.models allowlist, so installs that authenticated before a
+// release must have new recommended models seeded during update repair.
+// Claude Sonnet 5 is deliberately NOT recommended or seeded: on the claude-cli
+// route OpenClaw 2026.7.1 gives mandatory-thinking Claude 5 models an off-only
+// thinking profile, and session thinking patches validate against the DEFAULT
+// model — a sonnet-5 default rejects every thinking change portal-wide, and
+// sonnet-5 claude-cli turns currently return empty output.
+const RECOMMENDED_CLAUDE_SUBSCRIPTION_MODELS = [
+  'anthropic/claude-fable-5',
+  'anthropic/claude-opus-4-8',
+  'anthropic/claude-sonnet-4-6',
+  'anthropic/claude-haiku-4-5',
+];
+
+const CLAUDE_CLI_UNUSABLE_DEFAULT_RE = /^anthropic\/claude-(sonnet|mythos)-5$/;
+
+const RECOMMENDED_CODEX_SUBSCRIPTION_MODELS = [
+  'openai/gpt-5.6-sol',
+  'openai/gpt-5.6-terra',
+  'openai/gpt-5.6-luna',
+  'openai/gpt-5.5',
+];
+
+/**
+ * Declare a model in agents.defaults.models so OpenClaw allows selecting it.
+ * Declaration-only self-heal: it never touches the primary/fallback chain.
+ */
+export function ensureOpenClawModelDeclaration(rawModel: string): { changed: boolean; model: string } {
+  const normalized = normalizeOpenClawConfigModelId(rawModel);
+  if (!normalized || !normalized.includes('/')) return { changed: false, model: normalized };
+
+  const config = readJson<any>(CONFIG_PATH, {});
+  const authProfiles = readJson<any>(AUTH_PROFILES_PATH, { version: 2, profiles: {} });
+  config.agents = config.agents && typeof config.agents === 'object' ? config.agents : {};
+  config.agents.defaults = config.agents.defaults && typeof config.agents.defaults === 'object' ? config.agents.defaults : {};
+  const defaults = config.agents.defaults;
+  defaults.models = defaults.models && typeof defaults.models === 'object' && !Array.isArray(defaults.models) ? defaults.models : {};
+
+  let changed = false;
+  let entry = defaults.models[normalized];
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    entry = {};
+    defaults.models[normalized] = entry;
+    changed = true;
+  }
+  if (normalized.startsWith('anthropic/') && usesClaudeCliAuthProfile(config, authProfiles)) {
+    if (String(entry.agentRuntime?.id || '').trim() !== 'claude-cli') {
+      entry.agentRuntime = { ...(entry.agentRuntime && typeof entry.agentRuntime === 'object' ? entry.agentRuntime : {}), id: 'claude-cli' };
+      changed = true;
+    }
+  }
+
+  if (changed) writeJson(CONFIG_PATH, config);
+  return { changed, model: normalized };
+}
+
 export function repairClaudeSubscriptionConfig(preferredModel?: string | null): { changed: boolean; defaultModel: string | null } {
   const config = readJson<any>(CONFIG_PATH, {});
   const authProfiles = readJson<any>(AUTH_PROFILES_PATH, { version: 2, profiles: {} });
@@ -548,7 +605,13 @@ export function repairClaudeSubscriptionConfig(preferredModel?: string | null): 
   const useClaudeCliRuntime = usesClaudeCliAuthProfile(config, authProfiles);
 
   const currentDefault = normalizeOpenClawConfigModelId(config?.agents?.defaults?.model?.primary || '');
-  const desiredDefault = normalizeOpenClawConfigModelId(preferredModel || currentDefault);
+  let desiredDefault = normalizeOpenClawConfigModelId(preferredModel || currentDefault);
+  // A sonnet-5/mythos-5 default on the claude-cli runtime breaks every session:
+  // thinking patches validate against the default model's off-only profile and
+  // the CLI returns empty turns. Demote to Fable 5, which is proven working.
+  if (useClaudeCliRuntime && CLAUDE_CLI_UNUSABLE_DEFAULT_RE.test(desiredDefault)) {
+    desiredDefault = 'anthropic/claude-fable-5';
+  }
   if (desiredDefault && config?.agents?.defaults?.model?.primary !== desiredDefault) {
     config.agents = config.agents || {};
     config.agents.defaults = config.agents.defaults || {};
@@ -562,6 +625,12 @@ export function repairClaudeSubscriptionConfig(preferredModel?: string | null): 
   for (const [modelId, meta] of Object.entries<any>(existingModels)) {
     const normalizedModelId = normalizeOpenClawConfigModelId(modelId);
     if (!normalizedModelId) continue;
+    // Drop declarations for models the claude-cli runtime cannot serve: their
+    // off-only thinking profiles and empty turns only create broken choices.
+    if (useClaudeCliRuntime && CLAUDE_CLI_UNUSABLE_DEFAULT_RE.test(normalizedModelId)) {
+      changed = true;
+      continue;
+    }
     repairedModels[normalizedModelId] = {
       ...(repairedModels[normalizedModelId] || {}),
       ...(meta && typeof meta === 'object' ? meta : {}),
@@ -584,6 +653,27 @@ export function repairClaudeSubscriptionConfig(preferredModel?: string | null): 
       : {};
     changed = true;
   }
+
+  // Seed recommended model declarations for providers that already have auth,
+  // so updates surface newly supported models (Fable 5, GPT-5.6) without
+  // requiring the user to redo provider setup. Declarations only allow
+  // selection; they never change the primary/fallback chain.
+  if (useClaudeCliRuntime) {
+    for (const modelId of RECOMMENDED_CLAUDE_SUBSCRIPTION_MODELS) {
+      if (!repairedModels[modelId]) {
+        repairedModels[modelId] = { agentRuntime: { id: 'claude-cli' } };
+        changed = true;
+      }
+    }
+  }
+  if (hasCodexAuthProfile(config)) {
+    for (const modelId of RECOMMENDED_CODEX_SUBSCRIPTION_MODELS) {
+      if (!repairedModels[modelId]) {
+        repairedModels[modelId] = {};
+        changed = true;
+      }
+    }
+  }
   if (JSON.stringify(existingModels) !== JSON.stringify(repairedModels)) {
     config.agents = config.agents || {};
     config.agents.defaults = config.agents.defaults || {};
@@ -594,7 +684,8 @@ export function repairClaudeSubscriptionConfig(preferredModel?: string | null): 
   const fallbacks = Array.isArray(config?.agents?.defaults?.model?.fallbacks)
     ? config.agents.defaults.model.fallbacks
     : [];
-  const repairedFallbacks = uniqueStrings(fallbacks.map((model) => normalizeOpenClawConfigModelId(model)));
+  const repairedFallbacks = uniqueStrings(fallbacks.map((model) => normalizeOpenClawConfigModelId(model)))
+    .filter((model) => !(useClaudeCliRuntime && CLAUDE_CLI_UNUSABLE_DEFAULT_RE.test(model)));
   if (JSON.stringify(fallbacks) !== JSON.stringify(repairedFallbacks)) {
     config.agents = config.agents || {};
     config.agents.defaults = config.agents.defaults || {};

@@ -150,6 +150,96 @@ describe('PersistentGatewayWs Codex idle timeout handling', () => {
     }
   });
 
+  it('publishes cumulative reasoning snapshots as replace-style thinking events', () => {
+    const sessionKey = 'test-thinking-snapshot';
+    const events: StreamEvent[] = [];
+    const unsubscribe = streamEventBus.subscribe(sessionKey, (event) => events.push(event));
+
+    try {
+      __persistentGatewayWsTest.registerRun(sessionKey, 'run-thinking-snapshot');
+
+      // OpenClaw 2026.7.1 claude-cli thinking lane: cumulative snapshot + delta.
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey,
+        runId: 'run-thinking-snapshot',
+        stream: 'thinking',
+        data: { text: 'Plan', delta: 'Plan', isReasoningSnapshot: true },
+      });
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey,
+        runId: 'run-thinking-snapshot',
+        stream: 'thinking',
+        data: { text: 'Plan the fix carefully', delta: ' the fix carefully', isReasoningSnapshot: true },
+      });
+      // Exact duplicate snapshot must be dropped.
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey,
+        runId: 'run-thinking-snapshot',
+        stream: 'thinking',
+        data: { text: 'Plan the fix carefully', delta: '', isReasoningSnapshot: true },
+      });
+      // A non-extending snapshot is a new thinking phase: fresh segment, no replace.
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey,
+        runId: 'run-thinking-snapshot',
+        stream: 'thinking',
+        data: { text: 'Second thought', delta: 'Second thought', isReasoningSnapshot: true },
+      });
+      // progressTokens-only events carry no text and must not publish.
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey,
+        runId: 'run-thinking-snapshot',
+        stream: 'thinking',
+        data: { progressTokens: 128 },
+      });
+
+      const thinkingEvents = events.filter((event) => event.type === 'thinking');
+      expect(thinkingEvents).toEqual([
+        expect.objectContaining({ content: 'Plan' }),
+        expect.objectContaining({ content: 'Plan the fix carefully', replace: true }),
+        expect.objectContaining({ content: 'Second thought' }),
+      ]);
+      expect(thinkingEvents[0].replace).toBeUndefined();
+      expect(thinkingEvents[2].replace).toBeUndefined();
+    } finally {
+      unsubscribe();
+      __persistentGatewayWsTest.resetSession(sessionKey);
+    }
+  });
+
+  it('appends legacy delta-only thinking chunks without replace', () => {
+    const sessionKey = 'test-thinking-delta-only';
+    const events: StreamEvent[] = [];
+    const unsubscribe = streamEventBus.subscribe(sessionKey, (event) => events.push(event));
+
+    try {
+      __persistentGatewayWsTest.registerRun(sessionKey, 'run-thinking-delta');
+
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey,
+        runId: 'run-thinking-delta',
+        stream: 'thinking',
+        data: { delta: 'first chunk ' },
+      });
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey,
+        runId: 'run-thinking-delta',
+        stream: 'thinking',
+        data: { delta: 'second chunk' },
+      });
+
+      const thinkingEvents = events.filter((event) => event.type === 'thinking');
+      expect(thinkingEvents).toEqual([
+        expect.objectContaining({ content: 'first chunk ' }),
+        expect.objectContaining({ content: 'second chunk' }),
+      ]);
+      expect(thinkingEvents.every((event) => event.replace === undefined)).toBe(true);
+    } finally {
+      unsubscribe();
+      __persistentGatewayWsTest.resetSession(sessionKey);
+    }
+  });
+
   it('completes chat events for a direct-proxy run registered from chat.send ack', () => {
     const directSessionKey = 'test-direct-proxy-final-tracking';
     const events: StreamEvent[] = [];

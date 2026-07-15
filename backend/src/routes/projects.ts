@@ -652,7 +652,9 @@ router.get('/models/available', authenticateToken, requireApproved, async (_req:
     } else {
       res.json({ 
         models: [
-          { id: 'codex/gpt-5.5', name: 'GPT-5.5 Codex', provider: 'openai-codex' },
+          { id: 'openai/gpt-5.6-sol', name: 'GPT-5.6 Sol', provider: 'openai-codex' },
+          { id: 'openai/gpt-5.5', name: 'GPT-5.5', provider: 'openai-codex' },
+          { id: 'anthropic/claude-fable-5', name: 'Claude Fable 5', provider: 'anthropic' },
           { id: 'anthropic/claude-opus-4-8', name: 'Claude Opus 4.8', provider: 'anthropic' },
           { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6', provider: 'anthropic' },
           { id: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', provider: 'anthropic' },
@@ -3178,7 +3180,11 @@ function getModelDisplayName(model: string): string {
     'ollama/qwen3:8b': 'Qwen3 8B',
     'ollama/gemma4:e2b': 'Gemma 4 E2B',
     'ollama/gemma4:e4b': 'Gemma 4 E4B',
-    'codex/gpt-5.5': 'GPT-5.5 Codex',
+    'openai/gpt-5.6-sol': 'GPT-5.6 Sol',
+    'openai/gpt-5.6-terra': 'GPT-5.6 Terra',
+    'openai/gpt-5.6-luna': 'GPT-5.6 Luna',
+    'openai/gpt-5.5': 'GPT-5.5',
+    'codex/gpt-5.5': 'GPT-5.5',
     'openai/gpt-5.4': 'GPT-5.4 Codex',
     'openai/gpt-5.4-mini': 'GPT-5.4 Mini',
     'openai/gpt-5.1': 'GPT-5.1',
@@ -3570,7 +3576,7 @@ function normalizeGatewayModelIds(models: any[] | undefined): string[] {
 async function resolveAllowedProjectModel(candidates: string[], requestedForWarning = ''): Promise<{ model: string; warning?: string }> {
   const normalizedCandidates = candidates.map((candidate) => normalizePortalModelId(candidate)).filter(Boolean);
   const requestedModel = normalizePortalModelId(requestedForWarning);
-  const hardFallback = 'codex/gpt-5.5';
+  const hardFallback = 'openai/gpt-5.5';
   const fallbackCandidates = [...normalizedCandidates, hardFallback];
 
   let availableModels: string[] = [];
@@ -3778,7 +3784,7 @@ router.get('/:name/assistant/active-model', authenticateToken, async (req: Reque
       result = await getSessionInfo(sessionKey);
     }
     
-    const configuredDefault = getDefaultModel() || 'codex/gpt-5.5';
+    const configuredDefault = getDefaultModel() || 'openai/gpt-5.5';
     const [defaultProvider, ...defaultModelParts] = configuredDefault.split('/');
     const defaultModel = defaultModelParts.join('/') || 'gpt-5.5';
 

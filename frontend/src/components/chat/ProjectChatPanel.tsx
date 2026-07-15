@@ -85,10 +85,10 @@ interface PendingAttachment {
   uploadError?: string;
 }
 
-type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
+type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive' | 'max' | 'ultra';
 type ReasoningVisibility = 'off' | 'on' | 'stream';
 
-const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive'];
+const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'adaptive', 'high', 'xhigh', 'max', 'ultra'];
 const REASONING_VISIBILITY_LABELS: Record<ReasoningVisibility, string> = {
   off: 'Hidden',
   on: 'Visible',
@@ -100,17 +100,18 @@ const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
   low: 'Low',
   medium: 'Medium',
   high: 'High',
-  xhigh: 'Max',
+  xhigh: 'X-High',
   adaptive: 'Adaptive',
+  max: 'Max',
+  ultra: 'Ultra',
 };
 
-const OPENCLAW_FAST_MODE_MODELS = new Set([
-  'codex/gpt-5.5',
-]);
-
+// Fast mode applies to every Codex-backed openai/* model on OpenClaw 2026.7.1.
 function supportsOpenClawFastModeModel(model?: string | null): boolean {
   const normalized = String(model || '').trim().toLowerCase();
-  return OPENCLAW_FAST_MODE_MODELS.has(normalized);
+  return normalized.startsWith('openai/')
+    || normalized.startsWith('codex/')
+    || normalized.startsWith('openai-codex/');
 }
 
 function resolveAvailableModelId(model: string, availableModels: string[]): string {
@@ -2842,6 +2843,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       {/* Composer */}
       {pendingApproval && (
         <ExecApprovalModal
+          key={pendingApproval.id}
           approval={pendingApproval}
           queueCount={pendingApprovals.length}
           onResolve={resolveApproval}

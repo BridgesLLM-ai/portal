@@ -23,6 +23,16 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
   const [timeLeft, setTimeLeft] = useState<number>(0);
   const [isClosing, setIsClosing] = useState(false);
   const [isResolving, setIsResolving] = useState(false);
+  const [resolveError, setResolveError] = useState<string | null>(null);
+
+  // Mount sites key this modal by approval id, but guard here too: stale
+  // isResolving/isClosing carried into the next queued approval renders it
+  // dead (buttons stuck spinning) or invisible while the agent waits on it.
+  useEffect(() => {
+    setIsClosing(false);
+    setIsResolving(false);
+    setResolveError(null);
+  }, [approval.id]);
 
   // Calculate and update time remaining
   useEffect(() => {
@@ -51,8 +61,13 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
   const handleDecision = useCallback((decision: 'allow-once' | 'deny' | 'allow-always') => {
     if (isResolving) return;
     setIsResolving(true);
-    Promise.resolve(onResolve(approval.id, decision)).catch(() => {
+    setResolveError(null);
+    Promise.resolve(onResolve(approval.id, decision)).catch((err: any) => {
       setIsResolving(false);
+      const detail = err?.response?.data?.error || err?.message || '';
+      setResolveError(detail && !/^Request failed/i.test(detail)
+        ? `Couldn't submit decision (${detail}) — retry or deny.`
+        : "Couldn't submit decision — retry or deny.");
     });
   }, [approval.id, onResolve, isResolving]);
 
@@ -230,6 +245,15 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
                   )}
                 </div>
               </div>
+
+              {/* Resolve error */}
+              {resolveError && (
+                <div className="px-6 pb-2">
+                  <div className="rounded-xl border border-red-400/20 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+                    {resolveError}
+                  </div>
+                </div>
+              )}
 
               {/* Action buttons */}
               <div className="px-6 py-4 border-t border-white/10 flex items-center gap-3">

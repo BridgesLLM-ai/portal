@@ -26,13 +26,16 @@ const GEMINI_DECLARED_FALLBACK = [
 ];
 
 const OPENCLAW_VISIBLE_MODEL_IDS = [
-  'codex/gpt-5.5',
+  'openai/gpt-5.6-sol',
+  'openai/gpt-5.6-terra',
+  'openai/gpt-5.6-luna',
+  'openai/gpt-5.5',
   'google-gemini-cli/gemini-3.1-pro-preview',
   'google-gemini-cli/gemini-3-flash-preview',
   'google-gemini-cli/gemini-3.1-flash-lite',
+  'anthropic/claude-fable-5',
   'anthropic/claude-sonnet-4-6',
   'anthropic/claude-opus-4-8',
-  'anthropic/claude-fable-5',
   'anthropic/claude-haiku-4-5',
 ];
 
@@ -62,7 +65,8 @@ function declaredModels(ids: string[], provider: string): ProviderModelDescripto
 
 export function isOpenClawSessionSelectableModelId(id: string): boolean {
   const normalizedId = normalizePortalModelId(id);
-  return normalizedId.startsWith('codex/')
+  return normalizedId.startsWith('openai/')
+    || normalizedId.startsWith('codex/')
     || normalizedId.startsWith('anthropic/')
     || normalizedId.startsWith('google-gemini-cli/')
     || normalizedId.startsWith('google-antigravity/');

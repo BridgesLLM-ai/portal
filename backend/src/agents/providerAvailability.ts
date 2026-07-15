@@ -195,9 +195,21 @@ const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
   },
 };
 
+// CLI availability probes are synchronous execs that block the event loop —
+// stacked probes (claude/codex/gemini version checks) previously cost multiple
+// seconds on every providers/commands request AND stalled unrelated requests
+// like dashboard metrics. Binary presence and versions change rarely, so probe
+// results are memoized for a few minutes.
+const PROBE_CACHE_TTL_MS = 5 * 60_000;
+const probeCache = new Map<string, { at: number; value: string | null }>();
+
 function tryExec(command: string, args: string[]): string | null {
+  const cacheKey = `${command}\u0000${args.join('\u0000')}`;
+  const cached = probeCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < PROBE_CACHE_TTL_MS) return cached.value;
+  let value: string | null = null;
   try {
-    return execFileSync(command, args, {
+    value = execFileSync(command, args, {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       env: process.env,
@@ -205,8 +217,10 @@ function tryExec(command: string, args: string[]): string | null {
       maxBuffer: 1024 * 1024 * 2,
     }).trim();
   } catch {
-    return null;
+    value = null;
   }
+  probeCache.set(cacheKey, { at: Date.now(), value });
+  return value;
 }
 
 function resolveCommand(candidates: string[]): string | undefined {

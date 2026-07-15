@@ -15,6 +15,8 @@ import {
   Volume2,
   VolumeX,
   Globe,
+  ClipboardPaste,
+  ClipboardCopy,
 } from 'lucide-react';
 import client from '../api/client';
 
@@ -425,6 +427,60 @@ export default function DesktopPage() {
     setTimeout(() => postViewportToIframe('fullscreen-settled'), 1100);
   };
 
+  // Portal-native clipboard sync. The noVNC clipboard panel is opaque and only
+  // works when the in-session bridge is healthy; these buttons talk straight
+  // to the desktop's X selections through the backend instead.
+  const [clipboardStatus, setClipboardStatus] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+  const clipboardStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flashClipboardStatus = useCallback((kind: 'ok' | 'error', text: string) => {
+    if (clipboardStatusTimer.current) clearTimeout(clipboardStatusTimer.current);
+    setClipboardStatus({ kind, text });
+    clipboardStatusTimer.current = setTimeout(() => setClipboardStatus(null), kind === 'ok' ? 2500 : 6000);
+  }, []);
+
+  const sendClipboardToDesktop = useCallback(async () => {
+    let text = '';
+    try {
+      text = await navigator.clipboard.readText();
+    } catch {
+      flashClipboardStatus('error', 'Browser blocked clipboard access — allow clipboard permission for this site and try again.');
+      return;
+    }
+    if (!text) {
+      flashClipboardStatus('error', 'Your clipboard is empty (only text can be sent).');
+      return;
+    }
+    try {
+      await client.post('/remote-desktop/clipboard', { text, selection: 'both' });
+      flashClipboardStatus('ok', `Sent ${text.length.toLocaleString()} characters — paste inside the desktop with Ctrl+V.`);
+    } catch (err: any) {
+      flashClipboardStatus('error', err?.response?.data?.error || 'Failed to send clipboard to the desktop.');
+    }
+  }, [flashClipboardStatus]);
+
+  const fetchClipboardFromDesktop = useCallback(async () => {
+    let text = '';
+    try {
+      const { data } = await client.get('/remote-desktop/clipboard', { params: { selection: 'clipboard' } });
+      text = typeof data?.text === 'string' ? data.text : '';
+    } catch (err: any) {
+      flashClipboardStatus('error', err?.response?.data?.error || 'Failed to read the desktop clipboard.');
+      return;
+    }
+    if (!text) {
+      flashClipboardStatus('error', 'The desktop clipboard is empty — copy something inside the desktop first.');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      flashClipboardStatus('error', 'Browser blocked clipboard access — allow clipboard permission for this site and try again.');
+      return;
+    }
+    flashClipboardStatus('ok', `Copied ${text.length.toLocaleString()} characters from the desktop to your clipboard.`);
+  }, [flashClipboardStatus]);
+  useEffect(() => () => { if (clipboardStatusTimer.current) clearTimeout(clipboardStatusTimer.current); }, []);
+
   const postViewportToIframe = useCallback((reason: string) => {
     const iframe = iframeRef.current;
     const host = desktopViewportRef.current;
@@ -563,6 +619,22 @@ export default function DesktopPage() {
               />
             )}
           </div>
+          <button
+            onClick={() => void sendClipboardToDesktop()}
+            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-h-[44px] text-xs font-medium"
+            title="Send your computer's clipboard into the remote desktop (then paste there with Ctrl+V)"
+          >
+            <ClipboardPaste size={15} />
+            <span className="hidden md:inline">Send clipboard</span>
+          </button>
+          <button
+            onClick={() => void fetchClipboardFromDesktop()}
+            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-h-[44px] text-xs font-medium"
+            title="Copy whatever was last copied inside the remote desktop onto your computer's clipboard"
+          >
+            <ClipboardCopy size={15} />
+            <span className="hidden md:inline">Get clipboard</span>
+          </button>
           <button onClick={toggleFullscreen} className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center" title="Fullscreen">{fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}</button>
           <button
             onClick={() => void openCurrentBrowserInDesktop()}
@@ -617,6 +689,11 @@ export default function DesktopPage() {
               </div>
             )}
 
+            {clipboardStatus && (
+              <div className={`absolute top-3 left-1/2 -translate-x-1/2 z-20 max-w-lg px-4 py-2 rounded-xl border text-sm shadow-lg ${clipboardStatus.kind === 'ok' ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-200' : 'bg-red-500/15 border-red-500/30 text-red-200'}`}>
+                {clipboardStatus.text}
+              </div>
+            )}
             {configState.kind === 'ok' && loading && !error && (
               <div className="absolute inset-0 flex items-center justify-center bg-[#0A0E27] z-10"><div className="text-center space-y-3"><div className="w-14 h-14 border-2 border-emerald-500/30 border-t-emerald-400 rounded-full animate-spin mx-auto" /><p className="text-sm text-slate-400">{healthStatus === 'degraded' ? 'Remote desktop is degraded. Attempting connection...' : 'Connecting to remote desktop...'}</p></div></div>
             )}

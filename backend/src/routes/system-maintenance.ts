@@ -401,11 +401,25 @@ async function firstCommandLine(command: string, timeoutMs = 4000): Promise<stri
 
 async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
   const root = portalRoot();
-  const [openClawVersion, caddyVersion, stalwartVersion] = await Promise.all([
+  const [openClawVersion, caddyVersion, stalwartVersion, caddyCandidateRaw] = await Promise.all([
     firstCommandLine('command -v openclaw >/dev/null 2>&1 && openclaw --version'),
     firstCommandLine('command -v caddy >/dev/null 2>&1 && caddy version'),
     firstCommandLine('command -v stalwart-mail >/dev/null 2>&1 && stalwart-mail --version || command -v stalwart >/dev/null 2>&1 && stalwart --version'),
+    firstCommandLine("apt-cache policy caddy 2>/dev/null | awk '/Candidate:/ {print $2}'"),
   ]);
+
+  // A pending Caddy update only exists when apt's candidate differs from the
+  // installed package. The old permanent "review" status read like an update
+  // was always waiting, which caused repeated false alarms.
+  const caddyInstalledPkg = (caddyVersion || '').replace(/^v/, '').split(/\s+/)[0] || '';
+  const caddyCandidate = (caddyCandidateRaw || '').trim();
+  const caddyUpdatePending = Boolean(
+    caddyCandidate
+    && caddyCandidate !== '(none)'
+    && caddyInstalledPkg
+    && !caddyCandidate.startsWith(caddyInstalledPkg)
+    && caddyCandidate !== caddyInstalledPkg,
+  );
 
   return {
     policy: 'guarded',
@@ -442,10 +456,12 @@ async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
         id: 'caddy',
         label: 'Caddy reverse proxy',
         installedVersion: caddyVersion,
-        supportedVersion: 'Distribution security updates',
+        supportedVersion: caddyUpdatePending ? `Update available: ${caddyCandidate}` : 'Up to date with the stable channel',
         policy: 'manual-review',
-        status: caddyVersion ? 'review' : 'unknown',
-        note: 'Security updates are usually safe, but config-impacting upgrades should be reviewed.',
+        status: !caddyVersion ? 'unknown' : (caddyUpdatePending ? 'review' : 'ok'),
+        note: caddyUpdatePending
+          ? 'A Caddy package update is pending. Review the release notes and validate the Caddyfile before upgrading — never upgrade Caddy as part of a Portal update.'
+          : 'Installed Caddy matches the newest package in the stable channel. No action needed.',
       },
     ],
   };
@@ -751,9 +767,45 @@ async function collectMaintenanceStatus() {
   };
 }
 
-router.get('/', async (_req: Request, res: Response) => {
+// Maintenance collection shells out to apt/systemctl and can take seconds on
+// a cold or busy host. Serve a short-lived cache with stale-while-refresh
+// semantics so the dashboard's checks section renders instantly on revisit
+// while a background refresh keeps the data honest.
+const MAINTENANCE_CACHE_TTL_MS = 60_000;
+let maintenanceCache: { at: number; status: any } | null = null;
+let maintenanceRefreshInFlight: Promise<any> | null = null;
+
+async function refreshMaintenanceStatus(): Promise<any> {
+  if (maintenanceRefreshInFlight) return maintenanceRefreshInFlight;
+  maintenanceRefreshInFlight = collectMaintenanceStatus()
+    .then((status) => {
+      maintenanceCache = { at: Date.now(), status };
+      return status;
+    })
+    .finally(() => {
+      maintenanceRefreshInFlight = null;
+    });
+  return maintenanceRefreshInFlight;
+}
+
+router.get('/', async (req: Request, res: Response) => {
   try {
-    res.json(await collectMaintenanceStatus());
+    const force = ['1', 'true', 'yes'].includes(String(req.query.refresh || '').toLowerCase());
+    const cached = maintenanceCache;
+    if (!force && cached && Date.now() - cached.at < MAINTENANCE_CACHE_TTL_MS) {
+      res.json({ ...cached.status, checkedAt: cached.at, cached: true });
+      return;
+    }
+    if (!force && cached) {
+      // Stale: return immediately and refresh in the background.
+      void refreshMaintenanceStatus().catch((error) => {
+        console.error('[system-maintenance] background refresh failed:', error);
+      });
+      res.json({ ...cached.status, checkedAt: cached.at, cached: true, refreshing: true });
+      return;
+    }
+    const status = await refreshMaintenanceStatus();
+    res.json({ ...status, checkedAt: maintenanceCache?.at ?? Date.now(), cached: false });
   } catch (error: any) {
     console.error('[system-maintenance] status failed:', error);
     res.status(500).json({ error: error?.message || 'Failed to collect maintenance status' });

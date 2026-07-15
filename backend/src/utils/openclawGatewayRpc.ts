@@ -13,6 +13,7 @@ import path from 'path';
 import { getOpenClawWsUrl } from '../config/openclaw';
 import { buildSignedDevice, getOrCreateDeviceKeys } from './deviceIdentity';
 import { getGatewayToken } from './gatewayToken';
+import { ensureOpenClawModelDeclaration } from './openclawCli';
 
 const GATEWAY_WS_URL = getOpenClawWsUrl();
 const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(process.env.HOME || '/root', '.openclaw');
@@ -207,8 +208,26 @@ export async function patchSessionModel(sessionKey: string, model: string): Prom
   // especially right after auth/profile changes or when materializing a fresh
   // session. Keep the timeout comfortably above the ~7-10s real-world window
   // we see in portal logs so model switching does not fail spuriously.
-  const result = await gatewayRpcCall('sessions.patch', { key: sessionKey, model }, 20000);
-  
+  let result = await gatewayRpcCall('sessions.patch', { key: sessionKey, model }, 20000);
+
+  // OpenClaw validates sessions.patch against the agents.defaults.models
+  // allowlist. Catalog models that were never declared (for example newly
+  // supported models on an install that authenticated before they existed)
+  // fail with "model not allowed" — self-heal by declaring the model and
+  // retrying once after the gateway reloads its config.
+  if (!result.ok && /model not allowed/i.test(String(result.error || ''))) {
+    try {
+      const declaration = ensureOpenClawModelDeclaration(model);
+      if (declaration.changed) {
+        console.log(`[Gateway RPC] Declared ${declaration.model} in agents.defaults.models; retrying sessions.patch`);
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        result = await gatewayRpcCall('sessions.patch', { key: sessionKey, model }, 20000);
+      }
+    } catch (err: any) {
+      console.warn(`[Gateway RPC] Model declaration self-heal failed: ${err?.message || err}`);
+    }
+  }
+
   if (result.ok) {
     const resolved = result.data?.resolved;
     console.log(`[Gateway RPC] Model patched successfully: ${resolved?.modelProvider}/${resolved?.model}`);
@@ -241,7 +260,7 @@ export async function createSession(sessionKey: string, agentId?: string): Promi
   return { ok: false, error: String(result.error) };
 }
 
-function readLocalSessionRegistryEntry(sessionKey: string): any | null {
+export function readLocalSessionRegistryEntry(sessionKey: string): any | null {
   const agentId = sessionKey.startsWith('agent:') ? sessionKey.split(':')[1] : 'portal';
   const sessionsFile = path.join(OPENCLAW_HOME, 'agents', agentId, 'sessions', 'sessions.json');
   try {

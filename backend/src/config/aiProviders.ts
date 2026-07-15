@@ -60,9 +60,9 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     onboardAuthChoice: 'anthropic-api-key',
     onboardKeyFlag: 'anthropic-api-key',
     defaultModels: [
-      { id: 'claude-opus-4-8', name: 'Claude Opus 4.8', tier: 'frontier', description: 'Most capable. Best for complex reasoning and difficult tasks.' },
-      { id: 'claude-fable-5', name: 'Claude Fable 5', tier: 'frontier', description: 'Large-context Claude model exposed through OpenClaw.' },
-      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', tier: 'balanced', description: 'Balanced. Great all-rounder for most tasks.' },
+      { id: 'claude-fable-5', name: 'Claude Fable 5', tier: 'frontier', description: 'Anthropic\'s most capable model. Always-on adaptive thinking; restricted requests may be served and billed as Opus 4.8.' },
+      { id: 'claude-opus-4-8', name: 'Claude Opus 4.8', tier: 'frontier', description: 'Frontier model. Best for complex reasoning and difficult tasks.' },
+      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', tier: 'balanced', description: 'Proven all-rounder for most tasks.' },
       { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', tier: 'fast', description: 'Fastest and cheapest. Good for simple tasks.' },
     ],
     setupInstructions: [
@@ -117,7 +117,10 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     description: 'Use your ChatGPT subscription for AI. OpenAI explicitly supports this for external tools.',
     onboardAuthChoice: 'openai-codex',
     defaultModels: [
-      { id: 'codex/gpt-5.5', name: 'GPT-5.5 Codex', tier: 'frontier', description: 'Current OpenClaw Codex runtime model.' },
+      { id: 'openai/gpt-5.6-sol', name: 'GPT-5.6 Sol', tier: 'frontier', description: 'Recommended GPT-5.6 tier and OpenClaw\'s fresh-setup default. Requires GPT-5.6 access on your ChatGPT account.' },
+      { id: 'openai/gpt-5.6-terra', name: 'GPT-5.6 Terra', tier: 'balanced', description: 'Alternate GPT-5.6 tier. Availability depends on your ChatGPT plan.' },
+      { id: 'openai/gpt-5.6-luna', name: 'GPT-5.6 Luna', tier: 'balanced', description: 'Alternate GPT-5.6 tier with maximum-effort thinking. Availability depends on your ChatGPT plan.' },
+      { id: 'openai/gpt-5.5', name: 'GPT-5.5', tier: 'fast', description: 'Proven Codex runtime model. Choose this if your account does not have GPT-5.6 access.' },
     ],
     setupInstructions: [
       { stepNumber: 1, title: 'You need an active ChatGPT subscription', detail: 'ChatGPT Plus ($20/mo), Pro ($200/mo), or Team. Free accounts do NOT work. If you don\'t have one, subscribe at https://chatgpt.com/ → "Upgrade to Plus".', link: { url: 'https://chatgpt.com/', label: 'Open ChatGPT' } },

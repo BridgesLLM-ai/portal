@@ -6,7 +6,10 @@ export const config = {
   // Server
   nodeEnv: process.env.NODE_ENV || 'development',
   port: parseInt(process.env.PORT || '3000', 10),
-  host: process.env.HOST || '0.0.0.0',
+  // Loopback by default: external access is Caddy's job (TLS, headers). A
+  // 0.0.0.0 default left every install one firewall mistake away from a raw
+  // exposed portal. Set HOST explicitly for setups that need a wider bind.
+  host: process.env.HOST || '127.0.0.1',
 
   // JWT
   jwtSecret: process.env.JWT_SECRET || 'dev-secret-key',

@@ -55,24 +55,30 @@ const GOOGLE_MODEL_MAP: Record<string, string> = {
   'google-antigravity/gemini-3.1-flash-lite-preview': 'google-antigravity/gemini-3.5-flash',
 };
 
+// OpenClaw 2026.7.1 makes openai/* the canonical Codex-runtime route;
+// codex/* and openai-codex/* are legacy refs that normalize forward.
 const OPENAI_CODEX_MODEL_MAP: Record<string, string> = {
-  'gpt-5.4-codex': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.5-pro': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.4': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.4-mini': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.4-pro': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.4-codex': 'codex/gpt-5.5',
-  'openai-codex/gpt-5.2-codex': 'codex/gpt-5.2',
-  'codex/gpt-5.5-pro': 'codex/gpt-5.5',
-  'codex/gpt-5.4': 'codex/gpt-5.5',
-  'codex/gpt-5.4-mini': 'codex/gpt-5.5',
-  'codex/gpt-5.4-pro': 'codex/gpt-5.5',
-  'openai/gpt-5.4': 'codex/gpt-5.5',
-  'openai/gpt-5.4-mini': 'codex/gpt-5.5',
-  'openai/gpt-5.4-pro': 'codex/gpt-5.5',
-  'openai/gpt-5.4-codex': 'codex/gpt-5.5',
-  'codex/gpt-5.2-codex': 'codex/gpt-5.2',
-  'codex/gpt-5.4-codex': 'codex/gpt-5.5',
+  'gpt-5.6': 'openai/gpt-5.6-sol',
+  'openai/gpt-5.6': 'openai/gpt-5.6-sol',
+  'codex/gpt-5.6': 'openai/gpt-5.6-sol',
+  'openai-codex/gpt-5.6': 'openai/gpt-5.6-sol',
+  'gpt-5.4-codex': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.5-pro': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.4': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.4-mini': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.4-pro': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.4-codex': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.2-codex': 'openai/gpt-5.2',
+  'codex/gpt-5.5-pro': 'openai/gpt-5.5',
+  'codex/gpt-5.4': 'openai/gpt-5.5',
+  'codex/gpt-5.4-mini': 'openai/gpt-5.5',
+  'codex/gpt-5.4-pro': 'openai/gpt-5.5',
+  'openai/gpt-5.4': 'openai/gpt-5.5',
+  'openai/gpt-5.4-mini': 'openai/gpt-5.5',
+  'openai/gpt-5.4-pro': 'openai/gpt-5.5',
+  'openai/gpt-5.4-codex': 'openai/gpt-5.5',
+  'codex/gpt-5.2-codex': 'openai/gpt-5.2',
+  'codex/gpt-5.4-codex': 'openai/gpt-5.5',
 };
 
 function titleCase(value: string): string {
@@ -93,7 +99,10 @@ export function canonicalizePortalModelId(rawModel: unknown): string {
     return `anthropic/${mapped.slice('claude-cli/'.length)}`;
   }
   if (mapped.startsWith('openai-codex/')) {
-    return `codex/${mapped.slice('openai-codex/'.length)}`;
+    return `openai/${mapped.slice('openai-codex/'.length)}`;
+  }
+  if (mapped.startsWith('codex/')) {
+    return `openai/${mapped.slice('codex/'.length)}`;
   }
   return mapped;
 }
@@ -251,6 +260,7 @@ export function getModelRuntimeLabel(rawModel: unknown): string | null {
   switch (provider) {
     case 'anthropic': return 'API/OAuth';
     case 'claude-cli': return 'CLI';
+    case 'openai': return 'Codex';
     case 'openai-codex': return 'CLI OAuth';
     case 'codex': return 'CLI OAuth';
     case 'google-gemini-cli': return 'CLI OAuth';

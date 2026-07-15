@@ -362,7 +362,10 @@ router.post('/', async (req: Request, res: Response) => {
     sessionTarget: 'isolated',
     wakeMode: 'now',
     payload,
-    delivery: { mode: 'announce' },
+    // Portal automations have no external delivery target; announce mode with
+    // nowhere to deliver marks every successful run as an error on OpenClaw
+    // 2026.7.1. Run output is still captured in the runs history the UI shows.
+    delivery: { mode: 'none' },
   };
   if (agent) jobCreate.agentId = String(agent).trim();
 
@@ -403,6 +406,9 @@ router.put('/:id', async (req: Request, res: Response) => {
   if (model !== undefined) payload.model = String(model).trim() || undefined;
   if (thinking !== undefined) payload.thinking = String(thinking).trim() || undefined;
   if (Object.keys(payload).length > 1) patch.payload = payload;
+  // Normalize legacy announce delivery on edit: portal jobs have no delivery
+  // target, and announce-with-no-target flags successful runs as errors.
+  patch.delivery = { mode: 'none' };
 
   if (Object.keys(patch).length === 0) {
     res.json({ ok: true, result: null });

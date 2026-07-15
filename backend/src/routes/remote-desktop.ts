@@ -873,14 +873,24 @@ router.get('/clipboard', async (req: Request, res: Response) => {
 
 router.post('/clipboard', async (req: Request, res: Response) => {
   try {
-    const selection = normalizeDesktopClipboardSelection(req.body?.selection);
+    // 'both' writes CLIPBOARD and PRIMARY so Ctrl+V and middle-click paste
+    // agree — the portal "send clipboard" button uses it.
+    const selection = req.body?.selection === 'both'
+      ? 'both' as const
+      : normalizeDesktopClipboardSelection(req.body?.selection);
     const text = typeof req.body?.text === 'string' ? req.body.text : '';
     if (text.length > 1024 * 1024) {
       res.status(413).json({ ok: false, error: 'Clipboard text is too large' });
       return;
     }
 
-    const result = await writeDesktopClipboard(selection, text);
+    let result;
+    if (selection === 'both') {
+      await writeDesktopClipboard('primary', text);
+      result = await writeDesktopClipboard('clipboard', text);
+    } else {
+      result = await writeDesktopClipboard(selection, text);
+    }
     res.json({
       ok: true,
       selection,
@@ -939,7 +949,7 @@ export async function runRemoteDesktopAutoSetup(): Promise<{ ok: boolean; steps:
 
     // Step 1: Install packages if missing (idempotent — apt skips already-installed)
     // Matches production setup: full XFCE desktop + goodies, x11-utils for xdpyinfo, Google Chrome for browsing
-    const requiredPkgs = ['tigervnc-standalone-server', 'novnc', 'websockify', 'xfce4', 'xfce4-goodies', 'xfce4-terminal', 'dbus-x11', 'x11-utils', 'xclip', 'xsel', 'xterm', 'firefox', 'pulseaudio', 'pulseaudio-utils', 'librsvg2-common'];
+    const requiredPkgs = ['tigervnc-standalone-server', 'novnc', 'websockify', 'xfce4', 'xfce4-goodies', 'xfce4-terminal', 'dbus-x11', 'x11-utils', 'xclip', 'xsel', 'xterm', 'firefox', 'pulseaudio', 'pulseaudio-utils', 'librsvg2-common', 'wmctrl', 'xdotool'];
     // Check each package individually — count-based check was unreliable because
     // meta-packages (xfce4-goodies) inflate the count, masking missing packages
     const missingCheck = await runShell(`for pkg in ${requiredPkgs.join(' ')}; do dpkg -s "$pkg" &>/dev/null || echo "$pkg"; done`);
@@ -1027,6 +1037,22 @@ export async function runRemoteDesktopAutoSetup(): Promise<{ ok: boolean; steps:
 </channel>
 `;
       fs.writeFileSync(path.join(xfceConfigDir, 'xsettings.xml'), xsettingsXml);
+
+      // Power manager: stop xfce4-power-manager from re-enabling X screensaver
+      // blanking after the launcher disables it (the 10-minute black screen).
+      const powerManagerXml = `<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-power-manager" version="1.0">
+  <property name="xfce4-power-manager" type="empty">
+    <property name="dpms-enabled" type="bool" value="false"/>
+    <property name="blank-on-ac" type="int" value="0"/>
+    <property name="blank-on-battery" type="int" value="0"/>
+    <property name="dpms-on-ac-sleep" type="uint" value="0"/>
+    <property name="dpms-on-ac-off" type="uint" value="0"/>
+    <property name="presentation-mode" type="bool" value="true"/>
+  </property>
+</channel>
+`;
+      fs.writeFileSync(path.join(xfceConfigDir, 'xfce4-power-manager.xml'), powerManagerXml);
 
       // Window manager theme
       const xfwm4Xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -1140,6 +1166,54 @@ StartupNotify=true
     // Step 5: Write systemd units (Xtigervnc + websockify)
     // This is the PRODUCTION launcher — runs Xtigervnc as root, XFCE as bridgesrd user,
     // uses xdpyinfo to wait for display, disables screensaver, proper logging.
+    // Window-fit watcher: clamps windows back into the visible desktop after
+    // the client resizes the VNC screen (viewing from a different device left
+    // windows stranded outside the new, smaller resolution).
+    const windowFitScript = '/usr/local/bin/bridges-rd-window-fit.sh';
+    fs.writeFileSync(windowFitScript, `#!/bin/bash
+# Bridges Remote Desktop - window fit watcher
+# Watches for display geometry changes and clamps stray windows into view.
+sleep 15
+LAST_GEOM=""
+while true; do
+  GEOM=$(xdotool getdisplaygeometry 2>/dev/null || true)
+  if [ -n "$GEOM" ] && [ "$GEOM" != "$LAST_GEOM" ]; then
+    sleep 1
+    set -- $GEOM
+    W=$1
+    H=$2
+    MARGIN_TOP=32
+    wmctrl -l -G 2>/dev/null | while read -r WID DESK X Y WIN_W WIN_H REST; do
+      [ "$DESK" = "-1" ] && continue
+      NEW_W=$WIN_W; NEW_H=$WIN_H; NEW_X=$X; NEW_Y=$Y; CHANGED=0
+      MAX_W=$((W - 16))
+      MAX_H=$((H - MARGIN_TOP - 16))
+      [ "$MAX_W" -lt 200 ] && MAX_W=200
+      [ "$MAX_H" -lt 150 ] && MAX_H=150
+      if [ "$NEW_W" -gt "$MAX_W" ]; then NEW_W=$MAX_W; CHANGED=1; fi
+      if [ "$NEW_H" -gt "$MAX_H" ]; then NEW_H=$MAX_H; CHANGED=1; fi
+      if [ $((NEW_X + NEW_W)) -gt "$W" ] || [ "$NEW_X" -lt 0 ]; then
+        NEW_X=$(((W - NEW_W) / 2))
+        [ "$NEW_X" -lt 0 ] && NEW_X=0
+        CHANGED=1
+      fi
+      if [ $((NEW_Y + NEW_H)) -gt "$H" ] || [ "$NEW_Y" -lt "$MARGIN_TOP" ]; then
+        NEW_Y=$MARGIN_TOP
+        CHANGED=1
+      fi
+      if [ "$CHANGED" = "1" ]; then
+        wmctrl -i -r "$WID" -b remove,maximized_vert,maximized_horz 2>/dev/null || true
+        wmctrl -i -r "$WID" -e "0,$NEW_X,$NEW_Y,$NEW_W,$NEW_H" 2>/dev/null || true
+        echo "fitted window $WID to $NEW_X,$NEW_Y $NEW_W""x""$NEW_H (screen $W""x""$H)"
+      fi
+    done
+    LAST_GEOM="$GEOM"
+  fi
+  sleep 2
+done
+`, { mode: 0o755 });
+    steps.push({ step: 'Window-fit watcher', ok: true, message: 'Written' });
+
     const vncLauncher = '/usr/local/bin/bridges-rd-xtigervnc-start.sh';
     fs.writeFileSync(vncLauncher, `#!/bin/bash
 set -euo pipefail
@@ -1249,13 +1323,56 @@ su - "$RD_USER" -c "
 XFCE_PID=$!
 echo "Xtigervnc PID=$VNC_PID, XFCE PID=$XFCE_PID"
 
-# Wait for XFCE to start, then disable screensaver/blanking
+# Wait for XFCE to start, then disable screensaver/blanking AND display power
+# management. DPMS is separate from the X screensaver: without "xset -dpms"
+# the display still blanks to black after ~10 idle minutes even with the
+# screensaver off. XFCE components can re-enable either later, so a keep-awake
+# loop re-asserts both once a minute for the lifetime of the session.
 sleep 5
 DISPLAY="$DISPLAY_NUM" xset s off 2>/dev/null || true
 DISPLAY="$DISPLAY_NUM" xset s noblank 2>/dev/null || true
-# Kill screensaver if auto-started by XFCE
+DISPLAY="$DISPLAY_NUM" xset -dpms 2>/dev/null || true
 pkill -f xfce4-screensaver 2>/dev/null || true
-echo "Screensaver disabled"
+echo "Screensaver + DPMS disabled"
+
+(
+  while kill -0 $VNC_PID 2>/dev/null; do
+    DISPLAY="$DISPLAY_NUM" xset s off 2>/dev/null || true
+    DISPLAY="$DISPLAY_NUM" xset s noblank 2>/dev/null || true
+    DISPLAY="$DISPLAY_NUM" xset -dpms 2>/dev/null || true
+    pkill -f xfce4-screensaver 2>/dev/null || true
+    sleep 60
+  done
+) &
+KEEPAWAKE_PID=$!
+echo "Keep-awake loop started PID=$KEEPAWAKE_PID"
+
+# Clipboard bridge: without vncconfig, Xtigervnc never syncs VNC client
+# cut-text into the X selections (and X selection changes never reach the VNC
+# client), so the noVNC clipboard panel silently does nothing. Keep it alive
+# for the lifetime of the session.
+if command -v vncconfig >/dev/null 2>&1; then
+  (
+    while kill -0 $VNC_PID 2>/dev/null; do
+      su - "$RD_USER" -c "DISPLAY=$DISPLAY_NUM vncconfig -nowin" >>$LOG_DIR/vncconfig.log 2>&1 || true
+      sleep 5
+    done
+  ) &
+  echo "Clipboard bridge (vncconfig) started"
+else
+  echo "vncconfig not found; VNC clipboard bridge disabled"
+fi
+
+# Window-fit watcher: when the client resizes the VNC desktop (SetDesktopSize),
+# windows opened at the old resolution can end up outside the new bounds.
+# Watch for geometry changes and clamp stray windows back into view.
+if [ -x /usr/local/bin/bridges-rd-window-fit.sh ]; then
+  su - "$RD_USER" -c "
+    export DISPLAY=$DISPLAY_NUM
+    /usr/local/bin/bridges-rd-window-fit.sh >>$LOG_DIR/window-fit.log 2>&1
+  " &
+  echo "Window-fit watcher started"
+fi
 
 # Wait for VNC (main process). If it dies, everything should stop.
 wait $VNC_PID

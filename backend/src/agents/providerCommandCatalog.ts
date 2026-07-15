@@ -101,16 +101,11 @@ async function openClawAgentOptions() {
     }
   } catch {}
 
-  try {
-    const provider = AgentRegistry.get('OPENCLAW');
-    const sessions = await provider.listSessions('system');
-    for (const session of sessions) {
-      const agentId = String(session.metadata?.agentId || session.metadata?.agent || '').trim();
-      if (!agentId || seen.has(agentId)) continue;
-      seen.add(agentId);
-      options.push({ value: agentId, description: session.title || session.preview || undefined });
-    }
-  } catch {}
+  // Note: this intentionally does NOT call the gateway sessions.list RPC.
+  // The agents directory above already yields every agent id; the old RPC
+  // call filtered on portal-system session keys (matching nothing) while
+  // costing a full session-store enumeration — multiple seconds on installs
+  // with long histories — every time the Session Controls panel opened.
 
   if (!seen.has('main')) options.unshift({ value: 'main', description: 'Main agent' });
   return options.length > 0 ? options.sort((a, b) => (a.value === 'main' ? -1 : b.value === 'main' ? 1 : a.value.localeCompare(b.value))) : [{ value: 'main', description: 'Main agent' }];
@@ -123,7 +118,20 @@ function withArgumentValues(command: ProviderSlashCommandDescriptor, name: strin
   };
 }
 
+const COMMAND_CATALOG_CACHE_TTL_MS = 60_000;
+const commandCatalogCache = new Map<string, { at: number; commands: ProviderSlashCommandDescriptor[] }>();
+
 export async function getProviderCommandCatalog(provider: AgentProviderName): Promise<ProviderSlashCommandDescriptor[]> {
+  const cached = commandCatalogCache.get(provider);
+  if (cached && Date.now() - cached.at < COMMAND_CATALOG_CACHE_TTL_MS) {
+    return cached.commands;
+  }
+  const commands = await buildProviderCommandCatalog(provider);
+  commandCatalogCache.set(provider, { at: Date.now(), commands });
+  return commands;
+}
+
+async function buildProviderCommandCatalog(provider: AgentProviderName): Promise<ProviderSlashCommandDescriptor[]> {
   if (provider === 'OPENCLAW') {
     const [models, agents] = await Promise.all([
       listProviderModels('OPENCLAW'),

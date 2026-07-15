@@ -186,10 +186,13 @@ function getInitialSessionForAgentSelection(providerName: string, agentId?: stri
 /* ─── Provider model catalogs ───────────────────────────────────────────── */
 
 const OPENCLAW_MODEL_FALLBACK = [
-  'codex/gpt-5.5',
+  'openai/gpt-5.6-sol',
+  'openai/gpt-5.6-terra',
+  'openai/gpt-5.6-luna',
+  'openai/gpt-5.5',
+  'anthropic/claude-fable-5',
   'anthropic/claude-sonnet-4-6',
   'anthropic/claude-opus-4-8',
-  'anthropic/claude-fable-5',
   'anthropic/claude-haiku-4-5',
 ];
 
@@ -608,9 +611,11 @@ function GatewaySessionsPanel({ onViewSession }: { onViewSession: (sessionKey: s
 
 /* ─── Session Controls (real OpenClaw thinking + native OpenClaw fast mode) ───────────────────── */
 
-type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive';
+type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive' | 'max' | 'ultra';
 type ReasoningVisibility = 'off' | 'on' | 'stream';
-const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive'];
+// Canonical OpenClaw 2026.7.1 ladder ordering (adaptive sits between medium
+// and high, matching the gateway's own per-model profile ordering).
+const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'adaptive', 'high', 'xhigh', 'max', 'ultra'];
 const REASONING_VISIBILITY_LABELS: Record<ReasoningVisibility, string> = {
   off: 'Hidden',
   on: 'Visible',
@@ -624,20 +629,25 @@ const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
   high: 'High',
   xhigh: 'X-High',
   adaptive: 'Adaptive',
+  max: 'Max',
+  ultra: 'Ultra',
 };
 
-const OPENCLAW_FAST_MODE_MODELS = new Set([
-  'codex/gpt-5.5',
-]);
-
+// OpenClaw 2026.7.1 maps fast mode to service_tier=priority for every
+// Codex-backed openai/* model (legacy codex/openai-codex refs included), so
+// gate by provider family rather than a hardcoded model list.
 function supportsOpenClawFastModeModel(model?: string | null): boolean {
   const normalized = String(model || '').trim().toLowerCase();
-  return OPENCLAW_FAST_MODE_MODELS.has(normalized);
+  return normalized.startsWith('openai/')
+    || normalized.startsWith('codex/')
+    || normalized.startsWith('openai-codex/');
 }
 
 interface SessionControlsProps {
   loading?: boolean;
   thinkingLevel: ThinkingLevel;
+  /** Per-model thinking level ids declared by the gateway for the resolved model. */
+  thinkingOptions?: string[];
   reasoningVisibility: ReasoningVisibility;
   fastModeEnabled: boolean;
   compactionModelOverride: string;
@@ -672,6 +682,7 @@ interface SessionControlsProps {
 function SessionControls({
   loading = false,
   thinkingLevel,
+  thinkingOptions = [],
   reasoningVisibility,
   fastModeEnabled,
   compactionModelOverride,
@@ -717,10 +728,24 @@ function SessionControls({
     ...(heartbeatModel && !availableModels.includes(heartbeatModel) ? [heartbeatModel] : []),
   ]));
   const currentModelLower = String(currentModel || '').toLowerCase();
-  const adaptiveSupported = /claude-(opus|sonnet)-4[._-](5|6|7|8|9)|claude-(opus|sonnet)-[5-9]/.test(currentModelLower);
   const fastModeSupported = supportsOpenClawFastModeModel(currentModel) || fastModeEnabled;
-  const visibleThinkingLevels = THINKING_LEVELS.filter((level) => level !== 'adaptive' || adaptiveSupported || thinkingLevel === 'adaptive');
-  const effectiveThinking = (!adaptiveSupported && localThinking === 'adaptive') ? 'medium' : localThinking;
+  // Prefer the gateway-declared per-model level set (OpenClaw 2026.7.1 exposes
+  // it on the session row: ultra for GPT-5.6 Sol/Terra, adaptive for Claude,
+  // etc.). Fall back to the legacy heuristic only when no profile is loaded.
+  const profileLevels = THINKING_LEVELS.filter((level) => thinkingOptions.includes(level));
+  const legacyAdaptiveSupported = /claude-(opus|sonnet)-4[._-](5|6|7|8|9)|claude-(opus|sonnet)-[5-9]/.test(currentModelLower);
+  const adaptiveSupported = profileLevels.length > 0
+    ? profileLevels.includes('adaptive')
+    : legacyAdaptiveSupported;
+  const visibleThinkingLevels = profileLevels.length > 0
+    ? profileLevels
+    : THINKING_LEVELS.filter((level) => {
+        if (level === 'max' || level === 'ultra') return thinkingLevel === level;
+        return level !== 'adaptive' || legacyAdaptiveSupported || thinkingLevel === 'adaptive';
+      });
+  const effectiveThinking = visibleThinkingLevels.includes(localThinking)
+    ? localThinking
+    : (visibleThinkingLevels.includes('high') ? 'high' : (visibleThinkingLevels[0] || 'off'));
   const thinkingIndex = Math.max(0, visibleThinkingLevels.indexOf(effectiveThinking));
 
   // Close on click outside
@@ -785,7 +810,11 @@ function SessionControls({
                   <Sparkles size={14} className={localThinking !== 'off' ? 'text-violet-400' : 'text-slate-500'} />
                   <div>
                     <div className="text-xs font-medium text-white">Thinking Level</div>
-                    <div className="text-[10px] text-slate-500">Controls reasoning depth. Adaptive is only shown for supported Claude/Opus-style models.</div>
+                    <div className="text-[10px] text-slate-500">
+                      {profileLevels.length > 0
+                        ? `Levels supported by ${shortModel}: ${profileLevels.map((level) => THINKING_LEVEL_LABELS[level] || level).join(' · ')}`
+                        : 'Controls reasoning depth. Levels adjust to what the selected model supports.'}
+                    </div>
                   </div>
                 </div>
                 <input
@@ -816,6 +845,9 @@ function SessionControls({
                   {localThinking === 'adaptive' && !adaptiveSupported && (
                     <span className="ml-1 text-[9px] text-amber-400/80">(unsupported for current model)</span>
                   )}
+                  {localThinking === 'ultra' && (
+                    <span className="ml-1 text-[9px] text-fuchsia-300/80">(max reasoning + proactive sub-agents)</span>
+                  )}
                 </div>
               </div>
 
@@ -842,37 +874,37 @@ function SessionControls({
                 </div>
               </div>
 
-              <div className="p-2 rounded-lg bg-white/[0.02] space-y-2">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Radio size={14} className={fastModeEnabled ? 'text-amber-400' : 'text-slate-500'} />
-                    <div>
-                      <div className="text-xs font-medium text-white">Codex Fast Mode</div>
-                      <div className="text-[10px] text-slate-500">Toggles OpenClaw session fast mode for Codex sessions.</div>
+              {fastModeSupported && (
+                <div className="p-2 rounded-lg bg-white/[0.02] space-y-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Radio size={14} className={fastModeEnabled ? 'text-amber-400' : 'text-slate-500'} />
+                      <div>
+                        <div className="text-xs font-medium text-white">Codex Fast Mode</div>
+                        <div className="text-[10px] text-slate-500">Priority processing for GPT (openai/*) Codex-runtime models.</div>
+                      </div>
                     </div>
+                    <button
+                      onClick={() => {
+                        onToggleFastMode();
+                      }}
+                      disabled={disabled || loading || !sessionControlsSupported}
+                      className={`relative w-10 h-5 rounded-full transition-colors ${
+                        fastModeEnabled ? 'bg-amber-500' : 'bg-white/[0.12]'
+                      } disabled:opacity-50`}
+                    >
+                      <span
+                        className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${
+                          fastModeEnabled ? 'translate-x-5' : 'translate-x-0'
+                        }`}
+                      />
+                    </button>
                   </div>
-                  <button
-                    onClick={() => {
-                      onToggleFastMode();
-                    }}
-                    disabled={disabled || loading || !sessionControlsSupported || !fastModeSupported}
-                    className={`relative w-10 h-5 rounded-full transition-colors ${
-                      fastModeEnabled ? 'bg-amber-500' : 'bg-white/[0.12]'
-                    } disabled:opacity-50`}
-                  >
-                    <span
-                      className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${
-                        fastModeEnabled ? 'translate-x-5' : 'translate-x-0'
-                      }`}
-                    />
-                  </button>
+                  <div className="text-[10px] text-slate-400">
+                    Current: {fastModeEnabled ? 'enabled' : 'disabled'} for {shortModel}
+                  </div>
                 </div>
-                <div className="text-[10px] text-slate-400">
-                  {fastModeSupported
-                    ? `Current: ${fastModeEnabled ? 'enabled' : 'disabled'} for ${shortModel}`
-                    : 'Available when the session model is codex/gpt-5.5.'}
-                </div>
-              </div>
+              )}
 
               {showHeartbeatModel && (
                 <div className="p-2 rounded-lg bg-white/[0.02] space-y-2">
@@ -2090,6 +2122,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const reconnectSocket = chatState.reconnectSocket;
   // Session controls
   const thinkingLevel = chatState.thinkingLevel;
+  const sessionThinkingOptions = chatState.sessionThinkingOptions;
   const setThinkingLevel = chatState.setThinkingLevel;
   const reasoningVisibility = chatState.reasoningVisibility;
   const setReasoningVisibility = chatState.setReasoningVisibility;
@@ -3163,6 +3196,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               <SessionControls
                 loading={sessionControlsLoading || currentProviderModelsLoading}
                 thinkingLevel={thinkingLevel}
+                thinkingOptions={sessionThinkingOptions}
                 reasoningVisibility={reasoningVisibility}
                 fastModeEnabled={fastModeEnabled}
                 compactionModelOverride={compactionModelOverride}
@@ -3190,7 +3224,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 sessionControlsSupported={sessionControlsSupported}
                 onPanelOpen={() => {
                   setSessionControlsLoading(true);
-                  void ensureSessionControlsMetadataLoaded().finally(() => setSessionControlsLoading(false));
+                  void ensureSessionControlsMetadataLoaded({ force: true }).finally(() => setSessionControlsLoading(false));
                   void loadProviderCommands(provider);
                   void ensureProviderModelsLoaded(provider);
                   void loadHeartbeatModel();
@@ -3367,6 +3401,22 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                               const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0;
                               
                               if (!isLiveTimeline && !hasHistorySegments) return null;
+
+                              // Mid-turn reloads can persist a partial snapshot of a thought that the
+                              // live/resumed stream then carries in grown form. Drop history thinking
+                              // segments that are strict prefixes of the current live thinking so the
+                              // same thought never renders twice.
+                              const liveThinkingForDedupe = idx === messages.length - 1 ? (thinkingContent || '').trim() : '';
+                              const dropStalePartialThoughts = (segs: NonNullable<typeof msg.segments>) => (
+                                liveThinkingForDedupe
+                                  ? segs.filter((seg) => !(
+                                      seg.kind === 'thinking'
+                                      && seg.text.trim()
+                                      && seg.text.trim() !== liveThinkingForDedupe
+                                      && liveThinkingForDedupe.startsWith(seg.text.trim())
+                                    ))
+                                  : segs
+                              );
                               
                               if (isLiveTimeline) {
                                 // Live streaming: use timestamps to interleave
@@ -3402,7 +3452,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                               } else {
                                 // History/finalized turn: prefer timestamped segments from the live stream,
                                 // then fall back to position-based reconstruction from durable history.
-                                const segments = msg.segments || [];
+                                const segments = dropStalePartialThoughts(msg.segments || []);
                                 const hasTimestampedSegments = segments.some((seg) => typeof seg.ts === 'number' && Number.isFinite(seg.ts));
 
                                 if (hasTimestampedSegments) {
@@ -3514,12 +3564,20 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                 .find((segment) => segment.kind === 'thinking' && segment.text.trim());
                               const bubbleContentDuplicatesTimeline = Boolean(bubbleContent)
                                 && lastRenderedTextSegment?.text.trim() === bubbleContent;
+                              // A thought grows as cumulative snapshots. A mid-turn reload can leave a
+                              // partially flushed copy in durable history while the live/resumed stream
+                              // carries the grown version of the SAME thought — treat prefix matches in
+                              // either direction as the same thought, not two bubbles.
+                              const isSameGrowingThought = (a: string, b: string) => Boolean(a) && Boolean(b)
+                                && (a === b || a.startsWith(b) || b.startsWith(a));
                               const bubbleThinkingDuplicatesTimeline = Boolean(bubbleThinking)
-                                && lastRenderedThinkingSegment?.text.trim() === bubbleThinking;
+                                && isSameGrowingThought(lastRenderedThinkingSegment?.text.trim() || '', bubbleThinking);
                               const liveThinkingValue = idx === messages.length - 1 ? thinkingContent : undefined;
                               const liveThinkingText = liveThinkingValue?.trim() || '';
                               const liveThinkingAlreadyRendered = Boolean(liveThinkingText)
-                                && lastRenderedThinkingSegment?.text.trim() === liveThinkingText;
+                                && Boolean(lastRenderedThinkingSegment)
+                                && (lastRenderedThinkingSegment!.text.trim() === liveThinkingText
+                                  || lastRenderedThinkingSegment!.text.trim().startsWith(liveThinkingText));
                               const effectiveBubbleMessage = (bubbleContentDuplicatesTimeline || bubbleThinkingDuplicatesTimeline)
                                 ? {
                                     ...bubbleMessage,
@@ -3855,9 +3913,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
 
         <AgentSettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} onAiProviderSetupComplete={handleAiProviderSetupComplete} />
 
-        {/* Exec Approval Modal */}
+        {/* Exec Approval Modal — keyed per approval so isResolving/isClosing
+            state can never leak from one queued approval into the next. */}
         {pendingApproval && (
           <ExecApprovalModal
+            key={pendingApproval.id}
             approval={pendingApproval}
             queueCount={pendingApprovals.length}
             onResolve={resolveApproval}

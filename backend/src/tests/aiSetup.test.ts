@@ -4,9 +4,9 @@ describe('ai-setup model normalization', () => {
   test('does not prefix providerHint onto already-prefixed string model ids', () => {
     expect(normalizeModelPayload(['openai-codex/gpt-5.4'], 'google-gemini-cli')).toEqual([
       {
-        id: 'codex/gpt-5.5',
-        name: 'codex/gpt-5.5',
-        provider: 'codex',
+        id: 'openai/gpt-5.5',
+        name: 'openai/gpt-5.5',
+        provider: 'openai',
       },
     ]);
   });
@@ -43,10 +43,10 @@ describe('ai-setup model normalization', () => {
     ]);
   });
 
-  test('rewrites same-family OpenAI rows into the current Codex namespace when filtering for Codex OAuth', () => {
+  test('keeps same-family OpenAI rows on the canonical openai namespace when filtering for Codex OAuth', () => {
     expect(normalizeModelPayload([{ id: 'openai/gpt-5.5', provider: 'openai', name: 'GPT-5.5' }], 'openai-codex')).toEqual([
       {
-        id: 'codex/gpt-5.5',
+        id: 'openai/gpt-5.5',
         name: 'GPT-5.5',
         provider: 'openai-codex',
         raw: { id: 'openai/gpt-5.5', provider: 'openai', name: 'GPT-5.5' },
@@ -88,7 +88,9 @@ describe('ai-setup model normalization', () => {
     expect(merged.addedAllowlist).toEqual([]);
     expect(merged.addedFallbacks).toEqual([]);
     expect(merged.config.agents.defaults.model.fallbacks).toEqual([]);
-    expect(merged.config.agents.defaults.models['codex/gpt-5.5']).toEqual({ agentRuntime: { id: 'codex' } });
+    expect(merged.config.agents.defaults.models['openai/gpt-5.5']).toEqual({});
+    expect(merged.config.agents.defaults.models['openai-codex/gpt-5.5']).toBeUndefined();
+    expect(merged.config.agents.defaults.models['codex/gpt-5.5']).toBeUndefined();
   });
 
   test('register merge repairs Codex model-scoped runtime metadata', () => {
@@ -98,7 +100,7 @@ describe('ai-setup model normalization', () => {
           model: { primary: 'openai-codex/gpt-5.5', fallbacks: [] },
           models: {
             'openai/gpt-5.5': { agentRuntime: { id: 'codex' } },
-            'openai-codex/gpt-5.5': { agentRuntime: { id: 'pi' } },
+            'codex/gpt-5.5': { agentRuntime: { id: 'codex' } },
           },
         },
       },
@@ -108,7 +110,7 @@ describe('ai-setup model normalization', () => {
     expect(merged.addedAllowlist).toEqual([]);
     expect(merged.addedFallbacks).toEqual([]);
     expect(merged.config.agents.defaults.models['openai/gpt-5.5']).toEqual({});
-    expect(merged.config.agents.defaults.models['codex/gpt-5.5']).toEqual({ agentRuntime: { id: 'codex' } });
+    expect(merged.config.agents.defaults.models['codex/gpt-5.5']).toBeUndefined();
   });
 
   test('register merge preserves Antigravity provider namespace before persisting models', () => {
@@ -162,7 +164,12 @@ describe('ai-setup model normalization', () => {
   });
 
   test('setup model fallback exposes provider defaults without requiring OpenClaw model discovery', () => {
-    expect(getProviderDefaultModelPayload('openai-codex').map((model) => model.id)).toContain('codex/gpt-5.5');
+    expect(getProviderDefaultModelPayload('openai-codex').map((model) => model.id)).toEqual(
+      expect.arrayContaining(['openai/gpt-5.6-sol', 'openai/gpt-5.6-terra', 'openai/gpt-5.6-luna', 'openai/gpt-5.5']),
+    );
+    // Sonnet 5 is intentionally absent: unusable on the claude-cli route in
+    // OpenClaw 2026.7.1 (off-only thinking profile, empty turns).
+    expect(getProviderDefaultModelPayload('anthropic').map((model) => model.id)).not.toContain('anthropic/claude-sonnet-5');
     expect(getProviderDefaultModelPayload('anthropic').map((model) => model.id)).toContain('anthropic/claude-fable-5');
     expect(getProviderDefaultModelPayload('google-antigravity').map((model) => model.id)).toContain('google-antigravity/gemini-3.1-pro-high');
     expect(getProviderDefaultModelPayload(null)).toEqual([]);

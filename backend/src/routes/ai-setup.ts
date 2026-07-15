@@ -126,13 +126,16 @@ function runOpenClaw(args: string[], timeout = 30000) {
 
 const PROVIDER_MODEL_DISCOVERY_FALLBACKS: Record<string, string[]> = {
   anthropic: [
-    'anthropic/claude-opus-4-8',
     'anthropic/claude-fable-5',
+    'anthropic/claude-opus-4-8',
     'anthropic/claude-sonnet-4-6',
     'anthropic/claude-haiku-4-5',
   ],
   'openai-codex': [
-    'codex/gpt-5.5',
+    'openai/gpt-5.6-sol',
+    'openai/gpt-5.6-terra',
+    'openai/gpt-5.6-luna',
+    'openai/gpt-5.5',
   ],
   'google-gemini-cli': [],
   'google-antigravity': [
@@ -273,8 +276,11 @@ function repairProviderModelRuntimeMetadata(config: any, provider: string, authP
     let entry = rawEntry;
     let effectiveModelId = modelId;
 
-    if (provider === 'openai-codex' && modelId.startsWith('openai-codex/')) {
-      effectiveModelId = `codex/${modelId.slice('openai-codex/'.length)}`;
+    // OpenClaw 2026.7.1 makes openai/* the canonical Codex-runtime route, so
+    // migrate legacy openai-codex/* and codex/* declaration keys forward.
+    if ((provider === 'openai-codex' || provider === 'codex')
+      && (modelId.startsWith('openai-codex/') || modelId.startsWith('codex/'))) {
+      effectiveModelId = `openai/${modelId.slice(modelId.indexOf('/') + 1)}`;
       models[effectiveModelId] = {
         ...(models[effectiveModelId] && typeof models[effectiveModelId] === 'object' ? models[effectiveModelId] : {}),
         ...(entry && typeof entry === 'object' ? entry : {}),
@@ -300,16 +306,10 @@ function repairProviderModelRuntimeMetadata(config: any, provider: string, authP
       continue;
     }
 
-    if (effectiveModelId.startsWith('openai-codex/') || effectiveModelId.startsWith('codex/')) {
-      const runtimeId = String(entry.agentRuntime?.id || '').trim();
-      if (runtimeId !== 'codex') {
-        entry.agentRuntime = { ...(entry.agentRuntime && typeof entry.agentRuntime === 'object' ? entry.agentRuntime : {}), id: 'codex' };
-        changed = true;
-      }
-      continue;
-    }
-
-    if (modelId.startsWith('openai/') && String(entry.agentRuntime?.id || '').trim() === 'codex') {
+    // openai/* agent turns route through the bundled Codex app-server runtime
+    // by default on OpenClaw 2026.7.1, so explicit codex runtime pins are
+    // legacy metadata and should be removed.
+    if (effectiveModelId.startsWith('openai/') && String(entry.agentRuntime?.id || '').trim() === 'codex') {
       delete entry.agentRuntime;
       changed = true;
     }
@@ -417,11 +417,12 @@ export function mergeDiscoveredProviderModelsIntoConfig(config: any, provider: s
       changed = true;
     }
 
-    if ((provider === 'openai-codex' || provider === 'codex') && (modelId.startsWith('openai-codex/') || modelId.startsWith('codex/'))) {
+    if ((provider === 'openai-codex' || provider === 'codex') && modelId.startsWith('openai/')) {
       const entry = next.agents.defaults.models[modelId];
-      const runtimeId = String(entry.agentRuntime?.id || '').trim();
-      if (runtimeId !== 'codex') {
-        entry.agentRuntime = { ...(entry.agentRuntime && typeof entry.agentRuntime === 'object' ? entry.agentRuntime : {}), id: 'codex' };
+      if (String(entry.agentRuntime?.id || '').trim() === 'codex') {
+        // Canonical openai/* ids use the Codex app-server runtime by default
+        // on OpenClaw 2026.7.1; explicit pins are legacy metadata.
+        delete entry.agentRuntime;
         changed = true;
       }
     }

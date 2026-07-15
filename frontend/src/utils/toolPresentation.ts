@@ -161,7 +161,14 @@ function parseToolArgs(raw: unknown): Record<string, any> | undefined {
 }
 
 function canonicalToolName(name: string): string {
-  const trimmed = normalizeToolName(name).toLowerCase().replace(/-/g, '_');
+  let text = normalizeToolName(name);
+  // MCP tools arrive as mcp__<server>__<tool>; present the tool itself.
+  const mcpMatch = /^mcp__.+__(.+)$/.exec(text);
+  if (mcpMatch) text = mcpMatch[1];
+  // Direct-harness tools use CamelCase (WebFetch, TaskUpdate, TodoWrite…);
+  // fold them onto the snake_case names the mapping already knows.
+  text = text.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
+  const trimmed = text.toLowerCase().replace(/-/g, '_');
   if (!trimmed) return 'tool';
   const parts = trimmed.split('.').filter(Boolean);
   return parts[parts.length - 1] || trimmed;
@@ -236,18 +243,30 @@ export function resolveToolName(...candidates: unknown[]): string {
 export function getToolPresentation(name: string): ToolPresentation {
   const canonical = canonicalToolName(name);
 
-  if (canonical === 'read' || canonical === 'read_file' || canonical === 'list_directory') return TOOL_PRESENTATIONS.read;
+  if (canonical === 'read' || canonical === 'read_file' || canonical === 'list_directory' || canonical === 'read_many_files' || canonical === 'notebook_read') return TOOL_PRESENTATIONS.read;
   if (canonical === 'write' || canonical === 'write_file') return TOOL_PRESENTATIONS.write;
-  if (canonical === 'edit' || canonical === 'edit_file' || canonical === 'patch' || canonical === 'apply_patch' || canonical === 'replace') return TOOL_PRESENTATIONS.edit;
-  if (canonical === 'process') return TOOL_PRESENTATIONS.process;
-  if (canonical === 'exec' || canonical === 'execute' || canonical === 'bash' || canonical === 'shell' || canonical === 'run_shell_command') return TOOL_PRESENTATIONS.exec;
-  if (canonical === 'search' || canonical === 'web_search' || canonical === 'search_query' || canonical === 'image_query' || canonical === 'find' || canonical === 'finance' || canonical === 'sports' || canonical === 'time' || canonical === 'grep_search' || canonical === 'glob') return TOOL_PRESENTATIONS.search;
+  if (canonical === 'edit' || canonical === 'edit_file' || canonical === 'patch' || canonical === 'apply_patch' || canonical === 'replace' || canonical === 'multi_edit' || canonical === 'notebook_edit') return TOOL_PRESENTATIONS.edit;
+  if (canonical === 'process' || canonical === 'bash_output' || canonical === 'task_output' || canonical === 'kill_shell' || canonical === 'task_stop') return TOOL_PRESENTATIONS.process;
+  if (canonical === 'exec' || canonical === 'execute' || canonical === 'bash' || canonical === 'shell' || canonical === 'run_shell_command' || canonical === 'skill' || canonical === 'slash_command') return TOOL_PRESENTATIONS.exec;
+  if (canonical === 'search' || canonical === 'web_search' || canonical === 'search_query' || canonical === 'image_query' || canonical === 'find' || canonical === 'finance' || canonical === 'sports' || canonical === 'time' || canonical === 'grep_search' || canonical === 'glob' || canonical === 'grep' || canonical === 'search_file_content' || canonical === 'google_web_search' || canonical === 'tool_search') return TOOL_PRESENTATIONS.search;
   if (canonical === 'web_fetch' || canonical === 'fetch' || canonical === 'open' || canonical === 'click' || canonical === 'screenshot') return TOOL_PRESENTATIONS.fetch;
   if (canonical === 'browser' || canonical === 'canvas' || canonical === 'nodes') return TOOL_PRESENTATIONS.browser;
   if (canonical === 'gateway' || canonical === 'cron') return TOOL_PRESENTATIONS.gateway;
-  if (canonical === 'memory_search' || canonical === 'memory_get' || canonical === 'update_plan') return TOOL_PRESENTATIONS.memory;
-  if (canonical === 'message') return TOOL_PRESENTATIONS.message;
-  if (canonical === 'image' || canonical === 'image_generate' || canonical === 'video_generate' || canonical === 'music_generate' || canonical === 'pdf') return TOOL_PRESENTATIONS.media;
+  if (
+    canonical === 'memory_search'
+    || canonical === 'memory_get'
+    || canonical === 'save_memory'
+    || canonical === 'update_plan'
+    || canonical === 'todo_write'
+    || canonical === 'task_create'
+    || canonical === 'task_update'
+    || canonical === 'task_get'
+    || canonical === 'task_list'
+    || canonical === 'enter_plan_mode'
+    || canonical === 'exit_plan_mode'
+  ) return TOOL_PRESENTATIONS.memory;
+  if (canonical === 'message' || canonical === 'send_message' || canonical === 'push_notification' || canonical === 'ask_user_question') return TOOL_PRESENTATIONS.message;
+  if (canonical === 'image' || canonical === 'image_generate' || canonical === 'video_generate' || canonical === 'music_generate' || canonical === 'pdf' || canonical === 'view_image') return TOOL_PRESENTATIONS.media;
   if (canonical === 'tts' || canonical === 'voice_call') return TOOL_PRESENTATIONS.voice;
   if (
     canonical === 'sessions_spawn'
@@ -259,6 +278,8 @@ export function getToolPresentation(name: string): ToolPresentation {
     || canonical === 'agents_list'
     || canonical === 'session_status'
     || canonical === 'parallel'
+    || canonical === 'task'
+    || canonical === 'agent'
   ) return TOOL_PRESENTATIONS.session;
   if (canonical === 'weather') return TOOL_PRESENTATIONS.weather;
 
@@ -270,9 +291,14 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
   const canonical = canonicalToolName(rawName);
   const args = parseToolArgs(tool.arguments);
 
-  if (canonical === 'read' || canonical === 'read_file') {
-    const short = shortPath(args?.path || args?.file_path || args?.filePath);
+  if (canonical === 'read' || canonical === 'read_file' || canonical === 'notebook_read') {
+    const short = shortPath(args?.path || args?.file_path || args?.filePath || args?.notebook_path);
     return short ? `Read ${short}` : 'Read file';
+  }
+
+  if (canonical === 'read_many_files') {
+    const count = Array.isArray(args?.paths) ? args.paths.length : 0;
+    return count > 0 ? `Read ${count} files` : 'Read files';
   }
 
   if (canonical === 'list_directory') {
@@ -285,8 +311,8 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
     return short ? `Write ${short}` : 'Write file';
   }
 
-  if (canonical === 'edit' || canonical === 'edit_file') {
-    const short = shortPath(args?.path || args?.file_path || args?.filePath);
+  if (canonical === 'edit' || canonical === 'edit_file' || canonical === 'multi_edit' || canonical === 'notebook_edit') {
+    const short = shortPath(args?.path || args?.file_path || args?.filePath || args?.notebook_path);
     return short ? `Edit ${short}` : 'Edit file';
   }
 
@@ -408,6 +434,58 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
   if (canonical === 'update_plan') {
     const count = Array.isArray(args?.plan) ? args.plan.length : 0;
     return count > 0 ? `Update plan (${count} steps)` : 'Update plan';
+  }
+
+  if (canonical === 'todo_write') {
+    const count = Array.isArray(args?.todos) ? args.todos.length : 0;
+    return count > 0 ? `Update to-dos (${count})` : 'Update to-dos';
+  }
+
+  if (canonical === 'task_create') return 'Create task';
+  if (canonical === 'task_update') return 'Update task';
+  if (canonical === 'task_get' || canonical === 'task_list') return 'Check tasks';
+  if (canonical === 'task_output') return 'Check task output';
+  if (canonical === 'task_stop') return 'Stop task';
+  if (canonical === 'bash_output') return 'Check command output';
+  if (canonical === 'kill_shell') return 'Stop command';
+  if (canonical === 'enter_plan_mode') return 'Start planning';
+  if (canonical === 'exit_plan_mode') return 'Present plan';
+  if (canonical === 'save_memory') return 'Save memory';
+  if (canonical === 'ask_user_question') return 'Ask a question';
+  if (canonical === 'send_message') return 'Message agent';
+  if (canonical === 'push_notification') return 'Send notification';
+  if (canonical === 'view_image') return 'View image';
+
+  if (canonical === 'skill') {
+    const skillName = typeof args?.skill === 'string' ? args.skill.trim() : '';
+    return skillName ? `Skill ${skillName}` : 'Run skill';
+  }
+
+  if (canonical === 'slash_command') {
+    const command = typeof args?.command === 'string' ? args.command.trim() : '';
+    return command ? `Run ${command.slice(0, 48)}` : 'Run command';
+  }
+
+  if (canonical === 'tool_search') {
+    const query = typeof args?.query === 'string' ? args.query.trim() : '';
+    return query ? `Find tools “${query.slice(0, 40)}${query.length > 40 ? '…' : ''}”` : 'Find tools';
+  }
+
+  if (canonical === 'task' || canonical === 'agent') {
+    const kind = typeof args?.subagent_type === 'string' ? args.subagent_type.trim() : '';
+    const description = typeof args?.description === 'string' ? args.description.trim() : '';
+    if (kind) return `Agent ${kind}`;
+    return description ? `Agent: ${description.slice(0, 44)}${description.length > 44 ? '…' : ''}` : 'Run agent';
+  }
+
+  if (canonical === 'search_file_content' || canonical === 'grep') {
+    const query = typeof args?.pattern === 'string' ? args.pattern.trim() : (typeof args?.query === 'string' ? args.query.trim() : '');
+    return query ? `Search “${query.slice(0, 48)}${query.length > 48 ? '…' : ''}”` : 'Search files';
+  }
+
+  if (canonical === 'google_web_search') {
+    const query = getSearchQuery(args);
+    return query ? `Search “${query.slice(0, 48)}${query.length > 48 ? '…' : ''}”` : 'Search web';
   }
 
   if (canonical === 'message') {

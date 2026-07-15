@@ -75,9 +75,9 @@ export const PROVIDERS: ProviderUIConfig[] = [
       { stepNumber: 5, title: 'Pick your default Claude model', detail: 'Choose Opus, Sonnet, or Haiku. OpenClaw will keep normal Anthropic model IDs for runtime use.' },
     ],
     defaultModels: [
-      { id: 'anthropic/claude-opus-4-8', name: 'Claude Opus 4.8', tier: 'frontier', description: 'Most capable Claude model currently exposed by OpenClaw.' },
-      { id: 'anthropic/claude-fable-5', name: 'Claude Fable 5', tier: 'frontier', description: 'Large-context Claude model exposed through OpenClaw.' },
-      { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6', tier: 'balanced', description: 'Best all-round default for most users.' },
+      { id: 'anthropic/claude-fable-5', name: 'Claude Fable 5', tier: 'frontier', description: 'Anthropic\'s most capable model. Always-on adaptive thinking; restricted requests may be served and billed as Opus 4.8.' },
+      { id: 'anthropic/claude-opus-4-8', name: 'Claude Opus 4.8', tier: 'frontier', description: 'Frontier Claude model for complex reasoning and difficult tasks.' },
+      { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6', tier: 'balanced', description: 'Proven all-round default for most users.' },
       { id: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', tier: 'fast', description: 'Fastest and lowest-cost Claude model.' },
     ],
     onboardingNotes: {
@@ -136,7 +136,10 @@ export const PROVIDERS: ProviderUIConfig[] = [
       { stepNumber: 5, title: 'Paste the redirect URL back here', detail: 'Return to the portal and paste the full callback URL to complete sign-in.' },
     ],
     defaultModels: [
-      { id: 'codex/gpt-5.5', name: 'GPT-5.5 Codex', tier: 'frontier', description: 'Current OpenClaw Codex runtime model.' },
+      { id: 'openai/gpt-5.6-sol', name: 'GPT-5.6 Sol', tier: 'frontier', description: 'Recommended GPT-5.6 tier and OpenClaw\'s fresh-setup default. Requires GPT-5.6 access on your ChatGPT account.' },
+      { id: 'openai/gpt-5.6-terra', name: 'GPT-5.6 Terra', tier: 'balanced', description: 'Alternate GPT-5.6 tier. Availability depends on your ChatGPT plan.' },
+      { id: 'openai/gpt-5.6-luna', name: 'GPT-5.6 Luna', tier: 'balanced', description: 'Alternate GPT-5.6 tier with maximum-effort thinking. Availability depends on your ChatGPT plan.' },
+      { id: 'openai/gpt-5.5', name: 'GPT-5.5', tier: 'fast', description: 'Proven Codex runtime model. Choose this if your account does not have GPT-5.6 access.' },
     ],
     onboardingNotes: {
       intro: 'This connects the portal to your existing paid ChatGPT account. You are not creating an API key and you are not paying per-token through the developer platform.',
