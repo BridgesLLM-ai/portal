@@ -2,6 +2,17 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [3.26.1] - 2026-07-15
+
+### Fixed
+- **OpenClaw 2026.7.1 upgrades are safe on long-lived installs**: before the first upgraded gateway start, the updater now detects legacy state and plugin metadata that the new migration preflight can treat as fatal. Proven-obsolete artifacts are preserved in recoverable quarantine; unique or ambiguous records are left untouched and the upgrade fails closed.
+- **Failed OpenClaw upgrades roll back automatically**: the updater preserves a local reinstallable copy of the exact previous OpenClaw package and restores any prepared legacy artifacts if package installation, gateway startup, version parity, or readiness verification fails.
+- **Already-failed 2026.7.1 upgrades can recover through the normal updater**: an unready restart loop is stopped safely, the updater waits for OpenClaw's own startup-migration lease to expire, and then retries without deleting or bypassing the lease.
+- **Gateway readiness checks now prove stability instead of sampling a crash loop**: completion requires HTTP readiness, authenticated RPC, matching pinned CLI/gateway versions, a stable PID and restart count, a clean current-start journal, and the expected startup-migration checkpoint.
+
+### Maintenance
+- **OpenClaw state repair remains deliberately narrow**: the updater never runs `openclaw doctor --fix`, never mutates unverified custom state layouts, and keeps provider credential cleanup outside this emergency compatibility patch.
+
 ## [3.26.0] - 2026-07-15
 
 ### Added

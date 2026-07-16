@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
+import { isDeepStrictEqual } from 'util';
 import type { AgentProviderName } from '../agents/AgentProvider.interface';
 import {
   getNativeCliAuthStatus,
@@ -19,6 +20,7 @@ export const CODEX_EXTERNAL_CLI_PROFILE_ID = 'openai:codex-cli';
 export const CODEX_CLI_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
 export const OPENCLAW_CODEX_HOME_AUTH_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'codex-home', 'auth.json');
 export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.7.1';
+const LEGACY_OPENCLAW_HOME = path.join(HOME_DIR, '.clawdbot');
 const LEGACY_PLUGIN_INSTALLS_PATH = path.join(OPENCLAW_HOME, 'plugins', 'installs.json');
 const LEGACY_GLOBAL_CODEX_PLUGIN_DIR = path.join(OPENCLAW_HOME, 'npm', 'node_modules', '@openclaw', 'codex');
 const OPENCLAW_SQLITE_PATH = path.join(OPENCLAW_HOME, 'state', 'openclaw.sqlite');
@@ -54,6 +56,24 @@ interface CodexPluginStateRepairResult {
   globalPluginVersion: string | null;
   sqliteRemoved: boolean;
   sqliteBackupPath: string | null;
+  warnings: string[];
+}
+
+export interface OpenClawUpgradeStatePreparationResult {
+  readyForGatewayStart: boolean;
+  legacyStateAction: 'absent' | 'not-needed' | 'already-linked' | 'quarantined' | 'failed';
+  legacyStateBackupPath: string | null;
+  legacyPluginIndexAction: 'absent' | 'not-needed' | 'pruned' | 'quarantined-redundant' | 'quarantined-invalid' | 'failed';
+  legacyPluginIndexBackupPath: string | null;
+  removedPluginRecordIds: string[];
+  retainedPluginRecordIds: string[];
+  warnings: string[];
+}
+
+export interface OpenClawUpgradeStateRestoreResult {
+  restored: boolean;
+  legacyStateRestored: boolean;
+  legacyPluginIndexRestored: boolean;
   warnings: string[];
 }
 
@@ -164,6 +184,492 @@ function uniqueBackupPath(basePath: string): string {
     if (!fs.existsSync(candidate)) return candidate;
   }
   return `${basePath}-${process.pid}`;
+}
+
+function resolvedPathsMatch(left: string, right: string): boolean {
+  try {
+    return fs.realpathSync(left) === fs.realpathSync(right);
+  } catch {
+    return path.resolve(left) === path.resolve(right);
+  }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function isBlockedObjectKey(key: string): boolean {
+  return key === '__proto__' || key === 'constructor' || key === 'prototype';
+}
+
+function strings(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+function validFileSignature(value: unknown): boolean {
+  return isPlainRecord(value)
+    && typeof value.size === 'number'
+    && typeof value.mtimeMs === 'number'
+    && (value.ctimeMs === undefined || typeof value.ctimeMs === 'number');
+}
+
+function validPersistedPlugin(value: unknown): boolean {
+  if (!isPlainRecord(value) || !isPlainRecord(value.startup)) return false;
+  const startup = value.startup;
+  if (
+    typeof value.pluginId !== 'string'
+    || typeof value.manifestPath !== 'string'
+    || typeof value.manifestHash !== 'string'
+    || typeof value.rootDir !== 'string'
+    || typeof value.origin !== 'string'
+    || typeof value.enabled !== 'boolean'
+    || !strings(value.compat)
+    || typeof startup.sidecar !== 'boolean'
+    || typeof startup.memory !== 'boolean'
+    || typeof startup.deferConfiguredChannelFullLoadUntilAfterListen !== 'boolean'
+    || !strings(startup.agentHarnesses)
+    || (startup.configPaths !== undefined && !strings(startup.configPaths))
+  ) return false;
+
+  for (const key of ['packageName', 'packageVersion', 'installRecordHash', 'format', 'bundleFormat', 'source', 'setupSource']) {
+    if (value[key] !== undefined && typeof value[key] !== 'string') return false;
+  }
+  if (value.installRecord !== undefined && !isPlainRecord(value.installRecord)) return false;
+  if (value.enabledByDefault !== undefined && typeof value.enabledByDefault !== 'boolean') return false;
+  if (value.enabledByDefaultOnPlatforms !== undefined && !strings(value.enabledByDefaultOnPlatforms)) return false;
+  if (value.syntheticAuthRefs !== undefined && !strings(value.syntheticAuthRefs)) return false;
+  if (value.manifestFile !== undefined && !validFileSignature(value.manifestFile)) return false;
+  if (value.packageJson !== undefined) {
+    if (!isPlainRecord(value.packageJson) || typeof value.packageJson.path !== 'string' || typeof value.packageJson.hash !== 'string') return false;
+    if (value.packageJson.fileSignature !== undefined && !validFileSignature(value.packageJson.fileSignature)) return false;
+  }
+  if (value.contributions !== undefined) {
+    if (!isPlainRecord(value.contributions)) return false;
+    for (const key of [
+      'channels', 'channelConfigs', 'providers', 'modelCatalogProviders', 'modelSupportPrefixes',
+      'modelSupportPatterns', 'autoEnableProviderIds', 'commandAliases',
+    ]) {
+      if (!strings(value.contributions[key])) return false;
+    }
+    if (!isPlainRecord(value.contributions.contracts)) return false;
+    if (!Object.values(value.contributions.contracts).every(strings)) return false;
+  }
+  return true;
+}
+
+function collectLegacyPluginInstallRecords(index: any): Record<string, any> | null {
+  if (!isPlainRecord(index)) return null;
+
+  // Match OpenClaw's precedence exactly: installRecords, then records, then
+  // embedded plugin.installRecord entries. A malformed earlier container does
+  // not silently fall through to a later one.
+  let candidate: unknown = index.installRecords ?? index.records;
+  if (candidate === undefined || candidate === null) {
+    if (!Array.isArray(index.plugins)) return null;
+    const embedded: Record<string, any> = Object.create(null);
+    for (const plugin of index.plugins) {
+      if (!isPlainRecord(plugin)) continue;
+      const pluginId = typeof plugin.pluginId === 'string' ? plugin.pluginId.trim() : '';
+      if (!pluginId || isBlockedObjectKey(pluginId) || !isPlainRecord(plugin.installRecord)) continue;
+      embedded[pluginId] = plugin.installRecord;
+    }
+    if (Object.keys(embedded).length === 0) return null;
+    candidate = embedded;
+  }
+  if (!isPlainRecord(candidate)) return null;
+
+  const records: Record<string, any> = Object.create(null);
+  for (const [pluginId, record] of Object.entries(candidate)) {
+    if (!pluginId.trim() || isBlockedObjectKey(pluginId)) continue;
+    if (!isPlainRecord(record)) return null;
+    records[pluginId] = record;
+  }
+  return records;
+}
+
+function parseExactNpmIdentity(spec: unknown): { name: string; version: string } | null {
+  const value = typeof spec === 'string' ? spec.trim() : '';
+  if (!value) return null;
+  const separator = value.lastIndexOf('@');
+  if (separator <= 0 || separator === value.length - 1) return null;
+  const name = value.slice(0, separator);
+  const version = value.slice(separator + 1);
+  if (!name || !/^\d{4}\.\d+\.\d+(?:[-+].*)?$/.test(version)) return null;
+  return { name, version };
+}
+
+function resolvedNpmIdentity(record: any): { name: string; version: string } | null {
+  const resolvedName = typeof record?.resolvedName === 'string' ? record.resolvedName.trim() : '';
+  const resolvedVersion = typeof record?.resolvedVersion === 'string' ? record.resolvedVersion.trim() : '';
+  if (resolvedName && resolvedVersion) return { name: resolvedName, version: resolvedVersion };
+  return parseExactNpmIdentity(record?.resolvedSpec) || parseExactNpmIdentity(record?.spec);
+}
+
+function packageOnDiskMatches(record: any, identity: { name: string; version: string }): boolean {
+  const installPath = typeof record?.installPath === 'string' ? record.installPath.trim() : '';
+  if (!installPath) return false;
+  const pkg = safeReadJson<any>(path.join(installPath, 'package.json'), null);
+  return pkg?.name === identity.name && pkg?.version === identity.version;
+}
+
+function legacyPluginRecordIsCoveredByCurrent(current: any, legacy: any): boolean {
+  const currentSource = typeof current?.source === 'string' ? current.source.trim() : '';
+  const legacySource = typeof legacy?.source === 'string' ? legacy.source.trim() : '';
+  if (!currentSource || currentSource !== legacySource || currentSource !== 'npm') return false;
+
+  const currentIdentity = resolvedNpmIdentity(current);
+  const legacyIdentity = resolvedNpmIdentity(legacy);
+  if (!currentIdentity || !legacyIdentity) return false;
+  if (currentIdentity.name !== legacyIdentity.name || currentIdentity.version !== legacyIdentity.version) return false;
+
+  const legacyInstallPath = typeof legacy?.installPath === 'string' ? legacy.installPath.trim() : '';
+  const currentInstallPath = typeof current?.installPath === 'string' ? current.installPath.trim() : '';
+  if (legacyInstallPath && currentInstallPath && !resolvedPathsMatch(legacyInstallPath, currentInstallPath)) return false;
+
+  if (!packageOnDiskMatches(current, currentIdentity)) return false;
+
+  const retiredMetadata = new Set(['integrity', 'shasum', 'resolvedAt', 'installedAt', 'version']);
+  for (const key of Object.keys(legacy).sort()) {
+    if (isBlockedObjectKey(key)) return false;
+    if (isDeepStrictEqual(current[key], legacy[key])) continue;
+    if (key === 'spec') {
+      const legacySpec = typeof legacy.spec === 'string' ? legacy.spec.trim() : '';
+      const currentSpec = typeof current.spec === 'string' ? current.spec.trim() : '';
+      if (legacySpec === legacyIdentity.name && currentSpec === `${currentIdentity.name}@${currentIdentity.version}`) continue;
+      return false;
+    }
+    if (retiredMetadata.has(key) && current[key] === undefined) {
+      if (key === 'version' && legacy[key] === legacyIdentity.version) continue;
+      if ((key === 'resolvedAt' || key === 'installedAt') && typeof legacy[key] === 'string') continue;
+      if (key === 'integrity' && typeof legacy[key] === 'string' && legacy[key].startsWith('sha')) continue;
+      if (key === 'shasum' && typeof legacy[key] === 'string' && /^[a-f0-9]{40,128}$/i.test(legacy[key])) continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+function pruneLegacyPluginInstallRecords(index: any, coveredRecordIds: Set<string>): string[] {
+  const removed = new Set<string>();
+  const topLevelKey = index.installRecords !== undefined && index.installRecords !== null
+    ? 'installRecords'
+    : (index.records !== undefined && index.records !== null ? 'records' : null);
+  if (topLevelKey && isPlainRecord(index[topLevelKey])) {
+    for (const pluginId of Object.keys(index[topLevelKey])) {
+      if (!coveredRecordIds.has(pluginId)) continue;
+      delete index[topLevelKey][pluginId];
+      removed.add(pluginId);
+    }
+    return Array.from(removed).sort();
+  }
+
+  if (Array.isArray(index.plugins)) {
+    for (const plugin of index.plugins) {
+      if (!isPlainRecord(plugin)) continue;
+      const pluginId = typeof plugin.pluginId === 'string' ? plugin.pluginId.trim() : '';
+      if (!pluginId || !coveredRecordIds.has(pluginId) || !isPlainRecord(plugin.installRecord)) continue;
+      delete plugin.installRecord;
+      removed.add(pluginId);
+    }
+  }
+  return Array.from(removed).sort();
+}
+
+function readPersistedPluginInstallRecords(): { available: boolean; records: Record<string, any>; warning?: string } {
+  if (!fs.existsSync(OPENCLAW_SQLITE_PATH)) return { available: false, records: {} };
+
+  let database: any = null;
+  try {
+    // OpenClaw 2026.7 uses Node's built-in SQLite store. Using the same runtime
+    // keeps this repair available on customer boxes without sqlite3(1).
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require('node:sqlite');
+    database = new DatabaseSync(OPENCLAW_SQLITE_PATH, { readOnly: true });
+    const row = database.prepare(`
+      select version, warning, host_contract_version, compat_registry_version,
+             migration_version, policy_hash, generated_at_ms, refresh_reason,
+             install_records_json, plugins_json, diagnostics_json
+        from installed_plugin_index
+       where index_key='installed-plugin-index'
+    `).get();
+    if (!row) return { available: false, records: {} };
+    const installRecords = JSON.parse(row.install_records_json);
+    const plugins = JSON.parse(row.plugins_json);
+    const diagnostics = JSON.parse(row.diagnostics_json);
+    const validDiagnostics = Array.isArray(diagnostics) && diagnostics.every((entry) => (
+      isPlainRecord(entry)
+      && (entry.level === 'warn' || entry.level === 'error')
+      && typeof entry.message === 'string'
+      && (entry.pluginId === undefined || typeof entry.pluginId === 'string')
+      && (entry.source === undefined || typeof entry.source === 'string')
+    ));
+    const rowIsValid = Number(row.version) === 1
+      && typeof row.host_contract_version === 'string' && row.host_contract_version.length > 0
+      && typeof row.compat_registry_version === 'string' && row.compat_registry_version.length > 0
+      && Number(row.migration_version) === 1
+      && typeof row.policy_hash === 'string' && row.policy_hash.length > 0
+      && Number.isFinite(Number(row.generated_at_ms))
+      && (row.warning === null || typeof row.warning === 'string')
+      && (row.refresh_reason === null || typeof row.refresh_reason === 'string')
+      && isPlainRecord(installRecords)
+      && Array.isArray(plugins) && plugins.every(validPersistedPlugin)
+      && validDiagnostics;
+    if (!rowIsValid) {
+      return { available: false, records: {}, warning: 'OpenClaw SQLite plugin registry failed structural validation.' };
+    }
+    const safeRecords: Record<string, any> = Object.create(null);
+    for (const [pluginId, record] of Object.entries(installRecords)) {
+      if (isBlockedObjectKey(pluginId)) continue;
+      if (!isPlainRecord(record)) {
+        return { available: false, records: {}, warning: 'OpenClaw SQLite plugin registry contains an invalid install record.' };
+      }
+      safeRecords[pluginId] = record;
+    }
+    return { available: true, records: safeRecords };
+  } catch (error) {
+    // A missing table means this state has not adopted the SQLite registry yet;
+    // normal OpenClaw migration should retain and import the JSON source.
+    if (error instanceof Error && /no such table: installed_plugin_index/i.test(error.message)) {
+      return { available: false, records: {} };
+    }
+    return {
+      available: false,
+      records: {},
+      warning: `Could not inspect the OpenClaw SQLite plugin registry: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  } finally {
+    try {
+      database?.close();
+    } catch {
+      // Read-only handle cleanup is best effort.
+    }
+  }
+}
+
+/**
+ * Prepare long-lived OpenClaw installs for the strict 2026.7 startup migration
+ * checkpoint. Preserve every legacy artifact while removing only warning
+ * sources proven to be superseded by the authoritative current state.
+ */
+export function prepareOpenClawUpgradeState(): OpenClawUpgradeStatePreparationResult {
+  const result: OpenClawUpgradeStatePreparationResult = {
+    readyForGatewayStart: true,
+    legacyStateAction: 'absent',
+    legacyStateBackupPath: null,
+    legacyPluginIndexAction: 'absent',
+    legacyPluginIndexBackupPath: null,
+    removedPluginRecordIds: [],
+    retainedPluginRecordIds: [],
+    warnings: [],
+  };
+
+  if (fs.existsSync(LEGACY_OPENCLAW_HOME)) {
+    const legacyIsSymlink = fs.lstatSync(LEGACY_OPENCLAW_HOME).isSymbolicLink();
+    if (!fs.existsSync(OPENCLAW_HOME)) {
+      result.legacyStateAction = 'not-needed';
+    } else if (resolvedPathsMatch(LEGACY_OPENCLAW_HOME, OPENCLAW_HOME)) {
+      result.legacyStateAction = 'already-linked';
+    } else if (legacyIsSymlink) {
+      result.readyForGatewayStart = false;
+      result.legacyStateAction = 'failed';
+      result.warnings.push('Legacy .clawdbot is a symlink to a different path; it was left untouched for manual review.');
+    } else if (process.env.PORTAL_OPENCLAW_STANDARD_STATE_CONFIRMED !== '1') {
+      result.readyForGatewayStart = false;
+      result.legacyStateAction = 'failed';
+      result.warnings.push('Legacy .clawdbot state exists, but the active gateway state directory could not be proven to be the standard .openclaw path.');
+    } else {
+      const backupPath = uniqueBackupPath(`${LEGACY_OPENCLAW_HOME}.portal-backup-${timestampForBackup()}`);
+      try {
+        fs.renameSync(LEGACY_OPENCLAW_HOME, backupPath);
+        result.legacyStateAction = 'quarantined';
+        result.legacyStateBackupPath = backupPath;
+      } catch (error) {
+        result.readyForGatewayStart = false;
+        result.legacyStateAction = 'failed';
+        result.warnings.push(`Could not preserve the legacy OpenClaw state path: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  if (!fs.existsSync(LEGACY_PLUGIN_INSTALLS_PATH)) return result;
+
+  if (fs.lstatSync(LEGACY_PLUGIN_INSTALLS_PATH).isSymbolicLink()) {
+    result.readyForGatewayStart = false;
+    result.legacyPluginIndexAction = 'failed';
+    result.warnings.push('Legacy OpenClaw plugin metadata is a symlink and was left untouched for manual review.');
+    return result;
+  }
+
+  let legacyIndex: any;
+  try {
+    legacyIndex = JSON.parse(fs.readFileSync(LEGACY_PLUGIN_INSTALLS_PATH, 'utf8'));
+    if (!legacyIndex || typeof legacyIndex !== 'object' || Array.isArray(legacyIndex)) {
+      throw new Error('root value is not an object');
+    }
+  } catch (error) {
+    // Invalid metadata may be the only record of an installed plugin. Do not
+    // hide it merely to satisfy the stricter startup guard; abort the upgrade
+    // and leave the old runtime/state exactly as found.
+    result.readyForGatewayStart = false;
+    result.legacyPluginIndexAction = 'failed';
+    result.warnings.push(`Legacy OpenClaw plugin metadata is invalid and was left untouched: ${error instanceof Error ? error.message : String(error)}`);
+    return result;
+  }
+
+  const legacyRecords = collectLegacyPluginInstallRecords(legacyIndex);
+  if (!legacyRecords) {
+    result.readyForGatewayStart = false;
+    result.legacyPluginIndexAction = 'failed';
+    result.warnings.push('Legacy OpenClaw plugin metadata has an unsupported structure and was left untouched.');
+    return result;
+  }
+  const legacyRecordIds = Object.keys(legacyRecords).sort();
+  const current = readPersistedPluginInstallRecords();
+  if (current.warning) {
+    result.readyForGatewayStart = false;
+    result.legacyPluginIndexAction = 'failed';
+    result.warnings.push(current.warning);
+    result.retainedPluginRecordIds = legacyRecordIds;
+    return result;
+  }
+  if (!current.available) {
+    result.legacyPluginIndexAction = 'not-needed';
+    result.retainedPluginRecordIds = legacyRecordIds;
+    return result;
+  }
+
+  const overlappingIds = legacyRecordIds.filter((pluginId) => (
+    Object.prototype.hasOwnProperty.call(current.records, pluginId)
+  ));
+  const coveredIds = new Set(overlappingIds.filter((pluginId) => (
+    Object.prototype.hasOwnProperty.call(current.records, pluginId)
+    && legacyPluginRecordIsCoveredByCurrent(current.records[pluginId], legacyRecords[pluginId])
+  )));
+  const unresolvedIds = overlappingIds.filter((pluginId) => !coveredIds.has(pluginId));
+  if (unresolvedIds.length > 0) {
+    result.readyForGatewayStart = false;
+    result.legacyPluginIndexAction = 'failed';
+    result.retainedPluginRecordIds = legacyRecordIds;
+    result.warnings.push(`Legacy plugin metadata could not be proven redundant for: ${unresolvedIds.join(', ')}`);
+    return result;
+  }
+
+  const removed = pruneLegacyPluginInstallRecords(legacyIndex, coveredIds);
+  const retainedRecords = collectLegacyPluginInstallRecords(legacyIndex);
+  const retained = retainedRecords ? Object.keys(retainedRecords).sort() : [];
+  result.removedPluginRecordIds = removed;
+  result.retainedPluginRecordIds = retained;
+  if (removed.length === 0) {
+    result.legacyPluginIndexAction = 'not-needed';
+    return result;
+  }
+
+  const backupPath = uniqueBackupPath(`${LEGACY_PLUGIN_INSTALLS_PATH}.portal-backup-${timestampForBackup()}`);
+  try {
+    if (retained.length === 0) {
+      fs.renameSync(LEGACY_PLUGIN_INSTALLS_PATH, backupPath);
+      result.legacyPluginIndexAction = 'quarantined-redundant';
+    } else {
+      const sourceMode = fs.statSync(LEGACY_PLUGIN_INSTALLS_PATH).mode & 0o777;
+      fs.copyFileSync(LEGACY_PLUGIN_INSTALLS_PATH, backupPath);
+      fs.chmodSync(backupPath, sourceMode);
+      const temporaryPath = uniqueBackupPath(`${LEGACY_PLUGIN_INSTALLS_PATH}.portal-write-${process.pid}`);
+      try {
+        fs.writeFileSync(temporaryPath, `${JSON.stringify(legacyIndex, null, 2)}\n`, { mode: sourceMode });
+        fs.renameSync(temporaryPath, LEGACY_PLUGIN_INSTALLS_PATH);
+      } finally {
+        if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath, { force: true });
+      }
+      result.legacyPluginIndexAction = 'pruned';
+    }
+    result.legacyPluginIndexBackupPath = backupPath;
+  } catch (error) {
+    result.readyForGatewayStart = false;
+    result.legacyPluginIndexAction = 'failed';
+    result.warnings.push(`Could not reconcile the legacy OpenClaw plugin index: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  return result;
+}
+
+/** Restore artifacts moved or pruned by prepareOpenClawUpgradeState(). */
+export function restoreOpenClawUpgradeState(
+  preparation: OpenClawUpgradeStatePreparationResult,
+): OpenClawUpgradeStateRestoreResult {
+  const result: OpenClawUpgradeStateRestoreResult = {
+    restored: true,
+    legacyStateRestored: false,
+    legacyPluginIndexRestored: false,
+    warnings: [],
+  };
+
+  if (preparation.legacyStateAction === 'quarantined' && preparation.legacyStateBackupPath) {
+    const backupPath = preparation.legacyStateBackupPath;
+    const expectedPrefix = `${LEGACY_OPENCLAW_HOME}.portal-backup-`;
+    if (!backupPath.startsWith(expectedPrefix)) {
+      result.restored = false;
+      result.warnings.push('Refused to restore a legacy-state backup from an unexpected path.');
+    } else if (!fs.existsSync(backupPath)) {
+      result.restored = false;
+      result.warnings.push(`Legacy-state backup is missing: ${backupPath}`);
+    } else if (fs.existsSync(LEGACY_OPENCLAW_HOME)) {
+      result.restored = false;
+      result.warnings.push(`Could not restore ${LEGACY_OPENCLAW_HOME} because the path now exists.`);
+    } else {
+      try {
+        fs.renameSync(backupPath, LEGACY_OPENCLAW_HOME);
+        result.legacyStateRestored = true;
+      } catch (error) {
+        result.restored = false;
+        result.warnings.push(`Could not restore the legacy OpenClaw state path: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  if (
+    (preparation.legacyPluginIndexAction === 'pruned'
+      || preparation.legacyPluginIndexAction === 'quarantined-redundant')
+    && preparation.legacyPluginIndexBackupPath
+  ) {
+    const backupPath = preparation.legacyPluginIndexBackupPath;
+    const expectedPrefix = `${LEGACY_PLUGIN_INSTALLS_PATH}.portal-backup-`;
+    if (!backupPath.startsWith(expectedPrefix)) {
+      result.restored = false;
+      result.warnings.push('Refused to restore a legacy plugin-index backup from an unexpected path.');
+    } else if (!fs.existsSync(backupPath)) {
+      result.restored = false;
+      result.warnings.push(`Legacy plugin-index backup is missing: ${backupPath}`);
+    } else {
+      try {
+        fs.mkdirSync(path.dirname(LEGACY_PLUGIN_INSTALLS_PATH), { recursive: true });
+        const sourceMode = fs.statSync(backupPath).mode & 0o777;
+        const temporaryPath = uniqueBackupPath(`${LEGACY_PLUGIN_INSTALLS_PATH}.portal-restore-${process.pid}`);
+        fs.copyFileSync(backupPath, temporaryPath);
+        fs.chmodSync(temporaryPath, sourceMode);
+        let diagnosticPath: string | null = null;
+        if (fs.existsSync(LEGACY_PLUGIN_INSTALLS_PATH)) {
+          diagnosticPath = uniqueBackupPath(`${LEGACY_PLUGIN_INSTALLS_PATH}.failed-upgrade-${timestampForBackup()}`);
+          fs.renameSync(LEGACY_PLUGIN_INSTALLS_PATH, diagnosticPath);
+        }
+        try {
+          fs.renameSync(temporaryPath, LEGACY_PLUGIN_INSTALLS_PATH);
+        } catch (error) {
+          if (diagnosticPath && fs.existsSync(diagnosticPath) && !fs.existsSync(LEGACY_PLUGIN_INSTALLS_PATH)) {
+            fs.renameSync(diagnosticPath, LEGACY_PLUGIN_INSTALLS_PATH);
+          }
+          throw error;
+        } finally {
+          if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath, { force: true });
+        }
+        result.legacyPluginIndexRestored = true;
+      } catch (error) {
+        result.restored = false;
+        result.warnings.push(`Could not restore the legacy OpenClaw plugin index: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  return result;
 }
 
 function sqlite3Available(): boolean {

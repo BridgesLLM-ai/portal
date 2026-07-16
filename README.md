@@ -98,6 +98,11 @@ One-click updates from the browser. Admin dashboard with user management, storag
 
 ## 🆕 Recent Changes
 
+### v3.26.1 (July 15, 2026)
+- **Safe upgrades for older OpenClaw installs**: the updater handles legacy state and plugin metadata that can block the first OpenClaw 2026.7.1 gateway start, while preserving every changed artifact in a recoverable backup.
+- **Automatic OpenClaw rollback**: if the package upgrade or new gateway fails validation, the exact prior package and preserved state are restored and verified before the updater exits.
+- **Real readiness gates**: update success now requires HTTP and RPC health, pinned version parity, a stable process with no restart-loop activity, a clean startup journal, and the expected migration checkpoint. Custom or ambiguous state layouts fail closed instead of being guessed at.
+
 ### v3.26.0 (July 15, 2026)
 - **New recommended models**: Claude Fable 5 for Anthropic; the GPT-5.6 suite (Sol, Terra, Luna) for ChatGPT/Codex subscriptions, with GPT-5.5 as the compatibility fallback.
 - **OpenClaw runtime updated to 2026.7.1**: reasoning-streaming Claude models show live thinking natively; the canonical Codex model route moves to `openai/*` with automatic migration of legacy references.

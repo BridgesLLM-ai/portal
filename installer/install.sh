@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="3.26.0"
+readonly VERSION="3.26.1"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly INSTALL_ROOT="/opt/bridgesllm"
 readonly PORTAL_DIR="${INSTALL_ROOT}/portal"
@@ -42,6 +42,15 @@ SKIP_OLLAMA=false
 SKIP_OPENCLAW=false
 INSTALL_PROFILE="server"
 OPENCLAW_PACKAGE_UPDATED=false
+OPENCLAW_PACKAGE_UPDATE_ATTEMPTED=false
+OPENCLAW_PREUPDATE_VERSION=""
+OPENCLAW_BASELINE_PID=""
+OPENCLAW_BASELINE_RESTARTS=""
+OPENCLAW_ROLLBACK_PACKAGE_TARBALL=""
+OPENCLAW_UPGRADE_STATE_MANIFEST=""
+OPENCLAW_ROLLBACK_IN_PROGRESS=false
+OPENCLAW_UPGRADE_COMMITTED=false
+OPENCLAW_RESCUE_MODE=false
 
 # Generated during install
 DB_PASSWORD=""
@@ -573,9 +582,420 @@ verify_portal_service_health() {
 UPDATE_RECOVERY_BACKUP_DIR=""
 UPDATE_RECOVERY_ROLLBACK_RUNTIME=false
 
+openclaw_standard_state_static_is_confirmed() {
+  local allow_dynamic_unit="${1:-false}"
+  [[ -z "${OPENCLAW_STATE_DIR:-}" \
+    && -z "${OPENCLAW_HOME:-}" \
+    && -z "${OPENCLAW_PROFILE:-}" \
+    && -z "${OPENCLAW_CONFIG_PATH:-}" \
+    && -z "${CLAWDBOT_STATE_DIR:-}" \
+    && -z "${CLAWDBOT_HOME:-}" \
+    && -z "${CLAWDBOT_PROFILE:-}" \
+    && -z "${CLAWDBOT_CONFIG_PATH:-}" ]] || return 1
+  [[ "${HOME:-/root}" == "/root" && -d "/root/.openclaw" && ! -L "/root/.openclaw" ]] || return 1
+
+  local unit_user unit_env unit_text exec_start exec_path
+  unit_user="$(systemctl show openclaw-gateway -p User --value 2>/dev/null || true)"
+  [[ -z "${unit_user}" || "${unit_user}" == "root" ]] || return 1
+  unit_env="$(systemctl show openclaw-gateway -p Environment --value 2>/dev/null || true)"
+  if printf '%s\n' "${unit_env}" | grep -Eq '(^|[[:space:]])(OPENCLAW|CLAWDBOT)_(STATE_DIR|HOME|PROFILE|CONFIG_PATH)='; then
+    return 1
+  fi
+  if printf '%s\n' "${unit_env}" | grep -Eq '(^|[[:space:]])HOME=' \
+    && ! printf '%s\n' "${unit_env}" | grep -Eq '(^|[[:space:]])HOME=/root($|[[:space:]])'; then
+    return 1
+  fi
+  unit_text="$(systemctl cat openclaw-gateway --no-pager 2>/dev/null || true)"
+  # EnvironmentFile contents and named profiles can redirect state invisibly.
+  # Custom units are supported, but their OpenClaw package must be upgraded by
+  # an operator who knows that layout rather than by this default-path repair.
+  if ! $allow_dynamic_unit \
+    && printf '%s\n' "${unit_text}" | grep -Eq '^[[:space:]]*EnvironmentFile='; then
+    return 1
+  fi
+  if printf '%s\n' "${unit_text}" | grep -Eq -- '^[[:space:]]*ExecStart=.*(^|[[:space:]])--(profile|dev|config|state-dir|home)($|=|[[:space:]])'; then
+    return 1
+  fi
+
+  exec_start="$(systemctl show openclaw-gateway -p ExecStart --value 2>/dev/null || true)"
+  if printf '%s\n' "${exec_start}" | grep -Eq -- '(^|[[:space:]])--(profile|dev|config|state-dir|home)($|=|[[:space:]])'; then
+    return 1
+  fi
+  exec_path="$(printf '%s\n' "${exec_start}" | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -1)"
+  if [[ -n "${exec_path}" && -f "${exec_path}" ]]; then
+    if grep -Eq -- '(OPENCLAW|CLAWDBOT)_(STATE_DIR|HOME|PROFILE|CONFIG_PATH)=|(^|[[:space:]])--(profile|dev|config|state-dir|home)($|=|[[:space:]])' "${exec_path}"; then
+      return 1
+    fi
+    local wrapper_home_assignments
+    wrapper_home_assignments="$(grep -E '^[[:space:]]*(export[[:space:]]+)?HOME=' "${exec_path}" || true)"
+    if [[ -n "${wrapper_home_assignments}" ]] \
+      && printf '%s\n' "${wrapper_home_assignments}" \
+        | grep -Evq "^[[:space:]]*(export[[:space:]]+)?HOME=(/root|\"/root\"|'/root')[[:space:]]*(#.*)?$"; then
+      return 1
+    fi
+    # A healthy process can prove the result of sourced files via /proc. An
+    # inactive gateway cannot, so rescue mode refuses dynamic wrapper state.
+    if ! $allow_dynamic_unit \
+      && grep -Eq '^[[:space:]]*(source|\.)[[:space:]]+' "${exec_path}"; then
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+openclaw_standard_state_is_confirmed() {
+  openclaw_standard_state_static_is_confirmed true || return 1
+  systemctl is-active --quiet openclaw-gateway || return 1
+  openclaw_gateway_http_ready || return 1
+
+  local main_pid gateway_home
+
+  main_pid="$(systemctl show openclaw-gateway -p MainPID --value 2>/dev/null || true)"
+  [[ "${main_pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${main_pid}/environ" && -r "/proc/${main_pid}/cmdline" ]] || return 1
+
+  # /proc is the authority here. It includes EnvironmentFile and wrapper-script
+  # exports that cannot be inferred safely from the unit text while inactive.
+  gateway_home="$(tr '\0' '\n' < "/proc/${main_pid}/environ" | sed -n 's/^HOME=//p' | head -1)"
+  [[ "${gateway_home}" == "/root" ]] || return 1
+  if tr '\0' '\n' < "/proc/${main_pid}/environ" | grep -Eq '^(OPENCLAW|CLAWDBOT)_(STATE_DIR|HOME|PROFILE|CONFIG_PATH)='; then
+    return 1
+  fi
+  if tr '\0' ' ' < "/proc/${main_pid}/cmdline" | grep -Eq -- '(^|[[:space:]])--(profile|dev|config|state-dir|home)($|=|[[:space:]])'; then
+    return 1
+  fi
+
+  return 0
+}
+
+prepare_openclaw_upgrade_state() {
+  if $SKIP_OPENCLAW || ! command -v node >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local needs_preparation=false
+  if $OPENCLAW_PACKAGE_UPDATED; then
+    needs_preparation=true
+  elif ! openclaw_gateway_http_ready \
+    && { [[ -e "/root/.clawdbot" ]] || [[ -f "/root/.openclaw/plugins/installs.json" ]]; }; then
+    needs_preparation=true
+  fi
+  if ! $needs_preparation; then
+    ok "OpenClaw legacy-state preparation not needed"
+    return 0
+  fi
+
+  local layout_confirmed=false
+  if $OPENCLAW_PACKAGE_UPDATED; then
+    openclaw_standard_state_is_confirmed && layout_confirmed=true
+  else
+    # Rescue an already-failed 2026.7.1 first start using static unit proof. A
+    # healthy package upgrade requires the stronger live /proc baseline above.
+    openclaw_standard_state_static_is_confirmed && layout_confirmed=true
+  fi
+  if ! $layout_confirmed; then
+    warn "OpenClaw uses a custom or unverified state layout; refusing to alter default-path migration artifacts automatically."
+    if ! openclaw_gateway_http_ready; then
+      systemctl stop openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+      warn "Stopped the unready gateway to prevent a continuing restart loop; custom-state recovery requires an operator."
+    fi
+    return 1
+  fi
+
+  if ! $OPENCLAW_PACKAGE_UPDATED && ! openclaw_gateway_http_ready; then
+    # A failed first 2026.7 start may still be cycling under Restart=always.
+    # Stop it before touching warning sources so no new migration owner can
+    # race the repair or extend the upstream startup-migration lease.
+    systemctl stop openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+    local stop_waited=0
+    while systemctl is-active --quiet openclaw-gateway && (( stop_waited < 30 )); do
+      sleep 2
+      stop_waited=$((stop_waited + 2))
+    done
+    if systemctl is-active --quiet openclaw-gateway; then
+      warn "Could not stop the unready OpenClaw gateway before migration recovery."
+      return 1
+    fi
+    OPENCLAW_RESCUE_MODE=true
+  fi
+
+  local helper="${PORTAL_DIR}/backend/dist/services/openclawConfigManager.js"
+  if [[ ! -f "${helper}" ]]; then
+    warn "OpenClaw upgrade-state helper is missing."
+    return 1
+  fi
+
+  local manifest_dir="${UPDATE_RECOVERY_BACKUP_DIR:-/tmp}"
+  mkdir -p "${manifest_dir}"
+  OPENCLAW_UPGRADE_STATE_MANIFEST="${manifest_dir}/openclaw-upgrade-state-${TIMESTAMP}.json"
+  if ! PORTAL_OPENCLAW_STANDARD_STATE_CONFIRMED=1 \
+    NODE_PATH="${PORTAL_DIR}/backend/node_modules" \
+    node -e '
+const fs = require("fs");
+const helper = require(process.argv[1]);
+const output = process.argv[2];
+const result = helper.prepareOpenClawUpgradeState();
+try {
+  fs.writeFileSync(output, JSON.stringify(result, null, 2) + "\n", { mode: 0o600 });
+  fs.chmodSync(output, 0o600);
+} catch (error) {
+  const restored = helper.restoreOpenClawUpgradeState(result);
+  console.error(JSON.stringify({ manifestWriteFailed: String(error), restored }));
+  process.exit(44);
+}
+console.log(JSON.stringify(result));
+if (!result.readyForGatewayStart) process.exit(42);
+' "${helper}" "${OPENCLAW_UPGRADE_STATE_MANIFEST}" >> "$LOG_FILE" 2>&1; then
+    warn "OpenClaw legacy state could not be reconciled safely; the old runtime will be restored."
+    return 1
+  fi
+
+  ok "OpenClaw legacy state checked and recoverably preserved"
+
+  if $OPENCLAW_RESCUE_MODE && ! wait_for_openclaw_startup_migration_lease; then
+    warn "OpenClaw's orphaned startup-migration lease did not expire safely within the recovery window."
+    return 1
+  fi
+}
+
+restore_prepared_openclaw_state() {
+  [[ -n "${OPENCLAW_UPGRADE_STATE_MANIFEST:-}" && -f "${OPENCLAW_UPGRADE_STATE_MANIFEST}" ]] || return 0
+  local helper="${PORTAL_DIR}/backend/dist/services/openclawConfigManager.js"
+  [[ -f "${helper}" ]] || return 1
+
+  NODE_PATH="${PORTAL_DIR}/backend/node_modules" node -e '
+const fs = require("fs");
+const helper = require(process.argv[1]);
+const preparation = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const result = helper.restoreOpenClawUpgradeState(preparation);
+console.log(JSON.stringify(result));
+if (!result.restored) process.exit(43);
+' "${helper}" "${OPENCLAW_UPGRADE_STATE_MANIFEST}" >> "$LOG_FILE" 2>&1
+}
+
+openclaw_gateway_http_ready() {
+  curl -fsS --max-time 5 http://127.0.0.1:18789/readyz >/dev/null 2>&1
+}
+
+wait_for_openclaw_gateway_http_ready() {
+  local timeout_secs="${1:-60}"
+  local waited=0
+  while (( waited < timeout_secs )); do
+    openclaw_gateway_http_ready && return 0
+    sleep 3
+    waited=$((waited + 3))
+  done
+  return 1
+}
+
+openclaw_startup_migration_lease_remaining_seconds() {
+  NODE_NO_WARNINGS=1 node - <<'NODE' 2>> "$LOG_FILE"
+const { DatabaseSync } = require('node:sqlite');
+let db;
+try {
+  db = new DatabaseSync('/root/.openclaw/state/openclaw.sqlite', { readOnly: true });
+  const table = db.prepare("select 1 from sqlite_master where type='table' and name='state_leases'").get();
+  if (!table) {
+    console.log('0');
+    process.exit(0);
+  }
+  const row = db.prepare("select expires_at from state_leases where scope='startup-migrations' and lease_key='global'").get();
+  const expiresAt = Number(row?.expires_at || 0);
+  console.log(String(Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000))));
+} catch (error) {
+  console.error(`Could not inspect the OpenClaw startup-migration lease: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+} finally {
+  try { db?.close(); } catch {}
+}
+NODE
+}
+
+wait_for_openclaw_startup_migration_lease() {
+  local remaining waited=0 max_wait
+  remaining="$(openclaw_startup_migration_lease_remaining_seconds)" || return 1
+  [[ "${remaining}" =~ ^[0-9]+$ ]] || return 1
+  (( remaining == 0 )) && return 0
+  if (( remaining > 315 )); then
+    warn "OpenClaw reported an unexpectedly long startup-migration lease (${remaining}s); refusing to delete or bypass it."
+    return 1
+  fi
+
+  max_wait=$((remaining + 15))
+  info "Waiting up to ${max_wait}s for OpenClaw's orphaned startup-migration lease to expire (the lease is not deleted or bypassed)"
+  while (( waited < max_wait )); do
+    remaining="$(openclaw_startup_migration_lease_remaining_seconds)" || return 1
+    [[ "${remaining}" =~ ^[0-9]+$ ]] || return 1
+    (( remaining == 0 )) && return 0
+    sleep 3
+    waited=$((waited + 3))
+    if (( waited % 30 == 0 )); then
+      progress "OpenClaw migration lease: ${remaining}s remaining"
+    fi
+  done
+  return 1
+}
+
+openclaw_gateway_pid() {
+  systemctl show openclaw-gateway -p MainPID --value 2>/dev/null || true
+}
+
+openclaw_gateway_restart_count() {
+  systemctl show openclaw-gateway -p NRestarts --value 2>/dev/null || true
+}
+
+capture_openclaw_gateway_baseline() {
+  local expected_version="$1"
+  systemctl is-active --quiet openclaw-gateway || return 1
+  openclaw_gateway_http_ready || return 1
+  OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1 || return 1
+  [[ "$(openclaw_gateway_version)" == "${expected_version}" ]] || return 1
+
+  OPENCLAW_BASELINE_PID="$(openclaw_gateway_pid)"
+  OPENCLAW_BASELINE_RESTARTS="$(openclaw_gateway_restart_count)"
+  [[ "${OPENCLAW_BASELINE_PID}" =~ ^[1-9][0-9]*$ && "${OPENCLAW_BASELINE_RESTARTS}" =~ ^[0-9]+$ ]] || return 1
+  return 0
+}
+
+openclaw_startup_checkpoint_matches() {
+  local expected_version="$1"
+  OPENCLAW_EXPECTED_CHECKPOINT_VERSION="${expected_version}" node - <<'NODE' >> "$LOG_FILE" 2>&1
+const { DatabaseSync } = require('node:sqlite');
+const expected = process.env.OPENCLAW_EXPECTED_CHECKPOINT_VERSION;
+let db;
+try {
+  db = new DatabaseSync('/root/.openclaw/state/openclaw.sqlite', { readOnly: true });
+  const row = db.prepare("select app_version from schema_meta where meta_key='startup-migrations'").get();
+  if (row?.app_version !== expected) process.exit(1);
+} catch (error) {
+  console.error(`OpenClaw startup checkpoint check failed: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+} finally {
+  try { db?.close(); } catch {}
+}
+NODE
+}
+
+openclaw_gateway_log_is_clean_since_start() {
+  local started_at
+  started_at="$(systemctl show openclaw-gateway -p ExecMainStartTimestamp --value 2>/dev/null || true)"
+  [[ -n "${started_at}" && "${started_at}" != "n/a" ]] || return 1
+  ! journalctl -u openclaw-gateway --since "${started_at}" --no-pager 2>/dev/null \
+    | grep -Eqi 'refusing to report the gateway ready|startup migrations did not complete cleanly|state lease.*(contention|held|failed)|Main process exited|Failed with result'
+}
+
+verify_openclaw_gateway_stable() {
+  local expected_version="$1"
+  local stability_seconds="${2:-18}"
+  local cli_version gateway_version initial_pid initial_restarts waited=0
+
+  wait_for_openclaw_gateway_http_ready 60 || return 1
+  cli_version="$(openclaw_cli_version)"
+  gateway_version="$(openclaw_gateway_version)"
+  [[ -n "${expected_version}" && "${cli_version}" == "${expected_version}" && "${gateway_version}" == "${expected_version}" ]] || return 1
+  OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1 || return 1
+
+  initial_pid="$(openclaw_gateway_pid)"
+  initial_restarts="$(openclaw_gateway_restart_count)"
+  [[ "${initial_pid}" =~ ^[1-9][0-9]*$ && "${initial_restarts}" =~ ^[0-9]+$ ]] || return 1
+
+  while (( waited < stability_seconds )); do
+    sleep 3
+    waited=$((waited + 3))
+    systemctl is-active --quiet openclaw-gateway || return 1
+    openclaw_gateway_http_ready || return 1
+    [[ "$(openclaw_gateway_pid)" == "${initial_pid}" ]] || return 1
+    [[ "$(openclaw_gateway_restart_count)" == "${initial_restarts}" ]] || return 1
+  done
+
+  OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1 || return 1
+  openclaw_gateway_log_is_clean_since_start || return 1
+  if [[ "${expected_version}" == "${PIN_OPENCLAW_VERSION}" ]]; then
+    openclaw_startup_checkpoint_matches "${expected_version}" || return 1
+  fi
+  return 0
+}
+
+stage_openclaw_rollback_package() {
+  local expected_version="$1"
+  local global_root package_dir backup_dir packed_name packed_path packed_version
+  global_root="$(npm root -g 2>/dev/null || true)"
+  package_dir="${global_root}/openclaw"
+  backup_dir="${UPDATE_RECOVERY_BACKUP_DIR:-/tmp}/openclaw-package"
+  [[ -d "${package_dir}" && -f "${package_dir}/package.json" ]] || return 1
+  mkdir -p "${backup_dir}"
+
+  packed_name="$(cd "${backup_dir}" && npm pack --ignore-scripts --silent "${package_dir}" 2>> "$LOG_FILE" | tail -1)"
+  packed_path="${backup_dir}/${packed_name}"
+  [[ -n "${packed_name}" && -f "${packed_path}" ]] || return 1
+  packed_version="$(tar -xOf "${packed_path}" package/package.json 2>/dev/null \
+    | node -e 'let s=""; process.stdin.on("data", c => s += c); process.stdin.on("end", () => { try { console.log(JSON.parse(s).version || ""); } catch {} });' \
+    | head -1)"
+  if [[ "${packed_version}" != "${expected_version}" ]]; then
+    rm -f "${packed_path}"
+    return 1
+  fi
+  chmod 600 "${packed_path}" 2>/dev/null || true
+  OPENCLAW_ROLLBACK_PACKAGE_TARBALL="${packed_path}"
+  return 0
+}
+
+rollback_openclaw_package_update() {
+  $OPENCLAW_ROLLBACK_IN_PROGRESS && return 1
+  OPENCLAW_ROLLBACK_IN_PROGRESS=true
+  local rollback_ok=true
+  local restart_gateway=false
+  if $OPENCLAW_PACKAGE_UPDATE_ATTEMPTED || $OPENCLAW_PACKAGE_UPDATED || [[ -n "${OPENCLAW_UPGRADE_STATE_MANIFEST:-}" ]]; then
+    restart_gateway=true
+    systemctl stop openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+  fi
+
+  if { $OPENCLAW_PACKAGE_UPDATE_ATTEMPTED || $OPENCLAW_PACKAGE_UPDATED; } && [[ -n "${OPENCLAW_PREUPDATE_VERSION:-}" ]]; then
+    warn "Rolling OpenClaw back to ${OPENCLAW_PREUPDATE_VERSION}"
+    local rollback_source="openclaw@${OPENCLAW_PREUPDATE_VERSION}"
+    if [[ -n "${OPENCLAW_ROLLBACK_PACKAGE_TARBALL:-}" && -f "${OPENCLAW_ROLLBACK_PACKAGE_TARBALL}" ]]; then
+      rollback_source="${OPENCLAW_ROLLBACK_PACKAGE_TARBALL}"
+    fi
+    if ! npm install -g "${rollback_source}" >> "$LOG_FILE" 2>&1; then
+      warn "Could not reinstall OpenClaw ${OPENCLAW_PREUPDATE_VERSION} during automatic rollback."
+      rollback_ok=false
+    fi
+  fi
+
+  if ! restore_prepared_openclaw_state; then
+    warn "Could not restore one or more preserved OpenClaw legacy artifacts automatically."
+    rollback_ok=false
+  fi
+
+  if $restart_gateway; then
+    systemctl start openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+    if [[ -z "${OPENCLAW_PREUPDATE_VERSION:-}" ]] \
+      || ! verify_openclaw_gateway_stable "${OPENCLAW_PREUPDATE_VERSION}" 18; then
+      local restored_version
+      restored_version="$(OPENCLAW_ALLOW_ROOT=1 openclaw --version 2>/dev/null | head -1 | grep -oP '\d{4}\.\d+\.\d+' || true)"
+      warn "OpenClaw rollback health verification failed (expected ${OPENCLAW_PREUPDATE_VERSION:-unknown}, found ${restored_version:-unknown})."
+      systemctl stop openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+      rollback_ok=false
+    fi
+  fi
+
+  if $rollback_ok; then
+    OPENCLAW_PACKAGE_UPDATED=false
+    OPENCLAW_PACKAGE_UPDATE_ATTEMPTED=false
+    ok "Previous OpenClaw runtime restored"
+  fi
+  OPENCLAW_ROLLBACK_IN_PROGRESS=false
+  $rollback_ok
+}
+
 recover_interrupted_update() {
   echo ""
   echo -e "  ${YELLOW}⚠ Update interrupted before portal health verification — recovering portal...${NC}"
+
+  if ! $OPENCLAW_UPGRADE_COMMITTED \
+    && { $OPENCLAW_PACKAGE_UPDATE_ATTEMPTED || $OPENCLAW_PACKAGE_UPDATED || [[ -n "${OPENCLAW_UPGRADE_STATE_MANIFEST:-}" ]]; }; then
+    rollback_openclaw_package_update || warn "OpenClaw needs manual recovery; preserved artifacts and details are in ${UPDATE_RECOVERY_BACKUP_DIR:-$LOG_FILE}."
+  fi
 
   if [[ "${UPDATE_RECOVERY_ROLLBACK_RUNTIME:-false}" == "true" \
         && -n "${UPDATE_RECOVERY_BACKUP_DIR:-}" \
@@ -611,11 +1031,28 @@ update_dependencies() {
     current_oc="$(openclaw --version 2>/dev/null | head -1 | grep -oP '\d{4}\.\d+\.\d+' || echo '')"
     local latest_oc
     latest_oc="${PIN_OPENCLAW_VERSION}"
-    if [[ -n "${latest_oc}" && "${current_oc}" != "${latest_oc}" ]]; then
-      if spin "Updating OpenClaw (${current_oc} → ${latest_oc})" "npm install -g openclaw@${PIN_OPENCLAW_VERSION} 2>/dev/null"; then
-        OPENCLAW_PACKAGE_UPDATED=true
+    if [[ -z "${current_oc}" ]]; then
+      warn "Could not determine the installed OpenClaw version; leaving the package untouched for a safe retry."
+    elif [[ -n "${latest_oc}" && "${current_oc}" != "${latest_oc}" ]]; then
+      if ! capture_openclaw_gateway_baseline "${current_oc}"; then
+        warn "OpenClaw ${current_oc} is not stably ready over HTTP/RPC; leaving its package untouched so the updater cannot make recovery harder."
+      elif ! openclaw_standard_state_is_confirmed; then
+        warn "OpenClaw uses a custom or unverified state layout; leaving ${current_oc} installed rather than risking an unsafe automatic upgrade."
+      elif ! stage_openclaw_rollback_package "${current_oc}"; then
+        warn "Could not preserve a local reinstallable copy of OpenClaw ${current_oc}; leaving it untouched rather than upgrading without rollback insurance."
       else
-        warn "OpenClaw update failed. Continuing with installed version ${current_oc:-unknown}."
+        OPENCLAW_PREUPDATE_VERSION="${current_oc}"
+        OPENCLAW_PACKAGE_UPDATE_ATTEMPTED=true
+        info "Updating OpenClaw (${current_oc} → ${latest_oc})..."
+        # Keep npm in the foreground. The generic spinner backgrounds commands,
+        # which can leave npm racing rollback after SIGINT/TERM.
+        if npm install -g "openclaw@${PIN_OPENCLAW_VERSION}" >> "$LOG_FILE" 2>&1; then
+          OPENCLAW_PACKAGE_UPDATED=true
+          ok "OpenClaw ${latest_oc} package staged (gateway restart deferred)"
+        else
+          OPENCLAW_PACKAGE_UPDATED=true
+          fail "OpenClaw package installation failed or ended in a partial state; automatic rollback is starting from the preserved local package."
+        fi
       fi
     else
       ok "OpenClaw ${current_oc:-unknown} (current)"
@@ -2120,9 +2557,7 @@ ensure_openclaw_gateway_boots_cleanly() {
   fi
 
   systemctl start openclaw-gateway >> "$LOG_FILE" 2>&1 || true
-  sleep 5
-
-  if curl -fsS --max-time 5 http://127.0.0.1:18789/ >/dev/null 2>&1; then
+  if wait_for_openclaw_gateway_http_ready 60; then
     return 0
   fi
 
@@ -2131,9 +2566,7 @@ ensure_openclaw_gateway_boots_cleanly() {
   pkill -f 'openclaw-gateway|/usr/bin/openclaw gateway|/usr/local/bin/openclaw gateway|openclaw$' >> "$LOG_FILE" 2>&1 || true
   sleep 2
   systemctl start openclaw-gateway >> "$LOG_FILE" 2>&1 || true
-  sleep 5
-
-  if curl -fsS --max-time 5 http://127.0.0.1:18789/ >/dev/null 2>&1; then
+  if wait_for_openclaw_gateway_http_ready 60; then
     return 0
   fi
 
@@ -2175,24 +2608,34 @@ ensure_openclaw_gateway_matches_cli() {
   gateway_version="$(openclaw_gateway_version)"
 
   if [[ -n "${cli_version}" && -n "${gateway_version}" && "${cli_version}" == "${gateway_version}" ]]; then
-    ok "OpenClaw gateway ${gateway_version} matches CLI"
-    return 0
+    if OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1; then
+      ok "OpenClaw gateway ${gateway_version} matches CLI"
+      return 0
+    fi
+    warn "OpenClaw gateway version matches, but RPC readiness failed. Restarting once."
+  else
+    warn "OpenClaw gateway version mismatch detected (CLI: ${cli_version:-unknown}, gateway: ${gateway_version:-unknown}). Restarting gateway."
   fi
 
-  warn "OpenClaw gateway version mismatch detected (CLI: ${cli_version:-unknown}, gateway: ${gateway_version:-unknown}). Restarting gateway."
   if ! spin "Restarting OpenClaw gateway for version parity" "systemctl restart openclaw-gateway"; then
     warn "OpenClaw gateway restart failed."
     return 1
   fi
 
-  sleep 4
-  cli_version="$(openclaw_cli_version)"
-  gateway_version="$(openclaw_gateway_version)"
-
-  if [[ -n "${cli_version}" && -n "${gateway_version}" && "${cli_version}" == "${gateway_version}" ]]; then
-    ok "OpenClaw gateway ${gateway_version} matches CLI"
-    return 0
-  fi
+  local waited=0
+  while (( waited < 60 )); do
+    if openclaw_gateway_http_ready; then
+      cli_version="$(openclaw_cli_version)"
+      gateway_version="$(openclaw_gateway_version)"
+      if [[ -n "${cli_version}" && -n "${gateway_version}" && "${cli_version}" == "${gateway_version}" ]] \
+        && OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1; then
+        ok "OpenClaw gateway ${gateway_version} matches CLI"
+        return 0
+      fi
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
 
   warn "OpenClaw gateway still mismatched after restart (CLI: ${cli_version:-unknown}, gateway: ${gateway_version:-unknown})."
   return 1
@@ -2280,12 +2723,17 @@ auto_apply_openclaw_compatibility_hotfix() {
     return 0
   fi
 
-  if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
+  # During a package upgrade the currently running gateway is still the known-
+  # good old version. Keep it alive until every migration prerequisite has been
+  # prepared; the version-parity check performs the one intentional restart.
+  if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1 && ! $OPENCLAW_PACKAGE_UPDATED; then
     if ! spin "Restarting OpenClaw gateway after compatibility hotfix" "systemctl restart openclaw-gateway"; then
       warn "OpenClaw gateway restart after compatibility hotfix failed. Continuing install/update; check ${LOG_FILE}."
       return 0
     fi
     sleep 3
+  elif $OPENCLAW_PACKAGE_UPDATED; then
+    info "Deferring the OpenClaw gateway restart until compatibility preparation is complete"
   fi
 
   ok "OpenClaw compatibility hotfix checked"
@@ -2427,22 +2875,42 @@ PY
 }
 
 prepare_openclaw_runtime_for_portal() {
-  ensure_openclaw_sandbox_image
-  run_openclaw_state_repair_notice
+  if ! prepare_openclaw_upgrade_state; then
+    fail "OpenClaw upgrade stopped before the first new gateway restart because legacy state could not be proven safe. No data was deleted and openclaw doctor --fix was not run."
+  fi
+
+  # Only the byte-level compatibility patch is allowed before the first new
+  # gateway boot. Config/auth/plugin normalization happens after the upgraded
+  # runtime is proven healthy so rollback never mixes old code with new state.
   auto_apply_openclaw_compatibility_hotfix
-  repair_openclaw_portal_model_config
-  bridge_openclaw_codex_cli_auth
-  ensure_openclaw_codex_plugin_compatible
-  configure_openclaw_codex_harness_defaults
+  if $OPENCLAW_PACKAGE_UPDATED && [[ "$(openclaw_cli_version)" != "${PIN_OPENCLAW_VERSION}" ]]; then
+    fail "OpenClaw package staging did not produce the pinned ${PIN_OPENCLAW_VERSION} CLI. The updater will restore the preserved previous runtime."
+  fi
   if ! ensure_openclaw_gateway_boots_cleanly; then
     fail "OpenClaw gateway did not boot cleanly after Portal compatibility preparation. Check: journalctl -u openclaw-gateway -n 100 --no-pager"
   fi
   if ! ensure_openclaw_gateway_matches_cli; then
-    if $OPENCLAW_PACKAGE_UPDATED; then
-      fail "OpenClaw was updated, but the gateway did not restart into the installed version. Check: systemctl status openclaw-gateway"
-    fi
-    warn "OpenClaw gateway version parity could not be verified. Continuing with existing runtime."
+    fail "OpenClaw gateway version/RPC readiness could not be verified. The updater will restore the previous OpenClaw runtime when applicable. Check: systemctl status openclaw-gateway"
   fi
+  if $OPENCLAW_PACKAGE_UPDATED || [[ -n "${OPENCLAW_UPGRADE_STATE_MANIFEST:-}" ]]; then
+    local expected_gateway_version
+    expected_gateway_version="$(openclaw_cli_version)"
+    $OPENCLAW_PACKAGE_UPDATED && expected_gateway_version="${PIN_OPENCLAW_VERSION}"
+    if ! verify_openclaw_gateway_stable "${expected_gateway_version}" 18; then
+      fail "OpenClaw gateway did not remain ready and restart-free through the post-upgrade stability window. The updater will restore the previous runtime."
+    fi
+  fi
+  # From this point the new gateway has passed HTTP readiness, version parity,
+  # and an authenticated RPC status check. Later Portal-only recovery must not
+  # unwind a completed OpenClaw migration.
+  OPENCLAW_UPGRADE_COMMITTED=true
+
+  ensure_openclaw_sandbox_image
+  run_openclaw_state_repair_notice
+  repair_openclaw_portal_model_config
+  bridge_openclaw_codex_cli_auth
+  ensure_openclaw_codex_plugin_compatible
+  configure_openclaw_codex_harness_defaults
 }
 
 configure_backup_timers() {
