@@ -1,5 +1,10 @@
 import nodemailer from 'nodemailer';
 import { prisma } from '../config/database';
+import { decryptSecret } from '../utils/authSecrets';
+import {
+  assertPortalFeatureAvailable,
+  getPortalFeatureCapabilities,
+} from '../utils/portalFeatureCapabilities';
 
 type SendEmailInput = {
   to: string;
@@ -18,6 +23,15 @@ type EmailConfig = {
   fromName: string;
   fromEmail: string;
 };
+
+function escapeHtml(value: unknown): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 async function loadSmtpSettings(): Promise<EmailConfig> {
   const keys = [
@@ -41,7 +55,7 @@ async function loadSmtpSettings(): Promise<EmailConfig> {
   const port = Number.parseInt(map['smtp.port'] || '587', 10) || 587;
   const secure = map['smtp.secure'] === 'true';
   const user = map['smtp.user'] || '';
-  const password = map['smtp.password'] || '';
+  const password = map['smtp.password'] ? decryptSecret(map['smtp.password']) : '';
   const fromName = map['smtp.fromName'] || 'Bridges Portal';
   const fromEmail = map['smtp.fromEmail'] || user || '';
 
@@ -72,6 +86,10 @@ export async function getEmailConfig() {
 }
 
 export async function sendEmail({ to, subject, html, text }: SendEmailInput): Promise<void> {
+  // Fail before loading persisted SMTP credentials. Critical callers can
+  // distinguish this typed capability error from an attempted delivery.
+  assertPortalFeatureAvailable('mail');
+
   const cfg = await loadSmtpSettings();
 
   if (!cfg.configured) {
@@ -94,6 +112,8 @@ export async function sendEmail({ to, subject, html, text }: SendEmailInput): Pr
     subject,
     text: text || ' ',
     html: html || text || ' ',
+    disableFileAccess: true,
+    disableUrlAccess: true,
   });
 }
 
@@ -124,6 +144,7 @@ async function isNotificationEnabled(key: string): Promise<boolean> {
 }
 
 export async function sendJobFailedAlert(userId: string, jobTitle: string, toolId: string, error: string): Promise<void> {
+  if (!getPortalFeatureCapabilities().mail.available) return;
   const notify = await isNotificationEnabled('notifications.systemAlerts');
   if (!notify) return;
 
@@ -143,16 +164,17 @@ export async function sendJobFailedAlert(userId: string, jobTitle: string, toolI
     html: `
       <p><strong>An agent job exited with an error.</strong></p>
       <ul>
-        <li><strong>User ID:</strong> ${userId}</li>
-        <li><strong>Job Title:</strong> ${jobTitle || '(untitled)'}</li>
-        <li><strong>Tool:</strong> ${toolId}</li>
-        <li><strong>Error:</strong> ${error}</li>
+        <li><strong>User ID:</strong> ${escapeHtml(userId)}</li>
+        <li><strong>Job Title:</strong> ${escapeHtml(jobTitle || '(untitled)')}</li>
+        <li><strong>Tool:</strong> ${escapeHtml(toolId)}</li>
+        <li><strong>Error:</strong> ${escapeHtml(error)}</li>
       </ul>
     `,
   })));
 }
 
 export async function sendDiskAlert(percentUsed: number): Promise<void> {
+  if (!getPortalFeatureCapabilities().mail.available) return;
   const notify = await isNotificationEnabled('notifications.systemAlerts');
   if (!notify) return;
 
@@ -168,6 +190,7 @@ export async function sendDiskAlert(percentUsed: number): Promise<void> {
 }
 
 export async function sendNewUserAlert(email: string, username: string): Promise<void> {
+  if (!getPortalFeatureCapabilities().mail.available) return;
   const notify = await isNotificationEnabled('notifications.newRegistration');
   if (!notify) return;
 
@@ -178,6 +201,6 @@ export async function sendNewUserAlert(email: string, username: string): Promise
     to,
     subject: 'New user registration request',
     text: `A new user registration request was submitted.\n\nEmail: ${email}\nUsername/Name: ${username}`,
-    html: `<p><strong>New user registration request submitted.</strong></p><p>Email: ${email}<br/>Username/Name: ${username}</p>`,
+    html: `<p><strong>New user registration request submitted.</strong></p><p>Email: ${escapeHtml(email)}<br/>Username/Name: ${escapeHtml(username)}</p>`,
   })));
 }

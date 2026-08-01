@@ -134,6 +134,43 @@ export const sounds = {
     });
   },
 
+  // Agent is waiting on you - warm rising arpeggio with a soft bloom on top.
+  // Deliberately distinct from `notification`, which falls: this one asks.
+  question: () => {
+    if (!isSoundEnabled()) return;
+    const ctx = getCtx();
+    if (!ctx) return;
+    const start = ctx.currentTime;
+    // C5 - E5 - G5, each brief, overlapping just enough to read as one chord.
+    [523.25, 659.25, 783.99].forEach((frequency, index) => {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      const at = start + (index * 0.055);
+      g.gain.setValueAtTime(0, at);
+      g.gain.linearRampToValueAtTime(0.16 * masterVolume, at + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, at + 0.42);
+      g.connect(ctx.destination);
+      osc.type = 'triangle';
+      osc.frequency.value = frequency;
+      osc.connect(g);
+      osc.start(at);
+      osc.stop(at + 0.45);
+    });
+    // A quiet octave above the last note so the tail shimmers instead of thuds.
+    const bloom = ctx.createOscillator();
+    const bloomGain = ctx.createGain();
+    const bloomAt = start + 0.11;
+    bloomGain.gain.setValueAtTime(0, bloomAt);
+    bloomGain.gain.linearRampToValueAtTime(0.05 * masterVolume, bloomAt + 0.03);
+    bloomGain.gain.exponentialRampToValueAtTime(0.0001, bloomAt + 0.55);
+    bloomGain.connect(ctx.destination);
+    bloom.type = 'sine';
+    bloom.frequency.value = 1567.98;
+    bloom.connect(bloomGain);
+    bloom.start(bloomAt);
+    bloom.stop(bloomAt + 0.58);
+  },
+
   // Notification - gentle ping (like a message received)
   notification: () => {
     if (!isSoundEnabled()) return;

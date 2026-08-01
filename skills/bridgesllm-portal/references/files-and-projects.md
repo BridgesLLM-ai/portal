@@ -1,129 +1,89 @@
-# Files, Projects & Apps
+# Files, Projects, Apps, and shares
 
-## Contents
-- [File Manager](#file-manager) — Upload, browse, download files
-- [Projects](#projects) — Web IDE with git, deploy
-- [Apps](#apps) — Deploy projects as running applications
-- [Common File Paths](#common-file-paths-for-agents) — Where to find everything
+These surfaces have different ownership and storage contracts. Do not treat them as interchangeable host paths.
 
-## File Manager
+## Files
 
-Portal page: `/files`. User file uploads with per-user isolation.
+Files is the authenticated user's isolated library, not a server filesystem browser.
 
-### Storage Layout
-```
-/var/portal-files/
-  └── user-<uuid>/
-      └── uploads/          # All uploaded files
-```
+Start with:
 
-- Max upload: 500MB per file
-- Virus scanning on upload (ClamAV if available)
-- Thumbnail generation for images
-- Files tracked in PostgreSQL (`File` model) with metadata
+- GET /api/files/upload-config for current limits and upload mode.
+- GET /api/files for the user's records.
+- GET /api/files/resolve when resolving an owned file reference.
 
-### Backend API (`/api/files/`)
-- `GET /` — List files (query: `?search=`, `?sort=`, `?order=`)
-- `POST /` — Upload file (multipart, field: `file`)
-- `GET /<id>/content` — Get file content (inline)
-- `GET /<id>/download` — Download file
-- `GET /<id>/thumbnail` — Get thumbnail (images only)
-- `DELETE /<id>` — Delete file
-- `POST /batch-delete` — Bulk delete (`{ids: [...]}`)
-- `PATCH /<id>/rename` — Rename file (`{name}`)
-- `POST /<id>/copy-to-project` — Copy file into a project
-- `POST /sync` — Sync files from disk (re-scan upload dir)
-- `GET /upload-config` — Get upload limits
+Normal multipart upload uses POST /api/files. Large upload uses the resumable /api/upload flow:
+
+1. POST /api/upload/init
+2. POST /api/upload/chunk with the issued upload ID and chunk index
+3. pause/resume/status as needed
+4. POST /api/upload/complete
+5. DELETE /api/upload/:uploadId to cancel
+
+The server currently advertises up to 2 GiB through upload-config, but trust the returned limit rather than this document. Completed files are scanned before they become usable.
+
+Use file IDs and Portal content/download routes. Do not guess /var paths, construct another user's directory, or hand a host path to an agent.
 
 ## Projects
 
-Portal page: `/projects`. Full web IDE with git integration.
+Projects are actor-scoped working trees with server-owned immutable identities.
 
-### Storage Layout
-```
-/portal/projects/            # Project directories (git repos)
-  └── my-project/
-      ├── .git/
-      ├── src/
-      └── package.json
-/portal/project-zips/        # Upload staging for ZIP imports
-```
+Core routes:
 
-### Backend API (`/api/projects/`)
+- GET/POST /api/projects
+- POST /api/projects/clone
+- tree/file/raw/upload/download routes under /api/projects/:name
+- POST /api/projects/:name/git
+- check, dependency, deploy, process, activity, share, and Project Chat routes
 
-#### CRUD
-- `GET /` — List all projects
-- `POST /` — Create project (`{name, template?, description?}`)
-- `POST /clone` — Clone from git URL (`{url, name?}`)
-- `DELETE /<name>` — Delete project
-- `PATCH /<name>/rename` — Rename (`{newName}`)
+Rules:
 
-#### File Operations
-- `GET /<name>/tree` — Get file tree
-- `GET /<name>/file?path=<path>` — Read file content
-- `PUT /<name>/file` — Update file (`{path, content}`)
-- `POST /<name>/file` — Create file (`{path, content}`)
-- `DELETE /<name>/file?path=<path>` — Delete file
-- `GET /<name>/raw/<path>` — Raw file access (browser-viewable, auth via cookie)
+- Resolve every file beneath the selected project.
+- Do not expose or modify server-owned project identity metadata.
+- Use compare/race-safe editor operations and re-read after save.
+- ZIP imports are staged, scanned, bounded, and extracted without links or traversal.
+- Project activity is project-bound, not a global host transcript.
+- Deletion must quiesce turns, workloads, provider state, and egress resources before removing the project.
 
-#### Git Operations
-- `POST /<name>/git` — Execute git operation
-  - `{action: 'status'}` — Working tree status
-  - `{action: 'log', limit?}` — Commit log
-  - `{action: 'diff', cached?}` — Show diff
-  - `{action: 'add', paths?}` — Stage files
-  - `{action: 'commit', message}` — Commit
-  - `{action: 'push', remote?, branch?}` — Push
-  - `{action: 'pull', remote?, branch?}` — Pull
-  - `{action: 'branches'}` — List branches
-  - `{action: 'checkout', branch, create?}` — Switch branch
-  - `{action: 'remote'}` — List remotes
+## Legacy projects and lifecycle recovery
 
-#### Deployment
-- `POST /<name>/check` — Detect deploy type (static, node, python)
-- `GET /<name>/check-deps` — Check if dependencies installed
-- `POST /<name>/install-deps` — Install dependencies (npm/pip)
+Projects preserved from 3.x remain visible with their files and any exactly associated Apps, but they are not automatically promoted into the 4.0 identity boundary. While preserved 3.x OpenClaw evidence exists, Project Chat, rename, delete, and other destructive Project-level operations remain unavailable. Do not call the legacy-adoption route, edit identity records, or recreate the Project as a workaround; preserve the files and use the available non-destructive surfaces until the lineage can be resolved safely.
 
-#### Upload
-- `POST /upload-zip` — Upload ZIP file
-- `POST /create-from-upload` — Extract ZIP into project
-- `POST /<name>/upload` — Upload files into project (max 50 files)
+For Projects created or safely admitted under the 4.0 identity boundary, lifecycle states converge automatically: a Project stuck in RENAMING or DELETING after an interrupted operation is rolled forward or back by expired-lease recovery on a later touching request. Re-read the Project list before attempting manual repair.
 
-## Apps
+## Git, dependencies, and deployment
 
-Portal page: `/apps`. Deploy projects as running applications.
+Networked Git and dependency installation run in attested Portal workload containers with brokered public egress. Local-only Git uses no network.
 
-### Storage Layout
-```
-/portal/apps/               # Deployed app files
-/var/www/bridgesllm-apps/   # Static site deployments
-```
+- Validate remote URL and current branch/status before pull, push, or checkout.
+- Never add private-network exceptions to make a Git host work.
+- Dependency install uses project-local state; no host package-manager shortcut.
+- Deployment builds in a staged tree.
+- Full-stack promotion keeps the previous release until the replacement starts successfully.
+- Failure rolls back and restarts the previous app.
+- Verify app status and the public/share route after deployment.
 
-### Deploy Types
-- **Static**: HTML/CSS/JS → served by Caddy at `<domain>/apps/<slug>/`
-- **Node**: Node.js app → process manager allocates port, Caddy proxies
-- **Python**: Python app → similar to Node
+## Apps and shares
 
-### Backend API (`/api/apps/`)
-Apps are deployed from projects. The deployment process copies files, installs dependencies, and starts the process (for dynamic apps).
+Apps are separate persisted deployments. /api/apps lists, uploads, deletes, and creates share links.
 
-## Common File Paths for Agents
+Project shares live under /api/projects/:name/share and /shares. They can carry expiration, password, download, and API-access policy. Read the saved policy and test an unauthenticated or wrong-password negative case before calling a share ready.
 
-| Purpose | Path |
-|---------|------|
-| Portal source | `/opt/bridgesllm/portal/` |
-| Backend source | `/opt/bridgesllm/portal/backend/src/` |
-| Frontend source | `/opt/bridgesllm/portal/frontend/src/` |
-| Built backend | `/opt/bridgesllm/portal/backend/dist/` |
-| Built frontend | `/opt/bridgesllm/portal/frontend/dist/` |
-| User uploads | `/var/portal-files/user-<uuid>/uploads/` |
-| Projects | `/portal/projects/` |
-| Deployed apps | `/portal/apps/` |
-| Portal env | `/opt/bridgesllm/portal/backend/.env.production` |
-| Caddy config | `/etc/caddy/Caddyfile` |
-| Portal DB | PostgreSQL via `DATABASE_URL` in env |
-| OpenClaw workspace | Configured OpenClaw workspace directory |
-| OpenClaw config | `/root/.openclaw/openclaw.json` |
-| Portal service | `/etc/systemd/system/bridgesllm-product.service` |
-| VNC service | `/etc/systemd/system/bridges-rd-xtigervnc.service` |
-| Websockify service | `/etc/systemd/system/bridges-rd-websockify.service` |
+Never embed a Portal session cookie, internal port, filesystem path, or private upstream address in a share.
+
+## Project Chat attachments
+
+Attachments are:
+
+- malware-scanned;
+- bound to actor, immutable project, and provider;
+- copied to .portal/attachments/<uuid>/ inside that project;
+- referenced to the provider only by project_path.
+
+Never pass a host absolute path, signed Portal URL, /api/files URL, or another project attachment.
+
+## Storage discovery
+
+Installations can relocate Portal data with environment/configuration. The common surfaces include a File library root, Project root, Apps root, upload/chunk staging, PostgreSQL, and external service state, but paths are not part of the user API.
+
+For normal work, discover through Portal responses. For operator diagnosis, inspect the active service environment without printing secrets. Do not assume /portal, /opt/bridgesllm, or /var/portal-files is universal.

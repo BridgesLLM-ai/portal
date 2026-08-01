@@ -1,6 +1,8 @@
-import { motion, AnimatePresence } from 'framer-motion';
+import { useId, useRef } from 'react';
+import { motion } from 'framer-motion';
 import { X, Keyboard } from 'lucide-react';
 import { GLOBAL_SHORTCUTS, formatShortcut } from '../hooks/useKeyboardShortcuts';
+import ViewportModal from './ViewportModal';
 
 interface KeyboardShortcutsHelpProps {
   isOpen: boolean;
@@ -8,32 +10,34 @@ interface KeyboardShortcutsHelpProps {
 }
 
 export default function KeyboardShortcutsHelp({ isOpen, onClose }: KeyboardShortcutsHelpProps) {
+  const titleId = useId();
+  const closeRef = useRef<HTMLButtonElement>(null);
+
   if (!isOpen) return null;
 
   const categories = [
     { key: 'general', label: 'General' },
     { key: 'editor', label: 'Code Editor' },
-    { key: 'fileTree', label: 'File Tree' },
+    { key: 'projects', label: 'Projects' },
     { key: 'terminal', label: 'Terminal' },
   ];
 
   return (
-    <AnimatePresence>
+    <ViewportModal
+      open={isOpen}
+      onDismiss={onClose}
+      initialFocusRef={closeRef}
+      className="bg-black/60 p-4 backdrop-blur-sm"
+    >
       <motion.div
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-        className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
-        onClick={onClose}
+        initial={{ scale: 0.95, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        transition={{ type: 'spring', damping: 25, stiffness: 300 }}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="flex max-h-[calc(100dvh-2rem)] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-theme-border bg-theme-surface text-theme-text shadow-2xl backdrop-blur-2xl"
       >
-        <motion.div
-          initial={{ scale: 0.95, opacity: 0 }}
-          animate={{ scale: 1, opacity: 1 }}
-          exit={{ scale: 0.95, opacity: 0 }}
-          transition={{ type: 'spring', damping: 25, stiffness: 300 }}
-          className="w-full max-w-3xl bg-[#0A0E27]/95 border border-white/10 rounded-2xl shadow-2xl overflow-hidden backdrop-blur-2xl"
-          onClick={e => e.stopPropagation()}
-        >
           {/* Header */}
           <div className="flex items-center justify-between px-6 py-4 border-b border-white/5">
             <div className="flex items-center gap-3">
@@ -41,13 +45,15 @@ export default function KeyboardShortcutsHelp({ isOpen, onClose }: KeyboardShort
                 <Keyboard size={20} className="text-emerald-400" />
               </div>
               <div>
-                <h2 className="text-lg font-bold text-white">Keyboard Shortcuts</h2>
-                <p className="text-xs text-slate-500">Master the Portal like a pro</p>
+                <h2 id={titleId} className="text-lg font-bold text-theme-text">Keyboard Shortcuts</h2>
+                <p className="text-xs text-slate-500">Implemented keyboard controls by workspace</p>
               </div>
             </div>
             <button
+              ref={closeRef}
+              type="button"
               onClick={onClose}
-              className="p-2 rounded-lg hover:bg-white/5 text-slate-500 hover:text-white transition-colors"
+              className="p-2 rounded-lg hover:bg-theme-surface-hover text-theme-text-muted hover:text-theme-text transition-colors"
               aria-label="Close"
             >
               <X size={20} />
@@ -55,7 +61,7 @@ export default function KeyboardShortcutsHelp({ isOpen, onClose }: KeyboardShort
           </div>
 
           {/* Content */}
-          <div className="max-h-[70vh] overflow-auto p-6">
+          <div className="min-h-0 flex-1 overflow-auto p-6">
             <div className="grid md:grid-cols-2 gap-6">
               {categories.map(({ key, label }) => (
                 <div key={key}>
@@ -86,7 +92,7 @@ export default function KeyboardShortcutsHelp({ isOpen, onClose }: KeyboardShort
               <h4 className="text-sm font-bold text-emerald-400 mb-2">💡 Pro Tips</h4>
               <ul className="space-y-1 text-xs text-slate-400">
                 <li>• Press <kbd className="px-1 py-0.5 rounded bg-slate-800 text-emerald-400">Shift ?</kbd> anytime to show this help</li>
-                <li>• Most actions support both mouse and keyboard</li>
+                <li>• Page-specific shortcuts are active only in the workspace named above</li>
                 <li>• Touch gestures available on mobile (swipe, long press, pinch)</li>
                 <li>• Tab key navigates between interactive elements</li>
               </ul>
@@ -96,10 +102,9 @@ export default function KeyboardShortcutsHelp({ isOpen, onClose }: KeyboardShort
           {/* Footer */}
           <div className="px-6 py-3 border-t border-white/5 flex items-center justify-between text-xs text-slate-600">
             <span>Press ESC to close</span>
-            <span>Shortcuts reflect the controls currently available in this build.</span>
+            <span>Only implemented controls are listed; availability depends on the current page.</span>
           </div>
-        </motion.div>
       </motion.div>
-    </AnimatePresence>
+    </ViewportModal>
   );
 }

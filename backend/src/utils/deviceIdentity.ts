@@ -1,9 +1,27 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { ensureRuntimeDirectory } from './runtimeDirectory';
 
-// Store in portal projects dir — persistent rw volume mount
-const DEVICE_KEYS_PATH = path.join(process.env.PORTAL_ROOT || '/portal', 'projects/.openclaw-portal-device.json');
+export interface DeviceIdentityStorageOptions {
+  deviceKeysPath?: string;
+  portalRoot?: string;
+}
+
+// Store in portal projects dir — persistent rw volume mount.
+export function resolveDeviceKeysPath(options: DeviceIdentityStorageOptions = {}): string {
+  const portalRoot = path.resolve(
+    options.portalRoot || process.env.PORTAL_DATA_ROOT || process.env.PORTAL_ROOT || '/portal',
+  );
+  const projectsRoot = options.portalRoot
+    ? path.join(portalRoot, 'projects')
+    : path.resolve(process.env.PORTAL_PROJECTS_ROOT || path.join(portalRoot, 'projects'));
+  return path.resolve(
+    options.deviceKeysPath
+      || process.env.PORTAL_DEVICE_KEYS_PATH
+      || path.join(projectsRoot, '.openclaw-portal-device.json'),
+  );
+}
 
 export interface DeviceKeys {
   deviceId: string;
@@ -36,13 +54,6 @@ interface Ed25519Jwk {
   d?: string;
 }
 
-function ensureParentDir(filePath: string): void {
-  const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-}
-
 function isValidDeviceKeys(value: any): value is DeviceKeys {
   return Boolean(
     value
@@ -68,7 +79,7 @@ function buildDeviceIdFromPublicKey(publicKeyB64Url: string): string {
   return crypto.createHash('sha256').update(pub).digest('hex');
 }
 
-function generateDeviceKeys(): DeviceKeys {
+function generateDeviceKeys(filePath: string): DeviceKeys {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
 
   const publicJwk = publicKey.export({ format: 'jwk' }) as Ed25519Jwk;
@@ -84,25 +95,44 @@ function generateDeviceKeys(): DeviceKeys {
     privateKey: privateJwk.d,
   };
 
-  ensureParentDir(DEVICE_KEYS_PATH);
-  fs.writeFileSync(DEVICE_KEYS_PATH, JSON.stringify(keys, null, 2), { mode: 0o600 });
+  const parent = ensureRuntimeDirectory(path.dirname(filePath), { mode: 0o700 });
+  const tempPath = path.join(parent, `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`);
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(keys, null, 2), { mode: 0o600, flag: 'wx' });
+    fs.renameSync(tempPath, filePath);
+    fs.chmodSync(filePath, 0o600);
+  } finally {
+    try { fs.unlinkSync(tempPath); } catch {}
+  }
   return keys;
 }
 
-export function getOrCreateDeviceKeys(): DeviceKeys {
+export function getOrCreateDeviceKeys(options: DeviceIdentityStorageOptions = {}): DeviceKeys {
+  const deviceKeysPath = resolveDeviceKeysPath(options);
+  let existing: fs.Stats | undefined;
   try {
-    if (fs.existsSync(DEVICE_KEYS_PATH)) {
-      const parsed = JSON.parse(fs.readFileSync(DEVICE_KEYS_PATH, 'utf8'));
+    existing = fs.lstatSync(deviceKeysPath);
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  if (existing) {
+    if (existing.isSymbolicLink() || !existing.isFile()) {
+      throw new Error('Gateway device key path is not a regular file');
+    }
+    try {
+      const parsed = JSON.parse(fs.readFileSync(deviceKeysPath, 'utf8'));
       if (isValidDeviceKeys(parsed)) {
+        fs.chmodSync(deviceKeysPath, 0o600);
         return parsed;
       }
       console.warn('[Gateway RPC] Device key file invalid, regenerating keys');
+    } catch (error: any) {
+      console.warn(`[Gateway RPC] Failed to read device key file, regenerating keys: ${error?.message || error}`);
     }
-  } catch (error: any) {
-    console.warn(`[Gateway RPC] Failed to read device key file, regenerating keys: ${error?.message || error}`);
   }
 
-  const keys = generateDeviceKeys();
+  const keys = generateDeviceKeys(deviceKeysPath);
   console.log(`[Gateway RPC] Generated portal device identity: ${keys.deviceId}`);
   return keys;
 }

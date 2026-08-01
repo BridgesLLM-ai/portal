@@ -22,6 +22,28 @@ interface PortalApp {
   shareLinks?: AppShareLink[];
 }
 
+type AppShareAvailability = 'active' | 'disabled' | 'expired' | 'exhausted';
+
+function appShareAvailability(link: AppShareLink, now = Date.now()): AppShareAvailability {
+  if (link.expiresAt) {
+    const expiresAt = new Date(link.expiresAt).getTime();
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) return 'expired';
+  }
+  if (link.maxUses !== null && link.maxUses !== undefined && (link.currentUses || 0) >= link.maxUses) return 'exhausted';
+  return link.isActive ? 'active' : 'disabled';
+}
+
+function isUsableShareLink(link: AppShareLink, now = Date.now()): boolean {
+  return appShareAvailability(link, now) === 'active';
+}
+
+function appShareAvailabilityLabel(availability: AppShareAvailability): string {
+  if (availability === 'expired') return 'Expired';
+  if (availability === 'exhausted') return 'Limit reached';
+  if (availability === 'disabled') return 'Disabled';
+  return 'Active';
+}
+
 function timeAgo(dateStr: string) {
   const d = new Date(dateStr);
   const now = new Date();
@@ -45,6 +67,8 @@ export default function AppsLibraryPage() {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [file, setFile] = useState<File | null>(null);
+  const [shareExpiresAt, setShareExpiresAt] = useState('');
+  const [shareMaxUses, setShareMaxUses] = useState('');
 
   const loadApps = useCallback(async () => {
     setLoading(true);
@@ -78,6 +102,10 @@ export default function AppsLibraryPage() {
     e.preventDefault();
     if (!file) {
       setError('Choose a ZIP file to upload');
+      return;
+    }
+    if (name.trim().length > 120 || description.trim().length > 4_000) {
+      setError('App names are limited to 120 characters and descriptions to 4000 characters');
       return;
     }
 
@@ -117,15 +145,34 @@ export default function AppsLibraryPage() {
   };
 
   const handleCreateShare = async (app: PortalApp) => {
+    const expiresAt = shareExpiresAt ? new Date(shareExpiresAt) : null;
+    if (expiresAt && (!Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now())) {
+      setError('Share expiration must be in the future');
+      return;
+    }
+    const maxUses = shareMaxUses ? Number(shareMaxUses) : null;
+    if (maxUses !== null && (!Number.isSafeInteger(maxUses) || maxUses < 1 || maxUses > 1_000_000)) {
+      setError('Share visit limit must be a whole number from 1 to 1,000,000');
+      return;
+    }
     setWorkingAppId(app.id);
     setError('');
     setNotice('');
     try {
-      const data = await appsAPI.createShareLink(app.id);
+      const data = await appsAPI.createShareLink(app.id, {
+        ...(expiresAt ? { expiresAt: expiresAt.toISOString() } : {}),
+        ...(maxUses !== null ? { maxUses } : {}),
+      });
       const fullUrl = `${window.location.origin}${data.url}`;
-      await navigator.clipboard.writeText(fullUrl);
-      setNotice(`Share link copied for ${app.name}`);
       await loadApps();
+      setShareExpiresAt('');
+      setShareMaxUses('');
+      try {
+        await navigator.clipboard.writeText(fullUrl);
+        setNotice(`Share link created and copied for ${app.name}`);
+      } catch {
+        setNotice(`Share link created for ${app.name}. Use its Copy button to copy it.`);
+      }
     } catch (err: any) {
       setError(err?.response?.data?.error || 'Failed to create share link');
     } finally {
@@ -135,8 +182,50 @@ export default function AppsLibraryPage() {
 
   const copyShareLink = async (token: string) => {
     const fullUrl = `${window.location.origin}/share/${token}`;
-    await navigator.clipboard.writeText(fullUrl);
-    setNotice('Share link copied');
+    try {
+      await navigator.clipboard.writeText(fullUrl);
+      setNotice('Share link copied');
+    } catch {
+      setError('Clipboard access is unavailable. Copy the visible link manually.');
+    }
+  };
+
+  const handleToggleShare = async (app: PortalApp, link: AppShareLink) => {
+    const availability = appShareAvailability(link);
+    if (availability === 'expired' || availability === 'exhausted') {
+      setError(availability === 'expired'
+        ? 'Expired links cannot be reactivated; create a new link.'
+        : 'Links that reached their visit limit cannot be reactivated; create a new link.');
+      return;
+    }
+    setWorkingAppId(app.id);
+    setError('');
+    setNotice('');
+    try {
+      await appsAPI.updateShareLink(app.id, link.id, !link.isActive);
+      setNotice(link.isActive ? 'Share link disabled' : 'Share link enabled');
+      await loadApps();
+    } catch (err: any) {
+      setError(err?.response?.data?.error || 'Failed to update share link');
+    } finally {
+      setWorkingAppId(null);
+    }
+  };
+
+  const handleDeleteShare = async (app: PortalApp, link: AppShareLink) => {
+    if (!window.confirm('Delete this share link permanently? Existing recipients will lose access.')) return;
+    setWorkingAppId(app.id);
+    setError('');
+    setNotice('');
+    try {
+      await appsAPI.deleteShareLink(app.id, link.id);
+      setNotice('Share link deleted');
+      await loadApps();
+    } catch (err: any) {
+      setError(err?.response?.data?.error || 'Failed to delete share link');
+    } finally {
+      setWorkingAppId(null);
+    }
   };
 
   return (
@@ -181,6 +270,35 @@ export default function AppsLibraryPage() {
                 {sortedApps.length} {sortedApps.length === 1 ? 'app' : 'apps'}
               </div>
             </div>
+            <div className="grid gap-3 border-b border-white/10 bg-black/10 px-5 py-4 sm:grid-cols-2">
+              <label className="space-y-1.5 text-xs text-slate-400">
+                <span>New-link expiration (optional)</span>
+                <input
+                  aria-label="New app share expiration"
+                  type="datetime-local"
+                  value={shareExpiresAt}
+                  onChange={(event) => setShareExpiresAt(event.target.value)}
+                  className="min-h-[44px] w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+                />
+              </label>
+              <label className="space-y-1.5 text-xs text-slate-400">
+                <span>New-link visit limit (optional)</span>
+                <input
+                  aria-label="New app share visit limit"
+                  type="number"
+                  min={1}
+                  max={1_000_000}
+                  step={1}
+                  value={shareMaxUses}
+                  onChange={(event) => setShareMaxUses(event.target.value)}
+                  placeholder="Unlimited"
+                  className="min-h-[44px] w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+                />
+              </label>
+              <p className="text-xs text-slate-500 sm:col-span-2">
+                These controls apply to the next link you create. Visit limits count granted browser visits, not page views.
+              </p>
+            </div>
 
             {loading ? (
               <div className="flex items-center justify-center py-20 text-slate-400 gap-3">
@@ -199,16 +317,15 @@ export default function AppsLibraryPage() {
             ) : (
               <div className="divide-y divide-white/8">
                 {sortedApps.map((app) => {
-                  const activeShare = app.shareLinks?.find((link) => link.isActive);
+                  const usableShares = app.shareLinks?.filter((link) => isUsableShareLink(link)) || [];
                   const working = workingAppId === app.id;
-                  const shareUrl = activeShare ? `${window.location.origin}/share/${activeShare.token}` : null;
                   return (
                     <div key={app.id} className="px-5 py-4">
                       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                         <div className="min-w-0">
                           <div className="flex items-center gap-2 flex-wrap">
                             <h3 className="text-base font-medium text-white break-all">{app.name}</h3>
-                            {activeShare && (
+                            {usableShares.length > 0 && (
                               <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[11px] text-emerald-200">
                                 Shared
                               </span>
@@ -220,19 +337,71 @@ export default function AppsLibraryPage() {
                           <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500">
                             <span>Updated {timeAgo(app.updatedAt)}</span>
                             <span>Created {new Date(app.createdAt).toLocaleDateString()}</span>
-                            {app.shareLinks?.length ? <span>{app.shareLinks.length} active share link{app.shareLinks.length === 1 ? '' : 's'}</span> : null}
+                            {app.shareLinks?.length ? (
+                              <span>{usableShares.length} usable / {app.shareLinks.length} total share link{app.shareLinks.length === 1 ? '' : 's'}</span>
+                            ) : null}
                           </div>
-                          {shareUrl && (
-                            <div className="mt-3 flex items-center gap-2 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-300 overflow-hidden">
-                              <span className="truncate flex-1">{shareUrl}</span>
-                              <button onClick={() => copyShareLink(activeShare!.token)} className="rounded-lg p-1.5 text-slate-300 hover:bg-white/10 hover:text-white" title="Copy share link">
-                                <Copy size={14} />
-                              </button>
-                              <a href={shareUrl} target="_blank" rel="noopener noreferrer" className="rounded-lg p-1.5 text-slate-300 hover:bg-white/10 hover:text-white" title="Open share link">
-                                <ExternalLink size={14} />
-                              </a>
+                          {app.shareLinks?.length ? (
+                            <div className="mt-3 space-y-2" aria-label={`Share links for ${app.name}`}>
+                              {app.shareLinks.map((link) => {
+                                const availability = appShareAvailability(link);
+                                const usable = availability === 'active';
+                                const shareUrl = `${window.location.origin}/share/${link.token}`;
+                                return (
+                                  <div key={link.id} className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-300">
+                                    <div className="flex min-w-0 items-center gap-2">
+                                      <span className="min-w-0 flex-1 truncate">{shareUrl}</span>
+                                      <span className={usable ? 'text-emerald-300' : 'text-amber-300'}>{appShareAvailabilityLabel(availability)}</span>
+                                      <button
+                                        type="button"
+                                        onClick={() => copyShareLink(link.token)}
+                                        disabled={!usable || working}
+                                        className="inline-flex size-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                                        aria-label="Copy app share link"
+                                      >
+                                        <Copy size={14} />
+                                      </button>
+                                      {usable && (
+                                        <a
+                                          href={shareUrl}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="inline-flex size-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white"
+                                          aria-label="Open app share link"
+                                        >
+                                          <ExternalLink size={14} />
+                                        </a>
+                                      )}
+                                    </div>
+                                    <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
+                                      <span>
+                                        {link.currentUses || 0} visits{link.maxUses ? ` / ${link.maxUses} max` : ''}
+                                        {link.expiresAt ? ` • expires ${new Date(link.expiresAt).toLocaleString()}` : ''}
+                                      </span>
+                                      <span className="flex items-center gap-2">
+                                        <button
+                                          type="button"
+                                          onClick={() => handleToggleShare(app, link)}
+                                          disabled={working || availability === 'expired' || availability === 'exhausted'}
+                                          className="min-h-[36px] rounded-lg border border-white/10 px-2.5 text-slate-300 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+                                        >
+                                          {link.isActive ? 'Disable' : 'Enable'}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleDeleteShare(app, link)}
+                                          disabled={working}
+                                          className="inline-flex min-h-[36px] items-center gap-1 rounded-lg border border-red-500/20 px-2.5 text-red-200 hover:bg-red-500/10 disabled:opacity-40"
+                                        >
+                                          <Trash2 size={12} /> Delete link
+                                        </button>
+                                      </span>
+                                    </div>
+                                  </div>
+                                );
+                              })}
                             </div>
-                          )}
+                          ) : null}
                         </div>
 
                         <div className="flex flex-wrap gap-2 lg:justify-end">
@@ -242,7 +411,7 @@ export default function AppsLibraryPage() {
                             className="inline-flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100 hover:bg-emerald-500/15 disabled:opacity-50"
                           >
                             {working ? <Loader2 size={15} className="animate-spin" /> : <Share2 size={15} />}
-                            {activeShare ? 'New share link' : 'Create share link'}
+                            {app.shareLinks?.length ? 'New share link' : 'Create share link'}
                           </button>
                           <button
                             onClick={() => handleDelete(app)}
@@ -274,8 +443,10 @@ export default function AppsLibraryPage() {
 
             <form onSubmit={handleUpload} className="space-y-4">
               <div>
-                <label className="block text-sm font-medium text-slate-200 mb-2">Name</label>
+                <label htmlFor="app-upload-name" className="block text-sm font-medium text-slate-200 mb-2">Name</label>
                 <input
+                  id="app-upload-name"
+                  maxLength={120}
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   placeholder="Optional, defaults to the ZIP filename"
@@ -284,8 +455,10 @@ export default function AppsLibraryPage() {
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-slate-200 mb-2">Description</label>
+                <label htmlFor="app-upload-description" className="block text-sm font-medium text-slate-200 mb-2">Description</label>
                 <textarea
+                  id="app-upload-description"
+                  maxLength={4_000}
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
                   rows={3}
@@ -295,7 +468,7 @@ export default function AppsLibraryPage() {
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-slate-200 mb-2">ZIP package</label>
+                <p className="block text-sm font-medium text-slate-200 mb-2">ZIP package</p>
                 <label className="flex cursor-pointer items-center justify-between gap-3 rounded-2xl border border-dashed border-white/15 bg-black/20 px-4 py-3 text-sm text-slate-300 hover:border-emerald-400/40 hover:bg-white/[0.04]">
                   <span className="truncate">{file ? file.name : 'Choose a .zip file'}</span>
                   <span className="inline-flex items-center gap-2 rounded-lg bg-white/[0.06] px-3 py-1.5 text-xs text-slate-200">
@@ -304,6 +477,7 @@ export default function AppsLibraryPage() {
                   <input
                     type="file"
                     accept=".zip,application/zip"
+                    aria-label="Choose app ZIP package"
                     className="hidden"
                     onChange={(e) => setFile(e.target.files?.[0] || null)}
                   />

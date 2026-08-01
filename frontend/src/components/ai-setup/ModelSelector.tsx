@@ -49,15 +49,15 @@ export default function ModelSelector({
               onClick={() => onSelect(active ? '' : model.id)}
               className={`w-full rounded-2xl border p-4 text-left transition ${
                 active
-                  ? 'border-emerald-500/60 bg-emerald-500/10 shadow-[0_0_0_1px_rgba(16,185,129,0.25)]'
+                  ? 'accent-active'
                   : 'border-slate-800 bg-slate-900/70 hover:border-slate-700 hover:bg-slate-900'
               }`}
             >
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <div className="flex items-center gap-2">
-                    <div className={`h-4 w-4 rounded-full border ${active ? 'border-emerald-400 bg-emerald-400/20' : 'border-slate-600 bg-transparent'}`}>
-                      {active ? <CheckCircle2 className="h-4 w-4 text-emerald-400" /> : null}
+                    <div className={`h-4 w-4 rounded-full border ${active ? 'accent-active' : 'border-slate-600 bg-transparent'}`}>
+                      {active ? <CheckCircle2 className="h-4 w-4 accent-text" /> : null}
                     </div>
                     <span className="font-medium text-white">{model.name}</span>
                     {model.tier ? (
@@ -80,7 +80,8 @@ export default function ModelSelector({
             type="checkbox"
             checked={setDefault}
             onChange={(event) => onSetDefaultChange?.(event.target.checked)}
-            className="h-4 w-4 rounded border-slate-700 bg-slate-900 text-emerald-500 focus:ring-emerald-500"
+            className="h-4 w-4 rounded border-slate-700 bg-slate-900 accent-focus"
+            style={{ accentColor: 'var(--accent, #6366f1)' }}
           />
           Set this as the default AI model
         </label>

@@ -1,13 +1,21 @@
 import { execFile } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import path from 'path';
-import { prisma } from '../config/database';
-import { config } from '../config/env';
+import { AI_PROVIDER_MAP } from '../config/aiProviders';
 import { readOpenClawConfig } from '../services/openclawConfigManager';
+import {
+  requestResolvedOllamaJson,
+  resolveOllamaBackendAuthority,
+  type OllamaBackendAuthority,
+} from '../services/ollamaBackendAuthority';
 import type { AgentProviderName } from './AgentProvider.interface';
 import { buildOpenClawCliEnv, normalizePortalModelId } from '../utils/openclawCli';
 import { listGatewayModels } from '../utils/openclawGatewayRpc';
 import { listAntigravityModelsFromCli } from './antigravityModels';
+import {
+  loadSelectableAgentZeroOAuthModels,
+  type AgentZeroSelectableOAuthModel,
+} from './providers/agentZero/AgentZeroOAuthModelCatalog';
 
 export interface ProviderModelDescriptor {
   id: string;
@@ -25,14 +33,32 @@ const GEMINI_DECLARED_FALLBACK = [
   'gemini-3.1-pro-low',
 ];
 
+const GROK_DECLARED_FALLBACK = ['grok-build'];
+export const GROK_BUILD_MODEL_ARGS = ['--no-auto-update', 'models'] as const;
+const OLLAMA_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,199}$/u;
+const OLLAMA_MAX_MODELS = 1_000;
+
+function declaredCatalogProviderModels(
+  catalogProviderId: string,
+  runtimeProvider: string,
+): ProviderModelDescriptor[] {
+  return (AI_PROVIDER_MAP.get(catalogProviderId)?.defaultModels || []).map((model) => ({
+    id: model.id,
+    alias: null,
+    provider: runtimeProvider,
+    displayName: model.name,
+    source: 'declared' as const,
+  }));
+}
+
 const OPENCLAW_VISIBLE_MODEL_IDS = [
   'openai/gpt-5.6-sol',
   'openai/gpt-5.6-terra',
   'openai/gpt-5.6-luna',
   'openai/gpt-5.5',
-  'google-gemini-cli/gemini-3.1-pro-preview',
-  'google-gemini-cli/gemini-3-flash-preview',
-  'google-gemini-cli/gemini-3.1-flash-lite',
+  'google/gemini-3.1-pro-preview',
+  'google/gemini-3-flash-preview',
+  'google/gemini-3.1-flash-lite',
   'anthropic/claude-fable-5',
   'anthropic/claude-sonnet-4-6',
   'anthropic/claude-opus-4-8',
@@ -50,7 +76,7 @@ function toTitleCase(value: string): string {
 }
 
 function displayNameFromId(id: string): string {
-  return id.startsWith('gemini-') ? toTitleCase(id) : id;
+  return id.startsWith('gemini-') || id.startsWith('grok-') ? toTitleCase(id) : id;
 }
 
 function declaredModels(ids: string[], provider: string): ProviderModelDescriptor[] {
@@ -68,8 +94,9 @@ export function isOpenClawSessionSelectableModelId(id: string): boolean {
   return normalizedId.startsWith('openai/')
     || normalizedId.startsWith('codex/')
     || normalizedId.startsWith('anthropic/')
-    || normalizedId.startsWith('google-gemini-cli/')
-    || normalizedId.startsWith('google-antigravity/');
+    || normalizedId.startsWith('google/')
+    || normalizedId.startsWith('google-antigravity/')
+    || normalizedId.startsWith('xai/');
 }
 
 export function filterOpenClawSessionModelCatalog(models: ProviderModelDescriptor[]): ProviderModelDescriptor[] {
@@ -78,12 +105,109 @@ export function filterOpenClawSessionModelCatalog(models: ProviderModelDescripto
 
 const DECLARED_MODELS: Partial<Record<AgentProviderName, ProviderModelDescriptor[]>> = {
   OPENCLAW: declaredModels(OPENCLAW_VISIBLE_MODEL_IDS, 'openclaw'),
+  CLAUDE_CODE: declaredCatalogProviderModels('anthropic', 'claude-code'),
+  CODEX: declaredCatalogProviderModels('openai-codex', 'codex'),
   GEMINI: declaredModels(GEMINI_DECLARED_FALLBACK, 'gemini'),
+  GROK: declaredModels(GROK_DECLARED_FALLBACK, 'grok'),
 };
 
+export function parseGrokModelsOutput(output: string): ProviderModelDescriptor[] {
+  const ids = new Set<string>();
+  for (const line of String(output || '').split(/\r?\n/)) {
+    const defaultMatch = line.match(/^\s*Default model:\s*(\S+)\s*$/i);
+    const availableMatch = line.match(/^\s*[*-]\s+(\S+)(?:\s+\(default\))?\s*$/i);
+    const id = String(defaultMatch?.[1] || availableMatch?.[1] || '').trim();
+    if (id && /^[A-Za-z0-9._:-]+$/.test(id)) ids.add(id);
+  }
+  return Array.from(ids).map((id) => ({
+    id,
+    alias: null,
+    provider: 'grok',
+    displayName: displayNameFromId(id),
+    source: 'dynamic' as const,
+  }));
+}
+
+export function mapAgentZeroOAuthModels(
+  models: AgentZeroSelectableOAuthModel[],
+): ProviderModelDescriptor[] {
+  return models.map((model) => ({
+    id: model.id,
+    alias: null,
+    provider: model.providerId,
+    displayName: `${model.providerDisplayName} — ${model.displayName}`,
+    source: 'dynamic' as const,
+  }));
+}
+
+async function listAgentZeroModels(): Promise<ProviderModelDescriptor[]> {
+  // Intentionally no declared/preset fallback: an unvalidated fallback would
+  // recreate the silent OpenRouter/default-provider authentication failure.
+  return mapAgentZeroOAuthModels(await loadSelectableAgentZeroOAuthModels());
+}
+
+let grokModelCache: { at: number; models: ProviderModelDescriptor[] } | null = null;
+
+async function listGrokModels(): Promise<ProviderModelDescriptor[]> {
+  if (grokModelCache && Date.now() - grokModelCache.at < 60_000) return grokModelCache.models;
+  const dynamic = await new Promise<ProviderModelDescriptor[]>((resolve) => {
+    execFile('grok', [...GROK_BUILD_MODEL_ARGS], {
+      encoding: 'utf8',
+      timeout: 8000,
+      env: { ...process.env, NO_COLOR: '1', GROK_DISABLE_AUTOUPDATER: '1' },
+      maxBuffer: 1024 * 1024 * 2,
+    }, (error, stdout) => {
+      if (error) return resolve([]);
+      resolve(parseGrokModelsOutput(String(stdout || '')));
+    });
+  });
+  const deduped = new Map<string, ProviderModelDescriptor>();
+  for (const model of [...dynamic, ...DECLARED_MODELS.GROK!]) {
+    if (!deduped.has(model.id)) deduped.set(model.id, model);
+  }
+  const models = Array.from(deduped.values());
+  grokModelCache = { at: Date.now(), models };
+  return models;
+}
+
 const OPENCLAW_MODEL_CACHE_TTL_MS = 60_000;
-let openClawModelCache: { at: number; models: ProviderModelDescriptor[] } | null = null;
+const OPENCLAW_MODEL_DEGRADED_RETRY_MS = 15_000;
+
+export interface OpenClawModelCatalogCacheEntry {
+  at: number;
+  models: ProviderModelDescriptor[];
+  /** The cached models originate from live gateway/CLI discovery. */
+  liveData: boolean;
+  /** The most recent refresh attempt reached live discovery. */
+  lastRefreshLive: boolean;
+}
+
+let openClawModelCache: OpenClawModelCatalogCacheEntry | null = null;
 let openClawModelRefresh: Promise<ProviderModelDescriptor[]> | null = null;
+
+/**
+ * A degraded refresh (neither gateway RPC nor the CLI produced a catalog)
+ * must never overwrite a previously live catalog: the CLI regularly missed
+ * its old 5s budget on a loaded 2-core host, and every consumer then briefly
+ * saw the static fallback. Preserved entries keep serving the last live data
+ * while retrying on the shorter degraded cadence.
+ */
+export function reconcileOpenClawCatalogCache(
+  previous: OpenClawModelCatalogCacheEntry | null,
+  next: { at: number; models: ProviderModelDescriptor[]; live: boolean },
+): OpenClawModelCatalogCacheEntry {
+  if (next.live) {
+    return { at: next.at, models: next.models, liveData: true, lastRefreshLive: true };
+  }
+  if (previous?.liveData) {
+    return { at: next.at, models: previous.models, liveData: true, lastRefreshLive: false };
+  }
+  return { at: next.at, models: next.models, liveData: false, lastRefreshLive: false };
+}
+
+export function openClawCatalogCacheTtlMs(entry: OpenClawModelCatalogCacheEntry): number {
+  return entry.lastRefreshLive ? OPENCLAW_MODEL_CACHE_TTL_MS : OPENCLAW_MODEL_DEGRADED_RETRY_MS;
+}
 
 function aliasFromTags(tags: unknown): string | null {
   if (!Array.isArray(tags)) return null;
@@ -92,13 +216,39 @@ function aliasFromTags(tags: unknown): string | null {
   return alias || null;
 }
 
+/**
+ * Models the catalog knows about but cannot currently run, keyed by the most
+ * recent parse. The picker reports the count so a model that "should be there"
+ * is explained rather than simply absent.
+ */
+let lastOpenClawUnavailableModelIds: string[] = [];
+
+export function readLastOpenClawUnavailableModelIds(): string[] {
+  return [...lastOpenClawUnavailableModelIds];
+}
+
 export function parseOpenClawModelsListPayload(payload: any): ProviderModelDescriptor[] {
   const entries = Array.isArray(payload) ? payload : (Array.isArray(payload?.models) ? payload.models : []);
   const deduped = new Map<string, ProviderModelDescriptor>();
+  const unavailable = new Set<string>();
 
   for (const entry of entries) {
     if (!entry || typeof entry !== 'object') continue;
-    if (entry.missing === true || entry.available === false) continue;
+    // `missing` means the model is not in the catalog at all. `available:false`
+    // means it is known but its provider is not connected -- a state the
+    // operator can fix, so it is counted and reported rather than silently
+    // dropped.
+    if (entry.missing === true) continue;
+    if (entry.available === false) {
+      const unavailableRaw = String(entry.key || entry.id || entry.model || '').trim();
+      const unavailableProvider = String(entry.provider || '').trim();
+      const unavailableQualified = unavailableRaw && !unavailableRaw.includes('/') && unavailableProvider
+        ? `${unavailableProvider}/${unavailableRaw}`
+        : unavailableRaw;
+      const unavailableId = normalizePortalModelId(unavailableQualified);
+      if (unavailableId) unavailable.add(unavailableId);
+      continue;
+    }
 
     const rawId = String(entry.key || entry.id || entry.model || '').trim();
     const rawProvider = String(entry.provider || '').trim();
@@ -117,6 +267,9 @@ export function parseOpenClawModelsListPayload(payload: any): ProviderModelDescr
     });
   }
 
+  if (unavailable.size > 0 || deduped.size > 0) {
+    lastOpenClawUnavailableModelIds = Array.from(unavailable).sort();
+  }
   return Array.from(deduped.values());
 }
 
@@ -133,9 +286,12 @@ async function listOpenClawModelsFromGateway(): Promise<ProviderModelDescriptor[
 
 function listOpenClawModelsFromCli(): Promise<ProviderModelDescriptor[]> {
   return new Promise((resolve) => {
+    // `openclaw models list --json` measures ~4s on an idle 2-core appliance;
+    // the old 5s budget flaked under ordinary load and silently degraded the
+    // catalog. The cache absorbs the longer worst case.
     execFile('openclaw', ['models', 'list', '--json'], {
       encoding: 'utf8',
-      timeout: 5000,
+      timeout: 20_000,
       env: buildOpenClawCliEnv(),
       maxBuffer: 1024 * 1024 * 8,
     }, (error, stdout) => {
@@ -155,7 +311,7 @@ function listOpenClawModelsFromCli(): Promise<ProviderModelDescriptor[]> {
 
 async function listOpenClawModels(): Promise<ProviderModelDescriptor[]> {
   const now = Date.now();
-  if (openClawModelCache && now - openClawModelCache.at < OPENCLAW_MODEL_CACHE_TTL_MS) {
+  if (openClawModelCache && now - openClawModelCache.at < openClawCatalogCacheTtlMs(openClawModelCache)) {
     return openClawModelCache.models;
   }
   if (openClawModelRefresh) return openClawModelRefresh;
@@ -214,15 +370,22 @@ async function resolveOpenClawModels(): Promise<ProviderModelDescriptor[]> {
 
   let cliModels = await listOpenClawModelsFromGateway();
   if (cliModels.length === 0) cliModels = await listOpenClawModelsFromCli();
-  for (const model of Array.from(deduped.values())) {
-    if (!cliModels.some((entry) => entry.id === model.id)) cliModels.push(model);
+  const liveDiscovery = cliModels.length > 0;
+  if (!liveDiscovery) {
+    for (const model of Array.from(deduped.values())) {
+      if (!cliModels.some((entry) => entry.id === model.id)) cliModels.push(model);
+    }
   }
 
   const catalog = cliModels.length ? cliModels : [...DECLARED_MODELS.OPENCLAW!];
   const curated = filterOpenClawSessionModelCatalog(catalog);
   const models = curated.length ? curated : [...DECLARED_MODELS.OPENCLAW!];
-  openClawModelCache = { at: Date.now(), models };
-  return models;
+  openClawModelCache = reconcileOpenClawCatalogCache(openClawModelCache, {
+    at: Date.now(),
+    models,
+    live: liveDiscovery,
+  });
+  return openClawModelCache.models;
 }
 
 async function listGeminiDeclaredModels(): Promise<ProviderModelDescriptor[]> {
@@ -252,8 +415,8 @@ async function listGeminiDeclaredModels(): Promise<ProviderModelDescriptor[]> {
 
   if (liveAntigravityModels.length === 0) {
     for (const model of await listOpenClawModels()) {
-      if (model.id.startsWith('google-antigravity/') || model.id.startsWith('google-gemini-cli/')) {
-        add(model.id.replace(/^google-(?:antigravity|gemini-cli)\//, ''), model.alias || null);
+      if (model.id.startsWith('google-antigravity/')) {
+        add(model.id.slice('google-antigravity/'.length), model.alias || null);
       }
     }
 
@@ -263,8 +426,8 @@ async function listGeminiDeclaredModels(): Promise<ProviderModelDescriptor[]> {
         const raw = JSON.parse(readFileSync(openclawConfig, 'utf8'));
         const configured = raw?.agents?.defaults?.models || {};
         for (const [key, value] of Object.entries(configured)) {
-          if (!key.startsWith('google-antigravity/') && !key.startsWith('google-gemini-cli/')) continue;
-          const id = key.replace(/^google-(?:antigravity|gemini-cli)\//, '');
+          if (!key.startsWith('google-antigravity/')) continue;
+          const id = key.slice('google-antigravity/'.length);
           const alias = value && typeof value === 'object' && 'alias' in value ? String((value as any).alias || '') : '';
           add(id, alias || null);
         }
@@ -277,70 +440,63 @@ async function listGeminiDeclaredModels(): Promise<ProviderModelDescriptor[]> {
   return Array.from(ids.values());
 }
 
-function normalizeBaseUrl(input?: string | null): string {
-  const raw = String(input || '').trim();
-  if (!raw) return 'http://127.0.0.1:11434';
-  return raw.replace(/\/+$/, '');
-}
-
-async function getOllamaRuntimeCandidates(): Promise<Array<{ url: string; source: string }>> {
-  const candidates: Array<{ url: string; source: string }> = [];
-  const push = (url: string | null | undefined, source: string) => {
-    const normalized = normalizeBaseUrl(url);
-    if (!normalized) return;
-    if (!candidates.some((entry) => entry.url === normalized)) {
-      candidates.push({ url: normalized, source });
-    }
-  };
-
-  push(process.env.OLLAMA_HOST, 'env:OLLAMA_HOST');
-  push(process.env.OLLAMA_API_URL, 'env:OLLAMA_API_URL');
-  push(config.ollamaApiUrl, 'config.ollamaApiUrl');
-
+export async function getOllamaRuntimeCandidates(): Promise<Array<{
+  authority: OllamaBackendAuthority;
+  source: string;
+}>> {
   try {
-    const settings = await prisma.systemSetting.findMany({
-      where: { key: { in: ['ollama.host', 'ollama.remoteHost', 'ollama.localEnabled'] } },
-    });
-    const map = settings.reduce<Record<string, string>>((acc, row) => {
-      acc[row.key] = row.value;
-      return acc;
-    }, {});
-    const localEnabled = map['ollama.localEnabled'] !== 'false';
-    const remoteHost = String(map['ollama.remoteHost'] || '').trim();
-    const localHost = String(map['ollama.host'] || '').trim();
-    if (remoteHost) push(remoteHost, 'setting:ollama.remoteHost');
-    if (localEnabled) push(localHost || 'http://127.0.0.1:11434', 'setting:ollama.host');
+    const resolved = await resolveOllamaBackendAuthority();
+    return [{
+      authority: resolved.authority,
+      source: resolved.authority.source,
+    }];
   } catch {
-    // DB settings are optional here; env/config fallbacks still work.
+    return [];
   }
-
-  if (!candidates.length) push('http://127.0.0.1:11434', 'default');
-  return candidates;
 }
 
 async function listOllamaModels(): Promise<ProviderModelDescriptor[]> {
-  const candidates = await getOllamaRuntimeCandidates();
-  for (const candidate of candidates) {
-    try {
-      const response = await fetch(`${candidate.url}/api/tags`, { signal: AbortSignal.timeout(5000) });
-      if (!response.ok) continue;
-      const data = await response.json() as any;
-      const models = Array.isArray(data?.models) ? data.models : [];
-      return models
-        .map((model: any) => String(model?.name || '').trim())
-        .filter(Boolean)
-        .map((id: string) => ({
-          id,
-          alias: null,
-          provider: 'ollama',
-          displayName: id,
-          source: 'dynamic' as const,
-        }));
-    } catch {
-      continue;
-    }
+  try {
+    const resolved = await resolveOllamaBackendAuthority();
+    const { value: data } = await requestResolvedOllamaJson<any>(resolved, {
+      path: '/api/tags',
+      method: 'GET',
+      timeoutMs: 5_000,
+      maxResponseBytes: 2 * 1024 * 1024,
+    });
+    const models = Array.isArray(data?.models) ? data.models : [];
+    const visibleModels = resolved.authority.kind === 'TAILNET'
+      ? models.filter((model: any) => {
+        if (
+          !resolved.authority.selectedModel
+          || !resolved.authority.selectedModelDigest
+        ) {
+          return false;
+        }
+        const id = String(model?.name || model?.model || '').trim();
+        const digest = String(model?.digest || '').trim().toLowerCase();
+        return id === resolved.authority.selectedModel
+          && `sha256:${digest.replace(/^sha256:/u, '')}`
+            === resolved.authority.selectedModelDigest;
+      })
+      : models;
+    const ids = new Set<string>(visibleModels
+      .slice(0, OLLAMA_MAX_MODELS)
+      .flatMap((model: any) => {
+        const id = String(model?.name || model?.model || '').trim();
+        return OLLAMA_MODEL_ID_RE.test(id) ? [id] : [];
+      }));
+    return [...ids]
+      .map((id: string) => ({
+        id,
+        alias: null,
+        provider: 'ollama',
+        displayName: id,
+        source: 'dynamic' as const,
+      }));
+  } catch {
+    return [];
   }
-  return [];
 }
 
 export async function listProviderModels(name: AgentProviderName): Promise<ProviderModelDescriptor[]> {
@@ -349,6 +505,10 @@ export async function listProviderModels(name: AgentProviderName): Promise<Provi
       return listOpenClawModels();
     case 'GEMINI':
       return listGeminiDeclaredModels();
+    case 'GROK':
+      return listGrokModels();
+    case 'AGENT_ZERO':
+      return listAgentZeroModels();
     case 'OLLAMA':
       return listOllamaModels();
     default:

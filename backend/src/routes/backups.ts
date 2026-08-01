@@ -1,96 +1,115 @@
 import { Router, Request, Response } from 'express';
-import path from 'path';
 import fs from 'fs';
-import { spawn } from 'child_process';
-import jwt from 'jsonwebtoken';
 import { authenticateToken } from '../middleware/auth';
 import { requireOwner } from '../middleware/requireAdmin';
 import { prisma } from '../config/database';
-import { config } from '../config/env';
+import {
+  BACKUP_TYPES,
+  BackupFile,
+  BackupType,
+  findBackupFile,
+  getConfiguredBackupRoot,
+  listBackupFiles,
+  readBackupSchedules,
+  readBackupStatus,
+  readLegacyBackupCron,
+  startBackupUnit,
+} from '../services/backup.service';
 
 const router = Router();
+const CHUNK_SIZE = 4 * 1024 * 1024;
+const MAX_CHUNK_INDEX = 1_000_000;
+const activeBackupMutations = new Set<string>();
 
 router.use(authenticateToken, requireOwner);
-
-const BACKUP_DIRS: Record<string, string> = {
-  daily: '/root/backups/daily',
-  weekly: '/root/backups/weekly',
-  monthly: '/root/backups/monthly',
-  comprehensive: '/root/backups/comprehensive',
-};
-
-// In-memory backup status tracking
-interface BackupStatus {
-  id: string;
-  type: string;
-  status: 'running' | 'completed' | 'failed';
-  startedAt: string;
-  completedAt?: string;
-  output?: string;
-  error?: string;
-}
-
-let currentBackup: BackupStatus | null = null;
 
 function humanSize(bytes: number): string {
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let i = 0;
   let size = bytes;
-  while (size >= 1024 && i < units.length - 1) { size /= 1024; i++; }
+  while (size >= 1024 && i < units.length - 1) { size /= 1024; i += 1; }
   return `${size.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-
-function validateFilename(filename: string): boolean {
-  return !filename.includes('..') && !filename.includes('/') && !filename.includes('\\') && filename.length > 0;
+function publicBackup(file: BackupFile) {
+  return {
+    filename: file.filename,
+    size: file.size,
+    sizeHuman: humanSize(file.size),
+    created: new Date(file.mtimeMs).toISOString(),
+    type: file.type,
+    locked: file.locked,
+  };
 }
 
-function findBackupFile(filename: string): { fullPath: string; type: string } | null {
-  for (const [type, dir] of Object.entries(BACKUP_DIRS)) {
-    const fullPath = path.join(dir, filename);
-    if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
-      return { fullPath, type };
+async function resolveBackup(filename: string): Promise<BackupFile | null> {
+  const root = await getConfiguredBackupRoot();
+  return findBackupFile(root, filename);
+}
+
+function sameFile(left: BackupFile, right: BackupFile): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && Math.trunc(left.mtimeMs) === Math.trunc(right.mtimeMs);
+}
+
+function streamFile(req: Request, res: Response, file: BackupFile): void {
+  let start = 0;
+  let end = file.size - 1;
+  let statusCode = 200;
+  const range = req.headers.range;
+
+  if (range) {
+    const match = range.match(/^bytes=(\d+)-(\d*)$/);
+    if (!match) {
+      res.status(416).setHeader('Content-Range', `bytes */${file.size}`);
+      res.end();
+      return;
     }
+    start = Number(match[1]);
+    end = match[2] ? Number(match[2]) : end;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || start >= file.size) {
+      res.status(416).setHeader('Content-Range', `bytes */${file.size}`);
+      res.end();
+      return;
+    }
+    end = Math.min(end, file.size - 1);
+    statusCode = 206;
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${file.size}`);
   }
-  return null;
+
+  res.status(statusCode);
+  res.setHeader('Content-Type', 'application/gzip');
+  res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+  res.setHeader('Content-Length', String(end - start + 1));
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+
+  const stream = fs.createReadStream(file.fullPath, { start, end });
+  const close = () => stream.destroy();
+  req.once('aborted', close);
+  res.once('close', close);
+  stream.once('error', (error) => {
+    console.error('Backup stream error:', error);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to stream backup' });
+    else res.destroy(error);
+  });
+  stream.pipe(res);
 }
 
-// GET /api/backups/list - List all backups across all directories
-router.get('/list', async (req: Request, res: Response) => {
+router.get('/list', async (_req: Request, res: Response) => {
   try {
-
-    const backups: any[] = [];
-
-    for (const [type, dir] of Object.entries(BACKUP_DIRS)) {
-      if (!fs.existsSync(dir)) continue;
-      const files = fs.readdirSync(dir);
-      for (const filename of files) {
-        if (filename.endsWith('.locked') || !filename.includes('.tar.gz')) continue;
-        const fullPath = path.join(dir, filename);
-        try {
-          const stats = fs.statSync(fullPath);
-          if (!stats.isFile()) continue;
-          const locked = fs.existsSync(fullPath + '.locked');
-          backups.push({
-            filename,
-            fullPath,
-            size: stats.size,
-            sizeHuman: humanSize(stats.size),
-            created: stats.mtime.toISOString(),
-            type,
-            locked,
-          });
-        } catch {}
-      }
-    }
-
-    // Sort newest first
-    backups.sort((a, b) => new Date(b.created).getTime() - new Date(a.created).getTime());
-
-    const totalSize = backups.reduce((sum, b) => sum + b.size, 0);
+    const root = await getConfiguredBackupRoot();
+    const backups = listBackupFiles(root)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .map(publicBackup);
+    const totalSize = backups.reduce((sum, backup) => sum + backup.size, 0);
 
     res.json({
       backups,
+      root,
       summary: {
         total: backups.length,
         totalSize,
@@ -99,441 +118,228 @@ router.get('/list', async (req: Request, res: Response) => {
         newest: backups.length ? backups[0].created : null,
       },
     });
-  } catch (error: any) {
+  } catch (error) {
     console.error('Backup list error:', error);
-    res.status(500).json({ error: 'Failed to list backups' });
+    res.status(500).json({ error: 'Backup storage is unavailable or insecurely configured' });
   }
 });
 
-// GET /api/backups/download/:filename - Download a backup file
 router.get('/download/:filename', async (req: Request, res: Response) => {
   try {
-
-    const { filename } = req.params;
-    if (!validateFilename(filename)) {
-      res.status(400).json({ error: 'Invalid filename' });
-      return;
-    }
-
-    const found = findBackupFile(filename);
+    const found = await resolveBackup(req.params.filename);
     if (!found) {
       res.status(404).json({ error: 'Backup not found' });
       return;
     }
-
-    const stats = fs.statSync(found.fullPath);
-    res.setHeader('Content-Type', 'application/gzip');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Content-Length', stats.size.toString());
-
-    const stream = fs.createReadStream(found.fullPath);
-    stream.pipe(res);
-  } catch (error: any) {
+    streamFile(req, res, found);
+  } catch (error) {
     console.error('Backup download error:', error);
     res.status(500).json({ error: 'Failed to download backup' });
   }
 });
 
-// POST /api/backups/lock/:filename - Toggle lock status
 router.post('/lock/:filename', async (req: Request, res: Response) => {
+  const mutationKey = req.params.filename;
+  if (activeBackupMutations.has(mutationKey)) {
+    res.status(409).json({ error: 'Another operation is already changing this backup' });
+    return;
+  }
+  activeBackupMutations.add(mutationKey);
   try {
-
-    const { filename } = req.params;
-    if (!validateFilename(filename)) {
-      res.status(400).json({ error: 'Invalid filename' });
-      return;
-    }
-
-    const found = findBackupFile(filename);
+    const found = await resolveBackup(req.params.filename);
     if (!found) {
       res.status(404).json({ error: 'Backup not found' });
       return;
     }
 
-    const lockPath = found.fullPath + '.locked';
-    const isLocked = fs.existsSync(lockPath);
-
-    if (isLocked) {
+    const lockPath = `${found.fullPath}.locked`;
+    if (found.locked) {
+      const stat = fs.lstatSync(lockPath);
+      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('Invalid backup lock file');
       fs.unlinkSync(lockPath);
     } else {
-      fs.writeFileSync(lockPath, new Date().toISOString());
+      fs.writeFileSync(lockPath, `${new Date().toISOString()}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     }
-
-    res.json({ filename, locked: !isLocked });
-  } catch (error: any) {
+    res.json({ filename: found.filename, locked: !found.locked });
+  } catch (error) {
     console.error('Backup lock error:', error);
-    res.status(500).json({ error: 'Failed to toggle lock' });
+    res.status(500).json({ error: 'Failed to toggle backup lock' });
+  } finally {
+    activeBackupMutations.delete(mutationKey);
   }
 });
 
-// DELETE /api/backups/:filename - Delete a backup
 router.delete('/:filename', async (req: Request, res: Response) => {
+  const mutationKey = req.params.filename;
+  if (activeBackupMutations.has(mutationKey)) {
+    res.status(409).json({ error: 'Another operation is already changing this backup' });
+    return;
+  }
+  activeBackupMutations.add(mutationKey);
   try {
-
-    const { filename } = req.params;
-    if (!validateFilename(filename)) {
-      res.status(400).json({ error: 'Invalid filename' });
-      return;
-    }
-
-    const found = findBackupFile(filename);
+    const root = await getConfiguredBackupRoot();
+    const found = findBackupFile(root, req.params.filename);
     if (!found) {
       res.status(404).json({ error: 'Backup not found' });
       return;
     }
-
-    // Check if locked
-    const lockPath = found.fullPath + '.locked';
-    if (fs.existsSync(lockPath)) {
-      res.status(400).json({ error: 'Cannot delete locked backup. Unlock first.' });
+    if (found.locked) {
+      res.status(400).json({ error: 'Cannot delete locked backup. Unlock it first.' });
       return;
     }
 
+    const revalidated = findBackupFile(root, found.filename);
+    if (!revalidated || !sameFile(found, revalidated)) {
+      res.status(409).json({ error: 'Backup changed while the delete was being prepared' });
+      return;
+    }
     fs.unlinkSync(found.fullPath);
-    
-    // Log activity
+
     await prisma.activityLog.create({
       data: {
         userId: req.user!.userId,
         action: 'BACKUP_DELETE',
         resource: 'backup',
-        resourceId: filename,
+        resourceId: found.filename,
         severity: 'INFO',
-        metadata: { type: found.type, filename },
+        metadata: { type: found.type, filename: found.filename },
       },
-    });
-    
-    res.json({ success: true, filename });
-  } catch (error: any) {
+    }).catch((error) => console.error('Failed to record backup deletion activity:', error));
+    res.json({ success: true, filename: found.filename });
+  } catch (error) {
     console.error('Backup delete error:', error);
     res.status(500).json({ error: 'Failed to delete backup' });
+  } finally {
+    activeBackupMutations.delete(mutationKey);
   }
 });
 
-// POST /api/backups/create - Trigger a manual backup (async)
 router.post('/create', async (req: Request, res: Response) => {
-  try {
-
-    // Check if backup already running
-    if (currentBackup && currentBackup.status === 'running') {
-      res.status(409).json({ 
-        error: 'A backup is already in progress',
-        status: currentBackup.status,
-        id: currentBackup.id,
-      });
-      return;
-    }
-
-    const backupType = req.body?.type || 'daily';
-    if (!['daily', 'weekly', 'monthly', 'comprehensive'].includes(backupType)) {
-      res.status(400).json({ error: 'Invalid backup type' });
-      return;
-    }
-
-    // Create backup ID
-    const backupId = Date.now().toString();
-    const userId = req.user!.userId;
-
-    // Initialize status
-    currentBackup = {
-      id: backupId,
-      type: backupType,
-      status: 'running',
-      startedAt: new Date().toISOString(),
-    };
-
-    const scriptPath = path.join(process.env.PORTAL_ROOT || '/opt/bridgesllm/portal', 'backup-full.sh');
-    if (!fs.existsSync(scriptPath)) {
-      currentBackup = null;
-      res.status(500).json({
-        error: 'Backup script is not installed',
-        details: scriptPath,
-      });
-      return;
-    }
-
-    // Return immediately with running status
-    res.json({
-      status: 'running',
-      id: backupId,
-      type: backupType,
-      message: 'Backup started in background',
-    });
-
-    // All backup types use the same canonical host script.
-    const scriptType = backupType;
-
-    // Execute directly on host (portal runs as systemd service, not Docker)
-    const child = spawn('bash', [scriptPath, scriptType], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
-    child.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
-
-    child.on('close', async (code: number | null) => {
-      if (code === 0) {
-        currentBackup = {
-          ...currentBackup!,
-          status: 'completed',
-          completedAt: new Date().toISOString(),
-          output: stdout.slice(-500),
-        };
-        
-        // Log activity
-        try {
-          await prisma.activityLog.create({
-            data: {
-              userId,
-              action: 'BACKUP_CREATE',
-              resource: 'backup',
-              severity: 'INFO',
-              metadata: { type: backupType, backupId },
-            },
-          });
-        } catch (e) {
-          console.error('Failed to log backup activity:', e);
-        }
-      } else {
-        currentBackup = {
-          ...currentBackup!,
-          status: 'failed',
-          completedAt: new Date().toISOString(),
-          error: (stderr || stdout).slice(-500),
-        };
-      }
-    });
-
-    child.on('error', (err: Error) => {
-      currentBackup = {
-        ...currentBackup!,
-        status: 'failed',
-        completedAt: new Date().toISOString(),
-        error: err.message,
-      };
-    });
-  } catch (error: any) {
-    console.error('Backup create error:', error);
-    
-    // Update status if we have one
-    if (currentBackup) {
-      currentBackup = {
-        ...currentBackup,
-        status: 'failed',
-        completedAt: new Date().toISOString(),
-        error: error.message || 'Unknown error',
-      };
-    }
-    
-    res.status(500).json({ error: 'Failed to create backup' });
+  const backupType = String(req.body?.type || 'daily') as BackupType;
+  if (!BACKUP_TYPES.includes(backupType)) {
+    res.status(400).json({ error: 'Invalid backup type' });
+    return;
   }
-});
 
-// GET /api/backups/status - Get current backup status
-router.get('/status', async (req: Request, res: Response) => {
   try {
-
-    if (!currentBackup) {
-      res.json({ status: 'idle', message: 'No backup in progress' });
-      return;
-    }
-
-    res.json(currentBackup);
-  } catch (error: any) {
-    console.error('Backup status error:', error);
-    res.status(500).json({ error: 'Failed to get backup status' });
-  }
-});
-
-// GET /api/backups/cron-info - Get current cron schedule info
-router.get('/cron-info', async (req: Request, res: Response) => {
-  try {
-
-    // Read legacy cron and current systemd timers directly on the host.
-    const { execSync } = require('child_process');
-    let crontab = '';
-    let timers = '';
-    let unitFiles = '';
-    try {
-      crontab = execSync('crontab -l 2>/dev/null', { encoding: 'utf-8', timeout: 5000 });
-    } catch (e: any) {
-      console.error('Cron read error:', e.message);
-      crontab = '';
-    }
-    try {
-      timers = execSync("systemctl list-timers --all 'bridgesllm-backup*' --no-pager --plain 2>/dev/null || true", { encoding: 'utf-8', timeout: 5000 });
-    } catch {
-      timers = '';
-    }
-    try {
-      unitFiles = execSync("systemctl list-unit-files 'bridgesllm-backup*' --no-pager --plain 2>/dev/null || true", { encoding: 'utf-8', timeout: 5000 });
-    } catch {
-      unitFiles = '';
-    }
-
-    const backupLines = crontab.split('\n').filter((l: string) => l.includes('backup') && !l.startsWith('#') && l.trim().length > 0);
-    const commentedLines = crontab.split('\n').filter((l: string) => l.includes('backup') && l.startsWith('#'));
-
-    res.json({
-      active: backupLines,
-      disabled: commentedLines,
-      raw: crontab,
-      systemd: {
-        timers: timers.split('\n').filter((line: string) => line.trim().length > 0),
-        unitFiles: unitFiles.split('\n').filter((line: string) => line.trim().length > 0),
-        rawTimers: timers,
-        rawUnitFiles: unitFiles,
+    const status = await startBackupUnit(backupType);
+    await prisma.activityLog.create({
+      data: {
+        userId: req.user!.userId,
+        action: 'BACKUP_REQUESTED',
+        resource: 'backup',
+        severity: 'INFO',
+        metadata: { type: backupType, backupId: status?.id || null },
       },
+    }).catch((error) => console.error('Failed to record backup request activity:', error));
+
+    res.status(202).json({
+      status: status?.status || 'queued',
+      id: status?.id || null,
+      type: backupType,
+      message: status?.status === 'failed'
+        ? 'The backup service failed during startup'
+        : 'Backup request accepted by the system service',
     });
   } catch (error: any) {
-    console.error('Cron info error:', error);
-    res.status(500).json({ error: 'Failed to read cron info' });
+    if (error?.code === 'EBUSY') {
+      const status = readBackupStatus();
+      res.status(409).json({ error: 'A backup is already in progress', status: status?.status, id: status?.id });
+      return;
+    }
+    console.error('Backup create error:', error);
+    res.status(500).json({ error: 'Failed to start the installed backup service' });
   }
 });
 
-// POST /api/backups/download-token/:filename - Generate a signed download token
-router.post('/download-token/:filename', async (req: Request, res: Response) => {
+router.get('/status', async (_req: Request, res: Response) => {
   try {
-
-    const { filename } = req.params;
-    if (!validateFilename(filename)) {
-      res.status(400).json({ error: 'Invalid filename' });
+    const status = readBackupStatus();
+    res.setHeader('Cache-Control', 'no-store');
+    if (!status) {
+      res.json({ status: 'idle', message: 'No backup has run yet' });
       return;
     }
-
-    const found = findBackupFile(filename);
-    if (!found) {
-      res.status(404).json({ error: 'Backup not found' });
-      return;
-    }
-
-    const stats = fs.statSync(found.fullPath);
-    const secret = config.jwtSecret;
-    const token = jwt.sign({ filename, purpose: 'backup-download' }, secret, { expiresIn: '1h' });
-
-    res.json({ token, size: stats.size, sizeHuman: humanSize(stats.size) });
-  } catch (error: any) {
-    console.error('Download token error:', error);
-    res.status(500).json({ error: 'Failed to generate download token' });
+    res.json(status);
+  } catch (error) {
+    console.error('Backup status error:', error);
+    res.status(500).json({ error: 'Failed to read persistent backup status' });
   }
 });
 
-// GET /api/backups/direct/:filename - Direct download with signed token (no auth header needed)
-router.get('/direct/:filename', async (req: Request, res: Response) => {
+router.get('/cron-info', async (_req: Request, res: Response) => {
   try {
-    const { filename } = req.params;
-    const { token } = req.query;
-
-    if (!token || typeof token !== 'string') {
-      res.status(401).json({ error: 'Token required' });
-      return;
-    }
-
-    if (!validateFilename(filename)) {
-      res.status(400).json({ error: 'Invalid filename' });
-      return;
-    }
-
-    const secret = config.jwtSecret;
-    let payload: any;
-    try {
-      payload = jwt.verify(token, secret);
-    } catch {
-      res.status(401).json({ error: 'Invalid or expired token' });
-      return;
-    }
-
-    if (payload.filename !== filename || payload.purpose !== 'backup-download') {
-      res.status(403).json({ error: 'Token mismatch' });
-      return;
-    }
-
-    const found = findBackupFile(filename);
-    if (!found) {
-      res.status(404).json({ error: 'Backup not found' });
-      return;
-    }
-
-    const stats = fs.statSync(found.fullPath);
-    res.setHeader('Content-Type', 'application/gzip');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Content-Length', stats.size.toString());
-
-    const stream = fs.createReadStream(found.fullPath);
-    stream.pipe(res);
-  } catch (error: any) {
-    console.error('Direct download error:', error);
-    res.status(500).json({ error: 'Failed to download backup' });
+    const [schedules, legacy] = await Promise.all([readBackupSchedules(), readLegacyBackupCron()]);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      schedules,
+      active: legacy.active,
+      disabled: legacy.disabled,
+      legacyCron: legacy,
+    });
+  } catch (error) {
+    console.error('Backup schedule error:', error);
+    res.status(500).json({ error: 'Failed to read installed backup schedules' });
   }
 });
 
-// GET /api/backups/chunk/:filename - Download a chunk of a backup file
 router.get('/chunk/:filename', async (req: Request, res: Response) => {
   try {
-
-    const { filename } = req.params;
-    const chunkIndex = parseInt(req.query.chunk as string) || 0;
-    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
-
-    if (!validateFilename(filename)) {
-      res.status(400).json({ error: 'Invalid filename' });
+    const rawChunk = typeof req.query.chunk === 'string' ? req.query.chunk : '';
+    if (!/^(?:0|[1-9]\d{0,6})$/.test(rawChunk)) {
+      res.status(400).json({ error: 'Chunk index must be a non-negative integer' });
+      return;
+    }
+    const chunkIndex = Number(rawChunk);
+    if (!Number.isSafeInteger(chunkIndex) || chunkIndex > MAX_CHUNK_INDEX) {
+      res.status(400).json({ error: 'Chunk index is too large' });
       return;
     }
 
-    const found = findBackupFile(filename);
+    const found = await resolveBackup(req.params.filename);
     if (!found) {
       res.status(404).json({ error: 'Backup not found' });
       return;
     }
-
-    const stats = fs.statSync(found.fullPath);
-    const start = chunkIndex * CHUNK_SIZE;
-    const end = Math.min(start + CHUNK_SIZE, stats.size);
-    const totalChunks = Math.ceil(stats.size / CHUNK_SIZE);
-
-    if (start >= stats.size) {
+    const totalChunks = Math.ceil(found.size / CHUNK_SIZE);
+    if (chunkIndex >= totalChunks) {
       res.status(416).json({ error: 'Chunk out of range' });
       return;
     }
+    const start = chunkIndex * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, found.size) - 1;
 
     res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Length', (end - start).toString());
-    res.setHeader('X-Total-Size', stats.size.toString());
-    res.setHeader('X-Total-Chunks', totalChunks.toString());
-    res.setHeader('X-Chunk-Index', chunkIndex.toString());
-
-    const stream = fs.createReadStream(found.fullPath, { start, end: end - 1 });
+    res.setHeader('Content-Length', String(end - start + 1));
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('X-Total-Size', String(found.size));
+    res.setHeader('X-Total-Chunks', String(totalChunks));
+    res.setHeader('X-Chunk-Index', String(chunkIndex));
+    const stream = fs.createReadStream(found.fullPath, { start, end });
+    req.once('aborted', () => stream.destroy());
+    stream.once('error', (error) => res.destroy(error));
     stream.pipe(res);
-  } catch (error: any) {
+  } catch (error) {
     console.error('Chunk download error:', error);
     res.status(500).json({ error: 'Failed to download chunk' });
   }
 });
 
-// GET /api/backups/download-info/:filename - Get file metadata for chunked download
 router.get('/download-info/:filename', async (req: Request, res: Response) => {
   try {
-
-    const { filename } = req.params;
-    if (!validateFilename(filename)) {
-      res.status(400).json({ error: 'Invalid filename' });
-      return;
-    }
-
-    const found = findBackupFile(filename);
+    const found = await resolveBackup(req.params.filename);
     if (!found) {
       res.status(404).json({ error: 'Backup not found' });
       return;
     }
-
-    const stats = fs.statSync(found.fullPath);
-    const CHUNK_SIZE = 5 * 1024 * 1024;
-    const totalChunks = Math.ceil(stats.size / CHUNK_SIZE);
-
-    res.json({ filename, size: stats.size, sizeHuman: humanSize(stats.size), chunkSize: CHUNK_SIZE, totalChunks });
-  } catch (error: any) {
+    res.json({
+      filename: found.filename,
+      size: found.size,
+      sizeHuman: humanSize(found.size),
+      chunkSize: CHUNK_SIZE,
+      totalChunks: Math.ceil(found.size / CHUNK_SIZE),
+    });
+  } catch (error) {
     console.error('Download info error:', error);
     res.status(500).json({ error: 'Failed to get download info' });
   }

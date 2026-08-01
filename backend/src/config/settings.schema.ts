@@ -4,8 +4,8 @@
  * TypeScript types, default values, and category definitions for every
  * admin-configurable setting stored in the SystemSettings table.
  *
- * Phase 3 will build the admin UI that reads/writes these via API;
- * this file is the source of truth for shape & defaults.
+ * The Admin and Settings surfaces read and write these values through the API;
+ * this file is the source of truth for their shape and defaults.
  */
 
 import type { AgentProviderName } from '../agents/AgentProvider.interface';
@@ -125,7 +125,7 @@ export interface RemoteDesktopSettings {
 }
 
 export const REMOTE_DESKTOP_DEFAULTS: RemoteDesktopSettings = {
-  url: '/novnc/vnc_portal.html?reconnect=1&resize=smart&path=novnc/websockify',
+  url: '/novnc/vnc_portal.html?reconnect=1&resize=smart',
   allowedPathPrefixes: '/novnc,/vnc',
 };
 

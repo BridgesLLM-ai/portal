@@ -5,6 +5,7 @@ export interface User {
   role: 'OWNER' | 'SUB_ADMIN' | 'USER' | 'VIEWER';
   accountStatus?: 'ACTIVE' | 'PENDING' | 'DISABLED' | 'BANNED';
   sandboxEnabled?: boolean;
+  authorizationVersion?: number;
 }
 
 export interface AuthResponse {
@@ -48,6 +49,17 @@ export interface Metrics {
   networkOut: bigint;
   processCount: number;
   loadAverage: number[];
+  metadata?: {
+    memoryUsedBytes?: number;
+    memoryFreeBytes?: number;
+    diskUsedBytes?: number;
+    uptimeSeconds?: number;
+    cpuCores?: number;
+    hostname?: string;
+    platform?: string;
+    lightweightCollector?: boolean;
+    networkMetricsAvailable?: boolean;
+  };
 }
 
 export interface ActivityLog {

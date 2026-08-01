@@ -8,8 +8,14 @@
 import cron from 'node-cron';
 import { prisma } from './config/database';
 import { syncAutoForwardRule } from './services/mailService';
+import { decryptSecret } from './utils/authSecrets';
+import { getPortalFeatureCapabilities } from './utils/portalFeatureCapabilities';
 
-async function syncConfiguredAutoForwardRules(): Promise<void> {
+export async function syncConfiguredAutoForwardRules(): Promise<void> {
+  // Tailnet/local origin modes cannot operate mail. Keep the capability guard
+  // ahead of mailbox discovery and secret decryption, not merely the JMAP call.
+  if (!getPortalFeatureCapabilities().mail.available) return;
+
   const accounts = await prisma.mailboxAccount.findMany({
     select: {
       username: true,
@@ -21,7 +27,7 @@ async function syncConfiguredAutoForwardRules(): Promise<void> {
   let synced = 0;
   for (const account of accounts) {
     try {
-      await syncAutoForwardRule(account.autoForwardTo, account.username, account.mailPassword);
+      await syncAutoForwardRule(account.autoForwardTo, account.username, decryptSecret(account.mailPassword));
       synced++;
     } catch (error: any) {
       console.error(`[mail] Failed to sync server-side auto-forwarding for ${account.username}:`, error.message);

@@ -1,12 +1,111 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Loader2, Eye, EyeOff, CheckCircle, AlertTriangle } from 'lucide-react';
+import { Loader2, Eye, EyeOff, CheckCircle, AlertTriangle, RefreshCw } from 'lucide-react';
 import client from '../api/client';
+import PublicAuthBrand from '../components/PublicAuthBrand';
+import { usePasswordRecoveryCapability } from '../hooks/usePasswordRecoveryCapability';
+import { validatePortalPassword } from '../utils/passwordPolicy';
+
+function MissingResetTokenPage() {
+  const recoveryCapability = usePasswordRecoveryCapability();
+
+  return (
+    <div
+      className="min-h-dvh flex items-center justify-center relative overflow-hidden px-4"
+      style={{ background: 'linear-gradient(135deg, #0A0E27 0%, #0d1117 40%, #0A0E27 70%, #111827 100%)' }}
+    >
+      <motion.div
+        initial={{ opacity: 0, y: 30, scale: 0.95 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        transition={{ duration: 0.6 }}
+        className="w-full max-w-md relative z-10"
+      >
+        <div
+          className="relative rounded-2xl p-8 overflow-hidden text-center"
+          style={{
+            background: 'linear-gradient(135deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)',
+            backdropFilter: 'blur(20px)',
+            border: '1px solid rgba(255,255,255,0.08)',
+            boxShadow: '0 0 60px rgba(16, 185, 129, 0.06), 0 25px 50px -12px rgba(0, 0, 0, 0.5)',
+          }}
+        >
+          <AlertTriangle className="text-amber-400 mx-auto mb-4" size={40} />
+          <h2 className="text-lg font-semibold text-white mb-2">Invalid Reset Link</h2>
+          <p className="text-slate-400 text-sm mb-5">This password reset link is invalid or missing a token.</p>
+
+          {!recoveryCapability.capability ? (
+            <div
+              role={recoveryCapability.checkState === 'failed' ? 'alert' : 'status'}
+              aria-live="polite"
+              className="mb-5 rounded-xl border border-amber-300/15 bg-amber-400/[0.07] px-4 py-3 text-sm text-amber-100"
+            >
+              <div className="flex items-center justify-center gap-2">
+                {recoveryCapability.checkState === 'checking'
+                  ? <Loader2 size={15} className="animate-spin" />
+                  : <AlertTriangle size={15} />}
+                <span>
+                  {recoveryCapability.checkState === 'checking'
+                    ? 'Checking whether another reset link can be requested…'
+                    : 'Portal could not verify whether reset email is available.'}
+                </span>
+              </div>
+              {(recoveryCapability.checkState === 'failed' || recoveryCapability.retrying) && (
+                <button
+                  type="button"
+                  onClick={() => void recoveryCapability.retry()}
+                  disabled={recoveryCapability.retrying}
+                  aria-busy={recoveryCapability.retrying}
+                  className="mt-3 inline-flex items-center gap-1.5 text-xs font-semibold text-amber-100 underline decoration-amber-200/40 underline-offset-4 hover:text-white disabled:opacity-50"
+                >
+                  {recoveryCapability.retrying
+                    ? <Loader2 size={13} className="animate-spin" />
+                    : <RefreshCw size={13} />}
+                  {recoveryCapability.retrying ? 'Checking again…' : 'Retry availability check'}
+                </button>
+              )}
+            </div>
+          ) : recoveryCapability.capability.available ? (
+            <Link
+              to="/forgot-password"
+              className="text-emerald-400 hover:text-emerald-300 transition-colors text-sm font-medium"
+            >
+              Request a new reset link
+            </Link>
+          ) : (
+            <div role="status" aria-live="polite" className="mb-5">
+              <p className="text-sm leading-relaxed text-amber-100">
+                {recoveryCapability.capability.reason
+                  || 'Password reset email is unavailable for this Portal installation.'}
+              </p>
+              <p className="mt-2 text-xs leading-relaxed text-slate-500">
+                A new link cannot be emailed from this Portal mode. Ask a Portal administrator for help.
+              </p>
+            </div>
+          )}
+
+          <div className="mt-5">
+            <Link
+              to="/login"
+              className="text-slate-400 hover:text-white transition-colors text-sm font-medium"
+            >
+              Back to sign in
+            </Link>
+          </div>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
 
 export default function ResetPasswordPage() {
   const [searchParams] = useSearchParams();
-  const token = searchParams.get('token') || '';
+  const [token] = useState(() => {
+    const fragmentParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    // Fragment is the current safe transport. Query support keeps already-issued
+    // reset emails usable across the upgrade.
+    return fragmentParams.get('token') || searchParams.get('token') || '';
+  });
 
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -15,71 +114,69 @@ export default function ResetPasswordPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [success, setSuccess] = useState(false);
   const [error, setError] = useState('');
-  const [mounted, setMounted] = useState(false);
+  const [resetLinkInvalid, setResetLinkInvalid] = useState(false);
+  const submissionRef = useRef(false);
 
-  useEffect(() => { setMounted(true); }, []);
+  useEffect(() => {
+    if (!token) return;
+    const scrubbed = new URL(window.location.href);
+    scrubbed.searchParams.delete('token');
+    const fragmentParams = new URLSearchParams(scrubbed.hash.replace(/^#/, ''));
+    fragmentParams.delete('token');
+    const remainingFragment = fragmentParams.toString();
+    scrubbed.hash = remainingFragment ? `#${remainingFragment}` : '';
+    window.history.replaceState(
+      window.history.state,
+      '',
+      `${scrubbed.pathname}${scrubbed.search}${scrubbed.hash}`,
+    );
+  }, [token]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (submissionRef.current) return;
     setError('');
+    setResetLinkInvalid(false);
 
     if (newPassword !== confirmPassword) {
       setError('Passwords do not match.');
       return;
     }
 
-    if (newPassword.length < 8) {
-      setError('Password must be at least 8 characters.');
+    const policyError = validatePortalPassword(newPassword);
+    if (policyError) {
+      setError(policyError);
       return;
     }
 
+    const admittedToken = token;
+    const admittedPassword = newPassword;
+    submissionRef.current = true;
     setIsLoading(true);
     try {
-      await client.post('/auth/reset-password', { token, newPassword });
+      await client.post('/auth/reset-password', { token: admittedToken, newPassword: admittedPassword });
       setSuccess(true);
     } catch (err: any) {
       const msg = err?.response?.data?.error || err?.response?.data?.message || 'Something went wrong. Please try again.';
-      setError(msg);
+      if (
+        Number(err?.response?.status) === 400
+        && /invalid|expired/i.test(msg)
+        && /reset|token|link/i.test(msg)
+      ) {
+        setResetLinkInvalid(true);
+        setError('This password reset link is invalid or expired.');
+      } else {
+        setError(msg);
+      }
     } finally {
+      submissionRef.current = false;
       setIsLoading(false);
     }
   };
 
   // No token provided
   if (!token) {
-    return (
-      <div
-        className="min-h-dvh flex items-center justify-center relative overflow-hidden px-4"
-        style={{ background: 'linear-gradient(135deg, #0A0E27 0%, #0d1117 40%, #0A0E27 70%, #111827 100%)' }}
-      >
-        <motion.div
-          initial={{ opacity: 0, y: 30, scale: 0.95 }}
-          animate={{ opacity: 1, y: 0, scale: 1 }}
-          transition={{ duration: 0.6 }}
-          className="w-full max-w-md relative z-10"
-        >
-          <div
-            className="relative rounded-2xl p-8 overflow-hidden text-center"
-            style={{
-              background: 'linear-gradient(135deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)',
-              backdropFilter: 'blur(20px)',
-              border: '1px solid rgba(255,255,255,0.08)',
-              boxShadow: '0 0 60px rgba(16, 185, 129, 0.06), 0 25px 50px -12px rgba(0, 0, 0, 0.5)',
-            }}
-          >
-            <AlertTriangle className="text-amber-400 mx-auto mb-4" size={40} />
-            <h2 className="text-lg font-semibold text-white mb-2">Invalid Reset Link</h2>
-            <p className="text-slate-400 text-sm mb-6">This password reset link is invalid or missing a token.</p>
-            <Link
-              to="/forgot-password"
-              className="text-emerald-400 hover:text-emerald-300 transition-colors text-sm font-medium"
-            >
-              Request a new reset link
-            </Link>
-          </div>
-        </motion.div>
-      </div>
-    );
+    return <MissingResetTokenPage />;
   }
 
   const inputStyle = {
@@ -103,18 +200,10 @@ export default function ResetPasswordPage() {
       className="min-h-dvh flex items-center justify-center relative overflow-hidden px-4"
       style={{ background: 'linear-gradient(135deg, #0A0E27 0%, #0d1117 40%, #0A0E27 70%, #111827 100%)' }}
     >
-      {/* Animated background orbs */}
-      <div className="absolute inset-0 pointer-events-none">
-        <motion.div
-          animate={{ scale: [1, 1.2, 1], opacity: [0.08, 0.15, 0.08] }}
-          transition={{ duration: 8, repeat: Infinity, ease: 'easeInOut' }}
-          className="absolute top-1/4 left-1/4 w-[500px] h-[500px] bg-emerald-500 rounded-full blur-[160px]"
-        />
-        <motion.div
-          animate={{ scale: [1.2, 1, 1.2], opacity: [0.06, 0.12, 0.06] }}
-          transition={{ duration: 10, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
-          className="absolute bottom-1/4 right-1/4 w-[400px] h-[400px] bg-blue-500 rounded-full blur-[140px]"
-        />
+      {/* Static accents keep the public shell responsive on low-spec devices. */}
+      <div aria-hidden="true" className="absolute inset-0 pointer-events-none overflow-hidden">
+        <div className="absolute -top-32 -left-24 h-80 w-80 rounded-full bg-emerald-500/10 blur-3xl" />
+        <div className="absolute -bottom-32 -right-24 h-80 w-80 rounded-full bg-blue-500/10 blur-3xl" />
       </div>
 
       {/* Subtle grid overlay */}
@@ -122,19 +211,6 @@ export default function ResetPasswordPage() {
         backgroundImage: 'linear-gradient(rgba(255,255,255,.1) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.1) 1px, transparent 1px)',
         backgroundSize: '60px 60px',
       }} />
-
-      {/* Floating particles */}
-      <div className="absolute inset-0 pointer-events-none overflow-hidden">
-        {mounted && [...Array(6)].map((_, i) => (
-          <motion.div
-            key={i}
-            className="absolute w-1 h-1 bg-emerald-400/30 rounded-full"
-            initial={{ x: `${15 + i * 15}%`, y: '110%' }}
-            animate={{ y: '-10%', opacity: [0, 0.6, 0] }}
-            transition={{ duration: 8 + i * 2, repeat: Infinity, delay: i * 1.5, ease: 'linear' }}
-          />
-        ))}
-      </div>
 
       <motion.div
         initial={{ opacity: 0, y: 30, scale: 0.95 }}
@@ -161,20 +237,7 @@ export default function ResetPasswordPage() {
             transition={{ delay: 0.2 }}
             className="text-center mb-8"
           >
-            <motion.div
-              whileHover={{ scale: 1.05 }}
-              className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4 relative"
-              style={{
-                background: 'linear-gradient(135deg, rgba(16,185,129,0.2), rgba(16,185,129,0.05))',
-                border: '1px solid rgba(16,185,129,0.2)',
-                boxShadow: '0 0 30px rgba(16,185,129,0.15), inset 0 1px 0 rgba(16,185,129,0.1)',
-              }}
-            >
-              <span className="text-emerald-400 font-bold text-2xl">B</span>
-            </motion.div>
-            <h1 className="text-2xl font-bold text-white tracking-tight">
-              Bridges<span className="text-emerald-400">LLM</span>
-            </h1>
+            <PublicAuthBrand />
             <p className="text-slate-400 text-sm mt-2">Set your new password</p>
           </motion.div>
 
@@ -182,6 +245,8 @@ export default function ResetPasswordPage() {
             {success ? (
               <motion.div
                 key="success"
+                role="status"
+                aria-live="polite"
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -10 }}
@@ -226,14 +291,21 @@ export default function ResetPasswordPage() {
               >
                 <form onSubmit={handleSubmit} className="space-y-4">
                   <div>
-                    <label className="text-xs font-medium text-slate-400 mb-1.5 block uppercase tracking-wider">
+                    <label htmlFor="reset-new-password" className="text-xs font-medium text-slate-400 mb-1.5 block uppercase tracking-wider">
                       New Password
                     </label>
                     <div className="relative">
                       <input
+                        id="reset-new-password"
                         type={showPass ? 'text' : 'password'}
+                        autoComplete="new-password"
                         value={newPassword}
-                        onChange={(e) => { setNewPassword(e.target.value); setError(''); }}
+                        onChange={(e) => {
+                          if (submissionRef.current) return;
+                          setNewPassword(e.target.value);
+                          setError('');
+                        }}
+                        disabled={isLoading}
                         className="w-full px-4 py-3 rounded-xl text-white placeholder-slate-500 text-sm pr-10 outline-none transition-all duration-300"
                         style={inputStyle}
                         onFocus={handleFocus}
@@ -245,8 +317,11 @@ export default function ResetPasswordPage() {
                       />
                       <button
                         type="button"
-                        onClick={() => setShowPass(!showPass)}
+                        onClick={() => { if (!submissionRef.current) setShowPass(!showPass); }}
+                        disabled={isLoading}
                         className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-emerald-400 transition-colors duration-200"
+                        aria-label={showPass ? 'Hide new password' : 'Show new password'}
+                        aria-pressed={showPass}
                       >
                         {showPass ? <EyeOff size={18} /> : <Eye size={18} />}
                       </button>
@@ -257,14 +332,21 @@ export default function ResetPasswordPage() {
                   </div>
 
                   <div>
-                    <label className="text-xs font-medium text-slate-400 mb-1.5 block uppercase tracking-wider">
+                    <label htmlFor="reset-confirm-password" className="text-xs font-medium text-slate-400 mb-1.5 block uppercase tracking-wider">
                       Confirm Password
                     </label>
                     <div className="relative">
                       <input
+                        id="reset-confirm-password"
                         type={showConfirm ? 'text' : 'password'}
+                        autoComplete="new-password"
                         value={confirmPassword}
-                        onChange={(e) => { setConfirmPassword(e.target.value); setError(''); }}
+                        onChange={(e) => {
+                          if (submissionRef.current) return;
+                          setConfirmPassword(e.target.value);
+                          setError('');
+                        }}
+                        disabled={isLoading}
                         className="w-full px-4 py-3 rounded-xl text-white placeholder-slate-500 text-sm pr-10 outline-none transition-all duration-300"
                         style={inputStyle}
                         onFocus={handleFocus}
@@ -275,8 +357,11 @@ export default function ResetPasswordPage() {
                       />
                       <button
                         type="button"
-                        onClick={() => setShowConfirm(!showConfirm)}
+                        onClick={() => { if (!submissionRef.current) setShowConfirm(!showConfirm); }}
+                        disabled={isLoading}
                         className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-emerald-400 transition-colors duration-200"
+                        aria-label={showConfirm ? 'Hide confirmed password' : 'Show confirmed password'}
+                        aria-pressed={showConfirm}
                       >
                         {showConfirm ? <EyeOff size={18} /> : <Eye size={18} />}
                       </button>
@@ -286,6 +371,8 @@ export default function ResetPasswordPage() {
                   <AnimatePresence>
                     {error && (
                       <motion.div
+                        role="alert"
+                        aria-live="assertive"
                         initial={{ opacity: 0, height: 0 }}
                         animate={{ opacity: 1, height: 'auto' }}
                         exit={{ opacity: 0, height: 0 }}
@@ -296,6 +383,16 @@ export default function ResetPasswordPage() {
                         }}
                       >
                         {error}
+                        {resetLinkInvalid && (
+                          <div className="mt-2">
+                            <Link
+                              to="/forgot-password"
+                              className="font-medium text-red-200 underline decoration-red-200/40 underline-offset-4 hover:text-white"
+                            >
+                              Review password recovery options
+                            </Link>
+                          </div>
+                        )}
                       </motion.div>
                     )}
                   </AnimatePresence>
@@ -303,6 +400,7 @@ export default function ResetPasswordPage() {
                   <motion.button
                     type="submit"
                     disabled={isLoading}
+                    aria-busy={isLoading}
                     whileHover={{ scale: 1.01, boxShadow: '0 0 30px rgba(16,185,129,0.25)' }}
                     whileTap={{ scale: 0.98 }}
                     className="w-full py-3 rounded-xl text-white font-medium text-sm transition-all disabled:opacity-50 flex items-center justify-center gap-2 relative overflow-hidden"
@@ -312,14 +410,17 @@ export default function ResetPasswordPage() {
                     }}
                   >
                     {isLoading && <Loader2 size={16} className="animate-spin" />}
-                    Reset Password
+                    {isLoading ? 'Resetting password…' : 'Reset Password'}
                   </motion.button>
                 </form>
 
                 <p className="text-center text-sm text-slate-400 mt-6">
                   <Link
                     to="/login"
-                    className="text-emerald-400 hover:text-emerald-300 transition-colors font-medium"
+                    aria-disabled={isLoading}
+                    tabIndex={isLoading ? -1 : undefined}
+                    onClick={(event) => { if (submissionRef.current || isLoading) event.preventDefault(); }}
+                    className={`text-emerald-400 transition-colors font-medium ${isLoading ? 'pointer-events-none opacity-50' : 'hover:text-emerald-300'}`}
                   >
                     Back to sign in
                   </Link>

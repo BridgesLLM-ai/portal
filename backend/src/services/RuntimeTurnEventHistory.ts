@@ -1,10 +1,25 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
 import type { RuntimeTurnEvent, RuntimeTurnEventType } from './RuntimeTurnEvents';
 
 const DEFAULT_LIMIT = 1000;
 const MAX_TEXT_CHARS = 80_000;
+const DEFAULT_MAX_HISTORY_BYTES = 32 * 1024 * 1024;
+const DEFAULT_MAX_READ_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_HISTORY_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+const READ_CHUNK_BYTES = 256 * 1024;
+const MAX_REQUESTED_EVENTS = 50_000;
 const PERSISTED_TYPES = new Set<RuntimeTurnEventType>([
   'assistant_status',
   'assistant_reasoning',
@@ -31,6 +46,27 @@ function resolveHistoryDir(): string | null {
 function historyPathForSession(sessionKey: string, dir: string): string {
   const digest = createHash('sha256').update(sessionKey || 'main').digest('hex').slice(0, 32);
   return path.join(dir, `${digest}.jsonl`);
+}
+
+function positiveEnvNumber(name: string, fallback: number): number {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function historyMaxBytes(): number {
+  return positiveEnvNumber('PORTAL_RUNTIME_TURN_EVENT_HISTORY_MAX_BYTES', DEFAULT_MAX_HISTORY_BYTES);
+}
+
+function historyMaxReadBytes(): number {
+  return positiveEnvNumber('PORTAL_RUNTIME_TURN_EVENT_HISTORY_MAX_READ_BYTES', DEFAULT_MAX_READ_BYTES);
+}
+
+function historyMaxAgeMs(): number {
+  return positiveEnvNumber('PORTAL_RUNTIME_TURN_EVENT_HISTORY_MAX_AGE_MS', DEFAULT_MAX_HISTORY_AGE_MS);
+}
+
+function rotatedHistoryPath(filePath: string): string {
+  return `${filePath}.1`;
 }
 
 function trimText(value: unknown): string | undefined {
@@ -76,13 +112,44 @@ function sanitizeEvent(event: RuntimeTurnEvent): RuntimeTurnEvent | null {
 // event that is flushed when the thought settles (next non-replace event,
 // turn end, or a history read).
 const pendingReasoningBySession = new Map<string, RuntimeTurnEvent>();
+const lastRunBySession = new Map<string, string>();
+
+function rotateHistoryFile(filePath: string): void {
+  if (!existsSync(filePath)) return;
+  const rotated = rotatedHistoryPath(filePath);
+  if (existsSync(rotated)) unlinkSync(rotated);
+  renameSync(filePath, rotated);
+}
+
+function maybeRotateHistory(
+  sessionKey: string,
+  filePath: string,
+  event: RuntimeTurnEvent,
+  phase: 'before' | 'after',
+): void {
+  if (!existsSync(filePath)) return;
+  const stats = statSync(filePath);
+  const overLimit = stats.size >= historyMaxBytes();
+  const tooOld = Date.now() - stats.mtimeMs >= historyMaxAgeMs();
+  if (!overLimit && !tooOld) return;
+
+  const runId = String(event.runId || '').trim();
+  const previousRunId = lastRunBySession.get(sessionKey) || '';
+  const startsNewRun = phase === 'before' && (!previousRunId || (runId && runId !== previousRunId));
+  const closesRun = phase === 'after' && (event.type === 'turn_done' || event.type === 'turn_error');
+  if (startsNewRun || closesRun) rotateHistoryFile(filePath);
+}
 
 function appendEventLine(sessionKey: string, dir: string, event: RuntimeTurnEvent): void {
   // Persisted turn events hold conversation content; keep them out of reach
   // of non-root local accounts (modes apply at creation only — the installer
   // repairs pre-existing files).
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  appendFileSync(historyPathForSession(sessionKey, dir), JSON.stringify(event) + '\n', { encoding: 'utf8', mode: 0o600 });
+  const filePath = historyPathForSession(sessionKey, dir);
+  maybeRotateHistory(sessionKey, filePath, event, 'before');
+  appendFileSync(filePath, JSON.stringify(event) + '\n', { encoding: 'utf8', mode: 0o600 });
+  lastRunBySession.set(sessionKey, String(event.runId || '').trim());
+  maybeRotateHistory(sessionKey, filePath, event, 'after');
 }
 
 function flushPendingReasoning(sessionKey: string, dir: string): void {
@@ -132,13 +199,18 @@ export function readRuntimeTurnEvents(sessionKey: string, limit = DEFAULT_LIMIT)
   }
 
   const filePath = historyPathForSession(sessionKey, dir);
-  if (!existsSync(filePath)) return [];
+  const rotatedPath = rotatedHistoryPath(filePath);
+  if (!existsSync(filePath) && !existsSync(rotatedPath)) return [];
 
   try {
-    const lines = readFileSync(filePath, 'utf8')
-      .split('\n')
-      .filter((line) => line.trim())
-      .slice(-Math.max(limit * 3, limit));
+    const safeLimit = Math.min(Math.max(Math.floor(limit), 1), MAX_REQUESTED_EVENTS);
+    const lineBudget = Math.min(Math.max(safeLimit * 2, safeLimit), MAX_REQUESTED_EVENTS * 2);
+    const currentLines = readJsonlTail(filePath, lineBudget, historyMaxReadBytes());
+    const remaining = Math.max(lineBudget - currentLines.length, 0);
+    const rotatedLines = remaining > 0
+      ? readJsonlTail(rotatedPath, remaining, historyMaxReadBytes())
+      : [];
+    const lines = [...rotatedLines, ...currentLines];
     const seen = new Set<string>();
     const events: RuntimeTurnEvent[] = [];
 
@@ -169,9 +241,57 @@ export function readRuntimeTurnEvents(sessionKey: string, limit = DEFAULT_LIMIT)
 
     return events
       .sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq))
-      .slice(-Math.max(limit, 1));
+      .slice(-safeLimit);
   } catch (err: any) {
     console.warn('[runtime-turn-event-history] Failed to read turn events:', err?.message || err);
     return [];
   }
 }
+
+/**
+ * Read only the newest complete JSONL records. The old implementation loaded
+ * and split the entire lifetime file synchronously on every history refresh;
+ * a multi-hour agent turn could briefly allocate many times the file size and
+ * stall the Node event loop. This bounded tail reader touches only the bytes
+ * required for the requested replay window.
+ */
+function readJsonlTail(filePath: string, maxLines: number, maxBytes: number): string[] {
+  if (maxLines <= 0 || maxBytes <= 0 || !existsSync(filePath)) return [];
+  const size = statSync(filePath).size;
+  if (size <= 0) return [];
+
+  const fd = openSync(filePath, 'r');
+  const chunks: Buffer[] = [];
+  let position = size;
+  let bytesReadTotal = 0;
+  let newlineCount = 0;
+  try {
+    while (position > 0 && bytesReadTotal < maxBytes && newlineCount <= maxLines) {
+      const chunkSize = Math.min(READ_CHUNK_BYTES, position, maxBytes - bytesReadTotal);
+      if (chunkSize <= 0) break;
+      position -= chunkSize;
+      const buffer = Buffer.allocUnsafe(chunkSize);
+      const bytesRead = readSync(fd, buffer, 0, chunkSize, position);
+      const chunk = bytesRead === chunkSize ? buffer : buffer.subarray(0, bytesRead);
+      chunks.unshift(chunk);
+      bytesReadTotal += bytesRead;
+      for (let index = 0; index < chunk.length; index += 1) {
+        if (chunk[index] === 10) newlineCount += 1;
+      }
+    }
+  } finally {
+    closeSync(fd);
+  }
+
+  const text = Buffer.concat(chunks).toString('utf8');
+  let lines = text.split('\n');
+  // A bounded tail may begin inside a UTF-8/JSON record. Drop that partial
+  // record; every later newline-delimited event remains intact.
+  if (position > 0) lines = lines.slice(1);
+  return lines.filter((line) => line.trim()).slice(-maxLines);
+}
+
+export const __runtimeTurnEventHistoryTest = {
+  readJsonlTail,
+  historyPathForSession,
+};

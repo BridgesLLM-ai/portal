@@ -1,4 +1,5 @@
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import { config } from '../config/env';
 
 export interface JwtPayload {
@@ -7,6 +8,7 @@ export interface JwtPayload {
   role: string;
   accountStatus?: string;
   sandboxEnabled?: boolean;
+  authorizationVersion?: number;
 }
 
 export function generateAccessToken(payload: JwtPayload): string {
@@ -15,7 +17,10 @@ export function generateAccessToken(payload: JwtPayload): string {
 }
 
 export function generateRefreshToken(payload: { userId: string }): string {
-  const options: any = { expiresIn: config.jwtRefreshExpiration as any };
+  const options: any = {
+    expiresIn: config.jwtRefreshExpiration as any,
+    jwtid: crypto.randomUUID(),
+  };
   return jwt.sign(payload, config.jwtRefreshSecret, options);
 }
 

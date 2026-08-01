@@ -541,3 +541,13 @@ export function isCompactionNotice(content: string): boolean {
     /^compaction skipped(?::.*)?$/i,
   ].some((pattern) => pattern.test(marker));
 }
+
+/**
+ * The ask-question tool is the only tool the user is expected to act on, so
+ * both chat surfaces render it as an answer card rather than an inert pill.
+ * Matched on the canonical name so provider-specific prefixes still resolve.
+ */
+export function isAskQuestionTool(toolName: unknown): boolean {
+  if (typeof toolName !== 'string') return false;
+  return canonicalToolName(toolName) === 'ask_user_question';
+}

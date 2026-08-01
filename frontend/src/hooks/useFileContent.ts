@@ -10,7 +10,7 @@ const debugLog = (...args: unknown[]) => {
  * Secure file content hook - fetches files with auth header, creates blob URLs
  * Use for image/video/audio previews
  */
-export function useFileContent(fileId: string | null, mimeType?: string): {
+export function useFileContent(fileId: string | null, _mimeType?: string): {
   blobUrl: string | null;
   blob: Blob | null;
   loading: boolean;

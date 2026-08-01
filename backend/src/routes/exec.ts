@@ -1,18 +1,46 @@
 import { Server as SocketIOServer } from 'socket.io';
-import { spawn as ptySpawn } from 'node-pty';
 import { verifyAccessToken } from '../utils/jwt';
 import { prisma } from '../config/database';
 import { canUseInteractivePortal, isElevatedRole } from '../utils/authz';
+import { parseSafeCookieHeader } from '../utils/safeCookies';
+import { subscribeToAuthorizationChanges } from '../services/authorizationChangeBus';
+import {
+  acquireGlobalWorkspaceAuthorizationMutationLease,
+  subscribeToGlobalWorkspaceAuthorizationFence,
+} from '../services/workspaceAuthorizationBarrier';
+import {
+  prepareTerminalSystemdScope,
+  TerminalSystemdScopeError,
+  type PreparedTerminalSystemdScope,
+} from '../services/terminalSystemdScopeBoundary';
 
-function parseCookies(cookieHeader: string): Record<string, string> {
-  return cookieHeader.split(';').reduce((acc, part) => {
-    const idx = part.indexOf('=');
-    if (idx === -1) return acc;
-    const key = part.slice(0, idx).trim();
-    const value = decodeURIComponent(part.slice(idx + 1).trim());
-    acc[key] = value;
-    return acc;
-  }, {} as Record<string, string>);
+const DEFAULT_TERMINAL_COLS = 80;
+const DEFAULT_TERMINAL_ROWS = 24;
+const MAX_TERMINAL_COLS = 500;
+const MAX_TERMINAL_ROWS = 200;
+export const MAX_TERMINAL_INPUT_BYTES = 256 * 1024;
+
+interface TerminalAuthorizationControl {
+  revoked: boolean;
+  requestTermination?: () => void;
+}
+
+function clampTerminalDimension(value: unknown, fallback: number, maximum: number): number {
+  const parsed = typeof value === 'number'
+    ? value
+    : (typeof value === 'string' && value.trim() ? Number(value) : Number.NaN);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(maximum, Math.trunc(parsed)));
+}
+
+export function normalizeTerminalDimensions(
+  cols: unknown,
+  rows: unknown,
+): { cols: number; rows: number } {
+  return {
+    cols: clampTerminalDimension(cols, DEFAULT_TERMINAL_COLS, MAX_TERMINAL_COLS),
+    rows: clampTerminalDimension(rows, DEFAULT_TERMINAL_ROWS, MAX_TERMINAL_ROWS),
+  };
 }
 
 export function setupTerminalNamespace(io: SocketIOServer) {
@@ -23,7 +51,7 @@ export function setupTerminalNamespace(io: SocketIOServer) {
 
     if (!token || typeof token !== 'string') {
       const cookieHeader = socket.handshake.headers?.cookie || '';
-      const cookies = parseCookies(cookieHeader);
+      const cookies = parseSafeCookieHeader(cookieHeader);
       token = cookies.accessToken;
     }
 
@@ -36,84 +64,262 @@ export function setupTerminalNamespace(io: SocketIOServer) {
       return next(new Error('Invalid or expired token'));
     }
 
+    const authorizationControl: TerminalAuthorizationControl = {
+      revoked: false,
+    };
+    (socket as any).terminalAuthorizationControl = authorizationControl;
+    let unsubscribed = false;
+    const revokeInteractiveAuthority = () => {
+      authorizationControl.revoked = true;
+      authorizationControl.requestTermination?.();
+      try {
+        socket.disconnect(true);
+      } catch {
+        // The post-query check below still rejects a handshake being torn down.
+      }
+    };
+    let unsubscribeGlobalFence = () => {};
+    let unsubscribeAuthorization = () => {};
+    unsubscribeGlobalFence = subscribeToGlobalWorkspaceAuthorizationFence(
+      revokeInteractiveAuthority,
+    );
+    if (authorizationControl.revoked) {
+      unsubscribeGlobalFence();
+      return next(new Error('Workspace authorization is changing'));
+    }
+    unsubscribeAuthorization = subscribeToAuthorizationChanges(
+      payload.userId,
+      revokeInteractiveAuthority,
+    );
+    const cleanupAuthorization = () => {
+      if (unsubscribed) return;
+      unsubscribed = true;
+      socket.conn?.removeListener?.('close', cleanupAuthorization);
+      unsubscribeGlobalFence();
+      unsubscribeAuthorization();
+    };
+    (socket as any).authorizationUnsubscribe = cleanupAuthorization;
+    socket.conn?.once?.('close', cleanupAuthorization);
+
     prisma.user.findUnique({
       where: { id: payload.userId },
-      select: { id: true, email: true, role: true, accountStatus: true, isActive: true },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        accountStatus: true,
+        isActive: true,
+        authorizationVersion: true,
+      },
     } as any).then((user) => {
       if (!user || !canUseInteractivePortal(user.role, (user as any).accountStatus, user.isActive) || !isElevatedRole(user.role)) {
+        cleanupAuthorization();
         return next(new Error('Account is not permitted for terminal access'));
+      }
+      if ((payload.authorizationVersion ?? 1) !== Number((user as any).authorizationVersion ?? 1)) {
+        cleanupAuthorization();
+        return next(new Error('Authorization changed; sign in again'));
+      }
+      if (authorizationControl.revoked) {
+        cleanupAuthorization();
+        return next(new Error('Authorization changed during connection'));
       }
 
       (socket as any).user = { userId: user.id, email: user.email, role: user.role };
       next();
-    }).catch((err) => next(err));
+    }).catch((err) => {
+      cleanupAuthorization();
+      next(err);
+    });
   });
 
   terminal.on('connection', (socket) => {
-    console.log(`Terminal connected: ${(socket as any).user?.userId}`);
+    let releaseLeaseBeforeBoundary: (() => void) | null = null;
+    let terminateAfterBoundary: (() => void) | null = null;
 
-    const cols = parseInt(socket.handshake.query?.cols as string) || 80;
-    const rows = parseInt(socket.handshake.query?.rows as string) || 24;
+    void (async () => {
+      console.log(`Terminal connected: ${(socket as any).user?.userId}`);
+      const unsubscribeAuthorization = (socket as any).authorizationUnsubscribe as
+        | (() => void)
+        | undefined;
+      const authorizationControl = (socket as any).terminalAuthorizationControl as
+        | TerminalAuthorizationControl
+        | undefined;
 
-    let pty: ReturnType<typeof ptySpawn>;
+      const initialDimensions = normalizeTerminalDimensions(
+        socket.handshake.query?.cols,
+        socket.handshake.query?.rows,
+      );
 
-    try {
-      {
-        // Direct bash — portal runs on host as systemd service
-        pty = ptySpawn('bash', ['-l'], {
-          name: 'xterm-256color',
-          cols,
-          rows,
-          cwd: process.env.HOME || '/root',
-          env: {
-            ...process.env,
-            TERM: 'xterm-256color',
-          } as Record<string, string>,
+      let releaseMutationLease: (() => void) | null = null;
+      try {
+        releaseMutationLease = acquireGlobalWorkspaceAuthorizationMutationLease();
+      } catch {
+        socket.emit('output', '\r\nTerminal access is temporarily unavailable.\r\n');
+        unsubscribeAuthorization?.();
+        socket.disconnect();
+        return;
+      }
+
+      let session: PreparedTerminalSystemdScope | null = null;
+      let preparation: Promise<PreparedTerminalSystemdScope> | null = null;
+      let terminationPromise: Promise<void> | null = null;
+      let terminationRequested = false;
+      let acceptingInput = false;
+      let leaseReleased = false;
+
+      const releaseLease = () => {
+        if (leaseReleased) return;
+        leaseReleased = true;
+        releaseMutationLease?.();
+        releaseMutationLease = null;
+      };
+      releaseLeaseBeforeBoundary = releaseLease;
+
+      const requestTermination = (): void => {
+        terminationRequested = true;
+        acceptingInput = false;
+        if (terminationPromise) return;
+        terminationPromise = (async () => {
+          try {
+            const prepared = session || (preparation ? await preparation : null);
+            if (prepared) await prepared.stop();
+            releaseLease();
+          } catch (error) {
+            if (
+              error instanceof TerminalSystemdScopeError
+              && error.settlementProven
+            ) {
+              releaseLease();
+            } else {
+              // Retain the mutation lease. Authorization transitions must remain
+              // fail-closed until restart recovery proves this scope empty.
+              console.error(
+                '[Terminal Scope] Exact recursive settlement could not be proven',
+              );
+            }
+          } finally {
+            if (!socket.disconnected) socket.disconnect(true);
+          }
+        })();
+        void terminationPromise;
+      };
+      terminateAfterBoundary = requestTermination;
+      if (authorizationControl) {
+        authorizationControl.requestTermination = requestTermination;
+      }
+
+      socket.on('input', (data: unknown) => {
+        if (
+          typeof data !== 'string'
+          || Buffer.byteLength(data, 'utf8') > MAX_TERMINAL_INPUT_BYTES
+        ) {
+          socket.emit(
+            'output',
+            '\r\nTerminal input was rejected because it exceeded the 256 KiB safety limit.\r\n',
+          );
+          return;
+        }
+        if (!acceptingInput || !session) {
+          socket.emit(
+            'output',
+            '\r\nTerminal input is unavailable until the protected session is ready.\r\n',
+          );
+          return;
+        }
+        try {
+          session.pty.write(data);
+        } catch {
+          // pty already closed
+        }
+      });
+
+      socket.on('resize', (size: unknown) => {
+        if (!acceptingInput || !session) return;
+        try {
+          const dimensions = normalizeTerminalDimensions(
+            (size as { cols?: unknown } | null)?.cols,
+            (size as { rows?: unknown } | null)?.rows,
+          );
+          session.pty.resize(dimensions.cols, dimensions.rows);
+        } catch {
+          // ignore
+        }
+      });
+
+      socket.on('disconnect', () => {
+        unsubscribeAuthorization?.();
+        console.log(`Terminal disconnected: ${(socket as any).user?.userId}`);
+        requestTermination();
+      });
+
+      const targetEnvironment: NodeJS.ProcessEnv = {
+        ...process.env,
+        HOME: process.env.HOME || '/root',
+        TERM: 'xterm-256color',
+      };
+      preparation = prepareTerminalSystemdScope({
+        command: '/bin/bash',
+        args: ['-l'],
+        cwd: process.env.HOME || '/root',
+        env: targetEnvironment,
+        terminalName: 'xterm-256color',
+        cols: initialDimensions.cols,
+        rows: initialDimensions.rows,
+      });
+
+      try {
+        session = await preparation;
+        if (
+          terminationRequested
+          || authorizationControl?.revoked
+          || socket.disconnected
+        ) {
+          requestTermination();
+          await terminationPromise;
+          return;
+        }
+
+        session.pty.onData((data: string) => {
+          if (!terminationRequested && !socket.disconnected) {
+            socket.emit('output', data);
+          }
         });
-        console.log('Terminal: local bash mode (no SSH key found)');
-      }
-    } catch (error) {
-      console.error('Failed to spawn pty:', error);
-      socket.emit('output', '\r\nFailed to start terminal session.\r\n');
-      socket.disconnect();
-      return;
-    }
+        session.pty.onExit(({ exitCode }: { exitCode: number }) => {
+          if (!socket.disconnected) {
+            socket.emit('output', `\r\nProcess exited with code ${exitCode}\r\n`);
+          }
+          requestTermination();
+        });
 
-    pty.onData((data: string) => {
-      socket.emit('output', data);
-    });
-
-    pty.onExit(({ exitCode }: { exitCode: number }) => {
-      socket.emit('output', `\r\nProcess exited with code ${exitCode}\r\n`);
-      socket.disconnect();
-    });
-
-    socket.on('input', (data: string) => {
-      try {
-        pty.write(data);
+        await session.activate();
+        if (
+          terminationRequested
+          || authorizationControl?.revoked
+          || socket.disconnected
+        ) {
+          requestTermination();
+          await terminationPromise;
+          return;
+        }
+        acceptingInput = true;
+        socket.emit('terminal_ready', {
+          scope: session.identity.scopeUnit,
+        });
+        console.log('Terminal: attested local systemd scope ready');
       } catch {
-        // pty already closed
+        socket.emit('output', '\r\nFailed to start protected terminal session.\r\n');
+        requestTermination();
+        await terminationPromise;
       }
-    });
-
-    socket.on('resize', (size: { cols: number; rows: number }) => {
-      try {
-        pty.resize(
-          Math.max(1, Math.min(500, size.cols)),
-          Math.max(1, Math.min(200, size.rows))
-        );
-      } catch {
-        // ignore
+    })().catch(() => {
+      if (terminateAfterBoundary) {
+        terminateAfterBoundary();
+        return;
       }
-    });
-
-    socket.on('disconnect', () => {
-      console.log(`Terminal disconnected: ${(socket as any).user?.userId}`);
-      try {
-        pty.kill();
-      } catch {
-        // already dead
-      }
+      // No scope can exist before the termination boundary is installed.
+      releaseLeaseBeforeBoundary?.();
+      try { socket.disconnect(true); } catch {}
     });
   });
 }

@@ -69,6 +69,7 @@ const PROVIDER_COMMANDS: Record<AgentProviderName, ProviderSlashCommand[]> = {
   OPENCLAW: OPENCLAW_SLASH_COMMANDS,
   CLAUDE_CODE: [],
   CODEX: [],
+  GROK: [],
   AGENT_ZERO: [],
   GEMINI: [],
   OLLAMA: [],

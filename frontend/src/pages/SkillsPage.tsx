@@ -1,15 +1,18 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Puzzle, Search, RefreshCw, CheckCircle, AlertCircle, XCircle,
   ChevronDown, ChevronUp, Loader2, Package, Folder, Box, Download, Plug, Store, Wrench, Trash2, TrendingUp, Clock, Star
 } from 'lucide-react';
 import { skillsAPI } from '../api/endpoints';
+import { agentJobsAPI } from '../api/agentJobs';
+import TypedConfirmationDialog from '../components/TypedConfirmationDialog';
 
 /* ─── Types ─────────────────────────────────────────────── */
 
 interface SkillMissing {
   bins?: string[];
+  anyBins?: string[];
   env?: string[];
   config?: string[];
   os?: string[];
@@ -21,8 +24,9 @@ interface Skill {
   emoji?: string;
   eligible: boolean;
   disabled: boolean;
-  source: 'bundled' | 'managed' | 'workspace' | 'openclaw-bundled';
+  source: string;
   bundled?: boolean;
+  managed?: boolean;
   missing?: SkillMissing;
 }
 
@@ -50,6 +54,36 @@ interface PluginEntry {
 
 type FilterTab = 'all' | 'eligible' | 'installed' | 'missing';
 type MarketSort = 'trending' | 'newest' | 'downloads';
+
+type PendingExtensionMutation = {
+  kind: 'skill-install' | 'skill-uninstall' | 'plugin-install';
+  target: string;
+  confirmationPhrase: string;
+};
+
+type ExtensionMutationOwner = Readonly<{
+  mutation: Readonly<PendingExtensionMutation>;
+  confirmation: string;
+}>;
+
+type ExtensionMutationProof = Readonly<{
+  mutationKey: string;
+  jobId: string;
+  completed: boolean;
+}>;
+
+type ExtensionNavigationGuard = {
+  url: string;
+  state: unknown;
+  owner: ExtensionMutationOwner;
+};
+
+const JOB_STATUS_REQUEST_TIMEOUT_MS = 8_000;
+const JOB_POLL_TIMEOUT_MS = 5 * 60_000;
+const JOB_POLL_INTERVAL_MS = 2_000;
+const INVENTORY_READBACK_TIMEOUT_MS = 15_000;
+
+class ExtensionJobTerminalError extends Error {}
 
 /* ─── Animation Variants ────────────────────────────────── */
 
@@ -85,10 +119,63 @@ function getMissingItems(missing?: SkillMissing): string[] {
   if (!missing) return [];
   const items: string[] = [];
   if (missing.bins?.length) items.push(...missing.bins.map(b => `bin: ${b}`));
+  if (missing.anyBins?.length) items.push(`one of: ${missing.anyBins.join(', ')}`);
   if (missing.env?.length) items.push(...missing.env.map(e => `env: ${e}`));
   if (missing.config?.length) items.push(...missing.config.map(c => `config: ${c}`));
   if (missing.os?.length) items.push(...missing.os.map(o => `os: ${o}`));
   return items;
+}
+
+function mutationKey(mutation: PendingExtensionMutation): string {
+  return `${mutation.kind}:${mutation.target}`;
+}
+
+function withoutPackageVersion(value: string): string {
+  if (value.startsWith('@')) {
+    const slashIndex = value.indexOf('/');
+    const versionIndex = value.lastIndexOf('@');
+    return slashIndex >= 0 && versionIndex > slashIndex ? value.slice(0, versionIndex) : value;
+  }
+  const versionIndex = value.lastIndexOf('@');
+  return versionIndex > 0 ? value.slice(0, versionIndex) : value;
+}
+
+function pluginIdentityCandidates(spec: string): Set<string> {
+  const normalized = spec.trim().toLowerCase();
+  const withoutScheme = normalized.replace(/^(?:npm|clawhub):/, '');
+  return new Set([
+    normalized,
+    withoutScheme,
+    withoutPackageVersion(withoutScheme),
+  ].filter(Boolean));
+}
+
+function pluginMatchesSpec(plugin: PluginEntry, spec: string): boolean {
+  const candidates = pluginIdentityCandidates(spec);
+  const exactFields = [plugin.id, plugin.name, plugin.origin, plugin.source]
+    .filter((value): value is string => typeof value === 'string')
+    .map((value) => value.trim().toLowerCase());
+  if (exactFields.some((value) => candidates.has(value))) return true;
+
+  const source = typeof plugin.source === 'string'
+    ? plugin.source.replace(/\\/g, '/').toLowerCase()
+    : '';
+  return [...candidates].some((candidate) => (
+    candidate.includes('/')
+    && (source.includes(`/node_modules/${candidate}/`) || source.endsWith(`/node_modules/${candidate}`))
+  ));
+}
+
+async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  let timeoutId: number | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutId = window.setTimeout(() => reject(new Error(timeoutMessage)), Math.max(1, timeoutMs));
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+  }
 }
 
 /* ─── Skill Card Component ──────────────────────────────── */
@@ -97,24 +184,30 @@ interface SkillCardProps {
   skill: Skill;
   installedNames: Set<string>;
   onUninstall?: (name: string) => void;
+  disabled?: boolean;
 }
 
-function SkillCard({ skill, installedNames: _installedNames, onUninstall }: SkillCardProps) {
+function SkillCard({ skill, installedNames: _installedNames, onUninstall, disabled = false }: SkillCardProps) {
   const [expanded, setExpanded] = useState(false);
   const sourceInfo = getSourceLabel(skill);
   const statusInfo = getStatusInfo(skill);
   const StatusIcon = statusInfo.icon;
   const missingItems = getMissingItems(skill.missing);
-  const isManaged = skill.source === 'managed';
+  const isManaged = skill.managed === true || skill.source === 'managed';
 
   return (
     <motion.div
       variants={cardVariant}
       layout
-      className="bg-white/[0.03] border border-white/[0.06] rounded-2xl p-5 hover:bg-white/[0.05] hover:border-white/[0.1] transition-all duration-200 cursor-pointer"
-      onClick={() => setExpanded(!expanded)}
+      className="bg-white/[0.03] border border-white/[0.06] rounded-2xl p-5 hover:bg-white/[0.05] hover:border-white/[0.1] transition-all duration-200"
     >
-      <div className="flex items-start gap-4">
+      <button
+        type="button"
+        className="flex w-full cursor-pointer items-start gap-4 text-left"
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+        aria-label={`${expanded ? 'Hide' : 'Show'} details for ${skill.name}`}
+      >
         <div className="w-12 h-12 rounded-xl bg-white/[0.05] flex items-center justify-center text-2xl flex-shrink-0">
           {skill.emoji || '📦'}
         </div>
@@ -155,7 +248,7 @@ function SkillCard({ skill, installedNames: _installedNames, onUninstall }: Skil
         <div className="text-slate-500">
           {expanded ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
         </div>
-      </div>
+      </button>
 
       <AnimatePresence>
         {expanded && (
@@ -193,7 +286,7 @@ function SkillCard({ skill, installedNames: _installedNames, onUninstall }: Skil
                 {skill.source === 'managed' && (
                   <span className="flex items-center gap-1"><Box size={12} /> Managed via ClawHub</span>
                 )}
-                {skill.source === 'workspace' && (
+                {!skill.bundled && skill.source !== 'bundled' && skill.source !== 'openclaw-bundled' && !isManaged && (
                   <span className="flex items-center gap-1"><Folder size={12} /> Local workspace skill</span>
                 )}
               </div>
@@ -202,7 +295,8 @@ function SkillCard({ skill, installedNames: _installedNames, onUninstall }: Skil
                 <div className="mt-3 pt-3 border-t border-white/[0.06]">
                   <button
                     onClick={(e) => { e.stopPropagation(); onUninstall(skill.name); }}
-                    className="inline-flex items-center gap-2 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs text-red-300 hover:bg-red-500/20 transition-all"
+                    disabled={disabled}
+                    className="inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs text-red-300 hover:bg-red-500/20 transition-all disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     <Trash2 size={12} /> Uninstall
                   </button>
@@ -229,49 +323,77 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
   const [plugins, setPlugins] = useState<PluginEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [marketQuery, setMarketQuery] = useState('');
   const [marketResults, setMarketResults] = useState<MarketplaceResult[]>([]);
   const [marketLoading, setMarketLoading] = useState(false);
   const [marketSort, setMarketSort] = useState<MarketSort>('trending');
   const [marketMode, setMarketMode] = useState<'explore' | 'search'>('explore');
-  const [installingSkill, setInstallingSkill] = useState<string | null>(null);
   const [pluginSpec, setPluginSpec] = useState('');
-  const [installingPlugin, setInstallingPlugin] = useState(false);
   const [activityMessage, setActivityMessage] = useState<string | null>(null);
+  const [activityError, setActivityError] = useState(false);
   const [activeTab, setActiveTab] = useState<FilterTab>('all');
+  const [pendingMutation, setPendingMutation] = useState<PendingExtensionMutation | null>(null);
+  const [mutationBusy, setMutationBusy] = useState(false);
+  const [mutationError, setMutationError] = useState<string | null>(null);
+  const [mutationProof, setMutationProof] = useState<ExtensionMutationProof | null>(null);
+  const mountedRef = useRef(true);
+  const listingRequestRef = useRef(0);
+  const marketRequestRef = useRef(0);
+  const mutationOwnerRef = useRef<ExtensionMutationOwner | null>(null);
+  const mutationProofRef = useRef<ExtensionMutationProof | null>(null);
+  const mutationNavigationGuardRef = useRef<ExtensionNavigationGuard | null>(null);
 
   const installedNames = useMemo(() => new Set(skills.map(s => s.name)), [skills]);
 
-  const fetchSkills = async () => {
+  const fetchSkills = async (force = false) => {
+    const requestId = ++listingRequestRef.current;
     setLoading(true);
     setError(null);
-    try {
-      const [skillData, pluginData] = await Promise.all([
-        skillsAPI.list(),
-        skillsAPI.listPlugins(),
-      ]);
-      setSkills(skillData.skills || []);
-      setPlugins(pluginData.plugins || []);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to load extensions';
-      setError(message);
-    } finally {
-      setLoading(false);
+    setWarning(null);
+    const [skillResult, pluginResult] = await Promise.allSettled([
+      skillsAPI.list(force),
+      skillsAPI.listPlugins(force),
+    ]);
+    if (!mountedRef.current || requestId !== listingRequestRef.current) return;
+
+    const failures: string[] = [];
+    if (skillResult.status === 'fulfilled') {
+      setSkills(Array.isArray(skillResult.value.skills) ? skillResult.value.skills : []);
+    } else {
+      failures.push(skillResult.reason?.response?.data?.error || skillResult.reason?.message || 'Skill inventory unavailable');
     }
+    if (pluginResult.status === 'fulfilled') {
+      setPlugins(Array.isArray(pluginResult.value.plugins) ? pluginResult.value.plugins : []);
+    } else {
+      failures.push(pluginResult.reason?.response?.data?.error || pluginResult.reason?.message || 'Plugin inventory unavailable');
+    }
+
+    if (skillResult.status === 'rejected' && pluginResult.status === 'rejected') setError(failures.join(' · '));
+    else if (failures.length) setWarning(failures.join(' · '));
+    setLoading(false);
   };
 
   const loadExplore = useCallback(async (sort: MarketSort = marketSort) => {
+    const requestId = ++marketRequestRef.current;
     setMarketLoading(true);
     setMarketMode('explore');
     try {
       const data = await skillsAPI.explore(sort, 25);
-      setMarketResults(Array.isArray(data.results) ? data.results : []);
+      if (mountedRef.current && requestId === marketRequestRef.current) {
+        setMarketResults(Array.isArray(data.results) ? data.results : []);
+        setActivityMessage(null);
+        setActivityError(false);
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to load marketplace';
-      setActivityMessage(message);
+      if (mountedRef.current && requestId === marketRequestRef.current) {
+        setActivityError(true);
+        setActivityMessage(message);
+      }
     } finally {
-      setMarketLoading(false);
+      if (mountedRef.current && requestId === marketRequestRef.current) setMarketLoading(false);
     }
   }, [marketSort]);
 
@@ -279,68 +401,247 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
     const trimmed = query.trim();
     if (!trimmed) {
       // Empty search → go back to explore mode
-      loadExplore();
+      void loadExplore();
       return;
     }
+    const requestId = ++marketRequestRef.current;
     setMarketLoading(true);
     setMarketMode('search');
     try {
       const data = await skillsAPI.search(trimmed);
-      setMarketResults(Array.isArray(data.results) ? data.results : []);
+      if (mountedRef.current && requestId === marketRequestRef.current) {
+        setMarketResults(Array.isArray(data.results) ? data.results : []);
+        setActivityMessage(null);
+        setActivityError(false);
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Marketplace search failed';
-      setActivityMessage(message);
+      if (mountedRef.current && requestId === marketRequestRef.current) {
+        setActivityError(true);
+        setActivityMessage(message);
+      }
     } finally {
-      setMarketLoading(false);
+      if (mountedRef.current && requestId === marketRequestRef.current) setMarketLoading(false);
     }
   };
 
-  const installSkill = async (name: string) => {
-    setInstallingSkill(name);
-    setActivityMessage(null);
-    try {
-      await skillsAPI.install(name);
-      setActivityMessage(`✅ Installed skill: ${name}`);
-      await fetchSkills();
-    } catch (err) {
-      setActivityMessage(err instanceof Error ? err.message : `Failed to install ${name}`);
-    } finally {
-      setInstallingSkill(null);
-    }
+  const installSkill = (name: string) => {
+    if (mutationOwnerRef.current) return;
+    setMutationError(null);
+    mutationProofRef.current = null;
+    setMutationProof(null);
+    setPendingMutation({
+      kind: 'skill-install',
+      target: name,
+      confirmationPhrase: `INSTALL SKILL ${name}`,
+    });
   };
 
-  const uninstallSkill = async (name: string) => {
-    if (!confirm(`Uninstall skill "${name}"?`)) return;
-    setActivityMessage(null);
-    try {
-      await skillsAPI.uninstall(name);
-      setActivityMessage(`Uninstalled skill: ${name}`);
-      await fetchSkills();
-    } catch (err) {
-      setActivityMessage(err instanceof Error ? err.message : `Failed to uninstall ${name}`);
-    }
+  const uninstallSkill = (name: string) => {
+    if (mutationOwnerRef.current) return;
+    setMutationError(null);
+    mutationProofRef.current = null;
+    setMutationProof(null);
+    setPendingMutation({
+      kind: 'skill-uninstall',
+      target: name,
+      confirmationPhrase: `UNINSTALL SKILL ${name}`,
+    });
   };
 
-  const installPlugin = async () => {
+  const installPlugin = () => {
+    if (mutationOwnerRef.current) return;
     const spec = pluginSpec.trim();
     if (!spec) return;
-    setInstallingPlugin(true);
-    setActivityMessage(null);
+    setMutationError(null);
+    mutationProofRef.current = null;
+    setMutationProof(null);
+    setPendingMutation({
+      kind: 'plugin-install',
+      target: spec,
+      confirmationPhrase: `INSTALL PLUGIN ${spec}`,
+    });
+  };
+
+  const waitForMutationJob = async (jobId: string) => {
+    const deadline = Date.now() + JOB_POLL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (!mountedRef.current) throw new Error('Extension status polling cancelled');
+      const remainingMs = deadline - Date.now();
+      const requestTimeoutMs = Math.max(1, Math.min(JOB_STATUS_REQUEST_TIMEOUT_MS, remainingMs));
+      const job = await withDeadline(
+        agentJobsAPI.status(jobId, { timeoutMs: requestTimeoutMs }),
+        requestTimeoutMs,
+        `Background job ${jobId} did not answer a bounded status request. Retry verification or inspect its retained transcript in Tasks.`,
+      );
+      if (job.status === 'completed') return;
+      if (job.status === 'error' || job.status === 'killed') {
+        throw new ExtensionJobTerminalError(`Background extension job ${job.status}. Open Tasks for its retained transcript before retrying.`);
+      }
+      const delayMs = Math.min(JOB_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()));
+      if (delayMs > 0) await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+    }
+    throw new Error(`Background job ${jobId} did not finish within five minutes. Retry verification or continue tracking it in Tasks.`);
+  };
+
+  const verifyFreshMutationInventory = async (owner: ExtensionMutationOwner, jobId: string) => {
+    if (owner.mutation.kind === 'plugin-install') {
+      let data: { plugins?: unknown };
+      try {
+        data = await withDeadline(
+          skillsAPI.listPlugins(true),
+          INVENTORY_READBACK_TIMEOUT_MS,
+          'the inventory request timed out',
+        );
+      } catch (inventoryError) {
+        const reason = inventoryError instanceof Error ? inventoryError.message : 'the inventory request failed';
+        throw new Error(`Background job ${jobId} completed, but fresh plugin inventory is unavailable: ${reason}. Retry verification or inspect Tasks before starting another install.`);
+      }
+      const nextPlugins = Array.isArray(data?.plugins) ? data.plugins as PluginEntry[] : null;
+      if (!nextPlugins) {
+        throw new Error(`Background job ${jobId} completed, but Portal returned a malformed plugin inventory. Retry verification or inspect Tasks.`);
+      }
+      if (!nextPlugins.some((plugin) => pluginMatchesSpec(plugin, owner.mutation.target))) {
+        throw new Error(`Background job ${jobId} completed, but the fresh plugin inventory does not prove ${owner.mutation.target} is installed. Retry verification or inspect Tasks before starting another install.`);
+      }
+      if (mutationOwnerRef.current === owner) {
+        listingRequestRef.current += 1;
+        setPlugins(nextPlugins);
+        setLoading(false);
+      }
+      return;
+    }
+
+    let data: { skills?: unknown };
     try {
-      await skillsAPI.installPlugin(spec);
-      setActivityMessage(`✅ Installed plugin: ${spec}`);
-      setPluginSpec('');
-      await fetchSkills();
+      data = await withDeadline(
+        skillsAPI.list(true),
+        INVENTORY_READBACK_TIMEOUT_MS,
+        'the inventory request timed out',
+      );
+    } catch (inventoryError) {
+      const reason = inventoryError instanceof Error ? inventoryError.message : 'the inventory request failed';
+      throw new Error(`Background job ${jobId} completed, but fresh skill inventory is unavailable: ${reason}. Retry verification or inspect Tasks before starting another mutation.`);
+    }
+    const nextSkills = Array.isArray(data?.skills) ? data.skills as Skill[] : null;
+    if (!nextSkills) {
+      throw new Error(`Background job ${jobId} completed, but Portal returned a malformed skill inventory. Retry verification or inspect Tasks.`);
+    }
+    const targetPresent = nextSkills.some((skill) => skill.name === owner.mutation.target);
+    const expectedPresent = owner.mutation.kind === 'skill-install';
+    if (targetPresent !== expectedPresent) {
+      throw new Error(
+        `Background job ${jobId} completed, but the fresh skill inventory does not prove ${owner.mutation.target} was ${expectedPresent ? 'installed' : 'removed'}. Retry verification or inspect Tasks before starting another mutation.`,
+      );
+    }
+    if (mutationOwnerRef.current === owner) {
+      listingRequestRef.current += 1;
+      setSkills(nextSkills);
+      setLoading(false);
+    }
+  };
+
+  const confirmMutation = async (confirmation: string) => {
+    const mutation = pendingMutation;
+    if (!mutation || mutationOwnerRef.current) return;
+    const owner = Object.freeze({
+      mutation: Object.freeze({ ...mutation }),
+      confirmation,
+    });
+
+    mutationNavigationGuardRef.current = {
+      url: window.location.href,
+      state: window.history.state,
+      owner,
+    };
+    mutationOwnerRef.current = owner;
+    setMutationBusy(true);
+    setMutationError(null);
+    setActivityMessage(null);
+    setActivityError(false);
+    try {
+      const ownerKey = mutationKey(owner.mutation);
+      let proof = mutationProofRef.current?.mutationKey === ownerKey
+        ? mutationProofRef.current
+        : null;
+      if (!proof) {
+        const result = owner.mutation.kind === 'skill-install'
+          ? await skillsAPI.install(owner.mutation.target, owner.confirmation)
+          : owner.mutation.kind === 'skill-uninstall'
+            ? await skillsAPI.uninstall(owner.mutation.target, owner.confirmation)
+            : await skillsAPI.installPlugin(owner.mutation.target, owner.confirmation);
+        const jobId = String(result?.jobId || '');
+        if (!jobId) throw new Error('Extension mutation did not return a background job');
+        proof = Object.freeze({ mutationKey: ownerKey, jobId, completed: false });
+        mutationProofRef.current = proof;
+        setMutationProof(proof);
+      }
+      if (!proof.completed) {
+        await waitForMutationJob(proof.jobId);
+        proof = Object.freeze({ ...proof, completed: true });
+        mutationProofRef.current = proof;
+        setMutationProof(proof);
+      }
+      await verifyFreshMutationInventory(owner, proof.jobId);
+      mutationProofRef.current = null;
+      setMutationProof(null);
+      if (owner.mutation.kind === 'plugin-install') setPluginSpec('');
+      if (!mountedRef.current || mutationOwnerRef.current !== owner) return;
+      setPendingMutation(null);
+      setActivityMessage(`${owner.mutation.kind === 'skill-uninstall' ? 'Removed' : 'Installed'} ${owner.mutation.target}.`);
     } catch (err) {
-      setActivityMessage(err instanceof Error ? err.message : `Failed to install plugin: ${spec}`);
+      if (mountedRef.current && mutationOwnerRef.current === owner) {
+        if (err instanceof ExtensionJobTerminalError) {
+          mutationProofRef.current = null;
+          setMutationProof(null);
+        }
+        setMutationError(err instanceof Error ? err.message : `Failed to update ${owner.mutation.target}`);
+      }
     } finally {
-      setInstallingPlugin(false);
+      if (mutationOwnerRef.current === owner) {
+        if (mutationNavigationGuardRef.current?.owner === owner) {
+          mutationNavigationGuardRef.current = null;
+        }
+        mutationOwnerRef.current = null;
+      }
+      if (mountedRef.current) {
+        setMutationBusy(false);
+      }
     }
   };
 
   useEffect(() => {
+    const blockUnload = (event: BeforeUnloadEvent) => {
+      if (!mutationOwnerRef.current) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+
+    const blockHistoryBack = (event: PopStateEvent) => {
+      const guard = mutationNavigationGuardRef.current;
+      if (!guard) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      window.history.pushState(guard.state, '', guard.url);
+    };
+
+    window.addEventListener('beforeunload', blockUnload);
+    window.addEventListener('popstate', blockHistoryBack, true);
+    return () => {
+      window.removeEventListener('beforeunload', blockUnload);
+      window.removeEventListener('popstate', blockHistoryBack, true);
+    };
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
     fetchSkills();
     loadExplore('trending');
+    return () => {
+      mountedRef.current = false;
+      listingRequestRef.current += 1;
+      marketRequestRef.current += 1;
+    };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Filter skills
@@ -352,7 +653,7 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
         result = result.filter(s => s.eligible && !s.disabled);
         break;
       case 'installed':
-        result = result.filter(s => s.source === 'managed' || s.source === 'workspace');
+        result = result.filter(s => !(s.bundled || s.source === 'bundled' || s.source === 'openclaw-bundled'));
         break;
       case 'missing':
         result = result.filter(s => !s.eligible || s.disabled);
@@ -411,6 +712,7 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
               <div className="relative">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={16} />
                 <input
+                  aria-label="Filter installed skills"
                   type="text"
                   placeholder="Filter installed skills..."
                   value={searchQuery}
@@ -419,7 +721,8 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
                 />
               </div>
               <button
-                onClick={fetchSkills}
+                aria-label="Refresh installed skills"
+                onClick={() => fetchSkills(true)}
                 disabled={loading}
                 className="p-2 bg-white/[0.04] border border-white/[0.08] rounded-xl text-slate-400 hover:text-white hover:bg-white/[0.08] transition-all disabled:opacity-50"
               >
@@ -439,12 +742,14 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
                 placeholder="Filter installed skills..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
+                aria-label="Filter installed skills"
                 className="w-full pl-8 pr-3 py-1.5 bg-white/[0.04] border border-white/[0.08] rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50 transition-all"
               />
             </div>
             <button
-              onClick={fetchSkills}
+              onClick={() => fetchSkills(true)}
               disabled={loading}
+              aria-label="Refresh installed skills"
               className="p-1.5 bg-white/[0.04] border border-white/[0.08] rounded-lg text-slate-400 hover:text-white hover:bg-white/[0.08] transition-all disabled:opacity-50"
             >
               <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
@@ -466,8 +771,14 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
           </div>
         )}
 
+        {warning && (
+          <div role="status" className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+            Some extension sources are unavailable: {warning}
+          </div>
+        )}
+
         {activityMessage && (
-          <div className="rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3 text-sm text-slate-300">
+          <div role={activityError ? 'alert' : 'status'} className={`rounded-xl border px-4 py-3 text-sm ${activityError ? 'border-red-500/20 bg-red-500/10 text-red-200' : 'border-white/[0.08] bg-white/[0.04] text-slate-300'}`}>
             {activityMessage}
           </div>
         )}
@@ -498,12 +809,14 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
                   onChange={(e) => setMarketQuery(e.target.value)}
                   onKeyDown={(e) => { if (e.key === 'Enter') runMarketSearch(); }}
                   placeholder="Search marketplace skills..."
+                  aria-label="Search marketplace skills"
                   className="w-full pl-9 pr-4 py-2 bg-black/20 border border-white/[0.08] rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-violet-500/40"
                 />
               </div>
               <button
                 onClick={() => runMarketSearch()}
                 disabled={marketLoading}
+                aria-label="Search marketplace skills"
                 className="px-4 py-2 rounded-xl bg-violet-500/15 text-violet-300 border border-violet-500/20 hover:bg-violet-500/20 disabled:opacity-50"
               >
                 {marketLoading ? <Loader2 size={16} className="animate-spin" /> : 'Search'}
@@ -561,9 +874,13 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
                   {marketLoading ? 'Loading...' : 'No marketplace results.'}
                 </div>
               ) : marketResults.map((item) => {
-                const isInstalled = installedNames.has(item.name || item.slug || '');
+                const target = item.slug || item.name || '';
+                const isInstalled = Boolean(
+                  (item.slug && installedNames.has(item.slug))
+                  || (item.name && installedNames.has(item.name)),
+                );
                 return (
-                  <div key={item.name || item.slug} className="rounded-xl border border-white/[0.06] bg-black/10 px-4 py-3 flex items-start justify-between gap-4">
+                  <div key={target} className="rounded-xl border border-white/[0.06] bg-black/10 px-4 py-3 flex items-start justify-between gap-4">
                     <div className="min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-medium text-white">{item.name || item.slug}</span>
@@ -578,17 +895,16 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
                       </div>
                     </div>
                     <button
-                      onClick={() => installSkill(item.name || item.slug || '')}
-                      disabled={installingSkill === (item.name || item.slug) || isInstalled}
+                      type="button"
+                      onClick={() => installSkill(target)}
+                      disabled={!target || mutationBusy || isInstalled}
                       className={`shrink-0 inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm transition-all disabled:opacity-50 ${
                         isInstalled
                           ? 'border-emerald-500/20 bg-emerald-500/5 text-emerald-400 cursor-default'
                           : 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
                       }`}
                     >
-                      {installingSkill === (item.name || item.slug)
-                        ? <Loader2 size={14} className="animate-spin" />
-                        : isInstalled
+                      {isInstalled
                           ? <CheckCircle size={14} />
                           : <Download size={14} />
                       }
@@ -616,16 +932,18 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
                 type="text"
                 value={pluginSpec}
                 onChange={(e) => setPluginSpec(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') installPlugin(); }}
+                onKeyDown={(e) => { if (e.key === 'Enter' && !mutationBusy) installPlugin(); }}
+                disabled={mutationBusy}
                 placeholder="clawhub:my-plugin or npm:@scope/plugin"
+                aria-label="Plugin package specification"
                 className="w-full px-4 py-2 bg-black/20 border border-white/[0.08] rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500/40"
               />
               <button
                 onClick={installPlugin}
-                disabled={installingPlugin || !pluginSpec.trim()}
+                disabled={mutationBusy || !pluginSpec.trim()}
                 className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-blue-500/20 bg-blue-500/10 px-4 py-2 text-sm text-blue-300 hover:bg-blue-500/20 disabled:opacity-50"
               >
-                {installingPlugin ? <Loader2 size={14} className="animate-spin" /> : <Wrench size={14} />}
+                <Wrench size={14} />
                 Install Plugin
               </button>
             </div>
@@ -665,7 +983,7 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
               onClick={() => setActiveTab(tab.key)}
               className={`px-3 py-1.5 text-xs sm:text-sm font-medium rounded-t-lg transition-all whitespace-nowrap ${
                 activeTab === tab.key
-                  ? 'text-emerald-400 border-b-2 border-emerald-400 -mb-[3px]'
+                  ? 'accent-active border-b-2 -mb-[3px]'
                   : 'text-slate-400 hover:text-white'
               }`}
             >
@@ -684,7 +1002,7 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
             <AlertCircle className="text-red-400 mx-auto mb-2" size={32} />
             <p className="text-red-400">{error}</p>
             <button
-              onClick={fetchSkills}
+              onClick={() => fetchSkills(true)}
               className="mt-4 px-4 py-2 bg-red-500/20 text-red-400 rounded-lg hover:bg-red-500/30 transition-colors"
             >
               Retry
@@ -709,11 +1027,52 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
                 skill={skill}
                 installedNames={installedNames}
                 onUninstall={uninstallSkill}
+                disabled={mutationBusy}
               />
             ))}
           </motion.div>
         )}
       </div>
+      <TypedConfirmationDialog
+        open={Boolean(pendingMutation)}
+        title={pendingMutation?.kind === 'skill-uninstall' ? 'Remove host extension' : 'Install host extension'}
+        description="This changes executable code available to OpenClaw on the server. The operation runs as a serialized background job and keeps its output in Tasks."
+        confirmationPhrase={pendingMutation?.confirmationPhrase}
+        confirmLabel={mutationProof ? 'Retry verification' : pendingMutation?.kind === 'skill-uninstall' ? 'Remove extension' : 'Install extension'}
+        busyLabel={mutationProof?.completed ? 'Verifying inventory…' : mutationProof ? 'Checking background job…' : pendingMutation?.kind === 'skill-uninstall' ? 'Removing extension…' : 'Installing extension…'}
+        busy={mutationBusy}
+        tone={pendingMutation?.kind === 'skill-uninstall' ? 'danger' : 'warning'}
+        details={pendingMutation && (
+          <div className="space-y-3">
+            <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm text-slate-300">
+              Target: <code className="break-all font-mono text-white">{pendingMutation.target}</code>
+            </div>
+            {mutationProof ? (
+              <div role="status" className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                Background job <code className="break-all font-mono text-white">{mutationProof.jobId}</code> is retained in Tasks. Retrying here verifies that same job and its fresh inventory; it does not start another mutation.
+              </div>
+            ) : null}
+            {mutationError ? (
+              <div role="alert" className="rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+                {mutationError}
+              </div>
+            ) : null}
+          </div>
+        )}
+        onCancel={() => {
+          if (mutationOwnerRef.current) return;
+          const proof = mutationProofRef.current;
+          if (proof) {
+            setActivityError(true);
+            setActivityMessage(`Verification for background job ${proof.jobId} was left incomplete. Inspect Tasks before starting another extension mutation.`);
+          }
+          mutationProofRef.current = null;
+          setMutationProof(null);
+          setMutationError(null);
+          setPendingMutation(null);
+        }}
+        onConfirm={confirmMutation}
+      />
     </div>
   );
 }

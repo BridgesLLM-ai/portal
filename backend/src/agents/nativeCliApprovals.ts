@@ -16,6 +16,7 @@ export interface NativeCliApprovalDraft {
   resolvedPath?: string;
   timeoutMs?: number;
   onRequest?: ApprovalRequestCallback;
+  signal?: AbortSignal;
 }
 
 type ApprovalRequestCallback = (approval: ExecApprovalRequest) => void;
@@ -58,6 +59,7 @@ export function onNativeCliApprovalResolved(callback: ApprovalResolvedCallback):
 }
 
 export function requestNativeCliApproval(draft: NativeCliApprovalDraft): Promise<NativeCliApprovalDecision> {
+  if (draft.signal?.aborted) return Promise.resolve('deny');
   const createdAtMs = Date.now();
   const timeoutMs = Math.max(10_000, Math.min(draft.timeoutMs || 120_000, 10 * 60_000));
   const approval: ExecApprovalRequest = {
@@ -77,22 +79,30 @@ export function requestNativeCliApproval(draft: NativeCliApprovalDraft): Promise
   };
 
   return new Promise((resolve) => {
+    const onAbort = () => finish('deny');
     const finish = (decision: NativeCliApprovalDecision) => {
       const current = pending.get(approval.id);
       if (!current) return;
       clearTimeout(current.timeout);
       pending.delete(approval.id);
+      draft.signal?.removeEventListener('abort', onAbort);
       emitResolved({ id: approval.id, decision });
       resolve(decision);
     };
 
     const timeout = setTimeout(() => finish('deny'), timeoutMs);
     pending.set(approval.id, { approval, resolve: finish, timeout });
+    draft.signal?.addEventListener('abort', onAbort, { once: true });
+    if (draft.signal?.aborted) {
+      finish('deny');
+      return;
+    }
     if (draft.onRequest) {
       try { draft.onRequest(approval); } catch (error: any) {
         console.error('[NativeCliApprovals] direct request listener error:', error?.message || error);
       }
     }
+    if (!pending.has(approval.id)) return;
     emitRequest(approval);
   });
 }

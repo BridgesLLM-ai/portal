@@ -11,12 +11,20 @@ if [ "$(id -u)" = "0" ]; then
   exit 1
 fi
 
+if [ "$(id -un)" != "bridgesrd" ]; then
+  echo "ERROR: OpenClaw UI browser must run as the bridgesrd account" >&2
+  exit 1
+fi
+
+umask 077
+
 ENV_FILE="/home/bridgesrd/.bridges-rd-env"
 if [ -f "$ENV_FILE" ]; then
   # shellcheck disable=SC1090
   . "$ENV_FILE"
 else
   export DISPLAY="${DISPLAY:-:1}"
+  export XAUTHORITY="${XAUTHORITY:-/home/bridgesrd/.Xauthority}"
   export XDG_RUNTIME_DIR=/tmp/bridges-rd-runtime
   export PULSE_SERVER=unix:/tmp/bridges-rd-runtime/pulse/native
   export SDL_AUDIODRIVER=pulseaudio
@@ -66,7 +74,9 @@ NAV_EXTENSION_DIR="$PROFILE_DIR/nav-extension"
 URL_FILE="${OPENCLAW_DASHBOARD_URL_FILE:-$PROFILE_DIR/dashboard-url}"
 LAUNCH_HTML="${OPENCLAW_DASHBOARD_LAUNCH_HTML:-$PROFILE_DIR/launch.html}"
 mkdir -p "$PROFILE_DIR"
+chmod 700 "$PROFILE_DIR"
 write_nav_extension "$NAV_EXTENSION_DIR"
+chmod 700 "$NAV_EXTENSION_DIR"
 
 read_vnc_geometry() {
   local res
@@ -177,9 +187,6 @@ fi
   --name=OpenClawControlUI \
   --no-first-run \
   --no-default-browser-check \
-  --no-sandbox \
-  --disable-gpu-sandbox \
-  --disable-setuid-sandbox \
   --user-data-dir="$PROFILE_DIR" \
   --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=${CDP_PORT} \

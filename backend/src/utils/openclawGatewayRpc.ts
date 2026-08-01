@@ -6,7 +6,6 @@
  * 
  * Protocol: JSON-RPC over WebSocket with connect handshake.
  */
-// @ts-ignore - ws doesn't have type declarations in this project
 import WebSocket from 'ws';
 import fs from 'fs';
 import path from 'path';
@@ -32,6 +31,41 @@ interface RpcResponse {
   ok: boolean;
   data?: any;
   error?: any;
+}
+
+const sessionMutationTails = new Map<string, Promise<void>>();
+
+/**
+ * Serialize Portal-owned mutations for one OpenClaw session. This makes the
+ * missing-session default projection and an explicit Session Controls change
+ * one ordered boundary instead of a GET -> PATCH race.
+ */
+export async function withOpenClawSessionMutation<T>(
+  rawSessionKey: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const sessionKey = String(rawSessionKey || '').trim();
+  if (!sessionKey) return operation();
+
+  const previous = sessionMutationTails.get(sessionKey) || Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => current);
+  sessionMutationTails.set(sessionKey, tail);
+
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    void tail.finally(() => {
+      if (sessionMutationTails.get(sessionKey) === tail) {
+        sessionMutationTails.delete(sessionKey);
+      }
+    });
+  }
 }
 
 /**
@@ -198,30 +232,43 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
  * This is the key function for making the portal model switcher actually work.
  * 
  * @param sessionKey - Full session key, e.g. "agent:portal:portal-{userId}-{projectName}"
- * @param model - Model identifier, e.g. "anthropic/claude-haiku-4-5"
+ * @param model - Model identifier, e.g. "anthropic/claude-haiku-4-5", or null to clear the override
  * @returns The resolved model info from the gateway
  */
-export async function patchSessionModel(sessionKey: string, model: string): Promise<{ ok: boolean; resolved?: { modelProvider: string; model: string }; error?: string }> {
-  console.log(`[Gateway RPC] Patching session model: key=${sessionKey} model=${model}`);
-  
+export interface OpenClawSessionCreationDefaults {
+  thinkingLevel?: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'adaptive';
+  reasoningLevel?: 'off' | 'on' | 'stream';
+}
+
+export async function patchSessionModelWithinMutation(
+  sessionKey: string,
+  model: string | null,
+  creationDefaults?: OpenClawSessionCreationDefaults,
+): Promise<{ ok: boolean; resolved?: { modelProvider: string; model: string; agentRuntime?: { id?: string; source?: string } }; error?: string }> {
   // sessions.patch can take noticeably longer than chat.send on a busy gateway,
   // especially right after auth/profile changes or when materializing a fresh
-  // session. Keep the timeout comfortably above the ~7-10s real-world window
-  // we see in portal logs so model switching does not fail spuriously.
-  let result = await gatewayRpcCall('sessions.patch', { key: sessionKey, model }, 20000);
+  // session. Keep a generous busy-gateway latency budget so model switching
+  // does not fail spuriously during normal runtime contention.
+  const patch = {
+    key: sessionKey,
+    model,
+    ...(creationDefaults?.thinkingLevel ? { thinkingLevel: creationDefaults.thinkingLevel } : {}),
+    ...(creationDefaults?.reasoningLevel ? { reasoningLevel: creationDefaults.reasoningLevel } : {}),
+  };
+  let result = await gatewayRpcCall('sessions.patch', patch, 20000);
 
   // OpenClaw validates sessions.patch against the agents.defaults.models
   // allowlist. Catalog models that were never declared (for example newly
   // supported models on an install that authenticated before they existed)
   // fail with "model not allowed" — self-heal by declaring the model and
   // retrying once after the gateway reloads its config.
-  if (!result.ok && /model not allowed/i.test(String(result.error || ''))) {
+  if (model && !result.ok && /model not allowed/i.test(String(result.error || ''))) {
     try {
       const declaration = ensureOpenClawModelDeclaration(model);
       if (declaration.changed) {
         console.log(`[Gateway RPC] Declared ${declaration.model} in agents.defaults.models; retrying sessions.patch`);
         await new Promise((resolve) => setTimeout(resolve, 1500));
-        result = await gatewayRpcCall('sessions.patch', { key: sessionKey, model }, 20000);
+        result = await gatewayRpcCall('sessions.patch', patch, 20000);
       }
     } catch (err: any) {
       console.warn(`[Gateway RPC] Model declaration self-heal failed: ${err?.message || err}`);
@@ -236,6 +283,16 @@ export async function patchSessionModel(sessionKey: string, model: string): Prom
     console.error(`[Gateway RPC] Failed to patch model: ${result.error}`);
     return { ok: false, error: String(result.error) };
   }
+}
+
+export async function patchSessionModel(
+  sessionKey: string,
+  model: string | null,
+  creationDefaults?: OpenClawSessionCreationDefaults,
+): Promise<{ ok: boolean; resolved?: { modelProvider: string; model: string; agentRuntime?: { id?: string; source?: string } }; error?: string }> {
+  return withOpenClawSessionMutation(sessionKey, () => (
+    patchSessionModelWithinMutation(sessionKey, model, creationDefaults)
+  ));
 }
 
 /**

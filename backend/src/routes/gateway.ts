@@ -1,26 +1,79 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { requireAdmin } from '../middleware/requireAdmin';
+import { requireAdmin, requireOwner } from '../middleware/requireAdmin';
 import { requireApproved } from '../middleware/requireApproved';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'fs';
-import { execFile, execFileSync, spawn } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import path from 'path';
 import { AgentRegistry, AgentProviderName } from '../agents';
-import { AgentAbortError } from '../agents/AgentProvider.interface';
-import { listProviderModels } from '../agents/providerModels';
+import {
+  AgentAbortError,
+  type AgentExecutionContext,
+  type AgentProvider,
+  type AgentSendResult,
+  type HostOperatorExecutionContext,
+  type SenderIdentity,
+} from '../agents/AgentProvider.interface';
+import {
+  assertExecutionContextBinding,
+  assertProviderSupportsExecutionScope,
+  createHostOperatorExecutionContext,
+} from '../agents/executionScope';
+import { readLastOpenClawUnavailableModelIds, listProviderModels } from '../agents/providerModels';
+import {
+  AskUserQuestionError,
+} from '../services/askUserQuestionBroker';
+import {
+  resolveAskUserQuestionRunOwner,
+} from '../services/askUserQuestionSessionOwner';
+import {
+  deliverNativeAskUserQuestionAnswer,
+  deliverNativeAskUserQuestionDismissal,
+  syncNativeAskUserQuestionsForActor,
+} from '../services/nativeAskUserQuestionChannel';
 import { getProviderCapabilities } from '../agents/providerAvailability';
+import {
+  NativeSessionModelMutationError,
+  setNativeSessionModel,
+} from '../agents/sessionModelMutation';
 import { getProviderCommandCatalog } from '../agents/providerCommandCatalog';
 import { ExecApprovalRequest } from '../agents/providers/OpenClawProvider';
-import { appendNativeMessage, loadNativeSession, updateNativeSessionModel } from '../agents/providers/NativeSessionStore';
-import { gatewayRpcCall, patchSessionModel, getSessionInfo, isGatewayTransportError, chatSend, createSession, listGatewayModels, readLocalSessionRegistryEntry } from '../utils/openclawGatewayRpc';
+import {
+  appendNativeMessage,
+  ensureNativeSessionExecutionContext,
+  loadNativeSession,
+  loadNativeSessionMetadata,
+  readNativeSessionHistoryPage,
+  readNativeSessionHistoryTail,
+} from '../agents/providers/NativeSessionStore';
+import {
+  AGENT_ZERO_MODEL_PROTOCOL_INCOMPATIBLE_MESSAGE,
+  AgentZeroOAuthModelCatalogError,
+  validateAgentZeroOAuthModelSelection,
+} from '../agents/providers/agentZero/AgentZeroOAuthModelCatalog';
+import { safeAgentZeroErrorMessage } from '../agents/providers/agentZero/AgentZeroDiagnostics';
+import {
+  gatewayRpcCall,
+  patchSessionModel,
+  getSessionInfo,
+  isGatewayTransportError,
+  createSession,
+  listGatewayModels,
+  readLocalSessionRegistryEntry,
+  withOpenClawSessionMutation,
+} from '../utils/openclawGatewayRpc';
 import {
   sendApprovalDecision,
+  answerPendingUserInput,
+  PendingUserInputAnswerError,
   injectChatMessage,
   steerSessionMessage,
   onApprovalRequest,
   onApprovalResolved,
   subscribeGatewaySessionMessages,
-  registerRun,
+  reserveLogicalRun,
+  acknowledgeRunReservation,
+  failPendingRunReservation,
   isConnected as isPersistentWsConnected,
   reconnectNow as reconnectPersistentWs,
   type ExecApprovalRequest as PersistentApprovalRequest,
@@ -33,6 +86,10 @@ import {
   listPendingNativeCliApprovals,
   type NativeCliApprovalDecision,
 } from '../agents/nativeCliApprovals';
+import {
+  redactNativeProviderText,
+  sanitizeNativeProviderEvent,
+} from '../agents/providers/native/NativeProviderDiagnostics';
 import { streamEventBus, type StreamEvent, type StreamInfo } from '../services/StreamEventBus';
 import { readRuntimeTurnEvents } from '../services/RuntimeTurnEventHistory';
 import type { RuntimeTurnEvent } from '../services/RuntimeTurnEvents';
@@ -47,21 +104,141 @@ import {
   stripEnvelope,
   stripOpenClawReplyTags,
 } from '../utils/chatText';
-import { canAccessPortal, canUseInteractivePortal, isElevatedRole, isOwnerRole } from '../utils/authz';
+import { canUseDirectGateway, canUseInteractivePortal, isElevatedRole } from '../utils/authz';
 import { hasGatewayToken, getGatewayToken } from '../utils/gatewayToken';
 import { getOpenClawWsUrl } from '../config/openclaw';
 import { isAllowedWebSocketOrigin } from '../utils/websocketOrigin';
 import { buildOpenClawCliEnv, canonicalizeProviderModelId, modelForOpenClawSessionPatch, normalizePortalModelId, resolvePortalModelFromCatalog } from '../utils/openclawCli';
-// @ts-ignore - ws doesn't have type declarations in this project
-import { WebSocketServer, WebSocket } from 'ws';
+import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import type { Server as HttpServer, IncomingMessage } from 'http';
 import type { Duplex } from 'stream';
-import { createHash } from 'crypto';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
+import { config } from '../config/env';
+import { PRIVILEGED_CONFIRMATION, isTypedConfirmationMatch } from '../utils/privilegedConfirmation';
+import { parseSafeCookieHeader } from '../utils/safeCookies';
+import { sanitizeThinkingSubject } from '../utils/thinkingSubject';
+import { subscribeToAuthorizationChanges } from '../services/authorizationChangeBus';
+import {
+  acquireWorkspaceAuthorizationMutationLease,
+  settleWorkspaceAuthorizationRequest,
+  subscribeToGlobalWorkspaceAuthorizationFence,
+} from '../services/workspaceAuthorizationBarrier';
+import { OPENCLAW_CODEX_PLUGIN_VERSION } from '../services/openclawConfigManager';
+import {
+  getOpenClawSetupReadiness,
+  TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
+  TESTED_OPENCLAW_RUNTIME_VERSION,
+  matchesTestedRuntime,
+} from '../services/openclawSetupReadiness';
+import {
+  buildUsageStatsPayload,
+  isValidUsageAgentFilter,
+  type UsageStatsPayload,
+} from '../services/usageStats';
+import { loadUsageStatsSources } from '../services/usageStatsSources';
+import {
+  beginOpenClawHostRun,
+  markOpenClawHostRunDispatchAccepted,
+  markOpenClawHostRunVisibleSettled,
+  quarantineOpenClawHostRun,
+  type OpenClawHostRunHandle,
+} from '../services/openClawHostRunJournal';
+import {
+  assertOpenClawGatewayAuthorizationFenceReleased,
+} from '../services/openClawGatewayAuthorizationFence';
 
 const DEBUG_GATEWAY_WS = process.env.DEBUG_GATEWAY_WS === '1';
 const debugLog = (...args: unknown[]) => {
   if (DEBUG_GATEWAY_WS) console.log('[gateway]', ...args);
 };
+
+type HostOperatorProviderSend = {
+  provider: AgentProvider;
+  sessionId: string;
+  message: string;
+  onChunk?: Parameters<AgentProvider['sendMessage']>[2];
+  onStatus?: Parameters<AgentProvider['sendMessage']>[3];
+  onExecApproval?: Parameters<AgentProvider['sendMessage']>[4];
+  sender?: SenderIdentity;
+  onQuarantinePersistenceFailure?(): void;
+};
+
+class OpenClawHostRunQuarantinePersistenceError extends Error {
+  constructor() {
+    super('OpenClaw host-run ambiguity could not be durably quarantined');
+    this.name = 'OpenClawHostRunQuarantinePersistenceError';
+  }
+}
+
+async function sendHostOperatorProviderMessage(
+  input: HostOperatorProviderSend,
+): Promise<AgentSendResult> {
+  if (input.provider.providerName !== 'OPENCLAW') {
+    return input.provider.sendMessage(
+      input.sessionId,
+      input.message,
+      input.onChunk,
+      input.onStatus,
+      input.onExecApproval,
+      input.sender,
+    );
+  }
+
+  const actorUserId = String(input.sender?.userId || '').trim();
+  const actorAuthorizationVersion = Number(input.sender?.authorizationVersion);
+  const requestId = String(input.sender?.requestId || '').trim();
+  if (
+    !actorUserId
+    || !requestId
+    || !Number.isSafeInteger(actorAuthorizationVersion)
+    || actorAuthorizationVersion < 1
+  ) {
+    throw new Error('OpenClaw host-run sender identity is incomplete');
+  }
+
+  const handle: OpenClawHostRunHandle = {
+    id: requestId,
+    actorUserId,
+    actorAuthorizationVersion,
+    provider: 'OPENCLAW',
+    executionScope: 'HOST_OPERATOR',
+    sessionKey: input.sessionId,
+  };
+  await beginOpenClawHostRun(handle);
+
+  let dispatchAccepted = false;
+  const sender: SenderIdentity = {
+    ...input.sender!,
+    onProviderDispatchAccepted: async (upstreamRunId: string) => {
+      await markOpenClawHostRunDispatchAccepted(handle, upstreamRunId);
+      dispatchAccepted = true;
+    },
+  };
+
+  try {
+    const result = await input.provider.sendMessage(
+      input.sessionId,
+      input.message,
+      input.onChunk,
+      input.onStatus,
+      input.onExecApproval,
+      sender,
+    );
+    if (!dispatchAccepted) {
+      throw new Error('OpenClaw provider settled without durable dispatch acceptance');
+    }
+    await markOpenClawHostRunVisibleSettled(handle, 'completed');
+    return result;
+  } catch (error) {
+    try {
+      await quarantineOpenClawHostRun(handle, error);
+    } catch {
+      input.onQuarantinePersistenceFailure?.();
+      throw new OpenClawHostRunQuarantinePersistenceError();
+    }
+    throw error;
+  }
+}
 
 const router = Router();
 
@@ -81,17 +258,349 @@ router.use(authenticateToken, requireApproved);
 const AGENTS_BASE = path.join(process.env.HOME || '/root', '.openclaw/agents');
 const SESSIONS_DIR = path.join(AGENTS_BASE, 'main/sessions');
 const GATEWAY_URL = getOpenClawApiUrl();
-const OPENCLAW_DIST_DIR = '/usr/lib/node_modules/openclaw/dist';
+const FALLBACK_OPENCLAW_PACKAGE_DIR = '/usr/lib/node_modules/openclaw';
 const PORTAL_ROOT = path.resolve(__dirname, '../../..');
 const OPENCLAW_COMPAT_HOTFIX_SCRIPT = path.join(PORTAL_ROOT, 'scripts', 'patch-openclaw-long-run-relay-hotfix.sh');
 const GEMINI_CLI_TMP_DIR = path.join(process.env.HOME || '/root', '.gemini', 'tmp');
 const GEMINI_CLI_PROVIDER = 'google-gemini-cli';
 const GEMINI_CLI_TRANSCRIPT_INDEX_TTL_MS = 30000;
-const MAIN_SESSION_LIST_CACHE_TTL_MS = 5000;
-const MAIN_SESSION_DERIVED_TITLE_LIMIT = 80;
 const MAINTENANCE_HISTORY_DIR = path.join(PORTAL_ROOT, 'backend', '.data', 'maintenance-history');
 const MAINTENANCE_HISTORY_DEDUP_WINDOW_MS = 4000;
+const DEFAULT_HISTORY_PAGE_SIZE = 100;
+const MAX_HISTORY_PAGE_SIZE = 100;
+const MAX_HISTORY_CURSOR_LENGTH = 2048;
+const MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES = 50_000;
+const HISTORY_CURSOR_PURPOSE = 'gateway-history-before-v1';
+const DIRECT_GATEWAY_CHAT_SEND_TIMEOUT_MS = 30_000;
 const maintenanceHistoryDedup = new Map<string, number>();
+
+type HistoryCursorAnchor = {
+  id: string;
+  timestamp: string;
+  role: string;
+  digest: string;
+};
+
+type HistoryCursorPayload = {
+  v: 1;
+  scope: string;
+  anchor: HistoryCursorAnchor;
+  source?:
+    | {
+        kind: 'native-jsonl-v1';
+        beforeOffset: number;
+        fileIdentity: string;
+      }
+    | {
+        kind: 'agent-zero-sequence-v1';
+        beforeSequence: number;
+      };
+};
+
+type HistoryPageResult = {
+  messages: any[];
+  beforeCursor: string | null;
+  hasMoreBefore: boolean;
+};
+
+type NativeHistoryTailResult = {
+  messages: any[];
+  hasMore: boolean;
+};
+
+class HistoryCursorError extends Error {}
+
+function historyCursorSecret(): string {
+  return config.jwtSecret;
+}
+
+function historyCursorScope(userId: string, providerName: string, sessionId: string): string {
+  return createHmac('sha256', historyCursorSecret())
+    .update(`${HISTORY_CURSOR_PURPOSE}\0${userId}\0${providerName}\0${sessionId}`, 'utf8')
+    .digest('base64url');
+}
+
+function historyMessageAnchor(message: any): HistoryCursorAnchor {
+  const id = typeof message?.id === 'string' ? message.id.trim() : '';
+  const timestamp = typeof message?.timestamp === 'string'
+    ? message.timestamp
+    : (typeof message?.createdAt === 'string' ? message.createdAt : '');
+  const role = typeof message?.role === 'string' ? message.role : '';
+  const digest = createHash('sha256')
+    .update(JSON.stringify({ id, timestamp, role, content: String(message?.content || '') }), 'utf8')
+    .digest('base64url');
+  return { id, timestamp, role, digest };
+}
+
+function encodeHistoryCursor(
+  scope: string,
+  message: any,
+  source?: HistoryCursorPayload['source'],
+): string {
+  const payload: HistoryCursorPayload = { v: 1, scope, anchor: historyMessageAnchor(message), source };
+  const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const signature = createHmac('sha256', historyCursorSecret())
+    .update(`${HISTORY_CURSOR_PURPOSE}.${encoded}`, 'utf8')
+    .digest('base64url');
+  return `${encoded}.${signature}`;
+}
+
+function decodeHistoryCursorPayload(rawCursor: unknown, expectedScope: string): HistoryCursorPayload {
+  const cursor = typeof rawCursor === 'string' ? rawCursor.trim() : '';
+  if (!cursor || cursor.length > MAX_HISTORY_CURSOR_LENGTH) throw new HistoryCursorError('Invalid history cursor');
+  const [encoded, suppliedSignature, ...rest] = cursor.split('.');
+  if (!encoded || !suppliedSignature || rest.length > 0) throw new HistoryCursorError('Invalid history cursor');
+
+  const expectedSignature = createHmac('sha256', historyCursorSecret())
+    .update(`${HISTORY_CURSOR_PURPOSE}.${encoded}`, 'utf8')
+    .digest('base64url');
+  const supplied = Buffer.from(suppliedSignature, 'base64url');
+  const expected = Buffer.from(expectedSignature, 'base64url');
+  if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+    throw new HistoryCursorError('Invalid history cursor');
+  }
+
+  let payload: HistoryCursorPayload;
+  try {
+    const decoded = Buffer.from(encoded, 'base64url');
+    if (decoded.toString('base64url') !== encoded) throw new Error('non-canonical cursor');
+    payload = JSON.parse(decoded.toString('utf8')) as HistoryCursorPayload;
+  } catch {
+    throw new HistoryCursorError('Invalid history cursor');
+  }
+  if (
+    payload?.v !== 1
+    || payload.scope !== expectedScope
+    || !payload.anchor
+    || typeof payload.anchor.id !== 'string'
+    || typeof payload.anchor.timestamp !== 'string'
+    || typeof payload.anchor.role !== 'string'
+    || typeof payload.anchor.digest !== 'string'
+  ) {
+    throw new HistoryCursorError('History cursor does not belong to this chat');
+  }
+  if (payload.source !== undefined) {
+    const validNative = payload.source?.kind === 'native-jsonl-v1'
+      && Number.isSafeInteger(payload.source.beforeOffset)
+      && payload.source.beforeOffset >= 0
+      && typeof payload.source.fileIdentity === 'string'
+      && /^[A-Za-z0-9_-]{43}$/.test(payload.source.fileIdentity);
+    const validAgentZero = payload.source?.kind === 'agent-zero-sequence-v1'
+      && Number.isSafeInteger(payload.source.beforeSequence)
+      && payload.source.beforeSequence >= 1;
+    if (!validNative && !validAgentZero) {
+      throw new HistoryCursorError('Invalid history cursor');
+    }
+  }
+  return payload;
+}
+
+function decodeHistoryCursor(rawCursor: unknown, expectedScope: string): HistoryCursorAnchor {
+  return decodeHistoryCursorPayload(rawCursor, expectedScope).anchor;
+}
+
+function historyAnchorMatches(message: any, anchor: HistoryCursorAnchor): boolean {
+  const candidate = historyMessageAnchor(message);
+  return candidate.digest === anchor.digest
+    && candidate.id === anchor.id
+    && candidate.timestamp === anchor.timestamp
+    && candidate.role === anchor.role;
+}
+
+function findHistoryAnchorIndex(messages: any[], anchor: HistoryCursorAnchor): number {
+  const exact = messages.findIndex((message) => historyAnchorMatches(message, anchor));
+  if (exact >= 0) return exact;
+
+  // A live assistant row can gain its final text/tool metadata after a cursor
+  // is issued. Durable identity and timestamp stay fixed, so tolerate only
+  // that exact enrichment — never drift to an unrelated newer row.
+  if (!anchor.id) return -1;
+  return messages.findIndex((message) => {
+    const candidate = historyMessageAnchor(message);
+    return candidate.id === anchor.id
+      && candidate.timestamp === anchor.timestamp
+      && candidate.role === anchor.role;
+  });
+}
+
+function buildHistoryPage(
+  messages: any[],
+  limit: number,
+  scope: string,
+  anchor?: HistoryCursorAnchor,
+  sourceComplete = true,
+): HistoryPageResult {
+  const end = anchor ? findHistoryAnchorIndex(messages, anchor) : messages.length;
+  if (anchor && end < 0) throw new HistoryCursorError('History cursor is no longer available');
+  const start = Math.max(0, end - limit);
+  const pageMessages = messages.slice(start, end);
+  const hasMoreBefore = start > 0 || (!sourceComplete && end <= limit);
+  return {
+    messages: pageMessages,
+    hasMoreBefore,
+    beforeCursor: hasMoreBefore && pageMessages.length > 0
+      ? encodeHistoryCursor(scope, pageMessages[0])
+      : null,
+  };
+}
+
+function parseHistoryLimit(value: unknown): number {
+  if (value === undefined || value === null || value === '') return DEFAULT_HISTORY_PAGE_SIZE;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new HistoryCursorError('History limit must be a positive integer');
+  return Math.min(parsed, MAX_HISTORY_PAGE_SIZE);
+}
+
+function readNativeHistoryPage(params: {
+  providerName: AgentProviderName;
+  sessionId: string;
+  limit: number;
+  scope: string;
+  beforeCursor?: unknown;
+  readTail?: (limit: number) => NativeHistoryTailResult;
+  readPage?: (
+    limit: number,
+    beforeOffset?: number,
+    expectedFileIdentity?: string,
+  ) => {
+    messages: any[];
+    hasMore: boolean;
+    beforeOffset: number | null;
+    fileIdentity: string;
+  };
+}): HistoryPageResult {
+  const decodedCursor = params.beforeCursor
+    ? decodeHistoryCursorPayload(params.beforeCursor, params.scope)
+    : undefined;
+  const anchor = decodedCursor?.anchor;
+
+  // Native session transcripts are append-only JSONL. New cursors carry a
+  // signed byte boundary, so every older page is one bounded backwards read
+  // instead of rescanning an ever-growing tail (which becomes quadratic over
+  // multi-day exports). The durable anchor remains in the cursor as an
+  // integrity/debugging identity; file identity rejects replacement/reset.
+  const directPageReader = params.readPage || (!params.readTail
+    ? ((limit: number, beforeOffset?: number, expectedFileIdentity?: string) => (
+        readNativeSessionHistoryPage(
+          params.providerName,
+          params.sessionId,
+          limit,
+          beforeOffset,
+          expectedFileIdentity,
+        )
+      ))
+    : undefined);
+  if (directPageReader) {
+    const source = decodedCursor?.source?.kind === 'native-jsonl-v1'
+      ? decodedCursor.source
+      : undefined;
+    if (decodedCursor && !source) {
+      // Backward compatibility for a cursor minted before byte-positioned
+      // native paging shipped. Fall through to the adaptive anchor reader.
+    } else {
+      let page;
+      try {
+        page = directPageReader(
+          params.limit,
+          source?.beforeOffset,
+          source?.fileIdentity,
+        );
+      } catch (error: any) {
+        throw new HistoryCursorError(String(error?.message || 'History cursor is no longer available'));
+      }
+      return {
+        messages: page.messages,
+        hasMoreBefore: page.hasMore,
+        beforeCursor: page.hasMore && page.messages.length > 0 && page.beforeOffset !== null
+          ? encodeHistoryCursor(params.scope, page.messages[0], {
+              kind: 'native-jsonl-v1',
+              beforeOffset: page.beforeOffset,
+              fileIdentity: page.fileIdentity,
+            })
+          : null,
+      };
+    }
+  }
+  const readTail = params.readTail || ((limit: number) => (
+    readNativeSessionHistoryTail(params.providerName, params.sessionId, limit)
+  ));
+  // Initial history is one bounded tail read. Older pages grow only far enough
+  // to locate their signed durable anchor; the lifetime transcript is never
+  // deserialized merely to paint the latest browser window.
+  let scanLimit = anchor
+    ? Math.min(Math.max(params.limit * 2, 200), MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES)
+    : params.limit + 1;
+
+  while (true) {
+    const tail = readTail(scanLimit);
+    const sourceComplete = !tail.hasMore;
+    if (!anchor) {
+      return buildHistoryPage(tail.messages, params.limit, params.scope, undefined, sourceComplete);
+    }
+
+    const anchorIndex = findHistoryAnchorIndex(tail.messages, anchor);
+    if (anchorIndex >= params.limit || (anchorIndex >= 0 && sourceComplete)) {
+      return buildHistoryPage(tail.messages, params.limit, params.scope, anchor, sourceComplete);
+    }
+    if (sourceComplete) throw new HistoryCursorError('History cursor is no longer available');
+    if (scanLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES) {
+      throw new HistoryCursorError('History cursor is outside the retained pagination window');
+    }
+    scanLimit = Math.min(scanLimit * 2, MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
+  }
+}
+
+async function readAgentZeroHistoryPage(params: {
+  provider: unknown;
+  sessionId: string;
+  limit: number;
+  scope: string;
+  beforeCursor?: unknown;
+}): Promise<HistoryPageResult> {
+  const provider = params.provider as {
+    getHistoryPage?: (
+      sessionId: string,
+      limit: number,
+      beforeSequence?: number,
+    ) => Promise<{
+      messages: any[];
+      hasMoreBefore: boolean;
+      beforeSequence: number | null;
+    }>;
+  };
+  if (typeof provider.getHistoryPage !== 'function') {
+    throw new Error('Agent Zero history paging is unavailable');
+  }
+  const decoded = params.beforeCursor
+    ? decodeHistoryCursorPayload(params.beforeCursor, params.scope)
+    : undefined;
+  if (decoded && decoded.source?.kind !== 'agent-zero-sequence-v1') {
+    throw new HistoryCursorError('History cursor does not belong to this provider history');
+  }
+  const page = await provider.getHistoryPage(
+    params.sessionId,
+    params.limit,
+    decoded?.source?.kind === 'agent-zero-sequence-v1'
+      ? decoded.source.beforeSequence
+      : undefined,
+  );
+  const anchorMessage = page.messages[0] || {
+    id: `agent-zero-sequence-${page.beforeSequence || 0}`,
+    role: 'system',
+    content: '',
+    timestamp: '',
+  };
+  return {
+    messages: page.messages,
+    hasMoreBefore: page.hasMoreBefore,
+    beforeCursor: page.hasMoreBefore && page.beforeSequence !== null
+      ? encodeHistoryCursor(params.scope, anchorMessage, {
+          kind: 'agent-zero-sequence-v1',
+          beforeSequence: page.beforeSequence,
+        })
+      : null,
+  };
+}
 
 type OpenClawCliResult = { ok: boolean; stdout: string; stderr: string; error?: string };
 
@@ -108,55 +617,61 @@ function runOpenClawCli(args: string[], timeoutMs = 8000, extraEnv: NodeJS.Proce
   });
 }
 
-function parseOpenClawVersion(raw: unknown): string | null {
-  const text = String(raw || '').trim();
-  const match = text.match(/OpenClaw\s+v?(\d{4}\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?)/i)
-    || text.match(/\bv?(\d{4}\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?)\b/);
-  return match?.[1] || null;
-}
-
 function parseJsonLoose(raw: string): any | null {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
-function getOpenClawPackageMtimeMs(): number | null {
-  const candidates = [
-    '/usr/lib/node_modules/openclaw/package.json',
-    '/usr/local/lib/node_modules/openclaw/package.json',
-  ];
-  for (const candidate of candidates) {
+interface OpenClawPackageMetadata {
+  packageDir: string;
+  version: string;
+  mtimeMs: number;
+}
+
+let openClawPackageMetadataCache: { checkedAtMs: number; metadata: OpenClawPackageMetadata | null } | null = null;
+
+function getOpenClawPackageMetadata(): OpenClawPackageMetadata | null {
+  const now = Date.now();
+  if (openClawPackageMetadataCache && now - openClawPackageMetadataCache.checkedAtMs < 5000) {
+    return openClawPackageMetadataCache.metadata;
+  }
+  const packageDirs = new Set<string>();
+  if (process.env.PORTAL_OPENCLAW_PACKAGE_DIR) {
+    packageDirs.add(path.resolve(process.env.PORTAL_OPENCLAW_PACKAGE_DIR));
+  }
+  try {
+    const npmRoot = execFileSync('npm', ['root', '-g'], {
+      env: buildOpenClawCliEnv(),
+      timeout: 2500,
+      encoding: 'utf8',
+    }).trim();
+    if (npmRoot) packageDirs.add(path.join(npmRoot, 'openclaw'));
+  } catch {
+    // Fall through to common global npm layouts.
+  }
+  packageDirs.add('/usr/lib/node_modules/openclaw');
+  packageDirs.add('/usr/local/lib/node_modules/openclaw');
+
+  for (const packageDir of packageDirs) {
+    const packageJsonPath = path.join(packageDir, 'package.json');
     try {
-      if (existsSync(candidate)) return statSync(candidate).mtimeMs;
+      if (!existsSync(packageJsonPath)) continue;
+      const manifest = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+      if (manifest?.name !== 'openclaw' || typeof manifest?.version !== 'string') continue;
+      const metadata = {
+        packageDir,
+        version: manifest.version,
+        mtimeMs: statSync(packageJsonPath).mtimeMs,
+      };
+      openClawPackageMetadataCache = { checkedAtMs: now, metadata };
+      return metadata;
     } catch {}
   }
+  openClawPackageMetadataCache = { checkedAtMs: now, metadata: null };
   return null;
 }
 
-function gatewayRecoveryEnv(): NodeJS.ProcessEnv {
-  return {
-    ...buildOpenClawCliEnv(),
-    // Needed when the installed stable CLI is intentionally recovering from a
-    // beta-written config after channel downgrade. OpenClaw gates destructive
-    // downgrade actions unless this is explicit.
-    OPENCLAW_ALLOW_OLDER_BINARY_DESTRUCTIVE_ACTIONS: '1',
-  };
-}
-
-function forceStartOpenClawGateway(): { ok: boolean; pid?: number; error?: string } {
-  try {
-    const logPath = '/root/.openclaw/logs/openclaw.log';
-    const out = openSync(logPath, 'a');
-    const child = spawn('openclaw', ['gateway', '--force', 'run'], {
-      env: gatewayRecoveryEnv(),
-      detached: true,
-      stdio: ['ignore', out, out],
-    });
-    child.unref();
-    closeSync(out);
-    return { ok: true, pid: child.pid };
-  } catch (err: any) {
-    return { ok: false, error: err?.message || 'Failed to force-start OpenClaw gateway' };
-  }
+function getOpenClawDistDir(): string {
+  return path.join(getOpenClawPackageMetadata()?.packageDir || FALLBACK_OPENCLAW_PACKAGE_DIR, 'dist');
 }
 
 async function waitForGatewayVersionClear(timeoutMs = 12000) {
@@ -164,11 +679,19 @@ async function waitForGatewayVersionClear(timeoutMs = 12000) {
   let last: any = null;
   while (Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 1000));
-    last = await getOpenClawVersionStatus({ force: true }).catch((err: any) => ({
+    last = await getOpenClawVersionStatus({ force: true, refreshReadiness: true }).catch((err: any) => ({
       installedVersion: null,
+      installedPackageVersion: null,
       runningVersion: null,
+      codexPluginVersion: null,
+      codexPluginInstallSpec: null,
       latestVersion: null,
       updateChannel: null,
+      testedCorePackageVersion: TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
+      testedRuntimeVersion: TESTED_OPENCLAW_RUNTIME_VERSION,
+      testedCodexPluginVersion: OPENCLAW_CODEX_PLUGIN_VERSION,
+      testedPairReady: false,
+      testedPairReason: err?.message || 'Tested OpenClaw pair verification failed while waiting for gateway restart',
       mismatch: false,
       restartRecommended: false,
       reason: null,
@@ -212,9 +735,17 @@ function getGatewayListenerProcess(): { pid: number | null; startedAt: string | 
 
 interface OpenClawVersionStatus {
   installedVersion: string | null;
+  installedPackageVersion: string | null;
   runningVersion: string | null;
+  codexPluginVersion: string | null;
+  codexPluginInstallSpec: string | null;
   latestVersion: string | null;
   updateChannel: string | null;
+  testedCorePackageVersion: string;
+  testedRuntimeVersion: string;
+  testedCodexPluginVersion: string;
+  testedPairReady: boolean | null;
+  testedPairReason: string | null;
   mismatch: boolean;
   restartRecommended: boolean;
   reason: string | null;
@@ -229,6 +760,12 @@ interface OpenClawVersionStatus {
 }
 
 const OPENCLAW_VERSION_STATUS_TTL_MS = Number(process.env.PORTAL_OPENCLAW_VERSION_STATUS_TTL_MS || 5 * 60 * 1000);
+// A cold shared readiness pass has five individually bounded CLI checks
+// (49 seconds total), two package-discovery lookups (2.5 seconds each), the
+// version-status update lookup (9 seconds), listener inspection (3.5 seconds),
+// and the wait loop's initial delay. Keep margin around the 67.5-second bound.
+const OPENCLAW_VERSION_STATUS_COLD_PROBE_BUDGET_MS = 75_000;
+const OPENCLAW_UPDATE_STATUS_TIMEOUT_MS = 9_000;
 let openClawVersionStatusCache: { status: OpenClawVersionStatus; checkedAtMs: number } | null = null;
 let openClawVersionStatusProbe: Promise<OpenClawVersionStatus> | null = null;
 
@@ -236,9 +773,17 @@ function getLightweightOpenClawVersionStatus(reason: string | null = null): Open
   const listener = getGatewayListenerProcess();
   return {
     installedVersion: null,
+    installedPackageVersion: null,
     runningVersion: null,
+    codexPluginVersion: null,
+    codexPluginInstallSpec: null,
     latestVersion: null,
     updateChannel: null,
+    testedCorePackageVersion: TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
+    testedRuntimeVersion: TESTED_OPENCLAW_RUNTIME_VERSION,
+    testedCodexPluginVersion: OPENCLAW_CODEX_PLUGIN_VERSION,
+    testedPairReady: null,
+    testedPairReason: null,
     mismatch: false,
     restartRecommended: false,
     reason,
@@ -252,22 +797,70 @@ function getLightweightOpenClawVersionStatus(reason: string | null = null): Open
   };
 }
 
-async function probeOpenClawVersionStatus(): Promise<OpenClawVersionStatus> {
-  const [cliVersionResult, updateStatusResult, probeResult] = await Promise.all([
-    runOpenClawCli(['--version'], 4000),
-    runOpenClawCli(['update', 'status', '--json', '--timeout', '3'], 9000),
-    runOpenClawCli(['gateway', 'probe', '--json'], 9000),
-  ]);
+async function probeOpenClawVersionStatus(forceReadiness = false): Promise<OpenClawVersionStatus> {
+  return probeOpenClawVersionStatusWithDependencies({}, forceReadiness);
+}
 
-  const installedVersion = parseOpenClawVersion(cliVersionResult.stdout);
+interface OpenClawVersionProbeDependencies {
+  runCli: typeof runOpenClawCli;
+  getSetupReadiness: typeof getOpenClawSetupReadiness;
+  getPackageMetadata: typeof getOpenClawPackageMetadata;
+  getListenerProcess: typeof getGatewayListenerProcess;
+}
+
+async function probeOpenClawVersionStatusWithDependencies(
+  dependencies: Partial<OpenClawVersionProbeDependencies> = {},
+  forceReadiness = false,
+): Promise<OpenClawVersionStatus> {
+  const runCli = dependencies.runCli || runOpenClawCli;
+  const readiness = await (dependencies.getSetupReadiness || getOpenClawSetupReadiness)(
+    {},
+    { force: forceReadiness },
+  );
+
+  // Readiness owns the shared, in-flight-deduplicated OpenClaw CLI sequence
+  // used by maintenance and setup routes. Run update discovery only after that
+  // sequence settles so the Dashboard never starts a competing CLI process.
+  const updateStatusResult = await runCli(
+    ['update', 'status', '--json', '--timeout', '3'],
+    OPENCLAW_UPDATE_STATUS_TIMEOUT_MS,
+  );
+
+  const installedVersion = readiness.version;
+  const packageMetadata = (dependencies.getPackageMetadata || getOpenClawPackageMetadata)();
+  const installedPackageVersion = readiness.corePackageVersion;
   const updateStatus = parseJsonLoose(updateStatusResult.stdout);
-  const probe = parseJsonLoose(probeResult.stdout);
-  const primaryTarget = Array.isArray(probe?.targets) ? probe.targets[0] : null;
-  const runningVersion = parseOpenClawVersion(primaryTarget?.self?.version || probe?.self?.version);
-  const listener = getGatewayListenerProcess();
-  const installedPackageMtimeMs = getOpenClawPackageMtimeMs();
+  const codexPluginVersion = readiness.codexPluginVersion;
+  const codexPluginInstallSpec = readiness.codexPluginInstallSpec;
+  const runningVersion = readiness.runningVersion;
+  const listener = (dependencies.getListenerProcess || getGatewayListenerProcess)();
+  const installedPackageMtimeMs = packageMetadata?.mtimeMs || null;
   const installedPackageMtime = installedPackageMtimeMs ? new Date(installedPackageMtimeMs).toISOString() : null;
-  const probeError = primaryTarget?.connect?.error || probe?.warnings?.[0]?.message || probeResult.error || null;
+  const probeError = readiness.gatewayProbeError;
+
+  const expectedCodexPluginSpec = `@openclaw/codex@${OPENCLAW_CODEX_PLUGIN_VERSION}`;
+  const testedPairReady = readiness.testedPairReady;
+  const testedPairBlocker = readiness.blockers.find((blocker) => [
+    'not-installed',
+    'core-package-mismatch',
+    'cli-runtime-mismatch',
+    'gateway-rpc-unavailable',
+    'gateway-runtime-mismatch',
+    'codex-plugin-mismatch',
+  ].includes(blocker.code));
+  const testedPairReason = testedPairReady
+    ? null
+    : installedPackageVersion !== TESTED_OPENCLAW_CORE_PACKAGE_VERSION
+    ? `OpenClaw package ${installedPackageVersion || 'unknown'} is installed; Portal 4.0 is tested with ${TESTED_OPENCLAW_CORE_PACKAGE_VERSION}.`
+    : !matchesTestedRuntime(installedVersion)
+      ? `OpenClaw CLI runtime ${installedVersion || 'unknown'} does not match tested runtime ${TESTED_OPENCLAW_RUNTIME_VERSION}.`
+      : !matchesTestedRuntime(runningVersion)
+        ? `OpenClaw gateway runtime ${runningVersion || 'unknown'} does not match tested runtime ${TESTED_OPENCLAW_RUNTIME_VERSION}.`
+        : readiness.blockers.some((blocker) => blocker.code === 'codex-plugin-mismatch')
+          ? `OpenClaw Codex plugin must be the pinned npm install ${expectedCodexPluginSpec}; detected ${codexPluginInstallSpec || codexPluginVersion || 'unknown'}.`
+          : !readiness.gatewayProbeOk
+            ? testedPairBlocker?.message || 'OpenClaw gateway RPC probe did not validate the tested runtime pair.'
+            : testedPairBlocker?.message || 'OpenClaw did not validate the tested runtime pair.';
 
   const exactVersionMismatch = Boolean(installedVersion && runningVersion && installedVersion !== runningVersion);
   const listenerOlderThanInstall = Boolean(
@@ -287,22 +880,32 @@ async function probeOpenClawVersionStatus(): Promise<OpenClawVersionStatus> {
 
   return {
     installedVersion,
+    installedPackageVersion,
     runningVersion,
+    codexPluginVersion,
+    codexPluginInstallSpec,
     latestVersion: updateStatus?.availability?.latestVersion || updateStatus?.update?.registry?.latestVersion || null,
     updateChannel: updateStatus?.channel?.value || null,
+    testedCorePackageVersion: TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
+    testedRuntimeVersion: TESTED_OPENCLAW_RUNTIME_VERSION,
+    testedCodexPluginVersion: OPENCLAW_CODEX_PLUGIN_VERSION,
+    testedPairReady,
+    testedPairReason,
     mismatch,
     restartRecommended: mismatch,
     reason,
     listenerPid: listener.pid,
     listenerStartedAt: listener.startedAt,
     installedPackageMtime,
-    probeOk: Boolean(probe?.ok),
+    probeOk: readiness.gatewayProbeOk,
     probeError,
     checkedAt: new Date().toISOString(),
   };
 }
 
-async function getOpenClawVersionStatus(options: { force?: boolean } = {}): Promise<OpenClawVersionStatus> {
+async function getOpenClawVersionStatus(
+  options: { force?: boolean; refreshReadiness?: boolean } = {},
+): Promise<OpenClawVersionStatus> {
   const now = Date.now();
   const force = options.force === true;
   const cacheFresh = openClawVersionStatusCache && now - openClawVersionStatusCache.checkedAtMs < OPENCLAW_VERSION_STATUS_TTL_MS;
@@ -324,7 +927,7 @@ async function getOpenClawVersionStatus(options: { force?: boolean } = {}): Prom
       : getLightweightOpenClawVersionStatus('OpenClaw version probe already running.');
   }
 
-  openClawVersionStatusProbe = probeOpenClawVersionStatus()
+  openClawVersionStatusProbe = probeOpenClawVersionStatus(options.refreshReadiness === true)
     .then(status => {
       openClawVersionStatusCache = { status, checkedAtMs: Date.now() };
       return status;
@@ -344,15 +947,15 @@ async function getOpenClawVersionStatus(options: { force?: boolean } = {}): Prom
 }
 
 let geminiCliTranscriptIndexCache: { at: number; index: Map<string, string> } | null = null;
-let mainSessionListCache: { at: number; mtimeMs: number; size: number; sessions: any[] } | null = null;
 
 function resolveOpenClawDistBundle(prefix: string | string[]): string | null {
   try {
-    if (!existsSync(OPENCLAW_DIST_DIR)) return null;
+    const openClawDistDir = getOpenClawDistDir();
+    if (!existsSync(openClawDistDir)) return null;
     const prefixes = Array.isArray(prefix) ? prefix : [prefix];
-    const matches = readdirSync(OPENCLAW_DIST_DIR)
+    const matches = readdirSync(openClawDistDir)
       .filter((name) => name.endsWith('.js') && prefixes.some((candidate) => name.startsWith(candidate)))
-      .map((name) => path.join(OPENCLAW_DIST_DIR, name))
+      .map((name) => path.join(openClawDistDir, name))
       .sort((a, b) => {
         const sizeDiff = statSync(b).size - statSync(a).size;
         return sizeDiff !== 0 ? sizeDiff : path.basename(a).localeCompare(path.basename(b));
@@ -365,14 +968,15 @@ function resolveOpenClawDistBundle(prefix: string | string[]): string | null {
 
 function resolveOpenClawExtensionImportedBundle(extensionRelativePath: string, prefix: string | string[]): string | null {
   try {
-    const extensionPath = path.join(OPENCLAW_DIST_DIR, extensionRelativePath);
+    const openClawDistDir = getOpenClawDistDir();
+    const extensionPath = path.join(openClawDistDir, extensionRelativePath);
     if (!existsSync(extensionPath)) return null;
     const text = readFileSync(extensionPath, 'utf8');
     const prefixes = Array.isArray(prefix) ? prefix : [prefix];
     for (const candidate of prefixes) {
       const match = text.match(new RegExp(`${candidate}[^"']+\\.js`));
       if (!match) continue;
-      const resolved = path.join(OPENCLAW_DIST_DIR, path.basename(match[0]));
+      const resolved = path.join(openClawDistDir, path.basename(match[0]));
       if (existsSync(resolved)) return resolved;
     }
   } catch {
@@ -382,6 +986,7 @@ function resolveOpenClawExtensionImportedBundle(extensionRelativePath: string, p
 }
 
 function getOpenClawCompatibilityHotfixStatus() {
+  const openClawDistDir = getOpenClawDistDir();
   const heartbeatEventsFilterPath = resolveOpenClawDistBundle('heartbeat-events-filter-');
   const heartbeatRunnerPath = resolveOpenClawDistBundle('heartbeat-runner-');
   const replyBundlePath = resolveOpenClawDistBundle(['get-reply-', 'reply-']);
@@ -389,8 +994,8 @@ function getOpenClawCompatibilityHotfixStatus() {
   const executeRuntimePath = resolveOpenClawDistBundle('execute.runtime-');
   const geminiCliBackendPath = resolveOpenClawExtensionImportedBundle('extensions/google/cli-backend.js', 'cli-backend-')
     || resolveOpenClawDistBundle('cli-backend-')
-    || (existsSync(path.join(OPENCLAW_DIST_DIR, 'extensions/google/cli-backend.js'))
-      ? path.join(OPENCLAW_DIST_DIR, 'extensions/google/cli-backend.js')
+    || (existsSync(path.join(openClawDistDir, 'extensions/google/cli-backend.js'))
+      ? path.join(openClawDistDir, 'extensions/google/cli-backend.js')
       : null);
   const scriptExists = existsSync(OPENCLAW_COMPAT_HOTFIX_SCRIPT);
   const issues: string[] = [];
@@ -460,80 +1065,45 @@ function getOpenClawCompatibilityHotfixStatus() {
     heartbeatRunner: heartbeatRunnerPath ? path.basename(heartbeatRunnerPath) : null,
     replyBundle: replyBundlePath ? path.basename(replyBundlePath) : null,
     executeRuntime: executeRuntimePath ? path.basename(executeRuntimePath) : null,
-    geminiCliBackend: geminiCliBackendPath ? path.relative(OPENCLAW_DIST_DIR, geminiCliBackendPath) : null,
+    geminiCliBackend: geminiCliBackendPath ? path.relative(openClawDistDir, geminiCliBackendPath) : null,
     issues,
   };
 }
 
-function restartOpenClawGatewayBySignal(): string {
-  const output = execFileSync('pgrep', ['-f', 'openclaw.*gateway|gateway.*openclaw|/openclaw/dist/.*gateway|openclaw-gateway'], {
-    encoding: 'utf8',
-    timeout: 5000,
-  });
-  const pid = output.split(/\s+/).map((value) => value.trim()).find(Boolean);
-  if (!pid) {
-    throw new Error('No gateway PID found for signal fallback.');
-  }
-  process.kill(Number(pid), 'SIGUSR1');
-  return `Gateway restart fallback sent via SIGUSR1 to PID ${pid}.`;
-}
-
-function hasSystemOpenClawGatewayService(): boolean {
-  return [
-    '/etc/systemd/system/openclaw-gateway.service',
-    '/lib/systemd/system/openclaw-gateway.service',
-    '/usr/lib/systemd/system/openclaw-gateway.service',
-  ].some((servicePath) => existsSync(servicePath));
-}
-
 async function restartOpenClawGatewayBySystemService(): Promise<string> {
-  const restartRun = await execFileText('systemctl', ['restart', 'openclaw-gateway'], 45000);
+  await assertOpenClawGatewayAuthorizationFenceReleased();
+  if (
+    !existsSync('/run/systemd/system')
+    || !existsSync('/usr/bin/systemctl')
+    || !existsSync('/etc/systemd/system/openclaw-gateway.service')
+  ) {
+    throw new Error('The installer-owned OpenClaw gateway system service is unavailable.');
+  }
+  const restartRun = await execFileText(
+    '/usr/bin/systemctl',
+    ['restart', 'openclaw-gateway.service'],
+    45_000,
+  );
   await new Promise((resolve) => setTimeout(resolve, 3000));
   const output = [restartRun.stdout, restartRun.stderr].filter(Boolean).join('\n').trim();
   return output || 'Restarted openclaw-gateway via systemd system service.';
 }
 
-function isOpenClawGatewayServiceUnavailable(detail: string): boolean {
-  return /Gateway service disabled\.|systemd user services are unavailable|systemd not installed|systemctl is-enabled unavailable|Failed to connect to bus: No medium found/i.test(detail);
-}
-
 async function restartOpenClawGateway(): Promise<string> {
-  const systemdAvailable = existsSync('/run/systemd/system') && existsSync('/bin/systemctl');
-  if (!systemdAvailable) {
-    const signalMessage = restartOpenClawGatewayBySignal();
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    return signalMessage;
-  }
-
-  try {
-    const cliRun = await execFileText('openclaw', ['gateway', 'restart'], 45000);
-    const cliOutput = [cliRun.stdout, cliRun.stderr].filter(Boolean).join('\n').trim();
-
-    if (isOpenClawGatewayServiceUnavailable(cliOutput)) {
-      if (hasSystemOpenClawGatewayService()) return await restartOpenClawGatewayBySystemService();
-      const signalMessage = restartOpenClawGatewayBySignal();
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-      return [cliOutput, signalMessage].filter(Boolean).join('\n');
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    return cliOutput;
-  } catch (err: any) {
-    const detail = String(err?.message || err || '').trim();
-    if (!isOpenClawGatewayServiceUnavailable(detail)) throw err;
-    if (hasSystemOpenClawGatewayService()) return await restartOpenClawGatewayBySystemService();
-    const signalMessage = restartOpenClawGatewayBySignal();
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    return [detail, signalMessage].filter(Boolean).join('\n');
-  }
+  return await restartOpenClawGatewayBySystemService();
 }
 
-async function execFileText(command: string, args: string[], timeout: number): Promise<{ stdout: string; stderr: string }> {
+async function execFileText(
+  command: string,
+  args: string[],
+  timeout: number,
+  extraEnv: NodeJS.ProcessEnv = {},
+): Promise<{ stdout: string; stderr: string }> {
   return await new Promise((resolve, reject) => {
     execFile(command, args, {
       timeout,
       encoding: 'utf8',
-      env: buildOpenClawCliEnv(),
+      env: { ...buildOpenClawCliEnv(), ...extraEnv },
       maxBuffer: 1024 * 1024 * 4,
     }, (error, stdout, stderr) => {
       const normalizedStdout = String(stdout || '').trim();
@@ -578,16 +1148,104 @@ function normalizePortalNewSessionAlias(rawSession: unknown): string {
   return `agent:${agentId}:${sessionName.replace(/^portal-/, '')}`;
 }
 
-function resolveOpenClawSessionKey(rawSession: unknown, user?: Pick<JwtPayload, 'role'> | null): string {
+function openClawAgentChatSessionKey(
+  rawUserId: string,
+  rawAgentId = 'main',
+  rawSessionName = '',
+): string {
+  const userId = String(rawUserId || '').trim();
+  const agentId = String(rawAgentId || '').trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId)) {
+    throw new Error('Admin access required');
+  }
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(agentId)) throw new Error('Invalid OpenClaw agent');
+
+  const requestedName = String(rawSessionName || '').trim();
+  const safeName = requestedName
+    .replace(/[^a-zA-Z0-9_.-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 96);
+  const suffix = safeName && safeName !== 'main'
+    ? `-${safeName}`
+    : '';
+  return `agent:${agentId}:portal-${userId}${suffix}`;
+}
+
+function openClawSessionActorId(rawSessionKey: string): string | null {
+  const sessionKey = String(rawSessionKey || '').trim();
+  const match = /^agent:[^:]+:portal-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:-|$)/i.exec(sessionKey);
+  return match?.[1]?.toLowerCase() || null;
+}
+
+function isOpenClawSessionActorScopedTo(
+  rawSessionKey: string,
+  rawActorUserId: string,
+): boolean {
+  const sessionKey = String(rawSessionKey || '').trim();
+  const actorUserId = String(rawActorUserId || '').trim();
+  if (!sessionKey || !actorUserId) return false;
+  const match = /^agent:[^:]+:(.+)$/.exec(sessionKey);
+  const sessionName = match?.[1] || '';
+  return sessionName === `portal-${actorUserId}`
+    || sessionName.startsWith(`portal-${actorUserId}-`);
+}
+
+async function resolveOpenClawSessionKey(
+  rawSession: unknown,
+  user?: Pick<JwtPayload, 'role' | 'userId'> | null,
+  database: ProjectActivityScopeDatabase = prisma,
+): Promise<string> {
   const session = normalizePortalNewSessionAlias(rawSession);
-  if (session.startsWith('agent:')) return session;
+  if (!user || !isElevatedRole(user.role)) return session;
 
-  const isOwnerMainAlias = isOwnerRole(user?.role)
-    && (!session || session === 'main');
-  if (isOwnerMainAlias) return 'agent:main:main';
-  if (session.startsWith('new-')) return `agent:main:portal-${session}`;
+  const qualified = /^agent:([^:]+):(.+)$/.exec(session);
+  if (qualified) {
+    const [, agentId, sessionName] = qualified;
+    if (sessionName === 'main') {
+      const owner = await findOpenClawAgentSessionOwner(session, database);
+      if (owner === user.userId) return session;
+      return openClawAgentChatSessionKey(user.userId, agentId);
+    }
+    if (sessionName.startsWith('new-')) {
+      return openClawAgentChatSessionKey(user.userId, agentId, sessionName);
+    }
+    return session;
+  }
 
+  if (!session || session === 'main') {
+    const canonicalMain = 'agent:main:main';
+    const owner = await findOpenClawAgentSessionOwner(canonicalMain, database);
+    if (owner === user.userId) return canonicalMain;
+    return openClawAgentChatSessionKey(user.userId);
+  }
+  if (session.startsWith('new-')) {
+    return openClawAgentChatSessionKey(user.userId, 'main', session);
+  }
   return session;
+}
+
+async function resolveOpenClawTurnSessionKey(
+  rawSession: unknown,
+  rawAgentId: unknown,
+  user: Pick<JwtPayload, 'role' | 'userId'>,
+  database: ProjectActivityScopeDatabase = prisma,
+): Promise<string> {
+  const session = normalizePortalNewSessionAlias(rawSession);
+  if (session.startsWith('agent:')) {
+    return resolveOpenClawSessionKey(session, user, database);
+  }
+
+  const requestedAgentId = typeof rawAgentId === 'string' && rawAgentId.trim()
+    ? rawAgentId.trim()
+    : 'main';
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(requestedAgentId)) {
+    throw new Error('Invalid OpenClaw agent');
+  }
+  return resolveOpenClawSessionKey(
+    `agent:${requestedAgentId}:${session || 'main'}`,
+    user,
+    database,
+  );
 }
 
 function normalizeOpenClawAgentList(rawAgents: unknown): any[] {
@@ -696,36 +1354,400 @@ function isSandboxProjectSessionKeyForUser(sessionKey: string, user: JwtPayload)
   return sessionId.startsWith(`portal-${user.userId}-`);
 }
 
-function assertGatewaySessionAccess(sessionKey: string, user: JwtPayload, options?: { providerName?: AgentProviderName | string | undefined }): void {
-  if (isElevatedRole(user.role)) return;
-
+async function assertGatewaySessionAccess(
+  sessionKey: string,
+  user: JwtPayload,
+  options?: {
+    providerName?: AgentProviderName | string | undefined;
+    database?: ProjectActivityScopeDatabase;
+  },
+): Promise<void> {
   const providerName = String(options?.providerName || 'OPENCLAW').trim().toUpperCase();
   if (providerName !== 'OPENCLAW') {
+    if (isElevatedRole(user.role)) return;
     throw new Error('Admin access required');
   }
 
   if (isSandboxProjectSessionKeyForUser(sessionKey, user)) return;
-  throw new Error('Admin access required');
+  if (!isElevatedRole(user.role)) throw new Error('Admin access required');
+
+  const database = options?.database || prisma;
+  if (await isProjectChatActivitySession(sessionKey, database, user.userId)) {
+    throw new Error('Admin access required');
+  }
+  await claimOpenClawAgentSession(sessionKey, user.userId, database);
+}
+
+/**
+ * Read-only OpenClaw session authorization.
+ *
+ * Long-lived WebSocket delivery paths must never converge ownership or touch
+ * lastActivityAt: those writes could begin under an old authorization
+ * generation and settle after a transition commits. Session creation remains
+ * on the Portal broker, where request/host-run admission owns the mutation
+ * lease.
+ */
+async function assertExistingGatewaySessionAccess(
+  sessionKey: string,
+  user: JwtPayload,
+  options?: {
+    providerName?: AgentProviderName | string | undefined;
+    database?: ProjectActivityScopeDatabase;
+  },
+): Promise<void> {
+  const providerName = String(options?.providerName || 'OPENCLAW').trim().toUpperCase();
+  if (providerName !== 'OPENCLAW') {
+    if (isElevatedRole(user.role)) return;
+    throw new Error('Admin access required');
+  }
+
+  if (isSandboxProjectSessionKeyForUser(sessionKey, user)) return;
+  if (!isElevatedRole(user.role)) throw new Error('Admin access required');
+
+  const database = options?.database || prisma;
+  if (await isProjectChatActivitySession(sessionKey, database, user.userId)) {
+    throw new Error('Admin access required');
+  }
+  const ownerUserId = await findOpenClawAgentSessionOwner(sessionKey, database);
+  if (ownerUserId !== user.userId) throw new Error('Admin access required');
+}
+
+const NATIVE_AGENT_SESSION_PROVIDERS: readonly AgentProviderName[] = Object.freeze([
+  'CLAUDE_CODE',
+  'CODEX',
+  'GEMINI',
+  'GROK',
+  'AGENT_ZERO',
+  'OLLAMA',
+]);
+
+function findNativeAgentSessionOwner(sessionId: string): string | null {
+  const owners = new Set<string>();
+  for (const providerName of NATIVE_AGENT_SESSION_PROVIDERS) {
+    try {
+      const session = loadNativeSession(providerName, sessionId);
+      if (session?.userId) owners.add(session.userId);
+    } catch {
+      // A malformed/unreadable provider store is not ownership evidence.
+    }
+  }
+  return owners.size === 1 ? [...owners][0] : null;
+}
+
+async function assertAgentStreamSessionAccess(
+  sessionKey: string,
+  user: JwtPayload,
+): Promise<void> {
+  if (sessionKey.startsWith('agent:')) {
+    await assertExistingGatewaySessionAccess(sessionKey, user);
+    return;
+  }
+  if (!isElevatedRole(user.role) || findNativeAgentSessionOwner(sessionKey) !== user.userId) {
+    throw new Error('Admin access required');
+  }
+}
+
+type ProjectActivityScopeDatabase = Pick<typeof prisma,
+  | 'agentSession'
+  | 'projectChatProviderBinding'
+  | 'projectChatSession'
+  | 'projectChatMessage'
+  | 'projectChatTurn'
+  | 'legacyOpenClawProjectImport'
+  | 'legacyOpenClawProjectQuarantine'
+>;
+
+async function findOpenClawAgentSessionOwner(
+  rawSessionKey: string,
+  database: ProjectActivityScopeDatabase = prisma,
+): Promise<string | null> {
+  const sessionKey = String(rawSessionKey || '').trim();
+  if (!sessionKey) return null;
+  const existing = await database.agentSession.findFirst({
+    where: {
+      provider: 'OPENCLAW',
+      externalId: sessionKey,
+    },
+    select: { userId: true },
+  });
+  return existing?.userId || null;
+}
+
+function isPrismaUniqueConstraintError(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && (error as any).code === 'P2002');
+}
+
+async function claimOpenClawAgentSession(
+  rawSessionKey: string,
+  rawActorUserId: string,
+  database: ProjectActivityScopeDatabase = prisma,
+): Promise<void> {
+  const sessionKey = String(rawSessionKey || '').trim();
+  const actorUserId = String(rawActorUserId || '').trim();
+  if (!sessionKey || !actorUserId) throw new Error('Admin access required');
+
+  const embeddedActorId = openClawSessionActorId(sessionKey);
+  if (embeddedActorId && embeddedActorId !== actorUserId.toLowerCase()) {
+    throw new Error('Admin access required');
+  }
+  const actorScopedToCurrentUser = isOpenClawSessionActorScopedTo(sessionKey, actorUserId);
+
+  const touchOwned = async (row: { id: string; userId: string } | null): Promise<boolean> => {
+    if (!row) return false;
+    if (row.userId !== actorUserId) throw new Error('Admin access required');
+    await database.agentSession.update({
+      where: { id: row.id },
+      data: { status: 'active', lastActivityAt: new Date() },
+    });
+    return true;
+  };
+
+  const existing = await database.agentSession.findFirst({
+    where: {
+      provider: 'OPENCLAW',
+      externalId: sessionKey,
+    },
+    select: { id: true, userId: true },
+  });
+  if (await touchOwned(existing)) return;
+
+  if (!actorScopedToCurrentUser) {
+    // Legacy/unscoped keys are usable only after an earlier durable claim.
+    // This prevents role elevation or ownership transfer from adopting an
+    // existing OpenClaw transcript merely by knowing its key.
+    throw new Error('Admin access required');
+  }
+
+  try {
+    await database.agentSession.create({
+      data: {
+        userId: actorUserId,
+        provider: 'OPENCLAW',
+        externalId: sessionKey,
+        status: 'active',
+      },
+    });
+  } catch (error) {
+    if (!isPrismaUniqueConstraintError(error)) throw error;
+    const winner = await database.agentSession.findFirst({
+      where: {
+        provider: 'OPENCLAW',
+        externalId: sessionKey,
+      },
+      select: { id: true, userId: true },
+    });
+    if (!(await touchOwned(winner))) throw error;
+  }
+}
+
+const LEGACY_PROJECT_USER_ID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const LEGACY_PROJECT_SLUG_PATTERN = '[a-z0-9][a-z0-9_-]{0,95}';
+const RESERVED_LEGACY_PROJECT_SESSION_PATTERNS = [
+  new RegExp(`^portal-${LEGACY_PROJECT_USER_ID_PATTERN}-${LEGACY_PROJECT_SLUG_PATTERN}$`, 'i'),
+  new RegExp(`^agent:portal:portal-${LEGACY_PROJECT_USER_ID_PATTERN}-${LEGACY_PROJECT_SLUG_PATTERN}$`, 'i'),
+  // Early 3.x Project agents commonly persisted their canonical OpenClaw lane
+  // as `:main`, before Portal also began recording the actor-derived session
+  // id. The `portal-<actor8>-` agent namespace is reserved for those runtimes.
+  new RegExp(`^agent:portal-[0-9a-f]{8}-${LEGACY_PROJECT_SLUG_PATTERN}:main$`, 'i'),
+  new RegExp(
+    `^agent:portal-[0-9a-f]{8}-${LEGACY_PROJECT_SLUG_PATTERN}:portal-${LEGACY_PROJECT_USER_ID_PATTERN}-${LEGACY_PROJECT_SLUG_PATTERN}$`,
+    'i',
+  ),
+] as const;
+
+function isReservedLegacyProjectSessionKey(rawSessionKey: string): boolean {
+  const sessionKey = String(rawSessionKey || '').trim();
+  return Boolean(sessionKey) && RESERVED_LEGACY_PROJECT_SESSION_PATTERNS.some((pattern) => pattern.test(sessionKey));
+}
+
+function isActorDerivedLegacyProjectSessionKey(
+  rawSessionKey: string,
+  rawActorUserId: string,
+): boolean {
+  const sessionKey = String(rawSessionKey || '').trim();
+  const actorUserId = String(rawActorUserId || '').trim();
+  if (!sessionKey) return false;
+  // Reserved legacy aliases are Project evidence independent of the current
+  // browser actor. Otherwise an elevated actor could open another user's
+  // config-only 3.x key and bootstrap it into their own AgentSession row.
+  if (isReservedLegacyProjectSessionKey(sessionKey)) return true;
+  if (!actorUserId) return false;
+
+  const legacySessionPrefix = `portal-${actorUserId}-`;
+  if (sessionKey.startsWith(legacySessionPrefix)) return true;
+
+  const match = /^agent:([^:]+):(.+)$/.exec(sessionKey);
+  if (!match) return false;
+  const [, agentId, legacySessionId] = match;
+  if (!legacySessionId.startsWith(legacySessionPrefix)) return false;
+  const stableSlug = legacySessionId.slice(legacySessionPrefix.length);
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(stableSlug)) return false;
+
+  const dedicatedAgentId = `portal-${actorUserId.slice(0, 8)}-${stableSlug}`.slice(0, 64);
+  return agentId === dedicatedAgentId || agentId === 'portal';
+}
+
+async function attestAgentChatActivitySession(
+  rawSessionKey: string,
+  rawActorUserId: string,
+  database: ProjectActivityScopeDatabase = prisma,
+): Promise<void> {
+  const sessionKey = String(rawSessionKey || '').trim();
+  const actorUserId = String(rawActorUserId || '').trim();
+  if (!sessionKey || !actorUserId) return;
+  // Registration is positive Agent-surface evidence, but it must never turn
+  // an existing/current/legacy Project identity into an Agent title source.
+  if (await isProjectChatActivitySession(sessionKey, database, actorUserId)) return;
+  await claimOpenClawAgentSession(sessionKey, actorUserId, database);
+}
+
+async function isProjectChatActivitySession(
+  rawSessionKey: string,
+  database: ProjectActivityScopeDatabase = prisma,
+  actorUserId = '',
+): Promise<boolean> {
+  const sessionKey = String(rawSessionKey || '').trim();
+  if (!sessionKey) return true;
+  // Old 3.x Project identities can survive only in OpenClaw config/session
+  // inventory. Derive their reserved aliases from the authenticated actor on
+  // the server; the browser never guesses scope from this pattern.
+  if (isActorDerivedLegacyProjectSessionKey(sessionKey, actorUserId)) return true;
+
+  const [binding, session, message, turn, legacyImport, legacyQuarantine] = await Promise.all([
+    database.projectChatProviderBinding.findFirst({
+      where: {
+        OR: [{ sessionKey }, { externalSessionId: sessionKey }],
+      },
+      select: { id: true },
+    }),
+    database.projectChatSession.findFirst({
+      where: { sessionKey },
+      select: { id: true },
+    }),
+    database.projectChatMessage.findFirst({
+      where: { OR: [{ sessionKey }, { providerSessionId: sessionKey }] },
+      select: { id: true },
+    }),
+    database.projectChatTurn.findFirst({
+      where: { providerSessionId: sessionKey },
+      select: { id: true },
+    }),
+    database.legacyOpenClawProjectImport.findFirst({
+      where: {
+        OR: [{ sourceSessionKey: sessionKey }, { providerSessionId: sessionKey }],
+      },
+      select: { id: true },
+    }),
+    database.legacyOpenClawProjectQuarantine.findFirst({
+      where: { OR: [{ sessionKey }, { providerSessionId: sessionKey }] },
+      select: { id: true },
+    }),
+  ]);
+
+  return Boolean(binding || session || message || turn || legacyImport || legacyQuarantine);
+}
+
+const AGENT_ACTIVITY_SCOPE_CACHE_MAX_ENTRIES = 2_048;
+const agentActivityScopePending = new Map<string, Promise<boolean>>();
+
+async function isAgentChatActivitySession(
+  rawSessionKey: string,
+  rawActorUserId: string,
+  database: ProjectActivityScopeDatabase = prisma,
+): Promise<boolean> {
+  const sessionKey = String(rawSessionKey || '').trim();
+  const actorUserId = String(rawActorUserId || '').trim();
+  if (!sessionKey || !actorUserId) return false;
+  const pendingKey = `${actorUserId}\u0000${sessionKey}`;
+  const inflight = agentActivityScopePending.get(pendingKey);
+  if (inflight) return inflight;
+
+  // Coalesce only concurrent checks. A positive Agent classification is never
+  // cached across events because the same external key can later acquire an
+  // authoritative current or legacy Project binding.
+  let pending!: Promise<boolean>;
+  pending = Promise.all([
+    database.agentSession.findFirst({
+      where: {
+        userId: actorUserId,
+        provider: 'OPENCLAW',
+        externalId: sessionKey,
+        status: 'active',
+      },
+      select: { id: true },
+    }),
+    isProjectChatActivitySession(sessionKey, database, actorUserId),
+  ])
+    .then(([agentSession, isProject]) => Boolean(agentSession) && !isProject)
+    // Activity titles are optional presentation metadata. If authoritative
+    // scope attestation is unavailable, fail closed and emit no title.
+    .catch(() => false)
+    .finally(() => {
+      if (agentActivityScopePending.get(pendingKey) === pending) {
+        agentActivityScopePending.delete(pendingKey);
+      }
+    });
+  while (agentActivityScopePending.size >= AGENT_ACTIVITY_SCOPE_CACHE_MAX_ENTRIES) {
+    const oldest = agentActivityScopePending.keys().next().value;
+    if (typeof oldest !== 'string') break;
+    agentActivityScopePending.delete(oldest);
+  }
+  agentActivityScopePending.set(pendingKey, pending);
+  return pending;
+}
+
+/** Agent Chat is the elevated, host-wide operator control plane. */
+function requireHostOperatorExecutionContext(user: JwtPayload): HostOperatorExecutionContext {
+  if (!isElevatedRole(user.role)) throw new Error('Admin access required');
+  return createHostOperatorExecutionContext(user.userId);
+}
+
+function assertProviderExecutionContext(providerName: AgentProviderName, executionContext: AgentExecutionContext): void {
+  assertExecutionContextBinding(executionContext, executionContext.userId);
+  assertProviderSupportsExecutionScope(
+    providerName,
+    getProviderCapabilities(providerName)?.supportedExecutionScopes,
+    executionContext,
+  );
+}
+
+const REGISTERED_AGENT_PROVIDER_NAMES = new Set<AgentProviderName>([
+  'OPENCLAW',
+  'CLAUDE_CODE',
+  'CODEX',
+  'GROK',
+  'AGENT_ZERO',
+  'GEMINI',
+  'OLLAMA',
+]);
+
+class UnknownAgentProviderError extends Error {
+  constructor(provider: string) {
+    super(`Unknown provider: ${provider || 'empty'}`);
+    this.name = 'UnknownAgentProviderError';
+  }
 }
 
 function normalizeProviderName(input: unknown): AgentProviderName {
   const normalized = String(input || 'OPENCLAW').trim().toUpperCase();
-  return (normalized || 'OPENCLAW') as AgentProviderName;
+  const provider = normalized || 'OPENCLAW';
+  if (!REGISTERED_AGENT_PROVIDER_NAMES.has(provider as AgentProviderName)) {
+    throw new UnknownAgentProviderError(provider);
+  }
+  return provider as AgentProviderName;
 }
 
-function routeProviderForRequestedModel(providerName: unknown, requestedModel: unknown): AgentProviderName {
-  const provider = normalizeProviderName(providerName);
-  if (provider !== 'OPENCLAW') return provider;
+function isProviderModelResetAlias(value: unknown): boolean {
+  return /^(?:default|reset)$/i.test(String(value || '').trim());
+}
 
-  const normalizedModel = normalizePortalModelId(typeof requestedModel === 'string' ? requestedModel : '');
-  if (
-    normalizedModel.startsWith('google-antigravity/')
-    || normalizedModel.startsWith('google-gemini-cli/')
-  ) {
-    return 'GEMINI';
-  }
-
-  return provider;
+function routeProviderForRequestedModel(providerName: unknown, _requestedModel: unknown): AgentProviderName {
+  // A model identifier may resemble another harness's catalog namespace, but
+  // it must never silently change the selected provider. OpenClaw-owned model
+  // rows stay on OpenClaw; native Gemini is selected only when the user chose
+  // the Gemini harness. This keeps history, capabilities, and execution scope
+  // bound to the provider shown in the UI.
+  return normalizeProviderName(providerName);
 }
 
 function isNativeSessionPlaceholder(rawSession: unknown): boolean {
@@ -733,23 +1755,131 @@ function isNativeSessionPlaceholder(rawSession: unknown): boolean {
   return !session || session === 'main' || session.startsWith('new-') || session.startsWith('agent:');
 }
 
-function getOwnedNativeSession(providerName: AgentProviderName, userId: string, rawSession: unknown) {
+function getOwnedNativeSession(
+  providerName: AgentProviderName,
+  userId: string,
+  rawSession: unknown,
+  executionContext?: AgentExecutionContext,
+  options?: { metadataOnly?: boolean },
+) {
   if (isNativeSessionPlaceholder(rawSession)) return null;
   const sessionId = typeof rawSession === 'string' ? rawSession.trim() : '';
   if (!sessionId) return null;
-  const session = loadNativeSession(providerName, sessionId);
+  let session = options?.metadataOnly
+    ? loadNativeSessionMetadata(providerName, sessionId)
+    : loadNativeSession(providerName, sessionId);
   if (!session || session.userId !== userId) return null;
+  if (executionContext) {
+    session = ensureNativeSessionExecutionContext(providerName, sessionId, executionContext);
+    if (!session) return null;
+    assertExecutionContextBinding(session.executionContext, userId, executionContext.scope);
+  }
   return session;
+}
+
+async function validatedNativeModelSelection(
+  providerName: AgentProviderName,
+  rawModel: unknown,
+): Promise<string> {
+  const normalized = normalizeRequestedModel(
+    providerName,
+    typeof rawModel === 'string' ? rawModel.trim() : '',
+  );
+  if (providerName === 'AGENT_ZERO') {
+    return (await validateAgentZeroOAuthModelSelection(normalized)).id;
+  }
+  return normalized;
+}
+
+interface NativeSessionForTurnInput {
+  provider: AgentProvider;
+  userId: string;
+  userEmail: string;
+  clientSession: string;
+  executionContext: AgentExecutionContext;
+  requestedModel: unknown;
+}
+
+async function resolveNativeSessionForTurn(input: NativeSessionForTurnInput): Promise<string> {
+  const providerName = input.provider.providerName;
+  const requestedText = typeof input.requestedModel === 'string'
+    ? input.requestedModel.trim()
+    : '';
+  const requested = requestedText
+    ? normalizeRequestedModel(providerName, requestedText)
+    : '';
+  const reusable = getOwnedNativeSession(
+    providerName,
+    input.userId,
+    input.clientSession,
+    input.executionContext,
+  );
+
+  if (!reusable) {
+    const initialModel = providerName === 'AGENT_ZERO'
+      ? await validatedNativeModelSelection(providerName, requested)
+      : requested || undefined;
+    return input.provider.startSession(input.userId, {
+      executionContext: input.executionContext,
+      model: initialModel,
+      metadata: { requestedBy: input.userEmail },
+    });
+  }
+
+  const capabilities = getProviderCapabilities(providerName);
+  if (capabilities?.modelSelectionMode === 'launch') {
+    const existingModel = normalizeRequestedModel(providerName, reusable.model || '');
+    if (requested && requested !== existingModel) {
+      return input.provider.startSession(input.userId, {
+        executionContext: input.executionContext,
+        model: requested,
+        metadata: {
+          requestedBy: input.userEmail,
+          replacedSessionId: reusable.sessionId,
+          replacementReason: 'launch-bound-model-change',
+        },
+      });
+    }
+    return reusable.sessionId;
+  }
+
+  if (providerName === 'AGENT_ZERO') {
+    // Revalidate and re-assert every reused context. This repairs sessions
+    // created by the old local-only switcher and prevents stale OAuth models
+    // from silently falling through to Agent Zero's global/OpenRouter default.
+    const selected = await validatedNativeModelSelection(
+      providerName,
+      requested || reusable.model || '',
+    );
+    await setNativeSessionModel(providerName, reusable.sessionId, selected);
+  } else if (requested) {
+    await setNativeSessionModel(providerName, reusable.sessionId, requested);
+  }
+  return reusable.sessionId;
 }
 
 function humanizeProviderError(providerName: AgentProviderName, rawMessage: string): string {
   const message = String(rawMessage || '').trim();
   if (!message) return 'The agent failed to respond.';
 
-  if (/not logged in|please run \/login/i.test(message)) {
-    return providerName === 'CLAUDE_CODE'
-      ? 'Claude Code is installed on the server but not logged in yet. Run /login in Claude Code, then try again.'
-      : 'This provider is installed on the server but not logged in yet. Complete CLI login, then try again.';
+  if (providerName === 'AGENT_ZERO') {
+    if (message.includes(AGENT_ZERO_MODEL_PROTOCOL_INCOMPATIBLE_MESSAGE)) {
+      return AGENT_ZERO_MODEL_PROTOCOL_INCOMPATIBLE_MESSAGE;
+    }
+    if (/^(?:Agent Zero (?:could not verify its official OAuth model catalog|did not advertise its complete official OAuth provider catalog|has no connected OAuth provider with selectable models)|Choose a model from a connected Agent Zero OAuth provider|The selected Agent Zero OAuth model is not available)/i.test(message)) {
+      return redactNativeProviderText(message, 2_048);
+    }
+    return safeAgentZeroErrorMessage(message);
+  }
+
+  if (/not logged in|not signed in|please run \/login|grok login/i.test(message)) {
+    if (providerName === 'CLAUDE_CODE') {
+      return 'Claude Code is installed on the server but not logged in yet. Run /login in Claude Code, then try again.';
+    }
+    if (providerName === 'GROK') {
+      return 'Grok Build is installed but not signed in on this server. Complete the native Grok device login in AI Setup, then try again. OpenClaw xAI auth is separate.';
+    }
+    return 'This provider is installed on the server but not logged in yet. Complete CLI login, then try again.';
   }
 
   if (/GEMINI_API_KEY|GOOGLE_GENAI_USE_VERTEXAI|GOOGLE_GENAI_USE_GCA|Auth method/i.test(message)) {
@@ -968,7 +2098,7 @@ function readMaintenanceHistoryMarkers(sessionKey: string, limit = 200): any[] {
   if (!existsSync(filePath)) return [];
 
   try {
-    const lines = readFileSync(filePath, 'utf8').split('\n').filter((line) => line.trim()).slice(-Math.max(limit * 2, limit));
+    const lines = readLastJsonlLines(filePath, Math.max(limit * 2, limit)).lines;
     return lines
       .map((line) => {
         try { return JSON.parse(line); } catch { return null; }
@@ -1029,10 +2159,6 @@ function normalizeGeminiModelId(rawModel: unknown): string | undefined {
   if (!normalized) return undefined;
   if (normalized.includes('/')) return normalized;
   return `${GEMINI_CLI_PROVIDER}/${normalized}`;
-}
-
-function resolveSessionRegistryEntry(sessionKey: string, sessionsDir = SESSIONS_DIR): any | null {
-  return resolveSessionRegistryEntries(sessionKey, sessionsDir)[0] || null;
 }
 
 function getSessionKeyLookupVariants(sessionKey: string): string[] {
@@ -1432,6 +2558,7 @@ type OpenClawActiveStreamSnapshot = {
   startedAt?: number;
   runId?: string | null;
   content?: string;
+  turnEvents?: RuntimeTurnEvent[];
   lastEventAt?: number;
   staleAfterMs?: number;
 };
@@ -1446,6 +2573,84 @@ function inactiveOpenClawSnapshot(
   safeToClear = inactiveReason === 'terminal' || inactiveReason === 'stale',
 ): OpenClawActiveStreamSnapshot {
   return { active: false, inactiveReason, safeToClear };
+}
+
+function browserSafeActiveStreamSnapshot(
+  providerName: AgentProviderName,
+  snapshot: OpenClawActiveStreamSnapshot,
+): OpenClawActiveStreamSnapshot {
+  if (providerName !== 'OPENCLAW' || !snapshot.active || !Array.isArray(snapshot.turnEvents)) {
+    return snapshot;
+  }
+  const activeRunId = normalizeHostStreamRunId(snapshot.runId);
+  return {
+    ...snapshot,
+    // A real terminal event cannot coexist with an active lane: terminal
+    // publication and settlement are synchronous. Exclude stale/preliminary
+    // terminal projections from browser hydration, and bind the remainder to
+    // the exact active run.
+    turnEvents: snapshot.turnEvents.filter((event) => {
+      if (event.terminal || event.type === 'turn_error' || event.type === 'assistant_final' || event.type === 'turn_done') {
+        return false;
+      }
+      return !activeRunId || !event.runId || event.runId === activeRunId;
+    }),
+  };
+}
+
+function getProviderOwnedBusStreamSnapshot(sessionKey: string): OpenClawActiveStreamSnapshot {
+  const info = streamEventBus.getStreamStatus(sessionKey);
+  if (!info) {
+    const tracked = streamEventBus.getTrackedStream(sessionKey);
+    return tracked?.active === false
+      ? inactiveOpenClawSnapshot('terminal', true)
+      : inactiveOpenClawSnapshot('unknown', false);
+  }
+
+  const capturedRunIdentity = captureHostStreamRunIdentity(sessionKey);
+
+  const lastEventAt = info.lastEventAt || info.startedAt;
+  const hasRunningTool = Array.isArray(info.toolCalls)
+    && info.toolCalls.some((toolCall) => toolCall?.status === 'running');
+  const staleAfterMs = info.phase === 'streaming'
+    ? OPENCLAW_STREAMING_STALE_CUTOFF_MS
+    : (hasRunningTool || info.phase === 'tool')
+      ? OPENCLAW_RUNNING_TOOL_STALE_CUTOFF_MS
+      : OPENCLAW_THINKING_STALE_CUTOFF_MS;
+  if (lastEventAt && Date.now() - lastEventAt > staleAfterMs) {
+    clearHostStreamIfCurrentRun(sessionKey, capturedRunIdentity);
+    return inactiveOpenClawSnapshot('stale', true);
+  }
+
+  // A tool/status event can move the phase away from `streaming` after visible
+  // text has already arrived. Keep that partial answer in the reconnect
+  // snapshot instead of making it disappear until the next text delta.
+  const content = streamEventBus.getLatestText(sessionKey) || info.latestText || '';
+  return {
+    active: true,
+    phase: info.phase,
+    toolName: info.toolName || null,
+    toolCalls: Array.isArray(info.toolCalls) ? info.toolCalls : [],
+    statusText: info.statusText || null,
+    provenance: info.provenance || null,
+    model: info.model || null,
+    compactionPhase: info.compactionPhase || 'idle',
+    startedAt: info.startedAt,
+    runId: info.runId || null,
+    content: content || undefined,
+    turnEvents: streamEventBus.getRecentTurnEvents(sessionKey, 100),
+    lastEventAt,
+    staleAfterMs,
+  };
+}
+
+async function getProviderActiveStreamSnapshot(
+  providerName: AgentProviderName,
+  sessionKey: string,
+): Promise<OpenClawActiveStreamSnapshot> {
+  if (providerName === 'OPENCLAW') return getOpenClawActiveStreamSnapshot(sessionKey);
+  if (providerUsesHostStreamBus(providerName)) return getProviderOwnedBusStreamSnapshot(sessionKey);
+  return inactiveOpenClawSnapshot('idle', true);
 }
 
 function getOpenClawRunIdFromSessionInfo(sess: any): string | null {
@@ -1518,7 +2723,13 @@ function getOpenClawRuntimeActiveStreamSnapshot(
       ? 'streaming'
       : 'thinking';
   const statusText = latest.type === 'assistant_status' && latest.text ? latest.text : null;
-  const content = latest.type === 'assistant_delta' && latest.text ? latest.text : undefined;
+  const activeRunEvents = events.filter((event) => (
+    latest.runId ? event.runId === latest.runId : !event.runId
+  ));
+  const reconstructedContent = activeRunEvents.reduce((text, event) => {
+    if (event.type !== 'assistant_delta' || !event.text) return text;
+    return event.replace === true ? event.text : `${text}${event.text}`;
+  }, '');
 
   return {
     active: true,
@@ -1540,7 +2751,8 @@ function getOpenClawRuntimeActiveStreamSnapshot(
     compactionPhase: 'idle',
     startedAt: latest.ts,
     runId: latest.runId || null,
-    content,
+    content: reconstructedContent || undefined,
+    turnEvents: activeRunEvents.slice(-100),
     lastEventAt: latest.ts,
     staleAfterMs: staleCutoffMs,
   };
@@ -1553,6 +2765,10 @@ async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<Open
 
   const info = streamEventBus.getStreamStatus(sessionKey);
   if (info) {
+    // Keep an immutable identity across gateway probes. StreamInfo is mutable,
+    // so retaining the object reference itself would not detect run replacement
+    // while getSessionInfo() is in flight.
+    const capturedRunIdentity = captureHostStreamRunIdentity(sessionKey);
     const lastEvent = info.lastEventAt || info.startedAt;
     const hasRunningTool = Array.isArray(info.toolCalls) && info.toolCalls.some((toolCall: any) => toolCall?.status === 'running');
     const staleCutoffMs = info.phase === 'streaming'
@@ -1563,7 +2779,7 @@ async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<Open
 
     if (lastEvent && (Date.now() - lastEvent) > staleCutoffMs) {
       debugLog(`[stream-status] StreamEventBus has entry but lastEvent=${new Date(lastEvent).toISOString()} exceeded cutoff=${staleCutoffMs}ms for phase=${info.phase} — clearing stale entry`);
-      streamEventBus.clearStream(sessionKey);
+      clearHostStreamIfCurrentRun(sessionKey, capturedRunIdentity);
     } else if (latestMarker?.role === 'assistant' && lastEvent && latestMarker.timestamp >= lastEvent - 30_000) {
       // A durable transcript assistant message at/after the live lane usually
       // means the turn finished and the bus entry leaked — but transcripts can
@@ -1580,30 +2796,22 @@ async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<Open
         // still bounds how long a genuinely dead entry can linger.
         gatewayLooksLive = true;
       }
+
+      // A different run may have replaced the captured one while the gateway
+      // probe awaited. Never clear or return the stale snapshot in that case.
+      const currentTracked = streamEventBus.getTrackedStream(sessionKey);
+      if (!hostStreamRunIdentityMatches(currentTracked, capturedRunIdentity)) {
+        return getProviderOwnedBusStreamSnapshot(sessionKey);
+      }
       if (!gatewayLooksLive) {
         debugLog(`[stream-status] StreamEventBus reports active, but durable assistant message at ${new Date(latestMarker.timestamp).toISOString()} and gateway reports no active run — reporting inactive`);
-        streamEventBus.clearStream(sessionKey);
+        clearHostStreamIfCurrentRun(sessionKey, capturedRunIdentity);
         return inactiveOpenClawSnapshot('terminal', true);
       }
       debugLog('[stream-status] Durable assistant marker near live lane but gateway confirms the run is live — still active');
-      return {
-        active: true,
-        phase: info.phase,
-        toolName: info.toolName || null,
-        toolCalls: Array.isArray(info.toolCalls) ? info.toolCalls : [],
-        statusText: info.statusText || null,
-        provenance: info.provenance || null,
-        model: info.model || null,
-        compactionPhase: info.compactionPhase || 'idle',
-        startedAt: info.startedAt,
-        runId: info.runId || null,
-        lastEventAt: lastEvent,
-        staleAfterMs: staleCutoffMs,
-      };
+      return getProviderOwnedBusStreamSnapshot(sessionKey);
     } else {
-      const content = info.phase === 'streaming'
-        ? (streamEventBus.getLatestText(sessionKey) || info.latestText || '')
-        : '';
+      const content = streamEventBus.getLatestText(sessionKey) || info.latestText || '';
       return {
         active: true,
         phase: info.phase,
@@ -1616,6 +2824,7 @@ async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<Open
         startedAt: info.startedAt,
         runId: info.runId || null,
         content: content || undefined,
+        turnEvents: streamEventBus.getRecentTurnEvents(sessionKey, 100),
         lastEventAt: lastEvent,
         staleAfterMs: staleCutoffMs,
       };
@@ -1627,6 +2836,9 @@ async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<Open
   // telling the browser the stream ended.
   try {
     const sessResult = await getSessionInfo(sessionKey);
+    if (streamEventBus.getTrackedStream(sessionKey)) {
+      return getProviderOwnedBusStreamSnapshot(sessionKey);
+    }
     if (sessResult.ok && sessResult.data) {
       const sess = sessResult.data;
       const chatState = normalizeOpenClawChatState(sess);
@@ -1671,6 +2883,13 @@ async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<Open
     // temporarily unavailable during the exact reconnect path we are trying to heal.
   }
 
+  // The bus was empty before the gateway probe, but a local run can begin while
+  // that RPC is in flight. Prefer the newly tracked lane over the older gateway
+  // or runtime-history candidate.
+  if (streamEventBus.getTrackedStream(sessionKey)) {
+    return getProviderOwnedBusStreamSnapshot(sessionKey);
+  }
+
   const runtimeSnapshot = getOpenClawRuntimeActiveStreamSnapshot(sessionKey, latestMarker);
   if (runtimeSnapshot) return runtimeSnapshot;
 
@@ -1710,8 +2929,44 @@ function mergeRuntimeText(current: string, incoming: string, replace?: boolean):
   return current + chunk;
 }
 
+function reconcileRuntimeCumulativeFinalTail(
+  graduatedText: readonly string[],
+  rawFinalContent: string,
+): string {
+  const finalContent = String(rawFinalContent || '');
+  const represented = graduatedText.filter((value) => String(value || '').trim());
+  if (!finalContent || represented.length === 0) return finalContent;
+
+  let cursor = 0;
+  let matched = 0;
+  for (const value of represented) {
+    const text = String(value || '');
+    const index = finalContent.indexOf(text, cursor);
+    if (index < 0 || finalContent.slice(cursor, index).trim()) {
+      matched = 0;
+      break;
+    }
+    cursor = index + text.length;
+    matched += 1;
+  }
+  if (matched === represented.length) {
+    return finalContent.slice(cursor).replace(/^\s+/, '');
+  }
+
+  const normalize = (value: string) => value.replace(/\s+/g, ' ').trim();
+  const representedComparable = normalize(represented.join(''));
+  const finalComparable = normalize(finalContent);
+  if (!representedComparable) return finalContent;
+  if (finalComparable === representedComparable) return '';
+  if (finalComparable.startsWith(`${representedComparable} `)) {
+    return finalComparable.slice(representedComparable.length).trimStart();
+  }
+  return finalContent;
+}
+
 type RuntimeHistorySegment = {
   text: string;
+  subject?: string;
   position: 'before' | 'after' | 'between';
   kind: 'thinking' | 'text';
   source?: 'status' | 'reasoning' | 'text';
@@ -1771,23 +3026,39 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
     let provenance: string | undefined;
     let lastTs = 0;
 
-    const appendSegment = (kind: 'thinking' | 'text', text: string, ts: number, replace?: boolean, source: RuntimeHistorySegment['source'] = kind === 'thinking' ? 'reasoning' : 'text') => {
+    const appendSegment = (
+      kind: 'thinking' | 'text',
+      text: string,
+      ts: number,
+      replace?: boolean,
+      source: RuntimeHistorySegment['source'] = kind === 'thinking' ? 'reasoning' : 'text',
+      rawSubject?: unknown,
+    ) => {
       const value = sanitizeHistoryText(text || '');
-      if (!value || isHiddenHistoryArtifactText(value)) return;
+      const subject = kind === 'thinking' ? sanitizeThinkingSubject(rawSubject) : '';
+      if ((!value && !subject) || (value && isHiddenHistoryArtifactText(value))) return;
       const last = timeline[timeline.length - 1];
-      if (last?.kind === 'segment' && last.segment.kind === kind && last.segment.source === source && last.segment.text === value) {
-        last.segment.ts = ts;
-        return;
-      }
-      if (replace && last?.kind === 'segment' && last.segment.kind === kind && last.segment.source === source) {
-        last.segment.text = value;
-        last.segment.ts = ts;
-        return;
+      if (last?.kind === 'segment' && last.segment.kind === kind && last.segment.source === source) {
+        if (
+          subject
+          && last.segment.subject !== subject
+          && (last.segment.text || last.segment.subject)
+        ) {
+          // A new provider preamble starts a distinct reasoning phase.
+        } else {
+          if (subject) last.segment.subject = subject;
+          last.segment.text = replace
+            ? value
+            : mergeRuntimeText(last.segment.text, value);
+          last.segment.ts = ts;
+          return;
+        }
       }
       timeline.push({
         kind: 'segment',
         segment: {
           text: value,
+          ...(subject ? { subject } : {}),
           position: 'before',
           kind,
           source,
@@ -1873,7 +3144,14 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
           appendSegment('thinking', event.text, event.ts, event.replace === true, 'status');
         }
       } else if (event.type === 'assistant_reasoning') {
-        appendSegment('thinking', event.text || '', event.ts, event.replace === true, 'reasoning');
+        appendSegment(
+          'thinking',
+          event.text || '',
+          event.ts,
+          event.replace === true,
+          'reasoning',
+          event.subject,
+        );
       } else if (event.type === 'tool_started' || event.type === 'tool_output') {
         flushPendingTextBeforeTool(event.ts);
         upsertTool(event);
@@ -1881,27 +3159,27 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
         finalText = mergeRuntimeText(finalText, event.text || '', event.replace === true);
         pendingTextTs = event.ts;
       } else if (event.type === 'assistant_final') {
-        finalText = mergeRuntimeText(finalText, event.text || '', event.replace === true);
+        const representedText = timeline
+          .filter((item): item is { kind: 'segment'; segment: RuntimeHistorySegment } => (
+            item.kind === 'segment'
+            && item.segment.kind === 'text'
+            && item.segment.source === 'text'
+          ))
+          .map((item) => item.segment.text);
+        const terminalTail = reconcileRuntimeCumulativeFinalTail(
+          representedText,
+          event.text || '',
+        );
+        finalText = mergeRuntimeText(finalText, terminalTail, event.replace === true);
       } else if (event.type === 'turn_error' && !finalText) {
         finalText = sanitizeHistoryText(event.text || '');
       }
     }
 
     const content = sanitizeHistoryText(finalText || '');
-    const normalizedContent = normalizeRuntimeHistoryMatchText(content);
     const segments = timeline
       .filter((item): item is { kind: 'segment'; segment: RuntimeHistorySegment } => item.kind === 'segment')
-      .map((item) => item.segment)
-      // A provider final that repeats the streamed text (rather than only the
-      // post-tool block) would render a flushed text segment twice.
-      .filter((segment) => {
-        if (segment.kind !== 'text' || segment.source !== 'text') return true;
-        const normalized = normalizeRuntimeHistoryMatchText(segment.text);
-        if (!normalized) return false;
-        if (normalized === normalizedContent) return false;
-        return !(normalized.length >= 12 && normalizedContent.includes(normalized));
-      })
-      .map((segment, index) => ({ ...segment, order: index }));
+      .map((item) => item.segment);
     const toolCalls = [...toolsByKey.values()].map((tool) => ({
       ...tool,
       status: tool.status === 'running' ? 'done' : tool.status,
@@ -1926,8 +3204,44 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
   });
 }
 
+function reconcileMergedRuntimeHistoryContent(existing: any, runtimeMessage: any): string {
+  const existingContent = typeof existing?.content === 'string' ? existing.content : '';
+  const runtimeContent = typeof runtimeMessage?.content === 'string' ? runtimeMessage.content : '';
+  const representedRuntimeText = (Array.isArray(runtimeMessage?.segments) ? runtimeMessage.segments : [])
+    .filter((segment: any) => segment?.kind === 'text' && typeof segment?.text === 'string')
+    .map((segment: any) => segment.text);
+  if (representedRuntimeText.length === 0) return existingContent;
+
+  const existingResidual = reconcileRuntimeCumulativeFinalTail(
+    representedRuntimeText,
+    existingContent,
+  );
+  return normalizeRuntimeHistoryMatchText(existingResidual)
+    === normalizeRuntimeHistoryMatchText(runtimeContent)
+    ? runtimeContent
+    : existingContent;
+}
+
 function mergeRuntimeTurnEventHistory(sessionKey: string, messages: any[], limit = 200): any[] {
-  const runtimeMessages = buildRuntimeHistoryMessages(readRuntimeTurnEvents(sessionKey, Math.max(limit * 250, 25000)));
+  const earliestMessageTs = messages.reduce((earliest, message) => {
+    const ts = toHistoryTimestampMs(message?.timestamp);
+    return Number.isFinite(ts) && ts > 0 ? Math.min(earliest, ts) : earliest;
+  }, Number.POSITIVE_INFINITY);
+  let eventLimit = Math.min(Math.max(limit * 4, 200), MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
+  let runtimeEvents: RuntimeTurnEvent[] = [];
+
+  while (true) {
+    runtimeEvents = readRuntimeTurnEvents(sessionKey, eventLimit);
+    const oldestEventTs = runtimeEvents[0]?.ts;
+    const reachedRelevantBoundary = !Number.isFinite(earliestMessageTs)
+      || !oldestEventTs
+      || oldestEventTs <= earliestMessageTs;
+    const exhaustedSource = runtimeEvents.length < eventLimit;
+    if (reachedRelevantBoundary || exhaustedSource || eventLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES) break;
+    eventLimit = Math.min(eventLimit * 2, MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
+  }
+
+  const runtimeMessages = buildRuntimeHistoryMessages(runtimeEvents);
   if (runtimeMessages.length === 0) return messages;
 
   const combined = messages.map((message) => ({ ...message }));
@@ -1969,6 +3283,7 @@ function mergeRuntimeTurnEventHistory(sessionKey: string, messages: any[], limit
       const mergedTools = mergeHistoryToolCalls(existingTools, runtimeTools);
       combined[matchIndex] = {
         ...existing,
+        content: reconcileMergedRuntimeHistoryContent(existing, runtimeMessage),
         model: existing.model || runtimeMessage.model,
         provenance: existing.provenance || runtimeMessage.provenance,
         segments: mergedSegments.length > 0 ? mergedSegments : existing.segments,
@@ -2026,42 +3341,77 @@ function isDuplicateToolOnlyAssistantHistoryMessage(message: any, index: number,
 
 function mergeHistorySegments(existing: any[] | undefined, incoming: any[]): any[] {
   const merged: any[] = [];
-  const seen = new Set<string>();
+  const indexes = new Map<string, number>();
   const add = (segment: any) => {
     if (!segment || typeof segment !== 'object') return;
     const text = typeof segment.text === 'string' ? segment.text.trim() : '';
-    if (!text) return;
     const kind = segment.kind === 'thinking' ? 'thinking' : 'text';
-    const key = `${kind}:${normalizeRuntimeHistoryMatchText(text)}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    merged.push({
+    const subject = kind === 'thinking' ? sanitizeThinkingSubject(segment.subject) : '';
+    if (!text && !subject) return;
+    const key = `${kind}:${subject}:${normalizeRuntimeHistoryMatchText(text)}`;
+    const normalized = {
       ...segment,
       text,
+      ...(subject ? { subject } : {}),
       kind,
       position: segment.position === 'after' || segment.position === 'between' ? segment.position : 'before',
-      order: merged.length,
-    });
+    };
+    const existingIndex = indexes.get(key);
+    if (existingIndex !== undefined) {
+      const current = merged[existingIndex];
+      merged[existingIndex] = {
+        ...current,
+        ...(
+          !(typeof current.order === 'number' && Number.isFinite(current.order))
+          && typeof normalized.order === 'number'
+          && Number.isFinite(normalized.order)
+            ? { order: normalized.order }
+            : {}
+        ),
+        ...(
+          !(typeof current.ts === 'number' && Number.isFinite(current.ts))
+          && typeof normalized.ts === 'number'
+          && Number.isFinite(normalized.ts)
+            ? { ts: normalized.ts }
+            : {}
+        ),
+      };
+      return;
+    }
+    indexes.set(key, merged.length);
+    merged.push(normalized);
   };
 
   for (const segment of Array.isArray(existing) ? existing : []) add(segment);
   for (const segment of incoming) add(segment);
 
   return merged
-    .sort((a, b) => {
-      const aTs = typeof a.ts === 'number' && Number.isFinite(a.ts) ? a.ts : Number.POSITIVE_INFINITY;
-      const bTs = typeof b.ts === 'number' && Number.isFinite(b.ts) ? b.ts : Number.POSITIVE_INFINITY;
-      if (Number.isFinite(aTs) && Number.isFinite(bTs) && aTs !== bTs) return aTs - bTs;
-      const aOrder = typeof a.order === 'number' && Number.isFinite(a.order) ? a.order : 0;
-      const bOrder = typeof b.order === 'number' && Number.isFinite(b.order) ? b.order : 0;
-      return aOrder - bOrder;
+    .map((segment, index) => ({ segment, index }))
+    .sort((left, right) => {
+      const leftOrder = typeof left.segment.order === 'number' && Number.isFinite(left.segment.order)
+        ? left.segment.order
+        : null;
+      const rightOrder = typeof right.segment.order === 'number' && Number.isFinite(right.segment.order)
+        ? right.segment.order
+        : null;
+      if (leftOrder != null && rightOrder != null && leftOrder !== rightOrder) {
+        return leftOrder - rightOrder;
+      }
+      const leftTs = typeof left.segment.ts === 'number' && Number.isFinite(left.segment.ts)
+        ? left.segment.ts
+        : null;
+      const rightTs = typeof right.segment.ts === 'number' && Number.isFinite(right.segment.ts)
+        ? right.segment.ts
+        : null;
+      if (leftTs != null && rightTs != null && leftTs !== rightTs) return leftTs - rightTs;
+      return left.index - right.index;
     })
-    .map((segment, index) => ({ ...segment, order: index }));
+    .map(({ segment }) => segment);
 }
 
 function mergeHistoryToolCalls(existing: any[] | undefined, incoming: any[]): any[] {
   const merged: any[] = [];
-  const seen = new Set<string>();
+  const indexes = new Map<string, number>();
   const add = (toolCall: any) => {
     if (!toolCall || typeof toolCall !== 'object') return;
     const id = typeof toolCall.id === 'string' ? toolCall.id.trim() : '';
@@ -2071,8 +3421,23 @@ function mergeHistoryToolCalls(existing: any[] | undefined, incoming: any[]): an
       typeof toolCall.endedAt === 'number' ? toolCall.endedAt : '',
     ].join(':');
     const key = id || fallbackKey;
-    if (key && seen.has(key)) return;
-    if (key) seen.add(key);
+    const existingIndex = key ? indexes.get(key) : undefined;
+    if (existingIndex !== undefined) {
+      const current = merged[existingIndex];
+      merged[existingIndex] = {
+        ...current,
+        arguments: current.arguments ?? toolCall.arguments,
+        result: current.result ?? toolCall.result,
+        startedAt: Number.isFinite(current.startedAt) ? current.startedAt : toolCall.startedAt,
+        endedAt: Number.isFinite(current.endedAt) ? current.endedAt : toolCall.endedAt,
+        order: Number.isFinite(current.order) ? current.order : toolCall.order,
+        status: current.status === 'done' || current.status === 'error'
+          ? current.status
+          : toolCall.status ?? current.status,
+      };
+      return;
+    }
+    if (key) indexes.set(key, merged.length);
     merged.push(toolCall);
   };
 
@@ -2115,12 +3480,15 @@ function collapseFragmentedToolOnlyAssistantHistory(messages: any[]): any[] {
     collapsed.push({
       ...last,
       id: `tool-history-${createHash('sha256')
-        .update(pendingToolOnly.map((message) => String(message?.id || message?.timestamp || '')).join('|'))
+        // The last durable fragment is invariant when a wider older page adds
+        // adjacent fragments to the front of this aggregate. Cursor identity
+        // must therefore derive from the tail, not from the whole window.
+        .update(String(last?.id || last?.timestamp || ''))
         .digest('hex')
         .slice(0, 24)}`,
       role: 'assistant',
       content: '',
-      timestamp: first?.timestamp || last?.timestamp,
+      timestamp: last?.timestamp || first?.timestamp,
       toolCalls: mergeHistoryToolCalls(undefined, toolCalls),
     });
     pendingToolOnly = [];
@@ -2151,43 +3519,59 @@ function collapseFragmentedToolOnlyAssistantHistory(messages: any[]): any[] {
 }
 
 function finalizeEnhancedHistoryMessages(sessionKey: string, messages: any[], limit = 200): any[] {
-  const mergeLimit = Math.max(limit * 250, 25000);
   return collapseFragmentedToolOnlyAssistantHistory(mergeRuntimeTurnEventHistory(
     sessionKey,
-    mergeMaintenanceHistoryMarkers(sessionKey, messages, mergeLimit),
+    mergeMaintenanceHistoryMarkers(sessionKey, messages, Math.max(limit * 2, 200)),
     limit,
   ));
 }
 
 function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
-  const readLimit = Math.max(limit * 250, 25000);
-  const localMessages = readBestOpenClawSessionMessagesForSessionKey(sessionKey, readLimit, sessionsDir);
-
+  // Transcript rows are sparse among tool plumbing and control artifacts, so
+  // start with a modest enrichment window and let the lower-level tail reader
+  // grow only when filtering proves that more raw lines are actually needed.
   const geminiCliSessionIds = resolveSessionRegistryEntries(sessionKey, sessionsDir)
     .map((entry) => resolveGeminiCliBindingSessionId(entry))
     .filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
-  if (geminiCliSessionIds.length === 0) return finalizeEnhancedHistoryMessages(sessionKey, localMessages, limit);
+  let readLimit = Math.min(Math.max(limit * 3, 200), MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
 
-  const importedMessages = geminiCliSessionIds
-    .flatMap((cliSessionId) => readGeminiCliImportedMessages(cliSessionId, readLimit))
-    .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp))
-    .slice(-Math.max(readLimit, 1));
-  if (importedMessages.length === 0) return finalizeEnhancedHistoryMessages(sessionKey, localMessages, limit);
+  while (true) {
+    const localMessages = readBestOpenClawSessionMessagesForSessionKey(sessionKey, readLimit, sessionsDir);
+    const importedMessages = geminiCliSessionIds
+      .flatMap((cliSessionId) => readGeminiCliImportedMessages(cliSessionId, readLimit))
+      .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp))
+      .slice(-Math.max(readLimit, 1));
 
-  const localLatestTimestamp = getLatestMeaningfulConversationTimestamp(localMessages);
-  if (!hasMeaningfulConversationTurns(localMessages) || !localLatestTimestamp) {
-    const combined = [...localMessages, ...importedMessages]
-      .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
-    return finalizeEnhancedHistoryMessages(sessionKey, combined.slice(-Math.max(readLimit, 1)), limit);
+    let combined = localMessages;
+    if (importedMessages.length > 0) {
+      const localLatestTimestamp = getLatestMeaningfulConversationTimestamp(localMessages);
+      if (!hasMeaningfulConversationTurns(localMessages) || !localLatestTimestamp) {
+        combined = [...localMessages, ...importedMessages]
+          .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
+      } else {
+        const importedTail = importedMessages.filter((message) => toHistoryTimestampMs(message?.timestamp) > localLatestTimestamp);
+        if (importedTail.length > 0) {
+          combined = [...localMessages, ...importedTail]
+            .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
+        }
+      }
+    }
+
+    const finalized = finalizeEnhancedHistoryMessages(
+      sessionKey,
+      combined.slice(-Math.max(readLimit, 1)),
+      limit,
+    );
+    const sourceFilledWindow = localMessages.length >= readLimit || importedMessages.length >= readLimit;
+    if (
+      finalized.length >= limit
+      || !sourceFilledWindow
+      || readLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES
+    ) {
+      return finalized;
+    }
+    readLimit = Math.min(readLimit * 2, MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
   }
-
-  const importedTail = importedMessages.filter((message) => toHistoryTimestampMs(message?.timestamp) > localLatestTimestamp);
-  if (importedTail.length === 0) return finalizeEnhancedHistoryMessages(sessionKey, localMessages, limit);
-
-  const combined = [...localMessages, ...importedTail]
-    .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
-
-  return finalizeEnhancedHistoryMessages(sessionKey, combined.slice(-Math.max(readLimit, 1)), limit);
 }
 
 async function recoverRecentOpenClawAssistantReply(
@@ -2234,39 +3618,13 @@ async function recoverRecentOpenClawAssistantReply(
   return null;
 }
 
-function summarizeSessionLabelFromMessages(params: { sessionKey: string; sessionId: string; messages: any[] }) {
-  const { sessionKey, sessionId, messages } = params;
-  const fallbackTitle = humanizeSessionKey(sessionKey, sessionId);
-
-  let firstUserText = '';
-  let firstUserRawText = '';
-  let assistantPreview = '';
-
-  for (const message of messages) {
-    if (!message || typeof message !== 'object') continue;
-    const role = typeof message.role === 'string' ? message.role : '';
-    const rawText = typeof message.content === 'string' ? message.content : extractText(message.content);
-    const text = sanitizeHistoryText(rawText).replace(/\s+/g, ' ').trim();
-    if (!text && !rawText) continue;
-    if (!firstUserText && role === 'user') {
-      firstUserText = text;
-      firstUserRawText = rawText;
-    }
-    if (!assistantPreview && role === 'assistant' && text && !/^Model set to /i.test(text)) assistantPreview = text;
-    if (firstUserText && assistantPreview) break;
-  }
-
-  const senderLabel = extractSenderLabel(firstUserRawText);
-  const cleanedPrompt = cleanSessionTitleCandidate(firstUserText);
-  const titleSource = cleanedPrompt || senderLabel || fallbackTitle;
-
-  return {
-    title: titleSource.length > 72 ? `${titleSource.slice(0, 69).trimEnd()}…` : titleSource,
-    preview: assistantPreview
-      ? (assistantPreview.length > 120 ? `${assistantPreview.slice(0, 117).trimEnd()}…` : assistantPreview)
-      : undefined,
-    isMainSession: sessionKey === 'agent:main:main' || sessionId === 'main',
-  };
+function shouldAttemptOpenClawReplyRecovery(
+  providerName: AgentProviderName,
+  pendingError: string | null,
+  requestedModel: unknown,
+): boolean {
+  return providerName === 'OPENCLAW'
+    && Boolean(pendingError || (typeof requestedModel === 'string' && requestedModel.trim()));
 }
 
 function isHiddenHistoryArtifactText(text: string): boolean {
@@ -2400,122 +3758,6 @@ function summarizeHiddenHistoryArtifactText(text: string): string | null {
   return null;
 }
 
-function humanizeSessionKey(sessionKey: string, sessionId: string): string {
-  if (sessionKey === 'agent:main:main' || sessionId === 'main') return 'Main session';
-
-  const parts = sessionKey.split(':');
-  const slug = parts.slice(2).join(':') || sessionId;
-  const normalized = slug.replace(/^portal-[a-f0-9]{8}-/i, '');
-
-  const newSessionMatch = normalized.match(/^(?:portal-)?new-(\d{13,})$/i);
-  if (newSessionMatch) {
-    const timestamp = Number(newSessionMatch[1]);
-    const date = new Date(timestamp);
-    if (!Number.isNaN(date.getTime())) {
-      return `New chat · ${date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}`;
-    }
-    return 'New chat';
-  }
-
-  if (/^blip-analysis(?:-\d+)?$/i.test(normalized)) {
-    return normalized.replace(/-/g, ' ');
-  }
-
-  if (/^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(normalized)
-      && !/^openai$/i.test(normalized)
-      && !/^portal-\d+$/i.test(slug)
-      && !/^[a-f0-9-]{24,}$/i.test(normalized)) {
-    return normalized.replace(/[-_]+/g, ' ');
-  }
-
-  return `Session ${sessionId.slice(0, 8)}`;
-}
-
-function extractSenderLabel(text: string): string {
-  if (!text || !text.includes('Sender (untrusted metadata)')) return '';
-  const match = text.match(/```json\s*([\s\S]*?)\s*```/i);
-  if (!match) return '';
-  try {
-    const parsed = JSON.parse(match[1]);
-    const candidates = [parsed?.label, parsed?.name, parsed?.username, parsed?.id]
-      .map((value) => typeof value === 'string' ? value.trim() : '')
-      .filter(Boolean);
-    return candidates[0] || '';
-  } catch {
-    return '';
-  }
-}
-
-function cleanSessionTitleCandidate(text: string): string {
-  return text
-    .replace(/^System:\s*/i, '')
-    .replace(/^\[[^\]]+\]\s*/, '')
-    .replace(/^A new session was started.*$/i, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function isUsableSessionTitle(title: string): boolean {
-  if (!title) return false;
-  // Long prompts are still useful session labels once truncated by the caller.
-  // Rejecting them here made real portal-created chats fall back to
-  // "New chat · date/time", which is exactly the multitasking-hostile case.
-  if (/^you are\s/i.test(title)) return false;
-  if (/^system:/i.test(title)) return false;
-  if (/^sender\s*\(/i.test(title)) return false;
-  if (/^conversation info\s*\(/i.test(title)) return false;
-  return true;
-}
-
-function summarizeSessionLabel(params: { sessionKey: string; sessionId: string; lines: string[] }) {
-  const { sessionKey, sessionId, lines } = params;
-  const fallbackTitle = humanizeSessionKey(sessionKey, sessionId);
-
-  let firstUserText = '';
-  let firstUserRawText = '';
-  let assistantPreview = '';
-
-  for (const line of lines) {
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type !== 'message' || !entry.message) continue;
-      const role = entry.message.role as string;
-      const rawText = typeof entry.message.content === 'string'
-        ? entry.message.content
-        : Array.isArray(entry.message.content)
-          ? entry.message.content.filter((c: any) => c.type === 'text').map((c: any) => c.text || '').join('\n')
-          : '';
-      const text = extractText(entry.message.content)
-        .replace(/\s+/g, ' ')
-        .trim();
-      if (!text && !rawText) continue;
-      if (!firstUserText && role === 'user') {
-        firstUserText = text;
-        firstUserRawText = rawText;
-      }
-      if (!assistantPreview && role === 'assistant' && text) assistantPreview = text;
-      if (firstUserText && assistantPreview) break;
-    } catch {
-      // ignore malformed lines
-    }
-  }
-
-  const senderLabel = extractSenderLabel(firstUserRawText);
-  const cleanedPrompt = cleanSessionTitleCandidate(firstUserText);
-
-  const titleSource = isUsableSessionTitle(cleanedPrompt)
-    ? cleanedPrompt
-    : senderLabel || fallbackTitle;
-
-  return {
-    title: titleSource.length > 72 ? `${titleSource.slice(0, 69).trimEnd()}…` : titleSource,
-    preview: assistantPreview
-      ? (assistantPreview.length > 120 ? `${assistantPreview.slice(0, 117).trimEnd()}…` : assistantPreview)
-      : undefined,
-    isMainSession: sessionKey === 'agent:main:main' || sessionId === 'main',
-  };
-}
-
 function summarizeTaskText(raw: unknown, max = 220): string | null {
   const text = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : '';
   if (!text) return null;
@@ -2541,61 +3783,6 @@ function pickTaskPromptCandidate(session: any): string | null {
       ?? session?.summary,
     240,
   );
-}
-
-function extractTaskHistorySummary(messages: any[]): string | null {
-  if (!Array.isArray(messages) || messages.length === 0) return null;
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const msg = messages[i];
-    if (!msg || msg.role === 'user') continue;
-    const text = summarizeTaskText(extractText(msg.content));
-    if (text) return text;
-  }
-  return null;
-}
-
-function extractTaskHistoryInsights(messages: any[]): { prompt: string | null; summary: string | null; detail: string | null; error: string | null } {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return { prompt: null, summary: null, detail: null, error: null };
-  }
-
-  let prompt: string | null = null;
-  let latestAssistant: string | null = null;
-  let latestNonUser: string | null = null;
-  let error: string | null = null;
-
-  for (const msg of messages) {
-    if (!msg) continue;
-    const text = extractText(msg.content);
-    const summaryText = summarizeTaskText(text, 260);
-    const detailText = summarizeTaskText(text, 900);
-    if (!summaryText && !detailText) continue;
-
-    const role = typeof msg.role === 'string' ? msg.role : '';
-    if (!prompt && role === 'user' && summaryText) {
-      prompt = summaryText;
-      continue;
-    }
-
-    if (role === 'assistant' && summaryText) {
-      latestAssistant = summaryText;
-    }
-
-    if (role !== 'user' && detailText) {
-      latestNonUser = detailText;
-    }
-
-    if (!error && /\b(error|failed|exception)\b/i.test(detailText || '')) {
-      error = summarizeTaskText(detailText, 320);
-    }
-  }
-
-  return {
-    prompt,
-    summary: latestAssistant ?? latestNonUser,
-    detail: latestNonUser,
-    error,
-  };
 }
 
 function readLastJsonlLines(filePath: string, maxLines: number): { lines: string[]; hitStart: boolean } {
@@ -2632,39 +3819,6 @@ function readLastJsonlLines(filePath: string, maxLines: number): { lines: string
   return { lines: lines.slice(-maxLines), hitStart };
 }
 
-function readFirstJsonlLines(filePath: string, maxLines: number, maxBytes = 256 * 1024): string[] {
-  if (!existsSync(filePath) || maxLines <= 0 || maxBytes <= 0) return [];
-
-  const stat = statSync(filePath);
-  if (!stat.size) return [];
-
-  const fd = openSync(filePath, 'r');
-  const buffer = Buffer.allocUnsafe(Math.min(stat.size, maxBytes));
-  let bytesRead = 0;
-  try {
-    bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
-  } finally {
-    closeSync(fd);
-  }
-
-  if (bytesRead <= 0) return [];
-  return buffer
-    .subarray(0, bytesRead)
-    .toString('utf-8')
-    .split('\n')
-    .filter((line) => line.trim())
-    .slice(0, maxLines);
-}
-
-function deriveSessionLabelFromSessionFile(sessionKey: string, sessionId: string, sessionsDir = SESSIONS_DIR): { title?: string; preview?: string; isMainSession?: boolean } | null {
-  const filePath = path.join(sessionsDir, `${sessionId}.jsonl`);
-  const lines = readFirstJsonlLines(filePath, 80);
-  if (!lines.length) return null;
-  const summary = summarizeSessionLabel({ sessionKey, sessionId, lines });
-  if (!summary?.title || !isUsableSessionTitle(summary.title)) return null;
-  return summary;
-}
-
 function readRecentSessionMessages<T>(params: {
   sessionId: string;
   limit: number;
@@ -2684,17 +3838,6 @@ function readRecentSessionMessages<T>(params: {
 
   const filePath = path.join(sessionsDir, `${sessionId}.jsonl`);
   if (!existsSync(filePath) || limit <= 0) return [];
-
-  const fileSize = statSync(filePath).size;
-  if (fileSize <= 2 * 1024 * 1024) {
-    const allLines = readFileSync(filePath, 'utf-8').split('\n').filter((line) => line.trim());
-    const parsed: T[] = [];
-    for (const line of allLines) {
-      const message = parseLine(line);
-      if (message) parsed.push(message);
-    }
-    return parsed.slice(-limit);
-  }
 
   const rawWindowFloor = Math.max(limit, minRawLineWindow);
   let rawLineWindow = Math.max(rawWindowFloor, limit * growthFactor);
@@ -2758,14 +3901,25 @@ async function readSessionMessages(sessionId: string, limit = 100, sessionsDir =
 // private; export only the behavior the /api/gateway/history legacy path uses.
 export const __gatewayHistoryTest = {
   readSessionMessages,
+  readRecentSessionMessages,
   readSessionMessagesEnhanced,
   readSessionMessagesEnhancedForSessionKey,
+  buildHistoryPage,
+  decodeHistoryCursor,
+  historyCursorScope,
+  parseHistoryLimit,
+  readNativeHistoryPage,
+  readAgentZeroHistoryPage,
+  readBoundedJsonlTailText,
+  mergeHistorySegments,
   mergeHistoryToolCalls,
   readBestOpenClawSessionMessagesForSessionKey,
   getOpenClawRuntimeActiveStreamSnapshot,
   getOpenClawActiveStreamSnapshot,
   buildRuntimeHistoryMessages,
   mergeRuntimeText,
+  reconcileRuntimeCumulativeFinalTail,
+  reconcileMergedRuntimeHistoryContent,
   getLatestMeaningfulConversationMarker,
 };
 
@@ -3143,6 +4297,49 @@ type TrajectoryFileIndexEntry = {
 };
 const trajectoryFileIndexCache = new Map<string, TrajectoryFileIndexEntry>();
 const TRAJECTORY_SESSION_KEY_RE = /"sessionKey"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+// Trajectory files are a best-effort recovery source, not the canonical
+// transcript. Long-running agents can grow them to hundreds of megabytes, so
+// opening a chat must never synchronously deserialize their lifetime contents.
+// Keep recovery bounded to recent complete JSONL records; canonical session
+// history remains responsible for older pages and complete export.
+const MAX_TRAJECTORY_RECOVERY_BYTES = 8 * 1024 * 1024;
+const MAX_TRAJECTORY_RECOVERY_FILES = 24;
+
+function readBoundedJsonlTailText(filePath: string, maxBytes = MAX_TRAJECTORY_RECOVERY_BYTES): string {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) return '';
+  let stat: ReturnType<typeof statSync>;
+  try {
+    stat = statSync(filePath);
+  } catch {
+    return '';
+  }
+  if (!stat.isFile() || stat.size <= 0) return '';
+
+  const length = Math.min(stat.size, maxBytes);
+  const start = stat.size - length;
+  const fd = openSync(filePath, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(length);
+    const bytesRead = readSync(fd, buffer, 0, length, start);
+    if (bytesRead <= 0) return '';
+    let text = buffer.subarray(0, bytesRead).toString('utf8');
+    // A bounded tail can begin in the middle of a JSON record. Discard that
+    // fragment rather than feeding malformed or attacker-shaped bytes to the
+    // parser. The final record is retained only when newline-terminated.
+    if (start > 0) {
+      const firstNewline = text.indexOf('\n');
+      if (firstNewline < 0) return '';
+      text = text.slice(firstNewline + 1);
+    }
+    if (!text.endsWith('\n')) {
+      const lastNewline = text.lastIndexOf('\n');
+      text = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : '';
+    }
+    return text;
+  } finally {
+    closeSync(fd);
+  }
+}
 
 function getTrajectoryFileIndex(filePath: string): TrajectoryFileIndexEntry | null {
   let stat: ReturnType<typeof statSync>;
@@ -3156,10 +4353,8 @@ function getTrajectoryFileIndex(filePath: string): TrajectoryFileIndexEntry | nu
   const cached = trajectoryFileIndexCache.get(filePath);
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached;
 
-  let raw = '';
-  try {
-    raw = readFileSync(filePath, 'utf-8');
-  } catch {
+  const raw = readBoundedJsonlTailText(filePath);
+  if (!raw) {
     trajectoryFileIndexCache.delete(filePath);
     return null;
   }
@@ -3188,10 +4383,22 @@ function listTrajectoryFilesForSessionVariants(variants: Set<string>, sessionsDi
     return [];
   }
 
+  const recentFiles = entries
+    .filter((entry) => entry.isFile?.() && entry.name.endsWith('.trajectory.jsonl'))
+    .map((entry) => {
+      const filePath = path.join(sessionsDir, entry.name);
+      try {
+        return { filePath, mtimeMs: statSync(filePath).mtimeMs };
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry): entry is { filePath: string; mtimeMs: number } => Boolean(entry))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, MAX_TRAJECTORY_RECOVERY_FILES);
+
   const matching: string[] = [];
-  for (const entry of entries) {
-    if (!entry.isFile?.() || !entry.name.endsWith('.trajectory.jsonl')) continue;
-    const filePath = path.join(sessionsDir, entry.name);
+  for (const { filePath } of recentFiles) {
     const index = getTrajectoryFileIndex(filePath);
     if (!index) continue;
     for (const variant of variants) {
@@ -3243,10 +4450,8 @@ function readTrajectoryFileExtraction(filePath: string, sessionKey: string, vari
     };
   }
 
-  let raw = '';
-  try {
-    raw = readFileSync(filePath, 'utf-8');
-  } catch {
+  const raw = readBoundedJsonlTailText(filePath);
+  if (!raw) {
     trajectoryParsedCache.delete(filePath);
     return null;
   }
@@ -3520,13 +4725,376 @@ function readBestOpenClawSessionMessagesForSessionKey(sessionKey: string, limit 
   return stripMessageDeliveryArtifactsFromHistory(combined).slice(-Math.max(limit, 1));
 }
 
+async function readOpenClawHistoryPage(params: {
+  sessionKey: string;
+  sessionId: string;
+  sessionsDir: string;
+  enhanced: boolean;
+  limit: number;
+  scope: string;
+  beforeCursor?: unknown;
+}): Promise<HistoryPageResult> {
+  const anchor = params.beforeCursor
+    ? decodeHistoryCursor(params.beforeCursor, params.scope)
+    : undefined;
+  let scanLimit = anchor
+    ? Math.min(Math.max(params.limit * 2 + 1, 200), MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES)
+    : params.limit + 1;
+
+  while (true) {
+    const messages = params.enhanced
+      ? readSessionMessagesEnhancedForSessionKey(params.sessionKey, scanLimit, params.sessionsDir)
+      : await readSessionMessages(params.sessionId, scanLimit, params.sessionsDir);
+    const sourceComplete = messages.length < scanLimit;
+
+    if (!anchor) {
+      return buildHistoryPage(messages, params.limit, params.scope, undefined, sourceComplete);
+    }
+
+    const anchorIndex = findHistoryAnchorIndex(messages, anchor);
+    if (anchorIndex >= 0 && (anchorIndex > params.limit || sourceComplete)) {
+      return buildHistoryPage(messages, params.limit, params.scope, anchor, sourceComplete);
+    }
+
+    if (sourceComplete) {
+      throw new HistoryCursorError('History cursor is no longer available');
+    }
+    if (scanLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES) {
+      throw new HistoryCursorError('History cursor is outside the retained pagination window');
+    }
+    scanLimit = Math.min(scanLimit * 2, MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
+  }
+}
+
 const PROVENANCE: Record<string, string> = {
   OPENCLAW: 'via OpenClaw',
   CLAUDE_CODE: 'via Claude CLI',
   CODEX: 'via Codex CLI',
+  GROK: 'via Grok Build CLI',
   GEMINI: 'via Antigravity',
   AGENT_ZERO: 'via Agent Zero',
 };
+
+// These providers publish HOST_OPERATOR turns into StreamEventBus themselves.
+// Their browser transport must consume that bus and leave the legacy callback
+// arguments as no-ops, otherwise every chunk/status/tool/terminal event is sent
+// twice (once by the callback and once by the bus/global reconnect path).
+const PROVIDER_OWNED_HOST_STREAMS = new Set<AgentProviderName>([
+  'OPENCLAW',
+  'CLAUDE_CODE',
+  'CODEX',
+  'GEMINI',
+]);
+
+function providerPublishesHostStream(providerName: AgentProviderName): boolean {
+  return PROVIDER_OWNED_HOST_STREAMS.has(providerName);
+}
+
+function providerUsesHostStreamBus(providerName: AgentProviderName): boolean {
+  return providerName === 'OPENCLAW'
+    || providerName === 'CLAUDE_CODE'
+    || providerName === 'CODEX'
+    || providerName === 'GROK'
+    || providerName === 'AGENT_ZERO'
+    || providerName === 'GEMINI'
+    || providerName === 'OLLAMA';
+}
+
+function reserveHostStreamRoute(params: {
+  sessionId: string;
+  runId: string;
+  provenance: string;
+  model?: string;
+}): boolean {
+  const existing = streamEventBus.getTrackedStream(params.sessionId);
+  const existingRunId = normalizeHostStreamRunId(existing?.runId);
+  if (existing && !existing.active && existingRunId && existingRunId !== params.runId) {
+    const adopted = streamEventBus.adoptStreamRun(
+      params.sessionId,
+      existingRunId,
+      params.runId,
+      { provenance: params.provenance, model: params.model },
+    );
+    return adopted && streamEventBus.resumeStream(params.sessionId, params.runId, {
+      provenance: params.provenance,
+      model: params.model,
+    });
+  }
+  return streamEventBus.startStream(params.sessionId, params.runId, {
+    provenance: params.provenance,
+    model: params.model,
+  });
+}
+
+function reserveDirectGatewayChatRun(sessionId: string, reservationRunId: string): boolean {
+  if (!reserveHostStreamRoute({
+    sessionId,
+    runId: reservationRunId,
+    provenance: 'via OpenClaw',
+  })) return false;
+  if (reserveLogicalRun(sessionId, reservationRunId)) return true;
+  streamEventBus.clearStream(sessionId, reservationRunId);
+  return false;
+}
+
+function acknowledgeDirectGatewayChatRun(
+  sessionId: string,
+  reservationRunId: string,
+  upstreamRunId: string,
+): boolean {
+  return acknowledgeRunReservation(sessionId, reservationRunId, upstreamRunId);
+}
+
+function failDirectGatewayChatRun(sessionId: string, reservationRunId: string): void {
+  failPendingRunReservation(sessionId, reservationRunId);
+}
+
+function scheduleDirectGatewayChatRunTimeout(
+  sessionId: string,
+  reservationRunId: string,
+  onExpire: () => void,
+): ReturnType<typeof setTimeout> {
+  return setTimeout(() => {
+    failDirectGatewayChatRun(sessionId, reservationRunId);
+    onExpire();
+  }, DIRECT_GATEWAY_CHAT_SEND_TIMEOUT_MS);
+}
+
+function createHostStreamRunMatcher(
+  providerName: AgentProviderName,
+  routeRunId: string,
+  options?: { openClawRunIdKnown?: boolean },
+): { matches: (event: StreamEvent) => boolean; currentRunId: () => string } {
+  let observedRunId = providerName === 'OPENCLAW' && options?.openClawRunIdKnown !== true
+    ? ''
+    : routeRunId;
+  return {
+    matches: (event: StreamEvent) => {
+      const eventRunId = typeof event.runId === 'string' ? event.runId.trim() : '';
+      if (!eventRunId) return true;
+      if (!observedRunId) observedRunId = eventRunId;
+      if (providerName === 'OPENCLAW' && event.type === 'run_resumed' && eventRunId !== observedRunId) {
+        observedRunId = eventRunId;
+        return true;
+      }
+      return eventRunId === observedRunId;
+    },
+    currentRunId: () => observedRunId || routeRunId,
+  };
+}
+
+function softClearHostStreamIfCurrent(sessionId: string, runId: string): void {
+  streamEventBus.softClearStream(sessionId, runId);
+}
+
+type HostStreamRunIdentity = {
+  runId: string | null;
+  startedAt: number | null;
+};
+
+function normalizeHostStreamRunId(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function captureHostStreamRunIdentity(
+  sessionId: string,
+  requestedRunId?: unknown,
+): HostStreamRunIdentity {
+  const tracked = streamEventBus.getTrackedStream(sessionId);
+  const explicitRunId = normalizeHostStreamRunId(requestedRunId);
+  const trackedRunId = normalizeHostStreamRunId(tracked?.runId);
+  return {
+    runId: explicitRunId || trackedRunId,
+    // A caller-supplied run ID that does not match the locally tracked run is
+    // intentionally not allowed to borrow that run's timestamp as a fallback.
+    startedAt: explicitRunId && trackedRunId !== explicitRunId
+      ? null
+      : (typeof tracked?.startedAt === 'number' ? tracked.startedAt : null),
+  };
+}
+
+function hostStreamRunIdentityMatches(
+  tracked: StreamInfo | null,
+  identity: HostStreamRunIdentity,
+): boolean {
+  if (!tracked) return false;
+  const trackedRunId = normalizeHostStreamRunId(tracked.runId);
+  if (identity.runId) return trackedRunId === identity.runId;
+  return identity.startedAt !== null
+    && trackedRunId === null
+    && tracked.startedAt === identity.startedAt;
+}
+
+/**
+ * Hard-clear only the logical run captured before an asynchronous operation.
+ * A false result means a replacement run is now active and must be preserved.
+ */
+function clearHostStreamIfCurrentRun(
+  sessionId: string,
+  identity: HostStreamRunIdentity,
+): boolean {
+  const tracked = streamEventBus.getTrackedStream(sessionId);
+  if (!tracked) return true;
+  if (!hostStreamRunIdentityMatches(tracked, identity)) return false;
+  return streamEventBus.clearStream(sessionId, identity.runId);
+}
+
+const activeSseDeliveries = new Map<string, () => void>();
+
+function normalizeStreamClientId(value: unknown): string | null {
+  const normalized = typeof value === 'string' ? value.trim() : '';
+  return /^[A-Za-z0-9_-]{16,128}$/.test(normalized) ? normalized : null;
+}
+
+function sseDeliveryKey(userId: string, sessionId: string, streamClientId: string): string {
+  return `${userId}\0${sessionId}\0${streamClientId}`;
+}
+
+function registerSseDelivery(
+  userId: string,
+  sessionId: string,
+  rawStreamClientId: unknown,
+  cleanup: () => void,
+): () => void {
+  const streamClientId = normalizeStreamClientId(rawStreamClientId);
+  if (!streamClientId) return () => {};
+  const key = sseDeliveryKey(userId, sessionId, streamClientId);
+  activeSseDeliveries.get(key)?.();
+  activeSseDeliveries.set(key, cleanup);
+  return () => {
+    if (activeSseDeliveries.get(key) === cleanup) activeSseDeliveries.delete(key);
+  };
+}
+
+function takeOverSseDelivery(userId: string, sessionId: string, rawStreamClientId: unknown): boolean {
+  const streamClientId = normalizeStreamClientId(rawStreamClientId);
+  if (!streamClientId) return false;
+  const key = sseDeliveryKey(userId, sessionId, streamClientId);
+  const cleanup = activeSseDeliveries.get(key);
+  if (!cleanup) return false;
+  activeSseDeliveries.delete(key);
+  cleanup();
+  return true;
+}
+
+const HOST_STREAM_EVENT_TYPES = new Set<StreamEvent['type']>([
+  'text',
+  'thinking',
+  'tool_start',
+  'tool_update',
+  'tool_end',
+  'tool_used',
+  'status',
+  'done',
+  'error',
+  'exec_approval',
+  'segment_break',
+  'compaction_start',
+  'compaction_end',
+  'run_resumed',
+]);
+
+function sanitizeRouteOwnedHostStreamEvent(
+  rawEvent: { type?: string; content?: string; [key: string]: unknown },
+  runId: string,
+): StreamEvent {
+  const rawType = typeof rawEvent?.type === 'string' ? rawEvent.type.trim() : '';
+  let type = HOST_STREAM_EVENT_TYPES.has(rawType as StreamEvent['type'])
+    ? rawType as StreamEvent['type']
+    : 'status';
+  const sanitized = sanitizeNativeProviderEvent(rawEvent || {}) as Record<string, unknown>;
+
+  // Route-owned providers settle through their sendMessage Promise. A
+  // callback-level diagnostic named "error" can be followed by a successful
+  // completion, so it is nonterminal unless the provider explicitly proves
+  // otherwise.
+  if (type === 'error' && rawEvent.terminal !== true) {
+    type = 'status';
+    sanitized.severity = 'error';
+    sanitized.terminal = false;
+  }
+
+  // Text events are primary assistant output, not diagnostics. Preserve their
+  // exact content while still sanitizing every attached metadata field.
+  if (type === 'text' && typeof rawEvent?.content === 'string') {
+    sanitized.content = rawEvent.content;
+  }
+
+  return {
+    ...sanitized,
+    type,
+    runId,
+    ...(rawType && rawType !== type ? { providerEventType: rawType } : {}),
+  } as StreamEvent;
+}
+
+function publishRouteOwnedHostStreamEvent(params: {
+  sessionId: string;
+  runId: string;
+  provenance: string;
+  model?: string;
+  event: { type?: string; content?: string; [key: string]: unknown };
+}): void {
+  const { sessionId, runId, provenance, model } = params;
+  const tracked = streamEventBus.getTrackedStream(sessionId);
+  if (tracked?.active && tracked.runId && tracked.runId !== runId) return;
+  const event = sanitizeRouteOwnedHostStreamEvent(params.event, runId);
+  if (!streamEventBus.startStream(sessionId, runId, { provenance, model })) return;
+
+  if (event.type === 'text') {
+    if (!streamEventBus.updateStreamPhase(sessionId, { phase: 'streaming', runId, provenance, model })) return;
+  } else if (event.type === 'tool_start' || event.type === 'tool_update') {
+    if (!streamEventBus.updateStreamPhase(sessionId, {
+      phase: 'tool',
+      toolName: typeof event.toolName === 'string' ? event.toolName : undefined,
+      runId,
+      provenance,
+      model,
+    })) return;
+  } else if (event.type === 'tool_end' || event.type === 'thinking' || event.type === 'status') {
+    if (!streamEventBus.updateStreamPhase(sessionId, { phase: 'thinking', runId, provenance, model })) return;
+  }
+
+  streamEventBus.publish(sessionId, event);
+}
+
+function publishRouteOwnedHostStreamDone(params: {
+  sessionId: string;
+  runId: string;
+  provenance: string;
+  result?: { fullText?: unknown; metadata?: unknown };
+  aborted?: boolean;
+}): void {
+  const metadata = sanitizeNativeProviderEvent(
+    params.result?.metadata && typeof params.result.metadata === 'object'
+      ? params.result.metadata
+      : {},
+  );
+  const model = normalizeGatewayModelId((metadata as Record<string, unknown>)?.model) || null;
+  streamEventBus.publish(params.sessionId, {
+    type: 'done',
+    content: typeof params.result?.fullText === 'string' ? params.result.fullText : '',
+    provenance: params.provenance,
+    model,
+    metadata: params.aborted ? { ...metadata, aborted: true } : metadata,
+    runId: params.runId,
+  });
+  softClearHostStreamIfCurrent(params.sessionId, params.runId);
+}
+
+function publishRouteOwnedHostStreamError(params: {
+  sessionId: string;
+  runId: string;
+  content: string;
+}): void {
+  streamEventBus.publish(params.sessionId, {
+    type: 'error',
+    content: redactNativeProviderText(params.content) || 'Agent error',
+    terminal: true,
+    runId: params.runId,
+  });
+  softClearHostStreamIfCurrent(params.sessionId, params.runId);
+}
 
 /* ─── REST Routes (kept as fallback) ───────────────────────────────────── */
 
@@ -3548,9 +5116,28 @@ router.get('/status', authenticateToken, async (_req: Request, res: Response) =>
 // CLI/version probe in the background. Admin/status flows can pass
 // ?forceVersion=1 to wait for the real installed-vs-running Gateway version
 // check, which catches stale detached OpenClaw listeners after updates.
+// Dashboard views opt into a short server-side cooldown: repeat
+// opens within the window replay the last health snapshot instead of
+// re-probing the gateway, models, and version state. Live consumers (admin
+// status flows, restart polling) omit the flag and stay uncached; any forced
+// version probe always runs live and refreshes the snapshot.
+const DASHBOARD_HEALTH_COOLDOWN_MS = 5 * 60_000;
+let dashboardHealthSnapshot: { payload: Record<string, unknown>; at: number } | null = null;
+
 router.get('/health', authenticateToken, async (req: Request, res: Response) => {
   try {
     const forceVersionProbe = ['1', 'true', 'yes'].includes(String(req.query.forceVersion || req.query.force || '').toLowerCase());
+    const allowCooldownReplay = !forceVersionProbe
+      && ['1', 'true', 'yes'].includes(String(req.query.cooldown || '').toLowerCase());
+    if (allowCooldownReplay && dashboardHealthSnapshot
+      && Date.now() - dashboardHealthSnapshot.at < DASHBOARD_HEALTH_COOLDOWN_MS) {
+      res.json({
+        ...dashboardHealthSnapshot.payload,
+        checkedAt: dashboardHealthSnapshot.at,
+        cached: true,
+      });
+      return;
+    }
     const wsConnected = isPersistentWsConnected();
     const probe = await fetch(`${GATEWAY_URL}/`, { signal: AbortSignal.timeout(3000) }).then(r => r.ok).catch(() => false);
     // Gateway is reachable if the HTTP probe passes OR the persistent WS is up
@@ -3565,11 +5152,22 @@ router.get('/health', authenticateToken, async (req: Request, res: Response) => 
     let modelsConfigured = false;
     let modelCount = 0;
     const issues: string[] = [];
-    const openclawVersion = await getOpenClawVersionStatus({ force: forceVersionProbe }).catch((err: any) => ({
+    const openclawVersion = await getOpenClawVersionStatus({
+      force: forceVersionProbe,
+      refreshReadiness: forceVersionProbe,
+    }).catch((err: any) => ({
       installedVersion: null,
+      installedPackageVersion: null,
       runningVersion: null,
+      codexPluginVersion: null,
+      codexPluginInstallSpec: null,
       latestVersion: null,
       updateChannel: null,
+      testedCorePackageVersion: TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
+      testedRuntimeVersion: TESTED_OPENCLAW_RUNTIME_VERSION,
+      testedCodexPluginVersion: OPENCLAW_CODEX_PLUGIN_VERSION,
+      testedPairReady: false,
+      testedPairReason: err?.message || 'Tested OpenClaw pair verification failed',
       mismatch: false,
       restartRecommended: false,
       reason: null,
@@ -3582,6 +5180,9 @@ router.get('/health', authenticateToken, async (req: Request, res: Response) => 
 
     if (openclawVersion.restartRecommended && openclawVersion.reason) {
       issues.push(openclawVersion.reason);
+    }
+    if (openclawVersion.testedPairReady === false && openclawVersion.testedPairReason) {
+      issues.push(openclawVersion.testedPairReason);
     }
 
     if (connected) {
@@ -3612,8 +5213,14 @@ router.get('/health', authenticateToken, async (req: Request, res: Response) => 
       }
     }
 
-    const ok = chatReady && modelsConfigured && !openclawVersion.restartRecommended;
-    res.json({ ok, connected, wsConnected, chatReady, gatewayReachable, modelsConfigured, modelCount, issues, openclawVersion });
+    const ok = chatReady
+      && modelsConfigured
+      && !openclawVersion.restartRecommended
+      && openclawVersion.testedPairReady !== false;
+    const payload = { ok, connected, wsConnected, chatReady, gatewayReachable, modelsConfigured, modelCount, issues, openclawVersion };
+    const checkedAt = Date.now();
+    dashboardHealthSnapshot = { payload, at: checkedAt };
+    res.json({ ...payload, checkedAt, cached: false });
   } catch {
     res.json({ ok: false, connected: false, wsConnected: false, gatewayReachable: false, modelsConfigured: false, modelCount: 0, issues: ['Health check failed'], openclawVersion: null });
   }
@@ -3624,19 +5231,10 @@ router.get('/health', authenticateToken, async (req: Request, res: Response) => 
 router.post('/restart', authenticateToken, requireAdmin, async (_req: Request, res: Response) => {
   try {
     const before = await getOpenClawVersionStatus({ force: true }).catch(() => null);
-    const restart = await runOpenClawCli(['gateway', 'restart'], 45000, gatewayRecoveryEnv());
-    let forcedStart: { ok: boolean; pid?: number; error?: string } | null = null;
-    let after = await waitForGatewayVersionClear(7000);
-
-    // Some customer-like installs run OpenClaw as a detached listener instead of
-    // an enabled service. In that mode `gateway restart` may report success-ish
-    // instructions but leave the stale port owner alive. Fall back to the same
-    // recovery path an operator would use: force-kill the stale listener and run
-    // the installed gateway binary detached.
-    if (!after || after.restartRecommended || !after.probeOk) {
-      forcedStart = forceStartOpenClawGateway();
-      after = await waitForGatewayVersionClear(12000);
-    }
+    const restartOutput = await restartOpenClawGatewayBySystemService();
+    const after = await waitForGatewayVersionClear(
+      OPENCLAW_VERSION_STATUS_COLD_PROBE_BUDGET_MS,
+    );
 
     reconnectPersistentWs();
     const ok = Boolean(after && !after.restartRecommended && after.probeOk);
@@ -3644,14 +5242,13 @@ router.post('/restart', authenticateToken, requireAdmin, async (_req: Request, r
     res.status(ok ? 200 : 500).json({
       ok,
       restarted: ok,
-      forcedStart,
       message: ok
         ? 'OpenClaw gateway restarted.'
-        : (forcedStart?.error || restart.stderr || restart.error || 'OpenClaw gateway restart failed'),
+        : 'The installer-owned OpenClaw gateway service restarted but did not pass its version probe.',
       before,
       after,
-      stdout: restart.stdout.slice(-4000),
-      stderr: restart.stderr.slice(-4000),
+      stdout: restartOutput.slice(-4000),
+      stderr: '',
     });
   } catch (err: any) {
     res.status(500).json({ ok: false, restarted: false, error: err?.message || 'OpenClaw gateway restart failed' });
@@ -3690,14 +5287,22 @@ router.get('/compatibility-hotfix', authenticateToken, requireAdmin, async (_req
       note: status.applied
         ? 'Portal compatibility hotfixes are already present in the installed OpenClaw bundles.'
         : 'Installer/update usually auto-apply this temporary patch on affected installs. Use it as a fallback after a separate OpenClaw upgrade or if the compatibility markers are missing; it will restart the OpenClaw gateway.',
+      confirmationPhrase: PRIVILEGED_CONFIRMATION.compatibilityHotfix,
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to inspect compatibility hotfix status', detail: err.message });
   }
 });
 
-router.post('/compatibility-hotfix/apply', authenticateToken, requireAdmin, async (_req: Request, res: Response) => {
+router.post('/compatibility-hotfix/apply', authenticateToken, requireOwner, async (req: Request, res: Response) => {
   try {
+    if (!isTypedConfirmationMatch(PRIVILEGED_CONFIRMATION.compatibilityHotfix, req.body?.confirmation)) {
+      res.status(400).json({
+        error: `Type ${PRIVILEGED_CONFIRMATION.compatibilityHotfix} to confirm patching the installed runtime and restarting OpenClaw.`,
+        confirmationPhrase: PRIVILEGED_CONFIRMATION.compatibilityHotfix,
+      });
+      return;
+    }
     const before = getOpenClawCompatibilityHotfixStatus();
     if (!before.scriptExists) {
       res.status(500).json({ error: 'Portal hotfix script is missing from this install.' });
@@ -3708,7 +5313,11 @@ router.post('/compatibility-hotfix/apply', authenticateToken, requireAdmin, asyn
       return;
     }
 
-    const patchRun = await execFileText('bash', [OPENCLAW_COMPAT_HOTFIX_SCRIPT, OPENCLAW_DIST_DIR], 30000);
+    const openClawDistDir = getOpenClawDistDir();
+    const patchRun = await execFileText('bash', [OPENCLAW_COMPAT_HOTFIX_SCRIPT, openClawDistDir], 30000, {
+      PORTAL_OPENCLAW_HOTFIX_STRICT: '1',
+      PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION: TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
+    });
     const restartOutput = await restartOpenClawGateway();
     const after = getOpenClawCompatibilityHotfixStatus();
 
@@ -3727,9 +5336,12 @@ router.post('/compatibility-hotfix/apply', authenticateToken, requireAdmin, asyn
   }
 });
 
-router.get('/providers', authenticateToken, async (_req: Request, res: Response) => {
+router.get('/providers', authenticateToken, requireAdmin, async (_req: Request, res: Response) => {
   try {
-    res.json({ providers: AgentRegistry.listProviders() });
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+    res.vary('Authorization');
+    res.vary('Cookie');
+    res.json({ providers: await AgentRegistry.listProvidersAsync() });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to list providers', detail: err.message });
   }
@@ -3737,7 +5349,7 @@ router.get('/providers', authenticateToken, async (_req: Request, res: Response)
 
 router.get('/models', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const providerName = ((req.query.provider as string) || 'OPENCLAW').trim().toUpperCase() as AgentProviderName;
+    const providerName = normalizeProviderName(req.query.provider);
     const capabilities = getProviderCapabilities(providerName);
     if (!capabilities) {
       res.status(400).json({ error: `Unknown provider: ${providerName}` });
@@ -3745,19 +5357,47 @@ router.get('/models', authenticateToken, async (req: Request, res: Response) => 
     }
 
     const models = await listProviderModels(providerName);
+    // a model the catalog knows but cannot run was simply absent from
+    // the picker, so an operator looking for gpt-5.6 saw no model and no
+    // reason. Report the count so the UI can explain the gap.
+    const unavailableModelIds = providerName === 'OPENCLAW'
+      ? readLastOpenClawUnavailableModelIds()
+      : [];
     res.json({
       provider: providerName,
       capabilities,
       models,
+      ...(unavailableModelIds.length > 0 ? { unavailableModelIds } : {}),
     });
   } catch (err: any) {
-    res.status(500).json({ error: 'Failed to list models', detail: err.message });
+    if (err instanceof UnknownAgentProviderError) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    const providerName = String(req.query.provider || 'OPENCLAW').trim().toUpperCase();
+    if (providerName === 'AGENT_ZERO') {
+      const status = err instanceof AgentZeroOAuthModelCatalogError
+        && err.code !== 'CATALOG_UNAVAILABLE'
+        ? 409
+        : 503;
+      res.status(status).json({
+        error: err instanceof AgentZeroOAuthModelCatalogError
+          ? err.message
+          : 'Agent Zero could not verify its selectable OAuth models. Retry, or reconnect Agent Zero OAuth in AI Settings.',
+        ...(err?.code ? { code: err.code } : {}),
+      });
+      return;
+    }
+    res.status(500).json({
+      error: 'Failed to list models',
+      detail: redactNativeProviderText(err?.message || String(err), 2_048),
+    });
   }
 });
 
-router.get('/commands', authenticateToken, async (req: Request, res: Response) => {
+router.get('/commands', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
-    const providerName = ((req.query.provider as string) || 'OPENCLAW').trim().toUpperCase() as AgentProviderName;
+    const providerName = normalizeProviderName(req.query.provider);
     const providerInfo = AgentRegistry.listProviders().find((p) => p.name === providerName);
     if (!providerInfo) {
       res.status(400).json({ error: `Unknown provider: ${providerName}` });
@@ -3771,13 +5411,19 @@ router.get('/commands', authenticateToken, async (req: Request, res: Response) =
       commands,
     });
   } catch (err: any) {
+    if (err instanceof UnknownAgentProviderError) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
     res.status(500).json({ error: 'Failed to list commands', detail: err.message });
   }
 });
 
 router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
-    const providerName = (req.query.provider as AgentProviderName) || undefined;
+    const providerName = req.query.provider === undefined
+      ? undefined
+      : normalizeProviderName(req.query.provider);
     if (providerName) {
       try {
         const provider = AgentRegistry.get(providerName);
@@ -3786,267 +5432,86 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
         return;
       } catch (err: any) {
         console.warn(`[gateway] Provider ${providerName} listSessions failed: ${err.message}`);
+        res.status(502).json({
+          error: `Failed to list ${providerName === 'AGENT_ZERO' ? 'Agent Zero' : 'provider'} sessions`,
+          detail: providerName === 'AGENT_ZERO'
+            ? 'Portal could not read Agent Zero session metadata. Retry, then repair the managed runtime if the problem continues.'
+            : redactNativeProviderText(err?.message || String(err), 2_048),
+        });
+        return;
       }
     }
 
     // Support agentId filter — defaults to all agents for full visibility
-    const agentId = req.query.agentId as string | undefined;
-    const sanitizedAgentId = agentId ? agentId.replace(/[^a-zA-Z0-9_-]/g, '') : null;
-
-    // For 'main' (or no agentId = show main), use the canonical session registry from sessions.json.
-    // The 'main' agent is not in agents.list so the CLI won't enumerate it reliably.
-    const isAdmin = isElevatedRole(req.user!.role);
-    const isSandboxIsolated = shouldIsolateUser(req.user!);
-    const isMainAgent = !sanitizedAgentId || sanitizedAgentId === 'main';
-
-    if (!isAdmin && isSandboxIsolated && isMainAgent) {
-      const provider = AgentRegistry.get('OPENCLAW');
-      const sessions = await provider.listSessions(req.user!.userId);
-      res.json({ sessions });
+    const agentId = typeof req.query.agentId === 'string' ? req.query.agentId.trim() : '';
+    if (agentId && !/^[a-zA-Z0-9_-]{1,64}$/.test(agentId)) {
+      res.status(400).json({ error: 'Invalid OpenClaw agent' });
       return;
     }
-    if (isMainAgent) {
-      const sessionsDir = path.join(process.env.HOME || '/root', '.openclaw/agents/main/sessions');
-      const sessionsFile = path.join(sessionsDir, 'sessions.json');
-      try {
-        const cutoffMs = isOwnerRole(req.user!.role) ? 0 : Date.now() - 1440 * 60 * 1000;
-        if (existsSync(sessionsFile)) {
-          const stat = statSync(sessionsFile);
-          if (
-            mainSessionListCache
-            && Date.now() - mainSessionListCache.at < MAIN_SESSION_LIST_CACHE_TTL_MS
-            && mainSessionListCache.mtimeMs === stat.mtimeMs
-            && mainSessionListCache.size === stat.size
-          ) {
-            res.json({ sessions: mainSessionListCache.sessions });
-            return;
-          }
+    const openClawProvider = AgentRegistry.get('OPENCLAW');
+    const ownedSessions = await openClawProvider.listSessions(req.user!.userId);
+    const sessions = agentId
+      ? ownedSessions.filter((session) => String(session.sessionId || '').startsWith(`agent:${agentId}:`))
+      : ownedSessions;
+    res.json({ sessions });
+    return;
 
-          const raw = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
-          const source = Array.isArray(raw?.sessions) ? raw.sessions : raw;
-          const entries: Array<[string, any]> = Array.isArray(source)
-            ? (source
-                .map((meta: any) => [String(meta?.key || meta?.sessionKey || meta?.sessionId || meta?.id || '').trim(), meta] as [string, any])
-                .filter(([sessionKey]) => Boolean(sessionKey)))
-            : Object.entries(source || {}) as Array<[string, any]>;
-          const sessions: any[] = [];
-          const activeCutoffMs = Date.now() - 5 * 60 * 1000;
-
-          for (const [rawSessionKey, meta] of entries) {
-            const sessionKey = String(rawSessionKey || meta?.key || meta?.sessionKey || '').trim();
-            if (!sessionKey) continue;
-
-            const sessionId = String(meta?.sessionId || meta?.id || '').trim();
-            if (!sessionId) continue;
-
-            const createdAt = Number(meta?.sessionStartedAt || meta?.startedAt || meta?.createdAt || meta?.updatedAt || Date.now());
-            const lastActivityAt = Number(meta?.lastInteractionAt || meta?.updatedAt || meta?.endedAt || createdAt || Date.now());
-            if (lastActivityAt && lastActivityAt < cutoffMs) continue;
-
-            const fallbackTitle = humanizeSessionKey(sessionKey, sessionId);
-            const label = typeof meta?.label === 'string' ? meta.label.trim() : '';
-            const title = label || fallbackTitle;
-            const previewParts = [
-              typeof meta?.status === 'string' ? meta.status.trim() : '',
-              typeof meta?.model === 'string' ? meta.model.trim() : '',
-            ].filter(Boolean);
-
-            sessions.push({
-              key: sessionKey,
-              sessionId,
-              id: sessionId,
-              agentId: 'main',
-              status: lastActivityAt > activeCutoffMs ? 'active' : 'idle',
-              createdAt,
-              lastActivityAt,
-              updatedAt: lastActivityAt,
-              title,
-              preview: previewParts.join(' • '),
-              isMainSession: sessionKey === 'agent:main:main',
-              _hasExplicitTitle: Boolean(label),
-            });
-          }
-
-          sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-          for (const session of sessions.slice(0, MAIN_SESSION_DERIVED_TITLE_LIMIT)) {
-            if (session._hasExplicitTitle) continue;
-            const derived = deriveSessionLabelFromSessionFile(session.key, session.sessionId, sessionsDir);
-            if (!derived?.title) continue;
-            session.title = derived.title;
-            if (derived.preview) session.preview = derived.preview;
-            if (typeof derived.isMainSession === 'boolean') session.isMainSession = derived.isMainSession;
-          }
-          for (const session of sessions) delete session._hasExplicitTitle;
-          mainSessionListCache = { at: Date.now(), mtimeMs: stat.mtimeMs, size: stat.size, sessions };
-          res.json({ sessions });
-          return;
-        }
-      } catch (err: any) {
-        mainSessionListCache = null;
-        // fall through to CLI path
-      }
-    }
-
-    const args = ['sessions', '--json', '--active', '1440'];
-    if (sanitizedAgentId && sanitizedAgentId !== 'main') {
-      args.push('--agent', sanitizedAgentId);
-    } else {
-      args.push('--all-agents');
-    }
-
-    try {
-      const output = execFileSync('openclaw', args, { timeout: 10000, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], env: buildOpenClawCliEnv() }) as string;
-      const parsed = JSON.parse(output.trim());
-      // --all-agents returns { agents: { id: { sessions: [...] } } } — flatten
-      if (parsed.agents && !parsed.sessions) {
-        const allSessions: any[] = [];
-        for (const agent of Object.values(parsed.agents) as any[]) {
-          if (agent.sessions && Array.isArray(agent.sessions)) {
-            allSessions.push(...agent.sessions);
-          }
-        }
-        // Sort by updatedAt descending
-        allSessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-        res.json({ sessions: allSessions });
-      } else {
-        res.json(parsed);
-      }
-      return;
-    } catch {}
-
-    // Final fallback: sessions.json file
-    const fallbackAgent = sanitizedAgentId || 'main';
-    const agentSessionsDir = path.join(process.env.HOME || '/root', `.openclaw/agents/${fallbackAgent}/sessions`);
-    const sessionsFile = path.join(agentSessionsDir, 'sessions.json');
-    if (existsSync(sessionsFile)) {
-      res.json(JSON.parse(readFileSync(sessionsFile, 'utf-8')));
-      return;
-    }
-    res.json({ sessions: [] });
   } catch (err: any) {
-    res.status(500).json({ error: 'Failed to list sessions', detail: err.message });
+    const status = err instanceof UnknownAgentProviderError ? 400 : 500;
+    res.status(status).json({
+      error: status === 400 ? err.message : 'Failed to list sessions',
+      ...(status === 500 ? { detail: err.message } : {}),
+    });
   }
 });
 
 const USAGE_STATS_CACHE_TTL_MS = 15000;
-const usageStatsCache = new Map<string, { at: number; payload: any }>();
-const usageStatsInflight = new Map<string, Promise<any>>();
+const USAGE_STATS_CACHE_MAX_ENTRIES = 64;
+const usageStatsCache = new Map<string, { at: number; payload: UsageStatsPayload }>();
+const usageStatsInflight = new Map<string, Promise<UsageStatsPayload>>();
+
+function cacheUsageStats(cacheKey: string, payload: UsageStatsPayload): void {
+  usageStatsCache.delete(cacheKey);
+  while (usageStatsCache.size >= USAGE_STATS_CACHE_MAX_ENTRIES) {
+    const oldestKey = usageStatsCache.keys().next().value;
+    if (typeof oldestKey !== 'string') break;
+    usageStatsCache.delete(oldestKey);
+  }
+  usageStatsCache.set(cacheKey, { at: Date.now(), payload });
+}
 
 async function getUsageStatsSnapshot(selectedAgent: string) {
   const cacheKey = selectedAgent || '__all__';
   const now = Date.now();
   const cached = usageStatsCache.get(cacheKey);
   if (cached && (now - cached.at) < USAGE_STATS_CACHE_TTL_MS) {
+    usageStatsCache.delete(cacheKey);
+    usageStatsCache.set(cacheKey, cached);
     return cached.payload;
   }
+  if (cached) usageStatsCache.delete(cacheKey);
 
   const existing = usageStatsInflight.get(cacheKey);
   if (existing) return existing;
 
   const promise = (async () => {
-    const { execSync } = require('child_process');
-
-    let sessions: any[] = [];
-    try {
-      const sessionsResult = await gatewayRpcCall('sessions.list', {}, 10000);
-      if (sessionsResult.ok && Array.isArray(sessionsResult.data?.sessions)) {
-        sessions = sessionsResult.data.sessions;
-      } else if (sessionsResult.ok && sessionsResult.data?.agents && typeof sessionsResult.data.agents === 'object') {
-        sessions = Object.values(sessionsResult.data.agents).flatMap((agent: any) => Array.isArray(agent?.sessions) ? agent.sessions : []);
-      }
-    } catch {
-      // continue with CLI fallback
-    }
-
-    if (!sessions.length) {
-      try {
-        const agentsDir = path.join(process.env.HOME || '/root', '.openclaw/agents');
-        const collected: any[] = [];
-        if (existsSync(agentsDir)) {
-          for (const agentId of readdirSync(agentsDir)) {
-            const sessionsFile = path.join(agentsDir, agentId, 'sessions', 'sessions.json');
-            if (!existsSync(sessionsFile)) continue;
-            const raw = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
-            const source = Array.isArray(raw?.sessions) ? raw.sessions : raw;
-            const entries = Array.isArray(source) ? source : Object.values(source || {});
-            for (const session of entries as any[]) {
-              if (!session) continue;
-              collected.push({ ...session, agentId: session.agentId || agentId });
-            }
-          }
-        }
-        sessions = collected;
-      } catch {
-        // continue with CLI fallback
-      }
-    }
-
-    if (!sessions.length) {
-      try {
-        const sessionsRaw = execSync('openclaw sessions --json --all-agents 2>/dev/null', { timeout: 30000, encoding: 'utf-8', env: buildOpenClawCliEnv() });
-        const parsed = JSON.parse(sessionsRaw.trim());
-        if (Array.isArray(parsed.sessions)) {
-          sessions = parsed.sessions;
-        } else if (parsed.agents && typeof parsed.agents === 'object') {
-          sessions = Object.values(parsed.agents).flatMap((agent: any) => Array.isArray(agent?.sessions) ? agent.sessions : []);
-        }
-      } catch {
-        // continue with empty sessions
-      }
-    }
-
-    let cronJobs: any[] = [];
-    try {
-      const cronsRaw = execSync('openclaw cron list --json 2>/dev/null', { timeout: 10000, encoding: 'utf-8', env: buildOpenClawCliEnv() });
-      const parsed = JSON.parse(cronsRaw.trim());
-      cronJobs = parsed.jobs || [];
-    } catch {
-      // continue with empty crons
-    }
-
-    const agentFilteredSessions = selectedAgent
-      ? sessions.filter((s: any) => (s?.agentId || 'main') === selectedAgent)
-      : sessions;
-    const agentFilteredCrons = selectedAgent
-      ? cronJobs.filter((j: any) => (j?.agentId || j?.agent || 'main') === selectedAgent)
-      : cronJobs;
-
-    const totalSessions = agentFilteredSessions.length;
-    const activeSessions = agentFilteredSessions.filter((s: any) => {
-      const lastMs = s.lastActivityMs || s.updatedAt || s.updatedAtMs || 0;
-      return now - lastMs < 3600000;
-    }).length;
-
-    const modelCounts: Record<string, number> = {};
-    agentFilteredSessions.forEach((s: any) => {
-      const model = normalizeGatewayModelId(s.model ?? s.defaultModel) || 'unknown';
-      modelCounts[model] = (modelCounts[model] || 0) + 1;
+    const { sessions, cronJobs } = await loadUsageStatsSources(selectedAgent, {
+      agentsDir: path.join(process.env.HOME || '/root', '.openclaw/agents'),
+      gatewayCall: gatewayRpcCall,
+      runOpenClaw: async (args, timeoutMs) => (
+        await execFileText('openclaw', args, timeoutMs)
+      ).stdout,
     });
-    const modelBreakdown = Object.entries(modelCounts)
-      .map(([model, count]) => ({ model, sessions: count }))
-      .sort((a, b) => b.sessions - a.sessions);
 
-    const recentSessions = agentFilteredSessions
-      .sort((a: any, b: any) => (b.lastActivityMs || b.updatedAt || 0) - (a.lastActivityMs || a.updatedAt || 0))
-      .slice(0, 20)
-      .map((s: any) => ({
-        key: s.sessionKey || s.key || s.id,
-        agent: s.agentId || 'main',
-        model: normalizeGatewayModelId(s.model ?? s.defaultModel) || 'unknown',
-        lastActivity: s.lastActivityMs || s.updatedAt || s.updatedAtMs,
-        turns: s.turns || 0,
-      }));
+    const payload = buildUsageStatsPayload(
+      sessions,
+      cronJobs,
+      selectedAgent,
+      (model) => normalizeGatewayModelId(model) || 'unknown',
+      Date.now(),
+    );
 
-    const payload = {
-      totalSessions,
-      activeSessions,
-      cronJobs: agentFilteredCrons.length,
-      activeCrons: agentFilteredCrons.filter((j: any) => j.enabled !== false).length,
-      modelBreakdown,
-      recentSessions,
-    };
-
-    usageStatsCache.set(cacheKey, { at: Date.now(), payload });
+    cacheUsageStats(cacheKey, payload);
     return payload;
   })();
 
@@ -4066,10 +5531,17 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
       || (typeof req.query.agentId === 'string' && req.query.agentId.trim())
       || '';
 
+    if (selectedAgent && !isValidUsageAgentFilter(selectedAgent)) {
+      res.status(400).json({ error: 'Invalid agent filter' });
+      return;
+    }
+
     res.json(await getUsageStatsSnapshot(selectedAgent));
   } catch (err: any) {
     console.error('[gateway] usage-stats error:', err);
-    res.status(500).json({ error: err.message || 'Failed to get usage stats' });
+    const statusCode = Number(err?.statusCode);
+    res.status(Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 599 ? statusCode : 500)
+      .json({ error: err.message || 'Failed to get usage stats' });
   }
 });
 
@@ -4077,10 +5549,11 @@ const TASKS_ROUTE_CACHE_TTL_MS = 10000;
 let tasksRouteCache: { at: number; payload: any } | null = null;
 let tasksRouteInflight: Promise<any> | null = null;
 
-function normalizeGatewayTaskStatus(status: unknown, endedAt?: unknown): 'running' | 'done' | 'failed' | 'unknown' {
+function normalizeGatewayTaskStatus(status: unknown, endedAt?: unknown): 'running' | 'done' | 'failed' | 'cancelled' | 'unknown' {
   const normalized = typeof status === 'string' ? status.toLowerCase() : '';
   if (['done', 'completed', 'success', 'succeeded'].includes(normalized)) return 'done';
-  if (['failed', 'error', 'errored', 'cancelled', 'canceled'].includes(normalized)) return 'failed';
+  if (['cancelled', 'canceled', 'killed', 'aborted'].includes(normalized)) return 'cancelled';
+  if (['failed', 'error', 'errored'].includes(normalized)) return 'failed';
   if (['running', 'active', 'pending', 'queued', 'starting'].includes(normalized)) return 'running';
   if (endedAt) return 'done';
   return 'unknown';
@@ -4230,8 +5703,8 @@ router.get('/tasks', requireAdmin, async (_req: Request, res: Response) => {
 
 router.get('/session-info', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const sessionKey = resolveOpenClawSessionKey(req.query.session as string, req.user);
-    assertGatewaySessionAccess(sessionKey, req.user!);
+    const sessionKey = await resolveOpenClawSessionKey(req.query.session as string, req.user);
+    await assertGatewaySessionAccess(sessionKey, req.user!);
     let result = await getSessionInfo(sessionKey);
     if ((!result.ok || !result.data) && sessionKey.includes(':new-')) {
       const created = await createSession(sessionKey);
@@ -4263,7 +5736,7 @@ router.get('/session-info', authenticateToken, async (req: Request, res: Respons
 
 router.post('/session-create', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    const providerName = (typeof req.body?.provider === 'string' ? req.body.provider.trim().toUpperCase() : 'OPENCLAW') as AgentProviderName;
+    const providerName = normalizeProviderName(req.body?.provider);
     if (providerName !== 'OPENCLAW') {
       res.status(400).json({ error: 'Session creation only supported for OPENCLAW provider' });
       return;
@@ -4275,8 +5748,8 @@ router.post('/session-create', authenticateToken, requireApproved, async (req: R
       return;
     }
 
-    const sessionKey = resolveOpenClawSessionKey(rawSession, req.user);
-    assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
+    const sessionKey = await resolveOpenClawSessionKey(rawSession, req.user);
+    await assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
 
     const created = await createSession(sessionKey);
     if (!created.ok) {
@@ -4286,46 +5759,71 @@ router.post('/session-create', authenticateToken, requireApproved, async (req: R
     }
 
     const createdKey = created.key || sessionKey;
-    let info = await getSessionInfo(createdKey);
-    if (info.ok && info.data) {
-      const currentThinking = String(info.data.thinkingLevel || '').trim().toLowerCase();
-      const currentReasoning = String(info.data.reasoningLevel || '').trim().toLowerCase();
-      const shouldDefaultThinking = !currentThinking || currentThinking === 'off' || currentThinking === 'none';
-      const shouldDefaultReasoning = !currentReasoning || currentReasoning === 'off' || currentReasoning === 'none';
-      if (shouldDefaultThinking || shouldDefaultReasoning) {
-        await gatewayRpcCall('sessions.patch', {
-          key: createdKey,
-          ...(shouldDefaultThinking ? { thinkingLevel: 'high' } : {}),
-          ...(shouldDefaultReasoning ? { reasoningLevel: 'stream' } : {}),
-        });
-        info = await getSessionInfo(createdKey);
+    const info = await withOpenClawSessionMutation(createdKey, async () => {
+      let current = await getSessionInfo(createdKey);
+      if (current.ok && current.data) {
+        const currentThinking = String(current.data.thinkingLevel || '').trim().toLowerCase();
+        const currentReasoning = String(current.data.reasoningLevel || '').trim().toLowerCase();
+        const shouldDefaultThinking = !currentThinking;
+        const shouldDefaultReasoning = !currentReasoning;
+        if (shouldDefaultThinking || shouldDefaultReasoning) {
+          await gatewayRpcCall('sessions.patch', {
+            key: createdKey,
+            ...(shouldDefaultThinking ? { thinkingLevel: 'high' } : {}),
+            ...(shouldDefaultReasoning ? { reasoningLevel: 'stream' } : {}),
+          });
+          current = await getSessionInfo(createdKey);
+        }
       }
-    }
+      return current;
+    });
     res.json({ ok: true, key: createdKey, session: info.ok ? info.data : null });
   } catch (err: any) {
-    const status = err?.message === 'Admin access required' ? 403 : 500;
-    res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to create session', detail: err.message });
+    const status = err instanceof UnknownAgentProviderError
+      ? 400
+      : err?.message === 'Admin access required' ? 403 : 500;
+    res.status(status).json({
+      error: status === 400
+        ? err.message
+        : status === 403 ? 'Admin access required' : 'Failed to create session',
+      ...(status === 500 ? { detail: err.message } : {}),
+    });
   }
 });
 
 router.post('/session-model', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    const providerName = (typeof req.body?.provider === 'string' ? req.body.provider.trim().toUpperCase() : 'OPENCLAW') as AgentProviderName;
-    const model = normalizeRequestedModel(providerName, typeof req.body?.model === 'string' ? req.body.model.trim() : '');
+    const providerName = normalizeProviderName(req.body?.provider);
+    const rawModel = typeof req.body?.model === 'string' ? req.body.model.trim() : '';
+    const explicitResetRequested = req.body?.reset === true;
+    const resetAliasRequested = isProviderModelResetAlias(rawModel);
+    const resetRequested = explicitResetRequested || resetAliasRequested;
+    if (explicitResetRequested && rawModel) {
+      res.status(400).json({ error: 'Specify either a model or reset, not both.' });
+      return;
+    }
+    if (providerName === 'AGENT_ZERO' && resetRequested) {
+      res.status(409).json({
+        error: 'Agent Zero requires an exact model from a connected OAuth provider. Choose one of its available models instead of Default or reset.',
+        code: 'AGENT_ZERO_MODEL_REQUIRED',
+      });
+      return;
+    }
+    const model = resetRequested ? null : normalizeRequestedModel(providerName, rawModel);
 
-    if (!model) {
-      res.status(400).json({ error: 'model required' });
+    if (!resetRequested && !model) {
+      res.status(400).json({ error: 'model required; use reset=true to clear a session override' });
       return;
     }
 
     if (providerName === 'OPENCLAW') {
-      if (!model.includes('/')) {
+      if (model && !model.includes('/')) {
         res.status(400).json({ error: 'model must include provider prefix' });
         return;
       }
       const rawSession = typeof req.body?.session === 'string' ? req.body.session.trim() : '';
-      const sessionKey = resolveOpenClawSessionKey(rawSession, req.user);
-      assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
+      const sessionKey = await resolveOpenClawSessionKey(rawSession, req.user);
+      await assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
       const isConcreteSession = sessionKey.startsWith('agent:');
       if (!isConcreteSession) {
         res.status(409).json({ error: 'No concrete OpenClaw session selected', code: 'NO_CONCRETE_SESSION' });
@@ -4345,16 +5843,26 @@ router.post('/session-model', authenticateToken, requireApproved, async (req: Re
         return;
       }
 
-      const resolvedModel = await resolveOpenClawPatchModel(model);
-      const runtimeModel = modelForOpenClawSessionPatch(info.data, resolvedModel || model);
-      const patched = await patchSessionModel(sessionKey, runtimeModel || resolvedModel || model);
+      const resolvedModel = model ? await resolveOpenClawPatchModel(model) : null;
+      const runtimeModel = model
+        ? modelForOpenClawSessionPatch(info.data, resolvedModel || model)
+        : null;
+      const patched = await patchSessionModel(
+        sessionKey,
+        model ? runtimeModel || resolvedModel || model : null,
+      );
       if (!patched.ok) {
         res.status(502).json({ error: patched.error || 'Failed to patch session model' });
         return;
       }
 
       const refreshed = await getSessionInfo(sessionKey);
-      res.json({ ok: true, session: refreshed.ok ? refreshed.data : info.data, resolved: patched.resolved || null });
+      res.json({
+        ok: true,
+        session: refreshed.ok ? refreshed.data : info.data,
+        resolved: patched.resolved || null,
+        reset: resetRequested,
+      });
       return;
     }
 
@@ -4375,19 +5883,42 @@ router.post('/session-model', authenticateToken, requireApproved, async (req: Re
       return;
     }
 
-    const updated = updateNativeSessionModel(providerName, rawSession, model);
+    const selectedModel = providerName === 'AGENT_ZERO' && model
+      ? (await validateAgentZeroOAuthModelSelection(model)).id
+      : model;
+    const result = await setNativeSessionModel(providerName, rawSession, selectedModel || null);
     res.json({
       ok: true,
-      session: updated ? {
-        sessionId: updated.sessionId,
-        model: updated.model,
+      session: {
+        sessionId: nativeSession.sessionId,
+        model: result.model,
         modelProvider: providerName.toLowerCase(),
-        metadata: updated.metadata || {},
-      } : null,
-      resolved: updated ? { modelProvider: providerName.toLowerCase(), model } : null,
+        metadata: result.metadata || nativeSession.metadata || {},
+      },
+      resolved: result.model
+        ? { modelProvider: providerName.toLowerCase(), model: result.model }
+        : null,
+      reset: resetRequested,
     });
   } catch (err: any) {
-    res.status(500).json({ error: 'Failed to patch session model', detail: err.message });
+    const rawProviderName = String(req.body?.provider || 'OPENCLAW').trim().toUpperCase();
+    const status = err instanceof UnknownAgentProviderError
+      ? 400
+      : err instanceof NativeSessionModelMutationError
+      ? err.status
+      : err instanceof AgentZeroOAuthModelCatalogError
+        ? err.code === 'CATALOG_UNAVAILABLE' ? 503 : 409
+        : 500;
+    const safeDetail = err instanceof NativeSessionModelMutationError
+      || err instanceof AgentZeroOAuthModelCatalogError
+      ? err.message
+      : rawProviderName === 'AGENT_ZERO'
+        ? humanizeProviderError('AGENT_ZERO', err?.message || String(err))
+        : redactNativeProviderText(err?.message || String(err), 2_048);
+    res.status(status).json({
+      error: safeDetail || 'Failed to patch session model',
+      ...(err?.code ? { code: err.code } : {}),
+    });
   }
 });
 
@@ -4397,7 +5928,7 @@ router.post('/session-model', authenticateToken, requireApproved, async (req: Re
  */
 router.post('/session-patch', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    const providerName = (typeof req.body?.provider === 'string' ? req.body.provider.trim().toUpperCase() : 'OPENCLAW') as AgentProviderName;
+    const providerName = normalizeProviderName(req.body?.provider);
     const rawSession = typeof req.body?.session === 'string' ? req.body.session.trim() : '';
     const settings = typeof req.body?.settings === 'object' && req.body.settings !== null ? req.body.settings : {};
 
@@ -4412,8 +5943,8 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
       return;
     }
 
-    const sessionKey = resolveOpenClawSessionKey(rawSession, req.user);
-    assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
+    const sessionKey = await resolveOpenClawSessionKey(rawSession, req.user);
+    await assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
 
     const isConcreteSession = sessionKey.startsWith('agent:');
     if (!isConcreteSession) {
@@ -4499,7 +6030,10 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
       } catch {}
     }
 
-    const result = await gatewayRpcCall('sessions.patch', patch);
+    const result = await withOpenClawSessionMutation(
+      sessionKey,
+      () => gatewayRpcCall('sessions.patch', patch),
+    );
     if (!result.ok) {
       res.status(502).json({ error: result.error || 'Failed to patch session' });
       return;
@@ -4508,8 +6042,15 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
     res.json({ ok: true, session: result.data || null });
   } catch (err: any) {
     console.error('[gateway] session-patch error:', err);
-    const status = err?.message === 'Admin access required' ? 403 : 500;
-    res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to patch session', detail: err.message });
+    const status = err instanceof UnknownAgentProviderError
+      ? 400
+      : err?.message === 'Admin access required' ? 403 : 500;
+    res.status(status).json({
+      error: status === 400
+        ? err.message
+        : status === 403 ? 'Admin access required' : 'Failed to patch session',
+      ...(status === 500 ? { detail: err.message } : {}),
+    });
   }
 });
 
@@ -4652,6 +6193,7 @@ function formatProviderCapabilitySummary(params: {
     `- session history: ${capabilities.supportsHistory ? 'yes' : 'no'}`,
     `- session list: ${capabilities.supportsSessionList ? 'yes' : 'no'}`,
     `- exec approvals: ${capabilities.supportsExecApproval ? 'yes' : 'no'}`,
+    `- execution scopes: ${capabilities.supportedExecutionScopes?.join(', ') || 'none'}`,
     `- follow-ups while running: ${capabilities.supportsInTurnSteering ? 'live FYI / steer' : capabilities.supportsQueuedFollowUps === false ? 'not supported' : 'queued for next turn'}`,
     `- transport: ${capabilities.requiresGateway ? 'gateway' : 'native CLI'}`,
     `- adapter: ${capabilities.adapterFamily || 'unknown'}${capabilities.adapterKey ? ` (${capabilities.adapterKey})` : ''}`,
@@ -4688,6 +6230,7 @@ async function handleNativePortalSlashCommand(params: {
   sessionId: string;
   requestedModel?: string;
   message: string;
+  executionContext: AgentExecutionContext;
 }): Promise<{ handled: boolean; sessionId: string; content?: string; metadata?: Record<string, unknown> }> {
   const parsed = parsePortalSlashCommand(params.message);
   if (!parsed) return { handled: false, sessionId: params.sessionId };
@@ -4749,9 +6292,25 @@ async function handleNativePortalSlashCommand(params: {
       if (!parsed.rest) {
         return appendExchange(`Current model: ${session.model || 'default'}`, { command: parsed.command, model: session.model || null });
       }
-      const normalized = normalizeRequestedModel(params.providerName, parsed.rest);
-      const updated = updateNativeSessionModel(params.providerName, session.sessionId, normalized);
-      return appendExchange(`Model set to ${normalized}`, { command: parsed.command, model: updated?.model || normalized });
+      const resetModel = isProviderModelResetAlias(parsed.rest);
+      if (params.providerName === 'AGENT_ZERO' && resetModel) {
+        return appendExchange(
+          'Agent Zero requires an exact model from a connected OAuth provider. Choose one of the available Agent Zero models instead of Default or reset.',
+          { command: parsed.command, model: session.model || null },
+        );
+      }
+      const normalized = resetModel
+        ? null
+        : await validatedNativeModelSelection(params.providerName, parsed.rest);
+      const updated = await setNativeSessionModel(
+        params.providerName,
+        session.sessionId,
+        normalized,
+      );
+      return appendExchange(
+        updated.model ? `Model set to ${updated.model}` : 'Session model reset to the provider default.',
+        { command: parsed.command, model: updated.model },
+      );
     }
     case '/models': {
       const targetProvider = (parsed.args[0] || params.providerName).trim().toUpperCase() as AgentProviderName;
@@ -4770,8 +6329,17 @@ async function handleNativePortalSlashCommand(params: {
     }
     case '/new':
     case '/reset': {
+      const nextModel = params.providerName === 'AGENT_ZERO'
+        ? await validatedNativeModelSelection(
+          params.providerName,
+          params.requestedModel || session.model || '',
+        )
+        : params.requestedModel
+          ? normalizeRequestedModel(params.providerName, params.requestedModel)
+          : session.model;
       const newSessionId = await AgentRegistry.get(params.providerName).startSession(params.userId, {
-        model: params.requestedModel ? normalizeRequestedModel(params.providerName, params.requestedModel) : session.model,
+        executionContext: params.executionContext,
+        model: nextModel || undefined,
         metadata: { requestedBy: params.userEmail },
       });
       const content = `Started a new ${params.providerDisplayName} session.`;
@@ -4799,31 +6367,135 @@ async function handleNativePortalSlashCommand(params: {
 
 router.get('/history', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const sessionKey = resolveOpenClawSessionKey(req.query.session as string, req.user);
-    const limit = parseInt(req.query.limit as string) || 100;
+    const providerName = normalizeProviderName(req.query.provider);
+    const sessionKey = providerName === 'OPENCLAW'
+      ? await resolveOpenClawSessionKey(req.query.session as string, req.user)
+      : String(req.query.session || '').trim();
+    const limit = parseHistoryLimit(req.query.limit);
     const afterId = req.query.after as string;
-    const providerName = req.query.provider as AgentProviderName | undefined;
+    const beforeCursor = req.query.before;
     const enhanced = req.query.enhanced === '1';
 
-    assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
-    if (!providerName || providerName === 'OPENCLAW') {
+    if (afterId && beforeCursor) {
+      res.status(400).json({ error: 'History requests cannot combine after and before cursors' });
+      return;
+    }
+
+    await assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
+    if (providerName === 'OPENCLAW') {
+      if (isElevatedRole(req.user!.role)) {
+        try {
+          // History is the authenticated Agent Chat bootstrap/reconnect path,
+          // including the optional direct transport. Registering here covers
+          // pre-upgrade and resumed sessions before their next send.
+          await attestAgentChatActivitySession(sessionKey, req.user!.userId);
+        } catch (error) {
+          console.warn('[gateway] Agent activity history attestation could not be persisted:', error);
+        }
+      }
       subscribeBackendToLiveSessionEvents(sessionKey);
     }
 
     // For non-OPENCLAW providers use the provider abstraction
-    if (providerName && providerName !== 'OPENCLAW') {
+    if (providerName !== 'OPENCLAW') {
       try {
-        const nativeSession = getOwnedNativeSession(providerName, req.user!.userId, req.query.session);
+        const nativeSession = getOwnedNativeSession(
+          providerName,
+          req.user!.userId,
+          req.query.session,
+          undefined,
+          { metadataOnly: true },
+        );
         if (!nativeSession) {
-          res.json({ messages: [], sessionId: typeof req.query.session === 'string' ? req.query.session : '' });
+          res.json({
+            messages: [],
+            sessionId: typeof req.query.session === 'string' ? req.query.session : '',
+            activeStream: inactiveOpenClawSnapshot('idle', true),
+            pagination: { beforeCursor: null, hasMoreBefore: false, pageSize: limit },
+          });
           return;
         }
+        const scope = historyCursorScope(req.user!.userId, providerName, nativeSession.sessionId);
+        const activeStreamCandidate = await getProviderActiveStreamSnapshot(providerName, nativeSession.sessionId);
+        const activeStream = resolveAttachableHostStreamSnapshot(
+          nativeSession.sessionId,
+          activeStreamCandidate,
+        ) || activeStreamCandidate;
+        if (!afterId && providerName !== 'AGENT_ZERO') {
+          const page = readNativeHistoryPage({
+            providerName,
+            sessionId: nativeSession.sessionId,
+            limit,
+            scope,
+            beforeCursor,
+          });
+          res.json({
+            messages: page.messages,
+            sessionId: nativeSession.sessionId,
+            activeStream,
+            pagination: {
+              beforeCursor: page.beforeCursor,
+              hasMoreBefore: page.hasMoreBefore,
+              pageSize: limit,
+            },
+          });
+          return;
+        }
+
+        if (!afterId && providerName === 'AGENT_ZERO') {
+          const provider = AgentRegistry.get(providerName);
+          const page = await readAgentZeroHistoryPage({
+            provider,
+            sessionId: nativeSession.sessionId,
+            limit,
+            scope,
+            beforeCursor,
+          });
+          res.json({
+            messages: page.messages,
+            sessionId: nativeSession.sessionId,
+            activeStream,
+            pagination: {
+              beforeCursor: page.beforeCursor,
+              hasMoreBefore: page.hasMoreBefore,
+              pageSize: limit,
+            },
+          });
+          return;
+        }
+
+        // Forward-cursor reconnect remains a bounded provider projection. The
+        // initial/older-page path above uses Agent Zero's stable sequence cursor.
         const provider = AgentRegistry.get(providerName);
-        const messages = await provider.getHistory(nativeSession.sessionId);
-        res.json({ messages, sessionId: nativeSession.sessionId });
+        let messages = await provider.getHistory(nativeSession.sessionId);
+        if (afterId) {
+          const idx = messages.findIndex((message: any) => message.id === afterId);
+          if (idx >= 0) messages = messages.slice(idx + 1);
+          res.json({ messages: messages.slice(-limit), sessionId: nativeSession.sessionId, activeStream });
+          return;
+        }
+
+        const anchor = beforeCursor ? decodeHistoryCursor(beforeCursor, scope) : undefined;
+        const page = buildHistoryPage(messages, limit, scope, anchor, true);
+        res.json({
+          messages: page.messages,
+          sessionId: nativeSession.sessionId,
+          activeStream,
+          pagination: {
+            beforeCursor: page.beforeCursor,
+            hasMoreBefore: page.hasMoreBefore,
+            pageSize: limit,
+          },
+        });
         return;
       } catch (err: any) {
         console.warn(`[gateway] Provider ${providerName} getHistory failed: ${err.message}`);
+        if (err instanceof HistoryCursorError) throw err;
+        res.status(502).json({
+          error: 'Failed to get provider history',
+          detail: redactNativeProviderText(err?.message || String(err)) || 'Provider history failed',
+        });
+        return;
       }
     }
 
@@ -4831,28 +6503,80 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
     const sessionsDir = resolveSessionsDir(sessionKey);
     const fileId = resolveSessionFileId(sessionKey, sessionsDir);
     const sessionId = fileId || sessionKey;
-    let messages = enhanced
-      ? readSessionMessagesEnhancedForSessionKey(sessionKey, limit, sessionsDir)
-      : await readSessionMessages(sessionId, limit, sessionsDir);
+    const scope = historyCursorScope(req.user!.userId, providerName, sessionKey);
 
-    if (!fileId && messages.length === 0) {
-      res.json({ messages: [] });
+    if (afterId) {
+      let messages = enhanced
+        ? readSessionMessagesEnhancedForSessionKey(sessionKey, limit, sessionsDir)
+        : await readSessionMessages(sessionId, limit, sessionsDir);
+
+      if (!fileId && messages.length === 0) {
+        res.json({ messages: [] });
+        return;
+      }
+
+      const idx = messages.findIndex((message: any) => message.id === afterId);
+      if (idx >= 0) messages = messages.slice(idx + 1);
+      const activeStreamCandidate = await getOpenClawActiveStreamSnapshot(sessionKey);
+      const revalidatedActiveStream = resolveAttachableHostStreamSnapshot(sessionKey, activeStreamCandidate)
+        || activeStreamCandidate;
+      const activeStream = browserSafeActiveStreamSnapshot(providerName, revalidatedActiveStream);
+      res.json({ messages, sessionId, activeStream });
       return;
     }
 
-    if (afterId) {
-      const idx = messages.findIndex((m: any) => m.id === afterId);
-      if (idx >= 0) messages = messages.slice(idx + 1);
+    const page = await readOpenClawHistoryPage({
+      sessionKey,
+      sessionId,
+      sessionsDir,
+      enhanced,
+      limit,
+      scope,
+      beforeCursor,
+    });
+
+    if (!fileId && page.messages.length === 0) {
+      res.json({
+        messages: [],
+        pagination: { beforeCursor: null, hasMoreBefore: false, pageSize: limit },
+      });
+      return;
     }
 
-    const activeStream = providerName === 'OPENCLAW'
-      ? await getOpenClawActiveStreamSnapshot(sessionKey)
-      : null;
+    const activeStreamCandidate = await getOpenClawActiveStreamSnapshot(sessionKey);
+    const activeStream = browserSafeActiveStreamSnapshot(
+      providerName,
+      resolveAttachableHostStreamSnapshot(sessionKey, activeStreamCandidate) || activeStreamCandidate,
+    );
 
-    res.json({ messages, sessionId, activeStream });
+    res.json({
+      messages: page.messages,
+      sessionId,
+      activeStream,
+      pagination: {
+        beforeCursor: page.beforeCursor,
+        hasMoreBefore: page.hasMoreBefore,
+        pageSize: limit,
+      },
+    });
   } catch (err: any) {
-    const status = err?.message === 'Admin access required' ? 403 : 500;
-    res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to get history', detail: err.message });
+    const status = err?.message === 'Admin access required'
+      ? 403
+      : err instanceof UnknownAgentProviderError
+        ? 400
+      : err instanceof HistoryCursorError
+        ? 400
+        : 500;
+    res.status(status).json({
+      error: status === 403
+        ? 'Admin access required'
+        : status === 400
+          ? err.message
+          : 'Failed to get history',
+      detail: status === 400
+        ? err.message
+        : (redactNativeProviderText(err?.message || String(err)) || 'History failed'),
+    });
   }
 });
 
@@ -4861,64 +6585,54 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
   const { message, session = 'main', provider: providerName, model: requestedModel, agentId } = req.body;
   if (!message) { res.status(400).json({ error: 'message required' }); return; }
 
+  let releaseAuthorizationLease: () => void;
+  let authorizationLeaseReleaseSafe = true;
+  try {
+    // The response can close while a provider continues settling. Keep a
+    // detached mutation lease so that disconnecting the browser cannot let an
+    // old-generation host agent outlive a successful authorization change.
+    releaseAuthorizationLease = acquireWorkspaceAuthorizationMutationLease(req.user!.userId);
+  } catch {
+    res.status(409).json({
+      error: 'Workspace authorization is changing. Reload the Portal before sending another message.',
+      code: 'WORKSPACE_SCOPE_CHANGED',
+    });
+    return;
+  }
+
   const wantStream = req.query.stream === '1' || req.headers.accept === 'text/event-stream';
 
   try {
     const routedProviderName = routeProviderForRequestedModel(providerName, requestedModel);
+    // Authorize the host trust zone before provider lookup or any session write.
+    // Project Chat sends through its project route and only uses this gateway
+    // transport for its already-bound sandbox session history/reconnect lane.
+    const executionContext = requireHostOperatorExecutionContext(req.user!);
+    assertProviderExecutionContext(routedProviderName, executionContext);
     const provider = AgentRegistry.get(routedProviderName);
     const provenance = PROVENANCE[provider.providerName] || `via ${provider.displayName}`;
+    const providerPublishesStream = providerPublishesHostStream(provider.providerName);
 
     const clientSession = typeof session === 'string' && session.trim().length > 0 ? session.trim() : '';
     let sessionId: string;
     if (provider.providerName === 'OPENCLAW') {
-      const useCanonicalMainSession = isOwnerRole(req.user!.role)
-        && (!agentId || agentId === 'main')
-        && (!clientSession || clientSession === 'main');
-      if (agentId && agentId !== 'main') {
-        // Same sub-agent session resolution as the WS path
-        const agentPrefix = `agent:${agentId}:`;
-        if (clientSession.startsWith(agentPrefix)) {
-          sessionId = clientSession;
-        } else {
-          let sessionName: string;
-          if (!clientSession) {
-            sessionName = 'main';
-          } else if (clientSession.startsWith('new-')) {
-            sessionName = `portal-${clientSession}`;
-          } else if (clientSession.startsWith('agent:')) {
-            const parts = clientSession.split(':');
-            sessionName = parts.length >= 3 ? parts.slice(2).join(':') : 'main';
-          } else {
-            sessionName = clientSession;
-          }
-          sessionId = `agent:${agentId}:${sessionName}`;
-        }
-      } else if (clientSession.startsWith('agent:')) {
-        sessionId = clientSession;
-      } else if (useCanonicalMainSession) {
-        sessionId = 'agent:main:main';
-      } else {
-        sessionId = await provider.startSession(req.user!.userId, {
-          metadata: clientSession ? { sessionSlug: clientSession } : undefined,
-        });
-      }
+      sessionId = await resolveOpenClawTurnSessionKey(
+        clientSession,
+        agentId,
+        req.user!,
+      );
     } else {
-      const reusableNativeSession = getOwnedNativeSession(provider.providerName, req.user!.userId, clientSession);
-      if (!reusableNativeSession) {
-        sessionId = await provider.startSession(req.user!.userId, {
-          model: typeof requestedModel === 'string' && requestedModel.trim() ? normalizeRequestedModel(provider.providerName, requestedModel.trim()) : undefined,
-          metadata: { requestedBy: req.user!.email },
-        });
-      } else {
-        sessionId = reusableNativeSession.sessionId;
-        if (typeof requestedModel === 'string' && requestedModel.trim()) {
-          updateNativeSessionModel(provider.providerName, sessionId, normalizeRequestedModel(provider.providerName, requestedModel.trim()));
-        }
-      }
+      sessionId = await resolveNativeSessionForTurn({
+        provider,
+        userId: req.user!.userId,
+        userEmail: req.user!.email,
+        clientSession,
+        executionContext,
+        requestedModel,
+      });
     }
 
-    assertGatewaySessionAccess(sessionId, req.user!, { providerName: provider.providerName });
-
+    await assertGatewaySessionAccess(sessionId, req.user!, { providerName: provider.providerName });
     if (requestedModel && provider.providerName === 'OPENCLAW') {
       if (!String(requestedModel).includes('/')) {
         res.status(400).json({ error: 'model must include provider prefix' });
@@ -4947,6 +6661,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         sessionId,
         requestedModel: typeof requestedModel === 'string' ? requestedModel : undefined,
         message,
+        executionContext,
       });
       if (slashResult.handled) {
         res.json({
@@ -4966,7 +6681,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     if (wantStream) {
       res.socket?.setNoDelay?.(true);
       res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Cache-Control', 'private, no-store, no-transform, max-age=0');
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
       res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -4983,11 +6698,16 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
       let gotRealStatus = false;
       let streamUnsub: (() => void) | null = null;
       let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+      let unregisterSseDelivery = () => {};
+      let unsubscribeAuthorization = () => {};
       const keepaliveTimer = setInterval(() => { if (sseAlive) try { sseWrite(': keepalive\n\n'); } catch { sseAlive = false; } }, 15000);
       const finishSse = () => {
         if (sseFinished) return;
         sseFinished = true;
         sseAlive = false;
+        unsubscribeAuthorization();
+        unsubscribeAuthorization = () => {};
+        unregisterSseDelivery();
         if (fallbackTimer) {
           clearTimeout(fallbackTimer);
           fallbackTimer = null;
@@ -5002,6 +6722,9 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
       };
       req.on('close', () => {
         sseAlive = false;
+        unsubscribeAuthorization();
+        unsubscribeAuthorization = () => {};
+        unregisterSseDelivery();
         if (fallbackTimer) {
           clearTimeout(fallbackTimer);
           fallbackTimer = null;
@@ -5013,27 +6736,82 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         }
       });
 
+      if (req.user?.userId) {
+        const cleanup = () => finishSse();
+        unregisterSseDelivery = registerSseDelivery(
+          req.user.userId,
+          sessionId,
+          req.body?.streamClientId,
+          cleanup,
+        );
+      }
+
       fallbackTimer = setTimeout(() => {
         if (!gotRealStatus && sseAlive) try { sseWrite(`data: ${JSON.stringify({ type: 'status', content: `${provider.displayName} is thinking…` })}\n\n`); } catch { sseAlive = false; }
       }, 2000);
 
-      const senderIdentity = req.user ? { label: req.user.email, userId: req.user.userId, role: req.user.role } : undefined;
+      const routeRunId = randomUUID();
+      unsubscribeAuthorization = subscribeToAuthorizationChanges(req.user!.userId, () => {
+        void provider.abortActiveRun?.(sessionId, routeRunId).catch(() => false);
+        finishSse();
+      });
+      const senderIdentity = req.user
+        ? {
+            label: req.user.email,
+            userId: req.user.userId,
+            role: req.user.role,
+            authorizationVersion: Number(req.user.authorizationVersion ?? 1),
+            requestId: routeRunId,
+          }
+        : undefined;
       const streamStartedAtMs = Date.now();
+      const requestedStreamModel = normalizeGatewayModelId(
+        typeof requestedModel === 'string' ? requestedModel : '',
+      ) || undefined;
 
-      if (provider.providerName === 'OPENCLAW') {
-        // Single-path SSE delivery for OpenClaw: the persistent gateway WS publishes
-        // into StreamEventBus, and this SSE response forwards that bus directly.
-        // Do not re-publish provider callbacks back into StreamEventBus, or the
-        // HTTP send path will recursively amplify the same events.
-        streamEventBus.startStream(sessionId, undefined, {
+      if (providerUsesHostStreamBus(provider.providerName)) {
+        // Single-path SSE delivery for bus-owning providers. OpenClaw's
+        // persistent gateway and host-native CLI providers both publish their
+        // complete turn into StreamEventBus. The response forwards that bus
+        // directly and leaves provider callbacks as no-ops.
+        if (!reserveHostStreamRoute({
+          sessionId,
+          runId: routeRunId,
           provenance,
-          model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
-        });
+          model: requestedStreamModel,
+        })) {
+          sseWrite(`data: ${JSON.stringify({
+            type: 'error',
+            content: 'This chat already has an active turn.',
+            runId: routeRunId,
+          })}\n\n`);
+          finishSse();
+          return;
+        }
 
+        const runMatcher = createHostStreamRunMatcher(provider.providerName, routeRunId);
         let sawTerminalEvent = false;
         let pendingStreamError: string | null = null;
+        const terminalUnsub = streamEventBus.subscribe(sessionId, (evt: StreamEvent) => {
+          if (!runMatcher.matches(evt)) return;
+          gotRealStatus = true;
+          if (evt.type === 'done') {
+            sawTerminalEvent = true;
+            return;
+          }
+          if (evt.type !== 'error') return;
+          const errorText = redactNativeProviderText(
+            typeof evt.content === 'string' && evt.content.trim() ? evt.content.trim() : 'Agent error',
+          ) || 'Agent error';
+          if (provider.providerName === 'OPENCLAW' && (evt as any).terminal !== true) {
+            pendingStreamError = errorText;
+            return;
+          }
+          sawTerminalEvent = true;
+        });
         const deniedApprovalIds = new Set<string>();
         streamUnsub = streamEventBus.subscribe(sessionId, (evt: StreamEvent) => {
+          if (!runMatcher.matches(evt)) return;
           if (!sseAlive || sseFinished) return;
           gotRealStatus = true;
           const runtimeEvt = evt as any;
@@ -5056,9 +6834,20 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
             }
           }
           if (evt.type === 'error') {
-            pendingStreamError = typeof evt.content === 'string' && evt.content.trim()
-              ? evt.content.trim()
-              : 'Agent error';
+            const errorText = redactNativeProviderText(
+              typeof evt.content === 'string' && evt.content.trim() ? evt.content.trim() : 'Agent error',
+            ) || 'Agent error';
+            if (provider.providerName === 'OPENCLAW' && (evt as any).terminal !== true) {
+              pendingStreamError = errorText;
+              return;
+            }
+            sawTerminalEvent = true;
+            try {
+              sseWrite(`data: ${JSON.stringify(evt)}\n\n`);
+            } catch {
+              sseAlive = false;
+            }
+            finishSse();
             return;
           }
           try {
@@ -5074,47 +6863,104 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         });
 
         try {
-          const result = await (provider as any).sendMessage(
+          const result = await sendHostOperatorProviderMessage({
+            provider,
             sessionId,
             message,
-            (_chunk: string) => {},
-            (_evt: { type: string; content?: string; [key: string]: any }) => {},
-            (_approval: ExecApprovalRequest) => {},
-            senderIdentity,
-          );
-          if (!sawTerminalEvent && sseAlive && !sseFinished) {
-            sseWrite(`data: ${JSON.stringify({
-              type: 'done',
-              content: result.fullText,
+            onChunk: providerPublishesStream
+              ? (_chunk: string) => {}
+              : (chunk: string) => {
+                  if (!chunk) return;
+                  publishRouteOwnedHostStreamEvent({
+                    sessionId,
+                    runId: routeRunId,
+                    provenance,
+                    model: requestedStreamModel,
+                    event: { type: 'text', content: chunk },
+                  });
+                },
+            onStatus: providerPublishesStream
+              ? (_evt: { type: string; content?: string; [key: string]: any }) => {}
+              : (evt: { type: string; content?: string; [key: string]: any }) => {
+                  publishRouteOwnedHostStreamEvent({
+                    sessionId,
+                    runId: routeRunId,
+                    provenance,
+                    model: requestedStreamModel,
+                    event: evt,
+                  });
+                },
+            onExecApproval: providerPublishesStream
+              ? (_approval: ExecApprovalRequest) => {}
+              : (approval: ExecApprovalRequest) => {
+                  publishRouteOwnedHostStreamEvent({
+                    sessionId,
+                    runId: routeRunId,
+                    provenance,
+                    model: requestedStreamModel,
+                    event: { type: 'exec_approval', approval },
+                  });
+                },
+            sender: senderIdentity,
+            onQuarantinePersistenceFailure: () => {
+              authorizationLeaseReleaseSafe = false;
+            },
+          });
+          if (!sawTerminalEvent) {
+            publishRouteOwnedHostStreamDone({
+              sessionId,
+              runId: runMatcher.currentRunId(),
               provenance,
-              model: normalizeGatewayModelId(result.metadata?.model) || null,
-              metadata: result.metadata || {},
-            })}\n\n`);
-            finishSse();
+              result,
+            });
+          } else if (!providerPublishesStream) {
+            softClearHostStreamIfCurrent(sessionId, routeRunId);
           }
         } catch (err: any) {
+          if (sawTerminalEvent) {
+            if (!providerPublishesStream) softClearHostStreamIfCurrent(sessionId, routeRunId);
+            finishSse();
+            return;
+          }
+          if (err instanceof AgentAbortError) {
+            publishRouteOwnedHostStreamDone({
+              sessionId,
+              runId: runMatcher.currentRunId(),
+              provenance,
+              result: { fullText: '', metadata: {} },
+              aborted: true,
+            });
+            return;
+          }
           const friendlyError = humanizeProviderError(provider.providerName, err?.message || String(err));
-          const shouldAttemptRecovery = Boolean(pendingStreamError || (typeof requestedModel === 'string' && requestedModel.trim()));
+          const shouldAttemptRecovery = shouldAttemptOpenClawReplyRecovery(
+            provider.providerName,
+            pendingStreamError,
+            requestedModel,
+          );
           if (shouldAttemptRecovery) {
             const recovered = await recoverRecentOpenClawAssistantReply(sessionId, streamStartedAtMs);
-            if (recovered && !sseFinished && sseAlive) {
-              try {
-                sseWrite(`data: ${JSON.stringify({
-                  type: 'done',
-                  content: recovered.content,
-                  provenance,
-                  model: recovered.model,
-                  metadata: { recoveredAfterError: true },
-                })}\n\n`);
-              } catch {}
-              finishSse();
+            if (recovered) {
+              publishRouteOwnedHostStreamDone({
+                sessionId,
+                runId: runMatcher.currentRunId(),
+                provenance,
+                result: {
+                  fullText: recovered.content,
+                  metadata: { model: recovered.model, recoveredAfterError: true },
+                },
+              });
               return;
             }
           }
-          if (!sseFinished && sseAlive) {
-            try { sseWrite(`data: ${JSON.stringify({ type: 'error', content: pendingStreamError || friendlyError })}\n\n`); } catch {}
-          }
-          finishSse();
+          const errorContent = redactNativeProviderText(pendingStreamError || friendlyError) || 'Agent error';
+          publishRouteOwnedHostStreamError({
+            sessionId,
+            runId: runMatcher.currentRunId(),
+            content: errorContent,
+          });
+        } finally {
+          terminalUnsub();
         }
         return;
       }
@@ -5138,38 +6984,38 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
           if (sseAlive) try { sseWrite(`data: ${JSON.stringify({ type: 'exec_approval', approval })}\n\n`); } catch { sseAlive = false; }
           return;
         }
-        const runId = typeof evt.runId === 'string' ? evt.runId : undefined;
+        const runId = routeRunId;
         if (evt.type === 'tool_start') {
-          streamEventBus.startStream(sessionId, runId, {
+          if (!streamEventBus.startStream(sessionId, runId, {
             provenance,
             model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
-          });
-          streamEventBus.updateStreamPhase(sessionId, { phase: 'tool', toolName: typeof evt.toolName === 'string' ? evt.toolName : undefined, runId });
+          })) return;
+          if (!streamEventBus.updateStreamPhase(sessionId, { phase: 'tool', toolName: typeof evt.toolName === 'string' ? evt.toolName : undefined, runId })) return;
         } else if (evt.type === 'tool_update') {
-          streamEventBus.startStream(sessionId, runId, {
+          if (!streamEventBus.startStream(sessionId, runId, {
             provenance,
             model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
-          });
-          streamEventBus.updateStreamPhase(sessionId, { phase: 'tool', toolName: typeof evt.toolName === 'string' ? evt.toolName : undefined, runId });
+          })) return;
+          if (!streamEventBus.updateStreamPhase(sessionId, { phase: 'tool', toolName: typeof evt.toolName === 'string' ? evt.toolName : undefined, runId })) return;
         } else if (evt.type === 'tool_end') {
-          streamEventBus.startStream(sessionId, runId, {
+          if (!streamEventBus.startStream(sessionId, runId, {
             provenance,
             model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
-          });
-          streamEventBus.updateStreamPhase(sessionId, { phase: 'thinking', runId });
+          })) return;
+          if (!streamEventBus.updateStreamPhase(sessionId, { phase: 'thinking', runId })) return;
         } else if (evt.type === 'thinking' || evt.type === 'status') {
-          streamEventBus.startStream(sessionId, runId, {
+          if (!streamEventBus.startStream(sessionId, runId, {
             provenance,
             model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
-          });
-          streamEventBus.updateStreamPhase(sessionId, { phase: 'thinking', runId });
+          })) return;
+          if (!streamEventBus.updateStreamPhase(sessionId, { phase: 'thinking', runId })) return;
         } else if (evt.type === 'run_resumed') {
-          streamEventBus.startStream(sessionId, runId, {
+          if (!streamEventBus.startStream(sessionId, runId, {
             provenance,
             model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
-          });
+          })) return;
         }
-        streamEventBus.publish(sessionId, evt as StreamEvent);
+        streamEventBus.publish(sessionId, { ...evt, runId } as StreamEvent);
         if (sseAlive) try { sseWrite(`data: ${JSON.stringify(evt)}\n\n`); } catch { sseAlive = false; }
       };
       const onExecApproval = (approval: ExecApprovalRequest) => {
@@ -5187,22 +7033,26 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         }
         if (sseAlive) try { sseWrite(`data: ${JSON.stringify({ type: 'exec_approval', approval })}\n\n`); } catch { sseAlive = false; }
       };
-      streamEventBus.startStream(sessionId, undefined, {
+      if (!streamEventBus.startStream(sessionId, routeRunId, {
         provenance,
         model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
-      });
+      })) {
+        sseWrite(`data: ${JSON.stringify({ type: 'error', content: 'This chat already has an active turn.', runId: routeRunId })}\n\n`);
+        finishSse();
+        return;
+      }
 
       try {
         const result = await (provider as any).sendMessage(
           sessionId,
           message,
           (chunk: string) => {
-            streamEventBus.startStream(sessionId, undefined, {
+            if (!streamEventBus.startStream(sessionId, routeRunId, {
               provenance,
               model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
-            });
-            streamEventBus.updateStreamPhase(sessionId, { phase: 'streaming' });
-            streamEventBus.publish(sessionId, { type: 'text', content: chunk } as StreamEvent);
+            })) return;
+            if (!streamEventBus.updateStreamPhase(sessionId, { phase: 'streaming', runId: routeRunId })) return;
+            streamEventBus.publish(sessionId, { type: 'text', content: chunk, runId: routeRunId } as StreamEvent);
             if (sseAlive) try { sseWrite(`data: ${JSON.stringify({ type: 'text', content: chunk })}\n\n`); } catch { sseAlive = false; }
           },
           onStatus,
@@ -5218,8 +7068,9 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
           type: 'done',
           content: result.fullText,
           model: normalizeGatewayModelId(result.metadata?.model) || null,
+          runId: routeRunId,
         } as StreamEvent);
-        streamEventBus.softClearStream(sessionId);
+        streamEventBus.softClearStream(sessionId, routeRunId);
         if (sseAlive) {
           sseWrite(`data: ${JSON.stringify({
             type: 'done',
@@ -5236,9 +7087,11 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
           fallbackTimer = null;
         }
         clearInterval(keepaliveTimer);
-        const friendlyError = humanizeProviderError(provider.providerName, err?.message || String(err));
-        streamEventBus.publish(sessionId, { type: 'error', content: friendlyError } as StreamEvent);
-        streamEventBus.clearStream(sessionId);
+        const friendlyError = redactNativeProviderText(
+          humanizeProviderError(provider.providerName, err?.message || String(err)),
+        ) || 'Agent error';
+        streamEventBus.publish(sessionId, { type: 'error', content: friendlyError, terminal: true, runId: routeRunId } as StreamEvent);
+        streamEventBus.clearStream(sessionId, routeRunId);
         if (sseAlive) {
           sseWrite(`data: ${JSON.stringify({ type: 'error', content: friendlyError })}\n\n`);
         }
@@ -5248,10 +7101,84 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     }
 
     // Non-streaming
-    const senderIdentity = req.user ? { label: req.user.email, userId: req.user.userId, role: req.user.role } : undefined;
+    const nonStreamingRunId = randomUUID();
+    const senderIdentity = req.user
+      ? {
+          label: req.user.email,
+          userId: req.user.userId,
+          role: req.user.role,
+          authorizationVersion: Number(req.user.authorizationVersion ?? 1),
+          requestId: nonStreamingRunId,
+        }
+      : undefined;
     const nonStreamingStartedAtMs = Date.now();
+    const nonStreamingRunMatcher = createHostStreamRunMatcher(provider.providerName, nonStreamingRunId);
+    let sawNonStreamingTerminal = false;
+    let pendingNonStreamingError: string | null = null;
+    let nonStreamingTerminalUnsub: (() => void) | null = null;
+    if (providerUsesHostStreamBus(provider.providerName)) {
+      if (!reserveHostStreamRoute({
+        sessionId,
+        runId: nonStreamingRunId,
+        provenance,
+        model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
+      })) {
+        res.status(409).json({ error: 'This chat already has an active turn.' });
+        return;
+      }
+      nonStreamingTerminalUnsub = streamEventBus.subscribe(sessionId, (event: StreamEvent) => {
+        if (!nonStreamingRunMatcher.matches(event)) return;
+        if (event.type === 'error' && provider.providerName === 'OPENCLAW' && (event as any).terminal !== true) {
+          pendingNonStreamingError = redactNativeProviderText(
+            typeof event.content === 'string' && event.content.trim() ? event.content.trim() : 'Agent error',
+          ) || 'Agent error';
+          return;
+        }
+        if (event.type === 'done' || event.type === 'error') {
+          sawNonStreamingTerminal = true;
+        }
+      });
+    }
     try {
-      const result = await (provider as any).sendMessage(sessionId, message, undefined, undefined, undefined, senderIdentity);
+      const result = await sendHostOperatorProviderMessage({
+        provider,
+        sessionId,
+        message,
+        onChunk: providerPublishesStream
+          ? undefined
+          : (chunk: string) => {
+              if (!chunk) return;
+              publishRouteOwnedHostStreamEvent({
+                sessionId,
+                runId: nonStreamingRunId,
+                provenance,
+                event: { type: 'text', content: chunk },
+              });
+            },
+        onStatus: providerPublishesStream
+          ? undefined
+          : (event: { type?: string; content?: string; [key: string]: unknown }) => {
+              publishRouteOwnedHostStreamEvent({
+                sessionId,
+                runId: nonStreamingRunId,
+                provenance,
+                event,
+              });
+            },
+        onExecApproval: undefined,
+        sender: senderIdentity,
+        onQuarantinePersistenceFailure: () => {
+          authorizationLeaseReleaseSafe = false;
+        },
+      });
+      if (providerUsesHostStreamBus(provider.providerName) && !sawNonStreamingTerminal) {
+        publishRouteOwnedHostStreamDone({
+          sessionId,
+          runId: nonStreamingRunMatcher.currentRunId(),
+          provenance,
+          result,
+        });
+      }
       const resolvedSessionId = typeof result?.metadata?.resolvedSessionId === 'string' && result.metadata.resolvedSessionId.trim()
         ? result.metadata.resolvedSessionId.trim()
         : sessionId;
@@ -5264,9 +7191,25 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
       });
       return;
     } catch (sendErr: any) {
-      if (provider.providerName === 'OPENCLAW' && typeof requestedModel === 'string' && requestedModel.trim()) {
+      const shouldAttemptRecovery = shouldAttemptOpenClawReplyRecovery(
+        provider.providerName,
+        pendingNonStreamingError,
+        requestedModel,
+      );
+      if (shouldAttemptRecovery) {
         const recovered = await recoverRecentOpenClawAssistantReply(sessionId, nonStreamingStartedAtMs);
         if (recovered) {
+          if (providerUsesHostStreamBus(provider.providerName) && !sawNonStreamingTerminal) {
+            publishRouteOwnedHostStreamDone({
+              sessionId,
+              runId: nonStreamingRunMatcher.currentRunId(),
+              provenance,
+              result: {
+                fullText: recovered.content,
+                metadata: { model: recovered.model, recoveredAfterError: true },
+              },
+            });
+          }
           res.json({
             response: recovered.content,
             model: recovered.model,
@@ -5278,14 +7221,61 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
           return;
         }
       }
+      if (providerUsesHostStreamBus(provider.providerName) && !sawNonStreamingTerminal) {
+        if (sendErr instanceof AgentAbortError) {
+          publishRouteOwnedHostStreamDone({
+            sessionId,
+            runId: nonStreamingRunMatcher.currentRunId(),
+            provenance,
+            result: { fullText: '', metadata: {} },
+            aborted: true,
+          });
+        } else {
+          publishRouteOwnedHostStreamError({
+            sessionId,
+            runId: nonStreamingRunMatcher.currentRunId(),
+            content: pendingNonStreamingError || sendErr?.message || String(sendErr),
+          });
+        }
+      }
       throw sendErr;
+    } finally {
+      nonStreamingTerminalUnsub?.();
     }
   } catch (err: any) {
-    const status = err?.message === 'Admin access required' ? 403 : 503;
-    const friendlyError = status === 403
-      ? 'Admin access required'
-      : humanizeProviderError(normalizeProviderName(req.body?.provider), err?.message || String(err));
-    res.status(status).json({ error: friendlyError, detail: err?.message || String(err) });
+    const status = err instanceof UnknownAgentProviderError
+      ? 400
+      : err?.message === 'Admin access required'
+        ? 403
+        : err instanceof AgentZeroOAuthModelCatalogError
+          ? err.code === 'CATALOG_UNAVAILABLE' ? 503 : 409
+          : 503;
+    const safeDetail = err instanceof AgentZeroOAuthModelCatalogError
+      ? err.message
+      : redactNativeProviderText(err?.message || String(err)) || 'Agent error';
+    const friendlyError = err instanceof AgentZeroOAuthModelCatalogError
+      ? err.message
+      : status === 400
+        ? err.message
+        : status === 403
+          ? 'Admin access required'
+          : (redactNativeProviderText(
+              humanizeProviderError(normalizeProviderName(req.body?.provider), err?.message || String(err)),
+            ) || 'Agent error');
+    res.status(status).json({
+      error: friendlyError,
+      detail: safeDetail,
+      ...(err instanceof AgentZeroOAuthModelCatalogError ? { code: err.code } : {}),
+    });
+  } finally {
+    settleWorkspaceAuthorizationRequest(req);
+    if (authorizationLeaseReleaseSafe) {
+      releaseAuthorizationLease();
+    } else {
+      console.error(
+        '[gateway] Retaining the workspace authorization lease because an OpenClaw host-run ambiguity could not be quarantined',
+      );
+    }
   }
 });
 
@@ -5295,7 +7285,7 @@ router.get('/agents', authenticateToken, requireAdmin, async (_req: Request, res
     const raw = await listOpenClawAgentsForSelector();
 
     // Fetch sub-agent avatars from DB
-    let subAgentAvatarMap: Record<string, string> = {};
+    const subAgentAvatarMap: Record<string, string> = {};
     try {
       const { prisma } = await import('../config/database');
       const rows = await prisma.systemSetting.findMany({
@@ -5340,9 +7330,12 @@ router.get('/agents', authenticateToken, requireAdmin, async (_req: Request, res
 
 // GET /api/gateway/stream-status — check if a stream is active for a session
 router.get('/stream-status', authenticateToken, async (req: Request, res: Response) => {
-  const sessionKey = resolveOpenClawSessionKey(req.query.session as string, req.user);
+  const providerName = normalizeProviderName(req.query.provider);
+  const sessionKey = providerName === 'OPENCLAW'
+    ? await resolveOpenClawSessionKey(req.query.session as string, req.user)
+    : String(req.query.session || '').trim();
   try {
-    assertGatewaySessionAccess(sessionKey, req.user!);
+    await assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
   } catch (err: any) {
     res.status(403).json({ error: 'Admin access required', detail: err.message });
     return;
@@ -5351,42 +7344,63 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
     res.json({ active: false });
     return;
   }
-  res.json(await getOpenClawActiveStreamSnapshot(sessionKey));
+  const streamStatusCandidate = await getProviderActiveStreamSnapshot(providerName, sessionKey);
+  const streamStatus = resolveAttachableHostStreamSnapshot(sessionKey, streamStatusCandidate)
+    || streamStatusCandidate;
+  res.json(browserSafeActiveStreamSnapshot(providerName, streamStatus));
 });
 
 router.post('/chat/abort', authenticateToken, requireApproved, async (req: Request, res: Response): Promise<void> => {
   const { session, runId } = req.body;
   const providerName = normalizeProviderName(req.body?.provider);
   const sessionKey = providerName === 'OPENCLAW'
-    ? resolveOpenClawSessionKey(session, req.user)
+    ? await resolveOpenClawSessionKey(session, req.user)
     : String(session || '').trim();
   console.log(`[gateway] HTTP ABORT REQUEST: provider=${providerName} session=${sessionKey} runId=${runId || 'none'}`);
   try {
-    assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
+    await assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
 
     if (providerName !== 'OPENCLAW') {
       const provider = AgentRegistry.get(providerName);
-      const aborted = await provider.abortActiveRun?.(sessionKey);
-      res.json({ ok: aborted !== false, sessionKey, provider: providerName });
+      const expectedRunId = typeof runId === 'string' && runId.trim() ? runId.trim() : undefined;
+      const aborted = await provider.abortActiveRun?.(sessionKey, expectedRunId);
+      res.json({ ok: aborted === true, sessionKey, provider: providerName, runId: expectedRunId || null });
       return;
     }
 
     const payload: Record<string, string> = { sessionKey };
     if (runId) payload.runId = runId;
+    const abortRunIdentity = captureHostStreamRunIdentity(sessionKey, runId);
     const result = await gatewayRpcCall('chat.abort', payload);
     console.log(`[gateway] HTTP ABORT RESULT: ok=${result.ok} error=${result.error || 'none'}`);
-    if (!result.ok) { res.status(500).json({ error: 'Abort failed', detail: result.error }); return; }
-    streamEventBus.clearStream(sessionKey);
-    res.json({ ok: true, sessionKey, provider: providerName });
+    if (!result.ok) {
+      res.status(500).json({
+        error: 'Abort failed',
+        detail: redactNativeProviderText(result.error || 'Abort was not confirmed') || 'Abort was not confirmed',
+      });
+      return;
+    }
+    const aborted = result.data?.aborted !== false;
+    if (!aborted) {
+      res.json({ ok: false, sessionKey, provider: providerName, runId: runId || null });
+      return;
+    }
+    clearHostStreamIfCurrentRun(sessionKey, abortRunIdentity);
+    res.json({ ok: true, sessionKey, provider: providerName, runId: runId || null });
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 500;
-    res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to abort', detail: err.message });
+    res.status(status).json({
+      error: status === 403 ? 'Admin access required' : 'Failed to abort',
+      detail: status === 403
+        ? 'Admin access required'
+        : (redactNativeProviderText(err?.message || String(err)) || 'Abort failed'),
+    });
   }
 });
 
 
 router.post('/chat/inject', authenticateToken, requireApproved, async (req: Request, res: Response): Promise<void> => {
-  const sessionKey = resolveOpenClawSessionKey(req.body?.session, req.user);
+  const sessionKey = await resolveOpenClawSessionKey(req.body?.session, req.user);
   const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
   if (!isElevatedRole(req.user!.role)) {
     res.status(403).json({ error: 'Admin access required' });
@@ -5397,7 +7411,7 @@ router.post('/chat/inject', authenticateToken, requireApproved, async (req: Requ
     return;
   }
   try {
-    assertGatewaySessionAccess(sessionKey, req.user!);
+    await assertGatewaySessionAccess(sessionKey, req.user!);
     await injectChatMessage(sessionKey, text);
     res.json({ ok: true, sessionKey });
   } catch (err: any) {
@@ -5406,20 +7420,84 @@ router.post('/chat/inject', authenticateToken, requireApproved, async (req: Requ
   }
 });
 
-router.post('/session-steer', authenticateToken, requireApproved, async (req: Request, res: Response): Promise<void> => {
-  const sessionKey = resolveOpenClawSessionKey(req.body?.session, req.user);
+function pendingUserInputRouteError(res: Response, error: unknown): void {
+  if (error instanceof PendingUserInputAnswerError) {
+    res.status(error.statusCode).json({ error: error.message, code: error.code });
+    return;
+  }
+  if (error instanceof AskUserQuestionError) {
+    if (error.code === 'ASK_USER_AUTHORIZATION_TRANSITION') {
+      res.status(503).json({ error: error.message, code: error.code });
+      return;
+    }
+    if (error.code === 'ASK_USER_RUN_IDENTITY_REQUIRED') {
+      res.status(400).json({ error: error.message, code: error.code });
+      return;
+    }
+    if (error.code === 'ASK_USER_RUN_AMBIGUOUS') {
+      res.status(409).json({ error: error.message, code: error.code });
+      return;
+    }
+    // Ownership mismatches are deliberately indistinguishable from stale
+    // runs so one Portal user cannot probe another user's active run IDs.
+    res.status(404).json({ error: 'That OpenClaw run is no longer waiting for input.' });
+    return;
+  }
+  const message = String((error as any)?.message || error || '');
+  if (message === 'Admin access required') {
+    res.status(404).json({ error: 'That OpenClaw run is no longer waiting for input.' });
+    return;
+  }
+  console.error('[gateway] pending-user-input answer failed:', error);
+  res.status(500).json({ error: 'Failed to answer the OpenClaw prompt.' });
+}
+
+router.post('/answer-user-input', authenticateToken, requireApproved, async (req: Request, res: Response): Promise<void> => {
   const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  const runId = typeof req.body?.runId === 'string' ? req.body.runId.trim() : '';
+  const requestId = typeof req.body?.requestId === 'string' ? req.body.requestId.trim() : '';
+  if (!message || !runId || !requestId) {
+    res.status(400).json({ error: 'message, runId, and requestId are required' });
+    return;
+  }
+  try {
+    const sessionKey = await resolveOpenClawSessionKey(req.body?.session, req.user);
+    const ownership = await resolveAskUserQuestionRunOwner({
+      sessionKey,
+      runId,
+      toolCallId: requestId,
+    });
+    const actorAuthorizationVersion = Number(req.user?.authorizationVersion ?? 1);
+    if (
+      ownership.surface !== 'agent-chat'
+      || ownership.ownerUserId !== req.user?.userId
+      || ownership.actorAuthorizationVersion !== actorAuthorizationVersion
+    ) {
+      res.status(404).json({ error: 'That OpenClaw run is no longer waiting for input.' });
+      return;
+    }
+    await assertExistingGatewaySessionAccess(sessionKey, req.user!);
+    const result = await answerPendingUserInput(sessionKey, runId, requestId, message);
+    res.json({ ok: true, sessionKey, ...result });
+  } catch (error) {
+    pendingUserInputRouteError(res, error);
+  }
+});
+
+router.post('/session-steer', authenticateToken, requireApproved, async (req: Request, res: Response): Promise<void> => {
+  const sessionKey = await resolveOpenClawSessionKey(req.body?.session, req.user);
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  const requestId = typeof req.body?.requestId === 'string' ? req.body.requestId.trim() : undefined;
   if (!message) {
     res.status(400).json({ error: 'message required' });
     return;
   }
   try {
-    assertGatewaySessionAccess(sessionKey, req.user!);
-    const result = await steerSessionMessage(sessionKey, message);
+    await assertGatewaySessionAccess(sessionKey, req.user!);
+    const result = await steerSessionMessage(sessionKey, message, requestId);
     res.json({ ok: true, sessionKey, ...result });
-  } catch (err: any) {
-    const status = err?.message === 'Admin access required' ? 403 : 500;
-    res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to steer session', detail: err.message });
+  } catch (error) {
+    pendingUserInputRouteError(res, error);
   }
 });
 
@@ -5466,36 +7544,112 @@ router.post('/exec-approval/resolve', authenticateToken, requireAdmin, async (re
 });
 
 // GET /api/gateway/approvals/stream — SSE for exec approval events (kept as fallback)
-router.get('/approvals/stream', authenticateToken, requireAdmin, (req: Request, res: Response) => {
+router.get('/approvals/stream', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   res.socket?.setNoDelay?.(true);
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Cache-Control', 'private, no-store, no-transform, max-age=0');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.flushHeaders();
 
   let alive = true;
-  const sseWrite = (data: string) => { if (!alive) return; try { res.write(data); if (typeof (res as any).flush === 'function') (res as any).flush(); } catch { alive = false; } };
-  sseWrite(`data: ${JSON.stringify({ type: 'connected', persistentWsConnected: isPersistentWsConnected() })}\n\n`);
+  let cleaned = false;
+  let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+  let unsubscribeAuthorization = () => {};
+  let unsubReq = () => {};
+  let unsubRes = () => {};
+  let unsubNativeReq = () => {};
+  let unsubNativeRes = () => {};
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    alive = false;
+    unsubscribeAuthorization();
+    unsubscribeAuthorization = () => {};
+    if (keepaliveTimer) {
+      clearInterval(keepaliveTimer);
+      keepaliveTimer = undefined;
+    }
+    unsubReq();
+    unsubReq = () => {};
+    unsubRes();
+    unsubRes = () => {};
+    unsubNativeReq();
+    unsubNativeReq = () => {};
+    unsubNativeRes();
+    unsubNativeRes = () => {};
+  };
+  const terminateStream = () => {
+    cleanup();
+    if (!res.destroyed) res.destroy();
+  };
+  const sseWrite = (data: string): boolean => {
+    if (!alive) return false;
+    try {
+      res.write(data);
+      if (typeof (res as any).flush === 'function') (res as any).flush();
+      return true;
+    } catch {
+      terminateStream();
+      return false;
+    }
+  };
+  if (!sseWrite(`data: ${JSON.stringify({ type: 'connected', persistentWsConnected: isPersistentWsConnected() })}\n\n`)) {
+    return;
+  }
   // Replay any in-flight approval requests so a reconnecting / late SSE client still
   // renders the popup. The frontend upserts by id, so re-delivery is idempotent.
-  for (const approval of pendingApprovalsForUser(req.user!)) {
-    sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_requested', approval })}\n\n`);
+  for (const approval of await pendingApprovalsForUser(req.user!)) {
+    if (!sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_requested', approval })}\n\n`)) {
+      return;
+    }
   }
-  const keepaliveTimer = setInterval(() => { if (alive) sseWrite(': keepalive\n\n'); }, 15000);
-  const unsubReq = onApprovalRequest((a: PersistentApprovalRequest) => sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_requested', approval: a })}\n\n`));
-  const unsubRes = onApprovalResolved((r: ExecApprovalResolved) => sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_resolved', resolved: r })}\n\n`));
-  const unsubNativeReq = onNativeCliApprovalRequest((a: ExecApprovalRequest) => sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_requested', approval: a })}\n\n`));
-  const unsubNativeRes = onNativeCliApprovalResolved((r: ExecApprovalResolved) => sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_resolved', resolved: r })}\n\n`));
-  req.on('close', () => {
-    alive = false;
-    clearInterval(keepaliveTimer);
-    unsubReq();
-    unsubRes();
-    unsubNativeReq();
-    unsubNativeRes();
+  keepaliveTimer = setInterval(() => {
+    sseWrite(': keepalive\n\n');
+  }, 15000);
+  const deliverApprovalRequest = (approval: ExecApprovalRequest) => {
+    void (async () => {
+      let releaseAuthorizationLease: (() => void) | null = null;
+      try {
+        releaseAuthorizationLease = acquireWorkspaceAuthorizationMutationLease(req.user!.userId);
+        await assertGatewayActorIsCurrent(req.user!);
+        await assertApprovalAccess(approval, req.user!);
+        await assertGatewayActorIsCurrent(req.user!);
+        sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_requested', approval })}\n\n`);
+      } catch {
+        // Fenced, stale, or cross-user approvals are deliberately invisible.
+      } finally {
+        releaseAuthorizationLease?.();
+      }
+    })();
+  };
+  const deliverApprovalResolved = (resolved: ExecApprovalResolved) => {
+    void (async () => {
+      const sessionKey = approvalSessionKeys.get(resolved.id);
+      if (!sessionKey) return;
+      let releaseAuthorizationLease: (() => void) | null = null;
+      try {
+        releaseAuthorizationLease = acquireWorkspaceAuthorizationMutationLease(req.user!.userId);
+        await assertGatewayActorIsCurrent(req.user!);
+        await assertAgentStreamSessionAccess(sessionKey, req.user!);
+        await assertGatewayActorIsCurrent(req.user!);
+        sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_resolved', resolved })}\n\n`);
+      } catch {
+        // Fenced, stale, or cross-user resolutions are deliberately invisible.
+      } finally {
+        releaseAuthorizationLease?.();
+      }
+    })();
+  };
+  unsubReq = onApprovalRequest(deliverApprovalRequest);
+  unsubRes = onApprovalResolved(deliverApprovalResolved);
+  unsubNativeReq = onNativeCliApprovalRequest(deliverApprovalRequest);
+  unsubNativeRes = onNativeCliApprovalResolved(deliverApprovalResolved);
+  unsubscribeAuthorization = subscribeToAuthorizationChanges(req.user!.userId, () => {
+    terminateStream();
   });
+  req.on('close', cleanup);
 });
 
 
@@ -5503,20 +7657,9 @@ router.get('/approvals/stream', authenticateToken, requireAdmin, (req: Request, 
  * BROWSER ↔ PORTAL PERSISTENT WEBSOCKET
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-function parseCookiesWs(cookieHeader: string): Record<string, string> {
-  const cookies: Record<string, string> = {};
-  if (!cookieHeader) return cookies;
-  cookieHeader.split(';').forEach(pair => {
-    const idx = pair.indexOf('=');
-    if (idx > 0) {
-      cookies[pair.substring(0, idx).trim()] = decodeURIComponent(pair.substring(idx + 1).trim());
-    }
-  });
-  return cookies;
-}
-
 // Track active portal WS clients for approval broadcasting
 const portalWsClients: Set<WebSocket> = new Set();
+const approvalSessionKeys = new Map<string, string>();
 
 // Broadcast approval events to all portal WS clients
 let approvalBroadcastInit = false;
@@ -5526,24 +7669,66 @@ function initApprovalWsBroadcast() {
   const broadcastApprovalRequest = (approval: ExecApprovalRequest) => {
     const msg = JSON.stringify({ type: 'exec_approval', approval });
     const sessionKey = approval?.request?.sessionKey;
+    if (typeof sessionKey !== 'string' || !sessionKey.trim()) return;
+    approvalSessionKeys.set(approval.id, sessionKey.trim());
     for (const c of portalWsClients) {
       if (c.readyState !== WebSocket.OPEN) continue;
       const user = (c as any).__portalUser as JwtPayload | undefined;
       if (!user || !isElevatedRole(user.role)) continue;
-      if (sessionKey) {
+      void (async () => {
+        let releaseAuthorizationLease: (() => void) | null = null;
         try {
-          assertGatewaySessionAccess(sessionKey, user);
+          releaseAuthorizationLease = acquireWorkspaceAuthorizationMutationLease(user.userId);
+          const binding = (c as any).__portalAuthorizationBinding as
+            | GatewayWebSocketAuthorizationBinding
+            | undefined;
+          await assertGatewayWebSocketActorIsCurrent(user, binding);
+          await assertAgentStreamSessionAccess(sessionKey, user);
+          await assertGatewayWebSocketActorIsCurrent(user, binding);
+          if (c.readyState === WebSocket.OPEN) {
+            try { c.send(msg); } catch {}
+          }
         } catch {
-          continue;
+          // Fenced, stale, or cross-user approvals are deliberately invisible.
+        } finally {
+          releaseAuthorizationLease?.();
         }
-      }
-      try { c.send(msg); } catch {}
+      })();
     }
   };
   const broadcastApprovalResolved = (resolved: ExecApprovalResolved) => {
     const msg = JSON.stringify({ type: 'exec_approval_resolved', resolved });
+    const sessionKey = approvalSessionKeys.get(resolved.id);
+    if (!sessionKey) return;
+    const cleanupTimer = setTimeout(() => {
+      if (approvalSessionKeys.get(resolved.id) === sessionKey) {
+        approvalSessionKeys.delete(resolved.id);
+      }
+    }, 60_000);
+    cleanupTimer.unref?.();
     for (const c of portalWsClients) {
-      if (c.readyState === WebSocket.OPEN) try { c.send(msg); } catch {}
+      if (c.readyState !== WebSocket.OPEN) continue;
+      const user = (c as any).__portalUser as JwtPayload | undefined;
+      if (!user || !isElevatedRole(user.role)) continue;
+      void (async () => {
+        let releaseAuthorizationLease: (() => void) | null = null;
+        try {
+          releaseAuthorizationLease = acquireWorkspaceAuthorizationMutationLease(user.userId);
+          const binding = (c as any).__portalAuthorizationBinding as
+            | GatewayWebSocketAuthorizationBinding
+            | undefined;
+          await assertGatewayWebSocketActorIsCurrent(user, binding);
+          await assertAgentStreamSessionAccess(sessionKey, user);
+          await assertGatewayWebSocketActorIsCurrent(user, binding);
+          if (c.readyState === WebSocket.OPEN) {
+            try { c.send(msg); } catch {}
+          }
+        } catch {
+          // Fenced, stale, or cross-user resolutions are deliberately invisible.
+        } finally {
+          releaseAuthorizationLease?.();
+        }
+      })();
     }
   };
   onApprovalRequest((approval: PersistentApprovalRequest) => broadcastApprovalRequest(approval));
@@ -5554,6 +7739,40 @@ function initApprovalWsBroadcast() {
 
 function wsSend(ws: WebSocket, data: any) {
   if (ws.readyState === WebSocket.OPEN) try { ws.send(JSON.stringify(data)); } catch {}
+}
+
+interface GatewayWebSocketAuthorizationBinding {
+  revoked: boolean;
+}
+
+async function assertGatewayActorIsCurrent(user: JwtPayload): Promise<void> {
+  const current = await prisma.user.findUnique({
+    where: { id: user.userId },
+    select: {
+      role: true,
+      accountStatus: true,
+      isActive: true,
+      authorizationVersion: true,
+    },
+  } as any);
+  if (!current
+    || !canUseInteractivePortal(current.role, (current as any).accountStatus, current.isActive)
+    || Number((current as any).authorizationVersion ?? 1) !== Number(user.authorizationVersion ?? 1)) {
+    throw new Error('Authorization changed; reload the Portal');
+  }
+}
+
+async function assertGatewayWebSocketActorIsCurrent(
+  user: JwtPayload,
+  binding: GatewayWebSocketAuthorizationBinding | undefined,
+): Promise<void> {
+  if (!binding || binding.revoked) {
+    throw new Error('Authorization changed; reload the Portal');
+  }
+  await assertGatewayActorIsCurrent(user);
+  if (binding.revoked) {
+    throw new Error('Authorization changed; reload the Portal');
+  }
 }
 
 /* ─── Active stream tracking (via StreamEventBus) ─────────────────────── */
@@ -5582,6 +7801,10 @@ function runWsStreamCleanup(ws: WebSocket, sessionKey: string): void {
   if (unsub) { unsub(); map.delete(sessionKey); }
 }
 
+function wsHasSessionStreamSubscription(ws: WebSocket, sessionKey: string): boolean {
+  return wsStreamCleanups.get(ws)?.has(sessionKey) === true;
+}
+
 function subscribeBackendToLiveSessionEvents(sessionKey: string): void {
   const key = typeof sessionKey === 'string' ? sessionKey.trim() : '';
   if (!key) return;
@@ -5590,62 +7813,73 @@ function subscribeBackendToLiveSessionEvents(sessionKey: string): void {
   });
 }
 
+function resolveAttachableHostStreamSnapshot(
+  sessionKey: string,
+  candidate?: StreamInfo | OpenClawActiveStreamSnapshot | null,
+): StreamInfo | OpenClawActiveStreamSnapshot | null {
+  // Stream snapshots can require asynchronous gateway or disk probes. If the
+  // in-memory lane changed before attachment, its current state is the only
+  // safe authority. When memory is empty (for example after a Portal restart),
+  // retain the externally reconstructed candidate.
+  const tracked = streamEventBus.getTrackedStream(sessionKey);
+  if (!tracked) return candidate ?? null;
+  return getProviderOwnedBusStreamSnapshot(sessionKey);
+}
+
+function isPreliminaryOpenClawStreamError(
+  providerName: AgentProviderName | undefined,
+  event: StreamEvent,
+): boolean {
+  return providerName === 'OPENCLAW'
+    && event.type === 'error'
+    && (event as any).terminal !== true;
+}
+
 function attachBrowserWsToSessionStream(params: {
   ws: WebSocket;
   sessionKey: string;
+  providerName?: AgentProviderName;
   streamInfo?: StreamInfo | OpenClawActiveStreamSnapshot | null;
   sendResume?: boolean;
   keepSubscriptionAfterDone?: boolean;
+  acceptEvent?: (evt: StreamEvent) => boolean;
   onEvent?: (evt: StreamEvent) => void;
   shouldForwardEvent?: (evt: StreamEvent) => boolean;
 }): boolean {
   const {
     ws,
     sessionKey,
+    providerName,
     streamInfo,
     sendResume = false,
     keepSubscriptionAfterDone = true,
+    acceptEvent,
     onEvent,
     shouldForwardEvent,
   } = params;
 
-  const status = streamInfo ?? streamEventBus.getTrackedStream(sessionKey);
+  const status = resolveAttachableHostStreamSnapshot(sessionKey, streamInfo);
   if (!status) return false;
 
-  if (sendResume) {
-    if (status.active) {
-      const phase = status.phase || 'thinking';
-      const snapshotContent = 'content' in status && typeof status.content === 'string'
-        ? status.content
-        : '';
-      const snapshotLatestText = 'latestText' in status && typeof status.latestText === 'string'
-        ? status.latestText
-        : '';
-      const latestText = phase === 'streaming'
-        ? (snapshotContent || streamEventBus.getLatestText(sessionKey) || snapshotLatestText || '')
-        : '';
-      wsSend(ws, {
-        type: 'stream_resume',
-        sessionKey,
-        phase,
-        toolName: status.toolName || null,
-        toolCalls: Array.isArray(status.toolCalls) ? status.toolCalls : [],
-        statusText: status.statusText || null,
-        provenance: status.provenance || null,
-        model: status.model || null,
-        compactionPhase: status.compactionPhase || 'idle',
-        runId: status.runId || null,
-        content: latestText || undefined,
-        turnEvents: streamEventBus.getRecentTurnEvents(sessionKey, 100),
-      });
-    } else {
-      wsSend(ws, { type: 'stream_ended', sessionKey });
-    }
+  if (!status.active) {
+    if (sendResume) wsSend(ws, { type: 'stream_ended', sessionKey });
+    return false;
   }
+
+  // Snapshot/history/reconnect attachments lock to the synchronously
+  // revalidated run. Live-send attachments pass no streamInfo and retain their
+  // dynamic matcher so OpenClaw can adopt its first upstream run ID.
+  const revalidatedRunId = normalizeHostStreamRunId(status.runId);
+  const snapshotRunMatcher = streamInfo && providerName && status.active && revalidatedRunId
+    ? createHostStreamRunMatcher(providerName, revalidatedRunId, { openClawRunIdKnown: true })
+    : null;
 
   let unsubscribed = false;
   const unsub = streamEventBus.subscribe(sessionKey, (evt: StreamEvent) => {
+    if (snapshotRunMatcher?.matches(evt) === false) return;
+    if (acceptEvent?.(evt) === false) return;
     onEvent?.(evt);
+    if (isPreliminaryOpenClawStreamError(providerName, evt)) return;
     if (shouldForwardEvent?.(evt) === false) {
       return;
     }
@@ -5655,11 +7889,15 @@ function attachBrowserWsToSessionStream(params: {
       : (typeof activeStream?.runId === 'string' && activeStream.runId.trim() ? activeStream.runId.trim() : undefined);
     wsSend(ws, { ...evt, sessionKey, ...(runId ? { runId } : {}) });
     if (evt.type === 'error') {
-      runWsStreamCleanup(ws, sessionKey);
+      // StreamEventBus notifies the session subscribers before its global
+      // subscribers. Keep this socket registered through the rest of the
+      // synchronous publish so the global fallback can see that direct
+      // delivery already occurred instead of sending the terminal twice.
+      queueMicrotask(() => runWsStreamCleanup(ws, sessionKey));
       return;
     }
     if (evt.type === 'done' && !keepSubscriptionAfterDone) {
-      runWsStreamCleanup(ws, sessionKey);
+      queueMicrotask(() => runWsStreamCleanup(ws, sessionKey));
     }
   });
 
@@ -5673,41 +7911,170 @@ function attachBrowserWsToSessionStream(params: {
 
   ws.once('close', onClose);
   registerWsStreamCleanup(ws, sessionKey, cleanup);
+
+  // Register delivery before exposing the snapshot. A terminal event can be
+  // published from the same turn as ws.send(), and subscribing afterward
+  // would lose it and leave the browser permanently "streaming".
+  if (sendResume) {
+    const phase = status.phase || 'thinking';
+    const snapshotContent = 'content' in status && typeof status.content === 'string'
+      ? status.content
+      : '';
+    const snapshotLatestText = 'latestText' in status && typeof status.latestText === 'string'
+      ? status.latestText
+      : '';
+    const latestText = snapshotContent || streamEventBus.getLatestText(sessionKey) || snapshotLatestText || '';
+    const rawTurnEvents = 'turnEvents' in status && Array.isArray(status.turnEvents)
+      ? status.turnEvents
+      : streamEventBus.getRecentTurnEvents(sessionKey, 100);
+    const turnEvents = rawTurnEvents.filter((event) => {
+      if (event.terminal || event.type === 'turn_error' || event.type === 'assistant_final' || event.type === 'turn_done') {
+        return false;
+      }
+      return !revalidatedRunId || !event.runId || event.runId === revalidatedRunId;
+    });
+    wsSend(ws, {
+      type: 'stream_resume',
+      sessionKey,
+      phase,
+      toolName: status.toolName || null,
+      toolCalls: Array.isArray(status.toolCalls) ? status.toolCalls : [],
+      statusText: status.statusText || null,
+      provenance: status.provenance || null,
+      model: status.model || null,
+      compactionPhase: status.compactionPhase || 'idle',
+      runId: status.runId || null,
+      content: latestText || undefined,
+      turnEvents,
+    });
+  }
   return true;
 }
 
 async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
-  const sessionKey = resolveOpenClawSessionKey(msg.session, user);
-  const providerName = msg.provider as AgentProviderName | undefined;
+  const providerName = normalizeProviderName(msg.provider);
+  const sessionKey = providerName === 'OPENCLAW'
+    ? await resolveOpenClawSessionKey(msg.session, user)
+    : String(msg.session || '').trim();
   const requestId = msg.requestId; // For client-side correlation
 
   try {
-    assertGatewaySessionAccess(sessionKey, user, { providerName });
-    if (!providerName || providerName === 'OPENCLAW') subscribeBackendToLiveSessionEvents(sessionKey);
+    const limit = parseHistoryLimit(msg.limit);
+    await assertGatewaySessionAccess(sessionKey, user, { providerName });
+    if (providerName === 'OPENCLAW') subscribeBackendToLiveSessionEvents(sessionKey);
     // Try provider abstraction for non-OpenClaw providers only.
-    if (providerName && providerName !== 'OPENCLAW') {
+    if (providerName !== 'OPENCLAW') {
       try {
-        const provider = AgentRegistry.get(providerName);
-        const messages = await provider.getHistory(sessionKey);
-        wsSend(ws, { type: 'history', messages, sessionId: sessionKey, requestId });
+        const nativeSession = getOwnedNativeSession(
+          providerName,
+          user.userId,
+          msg.session,
+          undefined,
+          { metadataOnly: true },
+        );
+        if (!nativeSession) {
+          wsSend(ws, {
+            type: 'history',
+            messages: [],
+            sessionId: typeof msg.session === 'string' ? msg.session : '',
+            activeStream: inactiveOpenClawSnapshot('idle', true),
+            pagination: { beforeCursor: null, hasMoreBefore: false, pageSize: limit },
+            requestId,
+          });
+          return;
+        }
+        const scope = historyCursorScope(user.userId, providerName, nativeSession.sessionId);
+        let resolvedPage: HistoryPageResult;
+        if (providerName === 'AGENT_ZERO') {
+          const provider = AgentRegistry.get(providerName);
+          resolvedPage = await readAgentZeroHistoryPage({
+            provider,
+            sessionId: nativeSession.sessionId,
+            limit,
+            scope,
+            beforeCursor: msg.before,
+          });
+        } else {
+          resolvedPage = readNativeHistoryPage({
+            providerName,
+            sessionId: nativeSession.sessionId,
+            limit,
+            scope,
+            beforeCursor: msg.before,
+          });
+        }
+        const activeStreamCandidate = await getProviderActiveStreamSnapshot(providerName, nativeSession.sessionId);
+        const activeStream = resolveAttachableHostStreamSnapshot(
+          nativeSession.sessionId,
+          activeStreamCandidate,
+        ) || activeStreamCandidate;
+        wsSend(ws, {
+          type: 'history',
+          messages: resolvedPage.messages,
+          sessionId: nativeSession.sessionId,
+          activeStream,
+          pagination: {
+            beforeCursor: resolvedPage.beforeCursor,
+            hasMoreBefore: resolvedPage.hasMoreBefore,
+            pageSize: limit,
+          },
+          requestId,
+        });
+        if (activeStream.active && providerUsesHostStreamBus(providerName)) {
+          attachBrowserWsToSessionStream({
+            ws,
+            sessionKey: nativeSession.sessionId,
+            providerName,
+            streamInfo: activeStream,
+            sendResume: true,
+            keepSubscriptionAfterDone: false,
+          });
+        }
         return;
-      } catch {}
+      } catch (err: any) {
+        if (err instanceof HistoryCursorError) throw err;
+        throw new Error(`Provider history failed: ${err?.message || err}`);
+      }
     }
 
     // JSONL-based enhanced history with Gemini CLI import fallback
     const sessionsDir = resolveSessionsDir(sessionKey);
     const fileId = resolveSessionFileId(sessionKey, sessionsDir);
     const sessionId = fileId || sessionKey;
-    const messages = readSessionMessagesEnhancedForSessionKey(sessionKey, msg.limit || 200, sessionsDir);
-    wsSend(ws, { type: 'history', messages, sessionId, requestId });
+    const scope = historyCursorScope(user.userId, providerName, sessionKey);
+    const page = await readOpenClawHistoryPage({
+      sessionKey,
+      sessionId,
+      sessionsDir,
+      enhanced: true,
+      limit,
+      scope,
+      beforeCursor: msg.before,
+    });
+    wsSend(ws, {
+      type: 'history',
+      messages: page.messages,
+      sessionId,
+      pagination: {
+        beforeCursor: page.beforeCursor,
+        hasMoreBefore: page.hasMoreBefore,
+        pageSize: limit,
+      },
+      requestId,
+    });
 
     // After sending history, check if there's an active stream on this session.
     // If so, send a stream_resume event and subscribe to StreamEventBus.
-    const activeStream = await getOpenClawActiveStreamSnapshot(sessionKey);
+    const activeStreamCandidate = await getOpenClawActiveStreamSnapshot(sessionKey);
+    const activeStream = browserSafeActiveStreamSnapshot(
+      providerName,
+      resolveAttachableHostStreamSnapshot(sessionKey, activeStreamCandidate) || activeStreamCandidate,
+    );
     if (activeStream.active) {
       attachBrowserWsToSessionStream({
         ws,
         sessionKey,
+        providerName,
         streamInfo: activeStream,
         sendResume: true,
         // Keep subscription alive after done so resumed runs continue forwarding.
@@ -5715,85 +8082,65 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
       });
     }
   } catch (err: any) {
-    wsSend(ws, { type: 'error', content: err?.message === 'Admin access required' ? 'Admin access required' : `History failed: ${err.message}`, requestId });
+    const historyError = err?.message === 'Admin access required'
+      ? 'Admin access required'
+      : `History failed: ${redactNativeProviderText(err?.message || String(err)) || 'Provider history failed'}`;
+    wsSend(ws, { type: 'error', content: historyError, requestId });
   }
 }
 
-async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
+async function handleWsSend(
+  ws: WebSocket,
+  msg: any,
+  user: JwtPayload,
+  onQuarantinePersistenceFailure?: () => void,
+) {
   const { message, session = 'main', provider: providerName, model: requestedModel, agentId } = msg;
   if (!message) { wsSend(ws, { type: 'error', content: 'message required' }); return; }
 
   let streamKeepalive: ReturnType<typeof setInterval> | null = null;
-  let resolvedSessionId: string | null = null;
-  const routedProviderName = routeProviderForRequestedModel(providerName, requestedModel);
-  let providerNameForError: AgentProviderName = routedProviderName;
+  let reservedStream: { sessionId: string; runId: string } | null = null;
+  let routedProviderName: AgentProviderName = 'OPENCLAW';
+  let providerNameForError: AgentProviderName = 'OPENCLAW';
 
   try {
+    routedProviderName = routeProviderForRequestedModel(providerName, requestedModel);
+    providerNameForError = routedProviderName;
+    // Reject unauthorized Agent Chat sends before provider lookup/session creation.
+    const executionContext = requireHostOperatorExecutionContext(user);
+    assertProviderExecutionContext(routedProviderName, executionContext);
     const provider = AgentRegistry.get(routedProviderName);
     providerNameForError = provider.providerName;
     const provenance = PROVENANCE[provider.providerName] || `via ${provider.displayName}`;
     const isOpenClawProvider = provider.providerName === 'OPENCLAW';
+    const providerPublishesStream = providerPublishesHostStream(provider.providerName);
 
     const clientSession = typeof session === 'string' && session.trim().length > 0 ? session.trim() : '';
     let sessionId: string;
     if (isOpenClawProvider) {
-      const useCanonicalMainSession = isOwnerRole(user.role)
-        && (!agentId || agentId === 'main')
-        && (!clientSession || clientSession === 'main');
-      if (agentId && agentId !== 'main') {
-        // If clientSession is already a fully-qualified agent: key for this agent, reuse it directly.
-        // This prevents the cascading session bug where e.g. 'agent:parity:main' gets wrapped
-        // into 'agent:parity:agent:parity:main' on subsequent messages.
-        const agentPrefix = `agent:${agentId}:`;
-        if (clientSession.startsWith(agentPrefix)) {
-          sessionId = clientSession;
-        } else {
-          // Extract just the session name, stripping any stale agent: prefix from a different agent
-          let sessionName: string;
-          if (!clientSession) {
-            sessionName = 'main';
-          } else if (clientSession.startsWith('new-')) {
-            sessionName = `portal-${clientSession}`;
-          } else if (clientSession.startsWith('agent:')) {
-            // Session key from a different agent — extract the trailing name part
-            const parts = clientSession.split(':');
-            sessionName = parts.length >= 3 ? parts.slice(2).join(':') : 'main';
-          } else {
-            sessionName = clientSession;
-          }
-          sessionId = `agent:${agentId}:${sessionName}`;
-        }
-      } else if (clientSession.startsWith('agent:')) {
-        sessionId = clientSession;
-      } else if (useCanonicalMainSession) {
-        sessionId = 'agent:main:main';
-      } else {
-        sessionId = await provider.startSession(user.userId, {
-          metadata: clientSession ? { sessionSlug: clientSession } : undefined,
-        });
-      }
+      sessionId = await resolveOpenClawTurnSessionKey(
+        clientSession,
+        agentId,
+        user,
+      );
     } else {
-      const reusableNativeSession = getOwnedNativeSession(provider.providerName, user.userId, clientSession);
-      if (!reusableNativeSession) {
-        sessionId = await provider.startSession(user.userId, {
-          model: typeof requestedModel === 'string' && requestedModel.trim() ? normalizeRequestedModel(provider.providerName, requestedModel.trim()) : undefined,
-          metadata: { requestedBy: user.email },
-        });
-      } else {
-        sessionId = reusableNativeSession.sessionId;
-        if (typeof requestedModel === 'string' && requestedModel.trim()) {
-          updateNativeSessionModel(provider.providerName, sessionId, normalizeRequestedModel(provider.providerName, requestedModel.trim()));
-        }
-      }
+      sessionId = await resolveNativeSessionForTurn({
+        provider,
+        userId: user.userId,
+        userEmail: user.email,
+        clientSession,
+        executionContext,
+        requestedModel,
+      });
     }
 
-    assertGatewaySessionAccess(sessionId, user, { providerName: provider.providerName });
+    await assertGatewaySessionAccess(sessionId, user, { providerName: provider.providerName });
 
     if (requestedModel && isOpenClawProvider) {
       try {
         if (!requestedModel.includes('/')) {
           console.warn(`[gateway-ws] Rejecting bare model name without provider prefix: "${requestedModel}". Select a fully-qualified model ID.`);
-          wsSend(ws, { type: 'error', content: `Invalid model "${requestedModel}": must include provider prefix (e.g. openai/gpt-5.5). Please reselect your model.` });
+          wsSend(ws, { type: 'error', content: `Invalid model "${requestedModel}": must include provider prefix (e.g. openai/gpt-5.6-sol). Please reselect your model.` });
           return;
         }
         const resolvedModel = await resolveOpenClawPatchModel(requestedModel);
@@ -5818,9 +8165,9 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
         sessionId,
         requestedModel: typeof requestedModel === 'string' ? requestedModel : undefined,
         message,
+        executionContext,
       });
       if (slashResult.handled) {
-        resolvedSessionId = slashResult.sessionId;
         wsSend(ws, {
           type: 'session',
           sessionId: slashResult.sessionId,
@@ -5842,7 +8189,6 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       }
     }
 
-    resolvedSessionId = sessionId;
     wsSend(ws, {
       type: 'session',
       sessionId,
@@ -5859,16 +8205,21 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       wsSend(ws, { type: 'keepalive', ts: Date.now() });
     }, 10000);
 
-    if (isOpenClawProvider) {
-      subscribeBackendToLiveSessionEvents(sessionId);
+    const routeRunId = randomUUID();
+    const streamStartedAtMs = Date.now();
+    const requestedStreamModel = normalizeGatewayModelId(
+      typeof requestedModel === 'string' ? requestedModel : '',
+    ) || undefined;
+
+    if (providerUsesHostStreamBus(provider.providerName)) {
+      if (isOpenClawProvider) subscribeBackendToLiveSessionEvents(sessionId);
       // ── Single-path streaming via StreamEventBus ──────────────────────
-      // OpenClawProvider.sendMessage() sends chat.send via the persistent WS
-      // and internally subscribes to StreamEventBus for its own resolution.
+      // OpenClaw and host-native CLI providers publish the complete turn into
+      // StreamEventBus and internally use it for reconnect/settlement state.
       //
-      // We subscribe to the SAME StreamEventBus to forward events to the browser.
-      // To avoid double-processing, the provider's internal subscription fires
-      // callbacks (onChunk/onStatus) which we intentionally leave as no-ops here.
-      // The bus subscription below is the SOLE path to the browser.
+      // We subscribe to that same bus to forward events to the browser. Provider
+      // callbacks intentionally remain no-ops; using both paths duplicates
+      // chunks, statuses, tools, and terminal events.
       //
       // The provider's sendMessage() returns when the bus publishes 'done' or 'error'.
       // Our subscription below also sees the same 'done'/'error' and cleans up.
@@ -5876,22 +8227,58 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
       // the 'done' event is emitted once from PersistentGatewayWs, and both
       // subscribers see it in the same publish() call.
 
-      streamEventBus.startStream(sessionId, undefined, {
+      if (!reserveHostStreamRoute({
+        sessionId,
+        runId: routeRunId,
         provenance,
-        model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
-      });
+        model: requestedStreamModel,
+      })) {
+        clearTimeout(fallbackTimer);
+        if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
+        wsSend(ws, {
+          type: 'error',
+          content: 'This chat already has an active turn.',
+          sessionKey: sessionId,
+          runId: routeRunId,
+        });
+        return;
+      }
+      reservedStream = { sessionId, runId: routeRunId };
 
       // Subscribe to StreamEventBus for this session.
-      // IMPORTANT: We do NOT unsubscribe on 'done'. The agent may yield to a
-      // sub-agent (sessions_yield), which causes a chat.final → 'done', but then
-      // the agent resumes with a NEW runId when the sub-agent completes. If we
-      // unsubscribe on 'done', the resumed run's events are never forwarded.
-      // The subscription stays alive until the browser WS closes.
+      // OpenClaw stays subscribed after 'done' because a yielded agent can
+      // resume under a new runId. Native CLI turns are terminal at 'done' and
+      // release this per-session subscription immediately.
+      const runMatcher = createHostStreamRunMatcher(provider.providerName, routeRunId);
       const deniedApprovalIds = new Set<string>();
+      let sawStreamTerminal = false;
+      let pendingStreamError: string | null = null;
+      const terminalUnsub = streamEventBus.subscribe(sessionId, (evt: StreamEvent) => {
+        if (!runMatcher.matches(evt)) return;
+        gotRealStatus = true;
+        if (evt.type === 'run_resumed') return;
+        if (evt.type === 'done') {
+          sawStreamTerminal = true;
+        } else if (evt.type === 'error') {
+          const errorText = redactNativeProviderText(
+            typeof evt.content === 'string' && evt.content.trim() ? evt.content.trim() : 'Agent error',
+          ) || 'Agent error';
+          if (provider.providerName === 'OPENCLAW' && (evt as any).terminal !== true) {
+            pendingStreamError = errorText;
+            return;
+          }
+          sawStreamTerminal = true;
+        } else {
+          return;
+        }
+        if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
+      });
       attachBrowserWsToSessionStream({
         ws,
         sessionKey: sessionId,
-        keepSubscriptionAfterDone: true,
+        providerName: provider.providerName,
+        keepSubscriptionAfterDone: isOpenClawProvider,
+        acceptEvent: runMatcher.matches,
         onEvent: (evt: StreamEvent) => {
         gotRealStatus = true;
         const runtimeEvt = evt as any;
@@ -5909,6 +8296,7 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
           return;
         }
         if (evt.type === 'done') {
+          sawStreamTerminal = true;
           // Stop keepalive during idle gap, but do NOT unsub — agent may resume
           if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
         }
@@ -5921,38 +8309,135 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
           }
           debugLog(`[handleWsSend] run_resumed detected for ${sessionId} — keepalive restarted`);
         }
-        if (evt.type === 'error') {
+        if (evt.type === 'error' && !(provider.providerName === 'OPENCLAW' && (evt as any).terminal !== true)) {
+          sawStreamTerminal = true;
           // Hard error — clean up fully
           if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
         }
         },
         shouldForwardEvent: (evt: StreamEvent) => {
           const runtimeEvt = evt as any;
+          if (provider.providerName === 'OPENCLAW' && runtimeEvt.type === 'error' && runtimeEvt.terminal !== true) {
+            return false;
+          }
           return !(runtimeEvt.type === 'exec_approval' && !isElevatedRole(user.role));
         },
       });
 
-      // No-op callbacks — all events go through StreamEventBus above
-      const onChunk = (_chunk: string) => {};
-      const onStatus = (_evt: { type: string; content?: string; [key: string]: any }) => {};
-      const onExecApproval = (_approval: ExecApprovalRequest) => {};
-      const senderIdentity = { label: user.email, userId: user.userId, role: user.role };
+      // Provider-owned streams already publish into the bus. Route-owned
+      // providers (Agent Zero/Ollama) are mirrored here so reconnect and
+      // replay use the same transport without double-sending to the browser.
+      const onChunk = providerPublishesStream
+        ? (_chunk: string) => {}
+        : (chunk: string) => {
+            if (!chunk) return;
+            publishRouteOwnedHostStreamEvent({
+              sessionId,
+              runId: routeRunId,
+              provenance,
+              model: requestedStreamModel,
+              event: { type: 'text', content: chunk },
+            });
+          };
+      const onStatus = providerPublishesStream
+        ? (_evt: { type: string; content?: string; [key: string]: any }) => {}
+        : (evt: { type: string; content?: string; [key: string]: any }) => {
+            publishRouteOwnedHostStreamEvent({
+              sessionId,
+              runId: routeRunId,
+              provenance,
+              model: requestedStreamModel,
+              event: evt,
+            });
+          };
+      const onExecApproval = providerPublishesStream
+        ? (_approval: ExecApprovalRequest) => {}
+        : (approval: ExecApprovalRequest) => {
+            publishRouteOwnedHostStreamEvent({
+              sessionId,
+              runId: routeRunId,
+              provenance,
+              model: requestedStreamModel,
+              event: { type: 'exec_approval', approval },
+            });
+          };
+      const senderIdentity = {
+        label: user.email,
+        userId: user.userId,
+        role: user.role,
+        authorizationVersion: Number(user.authorizationVersion ?? 1),
+        requestId: routeRunId,
+      };
 
       try {
-        await (provider as any).sendMessage(
-          sessionId, message, onChunk, onStatus, onExecApproval, senderIdentity,
-        );
-        // Promise resolved — bus already published 'done' and our subscriber handled it.
-        // Just clean up the fallback timer.
+        const result = await sendHostOperatorProviderMessage({
+          provider,
+          sessionId,
+          message,
+          onChunk,
+          onStatus,
+          onExecApproval,
+          sender: senderIdentity,
+          onQuarantinePersistenceFailure,
+        });
         clearTimeout(fallbackTimer);
+        if (!sawStreamTerminal) {
+          publishRouteOwnedHostStreamDone({
+            sessionId,
+            runId: runMatcher.currentRunId(),
+            provenance,
+            result,
+          });
+        } else if (!providerPublishesStream) {
+          softClearHostStreamIfCurrent(sessionId, routeRunId);
+        }
       } catch (sendErr: unknown) {
         clearTimeout(fallbackTimer);
-        // The provider rejects if chat.send fails or on timeout.
-        // The bus subscriber may already have forwarded an 'error' event.
-        // Clean up anything remaining.
         if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
-        runWsStreamCleanup(ws, sessionId);
-        throw sendErr;
+        // The bus already delivered the provider's sanitized terminal event.
+        if (sawStreamTerminal) {
+          if (!providerPublishesStream) softClearHostStreamIfCurrent(sessionId, routeRunId);
+          runWsStreamCleanup(ws, sessionId);
+          return;
+        }
+        if (sendErr instanceof AgentAbortError) {
+          publishRouteOwnedHostStreamDone({
+            sessionId,
+            runId: runMatcher.currentRunId(),
+            provenance,
+            result: { fullText: '', metadata: {} },
+            aborted: true,
+          });
+          return;
+        }
+        const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+        const shouldAttemptRecovery = shouldAttemptOpenClawReplyRecovery(
+          provider.providerName,
+          pendingStreamError,
+          requestedModel,
+        );
+        if (shouldAttemptRecovery) {
+          const recovered = await recoverRecentOpenClawAssistantReply(sessionId, streamStartedAtMs);
+          if (recovered) {
+            publishRouteOwnedHostStreamDone({
+              sessionId,
+              runId: runMatcher.currentRunId(),
+              provenance,
+              result: {
+                fullText: recovered.content,
+                metadata: { model: recovered.model, recoveredAfterError: true },
+              },
+            });
+            return;
+          }
+        }
+        publishRouteOwnedHostStreamError({
+          sessionId,
+          runId: runMatcher.currentRunId(),
+          content: pendingStreamError || humanizeProviderError(provider.providerName, errMsg),
+        });
+      } finally {
+        terminalUnsub();
       }
       return;
     }
@@ -5999,7 +8484,12 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
         onChunk,
         onStatus,
         onExecApproval,
-        { label: user.email, userId: user.userId, role: user.role },
+        {
+          label: user.email,
+          userId: user.userId,
+          role: user.role,
+          authorizationVersion: Number(user.authorizationVersion ?? 1),
+        },
       );
       clearTimeout(fallbackTimer);
       if (streamKeepalive) clearInterval(streamKeepalive);
@@ -6010,53 +8500,94 @@ async function handleWsSend(ws: WebSocket, msg: any, user: JwtPayload) {
     }
   } catch (err: unknown) {
     if (streamKeepalive) clearInterval(streamKeepalive);
-    if (resolvedSessionId) streamEventBus.clearStream(resolvedSessionId);
+    if (reservedStream) {
+      const tracked = streamEventBus.getTrackedStream(reservedStream.sessionId);
+      if (tracked?.active && tracked.runId === reservedStream.runId) {
+        streamEventBus.clearStream(reservedStream.sessionId, reservedStream.runId);
+      }
+    }
     if (err instanceof AgentAbortError) {
-      wsSend(ws, { type: 'abort_result', ok: true, sessionKey: resolvedSessionId || String(session || 'main') });
       return;
     }
     const errMsg = err instanceof Error ? err.message : String(err);
-    wsSend(ws, { type: 'error', content: humanizeProviderError(providerNameForError, errMsg) });
+    wsSend(ws, {
+      type: 'error',
+      content: err instanceof UnknownAgentProviderError
+        ? err.message
+        : redactNativeProviderText(humanizeProviderError(providerNameForError, errMsg)) || 'Agent error',
+      ...(err instanceof AgentZeroOAuthModelCatalogError ? { code: err.code } : {}),
+    });
   }
 }
 
 async function handleWsAbort(ws: WebSocket, msg: any, user?: JwtPayload) {
   const providerName = normalizeProviderName(msg.provider);
+  const requestId = typeof msg.requestId === 'string' && msg.requestId.trim() ? msg.requestId.trim() : null;
   const sessionKey = providerName === 'OPENCLAW'
-    ? resolveOpenClawSessionKey(msg.session, user)
+    ? await resolveOpenClawSessionKey(msg.session, user)
     : String(msg.session || '').trim();
   console.log(`[gateway] ABORT REQUEST: provider=${providerName} session=${sessionKey} runId=${msg.runId || 'none'}`);
   try {
-    if (user) assertGatewaySessionAccess(sessionKey, user, { providerName });
+    if (user) await assertGatewaySessionAccess(sessionKey, user, { providerName });
 
     if (providerName !== 'OPENCLAW') {
       const provider = AgentRegistry.get(providerName);
-      const aborted = await provider.abortActiveRun?.(sessionKey);
-      wsSend(ws, { type: 'abort_result', ok: aborted !== false, sessionKey, provider: providerName });
+      const expectedRunId = typeof msg.runId === 'string' && msg.runId.trim() ? msg.runId.trim() : undefined;
+      const aborted = await provider.abortActiveRun?.(sessionKey, expectedRunId);
+      wsSend(ws, {
+        type: 'abort_result',
+        ok: aborted === true,
+        sessionKey,
+        provider: providerName,
+        runId: expectedRunId || null,
+        requestId,
+      });
       return;
     }
 
     const payload: Record<string, string> = { sessionKey };
     if (msg.runId) payload.runId = msg.runId;
+    const abortRunIdentity = captureHostStreamRunIdentity(sessionKey, msg.runId);
     const result = await gatewayRpcCall('chat.abort', payload);
     console.log(`[gateway] ABORT RESULT: ok=${result.ok} error=${result.error || 'none'}`);
+    const aborted = result.ok && result.data?.aborted !== false;
 
     // Tear down the stream subscription for this WS + session.
     // Without this, the subscription stays alive (for sub-agent resume),
     // and any subsequent gateway events for this session (heartbeat, system
     // event, etc.) would re-trigger the frontend into streaming state.
-    runWsStreamCleanup(ws, sessionKey);
-    streamEventBus.clearStream(sessionKey);
+    if (aborted) {
+      const clearedAbortedRun = clearHostStreamIfCurrentRun(sessionKey, abortRunIdentity);
+      if (clearedAbortedRun) runWsStreamCleanup(ws, sessionKey);
+    }
 
-    wsSend(ws, { type: 'abort_result', ok: result.ok, sessionKey, provider: providerName });
+    wsSend(ws, {
+      type: 'abort_result',
+      ok: aborted,
+      sessionKey,
+      provider: providerName,
+      runId: typeof msg.runId === 'string' && msg.runId.trim() ? msg.runId.trim() : null,
+      requestId,
+      error: aborted
+        ? undefined
+        : (redactNativeProviderText(result.error || 'Abort was not confirmed') || 'Abort was not confirmed'),
+    });
   } catch (err: any) {
-    wsSend(ws, { type: 'abort_result', ok: false, error: err.message });
+    wsSend(ws, {
+      type: 'abort_result',
+      ok: false,
+      sessionKey,
+      provider: providerName,
+      runId: typeof msg.runId === 'string' && msg.runId.trim() ? msg.runId.trim() : null,
+      requestId,
+      error: redactNativeProviderText(err.message) || 'Abort failed',
+    });
   }
 }
 
 
 async function handleWsInject(ws: WebSocket, msg: any, user?: JwtPayload) {
-  const sessionKey = resolveOpenClawSessionKey(msg.session, user);
+  const sessionKey = await resolveOpenClawSessionKey(msg.session, user);
   const text = typeof msg.text === 'string' ? msg.text.trim() : '';
   if (!user || !isElevatedRole(user.role)) {
     wsSend(ws, { type: 'inject_result', ok: false, error: 'Admin access required' });
@@ -6067,7 +8598,7 @@ async function handleWsInject(ws: WebSocket, msg: any, user?: JwtPayload) {
     return;
   }
   try {
-    assertGatewaySessionAccess(sessionKey, user);
+    await assertGatewaySessionAccess(sessionKey, user);
     await injectChatMessage(sessionKey, text);
     wsSend(ws, { type: 'inject_result', ok: true, sessionKey });
   } catch (err: any) {
@@ -6114,41 +8645,60 @@ async function denyExecApprovalForUnauthorizedUser(approval: ExecApprovalRequest
   }
 }
 
-async function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?: JwtPayload): Promise<void> {
-  const sessionKey = resolveOpenClawSessionKey(msg.session, user);
+async function handleWsReconnect(
+  ws: WebSocket,
+  msg: { session?: string; provider?: string; streamClientId?: string },
+  user?: JwtPayload,
+): Promise<void> {
+  const providerName = normalizeProviderName(msg.provider);
+  const sessionKey = providerName === 'OPENCLAW'
+    ? await resolveOpenClawSessionKey(msg.session, user)
+    : String(msg.session || '').trim();
   if (!sessionKey) {
     wsSend(ws, { type: 'error', content: 'reconnect requires session' });
     return;
   }
 
   try {
-    if (user) assertGatewaySessionAccess(sessionKey, user);
-    subscribeBackendToLiveSessionEvents(sessionKey);
+    if (user) await assertGatewaySessionAccess(sessionKey, user, { providerName });
+    if (providerName === 'OPENCLAW') subscribeBackendToLiveSessionEvents(sessionKey);
   } catch (err: any) {
-    wsSend(ws, { type: 'error', content: err?.message === 'Admin access required' ? 'Admin access required' : `Reconnect failed: ${err.message}` });
+    const reconnectError = err?.message === 'Admin access required'
+      ? 'Admin access required'
+      : `Reconnect failed: ${redactNativeProviderText(err?.message || String(err)) || 'Agent error'}`;
+    wsSend(ws, { type: 'error', content: reconnectError });
     return;
   }
 
-  const streamInfo = await getOpenClawActiveStreamSnapshot(sessionKey);
+  if (user?.userId) {
+    takeOverSseDelivery(user.userId, sessionKey, msg.streamClientId);
+  }
+
+  const streamInfoCandidate = await getProviderActiveStreamSnapshot(providerName, sessionKey);
+  const streamInfo = resolveAttachableHostStreamSnapshot(sessionKey, streamInfoCandidate)
+    || streamInfoCandidate;
   if (!streamInfo.active) {
+    const inactiveReason = 'inactiveReason' in streamInfo ? streamInfo.inactiveReason : 'unknown';
+    const safeToClear = 'safeToClear' in streamInfo && streamInfo.safeToClear === true;
     runWsStreamCleanup(ws, sessionKey);
     wsSend(ws, {
       type: 'stream_status',
       sessionKey,
       active: false,
-      inactiveReason: streamInfo.inactiveReason || 'unknown',
-      safeToClear: streamInfo.safeToClear === true,
+      inactiveReason: inactiveReason || 'unknown',
+      safeToClear,
     });
-    debugLog(`[gateway-ws] Reconnect found no active stream for ${sessionKey}: reason=${streamInfo.inactiveReason || 'unknown'} safeToClear=${streamInfo.safeToClear === true}`);
+    debugLog(`[gateway-ws] Reconnect found no active stream for ${sessionKey}: reason=${inactiveReason || 'unknown'} safeToClear=${safeToClear}`);
     return;
   }
 
   attachBrowserWsToSessionStream({
     ws,
     sessionKey,
+    providerName,
     streamInfo,
     sendResume: true,
-    keepSubscriptionAfterDone: true,
+    keepSubscriptionAfterDone: providerName === 'OPENCLAW',
     onEvent: (evt: StreamEvent) => {
       if (evt.type === 'text') debugLog(`[Gateway] RECONNECT→browser TEXT: len=${(evt.content||'').length} "${(evt.content||'').substring(0, 40)}..."`);
     },
@@ -6161,22 +8711,37 @@ async function handleWsReconnect(ws: WebSocket, msg: { session?: string }, user?
 // Pending native-CLI (e.g. Claude Code) approvals a given user is allowed to see.
 // Used to replay in-flight approval popups to a freshly (re)connected client so a
 // reload / chat switch / reconnect mid-turn does not silently drop the request.
-function pendingApprovalsForUser(user: JwtPayload): ExecApprovalRequest[] {
+async function assertApprovalAccess(
+  approval: ExecApprovalRequest,
+  user: JwtPayload,
+): Promise<void> {
+  const sessionKey = typeof approval?.request?.sessionKey === 'string'
+    ? approval.request.sessionKey.trim()
+    : '';
+  if (!sessionKey) throw new Error('Admin access required');
+  await assertAgentStreamSessionAccess(sessionKey, user);
+}
+
+async function pendingApprovalsForUser(user: JwtPayload): Promise<ExecApprovalRequest[]> {
   if (!isElevatedRole(user.role)) return [];
-  return listPendingNativeCliApprovals().filter((approval) => {
-    const sessionKey = approval?.request?.sessionKey;
-    if (!sessionKey) return true;
+  const visible: ExecApprovalRequest[] = [];
+  for (const approval of listPendingNativeCliApprovals()) {
     try {
-      assertGatewaySessionAccess(sessionKey, user);
-      return true;
+      await assertApprovalAccess(approval, user);
+      approvalSessionKeys.set(approval.id, approval.request.sessionKey!.trim());
+      visible.push(approval);
     } catch {
-      return false;
+      // Cross-user or unowned approvals are never replayed.
     }
-  });
+  }
+  return visible;
 }
 
 function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
   (ws as any).__portalUser = user;
+  const authorizationBinding = (ws as any).__portalAuthorizationBinding as
+    | GatewayWebSocketAuthorizationBinding
+    | undefined;
   portalWsClients.add(ws);
   debugLog(`[gateway-ws] Client connected: ${user.email}`);
 
@@ -6192,46 +8757,104 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
   //    Without this, events from PersistentGatewayWs are received but never
   //    reach the browser (no per-session subscriber exists yet).
   const unsubGlobal = streamEventBus.subscribeGlobal((sessionKey, evt) => {
-    try {
-      assertGatewaySessionAccess(sessionKey, user);
-    } catch {
-      return;
-    }
+    void (async () => {
+      let releaseAuthorizationLease: (() => void) | null = null;
+      try {
+        releaseAuthorizationLease = acquireWorkspaceAuthorizationMutationLease(user.userId);
+        await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
+        await assertAgentStreamSessionAccess(sessionKey, user);
+        await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
 
-    recordMaintenanceHistoryMarker(sessionKey, evt);
+        // Maintenance history is a durable write and therefore remains inside
+        // the short event-delivery lease.
+        recordMaintenanceHistoryMarker(sessionKey, evt);
 
-    // If per-session subscribers exist, they handle normal forwarding. Maintenance
-    // events are deliberately also sent through the global path so the composer
-    // rail and durable history marker update even when the active stream
-    // subscription is mid-transition or attached to a different handler.
-    const hasSubs = streamEventBus.hasSubscribers(sessionKey);
-    const isMaintenanceEvent = evt.type === 'compaction_start'
-      || evt.type === 'compaction_end'
-      || evt.maintenanceKind === 'maintenance';
-    if (hasSubs && !isMaintenanceEvent) {
-      return;
-    }
+        const activityType = evt.type;
+        const activitySubject = activityType === 'thinking'
+          ? sanitizeThinkingSubject(evt.subject)
+          : '';
+        if (
+          activitySubject
+          || activityType === 'done'
+          || activityType === 'error'
+          || activityType === 'run_resumed'
+        ) {
+          // The browser never guesses Project scope from a key pattern. This
+          // narrow envelope is emitted only after exact database attestation
+          // and a second authorization-generation check.
+          const eligible = await isAgentChatActivitySession(sessionKey, user.userId);
+          await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
+          if (eligible && ws.readyState === WebSocket.OPEN) {
+            wsSend(ws, {
+              type: 'activity_title',
+              activityScope: 'agent-chat',
+              activityType,
+              sessionKey,
+              runId: evt.runId,
+              ...(activitySubject ? { subject: activitySubject } : {}),
+            });
+          }
+        }
 
-    // No per-session subscriber: forward the event directly.
-    // This covers maintenance events AND regular stream events that arrive
-    // after a backend restart (before the user re-subscribes).
-    if (ws.readyState === WebSocket.OPEN) {
-      wsSend(ws, { ...evt, sessionKey });
-    }
+        // Skip the global copy only when this exact browser socket already owns
+        // a direct subscription. Maintenance events deliberately use both
+        // paths so the composer rail and durable marker survive transitions.
+        const socketHasDirectSubscription = wsHasSessionStreamSubscription(ws, sessionKey);
+        const isMaintenanceEvent = evt.type === 'compaction_start'
+          || evt.type === 'compaction_end'
+          || evt.maintenanceKind === 'maintenance';
+        if (socketHasDirectSubscription && !isMaintenanceEvent) return;
+
+        await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
+        if (ws.readyState === WebSocket.OPEN) {
+          wsSend(ws, { ...evt, sessionKey });
+        }
+      } catch {
+        // A fence, ownership drift, or revoked generation drops the event.
+      } finally {
+        releaseAuthorizationLease?.();
+      }
+    })();
   });
 
   ws.on('message', async (raw: Buffer | string) => {
     let msg: any;
     try { msg = JSON.parse(raw.toString()); } catch { wsSend(ws, { type: 'error', content: 'Invalid JSON' }); return; }
-
-    switch (msg.type) {
-      case 'history': await handleWsHistory(ws, msg, user); break;
-      case 'send':    await handleWsSend(ws, msg, user);    break;
-      case 'abort':   await handleWsAbort(ws, msg, user);   break;
-      case 'inject':  await handleWsInject(ws, msg, user);  break;
-      case 'exec_approval_resolve': await handleWsExecApproval(ws, msg, user); break;
-      case 'reconnect': await handleWsReconnect(ws, msg, user);   break;
-      default: wsSend(ws, { type: 'error', content: `Unknown type: ${msg.type}` });
+    let releaseAuthorizationLease: (() => void) | null = null;
+    let authorizationLeaseReleaseSafe = true;
+    try {
+      if (!authorizationBinding || authorizationBinding.revoked) return;
+      // Every portal WS frame is actor-scoped. Hold the same fence across
+      // history/reconnect reads and host mutations so a queued old-generation
+      // frame cannot settle after a successful authorization change.
+      releaseAuthorizationLease = acquireWorkspaceAuthorizationMutationLease(user.userId);
+      await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
+      switch (msg.type) {
+        case 'history': await handleWsHistory(ws, msg, user); break;
+        case 'send':
+          await handleWsSend(ws, msg, user, () => {
+            authorizationLeaseReleaseSafe = false;
+          });
+          break;
+        case 'abort':   await handleWsAbort(ws, msg, user);   break;
+        case 'inject':  await handleWsInject(ws, msg, user);  break;
+        case 'exec_approval_resolve': await handleWsExecApproval(ws, msg, user); break;
+        case 'reconnect': await handleWsReconnect(ws, msg, user);   break;
+        default: wsSend(ws, { type: 'error', content: `Unknown type: ${msg.type}` });
+      }
+    } catch (error) {
+      wsSend(ws, {
+        type: 'error',
+        content: redactNativeProviderText((error as Error)?.message || String(error)) || 'Authorization changed',
+      });
+    } finally {
+      if (authorizationLeaseReleaseSafe) {
+        releaseAuthorizationLease?.();
+      } else {
+        console.error(
+          '[gateway-ws] Retaining the workspace authorization lease because an OpenClaw host-run ambiguity could not be quarantined',
+        );
+      }
     }
   });
 
@@ -6247,9 +8870,21 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
 
   // Replay any in-flight approval requests so a reconnecting / late client still
   // renders the popup. The frontend upserts by id, so re-delivery is idempotent.
-  for (const approval of pendingApprovalsForUser(user)) {
-    wsSend(ws, { type: 'exec_approval', approval });
-  }
+  void (async () => {
+    let releaseAuthorizationLease: (() => void) | null = null;
+    try {
+      releaseAuthorizationLease = acquireWorkspaceAuthorizationMutationLease(user.userId);
+      await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
+      for (const approval of await pendingApprovalsForUser(user)) {
+        await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
+        wsSend(ws, { type: 'exec_approval', approval });
+      }
+    } catch {
+      // A transition or generation change suppresses approval replay.
+    } finally {
+      releaseAuthorizationLease?.();
+    }
+  })();
 }
 
 /* ─── WS Server setup (called from server.ts) ─────────────────────────── */
@@ -6262,40 +8897,198 @@ const directUserConnections = new Map<string, number>();
 const MAX_DIRECT_WS_PER_USER = 5;
 
 // Allowlist of gateway methods that the direct proxy can forward
-// Device identity for direct WS proxy — loaded once, reused for all proxy connections
+// Device identity for direct WS proxy — loaded lazily, then reused for all
+// proxy connections. Importing this router must never create host state.
 // Use the SAME device keys as PersistentGatewayWs — the gateway allows
 // multiple connections from the same device with different instanceIds.
-// Using separate (unpaired) keys was the P4.5b blocker: "pairing required".
-const DIRECT_PROXY_DEVICE_KEYS = getOrCreateDeviceKeys();
+// Separate unpaired keys are rejected by the gateway as "pairing required".
+let directProxyDeviceKeys: ReturnType<typeof getOrCreateDeviceKeys> | undefined;
+function getDirectProxyDeviceKeys(): ReturnType<typeof getOrCreateDeviceKeys> {
+  if (!directProxyDeviceKeys) directProxyDeviceKeys = getOrCreateDeviceKeys();
+  return directProxyDeviceKeys;
+}
 const DIRECT_PROXY_CLIENT_ID = 'gateway-client';
 const DIRECT_PROXY_CLIENT_MODE = 'backend';
 const DIRECT_PROXY_ROLE = 'operator';
-const DIRECT_PROXY_BASE_SCOPES = ['operator.read', 'operator.write'];
+const DIRECT_PROXY_SCOPES = Object.freeze(['operator.read'] as const);
 const DIRECT_PROXY_MIN_PROTOCOL = 3;
 const DIRECT_PROXY_MAX_PROTOCOL = 4;
 
-function getDirectProxyScopes(user: JwtPayload): string[] {
-  if (isElevatedRole(user.role)) {
-    return [...DIRECT_PROXY_BASE_SCOPES, 'operator.approvals', 'operator.admin'];
-  }
-  return [...DIRECT_PROXY_BASE_SCOPES];
+function getDirectProxyScopes(): string[] {
+  return [...DIRECT_PROXY_SCOPES];
 }
 
 const ALLOWED_GATEWAY_METHODS = new Set([
   'connect',
-  'chat.send',
-  'chat.abort',
   'chat.history',
-  'sessions.steer',
-  'sessions.subscribe',
   'sessions.messages.subscribe',
 ]);
 
+const DIRECT_PROXY_SESSION_EVENTS = new Set([
+  'agent',
+  'chat',
+  'chat.side_result',
+  'session.message',
+  'session.tool',
+]);
+
+function directGatewayEventSessionKey(message: unknown): string | null {
+  if (!message || typeof message !== 'object') return null;
+  const frame = message as Record<string, any>;
+  if (
+    frame.type !== 'event'
+    || typeof frame.event !== 'string'
+    || !DIRECT_PROXY_SESSION_EVENTS.has(frame.event)
+  ) {
+    return null;
+  }
+  const value = frame.payload?.sessionKey;
+  if (
+    typeof value !== 'string'
+    || !value.trim()
+    || value.length > 2_048
+    || /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    return null;
+  }
+  return value.trim();
+}
+
+async function isDirectGatewayEventAllowed(
+  message: unknown,
+  user: JwtPayload,
+  database: ProjectActivityScopeDatabase = prisma,
+): Promise<boolean> {
+  if (!message || typeof message !== 'object') return false;
+  const frame = message as Record<string, any>;
+  if (frame.type !== 'event' || typeof frame.event !== 'string') return false;
+  if (frame.event === 'connect.challenge') {
+    const nonce = frame.payload?.nonce;
+    return typeof nonce === 'string'
+      && nonce.length >= 16
+      && nonce.length <= 512
+      && !/[\u0000-\u001f\u007f]/.test(nonce);
+  }
+  const sessionKey = directGatewayEventSessionKey(frame);
+  if (!sessionKey) return false;
+  try {
+    await assertExistingGatewaySessionAccess(sessionKey, user, { database });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isDirectGatewayMethodAllowed(method: unknown, user: JwtPayload): boolean {
   if (typeof method !== 'string') return false;
-  if (ALLOWED_GATEWAY_METHODS.has(method)) return true;
-  if (method === 'chat.inject') return isElevatedRole(user.role);
-  return false;
+  void user;
+  // Mutating methods stay on the Portal broker, which owns authorization
+  // leases through provider settlement. The transparent proxy cannot yet
+  // prove quiescence after a browser disconnect.
+  return ALLOWED_GATEWAY_METHODS.has(method);
+}
+
+function sameDirectParamKeys(actual: string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length
+    && actual.every((entry, index) => entry === expected[index]);
+}
+
+function isDirectGatewayRequestShapeAllowed(frame: unknown): boolean {
+  if (!frame || typeof frame !== 'object' || Array.isArray(frame)) return false;
+  const request = frame as Record<string, any>;
+  if (request.type !== 'req' || typeof request.method !== 'string') return false;
+  if (!request.params || typeof request.params !== 'object' || Array.isArray(request.params)) {
+    return false;
+  }
+  const paramKeys = Object.keys(request.params).sort();
+  if (request.method === 'connect') {
+    const nonce = request.params.nonce;
+    return typeof nonce === 'string'
+      && nonce.length >= 16
+      && nonce.length <= 512
+      && !/[\u0000-\u001f\u007f]/.test(nonce);
+  }
+  if (request.method === 'chat.history') {
+    if (
+      !sameDirectParamKeys(
+        paramKeys,
+        request.params.limit === undefined
+          ? ['sessionKey']
+          : ['limit', 'sessionKey'],
+      )
+    ) {
+      return false;
+    }
+    return request.params.limit === undefined
+      || (
+        Number.isSafeInteger(request.params.limit)
+        && request.params.limit >= 1
+        && request.params.limit <= 500
+      );
+  }
+  if (request.method === 'sessions.messages.subscribe') {
+    return sameDirectParamKeys(paramKeys, ['key']);
+  }
+  // Unknown methods are rejected by the method allowlist. Their shape is not
+  // forwarded, so no protocol-differential surface remains.
+  return true;
+}
+
+interface DirectProxyConnectDependencies {
+  getToken(): string;
+  getKeys(): ReturnType<typeof getOrCreateDeviceKeys>;
+  buildDevice(
+    input: Parameters<typeof buildSignedDevice>[0],
+  ): ReturnType<typeof buildSignedDevice>;
+}
+
+const directProxyConnectDependencies: DirectProxyConnectDependencies = {
+  getToken: getGatewayToken,
+  getKeys: getDirectProxyDeviceKeys,
+  buildDevice: buildSignedDevice,
+};
+
+function buildDirectProxyConnectFrame(
+  browserFrame: Record<string, any>,
+  user: JwtPayload,
+  dependencies: DirectProxyConnectDependencies = directProxyConnectDependencies,
+): Record<string, unknown> {
+  if (!isDirectGatewayRequestShapeAllowed(browserFrame) || browserFrame.method !== 'connect') {
+    throw new Error('Invalid direct gateway connect request');
+  }
+  const token = dependencies.getToken();
+  const nonce = browserFrame.params.nonce;
+  const scopes = getDirectProxyScopes();
+  return {
+    type: 'req',
+    id: String(browserFrame.id),
+    method: 'connect',
+    params: {
+      auth: { token },
+      client: {
+        id: DIRECT_PROXY_CLIENT_ID,
+        mode: DIRECT_PROXY_CLIENT_MODE,
+        version: '1.0.0',
+        displayName: `Portal (${user.email})`,
+        platform: 'linux',
+        instanceId: `portal-direct-${user.userId.substring(0, 8)}`,
+      },
+      device: dependencies.buildDevice({
+        keys: dependencies.getKeys(),
+        clientId: DIRECT_PROXY_CLIENT_ID,
+        clientMode: DIRECT_PROXY_CLIENT_MODE,
+        role: DIRECT_PROXY_ROLE,
+        scopes,
+        token,
+        nonce,
+      }),
+      role: DIRECT_PROXY_ROLE,
+      scopes,
+      caps: ['tool-events'],
+      minProtocol: DIRECT_PROXY_MIN_PROTOCOL,
+      maxProtocol: DIRECT_PROXY_MAX_PROTOCOL,
+    },
+  };
 }
 
 /**
@@ -6305,6 +9098,23 @@ function isDirectGatewayMethodAllowed(method: unknown, user: JwtPayload): boolea
  */
 function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
   const userId = user.userId;
+  const authorizationBinding = (browserWs as any).__portalAuthorizationBinding as
+    | GatewayWebSocketAuthorizationBinding
+    | undefined;
+  const withAuthorizationLease = async <T>(operation: () => Promise<T> | T): Promise<T> => {
+    const release = acquireWorkspaceAuthorizationMutationLease(user.userId);
+    try {
+      await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
+      const result = await operation();
+      // Any ownership lookup above may have yielded while an authorization
+      // change was published. Recheck immediately before exposing/forwarding
+      // the frame while the short lease still owns the transition boundary.
+      await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
+      return result;
+    } finally {
+      release();
+    }
+  };
 
   // Enforce per-user connection limit
   const currentCount = directUserConnections.get(userId) || 0;
@@ -6313,6 +9123,14 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
     return;
   }
   directUserConnections.set(userId, currentCount + 1);
+  let connectionSlotReleased = false;
+  const releaseConnectionSlot = () => {
+    if (connectionSlotReleased) return;
+    connectionSlotReleased = true;
+    const count = directUserConnections.get(userId) || 0;
+    if (count <= 1) directUserConnections.delete(userId);
+    else directUserConnections.set(userId, count - 1);
+  };
 
   const gatewayUrl = getOpenClawWsUrl();
   let gatewayWs: WebSocket | null = null;
@@ -6325,6 +9143,7 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
     gatewayWs = new WebSocket(gatewayUrl);
   } catch (err: any) {
     console.error('[gateway-direct] Failed to connect to gateway:', err.message);
+    releaseConnectionSlot();
     browserWs.close(1011, 'Gateway connection failed');
     return;
   }
@@ -6339,14 +9158,92 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
 
   // Track browser→gateway id mapping so we can convert string IDs back to numeric
   const idMap = new Map<string, number>(); // gateway string ID → browser numeric ID
-  const requestMeta = new Map<string, { method?: string; sessionKey?: string; limit?: number }>();
+  type DirectRequestMeta = {
+    method?: string;
+    sessionKey?: string;
+    limit?: number;
+    expectedRunId?: string | null;
+    reservationRunId?: string;
+    browserRequestId?: string | number;
+    timeoutTimer?: ReturnType<typeof setTimeout>;
+  };
+  const requestMeta = new Map<string, DirectRequestMeta>();
+  const expiredRequestIds = new Set<string>();
 
-  gatewayWs.on('message', (data: Buffer | string) => {
+  const markDirectRequestExpired = (gatewayId: string) => {
+    expiredRequestIds.delete(gatewayId);
+    expiredRequestIds.add(gatewayId);
+    while (expiredRequestIds.size > 256) {
+      const oldest = expiredRequestIds.values().next().value;
+      if (typeof oldest !== 'string') break;
+      expiredRequestIds.delete(oldest);
+    }
+  };
+
+  const clearDirectRequestMeta = (gatewayId: string): DirectRequestMeta | undefined => {
+    const meta = requestMeta.get(gatewayId);
+    if (meta?.timeoutTimer) clearTimeout(meta.timeoutTimer);
+    requestMeta.delete(gatewayId);
+    idMap.delete(gatewayId);
+    return meta;
+  };
+
+  const registerDirectRequestMeta = (gatewayId: string, meta: DirectRequestMeta) => {
+    requestMeta.set(gatewayId, meta);
+    if (meta.method !== 'chat.send' || !meta.sessionKey || !meta.reservationRunId) return;
+    meta.timeoutTimer = scheduleDirectGatewayChatRunTimeout(
+      meta.sessionKey,
+      meta.reservationRunId,
+      () => {
+        if (requestMeta.get(gatewayId) !== meta) return;
+        requestMeta.delete(gatewayId);
+        idMap.delete(gatewayId);
+        markDirectRequestExpired(gatewayId);
+        if (!browserClosed && browserWs.readyState === WebSocket.OPEN) {
+          try {
+            browserWs.send(JSON.stringify({
+              type: 'res',
+              id: meta.browserRequestId ?? gatewayId,
+              ok: false,
+              error: {
+                code: 'CHAT_SEND_TIMEOUT',
+                message: 'The gateway did not acknowledge the chat turn in time.',
+              },
+            }));
+          } catch {}
+        }
+      },
+    );
+  };
+
+  const failOutstandingDirectChatRuns = () => {
+    for (const meta of requestMeta.values()) {
+      if (meta.timeoutTimer) clearTimeout(meta.timeoutTimer);
+      if (meta.sessionKey && meta.reservationRunId) {
+        failDirectGatewayChatRun(meta.sessionKey, meta.reservationRunId);
+      }
+    }
+    requestMeta.clear();
+    idMap.clear();
+    expiredRequestIds.clear();
+  };
+
+  gatewayWs.on('message', async (data: RawData, isBinary: boolean) => {
     if (browserClosed) return;
+    if (isBinary) {
+      try { browserWs.close(1003, 'Binary gateway frames are not supported'); } catch {}
+      return;
+    }
     // Convert response string IDs back to the numeric IDs the browser expects
     try {
       const str = data.toString();
       const msg = JSON.parse(str);
+      if (msg.type === 'event') {
+        const allowed = await withAuthorizationLease(
+          () => isDirectGatewayEventAllowed(msg, user),
+        );
+        if (!allowed) return;
+      }
 
       if (DEBUG_GATEWAY_WS && msg.type === 'event') {
         if (msg.event === 'chat') {
@@ -6367,34 +9264,48 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
         }
       }
 
-      if (msg.type === 'res' && typeof msg.id === 'string' && idMap.has(msg.id)) {
-        const gatewayId = msg.id;
-        const meta = requestMeta.get(gatewayId);
-        if (msg.ok && meta?.method === 'chat.history' && meta.sessionKey) {
-          msg.payload = augmentDirectHistoryPayload(msg.payload, meta.sessionKey, meta.limit || 200);
-        }
-        if (msg.ok && meta?.sessionKey && (meta.method === 'chat.send' || meta.method === 'sessions.steer')) {
-          const runId = typeof msg.payload?.runId === 'string' && msg.payload.runId.trim()
-            ? msg.payload.runId.trim()
-            : undefined;
-          registerRun(meta.sessionKey, runId);
-          subscribeBackendToLiveSessionEvents(meta.sessionKey);
-        }
-        requestMeta.delete(gatewayId);
-        msg.id = idMap.get(gatewayId)!;
-        idMap.delete(gatewayId);
-        browserWs.send(JSON.stringify(msg));
+      if (msg.type === 'res' && typeof msg.id === 'string' && expiredRequestIds.has(msg.id)) {
+        expiredRequestIds.delete(msg.id);
         return;
       }
-      browserWs.send(data);
-    } catch (err: any) {
-      // If JSON parse fails, forward raw
-      try { browserWs.send(data); } catch {}
+      if (msg.type === 'res' && typeof msg.id === 'string' && requestMeta.has(msg.id)) {
+        await withAuthorizationLease(async () => {
+          const gatewayId = msg.id;
+          const meta = requestMeta.get(gatewayId);
+          if (meta?.sessionKey) {
+            await assertExistingGatewaySessionAccess(meta.sessionKey, user);
+          }
+          if (meta?.timeoutTimer) {
+            clearTimeout(meta.timeoutTimer);
+            meta.timeoutTimer = undefined;
+          }
+          if (msg.ok && meta?.method === 'chat.history' && meta.sessionKey) {
+            msg.payload = augmentDirectHistoryPayload(msg.payload, meta.sessionKey, meta.limit || 200);
+          }
+          const browserRequestId = meta?.browserRequestId ?? idMap.get(gatewayId) ?? gatewayId;
+          clearDirectRequestMeta(gatewayId);
+          msg.id = browserRequestId;
+          browserWs.send(JSON.stringify(msg));
+        });
+        return;
+      }
+      // The proxy is a correlated read-only protocol boundary. Unsolicited
+      // responses, unknown frame types, and unscoped events are never exposed.
+      if (msg.type !== 'event') return;
+      await withAuthorizationLease(() => {
+        browserWs.send(JSON.stringify(msg));
+      });
+    } catch {
+      // Fail closed on malformed upstream data or authorization drift.
+      if (!browserClosed) {
+        try { browserWs.close(4003, 'Authorization changed'); } catch {}
+      }
     }
   });
 
   gatewayWs.on('close', (code: number, reason: Buffer) => {
     gatewayClosed = true;
+    failOutstandingDirectChatRuns();
     debugLog(`[gateway-direct] Gateway closed: ${code} ${reason?.toString()}`);
     if (!browserClosed) {
       try {
@@ -6412,79 +9323,108 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
     }
   });
 
-  browserWs.on('message', (data: Buffer | string) => {
+  browserWs.on('message', async (data: RawData, isBinary: boolean) => {
+    if (!authorizationBinding || authorizationBinding.revoked) return;
     if (gatewayClosed || !gatewayWs) return;
+    if (isBinary) {
+      try {
+        browserWs.send(JSON.stringify({
+          type: 'res',
+          id: null,
+          ok: false,
+          error: { code: 'BINARY_FRAME_REJECTED', message: 'Gateway frames must be JSON text.' },
+        }));
+      } catch {}
+      return;
+    }
 
     // Parse the message to check if it's a 'connect' request
     let frame: any;
     try {
       frame = JSON.parse(data.toString());
     } catch {
-      // Not JSON — pass through unchanged (shouldn't happen with JSON-RPC)
       try {
-        gatewayWs.send(data);
+        browserWs.send(JSON.stringify({
+          type: 'res',
+          id: null,
+          ok: false,
+          error: { code: 'INVALID_JSON', message: 'Gateway frames must be valid JSON.' },
+        }));
       } catch {}
       return;
+    }
+
+    let releaseAuthorizationLease: (() => void) | null = null;
+    try {
+      releaseAuthorizationLease = acquireWorkspaceAuthorizationMutationLease(user.userId);
+      await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
+
+    if (frame.type === 'req') {
+      const validNumericId = typeof frame.id === 'number' && Number.isSafeInteger(frame.id);
+      const validStringId = typeof frame.id === 'string' && frame.id.trim().length > 0;
+      if (!validNumericId && !validStringId) {
+        browserWs.send(JSON.stringify({
+          type: 'res',
+          id: frame.id ?? null,
+          ok: false,
+          error: { code: 'INVALID_REQUEST_ID', message: 'Gateway request IDs must be non-empty strings or safe integers.' },
+        }));
+        return;
+      }
+      const gatewayRequestId = String(frame.id);
+      if (requestMeta.has(gatewayRequestId)
+        || idMap.has(gatewayRequestId)
+        || expiredRequestIds.has(gatewayRequestId)) {
+        browserWs.send(JSON.stringify({
+          type: 'res',
+          id: frame.id,
+          ok: false,
+          error: { code: 'DUPLICATE_REQUEST_ID', message: 'That gateway request ID is already in use.' },
+        }));
+        return;
+      }
+      if (!isDirectGatewayRequestShapeAllowed(frame)) {
+        browserWs.send(JSON.stringify({
+          type: 'res',
+          id: frame.id,
+          ok: false,
+          error: {
+            code: 'INVALID_REQUEST',
+            message: 'The gateway request schema is not allowed.',
+          },
+        }));
+        return;
+      }
     }
 
     // Intercept 'connect' requests — build the full signed connect frame server-side
     // The gateway requires auth token + signed device identity, both must be injected
     if (frame.type === 'req' && frame.method === 'connect') {
       debugLog('[gateway-direct] Intercepting connect request to build full signed connect frame');
-      const nonce = frame.params?.nonce;
-      const directProxyScopes = getDirectProxyScopes(user);
-      const fullParams: Record<string, unknown> = {
-        auth: { token: getGatewayToken() },
-        client: {
-          id: DIRECT_PROXY_CLIENT_ID,
-          mode: DIRECT_PROXY_CLIENT_MODE,
-          version: '1.0.0',
-          displayName: `Portal (${user.email})`,
-          platform: 'linux',
-          instanceId: `portal-direct-${user.userId.substring(0, 8)}`,
-        },
-        device: buildSignedDevice({
-          keys: DIRECT_PROXY_DEVICE_KEYS,
-          clientId: DIRECT_PROXY_CLIENT_ID,
-          clientMode: DIRECT_PROXY_CLIENT_MODE,
-          role: DIRECT_PROXY_ROLE,
-          scopes: directProxyScopes,
-          token: getGatewayToken(),
-          nonce,
-        }),
-        role: DIRECT_PROXY_ROLE,
-        scopes: directProxyScopes,
-        caps: ['tool-events'],
-        minProtocol: DIRECT_PROXY_MIN_PROTOCOL,
-        maxProtocol: DIRECT_PROXY_MAX_PROTOCOL,
-      };
-
       const stringId = String(frame.id);
       if (typeof frame.id === 'number') {
         idMap.set(stringId, frame.id);
       }
-      requestMeta.set(stringId, {
+      registerDirectRequestMeta(stringId, {
         method: 'connect',
+        browserRequestId: frame.id,
       });
 
-      const fullFrame = {
-        type: 'req',
-        id: stringId,
-        method: 'connect',
-        params: fullParams,
-      };
+      const fullFrame = buildDirectProxyConnectFrame(frame, user);
 
       const serialized = JSON.stringify(fullFrame);
-      debugLog(`[gateway-direct] CONNECT frame forwarding: readyState=${gatewayWs.readyState} bufferedAmount=${gatewayWs.bufferedAmount} id=${stringId} client=${DIRECT_PROXY_CLIENT_ID} scopeCount=${directProxyScopes.length}`);
+      debugLog(`[gateway-direct] CONNECT frame forwarding: readyState=${gatewayWs.readyState} bufferedAmount=${gatewayWs.bufferedAmount} id=${stringId} client=${DIRECT_PROXY_CLIENT_ID} scopeCount=${getDirectProxyScopes().length}`);
       try {
         gatewayWs.send(serialized, (err) => {
           if (err) {
+            clearDirectRequestMeta(stringId);
             console.error('[gateway-direct] Send callback error:', err.message);
           } else {
             debugLog(`[gateway-direct] CONNECT frame forwarded: bufferedAmount=${gatewayWs?.bufferedAmount} id=${stringId}`);
           }
         });
       } catch (err: any) {
+        clearDirectRequestMeta(stringId);
         console.error('[gateway-direct] Failed to send signed connect:', err.message);
       }
       return;
@@ -6511,15 +9451,63 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
     }
 
     const frameMethod = typeof frame.method === 'string' ? frame.method : '';
-    const frameSessionKey = typeof frame.params?.sessionKey === 'string' && frame.params.sessionKey.trim()
+    let frameSessionKey = typeof frame.params?.sessionKey === 'string' && frame.params.sessionKey.trim()
       ? frame.params.sessionKey.trim()
       : (typeof frame.params?.key === 'string' && frame.params.key.trim()
           ? frame.params.key.trim()
           : (typeof frame.params?.session === 'string' && frame.params.session.trim()
               ? frame.params.session.trim()
               : undefined));
+    if (!frameSessionKey) {
+      browserWs.send(JSON.stringify({
+        type: 'res',
+        id: frame.id,
+        ok: false,
+        error: { code: 'SESSION_REQUIRED', message: 'A concrete owned session is required.' },
+      }));
+      return;
+    }
+    try {
+      const resolvedSessionKey = await resolveOpenClawSessionKey(frameSessionKey, user);
+      await assertExistingGatewaySessionAccess(resolvedSessionKey, user);
+      await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
+      if (typeof frame.params?.sessionKey === 'string') {
+        frame.params.sessionKey = resolvedSessionKey;
+      } else if (typeof frame.params?.key === 'string') {
+        frame.params.key = resolvedSessionKey;
+      } else {
+        frame.params.session = resolvedSessionKey;
+      }
+      frameSessionKey = resolvedSessionKey;
+    } catch {
+      browserWs.send(JSON.stringify({
+        type: 'res',
+        id: frame.id,
+        ok: false,
+        error: { code: 'SESSION_ACCESS_DENIED', message: 'Session access denied.' },
+      }));
+      return;
+    }
+    let directExpectedRunId: string | null | undefined;
+    let directReservationRunId: string | undefined;
     if (frameSessionKey && (frameMethod === 'chat.send' || frameMethod === 'sessions.steer')) {
-      registerRun(frameSessionKey);
+      if (frameMethod === 'chat.send') {
+        directReservationRunId = `direct-${randomUUID()}`;
+        if (!reserveDirectGatewayChatRun(frameSessionKey, directReservationRunId)) {
+          browserWs.send(JSON.stringify({
+            type: 'res',
+            id: frame.id,
+            ok: false,
+            error: { code: 'TURN_ACTIVE', message: 'This chat already has an active turn.' },
+          }));
+          return;
+        }
+        directExpectedRunId = directReservationRunId;
+      } else {
+        directExpectedRunId = normalizeHostStreamRunId(
+          streamEventBus.getTrackedStream(frameSessionKey)?.runId,
+        );
+      }
       subscribeBackendToLiveSessionEvents(frameSessionKey);
     }
 
@@ -6529,9 +9517,12 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       const stringId = String(frame.id);
       frame.id = stringId;
       idMap.set(stringId, numericId);
-      requestMeta.set(stringId, {
+      registerDirectRequestMeta(stringId, {
         method: frame.method,
         sessionKey: frameSessionKey,
+        expectedRunId: directExpectedRunId,
+        reservationRunId: directReservationRunId,
+        browserRequestId: numericId,
         limit: typeof frame.params?.limit === 'number' && Number.isFinite(frame.params.limit)
           ? frame.params.limit
           : undefined,
@@ -6539,15 +9530,21 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       try {
         gatewayWs.send(JSON.stringify(frame));
       } catch (err: any) {
-        requestMeta.delete(stringId);
+        clearDirectRequestMeta(stringId);
+        if (frameSessionKey && directReservationRunId) {
+          failDirectGatewayChatRun(frameSessionKey, directReservationRunId);
+        }
         debugLog('[gateway-direct] Failed to forward to gateway:', err.message);
       }
     } else {
       const stringId = typeof frame.id === 'string' ? frame.id : undefined;
       if (stringId) {
-        requestMeta.set(stringId, {
+        registerDirectRequestMeta(stringId, {
           method: frame.method,
           sessionKey: frameSessionKey,
+          expectedRunId: directExpectedRunId,
+          reservationRunId: directReservationRunId,
+          browserRequestId: stringId,
           limit: typeof frame.params?.limit === 'number' && Number.isFinite(frame.params.limit)
             ? frame.params.limit
             : undefined,
@@ -6556,20 +9553,27 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       try {
         gatewayWs.send(JSON.stringify(frame));
       } catch (err: any) {
-        if (stringId) requestMeta.delete(stringId);
+        if (stringId) clearDirectRequestMeta(stringId);
+        if (frameSessionKey && directReservationRunId) {
+          failDirectGatewayChatRun(frameSessionKey, directReservationRunId);
+        }
         debugLog('[gateway-direct] Failed to forward to gateway:', err.message);
       }
+    }
+    } catch {
+      try { browserWs.close(4003, 'Authorization changed'); } catch {}
+    } finally {
+      releaseAuthorizationLease?.();
     }
   });
 
   browserWs.on('close', (code: number, reason: Buffer) => {
     browserClosed = true;
+    failOutstandingDirectChatRuns();
     debugLog(`[gateway-direct] Browser closed: ${code} ${reason?.toString()}`);
 
     // Decrement per-user connection count
-    const count = directUserConnections.get(userId) || 0;
-    if (count <= 1) directUserConnections.delete(userId);
-    else directUserConnections.set(userId, count - 1);
+    releaseConnectionSlot();
 
     if (!gatewayClosed && gatewayWs) {
       try {
@@ -6616,6 +9620,14 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
       ws.close(4001, 'Unauthorized');
       return;
     }
+    const authorizationBinding = (req as any).__portalAuthorizationBinding as
+      | GatewayWebSocketAuthorizationBinding
+      | undefined;
+    if (!authorizationBinding || authorizationBinding.revoked) {
+      ws.close(4003, 'Authorization changed');
+      return;
+    }
+    (ws as any).__portalAuthorizationBinding = authorizationBinding;
     handlePortalWsConnection(ws, user);
   });
 
@@ -6628,6 +9640,14 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
       ws.close(4001, 'Unauthorized');
       return;
     }
+    const authorizationBinding = (req as any).__portalAuthorizationBinding as
+      | GatewayWebSocketAuthorizationBinding
+      | undefined;
+    if (!authorizationBinding || authorizationBinding.revoked) {
+      ws.close(4003, 'Authorization changed');
+      return;
+    }
+    (ws as any).__portalAuthorizationBinding = authorizationBinding;
     handleDirectProxyConnection(ws, user);
   });
 
@@ -6647,7 +9667,7 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
     }
 
     // Authenticate via cookie
-    const cookies = parseCookiesWs(req.headers.cookie || '');
+    const cookies = parseSafeCookieHeader(req.headers.cookie);
     const token = cookies.accessToken;
     if (!token) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -6661,12 +9681,61 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
       return;
     }
 
+    const authorizationBinding: GatewayWebSocketAuthorizationBinding = { revoked: false };
+    (req as any).__portalAuthorizationBinding = authorizationBinding;
+    let unsubscribed = false;
+    let globalSubscriptionReady = false;
+    const revokeForGlobalFence = () => {
+      authorizationBinding.revoked = true;
+      if (globalSubscriptionReady) socket.destroy();
+    };
+    let unsubscribeGlobalFence = subscribeToGlobalWorkspaceAuthorizationFence(
+      revokeForGlobalFence,
+    );
+    globalSubscriptionReady = true;
+    if (authorizationBinding.revoked) {
+      unsubscribeGlobalFence();
+      socket.write('HTTP/1.1 409 Conflict\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    const unsubscribeAuthorization = subscribeToAuthorizationChanges(user.userId, () => {
+      authorizationBinding.revoked = true;
+      socket.destroy();
+    });
+    const cleanupAuthorization = () => {
+      if (unsubscribed) return;
+      unsubscribed = true;
+      socket.removeListener('close', cleanupAuthorization);
+      unsubscribeGlobalFence();
+      unsubscribeGlobalFence = () => {};
+      unsubscribeAuthorization();
+    };
+    socket.once('close', cleanupAuthorization);
+
     prisma.user.findUnique({
       where: { id: user.userId },
-      select: { id: true, email: true, role: true, accountStatus: true, isActive: true, sandboxEnabled: true },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        accountStatus: true,
+        isActive: true,
+        sandboxEnabled: true,
+        authorizationVersion: true,
+      },
     } as any).then((dbUser) => {
-      if (!dbUser || !canUseInteractivePortal(dbUser.role, (dbUser as any).accountStatus, dbUser.isActive)) {
-        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      const canUseRequestedTransport = dbUser && (
+        isDirectProxy
+          ? canUseDirectGateway(dbUser.role, (dbUser as any).accountStatus, dbUser.isActive)
+          : canUseInteractivePortal(dbUser.role, (dbUser as any).accountStatus, dbUser.isActive)
+      );
+      if (authorizationBinding.revoked
+        || socket.destroyed
+        || !canUseRequestedTransport
+        || (user.authorizationVersion ?? 1) !== Number((dbUser as any).authorizationVersion ?? 1)) {
+        cleanupAuthorization();
+        if (!socket.destroyed) socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
         socket.destroy();
         return;
       }
@@ -6677,20 +9746,27 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
         role: dbUser.role,
         accountStatus: (dbUser as any).accountStatus,
         sandboxEnabled: !!(dbUser as any).sandboxEnabled,
+        authorizationVersion: Number((dbUser as any).authorizationVersion ?? 1),
       };
 
       // Route to the appropriate WebSocket server
-      if (isDirectProxy) {
-        directWss!.handleUpgrade(req, socket, head, (ws: any) => {
-          directWss!.emit('connection', ws, req);
-        });
-      } else {
-        portalWss!.handleUpgrade(req, socket, head, (ws: any) => {
-          portalWss!.emit('connection', ws, req);
-        });
+      try {
+        if (isDirectProxy) {
+          directWss!.handleUpgrade(req, socket, head, (ws: any) => {
+            directWss!.emit('connection', ws, req);
+          });
+        } else {
+          portalWss!.handleUpgrade(req, socket, head, (ws: any) => {
+            portalWss!.emit('connection', ws, req);
+          });
+        }
+      } catch {
+        cleanupAuthorization();
+        socket.destroy();
       }
     }).catch(() => {
-      socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+      cleanupAuthorization();
+      if (!socket.destroyed) socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
       socket.destroy();
     });
   });
@@ -6698,11 +9774,72 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
   debugLog('[gateway-ws] Portal WebSocket server attached on /api/gateway/ws and /api/gateway/direct');
 }
 
+// Narrow test surface for the Agent Chat trust-boundary ordering. Project Chat
+// keeps using the shared gateway transport for sandbox history/reconnect.
+export const __gatewayExecutionScopeTest = {
+  requireHostOperatorExecutionContext,
+  openClawAgentChatSessionKey,
+  openClawSessionActorId,
+  resolveOpenClawSessionKey,
+  resolveOpenClawTurnSessionKey,
+  claimOpenClawAgentSession,
+  findOpenClawAgentSessionOwner,
+  assertGatewaySessionAccess,
+  assertExistingGatewaySessionAccess,
+  providerPublishesHostStream,
+  providerUsesHostStreamBus,
+  getProviderOwnedBusStreamSnapshot,
+  browserSafeActiveStreamSnapshot,
+  attachBrowserWsToSessionStream,
+  wsHasSessionStreamSubscription,
+  captureHostStreamRunIdentity,
+  clearHostStreamIfCurrentRun,
+  shouldAttemptOpenClawReplyRecovery,
+  registerSseDelivery,
+  takeOverSseDelivery,
+  reserveDirectGatewayChatRun,
+  acknowledgeDirectGatewayChatRun,
+  failDirectGatewayChatRun,
+  scheduleDirectGatewayChatRunTimeout,
+  normalizeRequestedModel,
+  isProviderModelResetAlias,
+  routeProviderForRequestedModel,
+  humanizeProviderError,
+  isActorDerivedLegacyProjectSessionKey,
+  isProjectChatActivitySession,
+  isAgentChatActivitySession,
+  attestAgentChatActivitySession,
+  isDirectGatewayMethodAllowed,
+  isDirectGatewayRequestShapeAllowed,
+  buildDirectProxyConnectFrame,
+  getDirectProxyScopes,
+  directGatewayEventSessionKey,
+  isDirectGatewayEventAllowed,
+  sendHostOperatorProviderMessage,
+  clearAgentActivityScopePending: () => agentActivityScopePending.clear(),
+  directGatewayChatSendTimeoutMs: DIRECT_GATEWAY_CHAT_SEND_TIMEOUT_MS,
+  handleWsSend,
+  handleWsAbort,
+  handleWsReconnect,
+};
+
+// Narrow test surface for the dashboard's OpenClaw version checks. The
+// dependency seam lets regression tests prove that CLI processes never overlap
+// without changing production probe inputs or acceptance rules.
+export const __gatewayVersionProbeTest = {
+  probeOpenClawVersionStatusWithDependencies,
+  OPENCLAW_VERSION_STATUS_COLD_PROBE_BUDGET_MS,
+};
+
 export default router;
 function normalizeRequestedModel(providerName: AgentProviderName, rawModel: string): string {
   const model = String(rawModel || '').trim();
   if (!model) return '';
-  if (providerName === 'OPENCLAW' || providerName === 'OLLAMA') return normalizePortalModelId(model);
+  if (providerName === 'OPENCLAW') return normalizePortalModelId(model);
+  // Ollama tags are opaque and can resemble Portal/OpenClaw aliases. Preserve
+  // the exact `/api/tags` identifier through selection, session launch, and
+  // send so a local `codex/gpt-5.5` tag is never rewritten to another model.
+  if (providerName === 'OLLAMA') return model;
   if (providerName === 'GEMINI') {
     const normalized = normalizePortalModelId(model).replace(/^models\//, '');
     if (normalized.startsWith('google-antigravity/')) return normalized.slice('google-antigravity/'.length);
@@ -6721,5 +9858,82 @@ function normalizeRequestedModel(providerName: AgentProviderName, rawModel: stri
   if (providerName === 'CODEX' && (lower.startsWith('codex/') || lower.startsWith('openai-codex/') || lower.startsWith('openai/'))) {
     return parts.slice(1).join('/');
   }
+  if (providerName === 'GROK' && (lower.startsWith('xai/') || lower.startsWith('grok/'))) {
+    return parts.slice(1).join('/');
+  }
   return model;
 }
+
+/** Native Codex pending-input channel, projected through an owner-scoped broker. */
+function askUserErrorResponse(res: Response, error: unknown): void {
+  if (error instanceof AskUserQuestionError) {
+    if ([
+      'ASK_USER_NOT_FOUND',
+      'ASK_USER_RUN_UNOWNED',
+      'ASK_USER_OWNER_REQUIRED',
+      'ASK_USER_AUTHORITY_REQUIRED',
+    ].includes(error.code)) {
+      res.status(404).json({ error: 'That question is no longer open.' });
+      return;
+    }
+    res.status(error.statusCode).json({ error: error.message, code: error.code });
+    return;
+  }
+  if (error instanceof PendingUserInputAnswerError) {
+    if (error.statusCode === 404) {
+      res.status(404).json({ error: 'That question is no longer open.' });
+      return;
+    }
+    res.status(error.statusCode).json({ error: error.message, code: error.code });
+    return;
+  }
+  console.error('[gateway] ask-user error:', error);
+  res.status(500).json({ error: 'The question channel is unavailable.' });
+}
+
+router.get('/ask-user/pending', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const actorUserId = req.user?.userId || '';
+    const actorAuthorizationVersion = Number(req.user?.authorizationVersion ?? 1);
+    const requestedSession = typeof req.query.session === 'string' && req.query.session.trim()
+      ? await resolveOpenClawSessionKey(req.query.session, req.user)
+      : undefined;
+    const pending = await syncNativeAskUserQuestionsForActor({
+      actorUserId,
+      actorAuthorizationVersion,
+      sessionKey: requestedSession,
+    });
+    res.json({ questions: pending, actorUserId });
+  } catch (error) {
+    askUserErrorResponse(res, error);
+  }
+});
+
+router.post('/ask-user/answer', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const id = String(req.body?.id || '');
+    const actorUserId = req.user?.userId || '';
+    const { record, idempotentReplay } = await deliverNativeAskUserQuestionAnswer({
+      id,
+      answers: (req.body?.answers && typeof req.body.answers === 'object') ? req.body.answers : {},
+      actorUserId,
+    });
+    res.json({ ok: true, id: record.id, state: record.state, idempotentReplay });
+  } catch (error) {
+    askUserErrorResponse(res, error);
+  }
+});
+
+router.post('/ask-user/dismiss', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const id = String(req.body?.id || '');
+    const actorUserId = req.user?.userId || '';
+    const { idempotentReplay } = await deliverNativeAskUserQuestionDismissal({
+      id,
+      actorUserId,
+    });
+    res.json({ ok: true, idempotentReplay });
+  } catch (error) {
+    askUserErrorResponse(res, error);
+  }
+});

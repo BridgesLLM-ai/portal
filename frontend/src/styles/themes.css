@@ -4,56 +4,166 @@
 [data-theme="dark"] {
   --color-bg: #0A0E27;
   --color-surface: #0D1130;
+  --color-surface-raised: #1A1F3A;
+  --color-surface-strong: #252B4A;
+  --color-surface-hover: rgba(255, 255, 255, 0.06);
   --color-border: rgba(255, 255, 255, 0.06);
+  --color-border-strong: rgba(255, 255, 255, 0.12);
   --color-text: #e2e8f0;
   --color-text-muted: #64748b;
+  --color-text-subtle: #94a3b8;
+  --color-shadow: rgba(0, 0, 0, 0.35);
   --color-accent: var(--color-accent-custom, #6366f1);
   color-scheme: dark;
 }
 
 [data-theme="light"] {
-  --color-bg: #f8fafc;
+  --color-bg: #f2f5f9;
   --color-surface: #ffffff;
-  --color-border: #e2e8f0;
-  --color-text: #1e293b;
-  --color-text-muted: #64748b;
+  --color-surface-raised: #f8fafc;
+  --color-surface-strong: #e9eef5;
+  --color-surface-hover: #e9eef5;
+  --color-border: #d5deea;
+  --color-border-strong: #bdc9d8;
+  --color-text: #172033;
+  --color-text-muted: #596a80;
+  --color-text-subtle: #64748b;
+  --color-shadow: rgba(15, 23, 42, 0.14);
   --color-accent: var(--color-accent-custom, #6366f1);
   color-scheme: light;
 }
 
-/* Light-mode overrides for hardcoded dark backgrounds */
+/* The product predates the semantic theme tokens and still contains many
+   dark-only Tailwind utilities. Keep the translation here so every surface —
+   including lazy-loaded drawers and modals — receives the same light palette. */
+[data-theme="light"],
+[data-theme="light"] body {
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
 [data-theme="light"] .bg-\[\#0A0E27\],
+[data-theme="light"] .bg-\[\#0A0E27\]\/95,
+[data-theme="light"] .bg-\[\#0A0E27\]\/98,
 [data-theme="light"] .bg-\[\#0f1117\],
 [data-theme="light"] .bg-\[\#080B20\],
+[data-theme="light"] .bg-\[\#080B20\]\/50,
+[data-theme="light"] .bg-\[\#080B20\]\/85,
+[data-theme="light"] .bg-\[\#080B20\]\/95,
+[data-theme="light"] .bg-\[\#080B20\]\/98,
 [data-theme="light"] .bg-\[\#0D1130\],
-[data-theme="light"] .bg-\[\#0D1130\]\/70 {
+[data-theme="light"] .bg-\[\#0D1130\]\/30,
+[data-theme="light"] .bg-\[\#0D1130\]\/40,
+[data-theme="light"] .bg-\[\#0D1130\]\/50,
+[data-theme="light"] .bg-\[\#0D1130\]\/70,
+[data-theme="light"] .bg-\[\#0D1130\]\/80,
+[data-theme="light"] .bg-\[\#0D1130\]\/90,
+[data-theme="light"] .bg-\[\#0D1130\]\/95,
+[data-theme="light"] .bg-\[\#0D1130\]\/98,
+[data-theme="light"] .bg-\[\#0D1033\],
+[data-theme="light"] .bg-\[\#111735\],
+[data-theme="light"] .bg-\[\#141A43\],
+[data-theme="light"] .bg-\[\#1A1F3A\],
+[data-theme="light"] .bg-\[\#1A1F3A\]\/95,
+[data-theme="light"] .bg-\[\#252B4A\],
+[data-theme="light"] .bg-slate-950,
+[data-theme="light"] .bg-slate-950\/30,
+[data-theme="light"] .bg-slate-950\/40,
+[data-theme="light"] .bg-slate-950\/45,
+[data-theme="light"] .bg-slate-950\/50,
+[data-theme="light"] .bg-slate-950\/60,
+[data-theme="light"] .bg-slate-950\/70,
+[data-theme="light"] .bg-slate-950\/80,
+[data-theme="light"] .bg-slate-900,
+[data-theme="light"] .bg-slate-900\/50,
+[data-theme="light"] .bg-slate-900\/55,
+[data-theme="light"] .bg-slate-900\/70,
+[data-theme="light"] .bg-slate-900\/80,
+[data-theme="light"] .bg-slate-900\/90,
+[data-theme="light"] .bg-slate-900\/95 {
   background-color: var(--color-surface) !important;
+}
+
+[data-theme="light"] .bg-slate-800,
+[data-theme="light"] .bg-slate-800\/30,
+[data-theme="light"] .bg-slate-800\/40,
+[data-theme="light"] .bg-slate-800\/50,
+[data-theme="light"] .bg-slate-800\/60,
+[data-theme="light"] .bg-slate-800\/70,
+[data-theme="light"] .bg-slate-800\/90,
+[data-theme="light"] .bg-slate-700,
+[data-theme="light"] .bg-slate-700\/50,
+[data-theme="light"] .bg-slate-600\/20 {
+  background-color: var(--color-surface-strong) !important;
+}
+
+[data-theme="light"] .bg-gray-900\/20,
+[data-theme="light"] .bg-gray-900\/30,
+[data-theme="light"] .bg-gray-900\/50 {
+  background-color: rgba(15, 23, 42, 0.05) !important;
+}
+
+[data-theme="light"] .bg-black\/10,
+[data-theme="light"] .bg-black\/20,
+[data-theme="light"] .bg-black\/30 {
+  background-color: rgba(15, 23, 42, 0.05) !important;
 }
 
 [data-theme="light"] .bg-black\/60,
 [data-theme="light"] .bg-black\/50 {
-  background-color: rgba(0, 0, 0, 0.3) !important;
+  background-color: rgba(15, 23, 42, 0.38) !important;
 }
 
+[data-theme="light"] .bg-white\/5,
+[data-theme="light"] .bg-white\/10,
+[data-theme="light"] .bg-white\/20,
+[data-theme="light"] .bg-white\/\[0\.01\],
+[data-theme="light"] .bg-white\/\[0\.015\],
 [data-theme="light"] .bg-white\/\[0\.03\],
 [data-theme="light"] .bg-white\/\[0\.04\],
 [data-theme="light"] .bg-white\/\[0\.05\],
-[data-theme="light"] .bg-white\/\[0\.06\] {
-  background-color: rgba(0, 0, 0, 0.03) !important;
+[data-theme="light"] .bg-white\/\[0\.06\],
+[data-theme="light"] .bg-white\/\[0\.07\],
+[data-theme="light"] .bg-white\/\[0\.1\],
+[data-theme="light"] .bg-white\/\[0\.10\],
+[data-theme="light"] .bg-white\/\[0\.12\] {
+  background-color: rgba(15, 23, 42, 0.045) !important;
 }
 
-[data-theme="light"] .bg-white\/\[0\.02\] {
-  background-color: rgba(0, 0, 0, 0.02) !important;
+[data-theme="light"] .bg-white\/\[0\.02\],
+[data-theme="light"] .bg-white\/\[0\.025\] {
+  background-color: rgba(15, 23, 42, 0.025) !important;
 }
 
 [data-theme="light"] .bg-white\/\[0\.08\] {
-  background-color: rgba(0, 0, 0, 0.05) !important;
+  background-color: rgba(15, 23, 42, 0.07) !important;
 }
 
+[data-theme="light"] .border-white\/\[0\.04\],
+[data-theme="light"] .border-white\/\[0\.03\],
+[data-theme="light"] .border-white\/\[0\.05\],
 [data-theme="light"] .border-white\/\[0\.06\],
+[data-theme="light"] .border-white\/\[0\.07\],
 [data-theme="light"] .border-white\/\[0\.08\],
+[data-theme="light"] .border-white\/\[0\.1\],
+[data-theme="light"] .border-white\/\[0\.10\],
+[data-theme="light"] .border-white\/\[0\.12\],
+[data-theme="light"] .border-white\/\[0\.14\],
 [data-theme="light"] .border-white\/5,
-[data-theme="light"] .border-white\/10 {
+[data-theme="light"] .border-white\/6,
+[data-theme="light"] .border-white\/8,
+[data-theme="light"] .border-white\/10,
+[data-theme="light"] .border-white\/15,
+[data-theme="light"] .border-white\/20,
+[data-theme="light"] .border-white\/30,
+[data-theme="light"] .border-slate-600,
+[data-theme="light"] .border-slate-700,
+[data-theme="light"] .border-slate-700\/50,
+[data-theme="light"] .border-slate-800,
+[data-theme="light"] .border-gray-700,
+[data-theme="light"] .border-gray-700\/30,
+[data-theme="light"] .border-gray-700\/50,
+[data-theme="light"] .divide-slate-800 > :not([hidden]) ~ :not([hidden]) {
   border-color: var(--color-border) !important;
 }
 
@@ -61,40 +171,185 @@
   color: var(--color-text) !important;
 }
 
+[data-theme="light"] .text-white\/95,
+[data-theme="light"] .text-white\/80 {
+  color: #334155 !important;
+}
+
+[data-theme="light"] .text-white\/70,
+[data-theme="light"] .text-white\/60,
+[data-theme="light"] .text-white\/50,
+[data-theme="light"] .text-white\/40 {
+  color: #64748b !important;
+}
+
+[data-theme="light"] .text-white\/10 {
+  color: #cbd5e1 !important;
+}
+
+[data-theme="light"] .text-\[\#F0F4F8\],
+[data-theme="light"] .text-gray-50,
+[data-theme="light"] .text-gray-200,
+[data-theme="light"] .text-gray-300,
+[data-theme="light"] .text-slate-100,
 [data-theme="light"] .text-slate-200,
+[data-theme="light"] .text-slate-200\/90,
 [data-theme="light"] .text-slate-300 {
   color: #334155 !important;
 }
 
+[data-theme="light"] .text-slate-300\/85,
+[data-theme="light"] .text-slate-300\/95,
+[data-theme="light"] .text-gray-400,
 [data-theme="light"] .text-slate-400 {
+  color: #475569 !important;
+}
+
+[data-theme="light"] .text-gray-500,
+[data-theme="light"] .text-slate-500 {
   color: #64748b !important;
 }
 
-[data-theme="light"] .text-slate-500 {
-  color: #94a3b8 !important;
-}
-
 [data-theme="light"] .text-slate-600 {
-  color: #94a3b8 !important;
+  color: #526174 !important;
 }
 
 [data-theme="light"] .placeholder-slate-500::placeholder,
 [data-theme="light"] .placeholder-slate-600::placeholder {
-  color: #94a3b8 !important;
+  color: #74849a !important;
+  opacity: 1;
 }
 
+[data-theme="light"] .hover\:bg-white\/5:hover,
+[data-theme="light"] .hover\:bg-white\/10:hover,
 [data-theme="light"] .hover\:bg-white\/\[0\.04\]:hover,
 [data-theme="light"] .hover\:bg-white\/\[0\.06\]:hover,
 [data-theme="light"] .hover\:bg-white\/\[0\.08\]:hover {
-  background-color: rgba(0, 0, 0, 0.06) !important;
+  background-color: var(--color-surface-hover) !important;
 }
 
 [data-theme="light"] .hover\:text-white:hover {
   color: var(--color-text) !important;
 }
 
-[data-theme="light"] .divide-white\/\[0\.04\] > :not([hidden]) ~ :not([hidden]) {
+[data-theme="light"] .divide-white\/\[0\.04\] > :not([hidden]) ~ :not([hidden]),
+[data-theme="light"] .divide-white\/5 > :not([hidden]) ~ :not([hidden]),
+[data-theme="light"] .divide-white\/8 > :not([hidden]) ~ :not([hidden]) {
   border-color: var(--color-border) !important;
+}
+
+/* Dark-theme pastel status text is too faint against white. These retain the
+   provider/status hue while meeting normal-body contrast in light mode. */
+[data-theme="light"] :is(.text-emerald-100, .text-emerald-200, .text-emerald-300, .text-emerald-400) { color: #047857 !important; }
+[data-theme="light"] :is(.text-green-300, .text-green-400) { color: #15803d !important; }
+[data-theme="light"] :is(.text-red-100, .text-red-200, .text-red-300, .text-red-400) { color: #b42318 !important; }
+[data-theme="light"] :is(.text-amber-50, .text-amber-100, .text-amber-200, .text-amber-300, .text-amber-400) { color: #9a5b00 !important; }
+[data-theme="light"] :is(.text-yellow-300, .text-yellow-400) { color: #8a5a00 !important; }
+[data-theme="light"] :is(.text-blue-100, .text-blue-200, .text-blue-300, .text-blue-400) { color: #1d4ed8 !important; }
+[data-theme="light"] :is(.text-sky-100, .text-sky-200, .text-sky-300, .text-sky-400) { color: #0369a1 !important; }
+[data-theme="light"] :is(.text-cyan-100, .text-cyan-200, .text-cyan-300, .text-cyan-400) { color: #0e7490 !important; }
+[data-theme="light"] :is(.text-violet-100, .text-violet-200, .text-violet-300, .text-violet-400) { color: #6d28d9 !important; }
+[data-theme="light"] :is(.text-purple-300, .text-purple-400) { color: #7e22ce !important; }
+[data-theme="light"] :is(.text-fuchsia-100, .text-fuchsia-200, .text-fuchsia-300, .text-fuchsia-400) { color: #a21caf !important; }
+[data-theme="light"] .text-indigo-400 { color: #4f46e5 !important; }
+[data-theme="light"] .text-lime-400 { color: #4d7c0f !important; }
+[data-theme="light"] .text-pink-400 { color: #be185d !important; }
+[data-theme="light"] .text-teal-400 { color: #0f766e !important; }
+[data-theme="light"] :is(.text-orange-300, .text-orange-400) { color: #c2410c !important; }
+[data-theme="light"] :is(.text-rose-300, .text-rose-400) { color: #be123c !important; }
+
+/* White remains correct on solid actions, destructive buttons, user bubbles,
+   and opaque toasts. This must follow the legacy `.text-white` translation. */
+[data-theme="light"] :is(
+  .bg-emerald-400, .bg-emerald-500, .bg-emerald-600,
+  .bg-green-500, .bg-violet-500, .bg-violet-600,
+  .bg-blue-500, .bg-blue-600, .bg-red-500, .bg-red-600, .bg-red-700,
+  .bg-amber-500, .bg-indigo-500, .bg-indigo-600
+).text-white {
+  color: #ffffff !important;
+}
+
+[data-theme="light"] :is(
+  .bg-emerald-500\/80, .bg-emerald-500\/90,
+  .bg-blue-500\/90, .bg-blue-600\/65, .bg-blue-600\/90,
+  .bg-red-500\/90, .bg-red-700\/80
+).text-white,
+[data-theme="light"] :is(.bg-blue-600\/65, .bg-blue-600\/90) .text-white {
+  color: #ffffff !important;
+}
+
+[data-theme="light"] :is(.bg-black\/40, .bg-black\/50, .bg-black\/60, .bg-black\/80):is(
+  .text-white, .text-white\/40, .text-white\/50, .text-white\/60, .text-white\/70, .text-white\/80, .text-white\/95
+) {
+  color: #ffffff !important;
+}
+
+/* Explicitly marked image/video controls remain dark in either theme. This
+   is intentionally narrow: modal backdrops also use black utilities and must
+   not force white text into their light dialog descendants. */
+[data-theme="light"] .theme-fixed-dark,
+[data-theme="light"] .theme-fixed-dark :is(
+  .text-white, .text-white\/40, .text-white\/50, .text-white\/60,
+  .text-white\/70, .text-white\/80, .text-white\/95,
+  .text-slate-200, .text-slate-300, .text-slate-400
+) {
+  color: #ffffff !important;
+}
+
+[data-theme="light"] .theme-fixed-dark:is(.hover\:text-white:hover),
+[data-theme="light"] .theme-fixed-dark .hover\:text-white:hover {
+  color: #ffffff !important;
+}
+
+[data-theme="light"] :is(input, textarea, select) {
+  color: var(--color-text);
+  caret-color: var(--color-text);
+}
+
+[data-theme="light"] select,
+[data-theme="light"] select option,
+[data-theme="light"] select optgroup {
+  background-color: var(--color-surface);
+  color: var(--color-text);
+}
+
+[data-theme="light"] .glass,
+[data-theme="light"] .glass-sm {
+  background: rgba(255, 255, 255, 0.82);
+  border-color: var(--color-border);
+  box-shadow: 0 10px 30px var(--color-shadow), inset 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+[data-theme="light"] .gradient-border::before {
+  background: linear-gradient(135deg, rgba(5, 150, 105, 0.34), rgba(37, 99, 235, 0.25), rgba(109, 40, 217, 0.2));
+}
+
+[data-theme="light"] ::-webkit-scrollbar-thumb {
+  background: rgba(71, 85, 105, 0.28);
+}
+
+[data-theme="light"] ::selection {
+  background: rgba(99, 102, 241, 0.22);
+  color: #172033;
+}
+
+/* highlight.js is bundled with the dark palette for dark mode. These GitHub-
+   compatible light tokens win even when a lazy preview chunk loads later. */
+[data-theme="light"] .hljs { color: #24292f !important; background: transparent !important; }
+[data-theme="light"] :is(.hljs-doctag, .hljs-keyword, .hljs-meta .hljs-keyword, .hljs-template-tag, .hljs-template-variable, .hljs-type, .hljs-variable.language_) { color: #cf222e !important; }
+[data-theme="light"] :is(.hljs-title, .hljs-title.class_, .hljs-title.class_.inherited__, .hljs-title.function_) { color: #8250df !important; }
+[data-theme="light"] :is(.hljs-attr, .hljs-attribute, .hljs-literal, .hljs-meta, .hljs-number, .hljs-operator, .hljs-selector-attr, .hljs-selector-class, .hljs-selector-id, .hljs-variable) { color: #0550ae !important; }
+[data-theme="light"] :is(.hljs-meta .hljs-string, .hljs-regexp, .hljs-string) { color: #0a3069 !important; }
+[data-theme="light"] :is(.hljs-built_in, .hljs-symbol) { color: #953800 !important; }
+[data-theme="light"] :is(.hljs-comment, .hljs-code, .hljs-formula) { color: #6e7781 !important; }
+[data-theme="light"] :is(.hljs-name, .hljs-quote, .hljs-selector-pseudo, .hljs-selector-tag) { color: #116329 !important; }
+[data-theme="light"] .hljs-subst { color: #24292f !important; }
+[data-theme="light"] .hljs-addition { color: #116329 !important; background-color: #dafbe1 !important; }
+[data-theme="light"] .hljs-deletion { color: #82071e !important; background-color: #ffebe9 !important; }
+
+[data-theme="light"] :is(.accent-btn, .accent-text, .accent-active, .accent-avatar, .accent-success-toast) {
+  color: var(--accent-dark, #4338ca);
+  color: color-mix(in srgb, var(--accent, #6366f1) 62%, #172033);
 }
 
 /* Ambient background glow override for light mode */
@@ -102,13 +357,29 @@
   background-image: none !important;
 }
 
+[data-theme="light"] .ambient-bg::before {
+  background: radial-gradient(circle, rgba(16, 185, 129, 0.08) 0%, transparent 70%);
+  opacity: 0.5;
+}
+
+[data-theme="light"] .ambient-bg::after {
+  background: radial-gradient(circle, rgba(59, 130, 246, 0.07) 0%, transparent 70%);
+  opacity: 0.45;
+}
+
 /* Fallback: if no data-theme is set, default to dark */
 :root:not([data-theme]) {
   --color-bg: #0A0E27;
   --color-surface: #0D1130;
+  --color-surface-raised: #1A1F3A;
+  --color-surface-strong: #252B4A;
+  --color-surface-hover: rgba(255, 255, 255, 0.06);
   --color-border: rgba(255, 255, 255, 0.06);
+  --color-border-strong: rgba(255, 255, 255, 0.12);
   --color-text: #e2e8f0;
   --color-text-muted: #64748b;
+  --color-text-subtle: #94a3b8;
+  --color-shadow: rgba(0, 0, 0, 0.35);
   --color-accent: var(--color-accent-custom, #6366f1);
   color-scheme: dark;
 }
@@ -145,14 +416,36 @@
   box-shadow: 0 4px 15px var(--accent-shadow, rgba(99, 102, 241, 0.05));
 }
 
+.accent-hover:hover:not(:disabled) {
+  background: var(--accent-bg-hover, rgba(99, 102, 241, 0.25));
+}
+
 .accent-focus:focus {
   border-color: var(--accent-border, rgba(99, 102, 241, 0.3));
   box-shadow: 0 0 0 2px var(--accent-ring, rgba(99, 102, 241, 0.15));
   outline: none;
 }
 
+.accent-ring {
+  --tw-ring-color: var(--accent-ring, rgba(99, 102, 241, 0.3));
+}
+
 .accent-text {
   color: var(--accent, #6366f1);
+}
+
+.accent-fill {
+  background-color: var(--accent, #6366f1);
+}
+
+.accent-avatar {
+  background: var(--accent-bg, rgba(99, 102, 241, 0.15));
+  color: var(--accent-light, #818cf8);
+  --tw-ring-color: var(--accent-ring, rgba(99, 102, 241, 0.3));
+  box-shadow:
+    var(--tw-ring-offset-shadow, 0 0 #0000),
+    var(--tw-ring-shadow, 0 0 #0000),
+    0 4px 15px var(--accent-shadow, rgba(99, 102, 241, 0.05));
 }
 
 .accent-icon-badge {

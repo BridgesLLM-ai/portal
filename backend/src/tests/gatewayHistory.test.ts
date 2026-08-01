@@ -7,6 +7,276 @@ import { readRuntimeTurnEvents, recordRuntimeTurnEvent } from '../services/Runti
 import type { RuntimeTurnEvent } from '../services/RuntimeTurnEvents';
 
 describe('gateway history readers', () => {
+  test('backward cursors stay stable across appends and reject another actor/session scope', () => {
+    const messages = Array.from({ length: 120 }, (_, index) => ({
+      id: `message-${index + 1}`,
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: `content-${index + 1}`,
+      timestamp: new Date(Date.parse('2026-07-20T00:00:00.000Z') + index * 1000).toISOString(),
+    }));
+    const scope = __gatewayHistoryTest.historyCursorScope('actor-a', 'OPENCLAW', 'agent:main:cursor-test');
+    const initial = __gatewayHistoryTest.buildHistoryPage(messages, 20, scope);
+
+    expect(initial.messages.map((message: any) => message.id)).toEqual(
+      Array.from({ length: 20 }, (_, index) => `message-${index + 101}`),
+    );
+    expect(initial.hasMoreBefore).toBe(true);
+    expect(initial.beforeCursor).toEqual(expect.any(String));
+
+    // New live messages arriving after the cursor was issued do not move its
+    // anchor. The next page is still the exact preceding durable window.
+    const appended = [
+      ...messages,
+      ...Array.from({ length: 5 }, (_, index) => ({
+        id: `new-${index + 1}`,
+        role: 'assistant',
+        content: `new-content-${index + 1}`,
+        timestamp: new Date(Date.parse('2026-07-20T00:03:00.000Z') + index * 1000).toISOString(),
+      })),
+    ];
+    const anchor = __gatewayHistoryTest.decodeHistoryCursor(initial.beforeCursor, scope);
+    const older = __gatewayHistoryTest.buildHistoryPage(appended, 20, scope, anchor);
+    expect(older.messages.map((message: any) => message.id)).toEqual(
+      Array.from({ length: 20 }, (_, index) => `message-${index + 81}`),
+    );
+
+    const otherScope = __gatewayHistoryTest.historyCursorScope('actor-b', 'OPENCLAW', 'agent:main:cursor-test');
+    expect(() => __gatewayHistoryTest.decodeHistoryCursor(initial.beforeCursor, otherScope))
+      .toThrow('does not belong to this chat');
+
+    const nativeScope = __gatewayHistoryTest.historyCursorScope('actor-a', 'CODEX', 'codex-session-1');
+    const nativeInitial = __gatewayHistoryTest.buildHistoryPage(messages, 20, nativeScope);
+    expect(() => __gatewayHistoryTest.decodeHistoryCursor(nativeInitial.beforeCursor, nativeScope)).not.toThrow();
+    const otherNativeSessionScope = __gatewayHistoryTest.historyCursorScope('actor-a', 'CODEX', 'codex-session-2');
+    expect(() => __gatewayHistoryTest.decodeHistoryCursor(nativeInitial.beforeCursor, otherNativeSessionScope))
+      .toThrow('does not belong to this chat');
+  });
+
+  test('backward cursors distinguish equal timestamps and tolerate same-row live enrichment', () => {
+    const timestamp = '2026-07-20T00:00:00.000Z';
+    const messages = Array.from({ length: 8 }, (_, index) => ({
+      id: `equal-ts-${index + 1}`,
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: `content-${index + 1}`,
+      timestamp,
+    }));
+    const scope = __gatewayHistoryTest.historyCursorScope('actor-a', 'OPENCLAW', 'agent:main:equal-ts');
+    const initial = __gatewayHistoryTest.buildHistoryPage(messages, 3, scope);
+    expect(initial.messages.map((message: any) => message.id)).toEqual([
+      'equal-ts-6',
+      'equal-ts-7',
+      'equal-ts-8',
+    ]);
+
+    const anchor = __gatewayHistoryTest.decodeHistoryCursor(initial.beforeCursor, scope);
+    const enriched = messages.map((message) => message.id === 'equal-ts-6'
+      ? { ...message, content: `${message.content} (completed)`, toolCalls: [{ id: 'tool-1' }] }
+      : message);
+    const older = __gatewayHistoryTest.buildHistoryPage(enriched, 3, scope, anchor);
+    expect(older.messages.map((message: any) => message.id)).toEqual([
+      'equal-ts-3',
+      'equal-ts-4',
+      'equal-ts-5',
+    ]);
+    expect(older.beforeCursor).toEqual(expect.any(String));
+  });
+
+  test('history page size is capped at 100', () => {
+    expect(__gatewayHistoryTest.parseHistoryLimit(undefined)).toBe(100);
+    expect(__gatewayHistoryTest.parseHistoryLimit('100')).toBe(100);
+    expect(__gatewayHistoryTest.parseHistoryLimit('500')).toBe(100);
+  });
+
+  test('trajectory recovery reads only bounded complete tail records', () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-trajectory-tail-'));
+    const trajectory = path.join(sessionsDir, 'active.trajectory.jsonl');
+    try {
+      const complete = JSON.stringify({ sessionKey: 'agent:main:main', data: { messagesSnapshot: [] } });
+      const incomplete = JSON.stringify({ sessionKey: 'agent:main:other', data: { messagesSnapshot: [] } }).slice(0, 31);
+      fs.writeFileSync(trajectory, `${'x'.repeat(4_096)}\n${complete}\n${incomplete}`);
+
+      const tail = __gatewayHistoryTest.readBoundedJsonlTailText(trajectory, 512);
+      expect(Buffer.byteLength(tail, 'utf8')).toBeLessThanOrEqual(512);
+      expect(tail).toBe(`${complete}\n`);
+      expect(tail).not.toContain('x'.repeat(64));
+      expect(tail).not.toContain('agent:main:other');
+    } finally {
+      fs.rmSync(sessionsDir, { recursive: true, force: true });
+    }
+  });
+
+  test('Agent Zero history pages through the provider sidecar path without loading remote lifetime history', async () => {
+    const provider = {
+      getHistory: jest.fn(async () => { throw new Error('remote connector must not be used'); }),
+      getHistoryPage: jest.fn(async (_sessionId: string, _limit: number, beforeSequence?: number) => (
+        beforeSequence === undefined
+          ? {
+              messages: [{ id: 'a0-9', role: 'assistant', content: 'latest', timestamp: '2026-07-20T00:00:09Z' }],
+              hasMoreBefore: true,
+              beforeSequence: 9,
+            }
+          : {
+              messages: [{ id: 'a0-2', role: 'user', content: 'oldest', timestamp: '2026-07-20T00:00:02Z' }],
+              hasMoreBefore: false,
+              beforeSequence: null,
+            }
+      )),
+    };
+    const scope = __gatewayHistoryTest.historyCursorScope('actor-a0', 'AGENT_ZERO', 'CtxPaged');
+    const latest = await __gatewayHistoryTest.readAgentZeroHistoryPage({
+      provider,
+      sessionId: 'CtxPaged',
+      limit: 80,
+      scope,
+    });
+    expect(latest.messages.map((message: any) => message.id)).toEqual(['a0-9']);
+    expect(latest.hasMoreBefore).toBe(true);
+
+    const older = await __gatewayHistoryTest.readAgentZeroHistoryPage({
+      provider,
+      sessionId: 'CtxPaged',
+      limit: 80,
+      scope,
+      beforeCursor: latest.beforeCursor,
+    });
+    expect(older.messages.map((message: any) => message.id)).toEqual(['a0-2']);
+    expect(provider.getHistoryPage).toHaveBeenNthCalledWith(2, 'CtxPaged', 80, 9);
+    expect(provider.getHistory).not.toHaveBeenCalled();
+
+    const otherScope = __gatewayHistoryTest.historyCursorScope('other-a0', 'AGENT_ZERO', 'CtxPaged');
+    await expect(__gatewayHistoryTest.readAgentZeroHistoryPage({
+      provider,
+      sessionId: 'CtxPaged',
+      limit: 80,
+      scope: otherScope,
+      beforeCursor: latest.beforeCursor,
+    })).rejects.toThrow('does not belong to this chat');
+  });
+
+  test('native 10k sidecar history uses bounded byte-positioned pages', () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-native-history-'));
+    const previousSessionsDir = process.env.PORTAL_NATIVE_AGENT_SESSIONS_DIR;
+    process.env.PORTAL_NATIVE_AGENT_SESSIONS_DIR = sessionsDir;
+    jest.resetModules();
+
+    try {
+      const providerDir = path.join(sessionsDir, 'codex');
+      fs.mkdirSync(providerDir, { recursive: true });
+      const messages = Array.from({ length: 10_000 }, (_, index) => ({
+        id: `native-${index}`,
+        role: index % 2 === 0 ? 'user' : 'assistant',
+        content: `native history ${index}`,
+        timestamp: new Date(Date.parse('2026-07-20T00:00:00.000Z') + index).toISOString(),
+      }));
+      fs.writeFileSync(path.join(providerDir, 'native-long.json'), JSON.stringify({
+        sessionId: 'native-long',
+        provider: 'CODEX',
+        userId: 'actor-native',
+        createdAt: '2026-07-20T00:00:00.000Z',
+        lastActivityAt: '2026-07-20T00:00:00.000Z',
+        cwd: '/workspace',
+        executionContext: {
+          scope: 'HOST_OPERATOR',
+          source: 'PORTAL_SERVER',
+          userId: 'actor-native',
+        },
+        messages,
+      }));
+
+      const store = require('../agents/providers/NativeSessionStore') as typeof import('../agents/providers/NativeSessionStore');
+      const scope = __gatewayHistoryTest.historyCursorScope('actor-native', 'CODEX', 'native-long');
+      const pageReads: Array<{ limit: number; beforeOffset?: number; expectedFileIdentity?: string }> = [];
+      const readPage = (limit: number, beforeOffset?: number, expectedFileIdentity?: string) => {
+        pageReads.push({ limit, beforeOffset, expectedFileIdentity });
+        return store.readNativeSessionHistoryPage(
+          'CODEX',
+          'native-long',
+          limit,
+          beforeOffset,
+          expectedFileIdentity,
+        );
+      };
+
+      const latest = __gatewayHistoryTest.readNativeHistoryPage({
+        providerName: 'CODEX',
+        sessionId: 'native-long',
+        limit: 100,
+        scope,
+        readPage,
+      });
+      expect(pageReads).toEqual([{ limit: 100 }]);
+      expect(latest.messages).toHaveLength(100);
+      expect(latest.messages[0].id).toBe('native-9900');
+      expect(latest.messages.at(-1)?.id).toBe('native-9999');
+      expect(latest.hasMoreBefore).toBe(true);
+
+      pageReads.length = 0;
+      const older = __gatewayHistoryTest.readNativeHistoryPage({
+        providerName: 'CODEX',
+        sessionId: 'native-long',
+        limit: 100,
+        scope,
+        beforeCursor: latest.beforeCursor,
+        readPage,
+      });
+      expect(pageReads).toHaveLength(1);
+      expect(pageReads[0].limit).toBe(100);
+      expect(pageReads[0].beforeOffset).toEqual(expect.any(Number));
+      expect(pageReads[0].expectedFileIdentity).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(older.messages[0].id).toBe('native-9800');
+      expect(older.messages.at(-1)?.id).toBe('native-9899');
+
+      const metadata = JSON.parse(fs.readFileSync(path.join(providerDir, 'native-long.json'), 'utf8'));
+      expect(metadata.messages).toEqual([]);
+      expect(fs.statSync(path.join(providerDir, 'native-long.json')).size).toBeLessThan(8_192);
+      expect(fs.readFileSync(path.join(providerDir, 'native-long.history.jsonl'), 'utf8').trim().split('\n')).toHaveLength(10_000);
+    } finally {
+      if (previousSessionsDir === undefined) delete process.env.PORTAL_NATIVE_AGENT_SESSIONS_DIR;
+      else process.env.PORTAL_NATIVE_AGENT_SESSIONS_DIR = previousSessionsDir;
+      fs.rmSync(sessionsDir, { recursive: true, force: true });
+      jest.resetModules();
+    }
+  });
+
+  test('tail reader adaptively skips artifacts without parsing a 25k-line transcript', () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-history-tail-'));
+    const sessionId = 'adaptive-tail-session';
+    const filePath = path.join(sessionsDir, `${sessionId}.jsonl`);
+    const historicalArtifacts = Array.from({ length: 25_000 }, (_, index) => JSON.stringify({
+      type: 'artifact',
+      index,
+      payload: 'x'.repeat(48),
+    }));
+    const durableMessages = Array.from({ length: 80 }, (_, index) => JSON.stringify({
+      type: 'message',
+      id: `message-${index + 1}`,
+    }));
+    const trailingArtifacts = Array.from({ length: 260 }, (_, index) => JSON.stringify({
+      type: 'artifact',
+      index: `tail-${index}`,
+    }));
+    fs.writeFileSync(filePath, [...historicalArtifacts, ...durableMessages, ...trailingArtifacts].join('\n'));
+
+    let parsedLines = 0;
+    const messages = __gatewayHistoryTest.readRecentSessionMessages({
+      sessionId,
+      limit: 40,
+      sessionsDir,
+      parseLine: (line: string) => {
+        parsedLines += 1;
+        const parsed = JSON.parse(line);
+        return parsed.type === 'message' ? parsed : null;
+      },
+    });
+
+    expect(messages).toHaveLength(40);
+    expect(messages[0].id).toBe('message-41');
+    expect(messages.at(-1).id).toBe('message-80');
+    // Windows grow 200 -> 400; the implementation may reparse those bounded
+    // tails, but it must not touch the 25,000 historical artifact records.
+    expect(parsedLines).toBeLessThan(1_000);
+  });
+
   test('mergeHistoryToolCalls collapses metadata-free ghost duplicates of the same tool', () => {
     const merged = __gatewayHistoryTest.mergeHistoryToolCalls(
       [
@@ -710,7 +980,7 @@ describe('gateway history readers', () => {
     expect(segments.map((segment: any) => segment.text)).toEqual(['Analyzing the failing migration files']);
   });
 
-  test('runtime history drops a flushed pre-tool segment the final already repeats', () => {
+  test('runtime history keeps the pre-tool segment and stores only the cumulative final tail', () => {
     const baseTs = Date.parse('2026-07-15T04:10:00.000Z');
     const event = (seq: number, extra: Partial<RuntimeTurnEvent>): RuntimeTurnEvent => ({
       schema: 'bridgesllm.runtime-turn-event.v1',
@@ -734,8 +1004,110 @@ describe('gateway history readers', () => {
     ]);
 
     expect(messages).toHaveLength(1);
-    expect(messages[0].content).toBe('Preamble before the tool call.\n\nAll done.');
-    expect((messages[0].segments || []).filter((segment: any) => segment.kind === 'text')).toHaveLength(0);
+    expect(messages[0].content).toBe('All done.');
+    expect((messages[0].segments || []).filter((segment: any) => segment.kind === 'text'))
+      .toEqual([
+        expect.objectContaining({ text: 'Preamble before the tool call.', order: 0 }),
+      ]);
+  });
+
+  test('runtime history preserves A/tool1/B/tool2/C against an aggregate provider final', () => {
+    const baseTs = Date.parse('2026-07-15T04:15:00.000Z');
+    const event = (seq: number, extra: Partial<RuntimeTurnEvent>): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_delta',
+      sessionKey: 'agent:main:multi-tool-aggregate-final',
+      runId: 'run-multi-tool-aggregate-final',
+      seq,
+      ts: baseTs + seq * 100,
+      visible: true,
+      source: { transport: 'portal-stream-event-bus', eventType: 'text' },
+      ...extra,
+    });
+
+    const messages = __gatewayHistoryTest.buildRuntimeHistoryMessages([
+      event(1, { text: 'A ' }),
+      event(2, { type: 'tool_started', tool: { id: 'call-1', name: 'read', status: 'running' } }),
+      event(3, { type: 'tool_output', tool: { id: 'call-1', name: 'read', result: 'one', status: 'done' } }),
+      event(4, { text: 'B ' }),
+      event(5, { type: 'tool_started', tool: { id: 'call-2', name: 'exec', status: 'running' } }),
+      event(6, { type: 'tool_output', tool: { id: 'call-2', name: 'exec', result: 'two', status: 'done' } }),
+      event(7, { text: 'C' }),
+      event(8, { type: 'assistant_final', text: 'A B C', terminal: true }),
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toBe('C');
+    expect(messages[0].segments.map((segment: any) => [segment.text, segment.order]))
+      .toEqual([['A', 0], ['B', 2]]);
+    expect(messages[0].toolCalls.map((tool: any) => [tool.id, tool.order]))
+      .toEqual([['call-1', 1], ['call-2', 3]]);
+
+    expect(__gatewayHistoryTest.reconcileMergedRuntimeHistoryContent(
+      { content: 'A B C' },
+      messages[0],
+    )).toBe('C');
+    expect(__gatewayHistoryTest.reconcileMergedRuntimeHistoryContent(
+      { content: 'Independent canonical answer.' },
+      messages[0],
+    )).toBe('Independent canonical answer.');
+  });
+
+  test('runtime history preserves segment order across multiple tools', () => {
+    const baseTs = Date.parse('2026-07-15T04:20:00.000Z');
+    const event = (seq: number, extra: Partial<RuntimeTurnEvent>): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_reasoning',
+      sessionKey: 'agent:main:multi-tool-order',
+      runId: 'run-multi-tool-order',
+      seq,
+      ts: baseTs + seq * 100,
+      visible: true,
+      source: { transport: 'portal-stream-event-bus', eventType: 'thinking' },
+      ...extra,
+    });
+
+    const messages = __gatewayHistoryTest.buildRuntimeHistoryMessages([
+      event(1, { text: 'Before first tool.' }),
+      event(2, { type: 'tool_started', tool: { id: 'call-1', name: 'read', status: 'running' } }),
+      event(3, { type: 'tool_output', tool: { id: 'call-1', name: 'read', result: 'one', status: 'done' } }),
+      event(4, { text: 'Between tools.' }),
+      event(5, { type: 'tool_started', tool: { id: 'call-2', name: 'exec', status: 'running' } }),
+      event(6, { type: 'tool_output', tool: { id: 'call-2', name: 'exec', result: 'two', status: 'done' } }),
+      event(7, { text: 'After second tool.' }),
+      event(8, { type: 'assistant_final', text: 'Canonical final.', terminal: true }),
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].segments.map((segment: any) => segment.order)).toEqual([0, 2, 4]);
+    expect(messages[0].toolCalls.map((tool: any) => tool.order)).toEqual([1, 3]);
+  });
+
+  test('history reconciliation preserves runtime order when transcript duplicates lack it', () => {
+    const segments = __gatewayHistoryTest.mergeHistorySegments(
+      [
+        { text: 'Before first tool.', kind: 'thinking', position: 'before', ts: 1_000 },
+        { text: 'Between tools.', kind: 'thinking', position: 'between', ts: 3_000 },
+      ],
+      [
+        { text: 'Before first tool.', kind: 'thinking', position: 'before', ts: 1_000, order: 0 },
+        { text: 'Between tools.', kind: 'thinking', position: 'between', ts: 3_000, order: 2 },
+        { text: 'After second tool.', kind: 'thinking', position: 'after', ts: 5_000, order: 4 },
+      ],
+    );
+    const tools = __gatewayHistoryTest.mergeHistoryToolCalls(
+      [
+        { id: 'call-1', name: 'read', startedAt: 2_000, status: 'done' },
+        { id: 'call-2', name: 'exec', startedAt: 4_000, status: 'done' },
+      ],
+      [
+        { id: 'call-1', name: 'read', startedAt: 2_000, status: 'done', order: 1 },
+        { id: 'call-2', name: 'exec', startedAt: 4_000, status: 'done', order: 3 },
+      ],
+    );
+
+    expect(segments.map((segment: any) => segment.order)).toEqual([0, 2, 4]);
+    expect(tools.map((tool: any) => tool.order)).toEqual([1, 3]);
   });
 
   test('mergeRuntimeText keeps short repeated chunks and cumulative snapshots', () => {
@@ -835,6 +1207,7 @@ describe('gateway history readers', () => {
       streamEventBus.publish(sessionKey, {
         type: 'text',
         content: 'Partial answer before a long reasoning pause.',
+        runId: 'run-quiet-stream',
       });
 
       const tracked = streamEventBus.getTrackedStream(sessionKey);

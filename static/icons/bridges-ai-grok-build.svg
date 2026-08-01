@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Grok Build terminal runtime launcher">
+  <defs><linearGradient id="g" x1="18" y1="18" x2="110" y2="110"><stop stop-color="#f4f7ff"/><stop offset="1" stop-color="#7b88a8"/></linearGradient></defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="#08090d" stroke="#dce3f4" stroke-width="4"/>
+  <circle cx="64" cy="64" r="36" fill="none" stroke="url(#g)" stroke-width="10" stroke-dasharray="130 45" transform="rotate(-24 64 64)"/>
+  <text x="64" y="73" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="23" font-weight="800" fill="#fff">GB</text>
+</svg>

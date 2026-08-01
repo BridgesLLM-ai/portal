@@ -1,17 +1,63 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { requireAdmin } from '../middleware/requireAdmin';
+import { requireAdmin, requireOwner } from '../middleware/requireAdmin';
 import { prisma } from '../config/database';
 import { config } from '../config/env';
+import { isOwnerRole } from '../utils/authz';
+import { isTypedConfirmationMatch } from '../utils/privilegedConfirmation';
 import fs from 'fs';
 import path from 'path';
 import { exec as cpExec } from 'child_process';
 
 type StepResult = { step: string; ok: boolean; message: string };
 
+type SystemRemediationContract = {
+  feature: 'terminal' | 'fileManager' | 'agentTools';
+  ownerOnly: true;
+  confirmationPhrase: string;
+  changesSystem: boolean;
+};
+
+const SYSTEM_REMEDIATION_CONTRACTS: Record<SystemRemediationContract['feature'], SystemRemediationContract> = {
+  terminal: {
+    feature: 'terminal',
+    ownerOnly: true,
+    confirmationPhrase: 'REPAIR TERMINAL',
+    changesSystem: true,
+  },
+  fileManager: {
+    feature: 'fileManager',
+    ownerOnly: true,
+    confirmationPhrase: 'REPAIR FILE MANAGER',
+    changesSystem: true,
+  },
+  agentTools: {
+    feature: 'agentTools',
+    ownerOnly: true,
+    confirmationPhrase: 'VERIFY AGENT TOOLS',
+    changesSystem: false,
+  },
+};
+
 const router = Router();
 router.use(authenticateToken);
 router.use(requireAdmin);
+router.use(requireOwner);
+
+export function getSystemRemediationContract(feature: string): SystemRemediationContract | null {
+  return SYSTEM_REMEDIATION_CONTRACTS[feature as SystemRemediationContract['feature']] || null;
+}
+
+export function systemRemediationCanRun(role: string | null | undefined): boolean {
+  return isOwnerRole(role);
+}
+
+export function systemRemediationConfirmationValid(
+  contract: Pick<SystemRemediationContract, 'confirmationPhrase'>,
+  confirmation: unknown,
+): boolean {
+  return isTypedConfirmationMatch(contract.confirmationPhrase, confirmation);
+}
 
 function runShell(cmd: string, timeoutMs = 30000): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
@@ -35,12 +81,19 @@ async function remediateTerminal(): Promise<{ ok: boolean; message: string; step
     steps.push({ step: 'Install node-pty', ok: installPty.ok, message: installPty.ok ? 'node-pty installed' : (installPty.stderr || 'install failed').slice(0, 220) });
   }
 
-  const projectsDir = path.join(process.env.PORTAL_ROOT || '/portal', 'projects');
+  const projectsDir = path.resolve(
+    process.env.PORTAL_PROJECTS_ROOT
+      || path.join(process.env.PORTAL_DATA_ROOT || process.env.PORTAL_ROOT || '/portal', 'projects'),
+  );
   try {
     fs.mkdirSync(projectsDir, { recursive: true });
     steps.push({ step: 'Ensure projects directory', ok: true, message: `Exists: ${projectsDir}` });
   } catch (error: any) {
-    steps.push({ step: 'Ensure projects directory', ok: false, message: error?.message || 'Failed to create /portal/projects' });
+    steps.push({
+      step: 'Ensure projects directory',
+      ok: false,
+      message: error?.message || `Failed to create ${projectsDir}`,
+    });
   }
 
   const defaults: Array<[string, string]> = [
@@ -112,23 +165,36 @@ async function remediateAgentTools(): Promise<{ ok: boolean; message: string; st
 router.post('/:feature/auto-setup', async (req: Request, res: Response) => {
   try {
     const feature = String(req.params.feature || '').trim();
+    const contract = getSystemRemediationContract(feature);
+    if (!contract) {
+      res.status(400).json({ ok: false, message: `Auto-setup not implemented for feature: ${feature}`, steps: [] });
+      return;
+    }
+    if (!systemRemediationConfirmationValid(contract, req.body?.confirmation)) {
+      res.status(400).json({
+        ok: false,
+        error: `Type ${contract.confirmationPhrase} to confirm this owner-only remediation.`,
+        message: 'Typed confirmation is required.',
+        confirmationPhrase: contract.confirmationPhrase,
+        steps: [],
+      });
+      return;
+    }
 
     if (feature === 'terminal') {
-      res.json(await remediateTerminal());
+      res.json({ ...await remediateTerminal(), contract });
       return;
     }
 
     if (feature === 'fileManager') {
-      res.json(await remediateFileManager());
+      res.json({ ...await remediateFileManager(), contract });
       return;
     }
 
     if (feature === 'agentTools') {
-      res.json(await remediateAgentTools());
+      res.json({ ...await remediateAgentTools(), contract });
       return;
     }
-
-    res.status(400).json({ ok: false, message: `Auto-setup not implemented for feature: ${feature}`, steps: [] });
   } catch (error: any) {
     res.status(500).json({ ok: false, message: error?.message || 'Feature remediation failed', steps: [] });
   }

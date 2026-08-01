@@ -16,7 +16,18 @@ export interface ErrorLogContext {
   projectName?: string;
   route?: string;
   title?: string;
+  stackTrace?: string;
+  componentName?: string;
+  context?: string;
   severity?: 'ERROR' | 'CRITICAL';
+}
+
+const MAX_ERROR_MESSAGE_LENGTH = 4_000;
+const MAX_STACK_LENGTH = 64 * 1024;
+
+function truncate(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  return value.slice(0, maxLength);
 }
 
 /**
@@ -26,7 +37,7 @@ export interface ErrorLogContext {
 export async function logError(
   error: unknown,
   context: ErrorLogContext
-): Promise<void> {
+): Promise<string | null> {
   try {
     const err = normalizeError(error);
     const action = context.action || categorizeAction(context);
@@ -38,39 +49,43 @@ export async function logError(
     if (context.projectName) parts.push(`[${context.projectName}]`);
     if (context.endpoint) parts.push(`${context.endpoint}`);
     parts.push(err.message);
-    const translatedMessage = `❌ ${parts.join(' — ')}`;
+    const translatedMessage = `❌ ${parts.join(' — ')}`.slice(0, 5_000);
 
     // Build metadata with full error context
     const metadata: Record<string, any> = {
       errorMessage: err.message,
       errorType: 'error',
     };
-    if (err.stack) metadata.stackTrace = err.stack;
+    if (context.stackTrace || err.stack) metadata.stackTrace = truncate(context.stackTrace || err.stack, MAX_STACK_LENGTH);
     if (err.code) metadata.errorCode = err.code;
     if (err.status) metadata.httpStatus = err.status;
-    if (context.endpoint) metadata.endpoint = context.endpoint;
-    if (context.sessionId) metadata.sessionId = context.sessionId;
-    if (context.projectName) metadata.projectName = context.projectName;
-    if (context.route) metadata.route = context.route;
-    if (context.title) metadata.title = context.title;
-    if (context.userAgent) metadata.userAgent = context.userAgent;
+    if (context.endpoint) metadata.endpoint = truncate(context.endpoint, 1_000);
+    if (context.sessionId) metadata.sessionId = truncate(context.sessionId, 200);
+    if (context.projectName) metadata.projectName = truncate(context.projectName, 500);
+    if (context.route) metadata.route = truncate(context.route, 1_000);
+    if (context.title) metadata.title = truncate(context.title, 500);
+    if (context.userAgent) metadata.userAgent = truncate(context.userAgent, 1_000);
+    if (context.componentName) metadata.componentName = truncate(context.componentName, 1_000);
+    if (context.context) metadata.context = truncate(context.context, 1_000);
 
-    await prisma.activityLog.create({
+    const created = await prisma.activityLog.create({
       data: {
         userId: context.userId || null,
         action,
         resource,
-        resourceId: context.resourceId || context.projectName || context.endpoint || null,
+        resourceId: truncate(context.resourceId || context.projectName || context.endpoint, 1_000) || null,
         severity,
         translatedMessage,
-        ipAddress: context.ipAddress || null,
-        userAgent: context.userAgent || null,
+        ipAddress: truncate(context.ipAddress, 100) || null,
+        userAgent: truncate(context.userAgent, 1_000) || null,
         metadata,
       },
     });
+    return created?.id || null;
   } catch (logErr) {
     // Don't let logging errors cascade — just console it
     console.error('[errorLogger] Failed to log error to activity:', logErr);
+    return null;
   }
 }
 
@@ -82,15 +97,18 @@ export async function logRequestError(
   req: { method?: string; originalUrl?: string; path?: string; ip?: string; headers?: Record<string, any>; user?: { userId?: string }; params?: Record<string, any> },
   extra?: Partial<ErrorLogContext>
 ): Promise<void> {
-  const endpoint = req.method && (req.originalUrl || req.path)
-    ? `${req.method} ${req.originalUrl || req.path}`
+  const requestPath = (req.originalUrl || req.path)?.split(/[?#]/, 1)[0];
+  const endpoint = req.method && requestPath
+    ? `${req.method} ${requestPath}`
     : undefined;
 
   // Try to extract project name from params or URL
   let projectName = extra?.projectName || req.params?.name || req.params?.projectName;
   if (!projectName && req.originalUrl) {
     const match = req.originalUrl.match(/\/projects\/([^/]+)/);
-    if (match) projectName = decodeURIComponent(match[1]);
+    if (match) {
+      try { projectName = decodeURIComponent(match[1]); } catch { projectName = undefined; }
+    }
   }
 
   await logError(error, {
@@ -115,25 +133,27 @@ interface NormalizedError {
 function normalizeError(error: unknown): NormalizedError {
   if (error instanceof Error) {
     return {
-      message: error.message,
-      stack: error.stack,
-      code: (error as any).code,
+      message: (error.message || error.name || 'Unknown error').slice(0, MAX_ERROR_MESSAGE_LENGTH),
+      stack: truncate(error.stack, MAX_STACK_LENGTH),
+      code: truncate((error as any).code, 200),
       status: (error as any).statusCode || (error as any).status,
     };
   }
   if (typeof error === 'string') {
-    return { message: error };
+    return { message: error.slice(0, MAX_ERROR_MESSAGE_LENGTH) };
   }
   if (error && typeof error === 'object') {
     const e = error as any;
+    let fallback = '[Unserializable error]';
+    try { fallback = JSON.stringify(error); } catch {}
     return {
-      message: e.message || e.detail || JSON.stringify(error),
-      stack: e.stack,
-      code: e.code,
+      message: String(e.message || e.detail || fallback).slice(0, MAX_ERROR_MESSAGE_LENGTH),
+      stack: truncate(e.stack, MAX_STACK_LENGTH),
+      code: truncate(e.code, 200),
       status: e.statusCode || e.status,
     };
   }
-  return { message: String(error) };
+  return { message: String(error).slice(0, MAX_ERROR_MESSAGE_LENGTH) };
 }
 
 function categorizeAction(ctx: ErrorLogContext): string {

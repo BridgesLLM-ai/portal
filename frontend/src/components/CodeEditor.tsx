@@ -2,6 +2,7 @@ import React, { useRef, useEffect } from 'react';
 import { Editor } from '@monaco-editor/react';
 import { motion } from 'framer-motion';
 import { Loader2 } from 'lucide-react';
+import { useTheme } from '../contexts/ThemeContext';
 
 interface CodeEditorProps {
   value: string;
@@ -12,46 +13,74 @@ interface CodeEditorProps {
   readOnly?: boolean;
 }
 
+function configurePortalThemes(monaco: any) {
+  monaco.editor.defineTheme('portal-dark', {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'comment', foreground: '6A9955' },
+      { token: 'keyword', foreground: '569CD6' },
+      { token: 'string', foreground: 'CE9178' },
+      { token: 'number', foreground: 'B5CEA8' },
+      { token: 'function', foreground: 'DCDCAA' },
+    ],
+    colors: {
+      'editor.background': '#0A0E27',
+      'editor.foreground': '#F0F4F8',
+      'editorCursor.foreground': '#10B981',
+      'editor.selectionBackground': '#10B98120',
+      'editorLineNumber.foreground': '#6B7280',
+      'editor.lineHighlightBackground': '#1A1F3A20',
+      'editorWidget.background': '#1A1F3A',
+      'editorWidget.border': '#374151',
+      'editorSuggestWidget.background': '#1A1F3A',
+      'editorSuggestWidget.selectedBackground': '#10B98120',
+    },
+  });
+  monaco.editor.defineTheme('portal-light', {
+    base: 'vs',
+    inherit: true,
+    rules: [
+      { token: 'comment', foreground: '4D7C5B' },
+      { token: 'keyword', foreground: '1D4ED8' },
+      { token: 'string', foreground: '9A3412' },
+      { token: 'number', foreground: '047857' },
+      { token: 'function', foreground: '6D28D9' },
+    ],
+    colors: {
+      'editor.background': '#FFFFFF',
+      'editor.foreground': '#172033',
+      'editorCursor.foreground': '#047857',
+      'editor.selectionBackground': '#A7F3D055',
+      'editorLineNumber.foreground': '#74849A',
+      'editor.lineHighlightBackground': '#F2F5F9',
+      'editorWidget.background': '#FFFFFF',
+      'editorWidget.border': '#D5DEEA',
+      'editorSuggestWidget.background': '#FFFFFF',
+      'editorSuggestWidget.selectedBackground': '#E9EEF5',
+    },
+  });
+}
+
 export default function CodeEditor({
   value,
   onChange,
   language = 'javascript',
   height = '400px',
-  theme = 'vs-dark',
+  theme,
   readOnly = false
 }: CodeEditorProps) {
   const editorRef = useRef<any>(null);
+  const { resolvedTheme } = useTheme();
+  const effectiveTheme = theme || (resolvedTheme === 'light' ? 'portal-light' : 'portal-dark');
 
   useEffect(() => {
-    // Configure Monaco for dark theme
     if (editorRef.current) {
       const monaco = editorRef.current.monaco;
-      monaco.editor.defineTheme('portal-dark', {
-        base: 'vs-dark',
-        inherit: true,
-        rules: [
-          { token: 'comment', foreground: '6A9955' },
-          { token: 'keyword', foreground: '569CD6' },
-          { token: 'string', foreground: 'CE9178' },
-          { token: 'number', foreground: 'B5CEA8' },
-          { token: 'function', foreground: 'DCDCAA' },
-        ],
-        colors: {
-          'editor.background': '#0A0E27',
-          'editor.foreground': '#F0F4F8',
-          'editorCursor.foreground': '#10B981',
-          'editor.selectionBackground': '#10B98120',
-          'editorLineNumber.foreground': '#6B7280',
-          'editor.lineHighlightBackground': '#1A1F3A20',
-          'editorWidget.background': '#1A1F3A',
-          'editorWidget.border': '#374151',
-          'editorSuggestWidget.background': '#1A1F3A',
-          'editorSuggestWidget.selectedBackground': '#10B98120',
-        }
-      });
-      monaco.editor.setTheme('portal-dark');
+      configurePortalThemes(monaco);
+      monaco.editor.setTheme(effectiveTheme);
     }
-  }, []);
+  }, [effectiveTheme]);
 
   const handleEditorDidMount = (editor: any, monaco: any) => {
     editorRef.current = { editor, monaco };
@@ -78,8 +107,8 @@ export default function CodeEditor({
       rulers: [80, 120],
     });
 
-    // Set dark theme
-    monaco.editor.setTheme('portal-dark');
+    configurePortalThemes(monaco);
+    monaco.editor.setTheme(effectiveTheme);
   };
 
   return (
@@ -95,9 +124,9 @@ export default function CodeEditor({
         value={value}
         onChange={onChange}
         onMount={handleEditorDidMount}
-        theme="portal-dark"
+        theme={effectiveTheme}
         loading={
-          <div className="flex items-center justify-center h-full bg-slate-900">
+          <div className="flex h-full items-center justify-center bg-theme-surface">
             <div className="flex items-center gap-2 text-emerald-400">
               <Loader2 className="w-5 h-5 animate-spin" />
               <span>Loading editor...</span>

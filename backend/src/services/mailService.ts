@@ -15,6 +15,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { scanBuffer } from './virusScan';
+import { assertPortalFeatureAvailable } from '../utils/portalFeatureCapabilities';
 
 // These are functions (not module-level consts) so they read process.env at call time.
 // The wizard writes env vars AFTER this module loads — caching them at import time
@@ -28,6 +30,11 @@ function getMailDomain() { return process.env.MAIL_DOMAIN || 'localhost'; }
 
 // Signature storage path
 const SIGNATURE_FILE = path.join(process.cwd(), 'data', 'mail-signature.txt');
+const JMAP_REQUEST_TIMEOUT_MS = 20_000;
+const JMAP_UPLOAD_TIMEOUT_MS = 60_000;
+const MAX_JMAP_JSON_BYTES = 10 * 1024 * 1024;
+const MAX_JMAP_ERROR_BYTES = 16 * 1024;
+export const MAX_MAIL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
 // Dangerous attachment types that should be blocked/flagged
 const DANGEROUS_EXTENSIONS = new Set([
@@ -47,6 +54,71 @@ interface JmapSession {
   downloadUrl: string;
   uploadUrl: string;
   accountId: string;
+}
+
+async function readBoundedBuffer(response: Response, maxBytes: number): Promise<Buffer> {
+  const declaredLength = Number(response.headers.get('content-length') || 0);
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    try { await response.body?.cancel(); } catch {}
+    throw new Error(`Mail server response exceeds the ${maxBytes}-byte limit`);
+  }
+
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      total += chunk.length;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new Error(`Mail server response exceeds the ${maxBytes}-byte limit`);
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, total);
+}
+
+async function readBoundedText(response: Response, maxBytes = MAX_JMAP_ERROR_BYTES): Promise<string> {
+  return (await readBoundedBuffer(response, maxBytes)).toString('utf8');
+}
+
+async function readBoundedJson(response: Response, maxBytes = MAX_JMAP_JSON_BYTES): Promise<any> {
+  const text = await readBoundedText(response, maxBytes);
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch {
+    throw new Error('Mail server returned malformed JSON');
+  }
+}
+
+function fetchMail(url: string, init: RequestInit = {}, timeoutMs = JMAP_REQUEST_TIMEOUT_MS): Promise<Response> {
+  return fetch(url, {
+    ...init,
+    redirect: 'error',
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
+export function normalizeAttachmentName(name: string | null | undefined): string {
+  const normalized = path.basename(String(name || 'attachment'))
+    .replace(/[\u0000-\u001f\u007f"\\/]/g, '_')
+    .trim()
+    .slice(0, 180);
+  return normalized || 'attachment';
+}
+
+export function normalizeContentType(type: string | null | undefined): string {
+  const normalized = String(type || '').trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(normalized)
+    ? normalized
+    : 'application/octet-stream';
 }
 
 const PORTAL_AUTO_FORWARD_SCRIPT_NAME = 'bridgesllm-auto-forward';
@@ -140,13 +212,13 @@ function selectJmapAccountId(session: any, preferred: JmapPreferredAccount): str
 }
 
 async function getSession(user: string, pass: string, preferred: JmapPreferredAccount = 'mail'): Promise<JmapSession> {
-  const res = await fetch(`${getStalwartUrl()}/jmap/session`, {
+  const res = await fetchMail(`${getStalwartUrl()}/jmap/session`, {
     headers: {
       'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64'),
     },
   });
   if (!res.ok) throw new Error(`JMAP session failed: ${res.status} ${res.statusText}`);
-  const session = await res.json() as any;
+  const session = await readBoundedJson(res) as any;
   
   const accountId = selectJmapAccountId(session, preferred);
   if (!accountId) throw new Error('No JMAP account found');
@@ -168,7 +240,7 @@ async function jmapCall(
   methodCalls: any[],
   extraUsing: string[] = [],
 ): Promise<any> {
-  const res = await fetch(session.apiUrl, {
+  const res = await fetchMail(session.apiUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -180,10 +252,10 @@ async function jmapCall(
     }),
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`JMAP call failed: ${res.status} ${text}`);
+    await readBoundedText(res).catch(() => undefined);
+    throw new Error(`JMAP call failed: HTTP ${res.status}`);
   }
-  return res.json();
+  return readBoundedJson(res);
 }
 
 function formatJmapMethodError(error: any): string {
@@ -195,9 +267,8 @@ function formatJmapMethodError(error: any): string {
 }
 
 function getJmapMethodResponse(result: any, callId: string, methodName: string, action: string): any {
-  const responses = result.methodResponses || [];
-  const entry = responses.find((response: any[]) => response?.[2] === callId)
-    || responses.find((response: any[]) => response?.[0] === methodName);
+  const responses = Array.isArray(result?.methodResponses) ? result.methodResponses : [];
+  const entry = responses.find((response: any[]) => response?.[2] === callId);
 
   if (!entry) {
     const errorEntry = responses.find((response: any[]) => response?.[0] === 'error');
@@ -216,6 +287,87 @@ function getJmapMethodResponse(result: any, callId: string, methodName: string, 
   return entry[1] || {};
 }
 
+type JmapSetOperation = 'create' | 'update' | 'destroy';
+
+function assertJmapSetSucceeded(
+  response: any,
+  operation: JmapSetOperation,
+  requestedIds: string[],
+  action: string,
+): Record<string, any> {
+  const failureKey = operation === 'create'
+    ? 'notCreated'
+    : operation === 'update'
+      ? 'notUpdated'
+      : 'notDestroyed';
+  const successKey = operation === 'create'
+    ? 'created'
+    : operation === 'update'
+      ? 'updated'
+      : 'destroyed';
+  const failures = response?.[failureKey];
+  if (failures && typeof failures === 'object' && Object.keys(failures).length > 0) {
+    const details = JSON.stringify(failures).slice(0, 2_000);
+    throw new Error(`JMAP ${action} failed: ${details}`);
+  }
+
+  const successes = response?.[successKey];
+  if (operation === 'destroy') {
+    const destroyed = Array.isArray(successes) ? successes : [];
+    const missing = requestedIds.filter((id) => !destroyed.includes(id));
+    if (missing.length > 0) {
+      throw new Error(`JMAP ${action} did not confirm ${operation} for: ${missing.join(', ')}`);
+    }
+    return Object.fromEntries(destroyed.map((id: string) => [id, null]));
+  }
+
+  if (!successes || typeof successes !== 'object' || Array.isArray(successes)) {
+    throw new Error(`JMAP ${action} returned no ${successKey} confirmations`);
+  }
+  const missing = requestedIds.filter((id) => !Object.prototype.hasOwnProperty.call(successes, id));
+  if (missing.length > 0) {
+    throw new Error(`JMAP ${action} did not confirm ${operation} for: ${missing.join(', ')}`);
+  }
+  return successes;
+}
+
+function requireRequestedEmails(response: any, emailIds: string[], action: string): any[] {
+  const list = Array.isArray(response?.list) ? response.list : [];
+  const requested = [...new Set(emailIds)];
+  const byId = new Map<string, any>();
+  for (const email of list) {
+    if (typeof email?.id === 'string' && requested.includes(email.id)) byId.set(email.id, email);
+  }
+  const missing = requested.filter((id) => !byId.has(id));
+  if (missing.length > 0) {
+    const reportedNotFound = Array.isArray(response?.notFound)
+      ? response.notFound.filter((id: unknown) => typeof id === 'string')
+      : [];
+    const details = reportedNotFound.length > 0 ? ` (notFound: ${reportedNotFound.join(', ')})` : '';
+    throw new Error(`JMAP ${action} could not load: ${missing.join(', ')}${details}`);
+  }
+  return requested.map((id) => byId.get(id));
+}
+
+async function updateEmails(
+  session: JmapSession,
+  user: string,
+  pass: string,
+  update: Record<string, any>,
+  action: string,
+): Promise<void> {
+  const emailIds = Object.keys(update);
+  if (emailIds.length === 0) return;
+  const result = await jmapCall(session, user, pass, [
+    ['Email/set', {
+      accountId: session.accountId,
+      update,
+    }, 'email-update'],
+  ]);
+  const response = getJmapMethodResponse(result, 'email-update', 'Email/set', action);
+  assertJmapSetSucceeded(response, 'update', emailIds, action);
+}
+
 function escapeSieveString(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, ' ');
 }
@@ -230,21 +382,21 @@ export function buildAutoForwardSieveScript(forwardTo: string): string {
 }
 
 async function uploadSieveScript(session: JmapSession, user: string, pass: string, content: string): Promise<string> {
-  const res = await fetch(session.uploadUrl, {
+  const res = await fetchMail(session.uploadUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/sieve; charset=utf-8',
       'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64'),
     },
     body: Buffer.from(content, 'utf8'),
-  });
+  }, JMAP_UPLOAD_TIMEOUT_MS);
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Sieve upload failed: ${res.status} ${text}`);
+    await readBoundedText(res).catch(() => undefined);
+    throw new Error(`Sieve upload failed: HTTP ${res.status}`);
   }
 
-  const uploaded = await res.json() as any;
+  const uploaded = await readBoundedJson(res) as any;
   const blobId = typeof uploaded.blobId === 'string' ? uploaded.blobId : '';
   if (!blobId) throw new Error('Sieve upload did not return a blobId');
   return blobId;
@@ -286,6 +438,8 @@ function assertSieveSetSucceeded(result: any, action: string): void {
 }
 
 export async function syncAutoForwardRule(forwardTo: string | null | undefined, user: string, pass: string): Promise<void> {
+  assertPortalFeatureAvailable('mail');
+
   const target = typeof forwardTo === 'string' ? forwardTo.trim() : '';
   const session = await getSession(user, pass, 'sieve');
   const scripts = await getSieveScripts(session, user, pass);
@@ -405,8 +559,9 @@ export async function getMailboxes(user: string, pass: string): Promise<MailboxI
   const result = await jmapCall(session, user, pass, [
     ['Mailbox/get', { accountId: session.accountId }, '0'],
   ]);
-  
-  const mailboxes = result.methodResponses[0][1].list || [];
+
+  const mailboxResponse = getJmapMethodResponse(result, '0', 'Mailbox/get', 'load mailboxes');
+  const mailboxes = Array.isArray(mailboxResponse.list) ? mailboxResponse.list : [];
   return mailboxes.map((mb: any) => ({
     id: mb.id,
     name: mb.name,
@@ -426,6 +581,7 @@ export async function listEmails(user: string, pass: string, options: {
   position?: number;
   limit?: number;
   sort?: 'date-desc' | 'date-asc';
+  query?: string;
 }): Promise<{ emails: EmailSummary[]; total: number; position: number }> {
   const { position = 0, limit = 50, sort = 'date-desc' } = options;
   
@@ -442,6 +598,8 @@ export async function listEmails(user: string, pass: string, options: {
   
   const filter: any = {};
   if (mailboxId) filter.inMailbox = mailboxId;
+  const query = options.query?.trim();
+  if (query) filter.text = query;
   
   const result = await jmapCall(session, user, pass, [
     ['Email/query', {
@@ -462,8 +620,9 @@ export async function listEmails(user: string, pass: string, options: {
     }, '1'],
   ]);
   
-  const queryResult = result.methodResponses[0][1];
-  const emails = (result.methodResponses[1][1].list || []).map((e: any) => ({
+  const queryResult = getJmapMethodResponse(result, '0', 'Email/query', 'query emails');
+  const getResult = getJmapMethodResponse(result, '1', 'Email/get', 'load queried emails');
+  const emails = (Array.isArray(getResult.list) ? getResult.list : []).map((e: any) => ({
     id: e.id,
     threadId: e.threadId,
     mailboxIds: e.mailboxIds || {},
@@ -507,7 +666,8 @@ export async function getEmail(emailId: string, user: string, pass: string): Pro
     }, '0'],
   ]);
   
-  const email = result.methodResponses[0][1].list?.[0];
+  const getResult = getJmapMethodResponse(result, '0', 'Email/get', 'load email');
+  const email = requireRequestedEmails(getResult, [emailId], 'load email')[0];
   if (!email) throw new Error('Email not found');
   
   // Sanitize HTML body values
@@ -531,18 +691,6 @@ export async function getEmail(emailId: string, user: string, pass: string): Pro
     isDangerous: isAttachmentDangerous(att.name, att.type || ''),
   }));
   
-  // Mark as read
-  try {
-    await jmapCall(session, user, pass, [
-      ['Email/set', {
-        accountId: session.accountId,
-        update: {
-          [emailId]: { 'keywords/$seen': true },
-        },
-      }, '0'],
-    ]);
-  } catch {} // Non-critical
-  
   return {
     id: email.id,
     threadId: email.threadId,
@@ -556,7 +704,7 @@ export async function getEmail(emailId: string, user: string, pass: string): Pro
     size: email.size || 0,
     preview: email.preview || '',
     hasAttachment: email.hasAttachment || false,
-    isUnread: false, // We just marked it read
+    isUnread: !email.keywords?.['$seen'],
     isFlagged: !!(email.keywords?.['$flagged']),
     messageId: email.messageId,
     inReplyTo: email.inReplyTo,
@@ -572,28 +720,30 @@ export async function getEmail(emailId: string, user: string, pass: string): Pro
  * Download an attachment blob
  */
 export async function downloadAttachment(blobId: string, name: string, type: string, user: string, pass: string): Promise<{ buffer: Buffer; contentType: string; filename: string }> {
-  if (isAttachmentDangerous(name, type)) {
+  const filename = normalizeAttachmentName(name);
+  const contentType = normalizeContentType(type);
+  if (isAttachmentDangerous(filename, contentType)) {
     throw new Error('This attachment type is blocked for security reasons');
   }
   
   const session = await getSession(user, pass);
   const url = session.downloadUrl
-    .replace('{blobId}', blobId)
-    .replace('{name}', encodeURIComponent(name || 'attachment'))
-    .replace('{type}', encodeURIComponent(type));
+    .replace('{blobId}', encodeURIComponent(blobId))
+    .replace('{name}', encodeURIComponent(filename))
+    .replace('{type}', encodeURIComponent(contentType));
   
-  const res = await fetch(url, {
+  const res = await fetchMail(url, {
     headers: {
       'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64'),
     },
-  });
+  }, JMAP_UPLOAD_TIMEOUT_MS);
   if (!res.ok) throw new Error(`Download failed: ${res.status}`);
   
-  const buffer = Buffer.from(await res.arrayBuffer());
+  const buffer = await readBoundedBuffer(res, MAX_MAIL_ATTACHMENT_BYTES);
   return {
     buffer,
-    contentType: type,
-    filename: name || 'attachment',
+    contentType,
+    filename,
   };
 }
 
@@ -605,27 +755,43 @@ export async function uploadBlob(
   contentType: string,
   user: string,
   pass: string,
+  filename = 'attachment',
 ): Promise<{ blobId: string; type: string; size: number }> {
+  const safeName = normalizeAttachmentName(filename);
+  const safeType = normalizeContentType(contentType);
+  if (fileBuffer.length === 0 || fileBuffer.length > MAX_MAIL_ATTACHMENT_BYTES) {
+    throw new Error(`Attachment must be between 1 byte and ${MAX_MAIL_ATTACHMENT_BYTES} bytes`);
+  }
+  if (isAttachmentDangerous(safeName, safeType)) {
+    throw new Error('This attachment type is blocked for security reasons');
+  }
+  const scanResult = await scanBuffer(fileBuffer, safeName);
+  if (!scanResult.clean) {
+    throw new Error(scanResult.scannerAvailable
+      ? `Attachment blocked by malware scanner: ${scanResult.threat || 'threat detected'}`
+      : 'Attachment could not be verified because the malware scanner is unavailable');
+  }
+
   const session = await getSession(user, pass);
   
-  const res = await fetch(session.uploadUrl, {
+  const res = await fetchMail(session.uploadUrl, {
     method: 'POST',
     headers: {
-      'Content-Type': contentType,
+      'Content-Type': safeType,
       'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64'),
     },
     body: fileBuffer,
-  });
+  }, JMAP_UPLOAD_TIMEOUT_MS);
   
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Blob upload failed: ${res.status} ${text}`);
+    await readBoundedText(res).catch(() => undefined);
+    throw new Error(`Blob upload failed: HTTP ${res.status}`);
   }
   
-  const result = await res.json() as any;
+  const result = await readBoundedJson(res) as any;
   return {
     blobId: result.blobId,
-    type: result.type || contentType,
+    type: normalizeContentType(result.type || safeType),
     size: result.size || fileBuffer.length,
   };
 }
@@ -636,6 +802,10 @@ export async function uploadBlob(
  * When not provided, auto-detects: noreply@ for from=noreply@..., otherwise support@.
  */
 export async function sendEmail(params: SendEmailParams, user?: string, pass?: string): Promise<{ success: boolean; messageId?: string }> {
+  // This is the central outbound JMAP boundary. Assert before resolving any
+  // stored credentials or opening a Stalwart session.
+  assertPortalFeatureAvailable('mail');
+
   // Resolve which account to use
   let resolvedUser: string;
   let resolvedPass: string;
@@ -660,7 +830,8 @@ export async function sendEmail(params: SendEmailParams, user?: string, pass?: s
   const mailboxResult = await jmapCall(session, resolvedUser, resolvedPass, [
     ['Mailbox/get', { accountId: session.accountId, properties: ['id', 'role'] }, 'mb'],
   ]);
-  const mailboxList = mailboxResult.methodResponses[0][1].list || [];
+  const mailboxResponse = getJmapMethodResponse(mailboxResult, 'mb', 'Mailbox/get', 'load sending mailboxes');
+  const mailboxList = Array.isArray(mailboxResponse.list) ? mailboxResponse.list : [];
   const draftsBox = mailboxList.find((m: any) => m.role === 'drafts');
   const sentBox = mailboxList.find((m: any) => m.role === 'sent');
   const anyBox = mailboxList[0];
@@ -715,7 +886,8 @@ export async function sendEmail(params: SendEmailParams, user?: string, pass?: s
   const identityResult = await jmapCall(session, resolvedUser, resolvedPass, [
     ['Identity/get', { accountId: session.accountId }, 'id'],
   ]);
-  const identities = identityResult.methodResponses[0][1].list || [];
+  const identityResponse = getJmapMethodResponse(identityResult, 'id', 'Identity/get', 'load sending identity');
+  const identities = Array.isArray(identityResponse.list) ? identityResponse.list : [];
   const identityId = identities[0]?.id;
   if (!identityId) throw new Error('No email identity found for account');
   
@@ -735,29 +907,35 @@ export async function sendEmail(params: SendEmailParams, user?: string, pass?: s
     }, '1'],
   ]);
   
-  const createResult = result.methodResponses[0][1];
-  if (createResult.notCreated?.draft) {
-    throw new Error(`Failed to create email: ${JSON.stringify(createResult.notCreated.draft)}`);
+  const createResult = getJmapMethodResponse(result, '0', 'Email/set', 'create outbound email');
+  const createdEmails = assertJmapSetSucceeded(createResult, 'create', ['draft'], 'create outbound email');
+  const emailId = typeof createdEmails.draft?.id === 'string' ? createdEmails.draft.id : '';
+  if (!emailId) throw new Error('JMAP create outbound email returned no email id');
+
+  const submissionResult = getJmapMethodResponse(result, '1', 'EmailSubmission/set', 'submit outbound email');
+  const createdSubmissions = assertJmapSetSucceeded(
+    submissionResult,
+    'create',
+    ['send'],
+    'submit outbound email',
+  );
+  if (typeof createdSubmissions.send?.id !== 'string' || !createdSubmissions.send.id) {
+    throw new Error('JMAP submit outbound email returned no submission id');
   }
-  
-  const submissionResult = result.methodResponses[1]?.[1];
-  if (submissionResult?.notCreated?.send) {
-    throw new Error(`Failed to submit email: ${JSON.stringify(submissionResult.notCreated.send)}`);
-  }
-  
+
   // Move from drafts to sent after successful submission
-  const emailId = createResult.created?.draft?.id;
   if (emailId && sentMailboxId) {
     try {
       const moveUpdate: any = {};
       moveUpdate[`mailboxIds/${targetMailboxId}`] = null;
       moveUpdate[`mailboxIds/${sentMailboxId}`] = true;
-      await jmapCall(session, resolvedUser, resolvedPass, [
-        ['Email/set', {
-          accountId: session.accountId,
-          update: { [emailId]: moveUpdate },
-        }, '0'],
-      ]);
+      await updateEmails(
+        session,
+        resolvedUser,
+        resolvedPass,
+        { [emailId]: moveUpdate },
+        'move submitted email to Sent',
+      );
     } catch {
       // Non-critical — email was sent, just couldn't move to Sent folder
     }
@@ -785,9 +963,9 @@ export async function trashEmail(emailId: string, user: string, pass: string): P
       properties: ['mailboxIds'],
     }, '0'],
   ]);
-  
-  const email = getResult.methodResponses[0][1].list?.[0];
-  if (!email) throw new Error('Email not found');
+
+  const getResponse = getJmapMethodResponse(getResult, '0', 'Email/get', 'load email before trash');
+  const email = requireRequestedEmails(getResponse, [emailId], 'load email before trash')[0];
   
   // Build new mailboxIds — remove all current, add trash
   const update: any = {};
@@ -796,12 +974,7 @@ export async function trashEmail(emailId: string, user: string, pass: string): P
   }
   update[`mailboxIds/${trash.id}`] = true;
   
-  await jmapCall(session, user, pass, [
-    ['Email/set', {
-      accountId: session.accountId,
-      update: { [emailId]: update },
-    }, '0'],
-  ]);
+  await updateEmails(session, user, pass, { [emailId]: update }, 'move email to Trash');
 }
 
 /**
@@ -818,9 +991,9 @@ export async function moveEmail(emailId: string, targetMailboxId: string, user: 
       properties: ['mailboxIds'],
     }, '0'],
   ]);
-  
-  const email = getResult.methodResponses[0][1].list?.[0];
-  if (!email) throw new Error('Email not found');
+
+  const getResponse = getJmapMethodResponse(getResult, '0', 'Email/get', 'load email before move');
+  const email = requireRequestedEmails(getResponse, [emailId], 'load email before move')[0];
   
   // Build new mailboxIds — remove all current, add target
   const update: any = {};
@@ -829,12 +1002,7 @@ export async function moveEmail(emailId: string, targetMailboxId: string, user: 
   }
   update[`mailboxIds/${targetMailboxId}`] = true;
   
-  await jmapCall(session, user, pass, [
-    ['Email/set', {
-      accountId: session.accountId,
-      update: { [emailId]: update },
-    }, '0'],
-  ]);
+  await updateEmails(session, user, pass, { [emailId]: update }, 'move email');
 }
 
 /**
@@ -842,14 +1010,13 @@ export async function moveEmail(emailId: string, targetMailboxId: string, user: 
  */
 export async function toggleFlag(emailId: string, flagged: boolean, user: string, pass: string): Promise<void> {
   const session = await getSession(user, pass);
-  await jmapCall(session, user, pass, [
-    ['Email/set', {
-      accountId: session.accountId,
-      update: {
-        [emailId]: { 'keywords/$flagged': flagged || null },
-      },
-    }, '0'],
-  ]);
+  await updateEmails(
+    session,
+    user,
+    pass,
+    { [emailId]: { 'keywords/$flagged': flagged || null } },
+    flagged ? 'flag email' : 'unflag email',
+  );
 }
 
 /**
@@ -857,14 +1024,13 @@ export async function toggleFlag(emailId: string, flagged: boolean, user: string
  */
 export async function markRead(emailId: string, read: boolean, user: string, pass: string): Promise<void> {
   const session = await getSession(user, pass);
-  await jmapCall(session, user, pass, [
-    ['Email/set', {
-      accountId: session.accountId,
-      update: {
-        [emailId]: { 'keywords/$seen': read || null },
-      },
-    }, '0'],
-  ]);
+  await updateEmails(
+    session,
+    user,
+    pass,
+    { [emailId]: { 'keywords/$seen': read || null } },
+    read ? 'mark email read' : 'mark email unread',
+  );
 }
 
 /**
@@ -875,16 +1041,11 @@ export async function bulkMarkRead(emailIds: string[], read: boolean, user: stri
   const session = await getSession(user, pass);
   
   const updateMap: any = {};
-  for (const id of emailIds) {
+  for (const id of new Set(emailIds)) {
     updateMap[id] = { 'keywords/$seen': read || null };
   }
-  
-  await jmapCall(session, user, pass, [
-    ['Email/set', {
-      accountId: session.accountId,
-      update: updateMap,
-    }, '0'],
-  ]);
+
+  await updateEmails(session, user, pass, updateMap, read ? 'mark emails read' : 'mark emails unread');
 }
 
 /**
@@ -906,8 +1067,9 @@ export async function bulkTrash(emailIds: string[], user: string, pass: string):
       properties: ['mailboxIds'],
     }, '0'],
   ]);
-  
-  const emails = getResult.methodResponses[0][1].list || [];
+
+  const getResponse = getJmapMethodResponse(getResult, '0', 'Email/get', 'load emails before trash');
+  const emails = requireRequestedEmails(getResponse, emailIds, 'load emails before trash');
   const updateMap: any = {};
   
   for (const email of emails) {
@@ -919,12 +1081,7 @@ export async function bulkTrash(emailIds: string[], user: string, pass: string):
     updateMap[email.id] = update;
   }
   
-  await jmapCall(session, user, pass, [
-    ['Email/set', {
-      accountId: session.accountId,
-      update: updateMap,
-    }, '0'],
-  ]);
+  await updateEmails(session, user, pass, updateMap, 'move emails to Trash');
 }
 
 /**
@@ -942,24 +1099,21 @@ export async function bulkMove(emailIds: string[], targetMailboxId: string, user
       properties: ['mailboxIds'],
     }, '0'],
   ]);
-  
-  const emails = getResult.methodResponses[0][1].list || [];
+
+  const getResponse = getJmapMethodResponse(getResult, '0', 'Email/get', 'load emails before move');
+  const emails = requireRequestedEmails(getResponse, emailIds, 'load emails before move');
   const updateMap: any = {};
   
   for (const email of emails) {
-    const update: any = {};    for (const mbId of Object.keys(email.mailboxIds || {})) {
+    const update: any = {};
+    for (const mbId of Object.keys(email.mailboxIds || {})) {
       update[`mailboxIds/${mbId}`] = null;
     }
     update[`mailboxIds/${targetMailboxId}`] = true;
     updateMap[email.id] = update;
   }
   
-  await jmapCall(session, user, pass, [
-    ['Email/set', {
-      accountId: session.accountId,
-      update: updateMap,
-    }, '0'],
-  ]);
+  await updateEmails(session, user, pass, updateMap, 'move emails');
 }
 
 /**
@@ -994,15 +1148,16 @@ export async function forwardEmail(
     if (att.isDangerous) continue;
     try {
       const downloaded = await downloadAttachment(att.blobId, att.name || 'attachment', att.type, user, pass);
-      const uploaded = await uploadBlob(downloaded.buffer, att.type, user, pass);
+      const uploaded = await uploadBlob(downloaded.buffer, att.type, user, pass, att.name || 'attachment');
       forwardedAttachments.push({
         blobId: uploaded.blobId,
-        type: att.type,
-        name: att.name || 'attachment',
-        size: att.size,
+        type: uploaded.type,
+        name: downloaded.filename,
+        size: uploaded.size,
       });
     } catch (err) {
-      console.error(`[mail] Failed to forward attachment ${att.name}:`, err);
+      console.error(`[mail] Failed to forward attachment ${normalizeAttachmentName(att.name)}:`, err);
+      throw new Error('Forward failed because an original attachment could not be copied safely');
     }
   }
   

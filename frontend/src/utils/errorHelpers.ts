@@ -35,7 +35,10 @@ export function extractError(err: unknown, context?: string): ExtractedError {
     const data = e.response.data;
     const status = e.response.status;
     const serverMsg = data.detail || data.error || data.message || JSON.stringify(data);
-    const statusText = httpStatusHint(status);
+    // When the server names the cause, its hint beats a guess from the
+    // status code. A Tailscale denial arriving as 502 was being explained as
+    // "the backend may be restarting", which is the wrong thing to go check.
+    const statusText = errorCodeHint(data.code) || httpStatusHint(status);
     
     return {
       message: `${context || 'Request failed'}: ${serverMsg}`,
@@ -121,6 +124,26 @@ export function extractError(err: unknown, context?: string): ExtractedError {
     detail: JSON.stringify(e, null, 2),
     hint: 'Check the browser console and Activity Log for more details.',
   };
+}
+
+/**
+ * Hints for server error codes whose cause the status alone cannot convey.
+ * Only add a code here when the generic status hint would mislead.
+ */
+function errorCodeHint(code: unknown): string | null {
+  if (typeof code !== 'string' || !code) return null;
+  const hints: Record<string, string> = {
+    TAILNET_ACCESS_DENIED:
+      'That GPU refused the connection at its private listener. Re-run the Remote GPU setup '
+      + 'on that machine, then connect again.',
+    PROJECT_PROVIDER_RUNTIME_UNAVAILABLE:
+      'That provider\u2019s runtime is not installed on this server. Pick a different provider.',
+    TURN_STILL_ACTIVE:
+      'A chat turn is still finishing. This clears itself \u2014 the Portal will retry shortly.',
+    SHARE_PASSWORD_REQUIRES_PRIVATE_LINK:
+      'A share password only applies to a private link. Turn off public access, then set the password.',
+  };
+  return hints[code] || null;
 }
 
 /**

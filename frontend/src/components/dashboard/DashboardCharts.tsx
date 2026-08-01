@@ -5,11 +5,11 @@ interface ChartPoint {
   time: string;
   cpu: number;
   memory: number;
-  netIn: number;
-  netOut: number;
+  netIn: number | null;
+  netOut: number | null;
 }
 
-export default function DashboardCharts({ chartData }: { chartData: ChartPoint[] }) {
+export default function DashboardCharts({ chartData, networkAvailable = true }: { chartData: ChartPoint[]; networkAvailable?: boolean }) {
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
       <div className="glass hover-glow p-5">
@@ -51,7 +51,7 @@ export default function DashboardCharts({ chartData }: { chartData: ChartPoint[]
           <Wifi size={14} className="text-cyan-400" />
           Network I/O (6h)
         </h3>
-        <ResponsiveContainer width="100%" height={240}>
+        {networkAvailable ? <ResponsiveContainer width="100%" height={240}>
           <AreaChart data={chartData}>
             <defs>
               <linearGradient id="netInGrad" x1="0" y1="0" x2="0" y2="1">
@@ -73,12 +73,16 @@ export default function DashboardCharts({ chartData }: { chartData: ChartPoint[]
                 color: '#F0F4F8',
                 backdropFilter: 'blur(12px)',
               }}
-              formatter={(v: number) => `${v.toFixed(2)} MB/s`}
+              formatter={(v: unknown) => (typeof v === 'number' ? `${v.toFixed(2)} MB/s` : '—')}
             />
             <Area type="monotone" dataKey="netIn" stroke="#06B6D4" fill="url(#netInGrad)" strokeWidth={2} name="In" />
             <Area type="monotone" dataKey="netOut" stroke="#F59E0B" fill="url(#netOutGrad)" strokeWidth={2} name="Out" />
           </AreaChart>
-        </ResponsiveContainer>
+        </ResponsiveContainer> : (
+          <div className="flex h-[240px] items-center justify-center px-6 text-center text-sm text-slate-500">
+            Network throughput is unavailable in lightweight monitoring mode.
+          </div>
+        )}
       </div>
     </div>
   );

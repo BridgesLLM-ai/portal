@@ -34,6 +34,7 @@ export interface EmailFull extends EmailSummary {
     type: string;
     size: number;
     isDangerous: boolean;
+    downloadToken: string | null;
   }[];
   cc?: { name: string; email: string }[];
   replyTo?: { name: string; email: string }[];
@@ -51,3 +52,18 @@ export interface AttachmentFile {
   file: File;
   id: string;
 }
+
+/**
+ * A deliberately small, content-free signal that lets the Mail page keep its
+ * account and navigation boundary stable while a child owns a mutation. The
+ * child remains the sole progress/error surface; this is only coordination.
+ */
+export interface MailMutationActivity {
+  kind: string;
+  label: string;
+  account?: string;
+}
+
+export type MailMutationChangeHandler = (
+  activity: Readonly<MailMutationActivity> | null,
+) => void;

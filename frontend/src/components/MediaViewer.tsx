@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -8,9 +8,17 @@ import {
   X, Download, ZoomIn, ZoomOut, Maximize2, Minimize2,
   ChevronLeft, ChevronRight, RotateCw, Loader2, AlertCircle,
   FileText, FileCode, File as FileIcon, Copy, Trash2, Edit3,
-  Volume2, Image as ImageIcon, Film, Music, Eye, Code,
+  Volume2, Image as ImageIcon, Film, Music,
 } from 'lucide-react';
 import { useFileContent } from '../hooks/useFileContent';
+import { useTheme } from '../contexts/ThemeContext';
+import ViewportModal from './ViewportModal';
+import {
+  MAX_SPREADSHEET_FILE_BYTES,
+  formatSpreadsheetCell,
+  parseSpreadsheetWorkbook,
+  type ParsedSpreadsheetWorkbook,
+} from '../utils/spreadsheet';
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
@@ -61,6 +69,8 @@ function formatSize(bytes: number) {
 function getFileCategory(mime?: string, filename?: string): 'image' | 'video' | 'audio' | 'pdf' | 'excel' | 'text' | 'code' | 'markdown' | 'unknown' {
   const ext = filename?.split('.').pop()?.toLowerCase();
 
+  if (ext === 'csv') return 'text';
+
   if (mime) {
     if (mime.startsWith('image/')) return 'image';
     if (mime.startsWith('video/')) return 'video';
@@ -81,7 +91,7 @@ function getFileCategory(mime?: string, filename?: string): 'image' | 'video' | 
   if (ext) {
     if (['md', 'markdown', 'mdx'].includes(ext)) return 'markdown';
     if (['pdf'].includes(ext)) return 'pdf';
-    if (['xlsx', 'xls', 'csv'].includes(ext)) return 'excel';
+    if (['xlsx', 'xls', 'xlsm'].includes(ext)) return 'excel';
     if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif'].includes(ext)) return 'image';
     if (['mp4', 'webm', 'mov', 'avi', 'mkv', 'ogv'].includes(ext)) return 'video';
     if (['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac', 'wma'].includes(ext)) return 'audio';
@@ -141,7 +151,7 @@ function ImageViewer({ blobUrl, name }: { blobUrl: string; name: string }) {
   const [dragging, setDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [rotation, setRotation] = useState(0);
-  const containerRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLButtonElement>(null);
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
@@ -167,7 +177,7 @@ function ImageViewer({ blobUrl, name }: { blobUrl: string; name: string }) {
   return (
     <div className="flex flex-col h-full">
       {/* Image controls */}
-      <div className="flex items-center justify-center gap-1 py-2 bg-black/30 backdrop-blur-sm border-b border-white/5">
+      <div className="flex items-center justify-center gap-1 py-2 bg-theme-surface-raised backdrop-blur-sm border-b border-theme-border">
         <button onClick={() => setZoom(z => Math.max(0.1, z - 0.25))} className="p-2 rounded-lg hover:bg-white/10 text-slate-400 hover:text-white transition-colors" title="Zoom out">
           <ZoomOut size={16} />
         </button>
@@ -185,15 +195,28 @@ function ImageViewer({ blobUrl, name }: { blobUrl: string; name: string }) {
       </div>
 
       {/* Image area */}
-      <div
+      <button
+        type="button"
         ref={containerRef}
-        className="flex-1 overflow-hidden flex items-center justify-center bg-[#0a0a0a] cursor-grab active:cursor-grabbing select-none"
+        aria-label="Image viewer. Use arrow keys to pan and plus or minus to zoom."
+        className="flex-1 overflow-hidden flex items-center justify-center border-0 bg-[#0a0a0a] p-0 cursor-grab active:cursor-grabbing select-none"
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
         onDoubleClick={() => zoom === 1 ? setZoom(2) : resetView()}
+        onKeyDown={(event) => {
+          const delta = event.shiftKey ? 50 : 10;
+          if (event.key === 'ArrowLeft') setPosition((current) => ({ ...current, x: current.x - delta }));
+          else if (event.key === 'ArrowRight') setPosition((current) => ({ ...current, x: current.x + delta }));
+          else if (event.key === 'ArrowUp') setPosition((current) => ({ ...current, y: current.y - delta }));
+          else if (event.key === 'ArrowDown') setPosition((current) => ({ ...current, y: current.y + delta }));
+          else if (event.key === '+' || event.key === '=') setZoom((current) => Math.min(10, current + 0.25));
+          else if (event.key === '-') setZoom((current) => Math.max(0.25, current - 0.25));
+          else return;
+          event.preventDefault();
+        }}
       >
         <img
           src={blobUrl}
@@ -206,13 +229,14 @@ function ImageViewer({ blobUrl, name }: { blobUrl: string; name: string }) {
           }}
           draggable={false}
         />
-      </div>
+      </button>
     </div>
   );
 }
 
 // ─── Text/Code Viewer ────────────────────────────────────────
 function TextViewer({ blob, mime, filename }: { blob: Blob; mime?: string; filename?: string }) {
+  const { resolvedTheme } = useTheme();
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -242,45 +266,46 @@ function TextViewer({ blob, mime, filename }: { blob: Blob; mime?: string; filen
   const isMarkdown = lang === 'markdown';
 
   return (
-    <div className="h-full overflow-auto bg-[#1e1e1e]">
+    <div className="h-full overflow-auto bg-theme-surface">
       {isMarkdown ? (
         <div className="p-8 max-w-4xl mx-auto">
-          <article className="prose prose-invert prose-slate prose-sm md:prose-base lg:prose-lg max-w-none
-            prose-headings:font-bold prose-headings:text-white
-            prose-h1:text-3xl prose-h1:border-b prose-h1:border-white/10 prose-h1:pb-2 prose-h1:mb-4
-            prose-h2:text-2xl prose-h2:border-b prose-h2:border-white/5 prose-h2:pb-2 prose-h2:mt-8 prose-h2:mb-4
+          <article className={`prose prose-slate prose-sm md:prose-base lg:prose-lg max-w-none ${resolvedTheme === 'dark' ? 'prose-invert' : ''}
+            prose-headings:font-bold prose-headings:text-theme-text
+            prose-h1:text-3xl prose-h1:border-b prose-h1:border-theme-border prose-h1:pb-2 prose-h1:mb-4
+            prose-h2:text-2xl prose-h2:border-b prose-h2:border-theme-border prose-h2:pb-2 prose-h2:mt-8 prose-h2:mb-4
             prose-h3:text-xl prose-h3:mt-6 prose-h3:mb-3
             prose-p:text-slate-300 prose-p:leading-relaxed
             prose-a:text-blue-400 prose-a:no-underline hover:prose-a:underline
-            prose-strong:text-white prose-strong:font-semibold
+            prose-strong:text-theme-text prose-strong:font-semibold
             prose-code:text-emerald-400 prose-code:bg-white/5 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:before:content-none prose-code:after:content-none
-            prose-pre:bg-[#0d1117] prose-pre:border prose-pre:border-white/10 prose-pre:rounded-lg
+            prose-pre:bg-theme-surface-strong prose-pre:border prose-pre:border-theme-border prose-pre:rounded-lg
             prose-blockquote:border-l-4 prose-blockquote:border-blue-500/30 prose-blockquote:bg-blue-500/5 prose-blockquote:py-2 prose-blockquote:px-4 prose-blockquote:not-italic prose-blockquote:text-slate-300
             prose-ul:text-slate-300 prose-ol:text-slate-300
             prose-li:marker:text-slate-500
-            prose-table:border prose-table:border-white/10 prose-table:rounded-lg prose-table:overflow-hidden
-            prose-thead:bg-white/5 prose-thead:border-b prose-thead:border-white/10
-            prose-th:px-4 prose-th:py-2 prose-th:text-left prose-th:font-semibold prose-th:text-white
-            prose-td:px-4 prose-td:py-2 prose-td:border-t prose-td:border-white/5
-            prose-img:rounded-lg prose-img:border prose-img:border-white/10
-            prose-hr:border-white/10"
+            prose-table:border prose-table:border-theme-border prose-table:rounded-lg prose-table:overflow-hidden
+            prose-thead:bg-theme-surface-raised prose-thead:border-b prose-thead:border-theme-border
+            prose-th:px-4 prose-th:py-2 prose-th:text-left prose-th:font-semibold prose-th:text-theme-text
+            prose-td:px-4 prose-td:py-2 prose-td:border-t prose-td:border-theme-border
+            prose-img:rounded-lg prose-img:border prose-img:border-theme-border
+            prose-hr:border-theme-border`}
           >
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               rehypePlugins={[rehypeHighlight]}
               components={{
                 // Custom checkbox rendering for task lists
-                input: ({ node, ...props }) => {
+                input: ({ node: _node, ...props }) => {
                   if (props.type === 'checkbox') {
                     return (
                       <input
                         {...props}
+                        aria-label={props.checked ? 'Completed task' : 'Incomplete task'}
                         disabled
                         className="mr-2 accent-emerald-500 cursor-default"
                       />
                     );
                   }
-                  return <input {...props} />;
+                  return <input {...props} aria-label="Document form field" />;
                 },
               }}
             >
@@ -303,7 +328,7 @@ function TextViewer({ blob, mime, filename }: { blob: Blob; mime?: string; filen
 }
 
 // ─── PDF Viewer (react-pdf, renders all pages) ─────────────
-function PdfViewer({ blob, name }: { blob: Blob; name: string }) {
+function PdfViewer({ blob, name: _name }: { blob: Blob; name: string }) {
   const [numPages, setNumPages] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [pdfData, setPdfData] = useState<{ data: Uint8Array } | null>(null);
@@ -343,7 +368,7 @@ function PdfViewer({ blob, name }: { blob: Blob; name: string }) {
   }
 
   return (
-    <div ref={containerRef} className="h-full overflow-auto bg-[#2a2a2a]">
+    <div ref={containerRef} className="h-full overflow-auto bg-theme-surface-strong">
       <Document
         file={pdfData}
         onLoadSuccess={({ numPages: n }) => setNumPages(n)}
@@ -373,7 +398,7 @@ function PdfViewer({ blob, name }: { blob: Blob; name: string }) {
         ))}
       </Document>
       {numPages > 0 && (
-        <div className="sticky bottom-0 text-center py-2 bg-[#2a2a2a]/90 backdrop-blur-sm text-xs text-slate-500">
+        <div className="sticky bottom-0 text-center py-2 bg-theme-surface/90 backdrop-blur-sm text-xs text-theme-text-muted">
           {numPages} page{numPages !== 1 ? 's' : ''}
         </div>
       )}
@@ -381,98 +406,64 @@ function PdfViewer({ blob, name }: { blob: Blob; name: string }) {
   );
 }
 
-// ─── Excel parsing (direct import, no worker) ──────────────
-import * as XLSX from 'xlsx';
-
 const INITIAL_ROWS = 500;
 const LOAD_MORE_ROWS = 500;
-const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB
 const WARN_FILE_SIZE = 5 * 1024 * 1024; // 5MB
 
-function parseExcelBuffer(buf: ArrayBuffer, sheetIndex: number, maxRows: number = 5000) {
-  const wb = XLSX.read(buf, { type: 'array' });
-  const sheetNames = wb.SheetNames;
-  const sheet = wb.Sheets[sheetNames[sheetIndex]];
-  const range = sheet['!ref'] ? XLSX.utils.decode_range(sheet['!ref']) : null;
-  const totalRows = range ? range.e.r + 1 : 0;
-  const totalCols = range ? range.e.c + 1 : 0;
-  if (range && range.e.r >= maxRows) {
-    range.e.r = maxRows - 1;
-    sheet['!ref'] = XLSX.utils.encode_range(range);
-  }
-  const data = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' }) as any[][];
-  return { sheetNames, data, totalRows, totalCols, sheetIndex };
-}
-
 // ─── Excel Viewer ────────────────────────────────────────────
-function ExcelViewer({ blob }: { blob: Blob }) {
-  const [sheetNames, setSheetNames] = useState<string[]>([]);
+function ExcelViewer({ blob, name }: { blob: Blob; name: string }) {
+  const [workbook, setWorkbook] = useState<ParsedSpreadsheetWorkbook | null>(null);
   const [activeSheet, setActiveSheet] = useState(0);
-  const [data, setData] = useState<any[][]>([]);
-  const [totalRows, setTotalRows] = useState(0);
   const [visibleRows, setVisibleRows] = useState(INITIAL_ROWS);
   const [loading, setLoading] = useState(true);
-  const [parsing, setParsing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sizeWarningAccepted, setSizeWarningAccepted] = useState(false);
-  const bufferRef = useRef<ArrayBuffer | null>(null);
 
-  // Parse blob directly — no fetch needed, blob comes from useFileContent
   useEffect(() => {
     let cancelled = false;
     async function loadBlob() {
       try {
         setLoading(true);
         setError(null);
-        if (blob.size > MAX_FILE_SIZE) {
+        setWorkbook(null);
+        setActiveSheet(0);
+        setVisibleRows(INITIAL_ROWS);
+        if (/\.xls$/i.test(name)) {
+          setError('Legacy .xls files are not parsed in the browser. Convert this file to .xlsx or download it instead.');
+          setLoading(false);
+          return;
+        }
+        if (blob.size > MAX_SPREADSHEET_FILE_BYTES) {
           setError(`File is too large (${(blob.size / 1024 / 1024).toFixed(1)}MB). Please download it instead.`);
           setLoading(false);
           return;
         }
-        const buf = await blob.arrayBuffer();
-        if (cancelled) return;
-        bufferRef.current = buf;
         if (blob.size > WARN_FILE_SIZE && !sizeWarningAccepted) {
           setLoading(false);
           return; // Show warning UI
         }
-        parseSheet(buf, 0);
+        const parsed = await parseSpreadsheetWorkbook(blob);
+        if (!cancelled) setWorkbook(parsed);
       } catch (e: any) {
-        if (!cancelled) { setError(e.message); setLoading(false); }
+        if (!cancelled) setError(e?.message || 'Failed to parse spreadsheet');
+      } finally {
+        if (!cancelled) setLoading(false);
       }
     }
     loadBlob();
     return () => { cancelled = true; };
-  }, [blob, sizeWarningAccepted]);
-
-  function parseSheet(buf: ArrayBuffer, sheetIndex: number) {
-    setParsing(true);
-    setError(null);
-    setVisibleRows(INITIAL_ROWS);
-    try {
-      const result = parseExcelBuffer(buf, sheetIndex, 5000);
-      setSheetNames(result.sheetNames);
-      setData(result.data);
-      setTotalRows(result.totalRows);
-      setActiveSheet(result.sheetIndex);
-    } catch (err: any) {
-      setError(err.message || 'Failed to parse Excel file');
-    } finally {
-      setParsing(false);
-      setLoading(false);
-    }
-  }
+  }, [blob, name, sizeWarningAccepted]);
 
   function handleSheetChange(i: number) {
-    if (bufferRef.current && i !== activeSheet) {
-      parseSheet(bufferRef.current, i);
-    }
+    if (!workbook?.sheets[i] || i === activeSheet) return;
+    setActiveSheet(i);
+    setVisibleRows(INITIAL_ROWS);
   }
 
   // Size warning gate
   if (!loading && blob.size > WARN_FILE_SIZE && !sizeWarningAccepted && !error) {
     return (
-      <div className="h-full flex items-center justify-center bg-[#1e1e1e]">
+      <div className="h-full flex items-center justify-center bg-theme-surface">
         <div className="text-center space-y-3 p-6 max-w-sm">
           <AlertCircle size={32} className="text-amber-400 mx-auto" />
           <p className="text-amber-300 text-sm font-medium">Large File Warning</p>
@@ -486,10 +477,10 @@ function ExcelViewer({ blob }: { blob: Blob }) {
     );
   }
 
-  if (loading || parsing) return (
+  if (loading) return (
     <div className="flex flex-col items-center justify-center h-full gap-2">
       <Loader2 size={24} className="animate-spin text-slate-500" />
-      <span className="text-xs text-slate-500">{parsing ? 'Parsing spreadsheet…' : 'Loading file…'}</span>
+      <span className="text-xs text-slate-500">Parsing spreadsheet safely…</span>
     </div>
   );
   if (error) return (
@@ -500,58 +491,65 @@ function ExcelViewer({ blob }: { blob: Blob }) {
     </div>
   );
 
-  const displayData = data.slice(0, visibleRows + 1); // +1 for header
-  const hasMore = data.length > visibleRows + 1 || totalRows > data.length;
+  const sheet = workbook?.sheets[activeSheet];
+  const data = sheet?.data || [];
+  const columnCount = Math.max(0, Math.min(sheet?.totalColumns || 0, 256));
+  const columns = Array.from({ length: columnCount }, (_, index) => index);
+  const rows = data.slice(1, visibleRows + 1);
+  const hasMore = data.length > visibleRows + 1;
 
   return (
-    <div className="h-full flex flex-col bg-[#1e1e1e]">
+    <div className="h-full flex flex-col bg-theme-surface">
       {/* Info bar */}
-      <div className="flex items-center justify-between px-3 py-1 border-b border-white/5 bg-black/20 text-[10px] text-slate-500 shrink-0">
-        <span>{totalRows.toLocaleString()} rows · {sheetNames.length} sheet{sheetNames.length !== 1 ? 's' : ''} · {(blob.size / 1024).toFixed(0)}KB</span>
-        {totalRows > INITIAL_ROWS && <span className="text-amber-400/70">Showing first {Math.min(visibleRows, data.length - 1).toLocaleString()} rows</span>}
+      <div className="flex items-center justify-between px-3 py-1 border-b border-theme-border bg-theme-surface-raised text-[10px] text-theme-text-muted shrink-0">
+        <span>{(sheet?.totalRows || 0).toLocaleString()} rows · {workbook?.sheets.length || 0} sheet{workbook?.sheets.length !== 1 ? 's' : ''} · {(blob.size / 1024).toFixed(0)}KB</span>
+        {sheet?.truncated && <span className="text-amber-400/70">Preview safely limited to 5,000 rows / 256 columns</span>}
       </div>
       {/* Sheet tabs */}
-      {sheetNames.length > 1 && (
-        <div className="flex items-center gap-1 px-3 py-1.5 border-b border-white/5 bg-black/30 overflow-x-auto shrink-0">
-          {sheetNames.map((name, i) => (
+      {(workbook?.sheets.length || 0) > 1 && (
+        <div className="flex items-center gap-1 px-3 py-1.5 border-b border-theme-border bg-theme-surface-raised overflow-x-auto shrink-0" role="tablist" aria-label={`Sheets in ${name}`}>
+          {workbook?.sheets.map((candidate, i) => (
             <button
-              key={name}
+              key={`${candidate.name}-${i}`}
+              role="tab"
+              aria-selected={i === activeSheet}
               onClick={() => handleSheetChange(i)}
               className={`px-3 py-1 text-xs rounded transition-colors whitespace-nowrap ${
                 i === activeSheet
-                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                  ? 'accent-active border'
                   : 'text-slate-400 hover:bg-white/10 hover:text-white'
               }`}
             >
-              {name}
+              {candidate.name}
             </button>
           ))}
         </div>
       )}
       {/* Table */}
       <div className="flex-1 overflow-auto">
-        {displayData.length === 0 ? (
+        {data.length === 0 ? (
           <div className="flex items-center justify-center h-full text-slate-500 text-sm">Empty sheet</div>
         ) : (
           <>
             <table className="w-full text-xs text-slate-300 border-collapse">
+              <caption className="sr-only">Spreadsheet data for {name}, sheet {sheet?.name || activeSheet + 1}</caption>
               <thead className="sticky top-0 z-10">
                 <tr>
-                  <th className="bg-[#2a2a2a] border border-white/10 px-2 py-1.5 text-slate-500 font-normal text-center w-10">#</th>
-                  {(displayData[0] || []).map((_: any, ci: number) => (
-                    <th key={ci} className="bg-[#2a2a2a] border border-white/10 px-3 py-1.5 text-left font-semibold text-slate-200 whitespace-nowrap">
-                      {String(displayData[0][ci] ?? '')}
+                  <th className="bg-theme-surface-strong border border-theme-border px-2 py-1.5 text-theme-text-muted font-normal text-center w-10">#</th>
+                  {columns.map((ci) => (
+                    <th key={ci} className="bg-theme-surface-strong border border-theme-border px-3 py-1.5 text-left font-semibold text-theme-text whitespace-nowrap">
+                      {formatSpreadsheetCell(data[0]?.[ci]) || `Column ${ci + 1}`}
                     </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {displayData.slice(1).map((row, ri) => (
+                {rows.map((row, ri) => (
                   <tr key={ri} className="hover:bg-white/[0.03]">
-                    <td className="bg-[#252525] border border-white/10 px-2 py-1 text-slate-500 text-center tabular-nums">{ri + 2}</td>
-                    {(displayData[0] || []).map((_: any, ci: number) => (
-                      <td key={ci} className="border border-white/10 px-3 py-1 whitespace-nowrap">
-                        {String(row[ci] ?? '')}
+                    <td className="bg-theme-surface-raised border border-theme-border px-2 py-1 text-theme-text-muted text-center tabular-nums">{ri + 2}</td>
+                    {columns.map((ci) => (
+                      <td key={ci} className="border border-theme-border px-3 py-1 whitespace-nowrap">
+                        {formatSpreadsheetCell(row[ci])}
                       </td>
                     ))}
                   </tr>
@@ -564,7 +562,7 @@ function ExcelViewer({ blob }: { blob: Blob }) {
                   onClick={() => setVisibleRows(v => v + LOAD_MORE_ROWS)}
                   className="px-4 py-1.5 text-xs bg-white/5 text-slate-400 rounded hover:bg-white/10 hover:text-white transition-colors"
                 >
-                  Load more rows ({Math.min(LOAD_MORE_ROWS, data.length - 1 - visibleRows).toLocaleString()} more)
+                  Load more rows ({Math.min(LOAD_MORE_ROWS, Math.max(0, data.length - 1 - visibleRows)).toLocaleString()} more)
                 </button>
               </div>
             )}
@@ -581,13 +579,12 @@ export default function MediaViewer({
   onCopyToProject, downloadUrl, copyAIUrl,
 }: MediaViewerProps) {
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [showInfo, setShowInfo] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   
   const { blobUrl, blob, loading, error } = useFileContent(file.id, file.mimeType);
   
   const name = getDisplayName(file);
-  const ext = name.split('.').pop()?.toLowerCase();
   const category = getFileCategory(file.mimeType, name);
   const CatIcon = getCategoryIcon(category);
 
@@ -604,17 +601,6 @@ export default function MediaViewer({
     if (hasNext && onNavigate) onNavigate(files[currentIndex + 1]);
   }, [hasNext, currentIndex, files, onNavigate]);
 
-  // Keyboard shortcuts
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-      if (e.key === 'ArrowLeft') goPrev();
-      if (e.key === 'ArrowRight') goNext();
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [onClose, goPrev, goNext]);
-
   // Fullscreen
   const toggleFullscreen = useCallback(() => {
     if (!document.fullscreenElement) {
@@ -630,12 +616,6 @@ export default function MediaViewer({
     const handler = () => setIsFullscreen(!!document.fullscreenElement);
     document.addEventListener('fullscreenchange', handler);
     return () => document.removeEventListener('fullscreenchange', handler);
-  }, []);
-
-  // Prevent body scroll
-  useEffect(() => {
-    document.body.style.overflow = 'hidden';
-    return () => { document.body.style.overflow = ''; };
   }, []);
 
   const renderContent = () => {
@@ -661,7 +641,7 @@ export default function MediaViewer({
           </a>
         </div>
       );
-      if (category === 'excel') return <ExcelViewer blob={blob} />;
+      if (category === 'excel') return <ExcelViewer blob={blob} name={name} />;
       return <PdfViewer blob={blob} name={name} />;
     }
 
@@ -694,6 +674,7 @@ export default function MediaViewer({
           <div className="flex items-center justify-center h-full bg-black p-4">
             <video
               src={blobUrl}
+              aria-label={`Video preview for ${name}`}
               controls
               autoPlay
               className="max-w-full max-h-full rounded-lg"
@@ -712,7 +693,7 @@ export default function MediaViewer({
               <p className="font-medium text-lg">{name}</p>
               <p className="text-sm text-slate-400 mt-1">{formatSize(file.size)}</p>
             </div>
-            <audio src={blobUrl} controls autoPlay className="w-full max-w-md" />
+            <audio src={blobUrl} controls autoPlay aria-label={`Audio preview for ${name}`} className="w-full max-w-md" />
           </div>
         );
       
@@ -736,16 +717,29 @@ export default function MediaViewer({
   };
 
   return (
-    <motion.div
-      ref={containerRef}
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: 0.2 }}
-      className="fixed inset-0 z-50 flex flex-col bg-[#0d0d0d]/95 backdrop-blur-xl"
+    <ViewportModal
+      open
+      onDismiss={onClose}
+      initialFocusRef={closeButtonRef}
+      className="bg-theme-bg/95 text-theme-text backdrop-blur-xl"
     >
+      <motion.div
+        ref={containerRef}
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        transition={{ duration: 0.2 }}
+        className="flex h-full min-h-0 w-full flex-col bg-theme-bg/95 text-theme-text backdrop-blur-xl"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Preview ${name}`}
+        onKeyDown={event => {
+          if (event.key === 'ArrowLeft') goPrev();
+          if (event.key === 'ArrowRight') goNext();
+        }}
+      >
       {/* Top bar */}
-      <div className="flex items-center justify-between px-4 py-2.5 bg-black/40 border-b border-white/5 shrink-0">
+      <div className="flex items-center justify-between px-4 py-2.5 bg-theme-surface/95 border-b border-theme-border shrink-0">
         <div className="flex items-center gap-3 min-w-0">
           <CatIcon size={18} className="text-slate-400 shrink-0" />
           <span className="text-sm font-medium truncate max-w-[40vw]">{name}</span>
@@ -769,7 +763,7 @@ export default function MediaViewer({
             {isFullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
           </button>
           <div className="w-px h-5 bg-white/10 mx-1" />
-          <button onClick={onClose} className="p-2 rounded-lg hover:bg-white/10 text-slate-400 hover:text-white transition-colors" title="Close (Esc)">
+          <button ref={closeButtonRef} onClick={onClose} aria-label="Close file preview" className="p-2 rounded-lg hover:bg-white/10 text-slate-400 hover:text-white transition-colors" title="Close (Esc)">
             <X size={18} />
           </button>
         </div>
@@ -796,7 +790,7 @@ export default function MediaViewer({
             {hasPrev && (
               <button
                 onClick={goPrev}
-                className="absolute left-3 top-1/2 -translate-y-1/2 p-3 rounded-full bg-black/60 hover:bg-black/80 text-white/70 hover:text-white transition-all shadow-xl backdrop-blur-sm border border-white/10 z-10"
+                className="theme-fixed-dark absolute left-3 top-1/2 -translate-y-1/2 p-3 rounded-full bg-black/60 hover:bg-black/80 text-white/70 hover:text-white transition-all shadow-xl backdrop-blur-sm border border-white/10 z-10"
                 title="Previous (←)"
               >
                 <ChevronLeft size={24} />
@@ -805,7 +799,7 @@ export default function MediaViewer({
             {hasNext && (
               <button
                 onClick={goNext}
-                className="absolute right-3 top-1/2 -translate-y-1/2 p-3 rounded-full bg-black/60 hover:bg-black/80 text-white/70 hover:text-white transition-all shadow-xl backdrop-blur-sm border border-white/10 z-10"
+                className="theme-fixed-dark absolute right-3 top-1/2 -translate-y-1/2 p-3 rounded-full bg-black/60 hover:bg-black/80 text-white/70 hover:text-white transition-all shadow-xl backdrop-blur-sm border border-white/10 z-10"
                 title="Next (→)"
               >
                 <ChevronRight size={24} />
@@ -816,7 +810,7 @@ export default function MediaViewer({
       </div>
 
       {/* Bottom bar with file info */}
-      <div className="flex items-center justify-between px-4 py-2 bg-black/40 border-t border-white/5 shrink-0">
+      <div className="flex items-center justify-between px-4 py-2 bg-theme-surface/95 border-t border-theme-border shrink-0">
         <div className="flex items-center gap-3 text-[11px] text-slate-500">
           <span className="px-2 py-0.5 rounded bg-white/5">{file.mimeType || 'Unknown type'}</span>
           <span>{new Date(file.createdAt).toLocaleString()}</span>
@@ -839,6 +833,7 @@ export default function MediaViewer({
           )}
         </div>
       </div>
-    </motion.div>
+      </motion.div>
+    </ViewportModal>
   );
 }

@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import crypto from 'crypto';
+import { NativeOllamaBackendBindingState, Prisma } from '@prisma/client';
 import { prisma } from '../config/database';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin, requireOwner } from '../middleware/requireAdmin';
@@ -8,8 +9,12 @@ import { hashPassword } from '../utils/password';
 import { AppError } from '../middleware/errorHandler';
 import { sendEmail } from '../services/mailService';
 import { sendPasswordResetEmail } from '../services/notificationService';
-import { provisionUserMailbox, deleteUserMailbox, getProvisionedMailboxes } from '../services/userMailService';
-import { cleanupUserBeforeDelete } from '../services/adminUserDeletion.service';
+import { provisionUserMailbox, deleteUserMailbox, deleteUserMailboxByUserId, getProvisionedMailboxes } from '../services/userMailService';
+import { enqueueMailboxReconciliation, drainMailboxReconciliation } from '../services/mailboxReconciliation';
+import {
+  ADMIN_USER_DELETION_RETIREMENT_CODE,
+  ADMIN_USER_DELETION_RETIREMENT_MESSAGE,
+} from '../services/adminUserDeletion.service';
 import path from 'path';
 import {
   AVATARS_DIR,
@@ -20,15 +25,59 @@ import {
   cleanupBasenameVariants,
   cleanupBasenamePrefixVariants,
   cleanupFile,
+  classifyImageUploadFailure,
 } from '../services/imageAssets';
-import { ACTIVE_STATUS, canAccessPortal, isOwnerRole } from '../utils/authz';
+import { ACTIVE_STATUS, isOwnerRole } from '../utils/authz';
 import { buildPortalUrl } from '../utils/portalUrl';
 import { configureDomainAndHttps, getCodingToolsStatus, getPublicIp, installCodingTool, updateEnvFile } from '../utils/serverSetup';
 import { isReservedSystemMailboxUsername } from '../utils/reservedMailboxUsernames';
 import dns from 'dns/promises';
 import fs from 'fs';
 import { getUpdateStatus } from '../services/telemetryService';
-import { execSync, spawn } from 'child_process';
+import { execSync } from 'child_process';
+import { recycleStalwartContainerPreservingData } from '../services/stalwartRecovery';
+import { ensureBackupLayout, getConfiguredBackupRoot, writeBackupConfiguration } from '../services/backup.service';
+import {
+  confirmationForMailboxDeletion,
+  confirmationForToolInstall,
+  isTypedConfirmationMatch,
+} from '../utils/privilegedConfirmation';
+import {
+  getStalwartDkimSigningConfig,
+  provisionStalwartDkim,
+} from '../services/stalwartDkim';
+import {
+  ADMIN_SETTINGS_SECRET_KEYS,
+  isAdminEditableSettingKey,
+  parseAdminSettingsPatch,
+} from '../config/systemSettingsRegistry';
+import { digestAuthToken, encryptPlaintextSecret } from '../utils/authSecrets';
+import { canonicalEmail, canonicalUsername } from '../utils/identity';
+import { buildPasswordResetPath } from '../utils/passwordResetLink';
+import {
+  admitPortalUpdate,
+  admitPortalUpdateRelease,
+  getPortalUpdatePreparation,
+  launchPortalSelfUpdate,
+  PortalSelfUpdateLaunchError,
+} from '../services/updatePreparation';
+import { PROJECT_RUNTIME_AUTHORIZATION_POLICY } from '../services/projectRuntimeAuthorizationPolicy';
+import {
+  assertNoProjectAuthorizationTransitionActive,
+  projectAuthorizationTransitionCoordinator,
+  ProjectAuthorizationTransitionError,
+  type ProjectAuthorizationUserUpdate,
+} from '../services/projectAuthorizationTransition';
+import { publishAuthorizationChanged } from '../services/authorizationChangeBus';
+import {
+  OllamaAuthorityBarrierBusyError,
+  withOllamaAuthorityMutationFence,
+} from '../services/ollamaAuthorityBarrier';
+import {
+  configuredPortalOriginMode,
+  getPortalFeatureCapabilities,
+  portalFeatureUnavailableResponse,
+} from '../utils/portalFeatureCapabilities';
 
 const router = Router();
 
@@ -46,7 +95,37 @@ async function isNotificationEnabled(key: string): Promise<boolean> {
   return raw?.value !== 'false';
 }
 
-async function createUniqueUsername(baseName: string, email: string): Promise<string> {
+type RegistrationApprovalNotification = {
+  state: 'sent' | 'disabled' | 'failed' | 'manual_required';
+  delivered: boolean;
+  manualNotificationRequired: boolean;
+  reason: string | null;
+};
+
+const REGISTRATION_PRIVATE_PASSWORD_REQUIRED_MESSAGE =
+  'This registration request does not contain a sign-in password. Deny it and ask the applicant to submit a new request before approving it in private mode.';
+
+class RegistrationPrivatePasswordRequiredError extends Error {
+  constructor() {
+    super(REGISTRATION_PRIVATE_PASSWORD_REQUIRED_MESSAGE);
+    this.name = 'RegistrationPrivatePasswordRequiredError';
+  }
+}
+
+function sendPrivateRegistrationPasswordRequired(res: Response): void {
+  res.status(409).json({
+    error: REGISTRATION_PRIVATE_PASSWORD_REQUIRED_MESSAGE,
+    code: 'REGISTRATION_PRIVATE_PASSWORD_REQUIRED',
+    retryable: false,
+    action: 'deny_and_resubmit',
+  });
+}
+
+async function createUniqueUsername(
+  baseName: string,
+  email: string,
+  db: Pick<Prisma.TransactionClient, 'user'> | Pick<typeof prisma, 'user'> = prisma,
+): Promise<string> {
   const fromName = baseName.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
   const fromEmail = email.split('@')[0].toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
   const base = fromName || fromEmail || 'user';
@@ -55,12 +134,20 @@ async function createUniqueUsername(baseName: string, email: string): Promise<st
   let suffix = 1;
   while (true) {
     if (!isReservedSystemMailboxUsername(candidate)) {
-      const existing = await prisma.user.findUnique({ where: { username: candidate } });
+      const existing = await db.user.findUnique({ where: { username: candidate } });
       if (!existing) return candidate;
     }
     suffix += 1;
     candidate = `${base}${suffix}`.slice(0, 30);
   }
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
+}
+
+function isTransactionConflictError(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2034';
 }
 
 async function waitForStalwartJmap(timeoutMs = 45000): Promise<boolean> {
@@ -84,10 +171,9 @@ async function checkStalwartHealth(): Promise<boolean> {
   }
 }
 
-function teardownStalwart(mailDir: string): void {
-  console.warn('[admin/install-mail] Stalwart health check failed; tearing down and recreating container');
-  execSync('cd /opt/bridgesllm/stalwart && docker compose down -v 2>/dev/null; docker rm -f stalwart-mail 2>/dev/null; rm -rf /opt/bridgesllm/stalwart/data', { timeout: 120000, shell: '/bin/bash' });
-  fs.mkdirSync(path.join(mailDir, 'data'), { recursive: true });
+function recycleStalwartForRecovery(mailDir: string): void {
+  console.warn('[admin/install-mail] Recycling the Stalwart container while preserving stored mail');
+  recycleStalwartContainerPreservingData(mailDir);
 }
 
 /**
@@ -134,19 +220,44 @@ async function ensureStalwartDomain(domain: string, adminPass: string): Promise<
 }
 
 async function createStalwartAccount(domain: string, adminPass: string, name: string, pass: string): Promise<{ ok: boolean; error?: string; body?: any }> {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Basic ${Buffer.from(`admin:${adminPass}`).toString('base64')}`,
+  };
   try {
     const response = await fetch('http://127.0.0.1:8580/api/principal', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Basic ${Buffer.from(`admin:${adminPass}`).toString('base64')}`,
-      },
+      headers,
       body: JSON.stringify({ type: 'individual', name, secrets: [pass], emails: [`${name}@${domain}`], roles: ['user'], description: name === 'noreply' ? 'System Alerts' : name === 'support' ? 'Support' : name, quota: 1024 * 1024 * 1024 }),
       signal: AbortSignal.timeout(10000),
     });
     const raw = await response.text();
     let body: any = null;
     try { body = raw ? JSON.parse(raw) : null; } catch { body = raw; }
+
+    const alreadyExists = response.status === 409
+      || (body && typeof body === 'object' && body.error === 'fieldAlreadyExists');
+    if (alreadyExists) {
+      // Setup must be idempotent: a pre-existing account (from an earlier
+      // install or interrupted setup) is converged to the new credentials
+      // and address instead of failing the whole mail installation.
+      const patch = await fetch(`http://127.0.0.1:8580/api/principal/${encodeURIComponent(name)}`, {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify([
+          { action: 'set', field: 'secrets', value: [pass] },
+          { action: 'set', field: 'emails', value: [`${name}@${domain}`] },
+        ]),
+        signal: AbortSignal.timeout(10000),
+      });
+      const patchRaw = await patch.text();
+      let patchBody: any = null;
+      try { patchBody = patchRaw ? JSON.parse(patchRaw) : null; } catch { patchBody = patchRaw; }
+      if (!patch.ok || (patchBody && typeof patchBody === 'object' && patchBody.error)) {
+        return { ok: false, error: `existing account update failed: ${patchBody && typeof patchBody === 'object' && patchBody.error ? String(patchBody.error) : `HTTP ${patch.status}`}`, body: patchBody };
+      }
+      return { ok: true, body: patchBody };
+    }
 
     if (!response.ok) {
       return { ok: false, error: typeof body === 'object' && body?.error ? String(body.error) : raw || `HTTP ${response.status}`, body };
@@ -240,6 +351,7 @@ router.get('/users', async (req: Request, res: Response, next: NextFunction) => 
       total,
       page,
       pages: Math.ceil(total / limit),
+      authorizationSafety: PROJECT_RUNTIME_AUTHORIZATION_POLICY,
     });
   } catch (error) {
     next(error);
@@ -286,9 +398,10 @@ const updateUserSchema = z.object({
   accountStatus: z.enum(['ACTIVE', 'PENDING', 'DISABLED', 'BANNED']).optional(),
   sandboxEnabled: z.boolean().optional(),
   isActive: z.boolean().optional(),
-  username: z.string().min(2).max(100).optional(),
+  username: z.string().transform(canonicalUsername).pipe(z.string().min(2).max(100)).optional(),
   firstName: z.string().max(100).optional().nullable(),
   lastName: z.string().max(100).optional().nullable(),
+  confirmation: z.string().max(200).optional(),
 }).strict();
 
 /**
@@ -298,22 +411,15 @@ const updateUserSchema = z.object({
 router.patch('/users/:id', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
-    const data = updateUserSchema.parse(req.body);
+    const parsed = updateUserSchema.parse(req.body);
+    const { confirmation, ...data } = parsed;
 
     if (data.username && isReservedSystemMailboxUsername(data.username)) {
       throw new AppError(400, `Username '${data.username}' is reserved for system use. Choose a different username.`);
     }
 
-    // Check user exists
-    const existing = await prisma.user.findUnique({ where: { id } });
-    if (!existing) throw new AppError(404, 'User not found');
-
     if (id === req.user!.userId && data.role) {
       throw new AppError(400, 'Cannot change your own owner role directly');
-    }
-
-    if (isOwnerRole(existing.role) && (data.role || data.accountStatus || data.isActive === false)) {
-      throw new AppError(400, 'Cannot demote/disable owner from this endpoint');
     }
 
     const normalizedData: Record<string, unknown> = { ...data };
@@ -324,27 +430,20 @@ router.patch('/users/:id', requireOwner, async (req: Request, res: Response, nex
       normalizedData.isActive = data.accountStatus === ACTIVE_STATUS;
     }
 
-    const user = await prisma.user.update({
-      where: { id },
-      data: normalizedData as any,
-      select: {
-        id: true,
-        email: true,
-        username: true,
-        firstName: true,
-        lastName: true,
-        role: true,
-        accountStatus: true,
-        isActive: true,
-        sandboxEnabled: true,
-        lastLoginAt: true,
-        createdAt: true,
-        avatarPath: true,
-      },
-    } as any);
+    const committed = await projectAuthorizationTransitionCoordinator.updateUserAuthorization({
+      initiatedByUserId: req.user!.userId,
+      targetUserId: id,
+      update: normalizedData as ProjectAuthorizationUserUpdate,
+      confirmation,
+    });
+    const { user, existing } = committed;
 
     // Provision mailbox if username changed, but keep prior mailboxes accessible
-    if (normalizedData.username && normalizedData.username !== existing.username) {
+    if (
+      normalizedData.username
+      && normalizedData.username !== existing.username
+      && getPortalFeatureCapabilities().mail.available
+    ) {
       try {
         await provisionUserMailbox(String(normalizedData.username), id, { makePrimary: true });
         console.log(`[admin] Provisioned mailbox for user ${String(normalizedData.username)}`);
@@ -368,7 +467,21 @@ router.patch('/users/:id', requireOwner, async (req: Request, res: Response, nex
 
     res.json(user);
   } catch (error) {
-    next(error);
+    if (error instanceof ProjectAuthorizationTransitionError) {
+      res.status(error.statusCode).json({
+        error: error.message,
+        code: error.code,
+        retryable: error.retryable,
+      });
+      return;
+    }
+    next(
+      isUniqueConstraintError(error)
+        ? new AppError(409, 'Username already in use')
+        : isTransactionConflictError(error)
+          ? new AppError(409, 'User authorization changed concurrently. Retry the update.')
+          : error,
+    );
   }
 });
 
@@ -388,33 +501,15 @@ router.delete('/users/:id', requireOwner, async (req: Request, res: Response, ne
     if (!existing) throw new AppError(404, 'User not found');
     if (isOwnerRole(existing.role)) throw new AppError(400, 'Cannot delete owner account');
 
-    const cleanup = await cleanupUserBeforeDelete(id);
-
-    // Delete sessions first, then user row. Other dependent rows are expected to
-    // be gone via cleanup or DB cascade, but we keep this transactional tail small.
-    await prisma.$transaction(async (tx) => {
-      await tx.session.deleteMany({ where: { userId: id } });
-      await tx.user.delete({ where: { id } });
+    // Portal 4 project state is keyed by both workspace owner and actor. Until
+    // identity-aware retirement can remove every UUID-derived local/external
+    // artifact, cascading a User is unsafe even when they own no Project.
+    // The ProjectIdentity ownership FK is also RESTRICTed as defense in depth.
+    res.status(409).json({
+      error: ADMIN_USER_DELETION_RETIREMENT_MESSAGE,
+      code: ADMIN_USER_DELETION_RETIREMENT_CODE,
+      retryable: false,
     });
-
-    // Log deletion
-    await prisma.activityLog.create({
-      data: {
-        userId: req.user!.userId,
-        action: 'USER_DELETED',
-        resource: 'admin',
-        severity: 'WARNING',
-        translatedMessage: `Admin deleted user: ${existing.email}`,
-        metadata: {
-          deletedUserId: id,
-          deletedEmail: existing.email,
-          cleanupSummary: cleanup.summary,
-          cleanupFailures: cleanup.failures,
-        },
-      },
-    }).catch(() => {});
-
-    res.json({ success: true, cleanup });
   } catch (error) {
     next(error);
   }
@@ -427,21 +522,10 @@ router.delete('/users/:id', requireOwner, async (req: Request, res: Response, ne
 router.post('/users/:id/transfer-ownership', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const targetId = req.params.id;
-    if (targetId === req.user!.userId) throw new AppError(400, 'You already own this account');
-
-    const target = await prisma.user.findUnique({ where: { id: targetId } } as any);
-    if (!target) throw new AppError(404, 'Target user not found');
-    if (!canAccessPortal((target as any).accountStatus, target.isActive)) {
-      throw new AppError(400, 'Target user must be active to become owner');
-    }
-    if (isOwnerRole(target.role)) throw new AppError(400, 'Target user is already owner');
-
-    await prisma.$transaction(async (tx) => {
-      await tx.user.update({ where: { id: req.user!.userId }, data: { role: 'SUB_ADMIN' as any } });
-      await tx.user.update({
-        where: { id: targetId },
-        data: { role: 'OWNER' as any, accountStatus: 'ACTIVE', isActive: true } as any,
-      } as any);
+    const transfer = await projectAuthorizationTransitionCoordinator.transferOwnership({
+      sourceOwnerUserId: req.user!.userId,
+      targetUserId: targetId,
+      confirmation: req.body?.confirmation,
     });
 
     await prisma.activityLog.create({
@@ -451,70 +535,142 @@ router.post('/users/:id/transfer-ownership', requireOwner, async (req: Request, 
         resource: 'admin',
         resourceId: targetId,
         severity: 'WARNING',
-        translatedMessage: `Ownership transferred to ${target.email}`,
-        metadata: { fromUserId: req.user!.userId, toUserId: targetId, toEmail: target.email },
+        translatedMessage: `Ownership transferred to ${transfer.targetEmail}`,
+        metadata: { fromUserId: req.user!.userId, toUserId: targetId, toEmail: transfer.targetEmail },
       },
     }).catch(() => {});
 
     res.json({ success: true });
   } catch (error) {
-    next(error);
+    if (error instanceof ProjectAuthorizationTransitionError) {
+      res.status(error.statusCode).json({
+        error: error.message,
+        code: error.code,
+        retryable: error.retryable,
+      });
+      return;
+    }
+    next(
+      isTransactionConflictError(error)
+        ? new AppError(409, 'Portal ownership changed concurrently. Reload and retry.')
+        : error,
+    );
   }
 });
 
 
 router.get('/update-status', async (_req: Request, res: Response, next: NextFunction) => {
   try {
-    res.json(await getUpdateStatus());
+    const [status, preparation] = await Promise.all([
+      getUpdateStatus(),
+      getPortalUpdatePreparation(),
+    ]);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ ...status, preparation });
   } catch (error) {
     next(error);
   }
 });
 
-router.post('/check-updates', requireOwner, async (_req: Request, res: Response, next: NextFunction) => {
+router.post('/check-updates', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { checkForUpdates } = await import('../services/telemetryService');
-    res.json(await checkForUpdates());
+    const { checkForUpdatesWithCooldown } = await import('../services/telemetryService');
+    const force = req.body?.force === true;
+    const [status, preparation] = await Promise.all([
+      checkForUpdatesWithCooldown(force),
+      getPortalUpdatePreparation(),
+    ]);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ ...status, preparation });
   } catch (error) {
     next(error);
   }
 });
 
-router.post('/self-update', requireOwner, async (_req: Request, res: Response, next: NextFunction) => {
+router.post('/self-update', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const domain = await resolveSelfUpdateDomain();
-    if (!domain) throw new AppError(400, 'No domain configured for self-update.');
+    const request = req.body || {};
+    let preparation = await getPortalUpdatePreparation();
+    let admission = admitPortalUpdate(preparation, request);
+    if (!admission.ok) {
+      res.status(admission.status).json({
+        error: admission.error,
+        code: admission.code,
+        preparation,
+      });
+      return;
+    }
 
-    // SECURITY: Validate domain format to prevent shell injection (CRIT-1 from audit)
-    const domainRegex = /^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)+$/;
-    if (!domainRegex.test(domain)) {
-      throw new AppError(400, 'Invalid domain format — cannot run self-update.');
+    const updateStatus = await getUpdateStatus();
+    const releaseAdmission = admitPortalUpdateRelease(updateStatus, request);
+    if (!releaseAdmission.ok) {
+      res.status(releaseAdmission.status).json({
+        error: releaseAdmission.error,
+        code: releaseAdmission.code,
+        preparation,
+      });
+      return;
+    }
+
+    if (admission.backupDecision === 'use-current') {
+      // Metadata age alone is not recovery proof. Re-run the same bounded
+      // recovery-contract verifier used by host maintenance immediately before
+      // admitting the update, then re-read active backup state after it ends.
+      preparation = await getPortalUpdatePreparation(Date.now(), { verifyFreshArchive: true });
+      admission = admitPortalUpdate(preparation, request);
+      if (!admission.ok) {
+        res.status(admission.status).json({
+          error: admission.error,
+          code: admission.code,
+          preparation,
+        });
+        return;
+      }
+    }
+
+    // Domain-origin installs relaunch the updater with their attested domain.
+    // Tailnet/local origins launch plain --update: the installer reloads the
+    // attested installed-origin state and must never be forced into domain
+    // mode by the Dashboard.
+    const originMode = configuredPortalOriginMode(process.env);
+    let domain = '';
+    if (originMode === 'domain') {
+      domain = await resolveSelfUpdateDomain();
+      if (!domain) throw new AppError(400, 'No domain configured for self-update.');
+
+      // SECURITY: Validate domain format to prevent shell injection (CRIT-1 from audit)
+      const domainRegex = /^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)+$/;
+      if (!domainRegex.test(domain)) {
+        throw new AppError(400, 'Invalid domain format — cannot run self-update.');
+      }
     }
 
     const logsDir = '/opt/bridgesllm/logs';
     fs.mkdirSync(logsDir, { recursive: true });
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const logFile = path.join(logsDir, `self-update-${timestamp}.log`);
-    const logStream = fs.createWriteStream(logFile, { flags: 'a' });
-    logStream.write(`[${new Date().toISOString()}] Starting self-update for ${domain}\n`);
+    fs.appendFileSync(logFile, [
+      `[${new Date().toISOString()}] Starting self-update (${originMode} origin)${domain ? ` for ${domain}` : ''} at reviewed release ${releaseAdmission.expectedVersion}`,
+      `[${new Date().toISOString()}] Backup decision: ${admission.backupDecision}; readiness: ${preparation.backup.state}`,
+      '',
+    ].join('\n'), { encoding: 'utf8', mode: 0o600, flag: 'a' });
 
-    // The installer runs `systemctl stop bridgesllm-product` which kills
-    // everything in the service's cgroup — setsid/nohup/detached don't escape it.
-    // systemd-run launches in its own transient scope, completely outside our cgroup.
-    logStream.end(); // close our handle — the shell will append directly
-    const escapedDomain = domain.replace(/'/g, "'\\''");
-    const child = spawn('systemd-run', [
-      '--scope', '--quiet',
-      '/bin/bash', '-c',
-      `curl -fsSL https://bridgesllm.ai/install.sh | bash -s -- --update --domain '${escapedDomain}' >> ${logFile} 2>&1`,
-    ], {
-      detached: true,
-      stdio: 'ignore',
+    // The updater stops this service, so register it as a fixed-name transient
+    // service in a separate cgroup. The fixed unit name is also the durable
+    // host-side single-flight gate for concurrent tabs and request retries.
+    await launchPortalSelfUpdate({
+      originMode,
+      domain,
+      logFile,
+      expectedVersion: releaseAdmission.expectedVersion,
     });
-    child.unref();
 
     res.json({ ok: true, logFile });
   } catch (error) {
+    if (error instanceof PortalSelfUpdateLaunchError) {
+      res.status(error.statusCode).json({ error: error.message, code: error.code });
+      return;
+    }
     next(error);
   }
 });
@@ -591,91 +747,220 @@ router.get('/registration-requests', requireOwner, async (req: Request, res: Res
 router.post('/registration-requests/:id/approve', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
+    const approvedAt = new Date();
+    const mailCapability = getPortalFeatureCapabilities().mail;
 
-    const request = await prisma.registrationRequest.findUnique({ where: { id } });
-    if (!request) throw new AppError(404, 'Registration request not found');
-    if (request.status !== 'PENDING') {
-      throw new AppError(400, `Request already ${request.status.toLowerCase()}`);
+    if (!mailCapability.available) {
+      const privateModeRequest = await prisma.registrationRequest.findUnique({
+        where: { id },
+        select: { passwordHash: true },
+      });
+      if (!privateModeRequest) {
+        throw new AppError(404, 'Registration request not found');
+      }
+      if (!privateModeRequest.passwordHash) {
+        sendPrivateRegistrationPasswordRequired(res);
+        return;
+      }
     }
 
-    const approvedAt = new Date();
-    let approvedUserId: string;
-    let approvedUsername: string;
+    const sandboxEnabled = await getSandboxDefaultEnabled();
+    const fallbackPasswordHash = await hashPassword(crypto.randomUUID());
+    // Resolve settings before the irreversible approval transaction. A
+    // post-commit settings failure must never look like an approval failure
+    // that the owner should retry.
+    const approvalNotificationEnabled = mailCapability.available
+      ? await isNotificationEnabled('notifications.userApproved')
+      : false;
 
-    // Check if a user with this email already exists
-    const existingUser = await prisma.user.findUnique({ where: { email: request.email } });
-    if (existingUser) {
-      if ((existingUser as any).accountStatus !== 'PENDING') {
-        throw new AppError(409, 'A non-pending user with this email already exists');
+    const approved = await prisma.$transaction(async (tx) => {
+      await assertNoProjectAuthorizationTransitionActive(tx);
+      const request = await tx.registrationRequest.findUnique({ where: { id } });
+      if (!request) throw new AppError(404, 'Registration request not found');
+      // Re-attest the private-mode credential invariant inside the approval
+      // transaction so a raced or externally changed request can never fall
+      // through to an unknown random password.
+      if (!mailCapability.available && !request.passwordHash) {
+        throw new RegistrationPrivatePasswordRequiredError();
       }
 
-      const updatedUser = await prisma.user.update({
-        where: { id: existingUser.id },
+      const claimed = await tx.registrationRequest.updateMany({
+        where: { id, status: 'PENDING' },
         data: {
-          role: 'USER',
-          accountStatus: 'ACTIVE',
-          isActive: true,
-          approvedAt,
-          approvedBy: req.user!.userId,
-          sandboxEnabled: await getSandboxDefaultEnabled(),
+          status: 'APPROVED',
+          reviewedAt: approvedAt,
+          reviewedBy: req.user!.userId,
         },
-      } as any);
-      approvedUserId = updatedUser.id;
-      approvedUsername = updatedUser.username;
-    } else {
-      const approvedUsernameCandidate = await createUniqueUsername(request.name, request.email);
-      const createdUser = await prisma.user.create({
-        data: {
-          email: request.email,
-          username: approvedUsernameCandidate,
-          passwordHash: request.passwordHash || await hashPassword(crypto.randomUUID()),
-          role: 'USER',
-          accountStatus: 'ACTIVE',
-          isActive: true,
-          approvedAt,
-          approvedBy: req.user!.userId,
-          sandboxEnabled: await getSandboxDefaultEnabled(),
-        },
-      } as any);
-      approvedUserId = createdUser.id;
-      approvedUsername = createdUser.username;
-    }
+      });
+      if (claimed.count !== 1) {
+        throw new AppError(409, 'Registration request was already reviewed');
+      }
 
-    try {
-      await provisionUserMailbox(approvedUsername, approvedUserId, { makePrimary: true });
-    } catch (err) {
-      console.error('[admin] Failed to auto-provision mailbox on registration approval:', err);
-    }
-
-    // Update request status
-    await prisma.registrationRequest.update({
-      where: { id },
-      data: {
-        status: 'APPROVED',
-        reviewedAt: new Date(),
-        reviewedBy: req.user!.userId,
-      },
-    });
-
-    if (await isNotificationEnabled('notifications.userApproved')) {
-      try {
-        await prisma.passwordResetToken.deleteMany({
-          where: { userId: approvedUserId, usedAt: null },
-        });
-
-        const rawToken = crypto.randomBytes(32).toString('hex');
-        const tokenHash = await hashPassword(rawToken);
-        await prisma.passwordResetToken.create({
+      const email = canonicalEmail(request.email);
+      const existingUser = await tx.user.findUnique({ where: { email } });
+      if (existingUser) {
+        if ((existingUser as any).accountStatus !== 'PENDING') {
+          throw new AppError(409, 'A non-pending user with this email already exists');
+        }
+        const updatedUser = await tx.user.update({
+          where: { id: existingUser.id },
           data: {
-            userId: approvedUserId,
-            token: tokenHash,
-            expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+            role: 'USER',
+            accountStatus: 'ACTIVE',
+            isActive: true,
+            approvedAt,
+            approvedBy: req.user!.userId,
+            sandboxEnabled,
+            authorizationVersion: { increment: 1 },
           },
+        } as any);
+        // A supported PENDING transition preserves dormant authentication
+        // artifacts. Reactivation must not make an old refresh session,
+        // challenge, verification code, or reset link authoritative again.
+        await tx.session.deleteMany({ where: { userId: updatedUser.id } });
+        await tx.twoFactorChallenge.deleteMany({ where: { userId: updatedUser.id } });
+        await tx.emailVerificationCode.deleteMany({ where: { userId: updatedUser.id } });
+        await tx.passwordResetToken.updateMany({
+          where: { userId: updatedUser.id, usedAt: null },
+          data: { usedAt: approvedAt },
+        });
+        return {
+          request,
+          userId: updatedUser.id,
+          username: updatedUser.username,
+          email,
+          reactivatedAuthorizationVersion: Number(updatedUser.authorizationVersion),
+        };
+      }
+
+      const username = await createUniqueUsername(request.name, email, tx);
+      const createdUser = await tx.user.create({
+        data: {
+          email,
+          username,
+          passwordHash: request.passwordHash || fallbackPasswordHash,
+          role: 'USER',
+          accountStatus: 'ACTIVE',
+          isActive: true,
+          approvedAt,
+          approvedBy: req.user!.userId,
+          sandboxEnabled,
+        },
+      } as any);
+      return {
+        request,
+        userId: createdUser.id,
+        username: createdUser.username,
+        email,
+        reactivatedAuthorizationVersion: null,
+      };
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+    const {
+      request,
+      userId: approvedUserId,
+      username: approvedUsername,
+      reactivatedAuthorizationVersion,
+    } = approved;
+
+    if (reactivatedAuthorizationVersion !== null) {
+      publishAuthorizationChanged({
+        type: 'authorization_changed',
+        userId: approvedUserId,
+        authorizationVersion: reactivatedAuthorizationVersion,
+        reasons: ['account_status', 'active_status'],
+      });
+    }
+
+    if (mailCapability.available) {
+      try {
+        await provisionUserMailbox(approvedUsername, approvedUserId, { makePrimary: true });
+      } catch (err) {
+        console.error('[admin] Failed to auto-provision mailbox on registration approval:', err);
+      }
+    }
+
+    let notification: RegistrationApprovalNotification = mailCapability.available
+      ? {
+          state: 'disabled',
+          delivered: false,
+          manualNotificationRequired: false,
+          reason: null,
+        }
+      : {
+          state: 'manual_required',
+          delivered: false,
+          manualNotificationRequired: true,
+          reason: mailCapability.reason,
+        };
+
+    // A private-origin Portal cannot deliver approval mail. Do not create a
+    // bearer reset token that nobody can receive; report the manual handoff
+    // requirement explicitly so the frontend can guide the owner.
+    if (mailCapability.available && approvalNotificationEnabled) {
+      let resetToken: { id: string } | null = null;
+      try {
+        const rawToken = crypto.randomBytes(32).toString('hex');
+        const tokenHash = digestAuthToken('password-reset', rawToken);
+        resetToken = await prisma.$transaction(async (tx) => {
+          await assertNoProjectAuthorizationTransitionActive(tx);
+          return tx.passwordResetToken.create({
+            data: {
+              userId: approvedUserId,
+              token: tokenHash,
+              expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+            },
+          });
+        }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+        const resetUrl = buildPortalUrl(buildPasswordResetPath(rawToken), req);
+        await sendPasswordResetEmail({ email: request.email }, resetUrl);
+
+        // Preserve any previously issued link until delivery of the replacement
+        // has succeeded. After that, converge to exactly the delivered token.
+        await prisma.passwordResetToken.deleteMany({
+          where: {
+            userId: approvedUserId,
+            usedAt: null,
+            id: { not: resetToken.id },
+          },
+        }).catch((err) => {
+          console.error('[admin] Failed to retire older approval reset tokens:', err);
         });
 
-        const resetUrl = buildPortalUrl(`/reset-password?token=${encodeURIComponent(rawToken)}`, req);
-        await sendPasswordResetEmail({ email: request.email }, resetUrl);
+        notification = {
+          state: 'sent',
+          delivered: true,
+          manualNotificationRequired: false,
+          reason: null,
+        };
       } catch (err) {
+        if (resetToken) {
+          let cleanupVerified = true;
+          try {
+            // Delivery failed: remove only the newly undelivered bearer. Older
+            // reset links remain intact because they were not retired yet.
+            await prisma.passwordResetToken.delete({ where: { id: resetToken.id } });
+          } catch (cleanupError) {
+            cleanupVerified = false;
+            console.error('[admin] Failed to remove undelivered approval reset token:', cleanupError);
+          }
+          notification = {
+            state: 'failed',
+            delivered: false,
+            manualNotificationRequired: true,
+            reason: cleanupVerified
+              ? 'The approval email could not be delivered. Notify the user directly.'
+              : 'The approval email could not be delivered, and reset-link cleanup could not be verified. Notify the user directly and review server logs.',
+          };
+        } else {
+          notification = {
+            state: 'failed',
+            delivered: false,
+            manualNotificationRequired: true,
+            reason: 'The approval email could not be prepared. Notify the user directly.',
+          };
+        }
         console.error('[admin] Failed to send approval email:', err);
       }
     }
@@ -688,13 +973,26 @@ router.post('/registration-requests/:id/approve', requireOwner, async (req: Requ
         resource: 'admin',
         severity: 'INFO',
         translatedMessage: `Approved registration request from ${request.email}`,
-        metadata: { requestId: id, email: request.email, approvedUserId, approvedUsername },
+        metadata: {
+          requestId: id,
+          email: request.email,
+          approvedUserId,
+          approvedUsername,
+          notificationState: notification.state,
+          manualNotificationRequired: notification.manualNotificationRequired,
+        },
       },
     }).catch(() => {});
 
-    res.json({ success: true });
+    res.json({ success: true, notification });
   } catch (error) {
-    next(error);
+    if (error instanceof RegistrationPrivatePasswordRequiredError) {
+      sendPrivateRegistrationPasswordRequired(res);
+      return;
+    }
+    next(isUniqueConstraintError(error) || isTransactionConflictError(error)
+      ? new AppError(409, 'Registration approval conflicted with another identity or review operation')
+      : error);
   }
 });
 
@@ -709,18 +1007,16 @@ router.post('/registration-requests/:id/deny', requireOwner, async (req: Request
 
     const request = await prisma.registrationRequest.findUnique({ where: { id } });
     if (!request) throw new AppError(404, 'Registration request not found');
-    if (request.status !== 'PENDING') {
-      throw new AppError(400, `Request already ${request.status.toLowerCase()}`);
-    }
 
-    await prisma.registrationRequest.update({
-      where: { id },
+    const denied = await prisma.registrationRequest.updateMany({
+      where: { id, status: 'PENDING' },
       data: {
         status: 'DENIED',
         reviewedAt: new Date(),
         reviewedBy: req.user!.userId,
       },
     });
+    if (denied.count !== 1) throw new AppError(409, 'Registration request was already reviewed');
 
     // Log denial
     await prisma.activityLog.create({
@@ -751,7 +1047,12 @@ router.get('/settings', requireOwner, async (_req: Request, res: Response, next:
     const settings = await prisma.systemSetting.findMany();
     const result: Record<string, string> = {};
     for (const s of settings) {
-      result[s.key] = s.value;
+      if (isAdminEditableSettingKey(s.key) && !ADMIN_SETTINGS_SECRET_KEYS.has(s.key)) {
+        result[s.key] = s.value;
+      }
+      if (s.key === 'registrationMode' && !result['security.registrationMode']) {
+        result['security.registrationMode'] = s.value;
+      }
     }
     res.json(result);
   } catch (error) {
@@ -759,7 +1060,6 @@ router.get('/settings', requireOwner, async (_req: Request, res: Response, next:
   }
 });
 
-const settingsSchema = z.record(z.string(), z.string());
 const searchVisibilitySchema = z.object({
   visibility: z.enum(['visible', 'hidden']),
 });
@@ -770,25 +1070,82 @@ const searchVisibilitySchema = z.object({
  */
 router.put('/settings', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const data = settingsSchema.parse(req.body);
-    const normalizedData = { ...data };
+    const normalizedData = parseAdminSettingsPatch(req.body);
+    let preparedBackupRoot: string | null = null;
+    let previousBackupRoot: string | null = null;
 
-    if (normalizedData['security.registrationMode']) {
-      normalizedData['registrationMode'] = normalizedData['security.registrationMode'];
-    } else if (normalizedData['registrationMode']) {
-      normalizedData['security.registrationMode'] = normalizedData['registrationMode'];
+    if (Object.prototype.hasOwnProperty.call(normalizedData, 'system.backupPath')) {
+      try {
+        previousBackupRoot = await getConfiguredBackupRoot({ syncFile: true });
+        preparedBackupRoot = ensureBackupLayout(normalizedData['system.backupPath']);
+      } catch (error: any) {
+        throw new AppError(400, error?.message || 'Backup path is invalid');
+      }
+      normalizedData['system.backupPath'] = preparedBackupRoot;
     }
 
-    // Upsert each setting
-    await Promise.all(
-      Object.entries(normalizedData).map(([key, value]) =>
-        prisma.systemSetting.upsert({
-          where: { key },
-          update: { value },
-          create: { key, value },
-        })
-      )
-    );
+    if (Object.prototype.hasOwnProperty.call(normalizedData, 'smtp.password')) {
+      normalizedData['smtp.password'] = encryptPlaintextSecret(normalizedData['smtp.password']);
+    }
+
+    const commitSettingsPatch = async () => {
+      // Keep the database patch atomic. The backup runner reads its storage
+      // root from a root-owned file, so update that file inside the transaction
+      // and compensate it if the transaction or commit fails.
+      try {
+        await prisma.$transaction(async (transaction) => {
+          for (const [key, value] of Object.entries(normalizedData)) {
+            await transaction.systemSetting.upsert({
+              where: { key },
+              update: { value },
+              create: { key, value },
+            });
+          }
+          if (preparedBackupRoot) writeBackupConfiguration(preparedBackupRoot);
+        });
+      } catch (error) {
+        if (preparedBackupRoot && previousBackupRoot) {
+          try {
+            writeBackupConfiguration(previousBackupRoot);
+          } catch (rollbackError) {
+            console.error('Failed to restore the prior backup path after a settings transaction failure:', rollbackError);
+          }
+        }
+        throw error;
+      }
+    };
+    if (Object.prototype.hasOwnProperty.call(normalizedData, 'ollama.localEnabled')) {
+      let nativeAuthorityOwnsLocalPolicyFence = false;
+      await withOllamaAuthorityMutationFence(async () => {
+        const nativeAuthority = await prisma.nativeOllamaBackendBinding.findFirst({
+          where: {
+            purposeId: 'PRIMARY',
+            state: {
+              in: [
+                NativeOllamaBackendBindingState.ACTIVE,
+                NativeOllamaBackendBindingState.DISCONNECTED,
+              ],
+            },
+          },
+          select: { id: true },
+        });
+        if (nativeAuthority) {
+          nativeAuthorityOwnsLocalPolicyFence = true;
+          return;
+        }
+        await commitSettingsPatch();
+      });
+      if (nativeAuthorityOwnsLocalPolicyFence) {
+        res.status(409).json({
+          code: 'NATIVE_OLLAMA_LOCAL_POLICY_LOCKED',
+          error:
+            'Local Ollama policy cannot change while a native Remote GPU authority exists. Remove the Remote GPU first.',
+        });
+        return;
+      }
+    } else {
+      await commitSettingsPatch();
+    }
 
     // Log settings change
     await prisma.activityLog.create({
@@ -806,10 +1163,22 @@ router.put('/settings', requireOwner, async (req: Request, res: Response, next: 
     const settings = await prisma.systemSetting.findMany();
     const result: Record<string, string> = {};
     for (const s of settings) {
-      result[s.key] = s.value;
+      if (isAdminEditableSettingKey(s.key) && !ADMIN_SETTINGS_SECRET_KEYS.has(s.key)) {
+        result[s.key] = s.value;
+      }
+      if (s.key === 'registrationMode' && !result['security.registrationMode']) {
+        result['security.registrationMode'] = s.value;
+      }
     }
     res.json(result);
   } catch (error) {
+    if (error instanceof OllamaAuthorityBarrierBusyError) {
+      res.status(error.statusCode).json({
+        code: error.code,
+        error: error.message,
+      });
+      return;
+    }
     next(error);
   }
 });
@@ -856,6 +1225,11 @@ router.put('/search-visibility', requireOwner, async (req: Request, res: Respons
  */
 router.post('/settings/test-email', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const unavailable = portalFeatureUnavailableResponse('mail');
+    if (unavailable) {
+      res.status(409).json(unavailable);
+      return;
+    }
     const mailDomain = process.env.MAIL_DOMAIN || 'localhost';
     const noreplyEmail = `noreply@${mailDomain}`;
     const adminUser = await prisma.user.findUnique({
@@ -892,7 +1266,14 @@ router.post('/settings/test-email', requireOwner, async (req: Request, res: Resp
 
 
 const uploadImage = createImageUpload('image');
-const AGENT_PROVIDERS = ['OPENCLAW', 'CLAUDE_CODE', 'CODEX', 'AGENT_ZERO', 'GEMINI', 'OLLAMA'] as const;
+const AGENT_PROVIDERS = ['OPENCLAW', 'CLAUDE_CODE', 'CODEX', 'GROK', 'AGENT_ZERO', 'GEMINI', 'OLLAMA'] as const;
+
+function sendImageUploadFailure(res: Response, error: unknown): boolean {
+  const failure = classifyImageUploadFailure(error);
+  if (!failure) return false;
+  res.status(failure.statusCode).json(failure);
+  return true;
+}
 
 router.post('/appearance/logo', requireOwner, uploadImage, async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -902,7 +1283,6 @@ router.post('/appearance/logo', requireOwner, uploadImage, async (req: Request, 
     const basename = `portal-logo-${Date.now()}`;
     const { ext } = await processImageToTarget(req.file.path, req.file.mimetype, path.join(BRANDING_DIR, basename), cropParams, { staticSize: 512, gifSize: 256 });
     cleanupBasenamePrefixVariants(BRANDING_DIR, 'portal-logo', `${basename}${ext}`);
-    cleanupFile(req.file.path);
 
     const logoUrl = `/static-assets/branding/${basename}${ext}`;
     await prisma.systemSetting.upsert({
@@ -913,7 +1293,10 @@ router.post('/appearance/logo', requireOwner, uploadImage, async (req: Request, 
 
     return res.json({ success: true, logoUrl });
   } catch (error) {
+    if (sendImageUploadFailure(res, error)) return;
     return next(error);
+  } finally {
+    cleanupFile(req.file?.path);
   }
 });
 
@@ -945,7 +1328,6 @@ router.post('/appearance/agent-avatar/:provider', requireOwner, uploadImage, asy
     const basename = `agent-${provider}-${Date.now()}`;
     const { ext } = await processImageToTarget(req.file.path, req.file.mimetype, path.join(AVATARS_DIR, basename), cropParams, { staticSize: 256, gifSize: 256 });
     cleanupBasenamePrefixVariants(AVATARS_DIR, `agent-${provider}`, `${basename}${ext}`);
-    cleanupFile(req.file.path);
 
     const avatarUrl = `/static-assets/avatars/${basename}${ext}`;
     const key = `appearance.agentAvatar.${provider}`;
@@ -957,7 +1339,10 @@ router.post('/appearance/agent-avatar/:provider', requireOwner, uploadImage, asy
 
     return res.json({ success: true, avatarUrl, provider });
   } catch (error) {
+    if (sendImageUploadFailure(res, error)) return;
     return next(error);
+  } finally {
+    cleanupFile(req.file?.path);
   }
 });
 
@@ -992,7 +1377,6 @@ router.post('/appearance/sub-agent-avatar/:agentId', requireOwner, uploadImage, 
     const basename = `subagent-${agentId}-${Date.now()}`;
     const { ext } = await processImageToTarget(req.file.path, req.file.mimetype, path.join(AVATARS_DIR, basename), cropParams, { staticSize: 256, gifSize: 256 });
     cleanupBasenamePrefixVariants(AVATARS_DIR, `subagent-${agentId}`, `${basename}${ext}`);
-    cleanupFile(req.file.path);
 
     const avatarUrl = `/static-assets/avatars/${basename}${ext}`;
     const key = `appearance.subAgentAvatar.${agentId}`;
@@ -1004,7 +1388,10 @@ router.post('/appearance/sub-agent-avatar/:agentId', requireOwner, uploadImage, 
 
     return res.json({ success: true, avatarUrl, agentId });
   } catch (error) {
+    if (sendImageUploadFailure(res, error)) return;
     return next(error);
+  } finally {
+    cleanupFile(req.file?.path);
   }
 });
 
@@ -1029,6 +1416,11 @@ router.delete('/appearance/sub-agent-avatar/:agentId', requireOwner, async (req:
  */
 router.get('/email-status', requireOwner, async (_req: Request, res: Response, next: NextFunction) => {
   try {
+    const unavailable = portalFeatureUnavailableResponse('mail');
+    if (unavailable) {
+      res.status(409).json(unavailable);
+      return;
+    }
     const stalwartUrl = process.env.STALWART_URL || 'http://127.0.0.1:8580';
     const stalwartUser = process.env.STALWART_NOREPLY_USER || 'noreply';
     const stalwartPass = process.env.STALWART_NOREPLY_PASS || '';
@@ -1078,6 +1470,11 @@ router.get('/email-status', requireOwner, async (_req: Request, res: Response, n
  */
 router.get('/mailboxes', requireOwner, async (_req: Request, res: Response, next: NextFunction) => {
   try {
+    const unavailable = portalFeatureUnavailableResponse('mail');
+    if (unavailable) {
+      res.status(409).json(unavailable);
+      return;
+    }
     const mailboxes = await getProvisionedMailboxes();
     res.json({ mailboxes });
   } catch (error) {
@@ -1091,10 +1488,25 @@ router.get('/mailboxes', requireOwner, async (_req: Request, res: Response, next
  */
 router.delete('/mailboxes/:username', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const unavailable = portalFeatureUnavailableResponse('mail');
+    if (unavailable) {
+      res.status(409).json(unavailable);
+      return;
+    }
     const { username } = req.params;
     if (!username) throw new AppError(400, 'Username required');
 
-    await deleteUserMailbox(username);
+    const confirmationPhrase = confirmationForMailboxDeletion(username);
+    if (!isTypedConfirmationMatch(confirmationPhrase, req.body?.confirmation)) {
+      throw new AppError(400, `Type ${confirmationPhrase} to permanently remove this mailbox.`);
+    }
+
+    const mailbox = await prisma.mailboxAccount.findUnique({
+      where: { username },
+      select: { userId: true },
+    });
+    if (mailbox) await deleteUserMailboxByUserId(username, mailbox.userId);
+    else await deleteUserMailbox(username);
 
     // Log the action
     await prisma.activityLog.create({
@@ -1125,7 +1537,14 @@ router.get('/coding-tools-status', requireOwner, async (_req: Request, res: Resp
 
 router.post('/install-coding-tool', requireOwner, async (req: Request, res: Response) => {
   try {
-    const toolId = z.object({ toolId: z.string().min(1) }).parse(req.body).toolId;
+    const { toolId, confirmation } = z.object({
+      toolId: z.string().min(1),
+      confirmation: z.string().max(200).optional(),
+    }).parse(req.body);
+    const confirmationPhrase = confirmationForToolInstall(toolId);
+    if (!isTypedConfirmationMatch(confirmationPhrase, confirmation)) {
+      throw new AppError(400, `Type ${confirmationPhrase} to install this host-level coding tool.`);
+    }
     installCodingTool(toolId);
     res.json({ success: true, toolId });
   } catch (err: any) {
@@ -1208,6 +1627,10 @@ router.post('/configure-domain', requireOwner, async (req: Request, res: Respons
  */
 router.post('/install-mail', requireOwner, async (req: Request, res: Response, next: NextFunction): Promise<any> => {
   try {
+    const unavailable = portalFeatureUnavailableResponse('mail');
+    if (unavailable) {
+      return res.status(409).json(unavailable);
+    }
     let domain = (process.env.MAIL_DOMAIN || '').trim();
     if (!domain && req.body?.domain) {
       domain = String(req.body.domain).trim();
@@ -1338,10 +1761,7 @@ rotate = "daily"
 ansi = false
 enable = true
 
-[auth.dkim.sign]
-"0.if" = "is_local_domain(sender_domain)"
-"0.then" = '["rsa-" + sender_domain, "ed25519-" + sender_domain]'
-"1.else" = "false"
+${getStalwartDkimSigningConfig()}
 
 [authentication.fallback-admin]
 user = "admin"
@@ -1374,7 +1794,7 @@ secret = "${adminPass}"
     if (stalwartAlreadyRunning) {
       const healthy = await checkStalwartHealth();
       if (!healthy) {
-        teardownStalwart(mailDir);
+        recycleStalwartForRecovery(mailDir);
         stalwartAlreadyRunning = false;
         recreated = true;
       }
@@ -1389,8 +1809,8 @@ secret = "${adminPass}"
     const domainResult = await ensureStalwartDomain(domain, adminPass);
     if (!domainResult.ok) {
       if (!recreated) {
-        console.warn('[admin/install-mail] Domain creation failed; tearing down Stalwart:', domainResult.error);
-        teardownStalwart(mailDir);
+        console.warn('[admin/install-mail] Domain creation failed; retrying with a data-preserving container recycle:', domainResult.error);
+        recycleStalwartForRecovery(mailDir);
         await startFreshStalwart();
         recreated = true;
         const retryDomain = await ensureStalwartDomain(domain, adminPass);
@@ -1406,8 +1826,8 @@ secret = "${adminPass}"
     let noreplyResult = await createStalwartAccount(domain, adminPass, 'noreply', noreplyPass);
 
     if ((!supportResult.ok || !noreplyResult.ok) && !recreated) {
-      console.warn('[admin/install-mail] Account creation failed; tearing down and recreating Stalwart', supportResult, noreplyResult);
-      teardownStalwart(mailDir);
+      console.warn('[admin/install-mail] Account creation failed; retrying with a data-preserving container recycle', supportResult, noreplyResult);
+      recycleStalwartForRecovery(mailDir);
       await startFreshStalwart();
       recreated = true;
       const retryDomain2 = await ensureStalwartDomain(domain, adminPass);
@@ -1423,14 +1843,12 @@ secret = "${adminPass}"
       return res.status(500).json({ error: `Failed to create Stalwart accounts: ${detail || 'unknown error'}`, supportResult, noreplyResult });
     }
 
-    const keyPath = path.join(mailDir, 'dkim.key');
-    let dkimRecord = 'v=DKIM1; k=rsa; p=YOUR_DKIM_PUBLIC_KEY';
-    try {
-      execSync(`openssl genrsa -out "${keyPath}" 2048 2>/dev/null`, { timeout: 10000 });
-      const pubkey = execSync(`openssl rsa -in "${keyPath}" -pubout -outform DER 2>/dev/null | base64 -w0`, { timeout: 5000, encoding: 'utf-8' }).trim();
-      dkimRecord = `v=DKIM1; k=rsa; p=${pubkey}`;
-      fs.writeFileSync(path.join(mailDir, 'dkim-dns-record.txt'), dkimRecord);
-    } catch {}
+    const dkimRecords = await provisionStalwartDkim({
+      domain,
+      adminPass,
+      mailDir,
+      baseUrl: 'http://127.0.0.1:8580',
+    });
 
     updateEnvFile({
       STALWART_URL: 'http://127.0.0.1:8580',
@@ -1458,7 +1876,19 @@ secret = "${adminPass}"
       });
       for (const user of users) {
         try {
-          await provisionUserMailbox(user.username, user.id, { makePrimary: true });
+          const existing = await prisma.mailboxAccount.findFirst({
+            where: { userId: user.id },
+            select: { username: true },
+          });
+          if (existing) {
+            // The mailbox record already exists; a fresh provision would hit
+            // the username lock. Re-enqueue reconciliation instead — this
+            // also resets tasks that BLOCKED while mail was unconfigured,
+            // now that valid admin credentials exist.
+            await enqueueMailboxReconciliation(existing.username);
+          } else {
+            await provisionUserMailbox(user.username, user.id, { makePrimary: true });
+          }
           reprovisionedMailboxes += 1;
         } catch (err: any) {
           reprovisionErrors.push({ username: user.username, error: err?.message || String(err) });
@@ -1467,6 +1897,9 @@ secret = "${adminPass}"
       if (reprovisionErrors.length > 0) {
         console.warn('[admin/install-mail] Existing mailbox reprovisioning had non-fatal failures:', reprovisionErrors);
       }
+      // Converge re-enqueued mailboxes immediately rather than waiting for
+      // the next periodic drain.
+      await drainMailboxReconciliation({ maxTasks: 50, timeBudgetMs: 30_000 });
     } catch (err: any) {
       console.warn('[admin/install-mail] Existing mailbox reprovisioning skipped:', err?.message || err);
     }
@@ -1480,7 +1913,12 @@ secret = "${adminPass}"
       { type: 'A', name: 'mail', value: publicIp, description: 'Mail server hostname' },
       { type: 'MX', name: '@', value: `mail.${domain}`, priority: 10, description: 'Incoming mail routing' },
       { type: 'TXT', name: '@', value: `v=spf1 mx a ip4:${publicIp} ~all`, description: 'SPF — authorize this server to send email for your domain' },
-      { type: 'TXT', name: 'default._domainkey', value: dkimRecord, description: 'DKIM cryptographic signature' },
+      ...dkimRecords.map(record => ({
+        type: 'TXT',
+        name: record.name,
+        value: record.value,
+        description: `${record.algorithm.toUpperCase()} DKIM cryptographic signature`,
+      })),
       { type: 'TXT', name: '_dmarc', value: `v=DMARC1; p=quarantine; rua=mailto:postmaster@${domain}`, description: 'DMARC policy' },
     ];
 

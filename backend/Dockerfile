@@ -1,36 +1,73 @@
-FROM node:20
+FROM node:22.22.3-bookworm-slim AS backend-builder
+
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    chromium \
-    fonts-liberation \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libcups2 \
-    libdrm2 \
-    libgbm1 \
-    libnss3 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxrandr2 \
+    python3 \
+    make \
+    g++ \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /opt/bridgesllm/portal/backend
+
+COPY backend/package*.json ./
+RUN npm ci
+
+COPY backend/ ./
+# `@prisma/client` installs before the application schema is copied into this
+# hermetic builder, so its postinstall hook cannot generate the typed client.
+# Generate from the exact shipped schema before TypeScript compilation.
+RUN npx prisma generate && npm run build && npm prune --omit=dev
+
+FROM node:22.22.3-alpine AS frontend-builder
+
+ARG VITE_API_URL=/api
+ENV VITE_API_URL=${VITE_API_URL}
+
+WORKDIR /opt/bridgesllm/portal/frontend
+
+COPY frontend/package*.json ./
+RUN npm ci
+
+COPY frontend/ ./
+RUN npm run build
+
+FROM node:22.22.3-bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    chromium \
+    ffmpeg \
+    fonts-liberation \
+    git \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV NODE_ENV=production
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
-WORKDIR /app
+WORKDIR /opt/bridgesllm/portal/backend
 
-COPY package*.json ./
-RUN npm ci
+COPY --from=backend-builder /opt/bridgesllm/portal/backend/package*.json ./
+COPY --from=backend-builder /opt/bridgesllm/portal/backend/node_modules ./node_modules
+COPY --from=backend-builder /opt/bridgesllm/portal/backend/dist ./dist
+COPY --from=backend-builder /opt/bridgesllm/portal/backend/prisma ./prisma
+COPY --from=frontend-builder /opt/bridgesllm/portal/frontend/dist ../frontend/dist
 
-# Git config for auto-commit functionality
+COPY scripts ../scripts
+COPY static ../static
+COPY skills ../skills
+COPY installer ../installer
+
 RUN git config --global user.email "agent@bridgesllm.local" && \
     git config --global user.name "BridgesLLM Agent"
 
-COPY . .
+EXPOSE 3001
 
-RUN npm run build
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || '3001') + '/health').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))"
 
-EXPOSE 3000
-
-CMD ["npm", "start"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "dist/server.js"]

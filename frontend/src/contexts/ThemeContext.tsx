@@ -1,7 +1,8 @@
-import { createContext, useContext, useEffect, useState, useCallback, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useLayoutEffect, useState, useCallback, type ReactNode } from 'react';
 import { usePublicSettings } from '../hooks/usePublicSettings';
 
 type ThemeMode = 'dark' | 'light' | 'system';
+export type VisualEffectsMode = 'auto' | 'full' | 'reduced';
 
 interface ThemeContextValue {
   theme: ThemeMode;
@@ -10,6 +11,9 @@ interface ThemeContextValue {
   setAccentColor: (c: string) => void;
   /** The resolved theme actually applied (never 'system') */
   resolvedTheme: 'dark' | 'light';
+  effectsMode: VisualEffectsMode;
+  setEffectsMode: (mode: VisualEffectsMode) => void;
+  resolvedEffects: 'full' | 'reduced';
 }
 
 const ThemeContext = createContext<ThemeContextValue | null>(null);
@@ -17,18 +21,52 @@ const ThemeContext = createContext<ThemeContextValue | null>(null);
 const DEFAULT_ACCENT = '#6366f1';
 const LS_THEME_KEY = 'theme';
 const LS_ACCENT_KEY = 'accentColor';
+const LS_EFFECTS_KEY = 'visualEffects';
+
+function readStoredValue(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredValue(key: string, value: string): void {
+  try { localStorage.setItem(key, value); } catch { /* non-fatal */ }
+}
+
+function normalizeAccent(value: unknown): string | null {
+  return typeof value === 'string' && /^#[a-f\d]{6}$/i.test(value.trim())
+    ? value.trim().toLowerCase()
+    : null;
+}
+
+function normalizeTheme(value: unknown): ThemeMode | null {
+  return value === 'dark' || value === 'light' || value === 'system' ? value : null;
+}
 
 function getSystemTheme(): 'dark' | 'light' {
   if (typeof window === 'undefined') return 'dark';
-  return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-}
-
-function resolveTheme(mode: ThemeMode): 'dark' | 'light' {
-  return mode === 'system' ? getSystemTheme() : mode;
+  return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
 }
 
 function applyTheme(resolved: 'dark' | 'light') {
   document.documentElement.setAttribute('data-theme', resolved);
+  document.documentElement.style.colorScheme = resolved;
+  document.documentElement.style.backgroundColor = resolved === 'light' ? '#f2f5f9' : '#0A0E27';
+  const themeColor = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+  themeColor?.setAttribute('content', resolved === 'light' ? '#f2f5f9' : '#0A0E27');
+}
+
+function shouldAutoReduceEffects(): boolean {
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') return false;
+  const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
+  const slowDisplay = window.matchMedia?.('(update: slow)').matches === true;
+  const memory = Number((navigator as Navigator & { deviceMemory?: number }).deviceMemory || 0);
+  const cores = Number(navigator.hardwareConcurrency || 0);
+  const constrainedHardware = (memory > 0 && memory <= 4 && (cores === 0 || cores <= 4))
+    || (memory === 0 && cores > 0 && cores <= 2);
+  return prefersReducedMotion || slowDisplay || constrainedHardware;
 }
 
 function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
@@ -79,59 +117,106 @@ function applyAccent(hex: string) {
 export function ThemeProvider({ children }: { children: ReactNode }) {
   // Initialize from localStorage first (instant, no flash), then override with server settings
   const [theme, setThemeState] = useState<ThemeMode>(() => {
-    const stored = localStorage.getItem(LS_THEME_KEY);
-    if (stored === 'dark' || stored === 'light' || stored === 'system') return stored;
-    return 'dark';
+    return normalizeTheme(readStoredValue(LS_THEME_KEY)) || 'dark';
   });
 
   const [accentColor, setAccentState] = useState(() => {
-    return localStorage.getItem(LS_ACCENT_KEY) || DEFAULT_ACCENT;
+    return normalizeAccent(readStoredValue(LS_ACCENT_KEY)) || DEFAULT_ACCENT;
   });
+
+  const [effectsMode, setEffectsModeState] = useState<VisualEffectsMode>(() => {
+    const stored = readStoredValue(LS_EFFECTS_KEY);
+    return stored === 'full' || stored === 'reduced' || stored === 'auto' ? stored : 'auto';
+  });
+  const [systemTheme, setSystemTheme] = useState<'dark' | 'light'>(getSystemTheme);
+  const [autoReduceEffects, setAutoReduceEffects] = useState(shouldAutoReduceEffects);
 
   const publicSettings = usePublicSettings();
 
-  const resolvedTheme = resolveTheme(theme);
+  const resolvedTheme = theme === 'system' ? systemTheme : theme;
+  const resolvedEffects = effectsMode === 'auto'
+    ? (autoReduceEffects ? 'reduced' : 'full')
+    : effectsMode;
 
   useEffect(() => {
-    if (!localStorage.getItem(LS_THEME_KEY) && publicSettings?.theme) {
-      setThemeState(publicSettings.theme as ThemeMode);
+    if (!readStoredValue(LS_THEME_KEY)) {
+      const publicTheme = normalizeTheme(publicSettings?.theme);
+      if (publicTheme) setThemeState(publicTheme);
     }
-    if (!localStorage.getItem(LS_ACCENT_KEY) && publicSettings?.accentColor) {
-      setAccentState(publicSettings.accentColor);
+    if (!readStoredValue(LS_ACCENT_KEY)) {
+      const publicAccent = normalizeAccent(publicSettings?.accentColor);
+      if (publicAccent) setAccentState(publicAccent);
     }
   }, [publicSettings]);
 
-  // Apply theme to DOM whenever it changes
-  useEffect(() => {
+  // Apply the visual theme before paint. Using a normal effect here produced a
+  // dark-frame flash whenever a user with light mode refreshed the Portal.
+  useLayoutEffect(() => {
     applyTheme(resolvedTheme);
   }, [resolvedTheme]);
 
-  // Apply accent color whenever it changes
-  useEffect(() => {
+  // Accent variables affect controls throughout the first screen, so apply
+  // them in the same pre-paint phase as the color theme.
+  useLayoutEffect(() => {
     applyAccent(accentColor);
   }, [accentColor]);
 
-  // Listen for system theme changes when in 'system' mode
   useEffect(() => {
-    if (theme !== 'system') return;
-    const mq = window.matchMedia('(prefers-color-scheme: light)');
-    const handler = () => applyTheme(getSystemTheme());
-    mq.addEventListener('change', handler);
-    return () => mq.removeEventListener('change', handler);
-  }, [theme]);
+    document.documentElement.setAttribute('data-effects', resolvedEffects);
+  }, [resolvedEffects]);
+
+  useEffect(() => {
+    if (effectsMode !== 'auto') return;
+    const motionQuery = window.matchMedia?.('(prefers-reduced-motion: reduce)');
+    const updateQuery = window.matchMedia?.('(update: slow)');
+    const refresh = () => setAutoReduceEffects(shouldAutoReduceEffects());
+    motionQuery?.addEventListener?.('change', refresh);
+    updateQuery?.addEventListener?.('change', refresh);
+    refresh();
+    return () => {
+      motionQuery?.removeEventListener?.('change', refresh);
+      updateQuery?.removeEventListener?.('change', refresh);
+    };
+  }, [effectsMode]);
+
+  // Keep the system preference current even while the user has selected a
+  // fixed theme. That prevents a stale frame if they later switch to System.
+  useEffect(() => {
+    const mq = window.matchMedia?.('(prefers-color-scheme: light)');
+    const handler = () => setSystemTheme(mq?.matches ? 'light' : 'dark');
+    handler();
+    mq?.addEventListener?.('change', handler);
+    return () => mq?.removeEventListener?.('change', handler);
+  }, []);
 
   const setTheme = useCallback((t: ThemeMode) => {
     setThemeState(t);
-    localStorage.setItem(LS_THEME_KEY, t);
+    writeStoredValue(LS_THEME_KEY, t);
   }, []);
 
   const setAccentColor = useCallback((c: string) => {
-    setAccentState(c);
-    localStorage.setItem(LS_ACCENT_KEY, c);
+    const normalized = normalizeAccent(c);
+    if (!normalized) return;
+    setAccentState(normalized);
+    writeStoredValue(LS_ACCENT_KEY, normalized);
+  }, []);
+
+  const setEffectsMode = useCallback((mode: VisualEffectsMode) => {
+    setEffectsModeState(mode);
+    writeStoredValue(LS_EFFECTS_KEY, mode);
   }, []);
 
   return (
-    <ThemeContext.Provider value={{ theme, setTheme, accentColor, setAccentColor, resolvedTheme }}>
+    <ThemeContext.Provider value={{
+      theme,
+      setTheme,
+      accentColor,
+      setAccentColor,
+      resolvedTheme,
+      effectsMode,
+      setEffectsMode,
+      resolvedEffects,
+    }}>
       {children}
     </ThemeContext.Provider>
   );

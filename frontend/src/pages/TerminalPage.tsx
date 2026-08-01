@@ -1,19 +1,36 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Terminal as TermIcon, Maximize2, Minimize2, RotateCcw, Copy, Send, X,
-  Search, Command, AlertTriangle, Play, Loader2, Sparkles, ChevronRight,
+  Search, Command, AlertTriangle, Play, Loader2, Sparkles,
   ShieldAlert, Zap, ToggleLeft, ToggleRight, Trash2, Plus, XCircle
 } from 'lucide-react';
 import { Terminal } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import { io, Socket } from 'socket.io-client';
-import { aiAPI, terminalAPI, gatewayAPI } from '../api/endpoints';
-import { useIsMobile } from '../hooks/useIsMobile';
+import { terminalAPI, gatewayAPI } from '../api/endpoints';
 import { captureError } from '../utils/errorHandler';
 import { getShortModelLabel } from '../utils/modelId';
 import sounds from '../utils/sounds';
+import {
+  BRACKETED_PASTE_END,
+  BRACKETED_PASTE_START,
+  appendLooseTerminalPaste,
+  consumeBracketedPasteChunk,
+  createBracketedPasteState,
+  decideTerminalPaste,
+  flushLooseTerminalPaste,
+} from '../utils/terminalInput';
+import {
+  buildTerminalCatalog,
+  rankTerminalCatalog,
+  type TerminalActionRisk,
+  type TerminalCapabilities,
+  type TerminalSuggestion as AutocompleteSuggestion,
+} from '../utils/terminalCapabilities';
+import AnchoredPopover from '../components/AnchoredPopover';
+import ViewportModal from '../components/ViewportModal';
+import { useIsMobile } from '../hooks/useIsMobile';
 import 'xterm/css/xterm.css';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
@@ -24,23 +41,11 @@ interface LookupCommand {
   command: string;
   explanation: string;
   warning: string | null;
-}
-
-interface AutocompleteSuggestion {
-  command: string;
-  description: string;
-  category: string;
-  dangerous?: boolean;
+  risk?: TerminalActionRisk;
+  confirmation?: 'none' | 'explicit' | 'typed';
 }
 
 // TabDescriptor moved to main component section below
-
-interface ChatMessage {
-  id: string;
-  role: 'user' | 'ai';
-  content: string;
-  timestamp: number;
-}
 
 // ─── Category colors ─────────────────────────────────────────────
 const CATEGORY_COLORS: Record<string, string> = {
@@ -70,449 +75,118 @@ const CATEGORY_COLORS: Record<string, string> = {
 };
 
 
-const TOOL_PRESET_GROUPS: Array<{ tool: string; commands: string[] }> = [
-  { tool: 'OpenClaw', commands: ['openclaw status', 'openclaw gateway status', 'openclaw gateway restart', 'openclaw doctor'] },
-  { tool: 'Setup', commands: ['openclaw onboard', 'openclaw configure', 'openclaw channels list', 'openclaw models status'] },
-  { tool: 'Claude Code', commands: ['claude', 'claude --continue', 'claude --resume'] },
-  { tool: 'Codex', commands: ['codex', 'codex exec "task"'] },
-  { tool: 'System', commands: ['htop', 'df -h', 'free -h', 'docker ps'] },
-];
-
-// ─── Autocomplete Database ──────────────────────────────────────
-const AUTOCOMPLETE_DB: AutocompleteSuggestion[] = [
-  // ── OpenClaw: Core ────────────────────────────────────────────
-  { command: 'openclaw help', description: 'Show all available OpenClaw commands', category: 'openclaw' },
-  { command: 'openclaw status', description: 'Channel health + recent session recipients', category: 'openclaw' },
-  { command: 'openclaw -V', description: 'Print installed OpenClaw version', category: 'openclaw' },
-  { command: 'openclaw health', description: 'Fetch health from the running gateway', category: 'openclaw' },
-  // ── OpenClaw: Onboarding & Setup ──────────────────────────────
-  { command: 'openclaw onboard', description: 'Interactive onboarding wizard (gateway + workspace + skills)', category: 'openclaw' },
-  { command: 'openclaw configure', description: 'Interactive setup wizard (credentials, channels, agent defaults)', category: 'openclaw' },
-  { command: 'openclaw setup', description: 'Initialize local config and agent workspace', category: 'openclaw' },
-  { command: 'openclaw doctor', description: 'Health checks + quick fixes for gateway and channels', category: 'openclaw' },
-  { command: 'openclaw doctor --deep', description: 'Deep scan for extra gateway installs + service issues', category: 'openclaw' },
-  { command: 'openclaw doctor --non-interactive', description: 'Run safe migrations only (no prompts)', category: 'openclaw' },
-  // ── OpenClaw: Gateway ─────────────────────────────────────────
-  { command: 'openclaw gateway status', description: 'Service status + reachability probe', category: 'openclaw' },
-  { command: 'openclaw gateway start', description: 'Start the gateway service', category: 'openclaw' },
-  { command: 'openclaw gateway stop', description: '⚠️ Stop the gateway service', category: 'openclaw', dangerous: true },
-  { command: 'openclaw gateway restart', description: 'Restart the gateway service', category: 'openclaw' },
-  { command: 'openclaw gateway run', description: 'Run gateway in foreground (debug)', category: 'openclaw' },
-  { command: 'openclaw gateway run --verbose', description: 'Foreground gateway with verbose logging', category: 'openclaw' },
-  { command: 'openclaw gateway probe', description: 'Reachability + discovery + health summary', category: 'openclaw' },
-  { command: 'openclaw gateway install', description: 'Install gateway as system service', category: 'openclaw' },
-  { command: 'openclaw gateway uninstall', description: '⚠️ Uninstall the gateway service', category: 'openclaw', dangerous: true },
-  { command: 'openclaw gateway usage-cost', description: 'Fetch usage cost summary from session logs', category: 'openclaw' },
-  { command: 'openclaw logs', description: 'Tail gateway file logs via RPC', category: 'openclaw' },
-  // ── OpenClaw: Config ──────────────────────────────────────────
-  { command: 'openclaw config get', description: 'Get a config value by dot path', category: 'openclaw' },
-  { command: 'openclaw config set', description: 'Set a config value by dot path', category: 'openclaw' },
-  { command: 'openclaw config unset', description: 'Remove a config value by dot path', category: 'openclaw' },
-  { command: 'openclaw config file', description: 'Print the active config file path', category: 'openclaw' },
-  { command: 'openclaw config validate', description: 'Validate config against schema', category: 'openclaw' },
-  // ── OpenClaw: Models ──────────────────────────────────────────
-  { command: 'openclaw models status', description: 'Show configured model state (providers, keys)', category: 'openclaw' },
-  { command: 'openclaw models list', description: 'List configured models', category: 'openclaw' },
-  { command: 'openclaw models set', description: 'Set the default model', category: 'openclaw' },
-  { command: 'openclaw models set-image', description: 'Set the image model', category: 'openclaw' },
-  { command: 'openclaw models aliases', description: 'Manage model aliases', category: 'openclaw' },
-  { command: 'openclaw models auth', description: 'Manage model auth profiles', category: 'openclaw' },
-  { command: 'openclaw models fallbacks', description: 'Manage model fallback list', category: 'openclaw' },
-  { command: 'openclaw models scan', description: 'Scan OpenRouter free models for tools + images', category: 'openclaw' },
-  // ── OpenClaw: Channels ────────────────────────────────────────
-  { command: 'openclaw channels list', description: 'List configured channels + auth profiles', category: 'openclaw' },
-  { command: 'openclaw channels status', description: 'Show gateway channel status', category: 'openclaw' },
-  { command: 'openclaw channels status --deep', description: 'Deep local channel status checks', category: 'openclaw' },
-  { command: 'openclaw channels add', description: 'Add or update a channel account', category: 'openclaw' },
-  { command: 'openclaw channels login', description: 'Link a channel account (WhatsApp QR, etc.)', category: 'openclaw' },
-  { command: 'openclaw channels logout', description: 'Log out of a channel session', category: 'openclaw' },
-  { command: 'openclaw channels remove', description: '⚠️ Disable or delete a channel account', category: 'openclaw', dangerous: true },
-  { command: 'openclaw channels logs', description: 'Show recent channel logs', category: 'openclaw' },
-  { command: 'openclaw channels capabilities', description: 'Show provider capabilities + features', category: 'openclaw' },
-  // ── OpenClaw: Agents ──────────────────────────────────────────
-  { command: 'openclaw agents list', description: 'List configured agents', category: 'openclaw' },
-  { command: 'openclaw agents add', description: 'Add a new isolated agent', category: 'openclaw' },
-  { command: 'openclaw agents delete', description: '⚠️ Delete an agent and prune workspace/state', category: 'openclaw', dangerous: true },
-  { command: 'openclaw agents bind', description: 'Add routing bindings for an agent', category: 'openclaw' },
-  { command: 'openclaw agents bindings', description: 'List routing bindings', category: 'openclaw' },
-  { command: 'openclaw agents unbind', description: 'Remove routing bindings for an agent', category: 'openclaw' },
-  { command: 'openclaw agents set-identity', description: 'Update agent identity (name/emoji/avatar)', category: 'openclaw' },
-  // ── OpenClaw: Sessions & Cron ─────────────────────────────────
-  { command: 'openclaw sessions', description: 'List stored conversation sessions', category: 'openclaw' },
-  { command: 'openclaw sessions --active 60', description: 'Sessions updated in last hour', category: 'openclaw' },
-  { command: 'openclaw sessions --all-agents', description: 'Sessions across all agents', category: 'openclaw' },
-  { command: 'openclaw sessions cleanup', description: 'Run session-store maintenance', category: 'openclaw' },
-  { command: 'openclaw cron list', description: 'See all scheduled automatic tasks', category: 'openclaw' },
-  { command: 'openclaw cron add', description: 'Add a new scheduled task', category: 'openclaw' },
-  // ── OpenClaw: Memory ──────────────────────────────────────────
-  { command: 'openclaw memory status', description: 'Show memory search index status', category: 'openclaw' },
-  { command: 'openclaw memory status --deep', description: 'Probe embedding provider readiness', category: 'openclaw' },
-  { command: 'openclaw memory index --force', description: 'Force full memory reindex', category: 'openclaw' },
-  { command: 'openclaw memory search', description: 'Search memory files', category: 'openclaw' },
-  // ── OpenClaw: Skills & Plugins ────────────────────────────────
-  { command: 'openclaw skills list', description: 'List all available skills', category: 'openclaw' },
-  { command: 'openclaw skills check', description: 'Check skill readiness vs missing requirements', category: 'openclaw' },
-  { command: 'openclaw skills info', description: 'Show detailed info about a skill', category: 'openclaw' },
-  { command: 'openclaw plugins doctor', description: 'Report plugin load issues', category: 'openclaw' },
-  { command: 'openclaw plugins enable', description: 'Enable a plugin in config', category: 'openclaw' },
-  { command: 'openclaw plugins disable', description: 'Disable a plugin in config', category: 'openclaw' },
-  // ── OpenClaw: Security & Backup ───────────────────────────────
-  { command: 'openclaw security audit', description: 'Audit config + state for security foot-guns', category: 'openclaw' },
-  { command: 'openclaw security audit --deep', description: 'Include live gateway probe checks', category: 'openclaw' },
-  { command: 'openclaw security audit --fix', description: 'Apply safe security remediations', category: 'openclaw' },
-  { command: 'openclaw backup create', description: 'Create backup archive of config + state', category: 'openclaw' },
-  { command: 'openclaw backup verify', description: 'Validate a backup archive', category: 'openclaw' },
-  // ── OpenClaw: Devices & Pairing ───────────────────────────────
-  { command: 'openclaw devices list', description: 'List pending and paired devices', category: 'openclaw' },
-  { command: 'openclaw devices approve', description: 'Approve a pending device pairing', category: 'openclaw' },
-  { command: 'openclaw devices reject', description: 'Reject a pending device pairing', category: 'openclaw' },
-  { command: 'openclaw devices remove', description: 'Remove a paired device', category: 'openclaw' },
-  { command: 'openclaw qr', description: 'Generate iOS pairing QR/setup code', category: 'openclaw' },
-  // ── OpenClaw: Sandbox & Updates ───────────────────────────────
-  { command: 'openclaw sandbox list', description: 'List sandbox containers and status', category: 'openclaw' },
-  { command: 'openclaw sandbox recreate --all', description: 'Recreate all sandbox containers', category: 'openclaw' },
-  { command: 'openclaw sandbox explain', description: 'Explain effective sandbox/tool policy', category: 'openclaw' },
-  { command: 'openclaw update', description: 'Update OpenClaw to latest version', category: 'openclaw' },
-  { command: 'openclaw update status', description: 'Show update channel and version status', category: 'openclaw' },
-  { command: 'openclaw update --channel beta', description: 'Switch to beta update channel', category: 'openclaw' },
-  { command: 'openclaw update --dry-run', description: 'Preview update actions without changes', category: 'openclaw' },
-  // ── OpenClaw: Misc ────────────────────────────────────────────
-  { command: 'openclaw dashboard', description: 'Open the Control UI with your current token', category: 'openclaw' },
-  { command: 'openclaw tui', description: 'Open terminal UI connected to the Gateway', category: 'openclaw' },
-  { command: 'openclaw directory', description: 'Lookup contact and group IDs for chat channels', category: 'openclaw' },
-  { command: 'openclaw message send', description: 'Send a message via a chat channel', category: 'openclaw' },
-  { command: 'openclaw reset', description: '⚠️ Reset local config/state (keeps CLI installed)', category: 'openclaw', dangerous: true },
-  { command: 'openclaw uninstall', description: '⚠️ Uninstall gateway service + local data', category: 'openclaw', dangerous: true },
-  // ── Tailscale ─────────────────────────────────────────────────
-  { command: 'tailscale status', description: 'See your private network connections', category: 'tailscale' },
-  { command: 'tailscale ip', description: 'Show your private network address', category: 'tailscale' },
-  { command: 'tailscale ping', description: 'Test if you can reach another device', category: 'tailscale' },
-  { command: 'tailscale netcheck', description: 'Diagnose network connection problems', category: 'tailscale' },
-  { command: 'tailscale up', description: 'Connect to your private network', category: 'tailscale' },
-  { command: 'tailscale down', description: 'Disconnect from private network', category: 'tailscale' },
-  { command: 'tailscale logout', description: '⚠️ Sign out of Tailscale', category: 'tailscale', dangerous: true },
-  // ── Ollama ────────────────────────────────────────────────────
-  { command: 'ollama list', description: 'See which AI models are downloaded', category: 'ollama' },
-  { command: 'ollama ps', description: 'See which AI models are currently loaded', category: 'ollama' },
-  { command: 'ollama run', description: 'Chat with a local AI model', category: 'ollama' },
-  { command: 'ollama pull', description: 'Download a new AI model', category: 'ollama' },
-  { command: 'ollama show', description: 'See details about a specific model', category: 'ollama' },
-  { command: 'ollama rm', description: '⚠️ Delete an AI model', category: 'ollama', dangerous: true },
-  // ── Docker ────────────────────────────────────────────────────
-  { command: 'docker ps', description: 'Show running containers', category: 'docker' },
-  { command: 'docker ps -a', description: 'Show ALL containers including stopped', category: 'docker' },
-  { command: 'docker images', description: 'List downloaded images', category: 'docker' },
-  { command: 'docker logs', description: 'Read container log messages', category: 'docker' },
-  { command: 'docker logs -f', description: 'Watch container logs in real-time', category: 'docker' },
-  { command: 'docker exec -it', description: 'Open a terminal inside a container', category: 'docker' },
-  { command: 'docker stop', description: 'Gracefully shut down a container', category: 'docker' },
-  { command: 'docker start', description: 'Start a stopped container', category: 'docker' },
-  { command: 'docker restart', description: 'Restart a container', category: 'docker' },
-  { command: 'docker rm', description: '⚠️ Remove a stopped container', category: 'docker', dangerous: true },
-  { command: 'docker rm -f', description: '⚠️ Force-remove a container', category: 'docker', dangerous: true },
-  { command: 'docker rmi', description: '⚠️ Delete an image', category: 'docker', dangerous: true },
-  { command: 'docker compose up -d', description: 'Start all project services', category: 'docker' },
-  { command: 'docker compose down', description: '⚠️ Stop and remove all services', category: 'docker', dangerous: true },
-  { command: 'docker compose logs -f', description: 'Watch all service logs live', category: 'docker' },
-  { command: 'docker compose ps', description: 'See status of all services', category: 'docker' },
-  { command: 'docker system prune', description: '⚠️ Clean up unused Docker data', category: 'docker', dangerous: true },
-  { command: 'docker system prune -a --volumes', description: '⚠️ Deep clean ALL unused + volumes', category: 'docker', dangerous: true },
-  { command: 'docker system df', description: 'See Docker disk usage', category: 'docker' },
-  { command: 'docker stats', description: 'Live CPU & memory usage', category: 'docker' },
-  { command: 'docker stats --no-stream', description: 'Quick resource snapshot', category: 'docker' },
-  // ── Git ───────────────────────────────────────────────────────
-  { command: 'git status', description: 'See what files changed since last save', category: 'git' },
-  { command: 'git add .', description: 'Stage all changes', category: 'git' },
-  { command: 'git add -p', description: 'Stage interactively', category: 'git' },
-  { command: 'git commit -m ""', description: 'Commit with message', category: 'git' },
-  { command: 'git commit --amend', description: 'Fix your last commit', category: 'git' },
-  { command: 'git push', description: 'Push to remote', category: 'git' },
-  { command: 'git push --force-with-lease', description: 'Safe force push', category: 'git' },
-  { command: 'git push --force', description: '⚠️ Force push (overwrites remote!)', category: 'git', dangerous: true },
-  { command: 'git pull', description: 'Pull from remote', category: 'git' },
-  { command: 'git pull --rebase', description: 'Pull with rebase', category: 'git' },
-  { command: 'git fetch --all', description: 'Fetch all remotes', category: 'git' },
-  { command: 'git log --oneline -10', description: 'Recent commits', category: 'git' },
-  { command: 'git log --oneline --graph', description: 'Commit graph', category: 'git' },
-  { command: 'git diff', description: 'Show unstaged changes', category: 'git' },
-  { command: 'git diff --staged', description: 'Show staged changes', category: 'git' },
-  { command: 'git branch', description: 'List branches', category: 'git' },
-  { command: 'git branch -a', description: 'List all branches', category: 'git' },
-  { command: 'git checkout -b', description: 'New branch', category: 'git' },
-  { command: 'git switch -c', description: 'Create & switch branch', category: 'git' },
-  { command: 'git merge', description: 'Merge a branch', category: 'git' },
-  { command: 'git stash', description: 'Stash changes', category: 'git' },
-  { command: 'git stash list', description: 'List stashed changes', category: 'git' },
-  { command: 'git stash pop', description: 'Apply stash', category: 'git' },
-  { command: 'git reset --soft HEAD~1', description: 'Undo commit, keep changes', category: 'git' },
-  { command: 'git reset --hard HEAD', description: '⚠️ Discard ALL changes', category: 'git', dangerous: true },
-  { command: 'git clean -fd', description: '⚠️ Remove untracked files', category: 'git', dangerous: true },
-  { command: 'git remote -v', description: 'Show remotes', category: 'git' },
-  { command: 'git reflog', description: 'Reference log (recovery tool)', category: 'git' },
-  // ── npm / Node ────────────────────────────────────────────────
-  { command: 'npm install', description: 'Download all dependencies', category: 'npm' },
-  { command: 'npm run dev', description: 'Start dev mode', category: 'npm' },
-  { command: 'npm run build', description: 'Build for production', category: 'npm' },
-  { command: 'npm start', description: 'Start application', category: 'npm' },
-  { command: 'npm test', description: 'Run tests', category: 'npm' },
-  { command: 'npm outdated', description: 'Check outdated packages', category: 'npm' },
-  { command: 'npm audit', description: 'Security audit', category: 'npm' },
-  { command: 'npx tsc --noEmit', description: 'Type check', category: 'npm' },
-  { command: 'node -v', description: 'Node version', category: 'npm' },
-  // ── Caddy (Reverse Proxy) ─────────────────────────────────────
-  { command: 'caddy version', description: 'Caddy version', category: 'caddy' },
-  { command: 'caddy validate --config /etc/caddy/Caddyfile', description: 'Validate Caddyfile', category: 'caddy' },
-  { command: 'caddy reload --config /etc/caddy/Caddyfile', description: 'Reload Caddy config', category: 'caddy' },
-  { command: 'caddy fmt --overwrite /etc/caddy/Caddyfile', description: 'Format Caddyfile', category: 'caddy' },
-  { command: 'systemctl status caddy', description: 'Caddy service status', category: 'caddy' },
-  { command: 'systemctl restart caddy', description: 'Restart Caddy', category: 'caddy' },
-  { command: 'journalctl -u caddy --since "10 min ago"', description: 'Recent Caddy logs', category: 'caddy' },
-  { command: 'cat /etc/caddy/Caddyfile', description: 'View Caddyfile', category: 'caddy' },
-  // ── System / systemd ──────────────────────────────────────────
-  { command: 'systemctl status', description: 'Check service status', category: 'system' },
-  { command: 'systemctl start', description: 'Start a service', category: 'system' },
-  { command: 'systemctl stop', description: '⚠️ Stop a service', category: 'system', dangerous: true },
-  { command: 'systemctl restart', description: 'Restart a service', category: 'system' },
-  { command: 'systemctl enable', description: 'Auto-start on boot', category: 'system' },
-  { command: 'systemctl daemon-reload', description: 'Reload systemd', category: 'system' },
-  { command: 'systemctl list-units --failed', description: 'Show crashed services', category: 'system' },
-  { command: 'systemctl list-units --type=service --state=running', description: 'All running services', category: 'system' },
-  { command: 'systemctl list-timers', description: 'Scheduled timers', category: 'system' },
-  { command: 'systemctl cat', description: 'Show service file', category: 'system' },
-  { command: 'journalctl -u', description: 'Read service logs', category: 'system' },
-  { command: 'journalctl -xe', description: 'Show recent errors', category: 'system' },
-  { command: 'journalctl -f', description: 'Follow system logs', category: 'system' },
-  { command: 'htop', description: 'Visual process viewer', category: 'system' },
-  { command: 'df -h', description: 'Disk usage', category: 'system' },
-  { command: 'du -sh * | sort -hr', description: 'Folder sizes, biggest first', category: 'system' },
-  { command: 'free -h', description: 'Memory usage', category: 'system' },
-  { command: 'uname -a', description: 'System info', category: 'system' },
-  { command: 'uptime', description: 'Uptime & load', category: 'system' },
-  { command: 'lscpu', description: 'CPU info', category: 'system' },
-  { command: 'lsblk', description: 'Block devices', category: 'system' },
-  { command: 'date', description: 'Current date/time', category: 'system' },
-  { command: 'timedatectl', description: 'Timezone & time sync', category: 'system' },
-  { command: 'hostnamectl', description: 'System hostname info', category: 'system' },
-  { command: 'history | grep', description: 'Search history', category: 'system' },
-  { command: 'tmux ls', description: 'List tmux sessions', category: 'system' },
-  { command: 'tmux new -s', description: 'New tmux session', category: 'system' },
-  { command: 'crontab -l', description: 'List cron jobs', category: 'system' },
-  { command: 'crontab -e', description: 'Edit cron jobs', category: 'system' },
-  { command: 'whoami', description: 'Current user', category: 'system' },
-  { command: 'id', description: 'User ID & groups', category: 'system' },
-  { command: 'who', description: 'Logged in users', category: 'system' },
-  { command: 'last -10', description: 'Recent logins', category: 'system' },
-  // ── apt ───────────────────────────────────────────────────────
-  { command: 'apt update', description: 'Refresh package lists', category: 'apt' },
-  { command: 'apt upgrade', description: 'Upgrade packages', category: 'apt' },
-  { command: 'apt install', description: 'Install package', category: 'apt' },
-  { command: 'apt remove', description: 'Remove package', category: 'apt' },
-  { command: 'apt purge', description: '⚠️ Remove + config', category: 'apt', dangerous: true },
-  { command: 'apt autoremove', description: 'Remove unused deps', category: 'apt' },
-  { command: 'apt search', description: 'Search packages', category: 'apt' },
-  // ── Files ─────────────────────────────────────────────────────
-  { command: 'ls', description: 'List files', category: 'files' },
-  { command: 'ls -la', description: 'Detailed list', category: 'files' },
-  { command: 'ls -lah', description: 'Detailed + human sizes', category: 'files' },
-  { command: 'cd', description: 'Change directory', category: 'files' },
-  { command: 'pwd', description: 'Print working dir', category: 'files' },
-  { command: 'mkdir -p', description: 'Create directory', category: 'files' },
-  { command: 'cp -r', description: 'Copy recursive', category: 'files' },
-  { command: 'mv', description: 'Move/rename', category: 'files' },
-  { command: 'rm', description: '⚠️ Delete files', category: 'files', dangerous: true },
-  { command: 'rm -rf', description: '⚠️ Force recursive delete', category: 'files', dangerous: true },
-  { command: 'cat', description: 'Show file contents', category: 'files' },
-  { command: 'less', description: 'Page through file', category: 'files' },
-  { command: 'head -n 20', description: 'First 20 lines', category: 'files' },
-  { command: 'tail -n 20', description: 'Last 20 lines', category: 'files' },
-  { command: 'tail -f', description: 'Follow file', category: 'files' },
-  { command: 'find . -name', description: 'Find by name', category: 'files' },
-  { command: 'find . -type f -size +100M', description: 'Files > 100MB', category: 'files' },
-  { command: 'grep -r "" .', description: 'Search recursively', category: 'files' },
-  { command: 'grep -rn "" .', description: 'Search with line nums', category: 'files' },
-  { command: 'chmod +x', description: 'Make executable', category: 'files' },
-  { command: 'chmod -R 777', description: '⚠️ Wide open (security risk)', category: 'files', dangerous: true },
-  { command: 'chown -R', description: 'Change ownership', category: 'files' },
-  { command: 'tar -czf', description: 'Create .tar.gz', category: 'files' },
-  { command: 'tar -xzf', description: 'Extract .tar.gz', category: 'files' },
-  { command: 'zip -r archive.zip folder/', description: 'Create zip archive', category: 'files' },
-  { command: 'unzip archive.zip', description: 'Extract zip archive', category: 'files' },
-  { command: 'tree -L 2', description: 'Tree 2 levels', category: 'files' },
-  { command: 'nano', description: 'Text editor', category: 'files' },
-  // ── Network ───────────────────────────────────────────────────
-  { command: 'curl -s', description: 'HTTP request', category: 'network' },
-  { command: 'curl -I', description: 'Headers only', category: 'network' },
-  { command: 'curl -X POST', description: 'POST request', category: 'network' },
-  { command: 'wget', description: 'Download file', category: 'network' },
-  { command: 'ping -c 4', description: 'Ping 4 packets', category: 'network' },
-  { command: 'dig', description: 'DNS lookup', category: 'network' },
-  { command: 'nslookup', description: 'DNS lookup (alternative)', category: 'network' },
-  { command: 'ip addr', description: 'Network interfaces', category: 'network' },
-  { command: 'ss -tlnp', description: 'Listening TCP ports', category: 'network' },
-  { command: 'lsof -i', description: 'Open connections', category: 'network' },
-  { command: 'lsof -i :3001', description: 'What uses port 3001', category: 'network' },
-  { command: 'fuser -k 3001/tcp', description: '⚠️ Kill port process', category: 'network', dangerous: true },
-  { command: 'ufw status', description: 'Firewall status', category: 'network' },
-  { command: 'ufw allow', description: 'Allow port through firewall', category: 'network' },
-  { command: 'ufw deny', description: 'Block port in firewall', category: 'network' },
-  { command: 'iptables -L -n', description: 'Firewall rules (iptables)', category: 'network' },
-  { command: 'ssh', description: 'SSH connect', category: 'network' },
-  { command: 'rsync -avz --progress', description: 'Sync with progress', category: 'network' },
-  { command: 'traceroute', description: 'Trace packet route', category: 'network' },
-  { command: 'mtr', description: 'Interactive traceroute', category: 'network' },
-  // ── Nginx ─────────────────────────────────────────────────────
-  { command: 'nginx -t', description: 'Test nginx config', category: 'nginx' },
-  { command: 'nginx -s reload', description: 'Reload nginx', category: 'nginx' },
-  { command: 'systemctl restart nginx', description: 'Restart nginx', category: 'nginx' },
-  { command: 'systemctl status nginx', description: 'Nginx status', category: 'nginx' },
-  { command: 'tail -f /var/log/nginx/error.log', description: 'Nginx errors', category: 'nginx' },
-  // ── Processes ─────────────────────────────────────────────────
-  { command: 'ps aux', description: 'All processes', category: 'process' },
-  { command: 'ps aux | grep', description: 'Search process', category: 'process' },
-  { command: 'kill', description: 'Send signal', category: 'process' },
-  { command: 'kill -9', description: '⚠️ Force kill', category: 'process', dangerous: true },
-  { command: 'killall', description: '⚠️ Kill by name', category: 'process', dangerous: true },
-  { command: 'pkill -f', description: '⚠️ Kill by pattern', category: 'process', dangerous: true },
-  // ── Dangerous / Destructive ───────────────────────────────────
-  { command: 'dd if=', description: '⚠️ Low-level disk copy', category: 'security', dangerous: true },
-  { command: 'mkfs', description: '⚠️ Format disk', category: 'security', dangerous: true },
-  { command: 'shutdown -h now', description: '⚠️ Shutdown now', category: 'security', dangerous: true },
-  { command: 'reboot', description: '⚠️ Reboot system', category: 'security', dangerous: true },
-  // ── Python ────────────────────────────────────────────────────
-  { command: 'python3 --version', description: 'Python version', category: 'python' },
-  { command: 'python3', description: 'Start Python REPL', category: 'python' },
-  { command: 'python3 -m venv venv', description: 'Create virtual environment', category: 'python' },
-  { command: 'source venv/bin/activate', description: 'Activate virtual environment', category: 'python' },
-  { command: 'pip install', description: 'Install Python package', category: 'python' },
-  { command: 'pip install -r requirements.txt', description: 'Install from requirements', category: 'python' },
-  { command: 'pip list', description: 'List installed packages', category: 'python' },
-  { command: 'pip freeze > requirements.txt', description: 'Export requirements', category: 'python' },
-  { command: 'python3 -m http.server 8080', description: 'Quick HTTP server', category: 'python' },
-  // ── Database / Prisma ─────────────────────────────────────────
-  { command: 'npx prisma studio', description: 'Open Prisma DB browser', category: 'database' },
-  { command: 'npx prisma migrate dev', description: 'Run dev migrations', category: 'database' },
-  { command: 'npx prisma migrate deploy', description: 'Apply prod migrations', category: 'database' },
-  { command: 'npx prisma db push', description: 'Push schema to DB', category: 'database' },
-  { command: 'npx prisma generate', description: 'Generate Prisma client', category: 'database' },
-  { command: 'psql "$(grep \'^DATABASE_URL=\' /opt/bridgesllm/portal/backend/.env.production | cut -d= -f2- | tr -d \"\")"', description: 'Connect to configured portal DB', category: 'database' },
-  { command: 'pg_dump "$(grep \'^DATABASE_URL=\' /opt/bridgesllm/portal/backend/.env.production | cut -d= -f2- | tr -d \"\")" > backup.sql', description: 'Backup configured portal DB', category: 'database' },
-  // ── SSL / Certbot ─────────────────────────────────────────────
-  { command: 'certbot certificates', description: 'List SSL certificates', category: 'ssl' },
-  { command: 'certbot renew --dry-run', description: 'Test certificate renewal', category: 'ssl' },
-  { command: 'certbot renew', description: 'Renew SSL certificates', category: 'ssl' },
-  { command: 'openssl s_client -connect', description: 'Test SSL connection', category: 'ssl' },
-  // ── Monitoring ────────────────────────────────────────────────
-  { command: 'top -bn1 | head -20', description: 'Quick process snapshot', category: 'monitoring' },
-  { command: 'dmesg | tail -20', description: 'Recent kernel messages', category: 'monitoring' },
-  { command: 'dmesg -Tw', description: 'Follow kernel messages', category: 'monitoring' },
-  { command: 'vmstat 1 5', description: 'VM stats (5 samples)', category: 'monitoring' },
-  // ── Disk Cleanup ──────────────────────────────────────────────
-  { command: 'du -sh /var/log/*', description: 'Log directory sizes', category: 'disk' },
-  { command: 'find /tmp -type f -atime +7 -delete', description: '⚠️ Clean old temp files', category: 'disk', dangerous: true },
-  { command: 'journalctl --disk-usage', description: 'Journal log disk usage', category: 'disk' },
-  { command: 'journalctl --vacuum-time=7d', description: 'Trim journal to 7 days', category: 'disk' },
-  // ── Agent Tools ───────────────────────────────────────────────
-  { command: 'claude', description: 'Start Claude Code session', category: 'agents' },
-  { command: 'claude --continue', description: 'Continue last Claude session', category: 'agents' },
-  { command: 'claude --resume', description: 'Resume Claude session', category: 'agents' },
-  { command: 'claude -p "task"', description: 'One-shot Claude task', category: 'agents' },
-  { command: 'codex', description: 'Start Codex session', category: 'agents' },
-  { command: 'codex exec "task"', description: 'One-shot Codex task', category: 'agents' },
-  { command: 'codex --help', description: 'Show Codex CLI options', category: 'agents' },
-  { command: 'agy', description: 'Start Antigravity CLI session', category: 'agents' },
-  // ── Text Processing ───────────────────────────────────────────
-  { command: 'wc -l', description: 'Count lines', category: 'text' },
-  { command: 'sort | uniq -c | sort -rn', description: 'Frequency count', category: 'text' },
-  { command: 'awk \'{print $1}\'', description: 'Print first column', category: 'text' },
-  { command: 'sed -i \'s/old/new/g\'', description: 'Find & replace in file', category: 'text' },
-  { command: 'jq .', description: 'Pretty-print JSON', category: 'text' },
-  { command: 'jq -r \'.key\'', description: 'Extract JSON value', category: 'text' },
-  { command: 'xargs', description: 'Build command from stdin', category: 'text' },
-  { command: 'tee', description: 'Write to file + stdout', category: 'text' },
-];
-
-function getLocalSuggestions(input: string): AutocompleteSuggestion[] {
-  if (!input.trim()) return [];
-  const lower = input.toLowerCase();
-  const exact = AUTOCOMPLETE_DB.filter(c => c.command.toLowerCase().startsWith(lower));
-  if (exact.length > 0) return exact.slice(0, 10);
-  const words = lower.split(/\s+/);
-  return AUTOCOMPLETE_DB.filter(c =>
-    words.every(w => c.command.toLowerCase().includes(w) || c.description.toLowerCase().includes(w)) ||
-    c.category.startsWith(lower)
-  ).slice(0, 10);
+interface CommandWarning {
+  risk: Exclude<TerminalActionRisk, 'read_only'>;
+  confirmation: 'explicit' | 'typed';
+  message: string;
 }
 
-// ─── Destructive Command Detection ──────────────────────────────
-const DANGEROUS_PATTERNS = [
-  { pattern: /^rm\s+-rf\s+\//, message: 'This will recursively delete from root! System will be destroyed.' },
-  { pattern: /^rm\s+(-[a-z]*f[a-z]*\s+|.*--force)/, message: 'Force deletion — files cannot be recovered!' },
-  { pattern: /^rm\s+-r/, message: 'Recursive file deletion — files cannot be recovered.' },
-  { pattern: /^dd\s+/, message: 'Low-level disk operation. Can overwrite entire drives.' },
-  { pattern: /^mkfs/, message: 'This will FORMAT a disk partition, destroying all data!' },
-  { pattern: /^fdisk/, message: 'Disk partition editor — changes can cause data loss.' },
-  { pattern: /^parted/, message: 'Disk partition editor — changes can cause data loss.' },
-  { pattern: /^chmod\s+(-R\s+)?777/, message: 'Setting 777 permissions is a security risk!' },
-  { pattern: /^rm\s+-rf\s+\*/, message: 'This will delete everything in the current directory!' },
-  { pattern: />\s*\/dev\/sd[a-z]/, message: 'Writing directly to disk device — will destroy data!' },
-  { pattern: /^shutdown/, message: 'This will shut down the server!' },
-  { pattern: /^reboot/, message: 'This will reboot the server!' },
-  { pattern: /^kill\s+-9/, message: 'Force killing a process — no cleanup will occur.' },
-  { pattern: /^killall/, message: 'This kills ALL processes matching the name.' },
-  { pattern: /^docker\s+system\s+prune\s+-a/, message: 'This removes ALL unused Docker data!' },
-  { pattern: /^docker\s+compose\s+down\s+-v/, message: 'This will remove containers AND their volumes (data)!' },
-  { pattern: /^git\s+reset\s+--hard/, message: 'This will discard ALL uncommitted changes permanently!' },
-  { pattern: /^git\s+clean\s+-f/, message: 'This removes untracked files permanently!' },
-  { pattern: /^git\s+push\s+--force\b/, message: 'Force push will overwrite remote history!' },
-  { pattern: /^\s*:\s*\(\)\s*\{/, message: 'Fork bomb detected — this will crash the system!' },
-  { pattern: /^userdel/, message: 'This will delete a user account.' },
-  { pattern: /^apt\s+purge/, message: 'This removes packages AND their configuration.' },
-  { pattern: /^pm2\s+delete\s+all/, message: 'This will remove all PM2 managed processes.' },
-  { pattern: /^tailscale\s+logout/, message: 'This will disconnect from Tailscale network.' },
-  { pattern: /^openclaw\s+reset/, message: 'This will reset local config/state!' },
-  { pattern: /^openclaw\s+gateway\s+--force/, message: 'Force restart without safety checks — may interrupt active sessions!' },
-  { pattern: /^openclaw\s+gateway\s+stop/, message: 'This will stop the AI gateway — all AI features will be unavailable!' },
-  { pattern: /^openclaw\s+update/, message: 'Self-update may change system behavior or require restart!' },
-  { pattern: /^openclaw\s+.*--force/, message: 'Force flag bypasses safety checks!' },
-];
-
-function detectDanger(command: string): { isDangerous: boolean; message: string } | null {
-  const trimmed = command.trim();
-  for (const { pattern, message } of DANGEROUS_PATTERNS) {
-    if (pattern.test(trimmed)) return { isDangerous: true, message };
+async function classifyCommandForUi(command: string): Promise<CommandWarning | null> {
+  try {
+    const classification = await terminalAPI.classify(command);
+    if (classification?.risk === 'destructive' || classification?.risk === 'service_change') {
+      return {
+        risk: classification.risk,
+        confirmation: classification.confirmation === 'typed' ? 'typed' : 'explicit',
+        message: classification.message || 'This command changes host state.',
+      };
+    }
+    return null;
+  } catch {
+    // Classification is an accident-prevention layer, not an authorization
+    // boundary. If its server-side policy is unavailable, fail closed instead
+    // of relying on a duplicated client regex catalog that wrappers could evade.
+    return {
+      risk: 'destructive',
+      confirmation: 'typed',
+      message: 'Portal could not verify this command against the host mutation policy. Review it carefully before running it.',
+    };
   }
-  return null;
 }
 
 // ─── Danger Warning Modal ────────────────────────────────────────
-function DangerWarningModal({ command, message, onConfirm, onCancel }: {
-  command: string; message: string; onConfirm: () => void; onCancel: () => void;
+export function DangerWarningModal({ command, message, confirmation, onConfirm, onCancel }: {
+  command: string;
+  message: string;
+  confirmation: 'explicit' | 'typed';
+  onConfirm: () => void | Promise<void>;
+  onCancel: () => void;
 }) {
+  const [typedConfirmation, setTypedConfirmation] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const submittedRef = useRef(false);
+  const typedInputRef = useRef<HTMLInputElement>(null);
+  const cancelButtonRef = useRef<HTMLButtonElement>(null);
+  const requiresTyping = confirmation === 'typed';
+  const confirmOnce = useCallback(async () => {
+    if (
+      submittedRef.current ||
+      submitting ||
+      (requiresTyping && typedConfirmation !== 'RUN')
+    ) {
+      return;
+    }
+    submittedRef.current = true;
+    setSubmitting(true);
+    try {
+      await onConfirm();
+    } finally {
+      setSubmitting(false);
+    }
+  }, [onConfirm, requiresTyping, submitting, typedConfirmation]);
+
+  useEffect(() => {
+    submittedRef.current = false;
+    setSubmitting(false);
+    setTypedConfirmation('');
+  }, [command, confirmation, message]);
+
   return (
-    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-      className="fixed inset-0 z-[110] flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={onCancel}>
+    <ViewportModal
+      open
+      onDismiss={onCancel}
+      dismissible={!submitting}
+      initialFocusRef={requiresTyping ? typedInputRef : cancelButtonRef}
+      className="bg-black/70 px-4 py-6 backdrop-blur-sm"
+    >
       <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }}
         className="bg-[#1A0A0A] border-2 border-red-500/40 rounded-2xl p-6 max-w-md w-full mx-4 shadow-[0_0_60px_rgba(239,68,68,0.15)]"
-        onClick={e => e.stopPropagation()}>
+        role="alertdialog" aria-modal="true" aria-labelledby="terminal-confirm-title" aria-describedby="terminal-confirm-description"
+        aria-busy={submitting}>
         <div className="flex items-center gap-3 mb-4">
           <div className="w-12 h-12 rounded-xl bg-red-500/15 border border-red-500/30 flex items-center justify-center">
             <ShieldAlert size={24} className="text-red-400" />
           </div>
           <div>
-            <h3 className="text-lg font-bold text-red-400">⚠️ DANGEROUS COMMAND</h3>
-            <p className="text-xs text-red-300/60">This action may be destructive</p>
+            <h3 id="terminal-confirm-title" className="text-lg font-bold text-red-400">Confirm host command</h3>
+            <p className="text-xs text-red-300/60">This Terminal has full server access</p>
           </div>
         </div>
         <div className="bg-red-500/5 border border-red-500/20 rounded-xl p-3 mb-4">
           <code className="text-sm font-mono text-red-300 break-all">{command}</code>
         </div>
-        <p className="text-sm text-slate-300 mb-6">{message}</p>
+        <p id="terminal-confirm-description" className="text-sm text-slate-300 mb-4">{message}</p>
+        {requiresTyping && (
+          <label className="block mb-4 text-xs text-red-200/80">
+            Type <strong>RUN</strong> to confirm this destructive command
+            <input ref={typedInputRef} value={typedConfirmation} onChange={(event) => setTypedConfirmation(event.target.value)}
+              onKeyDown={(event) => { if (event.key === 'Enter' && typedConfirmation === 'RUN') void confirmOnce(); }}
+              disabled={submitting}
+              className="mt-2 w-full rounded-lg border border-red-500/30 bg-black/30 px-3 py-2 font-mono text-sm text-white outline-none focus:border-red-400"
+              aria-label="Type RUN to confirm" />
+          </label>
+        )}
         <div className="flex gap-3">
-          <button onClick={onCancel} className="flex-1 py-2.5 rounded-xl bg-white/5 border border-white/10 text-slate-300 text-sm font-medium hover:bg-white/10 transition-colors">Cancel</button>
-          <button onClick={onConfirm} className="flex-1 py-2.5 rounded-xl bg-red-500/20 border border-red-500/40 text-red-400 text-sm font-medium hover:bg-red-500/30 transition-colors">Run Anyway</button>
+          <button ref={cancelButtonRef} type="button" onClick={onCancel} disabled={submitting}
+            className="flex-1 py-2.5 rounded-xl bg-white/5 border border-white/10 text-slate-300 text-sm font-medium hover:bg-white/10 transition-colors disabled:cursor-not-allowed disabled:opacity-40">Cancel</button>
+          <button type="button" onClick={() => { void confirmOnce(); }}
+            disabled={submitting || (requiresTyping && typedConfirmation !== 'RUN')}
+            className="flex-1 py-2.5 rounded-xl bg-red-500/20 border border-red-500/40 text-red-400 text-sm font-medium hover:bg-red-500/30 transition-colors disabled:cursor-not-allowed disabled:opacity-30">
+            {submitting ? 'Running…' : 'Run command'}
+          </button>
         </div>
       </motion.div>
-    </motion.div>
+    </ViewportModal>
   );
 }
 
@@ -524,51 +198,11 @@ function extractKeywordsFromBuffer(buffer: string): string[] {
   return Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 15).map(([w]) => w);
 }
 
-function localLookupSearch(query: string, contextKeywords: string[]): AutocompleteSuggestion[] {
-  const q = query.toLowerCase().trim();
-  const isEmptyQuery = !q;
-  const qWords = isEmptyQuery ? [] : q.split(/\s+/);
-
-  // Score each command
-  const scored = AUTOCOMPLETE_DB.map(cmd => {
-    const cmdLower = cmd.command.toLowerCase();
-    const descLower = cmd.description.toLowerCase();
-    const catLower = cmd.category.toLowerCase();
-    let score = 0;
-
-    // Exact prefix match on command
-    if (cmdLower.startsWith(q)) score += 100;
-    // Each query word matches command or description
-    qWords.forEach(w => {
-      if (cmdLower.includes(w)) score += 30;
-      if (descLower.includes(w)) score += 20;
-      if (catLower.includes(w)) score += 15;
-    });
-    // Tag/category exact match
-    if (catLower === q) score += 50;
-
-    // Context boost: terminal buffer keywords significantly boost matching commands
-    let contextBoost = 0;
-    contextKeywords.forEach(kw => {
-      if (catLower === kw) contextBoost += 25;
-      else if (catLower.includes(kw)) contextBoost += 15;
-      if (cmdLower.includes(kw)) contextBoost += 10;
-    });
-    score += contextBoost;
-
-    // For empty query, give a small base score to popular/common commands
-    if (isEmptyQuery && contextBoost > 0) score += 5;
-
-    return { cmd, score };
-  }).filter(s => s.score > 0).sort((a, b) => b.score - a.score);
-
-  return scored.slice(0, 20).map(s => s.cmd);
-}
-
 // ─── Assistant Side Panel ────────────────────────────────────────
-function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEnabled, setContextEnabled }: {
+function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEnabled, setContextEnabled, catalog, contextKey, isMobile, onBusyChange }: {
   isOpen: boolean; onClose: () => void; onInsert: (cmd: string) => void; getFullBuffer: () => string;
-  contextEnabled: boolean; setContextEnabled: (v: boolean) => void;
+  contextEnabled: boolean; setContextEnabled: (v: boolean) => void; catalog: AutocompleteSuggestion[];
+  contextKey: string; isMobile: boolean; onBusyChange: (busy: boolean) => void;
 }) {
   const [activeTab, setActiveTab] = useState<'lookup' | 'aidebug'>('lookup');
   const [query, setQuery] = useState('');
@@ -581,7 +215,6 @@ function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEna
   // AI Debug state
   const [aiDebugModel, setAiDebugModel] = useState<string>('');
   const [aiDebugTier, setAiDebugTier] = useState<string>('smart');
-  const [ollamaModels, setOllamaModels] = useState<string[]>([]);
   const [debugLoading, setDebugLoading] = useState(false);
   const [debugResults, setDebugResults] = useState<LookupCommand[]>([]);
   const [debugSummary, setDebugSummary] = useState('');
@@ -590,61 +223,141 @@ function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEna
   const [debugIncludeContext, setDebugIncludeContext] = useState(true);
   const inputRef = useRef<HTMLInputElement>(null);
   const debugInputRef = useRef<HTMLInputElement>(null);
+  const debugAttemptRef = useRef<Readonly<{
+    contextKey: string;
+    query: string;
+    context?: string;
+    model?: string;
+    tier?: string;
+  }> | null>(null);
+  const currentContextKeyRef = useRef(contextKey);
+  const mountedRef = useRef(true);
+  const onBusyChangeRef = useRef(onBusyChange);
+  currentContextKeyRef.current = contextKey;
+  onBusyChangeRef.current = onBusyChange;
+
+  useEffect(() => () => {
+    mountedRef.current = false;
+    if (debugAttemptRef.current) {
+      debugAttemptRef.current = null;
+      onBusyChangeRef.current(false);
+    }
+  }, []);
 
   useEffect(() => {
-    if (isOpen && activeTab === 'lookup') setTimeout(() => inputRef.current?.focus(), 100);
-    if (isOpen && activeTab === 'aidebug') setTimeout(() => debugInputRef.current?.focus(), 100);
+    if (!isOpen) return undefined;
+    const focusTimer = setTimeout(() => {
+      if (activeTab === 'lookup') inputRef.current?.focus();
+      else debugInputRef.current?.focus();
+    }, 100);
+    return () => clearTimeout(focusTimer);
   }, [isOpen, activeTab]);
 
   // Live local search for Lookup tab
   useEffect(() => {
-    const contextKeywords = includeContext ? extractKeywordsFromBuffer(getFullBuffer()) : [];
-    setLookupResults(localLookupSearch(query, contextKeywords));
-  }, [query, includeContext]);
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      const contextKeywords = includeContext ? extractKeywordsFromBuffer(getFullBuffer()) : [];
+      let runtimeMatches: AutocompleteSuggestion[] = [];
+      if (query.trim()) {
+        try {
+          const data = await terminalAPI.autocomplete(query, 30);
+          runtimeMatches = Array.isArray(data?.suggestions) ? data.suggestions : [];
+        } catch {
+          // The cached runtime catalog remains available below.
+        }
+      }
+      if (cancelled) return;
+      const merged = [...runtimeMatches, ...catalog.filter((entry) => !runtimeMatches.some((match) => match.command === entry.command))];
+      setLookupResults(rankTerminalCatalog(query, contextKeywords, merged));
+    }, 140);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [query, includeContext, catalog, getFullBuffer]);
 
   // AI Debug: calls Ollama via backend
   const doAIDebug = async () => {
-    if (!debugQuery.trim()) return;
-    setDebugLoading(true); setDebugError(''); setDebugResults([]);
+    const querySnapshot = debugQuery.trim();
+    if (!querySnapshot || debugAttemptRef.current) return;
+    const snapshot = Object.freeze({
+      contextKey,
+      query: querySnapshot,
+      context: debugIncludeContext ? getFullBuffer() : undefined,
+      model: aiDebugModel || undefined,
+      tier: aiDebugTier || undefined,
+    });
+    debugAttemptRef.current = snapshot;
+    onBusyChange(true);
+    setDebugLoading(true);
+    setDebugError('');
+    setDebugResults([]);
+    setDebugSummary('');
     try {
-      const contextToSend = debugIncludeContext ? getFullBuffer() : undefined;
-      const data = await terminalAPI.lookup(debugQuery, contextToSend, aiDebugModel || undefined, aiDebugTier || undefined);
+      const data = await terminalAPI.lookup(snapshot.query, snapshot.context, snapshot.model, snapshot.tier);
+      if (
+        debugAttemptRef.current !== snapshot
+        || currentContextKeyRef.current !== snapshot.contextKey
+        || !mountedRef.current
+      ) return;
       if (data.commands?.length > 0) { setDebugResults(data.commands); setDebugSummary(data.summary || ''); }
       else setDebugError(data.summary || 'No commands found. Try rephrasing.');
-    } catch { setDebugError('Failed to reach AI service. Is Ollama running?'); }
-    finally { setDebugLoading(false); }
+    } catch {
+      if (
+        debugAttemptRef.current === snapshot
+        && currentContextKeyRef.current === snapshot.contextKey
+        && mountedRef.current
+      ) setDebugError(
+        'Failed to reach the configured Ollama backend. Check Settings → AI Providers and retry.',
+      );
+    } finally {
+      if (debugAttemptRef.current === snapshot) {
+        debugAttemptRef.current = null;
+        onBusyChange(false);
+        if (mountedRef.current) setDebugLoading(false);
+      }
+    }
   };
 
   if (!isOpen) return null;
 
-  return (
+  const requestClose = () => {
+    if (!debugAttemptRef.current) onClose();
+  };
+
+  const panel = (
     <motion.div
-      initial={window.innerWidth < 768 ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
-      animate={window.innerWidth < 768 ? { opacity: 1, x: 0 } : { width: 360, opacity: 1 }}
-      exit={window.innerWidth < 768 ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
+      initial={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
+      animate={isMobile ? { opacity: 1, x: 0 } : { width: 360, opacity: 1 }}
+      exit={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
       transition={{ type: 'spring', damping: 25, stiffness: 300 }}
-      className={window.innerWidth < 768
-        ? 'fixed inset-0 z-[60] flex flex-col bg-[#0D1130]/98 backdrop-blur-xl'
-        : 'border-l border-white/5 flex flex-col bg-[#0D1130]/95 flex-shrink-0 overflow-hidden backdrop-blur-xl z-[60]'}>
+      role={isMobile ? 'dialog' : 'complementary'}
+      aria-modal={isMobile ? 'true' : undefined}
+      aria-label="Terminal assistant"
+      aria-busy={debugLoading}
+      className={isMobile
+        ? 'flex h-full w-full flex-col bg-[#0D1130]/98 backdrop-blur-xl'
+        : 'z-[60] flex w-[360px] flex-shrink-0 flex-col overflow-hidden border-l border-white/5 bg-[#0D1130]/95 backdrop-blur-xl'}>
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-white/5">
         <div className="flex items-center gap-2">
           <Sparkles size={16} className="text-emerald-400" />
           <span className="text-sm font-semibold text-white">Assistant</span>
         </div>
-        <button onClick={onClose} className="p-1 rounded-lg hover:bg-white/5 text-slate-500 hover:text-white transition-colors">
+        <button aria-label="Close terminal assistant" onClick={requestClose} disabled={debugLoading} className="p-1 rounded-lg hover:bg-white/5 text-slate-500 hover:text-white transition-colors disabled:cursor-wait disabled:opacity-40">
           <X size={16} />
         </button>
       </div>
 
       {/* Tabs */}
       <div className="flex border-b border-white/5">
-        <button onClick={() => setActiveTab('lookup')}
-          className={`flex-1 py-2 text-xs font-medium transition-all ${activeTab === 'lookup' ? 'text-emerald-400 border-b-2 border-emerald-400 bg-emerald-500/5' : 'text-slate-500 hover:text-slate-300'}`}>
+        <button onClick={() => setActiveTab('lookup')} disabled={debugLoading}
+          className={`flex-1 py-2 text-xs font-medium transition-all ${activeTab === 'lookup' ? 'accent-active border-b-2' : 'text-slate-500 hover:text-slate-300'}`}>
           <Search size={12} className="inline mr-1.5" />Lookup
         </button>
-        <button onClick={() => setActiveTab('aidebug')}
-          className={`flex-1 py-2 text-xs font-medium transition-all ${activeTab === 'aidebug' ? 'text-purple-400 border-b-2 border-purple-400 bg-purple-500/5' : 'text-slate-500 hover:text-slate-300'}`}>
+        <button onClick={() => setActiveTab('aidebug')} disabled={debugLoading}
+          className={`flex-1 py-2 text-xs font-medium transition-all ${activeTab === 'aidebug' ? 'accent-active border-b-2' : 'text-slate-500 hover:text-slate-300'}`}>
           <AlertTriangle size={12} className="inline mr-1.5" />AI Debug
         </button>
       </div>
@@ -655,18 +368,18 @@ function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEna
           {/* Search input */}
           <div className="flex items-center gap-2 px-3 py-2 border-b border-white/5">
             <Search size={12} className="text-slate-500 flex-shrink-0" />
-            <input ref={inputRef} value={query} onChange={e => setQuery(e.target.value)}
+            <input ref={inputRef} aria-label="Search terminal commands" value={query} onChange={e => setQuery(e.target.value)}
               placeholder="Search commands (e.g. docker, disk, nginx)..."
               className="flex-1 bg-transparent text-xs text-white placeholder-slate-500 outline-none" />
-            {query && <button onClick={() => setQuery('')} className="text-slate-500 hover:text-white"><XCircle size={12} /></button>}
+            {query && <button aria-label="Clear command search" onClick={() => setQuery('')} className="text-slate-500 hover:text-white"><XCircle size={12} /></button>}
           </div>
 
           {/* Context toggle */}
           <div className="px-3 py-1.5 border-b border-white/5 flex items-center justify-between">
-            <label className="flex items-center gap-1.5 cursor-pointer select-none" onClick={() => { const next = !includeContext; next ? sounds.toggleOn() : sounds.toggleOff(); setIncludeContext(next); }}>
+            <button type="button" aria-pressed={includeContext} className="flex items-center gap-1.5 cursor-pointer select-none" onClick={() => { const next = !includeContext; if (next) sounds.toggleOn(); else sounds.toggleOff(); setIncludeContext(next); }}>
               {includeContext ? <ToggleRight size={14} className="text-emerald-400" /> : <ToggleLeft size={14} className="text-slate-500" />}
               <span className="text-[10px] font-medium text-slate-400">📋 Context boost</span>
-            </label>
+            </button>
             <span className="text-[9px] text-slate-600">{includeContext ? '✅ Biased by terminal (+ chat box)' : '⚡ All commands'}</span>
           </div>
 
@@ -675,11 +388,11 @@ function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEna
             {!query && lookupResults.length === 0 && (
               <div className="px-3 py-6 text-center">
                 <Command size={24} className="mx-auto mb-2 text-slate-600" />
-                <p className="text-[11px] text-slate-500 mb-1">Local Command Search</p>
-                <p className="text-[10px] text-slate-600 mb-3">{AUTOCOMPLETE_DB.length} commands · Instant results · No AI calls</p>
+                <p className="text-[11px] text-slate-500 mb-1">Runtime Command Search</p>
+                <p className="text-[10px] text-slate-600 mb-3">{catalog.length} current actions and discoveries · No AI call</p>
                 <p className="text-[10px] text-slate-500 mb-2">{includeContext ? '💡 Enable context boost & run some commands to see ranked suggestions here' : '💡 Turn on Context boost to see ranked suggestions'}</p>
                 <div className="flex flex-wrap gap-1.5 justify-center">
-                  {['openclaw', 'docker', 'nginx', 'git', 'disk', 'network'].map(ex => (
+                  {[...new Set(catalog.map((entry) => entry.category))].slice(0, 6).map(ex => (
                     <button key={ex} onClick={() => setQuery(ex)}
                       className="px-2 py-0.5 rounded-lg bg-white/5 text-[10px] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">{ex}</button>
                   ))}
@@ -728,9 +441,9 @@ function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEna
           <div className="px-3 py-2 border-t border-white/5">
             <span className="text-[9px] text-slate-600 uppercase tracking-wider">Quick</span>
             <div className="flex flex-wrap gap-1 mt-1">
-              {['ls -la', 'git status', 'docker ps', 'df -h', 'free -h'].map(cmd => (
-                <button key={cmd} onClick={() => onInsert(cmd)}
-                  className="px-1.5 py-0.5 rounded bg-white/5 text-[9px] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors font-mono">{cmd}</button>
+              {catalog.filter((entry) => entry.source === 'action' && entry.risk === 'read_only').slice(0, 5).map(entry => (
+                <button key={entry.command} onClick={() => onInsert(entry.command)} title={entry.description}
+                  className="px-1.5 py-0.5 rounded bg-white/5 text-[9px] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors font-mono">{entry.category}</button>
               ))}
             </div>
           </div>
@@ -742,24 +455,33 @@ function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEna
         <div className="flex-1 flex flex-col min-h-0">
           {/* Search input */}
           <div className="flex items-center gap-2 px-3 py-2 border-b border-white/5">
-            <input ref={debugInputRef} value={debugQuery} onChange={e => setDebugQuery(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') doAIDebug(); }}
+            <input ref={debugInputRef} aria-label="Describe a terminal problem" value={debugQuery} disabled={debugLoading} onChange={e => setDebugQuery(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void doAIDebug(); } }}
               placeholder="Describe your problem or what you want to do..."
               className="flex-1 bg-transparent text-xs text-white placeholder-slate-500 outline-none" />
-            {debugLoading ? <Loader2 size={14} className="text-purple-400 animate-spin" /> :
-              <button onClick={doAIDebug} disabled={debugLoading} className="px-2.5 py-1 rounded-lg bg-purple-500/20 text-purple-300 text-[10px] font-medium hover:bg-purple-500/30 transition-colors disabled:opacity-40">Debug</button>}
+            <button
+              type="button"
+              aria-busy={debugLoading}
+              aria-label={debugLoading ? 'Debugging terminal context' : 'Debug terminal context'}
+              onClick={() => { void doAIDebug(); }}
+              disabled={debugLoading || !debugQuery.trim()}
+              className="inline-flex min-w-[84px] items-center justify-center gap-1.5 rounded-lg bg-purple-500/20 px-2.5 py-1 text-[10px] font-medium text-purple-300 transition-colors hover:bg-purple-500/30 disabled:cursor-wait disabled:opacity-40"
+            >
+              {debugLoading && <Loader2 size={12} className="animate-spin" />}
+              {debugLoading ? 'Debugging…' : 'Debug'}
+            </button>
           </div>
 
           {/* Model tier toggle: Snappy / Smart / Best */}
           <div className="px-3 py-1.5 border-b border-white/5 flex items-center justify-between">
             <div className="flex items-center gap-1 bg-white/5 rounded-lg p-0.5">
-              <button onClick={() => { setAiDebugTier('snappy'); setAiDebugModel(''); }}
+              <button onClick={() => { setAiDebugTier('snappy'); setAiDebugModel(''); }} disabled={debugLoading}
                 className={`px-2 py-0.5 rounded-md text-[10px] font-medium transition-all ${aiDebugTier === 'snappy' ? 'bg-emerald-500/20 text-emerald-400 shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}
                 title="Snappy — fastest responses">⚡ Snappy</button>
-              <button onClick={() => { setAiDebugTier('smart'); setAiDebugModel(''); }}
+              <button onClick={() => { setAiDebugTier('smart'); setAiDebugModel(''); }} disabled={debugLoading}
                 className={`px-2 py-0.5 rounded-md text-[10px] font-medium transition-all ${aiDebugTier === 'smart' ? 'bg-cyan-500/20 text-cyan-400 shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}
                 title="Smart — balanced speed and quality">🧠 Smart</button>
-              <button onClick={() => { setAiDebugTier('best'); setAiDebugModel(''); }}
+              <button onClick={() => { setAiDebugTier('best'); setAiDebugModel(''); }} disabled={debugLoading}
                 className={`px-2 py-0.5 rounded-md text-[10px] font-medium transition-all ${aiDebugTier === 'best' ? 'bg-violet-500/20 text-violet-400 shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}
                 title="Best — highest quality analysis">🏆 Best</button>
             </div>
@@ -768,10 +490,10 @@ function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEna
 
           {/* Context toggle */}
           <div className="px-3 py-1.5 border-b border-white/5 flex items-center justify-between">
-            <label className="flex items-center gap-1.5 cursor-pointer select-none" onClick={() => { const next = !debugIncludeContext; next ? sounds.toggleOn() : sounds.toggleOff(); setDebugIncludeContext(next); }}>
+            <button type="button" aria-pressed={debugIncludeContext} disabled={debugLoading} className="flex items-center gap-1.5 cursor-pointer select-none disabled:cursor-wait disabled:opacity-40" onClick={() => { const next = !debugIncludeContext; if (next) sounds.toggleOn(); else sounds.toggleOff(); setDebugIncludeContext(next); }}>
               {debugIncludeContext ? <ToggleRight size={14} className="text-purple-400" /> : <ToggleLeft size={14} className="text-slate-500" />}
               <span className="text-[10px] font-medium text-slate-400">📋 Include terminal buffer</span>
-            </label>
+            </button>
             <span className="text-[9px] text-slate-600">{debugIncludeContext ? '✅ Context-aware' : '⚡ Fast'}</span>
           </div>
 
@@ -801,7 +523,7 @@ function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEna
               <div>
                 {debugSummary && <div className="px-3 pt-2 pb-1 text-[10px] text-slate-400">{debugSummary}</div>}
                 {debugResults.map((r, i) => {
-                  const danger = detectDanger(r.command);
+                  const requiresConfirmation = r.risk === 'destructive' || r.risk === 'service_change';
                   return (
                     <div key={i} className="px-3 py-2 border-b border-white/5 last:border-0 hover:bg-white/[0.02] group">
                       <div className="flex items-center justify-between gap-2">
@@ -812,9 +534,9 @@ function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEna
                         </button>
                       </div>
                       <p className="text-[10px] text-slate-500 mt-0.5">{r.explanation}</p>
-                      {(r.warning || danger) && (
+                      {(r.warning || requiresConfirmation) && (
                         <div className="flex items-center gap-1 mt-1 text-[10px] text-amber-400">
-                          <AlertTriangle size={10} />{r.warning || danger?.message}
+                          <AlertTriangle size={10} />{r.warning || 'Portal will ask for confirmation before this host-changing command runs.'}
                         </div>
                       )}
                     </div>
@@ -827,12 +549,27 @@ function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEna
       )}
     </motion.div>
   );
+
+  if (!isMobile) return panel;
+
+  return (
+    <ViewportModal
+      open={isOpen}
+      onDismiss={requestClose}
+      dismissible={!debugLoading}
+      initialFocusRef={activeTab === 'lookup' ? inputRef : debugInputRef}
+      className="items-stretch justify-stretch bg-[#0D1130]/98 backdrop-blur-xl"
+    >
+      {panel}
+    </ViewportModal>
+  );
 }
 
 // ─── Chat Box Input with Autocomplete ────────────────────────────
-function ChatBoxInput({ onSubmit, onInputChange, connected, running, externalClear, inputMode, onFocusChatBox, contextEnabled, getFullBuffer }: {
+function ChatBoxInput({ onSubmit, onInputChange, connected, running, externalClear, inputMode, onFocusChatBox, contextEnabled, getFullBuffer, catalog }: {
   onSubmit: (cmd: string) => void; onInputChange: (value: string) => void; connected: boolean; running: boolean; externalClear?: number;
   inputMode: 'chat' | 'terminal'; onFocusChatBox: () => void; contextEnabled: boolean; getFullBuffer: () => string;
+  catalog: AutocompleteSuggestion[];
 }) {
   const [value, setValue] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
@@ -841,6 +578,21 @@ function ChatBoxInput({ onSubmit, onInputChange, connected, running, externalCle
   const [chatAcIndex, setChatAcIndex] = useState(0);
   const [chatAcVisible, setChatAcVisible] = useState(false);
   const [sentFlash, setSentFlash] = useState(false);
+  const sentFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refocusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (sentFlashTimerRef.current) clearTimeout(sentFlashTimerRef.current);
+    if (refocusTimerRef.current) clearTimeout(refocusTimerRef.current);
+  }, []);
+
+  const flashAndRefocus = () => {
+    setSentFlash(true);
+    if (sentFlashTimerRef.current) clearTimeout(sentFlashTimerRef.current);
+    if (refocusTimerRef.current) clearTimeout(refocusTimerRef.current);
+    sentFlashTimerRef.current = setTimeout(() => setSentFlash(false), 800);
+    refocusTimerRef.current = setTimeout(() => inputRef.current?.focus(), 50);
+  };
 
   useEffect(() => {
     if (externalClear && externalClear !== lastClearRef.current) {
@@ -852,30 +604,38 @@ function ChatBoxInput({ onSubmit, onInputChange, connected, running, externalCle
   // Update autocomplete as user types
   useEffect(() => {
     if (value.length < 1) { setChatAcVisible(false); return; }
-    const contextKeywords = contextEnabled ? extractKeywordsFromBuffer(getFullBuffer()) : [];
-    const results = localLookupSearch(value, contextKeywords);
-    if (results.length > 0) {
-      setChatAcResults(results.slice(0, 8));
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      const contextKeywords = contextEnabled ? extractKeywordsFromBuffer(getFullBuffer()) : [];
+      let runtimeMatches: AutocompleteSuggestion[] = [];
+      try {
+        const data = await terminalAPI.autocomplete(value, 12);
+        runtimeMatches = Array.isArray(data?.suggestions) ? data.suggestions : [];
+      } catch {
+        // The cached capability catalog is the offline fallback.
+      }
+      if (cancelled) return;
+      const merged = [...runtimeMatches, ...catalog.filter((entry) => !runtimeMatches.some((match) => match.command === entry.command))];
+      const results = rankTerminalCatalog(value, contextKeywords, merged, 8);
+      setChatAcResults(results);
       setChatAcIndex(0);
-      setChatAcVisible(true);
-    } else {
-      setChatAcVisible(false);
-    }
-  }, [value, contextEnabled]);
+      setChatAcVisible(results.length > 0);
+    }, 140);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [value, contextEnabled, getFullBuffer, catalog]);
 
   const handleSubmit = () => {
     if (!value.trim()) return;
     onSubmit(value); setValue(''); onInputChange(''); setChatAcVisible(false);
-    setSentFlash(true);
-    setTimeout(() => setSentFlash(false), 800);
-    setTimeout(() => inputRef.current?.focus(), 50);
+    flashAndRefocus();
   };
 
   const selectSuggestion = (cmd: string) => {
     onSubmit(cmd); setValue(''); onInputChange(''); setChatAcVisible(false);
-    setSentFlash(true);
-    setTimeout(() => setSentFlash(false), 800);
-    setTimeout(() => inputRef.current?.focus(), 50);
+    flashAndRefocus();
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -927,10 +687,10 @@ function ChatBoxInput({ onSubmit, onInputChange, connected, running, externalCle
                 return (
                   <button key={s.command} onClick={() => selectSuggestion(s.command)}
                     className={`w-full flex items-center gap-2 px-3 py-1.5 text-left transition-all ${
-                      i === chatAcIndex ? 'bg-emerald-500/10 border-l-2 border-emerald-400' : 'hover:bg-white/[0.03] border-l-2 border-transparent'
+                      i === chatAcIndex ? 'accent-active border-l-2' : 'hover:bg-white/[0.03] border-l-2 border-transparent'
                     }`}>
                     <span className={`px-1 py-0.5 rounded text-[7px] font-medium uppercase ${catColor} flex-shrink-0`}>{s.category}</span>
-                    <code className={`text-[11px] font-mono flex-1 truncate ${i === chatAcIndex ? 'text-emerald-400' : 'text-slate-300'}`}>{s.command}</code>
+                    <code className={`text-[11px] font-mono flex-1 truncate ${i === chatAcIndex ? 'accent-text' : 'text-slate-300'}`}>{s.command}</code>
                     {s.dangerous && <AlertTriangle size={10} className="text-red-400 flex-shrink-0" />}
                     <span className="text-[9px] text-slate-600 truncate max-w-[120px]">{s.description}</span>
                   </button>
@@ -959,6 +719,7 @@ function ChatBoxInput({ onSubmit, onInputChange, connected, running, externalCle
           onChange={e => { setValue(e.target.value); onInputChange(e.target.value); }}
           onKeyDown={handleKeyDown}
           onFocus={onFocusChatBox}
+          aria-label="Terminal command"
           placeholder={connected ? (running ? 'Command running… (click terminal for interactive)' : 'Type a command… or click terminal for direct input') : 'Disconnected...'}
           disabled={!connected}
           className={`flex-1 bg-transparent text-white font-mono placeholder-slate-600 outline-none caret-emerald-400 transition-opacity ${running ? 'opacity-50' : ''}`}
@@ -1016,15 +777,43 @@ interface PersistedTerminalState {
   activeTabId: string;
 }
 
+function buildDefaultTerminalState(): PersistedTerminalState {
+  const tabId = `tab-${Date.now()}`;
+  return {
+    tabs: [{ id: tabId, label: 'bash', type: 'shell' }],
+    activeTabId: tabId,
+  };
+}
+
+function readPersistedTerminalState(): PersistedTerminalState {
+  try {
+    const raw = sessionStorage.getItem(TERMINAL_STATE_STORAGE_KEY);
+    if (!raw) return buildDefaultTerminalState();
+    const parsed = JSON.parse(raw) as PersistedTerminalState;
+    if (!Array.isArray(parsed?.tabs) || parsed.tabs.length === 0) return buildDefaultTerminalState();
+    const normalizedTabs = parsed.tabs.filter((tab) => (
+      tab?.id && (tab.type === 'shell' || tab.type === 'chat' || tab.type === 'openclaw-tui')
+    ));
+    if (normalizedTabs.length === 0) return buildDefaultTerminalState();
+    const activeTabExists = normalizedTabs.some((tab) => tab.id === parsed.activeTabId);
+    return {
+      tabs: normalizedTabs,
+      activeTabId: activeTabExists ? parsed.activeTabId : normalizedTabs[0].id,
+    };
+  } catch {
+    return buildDefaultTerminalState();
+  }
+}
+
 // ─── Independent Shell Tab Component ─────────────────────────────
 // Each instance creates its own PTY socket + xterm terminal.
 // The div persists; parent shows/hides via CSS.
-function ShellTabSession({ tabId, isActive, onConnectionChange, onRunningChange, onDanger, onShowAssistant, acActiveRef, acSelectedIndexRef, setAcSuggestions, setAcSelectedIndex, setAcVisible, setAcInput }: {
+function ShellTabSession({ tabId, isActive, onConnectionChange, onRunningChange, onDanger, onShowAssistant, acActiveRef, acSelectedIndexRef, setAcSuggestions, setAcSelectedIndex, setAcVisible, setAcInput, catalog }: {
   tabId: string;
   isActive: boolean;
   onConnectionChange: (tabId: string, connected: boolean) => void;
   onRunningChange: (tabId: string, running: boolean) => void;
-  onDanger: (cmd: string, message: string) => void;
+  onDanger: (cmd: string, message: string, confirmation?: 'explicit' | 'typed', targetTabId?: string) => void;
   onShowAssistant: (tab?: 'lookup' | 'chat') => void;
   acActiveRef: React.MutableRefObject<boolean>;
   acSelectedIndexRef: React.MutableRefObject<number>;
@@ -1032,13 +821,15 @@ function ShellTabSession({ tabId, isActive, onConnectionChange, onRunningChange,
   setAcSelectedIndex: React.Dispatch<React.SetStateAction<number>>;
   setAcVisible: (v: boolean) => void;
   setAcInput: (v: string) => void;
+  catalog: AutocompleteSuggestion[];
 }) {
   const termRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef<TabSession | null>(null);
+  const catalogRef = useRef(catalog);
+  useEffect(() => { catalogRef.current = catalog; }, [catalog]);
 
-  // Expose session for parent to read (terminal, socket, etc.)
-  // We store it on the DOM element as a data attribute workaround,
-  // but better: use a ref map in parent. We'll use a global map.
+  // Register the session in the shared map so tab-level controls address the
+  // exact terminal and socket pair owned by this pane.
   useEffect(() => {
     if (!termRef.current) return;
 
@@ -1046,13 +837,13 @@ function ShellTabSession({ tabId, isActive, onConnectionChange, onRunningChange,
       theme: XTERM_THEME,
       fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", monospace',
       fontSize: 14, lineHeight: 1.4, cursorBlink: true, cursorStyle: 'bar',
-      allowProposedApi: true, scrollback: 5000, convertEol: true,
+      allowProposedApi: true, scrollback: 3000, convertEol: true,
     });
 
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(termRef.current);
-    setTimeout(() => fit.fit(), 100);
+    const initialFitTimer = setTimeout(() => { try { fit.fit(); } catch {} }, 100);
 
     const wsUrl = API_URL.replace(/\/api$/, '');
     const socket = io(`${wsUrl}/terminal`, {
@@ -1067,6 +858,44 @@ function ShellTabSession({ tabId, isActive, onConnectionChange, onRunningChange,
     sessionRef.current = session;
     // Register in global map so parent can access
     tabSessionMap.set(tabId, session);
+    let autocompleteTimer: ReturnType<typeof setTimeout> | null = null;
+    let autocompleteGeneration = 0;
+    let latestSuggestions: AutocompleteSuggestion[] = [];
+    let disposed = false;
+    let classificationPending = false;
+    let bracketedPasteState = createBracketedPasteState();
+    let bracketedMarkerTimer: ReturnType<typeof setTimeout> | null = null;
+    let loosePasteBuffer = '';
+    let loosePasteTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const scheduleAutocomplete = () => {
+      if (autocompleteTimer) clearTimeout(autocompleteTimer);
+      const input = session.inputBuffer.trim();
+      if (!input) {
+        latestSuggestions = [];
+        setAcSuggestions([]);
+        setAcVisible(false);
+        acActiveRef.current = false;
+        return;
+      }
+      const generation = ++autocompleteGeneration;
+      autocompleteTimer = setTimeout(async () => {
+        let suggestions: AutocompleteSuggestion[] = [];
+        try {
+          const data = await terminalAPI.autocomplete(input, 10);
+          suggestions = Array.isArray(data?.suggestions) ? data.suggestions : [];
+        } catch {
+          suggestions = rankTerminalCatalog(input, [], catalogRef.current, 10);
+        }
+        if (disposed || generation !== autocompleteGeneration) return;
+        latestSuggestions = suggestions;
+        setAcSuggestions(suggestions);
+        setAcSelectedIndex(0);
+        setAcInput(input);
+        setAcVisible(suggestions.length > 0);
+        acActiveRef.current = suggestions.length > 0;
+      }, 140);
+    };
 
     socket.on('connect', () => {
       const resumedAfterDisconnect = reconnectAttempt > 0;
@@ -1087,7 +916,7 @@ function ShellTabSession({ tabId, isActive, onConnectionChange, onRunningChange,
       } else {
         term.writeln('\x1b[32m ✓ Connected to Terminal\x1b[0m');
         term.writeln('\x1b[38;5;240m   Ctrl+K → AI Lookup  ·  Ctrl+T → New Tab\x1b[0m');
-        term.writeln('\x1b[38;5;240m   Ctrl+` → Assistant  ·  ⚠️ Dangerous cmds require confirmation\x1b[0m');
+        term.writeln('\x1b[38;5;240m   HOST OPERATOR  ·  Mutation prompts reduce accidents; this shell is not sandboxed\x1b[0m');
       }
       term.writeln('\x1b[38;5;240m────────────────────────────────────────\x1b[0m\r\n');
     });
@@ -1155,30 +984,146 @@ function ShellTabSession({ tabId, isActive, onConnectionChange, onRunningChange,
 
     // connect_error handled above in reconnection logic
 
-    // Direct typing in xterm
-    term.onData((data) => {
+    const hideAutocomplete = () => {
+      latestSuggestions = [];
+      setAcVisible(false);
+      acActiveRef.current = false;
+    };
+
+    const recordTerminalInput = (data: string) => {
+      if (data === '\x7f' || data === '\b') session.inputBuffer = session.inputBuffer.slice(0, -1);
+      else if (data === '\x15' || data === '\x03') {
+        session.inputBuffer = '';
+        hideAutocomplete();
+      } else {
+        const bufferText = data.length > 1 ? data.replace(/\t/g, ' ') : data;
+        if (bufferText && !bufferText.includes('\x1b') && [...bufferText].every((character) => character.charCodeAt(0) >= 32)) {
+          session.inputBuffer += bufferText;
+        }
+      }
+      scheduleAutocomplete();
+    };
+
+    const applyPasteConfirmation = (paste: string) => {
+      const decision = decideTerminalPaste(session.inputBuffer, paste);
+      if (decision.kind !== 'confirm') return false;
+      // A prefix may already be in Bash's line editor. Remove it so confirming
+      // the reviewed block executes exactly once.
+      socket.emit('input', '\x15');
+      session.inputBuffer = '';
+      hideAutocomplete();
+      onDanger(
+        decision.value,
+        'Pasted content contains one or more command terminators. Review the entire block before it runs on the host.',
+        'typed',
+        tabId,
+      );
+      return true;
+    };
+
+    const flushLoosePaste = () => {
+      if (loosePasteTimer) {
+        clearTimeout(loosePasteTimer);
+        loosePasteTimer = null;
+      }
+      const flushed = flushLooseTerminalPaste(loosePasteBuffer, session.inputBuffer);
+      loosePasteBuffer = flushed.remaining;
+      const { raw } = flushed;
+      if (!raw) return;
+      if (flushed.decision.kind === 'confirm' && applyPasteConfirmation(raw)) return;
+      socket.emit('input', raw);
+      recordTerminalInput(raw);
+    };
+
+    const queueLoosePaste = (data: string) => {
+      loosePasteBuffer = appendLooseTerminalPaste(loosePasteBuffer, data);
+      if (loosePasteTimer) clearTimeout(loosePasteTimer);
+      // Browsers that omit bracketed-paste markers may split one paste over
+      // several onData calls. A short coalescing window prevents duplicate
+      // confirmations while preserving the original byte order.
+      loosePasteTimer = setTimeout(flushLoosePaste, 35);
+    };
+
+    const handleCompletedBracketedPaste = (paste: string) => {
+      const decision = decideTerminalPaste(session.inputBuffer, paste);
+      if (decision.kind === 'confirm') {
+        applyPasteConfirmation(paste);
+        return;
+      }
+      if (decision.kind === 'ignore') return;
+      const framedPaste = `${BRACKETED_PASTE_START}${decision.value}${BRACKETED_PASTE_END}`;
+      socket.emit('input', framedPaste);
+      recordTerminalInput(decision.value);
+    };
+
+    const handleOrdinaryInput = async (data: string) => {
+      if (!data) return;
+      if (loosePasteBuffer || data.length > 1) {
+        queueLoosePaste(data);
+        return;
+      }
       if (data === '\r' || data === '\n') {
         const cmd = session.inputBuffer.trim();
-        const danger = detectDanger(cmd);
-        if (danger && cmd.length > 0) {
-          // Clear the shell's line buffer so the command doesn't persist in the PTY
-          // (characters were already sent keystroke-by-keystroke via socket.emit)
-          socket.emit('input', '\x15'); // Ctrl+U clears line in bash/zsh
-          onDanger(cmd, danger.message);
+        classificationPending = true;
+        const warning = cmd.length > 0 ? await classifyCommandForUi(cmd) : null;
+        classificationPending = false;
+        if (disposed) return;
+        if (warning && cmd.length > 0) {
+          // Characters were already sent one at a time. Remove the pending line
+          // before opening confirmation so it cannot execute a second time.
+          socket.emit('input', '\x15');
+          onDanger(cmd, warning.message, warning.confirmation, tabId);
           session.inputBuffer = '';
-          setAcVisible(false); acActiveRef.current = false;
+          hideAutocomplete();
           return;
         }
         socket.emit('input', data);
         if (cmd) { session.running = true; onRunningChange(tabId, true); }
         session.inputBuffer = '';
-        setAcVisible(false); acActiveRef.current = false;
+        hideAutocomplete();
         return;
       }
       socket.emit('input', data);
-      if (data === '\x7f' || data === '\b') { session.inputBuffer = session.inputBuffer.slice(0, -1); }
-      else if (data === '\x15' || data === '\x03') { session.inputBuffer = ''; setAcVisible(false); }
-      else if (data.length === 1 && data.charCodeAt(0) >= 32) { session.inputBuffer += data; }
+      recordTerminalInput(data);
+    };
+
+    // Direct typing in xterm. The parser is stateful because browsers and
+    // xterm may split both bracketed-paste markers and payloads across events.
+    term.onData(async (data) => {
+      if (classificationPending) return;
+      if (bracketedMarkerTimer) {
+        clearTimeout(bracketedMarkerTimer);
+        bracketedMarkerTimer = null;
+      }
+      const parsed = consumeBracketedPasteChunk(bracketedPasteState, data);
+      bracketedPasteState = parsed.state;
+      for (const event of parsed.events) {
+        if (event.type === 'paste') {
+          // Preserve ordering when ordinary bytes preceded the paste marker.
+          flushLoosePaste();
+          handleCompletedBracketedPaste(event.data);
+        } else {
+          await handleOrdinaryInput(event.data);
+        }
+      }
+      if (bracketedPasteState.pendingMarker) {
+        bracketedMarkerTimer = setTimeout(() => {
+          const pending = bracketedPasteState.pendingMarker;
+          if (!pending) return;
+          if (bracketedPasteState.active) {
+            bracketedPasteState = {
+              ...bracketedPasteState,
+              buffer: bracketedPasteState.buffer + pending,
+              pendingMarker: '',
+            };
+          } else {
+            bracketedPasteState = { ...bracketedPasteState, pendingMarker: '' };
+            socket.emit('input', pending);
+            recordTerminalInput(pending);
+          }
+          bracketedMarkerTimer = null;
+        }, 35);
+      }
     });
 
     term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
@@ -1187,16 +1132,14 @@ function ShellTabSession({ tabId, isActive, onConnectionChange, onRunningChange,
         if (e.key === 'ArrowDown' && e.type === 'keydown') {
           e.preventDefault();
           setAcSelectedIndex(prev => {
-            const s = getLocalSuggestions(session.inputBuffer);
-            return Math.min(s.length - 1, prev + 1);
+            return Math.min(Math.max(0, latestSuggestions.length - 1), prev + 1);
           });
           return false;
         }
         if (e.key === 'Tab' && e.type === 'keydown') {
           e.preventDefault();
-          const s = getLocalSuggestions(session.inputBuffer);
-          if (s.length > 0) {
-            const cmd = s[Math.min(acSelectedIndexRef.current, s.length - 1)]?.command || '';
+          if (latestSuggestions.length > 0) {
+            const cmd = latestSuggestions[Math.min(acSelectedIndexRef.current, latestSuggestions.length - 1)]?.command || '';
             socket.emit('input', '\x15' + cmd);
             session.inputBuffer = cmd;
             setAcVisible(false); acActiveRef.current = false;
@@ -1220,6 +1163,14 @@ function ShellTabSession({ tabId, isActive, onConnectionChange, onRunningChange,
     resizeObs.observe(termRef.current);
 
     return () => {
+      disposed = true;
+      autocompleteGeneration++;
+      if (autocompleteTimer) clearTimeout(autocompleteTimer);
+      if (loosePasteTimer) clearTimeout(loosePasteTimer);
+      if (bracketedMarkerTimer) clearTimeout(bracketedMarkerTimer);
+      loosePasteBuffer = '';
+      bracketedPasteState = createBracketedPasteState();
+      clearTimeout(initialFitTimer);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       clearTimeout(resizeTimeout);
       resizeObs.disconnect();
@@ -1227,15 +1178,17 @@ function ShellTabSession({ tabId, isActive, onConnectionChange, onRunningChange,
       term.dispose();
       tabSessionMap.delete(tabId);
     };
-  }, [tabId, onConnectionChange, onDanger, onRunningChange, onShowAssistant, setAcInput, setAcSelectedIndex, setAcSuggestions, setAcVisible]);
+  }, [acActiveRef, acSelectedIndexRef, tabId, onConnectionChange, onDanger, onRunningChange, onShowAssistant, setAcInput, setAcSelectedIndex, setAcSuggestions, setAcVisible]);
 
   // Re-fit when becoming active or layout changes
   useEffect(() => {
     if (isActive) {
-      setTimeout(() => sessionRef.current?.fitAddon.fit(), 50);
+      const fitTimer = setTimeout(() => { try { sessionRef.current?.fitAddon.fit(); } catch {} }, 50);
       // Focus the terminal
       sessionRef.current?.terminal.focus();
+      return () => clearTimeout(fitTimer);
     }
+    return undefined;
   }, [isActive]);
 
   return (
@@ -1413,6 +1366,9 @@ function OpenClawTUITab({ tabId, isActive, onConnectionChange }: {
   const streamControllerRef = useRef<AbortController | null>(null);
   const statusSocketRef = useRef<Socket | null>(null);
   const selectedSessionRef = useRef('agent:main:main');
+  const loadSessionsRef = useRef<() => Promise<Array<{ key: string; updatedAt?: number; label?: string; agentId?: string }>>>(async () => []);
+  const loadHistoryRef = useRef<(sessionKey?: string) => Promise<void>>(async () => undefined);
+  const pollMessagesRef = useRef<(sessionKey?: string) => Promise<void>>(async () => undefined);
 
   const createFreshSessionKey = useCallback(() => {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1422,10 +1378,12 @@ function OpenClawTUITab({ tabId, isActive, onConnectionChange }: {
 
   // Load history on mount + connect status socket
   useEffect(() => {
-    loadSessions();
-    loadHistory(selectedSessionRef.current);
+    void loadSessionsRef.current();
+    void loadHistoryRef.current(selectedSessionRef.current);
     // Poll for new messages every 3 seconds
-    pollRef.current = setInterval(() => pollMessages(selectedSessionRef.current), 3000);
+    pollRef.current = setInterval(() => {
+      void pollMessagesRef.current(selectedSessionRef.current);
+    }, 3000);
 
     // Connect to OpenClaw status socket
     const statusSocket = io('/openclaw-status', { transports: ['websocket'] });
@@ -1505,7 +1463,7 @@ function OpenClawTUITab({ tabId, isActive, onConnectionChange }: {
       setConnected(true);
       onConnectionChange(tabId, true);
       setError('');
-    } catch (err: any) {
+    } catch {
       setError('Failed to connect to gateway');
       setConnected(false);
       onConnectionChange(tabId, false);
@@ -1550,6 +1508,10 @@ function OpenClawTUITab({ tabId, isActive, onConnectionChange }: {
       };
     });
   };
+
+  loadSessionsRef.current = loadSessions;
+  loadHistoryRef.current = loadHistory;
+  pollMessagesRef.current = pollMessages;
 
   const handleSend = async () => {
     if (!input.trim() || loading) return;
@@ -1788,6 +1750,7 @@ function OpenClawTUITab({ tabId, isActive, onConnectionChange }: {
       {/* Input */}
       <div className="flex items-center gap-2 px-4 py-3 border-t border-white/5 bg-[#080B20]/95 flex-shrink-0">
         <input
+          aria-label="Message terminal assistant"
           ref={inputRef}
           value={input}
           onChange={e => setInput(e.target.value)}
@@ -1798,6 +1761,7 @@ function OpenClawTUITab({ tabId, isActive, onConnectionChange }: {
           style={{ fontSize: '16px' }}
         />
         <button
+          aria-label="Send message to terminal assistant"
           onClick={handleSend}
           disabled={!connected || !input.trim() || loading}
           className="p-2.5 rounded-xl bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 transition-all disabled:opacity-20 border border-emerald-500/20"
@@ -1811,40 +1775,49 @@ function OpenClawTUITab({ tabId, isActive, onConnectionChange }: {
 
 // ─── Main Terminal Page ──────────────────────────────────────────
 export default function TerminalPage() {
+  const isMobile = useIsMobile();
   const [fullscreen, setFullscreen] = useState(false);
   const [showAssistant, setShowAssistant] = useState(false);
+  const [assistantBusy, setAssistantBusy] = useState(false);
+  const assistantBusyRef = useRef(false);
   const [inputMode, setInputMode] = useState<'chat' | 'terminal'>('chat');
   // Shared context toggle for both Lookup and chat box autocomplete
   const [sharedContextEnabled, setSharedContextEnabled] = useState(true);
+  const [capabilities, setCapabilities] = useState<TerminalCapabilities | null>(null);
+  const [capabilityError, setCapabilityError] = useState('');
+  const [capabilityLoading, setCapabilityLoading] = useState(true);
 
-  const buildDefaultState = (): PersistedTerminalState => {
-    const tabId = `tab-${Date.now()}`;
-    return {
-      tabs: [{ id: tabId, label: 'bash', type: 'shell' }],
-      activeTabId: tabId,
-    };
-  };
-
-  const readInitialState = (): PersistedTerminalState => {
+  const loadCapabilities = useCallback(async (refresh = false) => {
+    setCapabilityLoading(true);
     try {
-      const raw = sessionStorage.getItem(TERMINAL_STATE_STORAGE_KEY);
-      if (!raw) return buildDefaultState();
-      const parsed = JSON.parse(raw) as PersistedTerminalState;
-      if (!Array.isArray(parsed?.tabs) || parsed.tabs.length === 0) return buildDefaultState();
-      const normalizedTabs = parsed.tabs.filter((t) => t?.id && (t.type === 'shell' || t.type === 'chat' || t.type === 'openclaw-tui'));
-      if (normalizedTabs.length === 0) return buildDefaultState();
-      const activeTabExists = normalizedTabs.some((t) => t.id === parsed.activeTabId);
-      return {
-        tabs: normalizedTabs,
-        activeTabId: activeTabExists ? parsed.activeTabId : normalizedTabs[0].id,
-      };
+      const data = await terminalAPI.capabilities(refresh);
+      setCapabilities(data as TerminalCapabilities);
+      setCapabilityError('');
     } catch {
-      return buildDefaultState();
+      setCapabilityError('Runtime discovery unavailable; shell access still works.');
+    } finally {
+      setCapabilityLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    terminalAPI.capabilities(false).then((data) => {
+      if (!mounted) return;
+      setCapabilities(data as TerminalCapabilities);
+      setCapabilityError('');
+    }).catch(() => {
+      if (mounted) setCapabilityError('Runtime discovery unavailable; shell access still works.');
+    }).finally(() => {
+      if (mounted) setCapabilityLoading(false);
+    });
+    return () => { mounted = false; };
+  }, []);
+
+  const runtimeCatalog = useMemo<AutocompleteSuggestion[]>(() => buildTerminalCatalog(capabilities), [capabilities]);
 
   // Tabs — lightweight descriptors only, heavy state in tabSessionMap
-  const initialState = useMemo(() => readInitialState(), []);
+  const initialState = useMemo(readPersistedTerminalState, []);
   const [tabs, setTabs] = useState<TabDescriptor[]>(initialState.tabs);
   const [activeTabId, setActiveTabId] = useState(initialState.activeTabId);
 
@@ -1861,15 +1834,17 @@ export default function TerminalPage() {
   useEffect(() => { acSelectedIndexRef.current = acSelectedIndex; }, [acSelectedIndex]);
 
   // Danger warning
-  const [dangerWarning, setDangerWarning] = useState<{ command: string; message: string; tabId: string } | null>(null);
+  const [dangerWarning, setDangerWarning] = useState<{
+    command: string;
+    message: string;
+    tabId: string;
+    confirmation: 'explicit' | 'typed';
+  } | null>(null);
   const [clearTrigger, setClearTrigger] = useState(0);
-
-  const INPUT_BAR_HEIGHT = 48;
 
   const activeState = tabStates[activeTabId] || { connected: false, running: false };
 
   const [showNewTabMenu, setShowNewTabMenu] = useState(false);
-  const newTabMenuRef = useRef<HTMLDivElement>(null);
   const newTabButtonRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
@@ -1882,7 +1857,7 @@ export default function TerminalPage() {
 
   // Create tab
   const createTab = useCallback((type: 'shell' | 'chat' | 'openclaw-tui' = 'shell') => {
-    if (tabs.length >= 5) return;
+    if (assistantBusyRef.current || tabs.length >= 5) return;
     const id = `tab-${Date.now()}`;
     let label: string;
     if (type === 'shell') { const shellCount = tabs.filter(t => t.type === 'shell').length; label = `bash ${shellCount + 1}`; }
@@ -1895,11 +1870,11 @@ export default function TerminalPage() {
 
   // Close tab
   const closeTab = useCallback((tabId: string) => {
-    if (tabs.length <= 1) return;
+    if (assistantBusyRef.current || tabs.length <= 1) return;
     // Session cleanup happens in ShellTabSession's useEffect return
     setTabs(prev => prev.filter(t => t.id !== tabId));
     if (activeTabId === tabId) {
-      setActiveTabId(prev => {
+      setActiveTabId(() => {
         const remaining = tabs.filter(t => t.id !== tabId);
         return remaining[remaining.length - 1]?.id || remaining[0]?.id || '';
       });
@@ -1915,18 +1890,27 @@ export default function TerminalPage() {
     setTabStates(prev => ({ ...prev, [tabId]: { ...prev[tabId], connected: prev[tabId]?.connected || false, running } }));
   }, []);
 
-  const handleDanger = useCallback((cmd: string, message: string) => {
-    setDangerWarning({ command: cmd, message, tabId: activeTabId });
+  const handleDanger = useCallback((cmd: string, message: string, confirmation: 'explicit' | 'typed' = 'typed', targetTabId = activeTabId) => {
+    setDangerWarning({ command: cmd, message, tabId: targetTabId, confirmation });
   }, [activeTabId]);
 
   const handleShowAssistant = useCallback((tab?: 'lookup' | 'chat') => {
+    if (assistantBusyRef.current) return;
     setShowAssistant(prev => tab ? true : !prev);
   }, []);
 
+  const handleAssistantBusyChange = useCallback((busy: boolean) => {
+    assistantBusyRef.current = busy;
+    setAssistantBusy(busy);
+  }, []);
+
   // Execute command on active tab's socket
-  const executeCommand = useCallback((cmd: string) => {
-    const danger = detectDanger(cmd);
-    if (danger) { setDangerWarning({ command: cmd, message: danger.message, tabId: activeTabId }); return; }
+  const executeCommand = useCallback(async (cmd: string) => {
+    const warning = await classifyCommandForUi(cmd);
+    if (warning) {
+      setDangerWarning({ command: cmd, message: warning.message, tabId: activeTabId, confirmation: warning.confirmation });
+      return;
+    }
     const session = tabSessionMap.get(activeTabId);
     if (session) {
       sounds.click();
@@ -1944,6 +1928,13 @@ export default function TerminalPage() {
   const forceExecuteCommand = useCallback(() => {
     if (dangerWarning) {
       const session = tabSessionMap.get(dangerWarning.tabId);
+      if (!session?.connected) {
+        setDangerWarning({
+          ...dangerWarning,
+          message: 'This Terminal disconnected before confirmation. Reconnect, review the command again, then confirm it.',
+        });
+        return;
+      }
       if (session) {
         session.socket.emit('input', dangerWarning.command + '\n');
         session.running = true;
@@ -1957,61 +1948,74 @@ export default function TerminalPage() {
 
   const handleInputBarSubmit = useCallback((cmd: string) => { executeCommand(cmd); }, [executeCommand]);
 
-  const handleInputBarChange = useCallback((value: string) => {
-    if (value.length < 2) { setAcVisible(false); acActiveRef.current = false; return; }
-    const suggestions = getLocalSuggestions(value);
-    if (suggestions.length > 0) {
-      setAcSuggestions(suggestions); setAcSelectedIndex(0); setAcInput(value);
-      setAcVisible(true); acActiveRef.current = true;
-    } else { setAcVisible(false); acActiveRef.current = false; }
+  const handleInputBarChange = useCallback((_value: string) => {
+    // ChatBoxInput owns its debounced runtime suggestions. Hide direct-PTY completions.
+    setAcVisible(false);
+    acActiveRef.current = false;
   }, []);
 
   const handleAcSelect = useCallback((cmd: string) => {
-    executeCommand(cmd);
+    const session = tabSessionMap.get(activeTabId);
+    if (session) {
+      session.socket.emit('input', '\x15' + cmd);
+      session.inputBuffer = cmd;
+      session.terminal.focus();
+    }
     setAcVisible(false); acActiveRef.current = false;
-  }, [executeCommand]);
+  }, [activeTabId]);
 
   const getFullBuffer = useCallback(() => {
     const session = tabSessionMap.get(activeTabId);
     if (!session) return '';
     const buf = session.terminal.buffer.active;
     const lines: string[] = [];
-    for (let i = 0; i < buf.length; i++) {
+    // Only inspect recent rows. Walking the entire scrollback on every lookup
+    // keystroke was a noticeable main-thread tax on low-spec clients.
+    for (let i = Math.max(0, buf.length - 240); i < buf.length; i++) {
       const line = buf.getLine(i);
       if (line) lines.push(line.translateToString(true));
     }
     return lines.join('\n').trimEnd().slice(-8000);
   }, [activeTabId]);
 
-  // Close new tab menu on outside click
-  useEffect(() => {
-    if (!showNewTabMenu) return;
-    const handler = (e: MouseEvent) => {
-      const target = e.target as Node;
-      // Don't close if clicking the menu itself or the button that opens it
-      if (
-        (newTabMenuRef.current && newTabMenuRef.current.contains(target)) ||
-        (newTabButtonRef.current && newTabButtonRef.current.contains(target))
-      ) {
-        return;
-      }
-      setShowNewTabMenu(false);
-    };
-    // Use requestAnimationFrame to ensure the click that opened the menu completes first
-    const rafId = requestAnimationFrame(() => {
-      document.addEventListener('click', handler);
-    });
-    return () => {
-      cancelAnimationFrame(rafId);
-      document.removeEventListener('click', handler);
-    };
-  }, [showNewTabMenu]);
-
   const activeTabType = tabs.find(t => t.id === activeTabId)?.type || 'shell';
 
   // Global keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      const shortcutKey = e.key.toLowerCase();
+      const modifierPressed = e.ctrlKey || e.metaKey;
+      if (
+        assistantBusyRef.current
+        && (
+          e.key === 'Escape'
+          || (modifierPressed && (
+            shortcutKey === 'k'
+            || shortcutKey === '`'
+            || shortcutKey === 't'
+            || shortcutKey === 'w'
+            || (shortcutKey >= '1' && shortcutKey <= '5')
+          ))
+        )
+      ) {
+        e.preventDefault();
+        return;
+      }
+      if (document.querySelector('[data-viewport-modal-layer="true"]')) {
+        if (
+          e.key === 'Escape' ||
+          (modifierPressed && (
+            shortcutKey === 'k' ||
+            shortcutKey === '`' ||
+            shortcutKey === 't' ||
+            shortcutKey === 'w' ||
+            (shortcutKey >= '1' && shortcutKey <= '5')
+          ))
+        ) {
+          e.preventDefault();
+        }
+        return;
+      }
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); setShowAssistant(true); }
       if ((e.ctrlKey || e.metaKey) && e.key === '`') { e.preventDefault(); setShowAssistant(prev => !prev); }
       if ((e.ctrlKey || e.metaKey) && e.key === 't') { e.preventDefault(); createTab('shell'); }
@@ -2028,7 +2032,7 @@ export default function TerminalPage() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [tabs, activeTabId, createTab, closeTab]);
+  }, [tabs, activeTabId, createTab, closeTab, inputMode]);
 
   // Re-fit active terminal on layout changes
   useEffect(() => {
@@ -2047,6 +2051,7 @@ export default function TerminalPage() {
   // Global window resize handler — fit all visible terminals
   useEffect(() => {
     let resizeTimer: ReturnType<typeof setTimeout>;
+    let orientationTimer: ReturnType<typeof setTimeout>;
     const handleResize = () => {
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
@@ -2055,15 +2060,18 @@ export default function TerminalPage() {
         });
       }, 150);
     };
+    const handleOrientationChange = () => {
+      clearTimeout(orientationTimer);
+      orientationTimer = setTimeout(handleResize, 300);
+    };
     window.addEventListener('resize', handleResize);
     // Also handle orientation change for tablets
-    window.addEventListener('orientationchange', () => {
-      setTimeout(handleResize, 300);
-    });
+    window.addEventListener('orientationchange', handleOrientationChange);
     return () => {
       clearTimeout(resizeTimer);
+      clearTimeout(orientationTimer);
       window.removeEventListener('resize', handleResize);
-      window.removeEventListener('orientationchange', handleResize);
+      window.removeEventListener('orientationchange', handleOrientationChange);
     };
   }, []);
 
@@ -2073,7 +2081,8 @@ export default function TerminalPage() {
 
       {/* Danger Warning Modal */}
       <AnimatePresence>
-        {dangerWarning && <DangerWarningModal command={dangerWarning.command} message={dangerWarning.message} onConfirm={forceExecuteCommand} onCancel={cancelDangerCommand} />}
+        {dangerWarning && <DangerWarningModal command={dangerWarning.command} message={dangerWarning.message}
+          confirmation={dangerWarning.confirmation} onConfirm={forceExecuteCommand} onCancel={cancelDangerCommand} />}
       </AnimatePresence>
 
       {/* Toolbar */}
@@ -2085,11 +2094,14 @@ export default function TerminalPage() {
             <span className={`w-1.5 h-1.5 rounded-full ${activeState.connected ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
             <span className="hidden sm:inline">{activeState.connected ? 'Connected' : 'Disconnected'}</span>
           </span>
+          <span className="hidden md:inline-flex items-center gap-1 rounded-full border border-amber-500/20 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold text-amber-300" title="Owner and Sub-Admin Terminal sessions run directly on the host">
+            <ShieldAlert size={10} /> Host operator
+          </span>
         </div>
         <div className="flex items-center gap-0.5 sm:gap-1 flex-shrink-0">
           <button onClick={() => setShowAssistant(true)}
             className="flex items-center gap-1 px-2 sm:px-3 py-1.5 rounded-lg bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25 transition-colors text-xs font-medium border border-emerald-500/20 mr-0.5 sm:mr-1 min-w-[44px] min-h-[44px] justify-center"
-            title="Assistant (Ctrl+` to toggle)">
+            title="Assistant (Ctrl+` to toggle)" aria-label="Open Terminal assistant">
             <Sparkles size={13} />
             <span className="hidden md:inline">Assistant</span>
           </button>
@@ -2099,75 +2111,95 @@ export default function TerminalPage() {
                   const s = tabSessionMap.get(activeTabId);
                   s?.terminal.clear();
                 }}
-                className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center" title="Clear"><Trash2 size={15} /></button>
+                className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center" title="Clear" aria-label="Clear terminal display"><Trash2 size={15} /></button>
               <button onClick={() => {
                   const s = tabSessionMap.get(activeTabId);
                   if (s) { s.terminal.reset(); s.socket.emit('input', '\x03'); }
                 }}
-                className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center hidden sm:flex" title="Reset"><RotateCcw size={15} /></button>
+                className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center hidden sm:flex" title="Reset" aria-label="Interrupt and reset terminal"><RotateCcw size={15} /></button>
               <button onClick={async () => {
                   const s = tabSessionMap.get(activeTabId);
                   const sel = s?.terminal.getSelection();
                   if (sel) { try { await navigator.clipboard.writeText(sel); } catch {} }
                 }}
-                className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center hidden sm:flex" title="Copy"><Copy size={15} /></button>
+                className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center hidden sm:flex" title="Copy" aria-label="Copy terminal selection"><Copy size={15} /></button>
             </>
           )}
-          <button onClick={() => setFullscreen(!fullscreen)} className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center" title="Fullscreen">
+          <button onClick={() => setFullscreen(!fullscreen)} className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center" title="Fullscreen" aria-label={fullscreen ? 'Exit fullscreen Terminal' : 'Open fullscreen Terminal'}>
             {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
           </button>
         </div>
       </div>
 
       {/* Tab Bar */}
-      <div className="flex items-center bg-[#080B20] border-b border-white/5 px-2 overflow-x-auto overflow-y-visible flex-shrink-0 scrollbar-none relative">
+      <div className="flex items-center bg-[#080B20] border-b border-white/5 px-2 overflow-x-auto overflow-y-visible flex-shrink-0 scrollbar-none relative" role="tablist" aria-label="Terminal sessions">
         {tabs.map(tab => {
           const state = tabStates[tab.id];
           return (
-            <button key={tab.id} onClick={() => setActiveTabId(tab.id)}
-              className={`group flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border-b-2 transition-all whitespace-nowrap ${
-                tab.id === activeTabId
-                  ? 'border-emerald-400 text-emerald-400 bg-emerald-500/5'
-                  : 'border-transparent text-slate-500 hover:text-slate-300 hover:bg-white/[0.02]'
-              }`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${state?.connected ? 'bg-emerald-400' : 'bg-slate-500'}`} />
-              🟢 {tab.label}
-              {state?.running && <Loader2 size={10} className="text-emerald-400 animate-spin" />}
+            <div key={tab.id} className="group flex items-center whitespace-nowrap">
+              <button type="button" role="tab" aria-selected={tab.id === activeTabId} disabled={assistantBusy} onClick={() => { if (!assistantBusyRef.current) setActiveTabId(tab.id); }}
+                className={`flex items-center gap-1.5 border-b-2 py-1.5 pl-3 text-xs font-medium transition-all ${tabs.length > 1 ? 'pr-1' : 'pr-3'} ${
+                  tab.id === activeTabId
+                    ? 'accent-active'
+                    : 'border-transparent text-slate-500 hover:text-slate-300 hover:bg-white/[0.02]'
+                }`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${state?.connected ? 'bg-emerald-400' : 'bg-slate-500'}`} />
+                {tab.label}
+                {state?.running && <Loader2 size={10} className="text-emerald-400 animate-spin" />}
+              </button>
               {tabs.length > 1 && (
-                <span onClick={e => { e.stopPropagation(); closeTab(tab.id); }}
-                  className="ml-1 p-0.5 rounded hover:bg-white/10 text-slate-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all">
+                <button type="button" onClick={() => closeTab(tab.id)} disabled={assistantBusy} aria-label={`Close ${tab.label} terminal`}
+                  className="mr-1 rounded p-1 text-slate-600 opacity-60 transition-all hover:bg-white/10 hover:text-red-400 focus:opacity-100 group-hover:opacity-100">
                   <X size={10} />
-                </span>
+                </button>
               )}
-            </button>
+            </div>
           );
         })}
         <div className="relative">
-          <button ref={newTabButtonRef} onClick={() => setShowNewTabMenu(prev => !prev)} disabled={tabs.length >= 5}
+          <button ref={newTabButtonRef} onClick={() => { if (!assistantBusyRef.current) setShowNewTabMenu(prev => !prev); }} disabled={assistantBusy || tabs.length >= 5}
             className="flex items-center gap-1 px-2 py-1.5 text-slate-600 hover:text-emerald-400 transition-colors disabled:opacity-20 cursor-pointer disabled:cursor-not-allowed"
-            title="New tab (Ctrl+T)">
+            title="New tab (Ctrl+T)" aria-label="Create terminal tab" aria-haspopup="menu" aria-expanded={showNewTabMenu}>
             <Plus size={14} />
           </button>
-          {showNewTabMenu && createPortal(
-            <div ref={newTabMenuRef} style={{
-              position: 'fixed',
-              left: newTabButtonRef.current ? newTabButtonRef.current.getBoundingClientRect().left : 0,
-              top: newTabButtonRef.current ? newTabButtonRef.current.getBoundingClientRect().bottom + 4 : 0,
-            }} className="w-48 bg-[#0D1130]/95 border border-white/10 rounded-xl shadow-2xl backdrop-blur-xl z-[9999] overflow-hidden" onClick={e => e.stopPropagation()}>
-              <button onClick={(e) => { e.stopPropagation(); createTab('shell'); setShowNewTabMenu(false); }}
+          <AnchoredPopover
+            open={showNewTabMenu}
+            anchorRef={newTabButtonRef}
+            onDismiss={() => setShowNewTabMenu(false)}
+            width={192}
+            align="start"
+            gap={4}
+            ariaLabel="Create terminal tab"
+            className="rounded-xl border border-white/10 bg-[#0D1130]/95 shadow-2xl backdrop-blur-xl"
+          >
+            <div role="menu" aria-label="Create terminal tab" className="overflow-hidden rounded-xl">
+              <button type="button" role="menuitem" onClick={() => { createTab('shell'); setShowNewTabMenu(false); }}
                 className="w-full flex items-center gap-2 px-3 py-2 text-xs text-slate-300 hover:bg-emerald-500/10 hover:text-emerald-400 transition-colors">
                 <span>🟢</span> New Terminal
               </button>
-            </div>,
-            document.body
-          )}
+            </div>
+          </AnchoredPopover>
         </div>
       </div>
 
       <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* All terminal sessions — each has own div, shown/hidden */}
         <div className="flex-1 flex flex-col min-h-0 min-w-0 relative">
-          <div className="flex-1 min-h-0 min-w-0 overflow-hidden relative" onClick={() => {
+          <div
+            className="flex-1 min-h-0 min-w-0 overflow-hidden relative"
+            role="textbox"
+            aria-multiline="true"
+            tabIndex={0}
+            aria-label="Terminal session area"
+            onKeyDown={(event) => {
+              if (event.key !== 'Enter') return;
+              if (activeTabType === 'shell') {
+                event.preventDefault();
+                setInputMode('terminal');
+                tabSessionMap.get(activeTabId)?.terminal.focus();
+              }
+            }}
+            onClick={() => {
             if (activeTabType === 'shell') {
               setInputMode('terminal');
               const session = tabSessionMap.get(activeTabId);
@@ -2189,6 +2221,7 @@ export default function TerminalPage() {
                 setAcSelectedIndex={setAcSelectedIndex}
                 setAcVisible={setAcVisible}
                 setAcInput={setAcInput}
+                catalog={runtimeCatalog}
               />
             ))}
             {tabs.filter(t => t.type === 'openclaw-tui').map(tab => (
@@ -2199,35 +2232,87 @@ export default function TerminalPage() {
                 onConnectionChange={handleConnectionChange}
               />
             ))}
+            {activeTabType === 'shell' && acVisible && acSuggestions.length > 0 && (
+              <div className="absolute bottom-2 left-2 right-2 z-40 max-h-64 overflow-auto rounded-xl border border-white/10 bg-[#0D1130]/95 shadow-2xl backdrop-blur-xl" role="listbox" aria-label={`Runtime completions for ${acInput}`}>
+                <div className="flex items-center justify-between border-b border-white/5 px-3 py-1.5 text-[9px] uppercase tracking-wider text-slate-500">
+                  <span>Runtime completions</span>
+                  <span>Tab inserts · Enter runs</span>
+                </div>
+                {acSuggestions.map((suggestion, index) => (
+                  <button key={`${suggestion.source || 'runtime'}:${suggestion.command}`} type="button" role="option" aria-selected={index === acSelectedIndex}
+                    onMouseDown={(event) => event.preventDefault()} onClick={() => handleAcSelect(suggestion.command)}
+                    className={`flex w-full items-center gap-2 border-l-2 px-3 py-1.5 text-left ${index === acSelectedIndex ? 'accent-active' : 'border-transparent hover:bg-white/[0.03]'}`}>
+                    <span className="rounded bg-white/5 px-1 py-0.5 text-[8px] uppercase text-slate-500">{suggestion.source || 'runtime'}</span>
+                    <code className={`min-w-0 flex-1 truncate text-[11px] ${index === acSelectedIndex ? 'accent-text' : 'text-slate-300'}`}>{suggestion.command}</code>
+                    {suggestion.dangerous && <AlertTriangle size={10} className="shrink-0 text-amber-400" />}
+                    <span className="max-w-[35%] truncate text-[9px] text-slate-500">{suggestion.description}</span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {activeTabType === 'shell' && (
             <>
-              {/* tool preset command groups */}
-              <div className="px-3 py-2 border-t border-white/5 bg-[#080B20]/85">
-                <div className="flex flex-wrap gap-3">
-                  {TOOL_PRESET_GROUPS.map((group) => (
-                    <div key={group.tool} className="min-w-[180px]">
-                      <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">{group.tool}</div>
-                      <div className="flex flex-wrap gap-1">
-                        {group.commands.map((cmd) => (
-                          <button
-                            key={cmd}
-                            onClick={() => executeCommand(cmd)}
-                            className="px-2 py-0.5 rounded-md bg-white/5 hover:bg-emerald-500/10 text-[10px] text-slate-300 hover:text-emerald-300 font-mono"
-                          >
-                            {cmd}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
+              {/* Runtime-backed operator actions and installed-tool inventory */}
+              <div className="border-t border-white/5 bg-[#080B20]/85 px-3 py-2">
+                <div className="mb-1.5 flex items-center justify-between gap-3">
+                  <div className="min-w-0" title={capabilities?.notice}>
+                    <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Operator actions</span>
+                    <span className="ml-2 text-[9px] text-amber-300/80">Full server access · raw shell unrestricted</span>
+                    <span className="ml-2 hidden text-[9px] text-slate-600 sm:inline">Live capabilities + reviewed templates, not a command encyclopedia</span>
+                  </div>
+                  <button type="button" onClick={() => loadCapabilities(true)} disabled={capabilityLoading}
+                    className="flex min-h-[32px] items-center gap-1 rounded-md px-2 text-[9px] text-slate-500 hover:bg-white/5 hover:text-emerald-300 disabled:opacity-40" aria-label="Refresh installed terminal tools">
+                    <RotateCcw size={10} className={capabilityLoading ? 'animate-spin' : ''} /> Refresh
+                  </button>
                 </div>
+                {capabilityError && <p className="mb-1 text-[10px] text-amber-300" role="status">{capabilityError}</p>}
+                <div className="flex gap-1.5 overflow-x-auto pb-1 scrollbar-none">
+                  {(capabilities?.actions || []).map((action) => {
+                    const unavailable = action.available === false;
+                    const requirements = unavailable && action.unmetRequirements?.length
+                      ? `Unavailable: missing ${action.unmetRequirements.join(', ')}`
+                      : `Requirements: ${action.requirements.join(', ')}`;
+                    return (
+                    <button key={action.id} type="button" onClick={() => executeCommand(action.command)} disabled={unavailable}
+                      title={`${action.description} ${requirements}`}
+                      className={`shrink-0 rounded-lg border px-2 py-1 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-35 ${action.risk === 'read_only' ? 'border-white/5 bg-white/[0.03] hover:border-emerald-500/30 hover:bg-emerald-500/10' : 'border-amber-500/20 bg-amber-500/5 hover:bg-amber-500/15'}`}>
+                      <span className={`flex items-center gap-1 text-[10px] font-medium ${unavailable ? 'text-slate-500' : action.risk === 'read_only' ? 'text-slate-300' : 'text-amber-300'}`}>
+                        {action.title}
+                        <span className="text-[7px] uppercase opacity-60">{unavailable ? 'unavailable' : action.risk === 'read_only' ? 'read only' : 'confirm'}</span>
+                      </span>
+                      <span className="block max-w-[180px] truncate font-mono text-[8px] text-slate-600">{action.command}</span>
+                    </button>
+                  )})}
+                  {capabilityLoading && !capabilities && <span className="px-2 py-2 text-[10px] text-slate-500">Discovering installed tools…</span>}
+                </div>
+                {capabilities && (
+                  <>
+                    <div className="mt-1 flex gap-1.5 overflow-x-auto scrollbar-none" aria-label="Detected host services">
+                      {(capabilities.services || []).filter((service) => service.installed).map((service) => (
+                        <span key={service.id} title={`${service.unit} · ${service.activeState || 'unknown'}/${service.subState || 'unknown'}`}
+                          className={`inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-[8px] ${service.status === 'active' ? 'bg-emerald-500/5 text-emerald-400/70' : service.status === 'failed' ? 'bg-red-500/10 text-red-300' : 'bg-amber-500/5 text-amber-300/70'}`}>
+                          <span className={`h-1 w-1 rounded-full ${service.status === 'active' ? 'bg-emerald-400' : service.status === 'failed' ? 'bg-red-400' : 'bg-amber-400'}`} />
+                          {service.label} · {service.status}
+                        </span>
+                      ))}
+                    </div>
+                    <div className="mt-1 flex gap-1.5 overflow-x-auto scrollbar-none" aria-label="Installed command-line tools">
+                      {capabilities.tools.filter((tool) => tool.installed).map((tool) => (
+                        <a key={tool.id} href={tool.sourceUrl} target="_blank" rel="noreferrer" title={`${tool.version || 'Installed'} · ${tool.helpCommand} · ${tool.executable || ''}`}
+                          className="inline-block max-w-[280px] shrink-0 truncate rounded-md bg-white/[0.025] px-1.5 py-0.5 text-[8px] text-slate-500 hover:text-slate-300">
+                          {tool.label}<span className="ml-1 text-slate-600">{tool.version || 'installed'}</span>
+                        </a>
+                      ))}
+                    </div>
+                  </>
+                )}
               </div>
               <ChatBoxInput onSubmit={handleInputBarSubmit} onInputChange={handleInputBarChange}
                 connected={activeState.connected} running={activeState.running} externalClear={clearTrigger}
                 inputMode={inputMode} onFocusChatBox={() => setInputMode('chat')}
-                contextEnabled={sharedContextEnabled} getFullBuffer={getFullBuffer} />
+                contextEnabled={sharedContextEnabled} getFullBuffer={getFullBuffer} catalog={runtimeCatalog} />
             </>
           )}
         </div>
@@ -2235,9 +2320,10 @@ export default function TerminalPage() {
         {/* Assistant Panel */}
         <AnimatePresence>
           {showAssistant && (
-            <AssistantAIPanel isOpen={showAssistant} onClose={() => setShowAssistant(false)}
+            <AssistantAIPanel key={`terminal-assistant:${activeTabId}`} isOpen={showAssistant} onClose={() => { if (!assistantBusyRef.current) setShowAssistant(false); }}
               onInsert={insertCommand} getFullBuffer={getFullBuffer}
-              contextEnabled={sharedContextEnabled} setContextEnabled={setSharedContextEnabled} />
+              contextEnabled={sharedContextEnabled} setContextEnabled={setSharedContextEnabled} catalog={runtimeCatalog}
+              contextKey={activeTabId} isMobile={isMobile} onBusyChange={handleAssistantBusyChange} />
           )}
         </AnimatePresence>
       </div>

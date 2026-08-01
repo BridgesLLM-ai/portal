@@ -51,7 +51,7 @@ export default function Drawer({ children }: { children: React.ReactNode }) {
           <UserAvatar assistant editable size="w-14 h-14" />
           <div className="min-w-0">
             <h1 className="text-base font-bold text-white">{assistantName}</h1>
-            <p className="text-[11px] text-emerald-400/70">Assistant</p>
+            <p className="text-[11px] accent-text opacity-70">Assistant</p>
           </div>
         </div>
       </div>
@@ -66,7 +66,7 @@ export default function Drawer({ children }: { children: React.ReactNode }) {
               to={item.path}
               className={`flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 ${
                 isActive
-                  ? 'bg-emerald-500/20 text-emerald-400 shadow-lg shadow-emerald-500/10'
+                  ? 'accent-active border border-transparent'
                   : 'text-gray-400 hover:text-white hover:bg-white/5'
               }`}
             >
@@ -100,10 +100,10 @@ export default function Drawer({ children }: { children: React.ReactNode }) {
   );
 
   return (
-    <div className="flex h-dvh bg-[#0A0E27]">
+    <div className="flex h-dvh bg-theme-bg text-theme-text">
       {/* Desktop sidebar */}
       {isDesktop && (
-        <aside className="w-72 flex-shrink-0 bg-[rgba(26,31,58,0.7)] backdrop-blur-xl border-r border-white/10">
+        <aside className="w-72 flex-shrink-0 bg-theme-surface/90 backdrop-blur-xl border-r border-theme-border">
           {sidebarContent}
         </aside>
       )}
@@ -114,11 +114,18 @@ export default function Drawer({ children }: { children: React.ReactNode }) {
           <div
             className="fixed inset-0 bg-black/60 z-40 backdrop-blur-sm"
             onClick={() => setIsOpen(false)}
+            aria-hidden="true"
           />
-          <aside className="fixed left-0 top-0 bottom-0 w-72 z-50 bg-[rgba(26,31,58,0.95)] backdrop-blur-xl border-r border-white/10">
+          <aside
+            className="fixed left-0 top-0 bottom-0 w-72 z-50 bg-theme-surface/95 backdrop-blur-xl border-r border-theme-border"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Navigation menu"
+          >
             <button
               onClick={() => setIsOpen(false)}
               className="absolute top-4 right-4 p-2 text-gray-400 hover:text-white"
+              aria-label="Close navigation menu"
             >
               <X size={24} />
             </button>
@@ -131,16 +138,18 @@ export default function Drawer({ children }: { children: React.ReactNode }) {
       <div className="flex-1 flex flex-col overflow-hidden">
         {/* Mobile header */}
         {!isDesktop && (
-          <header className="flex items-center gap-4 px-4 py-3 bg-[rgba(26,31,58,0.7)] backdrop-blur-xl border-b border-white/10">
+          <header className="flex items-center gap-4 px-4 py-3 bg-theme-surface/90 backdrop-blur-xl border-b border-theme-border">
             <button
               onClick={() => setIsOpen(true)}
               className="p-2 text-gray-400 hover:text-white"
+              aria-label="Open navigation menu"
+              aria-expanded={isOpen}
             >
               <Menu size={24} />
             </button>
             <div className="flex items-center gap-2">
               <UserAvatar assistant editable={false} size="w-10 h-10" />
-              <h1 className="text-lg font-bold text-emerald-400">{assistantName}</h1>
+              <h1 className="text-lg font-bold accent-text">{assistantName}</h1>
             </div>
           </header>
         )}

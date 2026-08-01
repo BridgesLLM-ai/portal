@@ -1,5 +1,13 @@
 import path from 'path';
-import { escapeHtml, isBlockedAppStaticPath, isPathWithin } from '../utils/appFileSecurity';
+import os from 'os';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import {
+  escapeHtml,
+  isBlockedAppStaticPath,
+  isPathWithin,
+  resolveExistingAppDirectory,
+  resolveExistingPathWithin,
+} from '../utils/appFileSecurity';
 
 describe('app file security helpers', () => {
   test('uses path-aware containment instead of unsafe prefix matching', () => {
@@ -53,5 +61,27 @@ describe('app file security helpers', () => {
 
   test('escapes names rendered into the share password landing page', () => {
     expect(escapeHtml('A&B <script>"x"</script>')).toBe('A&amp;B &lt;script&gt;&quot;x&quot;&lt;/script&gt;');
+  });
+
+  test('rejects files and app directories that escape through symlinks', () => {
+    const fixture = mkdtempSync(path.join(os.tmpdir(), 'portal-app-file-security-'));
+    const root = path.join(fixture, 'apps');
+    const appDir = path.join(root, 'app-1');
+    const outside = path.join(fixture, 'outside');
+    mkdirSync(appDir, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(path.join(appDir, 'index.html'), 'safe');
+    writeFileSync(path.join(outside, 'secret.txt'), 'secret');
+    symlinkSync(path.join(outside, 'secret.txt'), path.join(appDir, 'leak.txt'));
+    symlinkSync(outside, path.join(root, 'app-evil'));
+
+    try {
+      expect(resolveExistingPathWithin(appDir, path.join(appDir, 'index.html'))).toBe(path.join(appDir, 'index.html'));
+      expect(resolveExistingPathWithin(appDir, path.join(appDir, 'leak.txt'))).toBeNull();
+      expect(resolveExistingAppDirectory(path.join(root, 'app-evil'), [root])).toBeNull();
+      expect(resolveExistingAppDirectory(appDir, [root])).toBe(appDir);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
   });
 });

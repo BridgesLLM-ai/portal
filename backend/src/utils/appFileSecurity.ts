@@ -1,4 +1,5 @@
 import path from 'path';
+import fs from 'fs';
 
 const PRIVATE_APP_FILENAMES = new Set([
   'server.js',
@@ -65,6 +66,41 @@ export function isPathWithin(baseDir: string, candidatePath: string): boolean {
   const candidate = path.resolve(candidatePath);
   const relative = path.relative(base, candidate);
   return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+/**
+ * Resolve an existing path only when both its lexical path and its real path
+ * remain inside the selected root. `sendFile`, `stat`, and recursive deletion
+ * all follow symlinks, so lexical containment alone is not a security boundary.
+ */
+export function resolveExistingPathWithin(baseDir: string, candidatePath: string): string | null {
+  try {
+    const lexicalBase = path.resolve(baseDir);
+    const lexicalCandidate = path.resolve(candidatePath);
+    if (!isPathWithin(lexicalBase, lexicalCandidate)) return null;
+    if (!fs.existsSync(lexicalBase) || !fs.existsSync(lexicalCandidate)) return null;
+
+    const realBase = fs.realpathSync(lexicalBase);
+    const realCandidate = fs.realpathSync(lexicalCandidate);
+    return isPathWithin(realBase, realCandidate) ? realCandidate : null;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveExistingAppDirectory(candidatePath: string, allowedRoots: string[]): string | null {
+  for (const root of allowedRoots) {
+    const resolved = resolveExistingPathWithin(root, candidatePath);
+    if (!resolved) continue;
+    try {
+      if (fs.statSync(resolved).isDirectory() && path.resolve(resolved) !== path.resolve(fs.realpathSync(root))) {
+        return resolved;
+      }
+    } catch {
+      // Try the next configured root.
+    }
+  }
+  return null;
 }
 
 export function isBlockedAppStaticPath(requestedPath: string): boolean {

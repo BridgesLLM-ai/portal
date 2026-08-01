@@ -32,9 +32,9 @@ Small fixes (typos, docs, one-liners) can skip the issue step.
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 22.22.3+ on the 22.x line, 24.15.0+ on the 24.x line, or 25.9.0+ (Node 22 LTS recommended)
 - PostgreSQL 15+
-- Docker (for sandbox features)
+- Docker (optional, for local PostgreSQL and sandbox features)
 
 ### Getting Started
 
@@ -47,9 +47,29 @@ cd portal
 cd backend && npm install && cd ..
 cd frontend && npm install && cd ..
 
-# Set up environment
-cp backend/.env.example backend/.env
-# Edit backend/.env with your database URL and settings
+# Choose the password used by the local Compose database
+export POSTGRES_PASSWORD='choose-a-local-development-password'
+```
+
+Create `backend/.env` (it is ignored by Git) with local-only values. Generate
+the two JWT values separately with `openssl rand -hex 32`; do not reuse these
+development secrets on an installed Portal:
+
+```dotenv
+DATABASE_URL=postgresql://bridges:choose-a-local-development-password@127.0.0.1:5432/bridgesllm_portal
+PORT=4001
+HOST=127.0.0.1
+CORS_ORIGIN=http://localhost:5173
+JWT_SECRET=replace-with-a-random-64-character-hex-value
+JWT_REFRESH_SECRET=replace-with-another-random-64-character-hex-value
+```
+
+Start the local database (or use an existing PostgreSQL 15+ server), then
+finish setup and start the development servers:
+
+```bash
+# The POSTGRES_PASSWORD export from above must still be in this shell
+docker compose up -d postgres
 
 # Run database migrations
 cd backend && npx prisma migrate dev && cd ..
@@ -60,6 +80,11 @@ cd frontend && npm run dev &
 ```
 
 The frontend runs on `http://localhost:5173` and proxies API calls to the backend on port 4001.
+
+The root `docker-compose.yml` models the host-integrated Linux deployment and
+expects its listed host paths and companion services to exist. For ordinary
+source development, use only its `postgres` service as shown above; use the
+installer for a complete Portal host.
 
 ## Code Style
 
@@ -81,7 +106,7 @@ Follow [Conventional Commits](https://www.conventionalcommits.org/):
 
 ## What We're Looking For
 
-Check the [Roadmap](README.md#-roadmap) for areas where help is welcome. Issues tagged `good first issue` are great starting points.
+Check the [Roadmap](README.md#roadmap) for areas where help is welcome. Issues tagged `good first issue` are great starting points.
 
 ## Questions?
 

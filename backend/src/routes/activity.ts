@@ -2,41 +2,14 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { prisma } from '../config/database';
 import { config } from '../config/env';
-import { blockedIPs, extractIP } from '../utils/auth-tracking';
+import { blockedIPs } from '../utils/auth-tracking';
 import { logError } from '../utils/errorLogger';
+import { requireAdmin, requireOwner } from '../middleware/requireAdmin';
+import { isElevatedRole } from '../utils/authz';
+import net from 'net';
 
 const router = Router();
-
-// In-memory translation cache
-const translationCache = new Map<string, string>();
-
-async function translateMessage(action: string, resource: string, resourceId?: string | null): Promise<string> {
-  const cacheKey = `${action}:${resource}:${resourceId || ''}`;
-  if (translationCache.has(cacheKey)) return translationCache.get(cacheKey)!;
-
-  const prompt = `Translate this system log entry to a brief, plain English sentence (max 15 words). Action: "${action}", Resource: "${resource}", Resource ID: "${resourceId || 'N/A'}". Reply with ONLY the translated sentence.`;
-
-  try {
-    const response = await fetch(`${config.ollamaApiUrl}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: config.ollamaModel, prompt, stream: false }),
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!response.ok) throw new Error('Ollama unavailable');
-    const data = await response.json() as { response: string };
-    const translated = data.response?.trim() || fallbackTranslation(action, resource);
-    translationCache.set(cacheKey, translated);
-    if (resourceId) {
-      await prisma.activityLog.updateMany({ where: { action, resource, resourceId }, data: { translatedMessage: translated } }).catch(() => {});
-    }
-    return translated;
-  } catch {
-    const fallback = fallbackTranslation(action, resource);
-    translationCache.set(cacheKey, fallback);
-    return fallback;
-  }
-}
+router.use(authenticateToken);
 
 function richTranslation(action: string, resource: string, metadata?: any): string {
   const meta = metadata || {};
@@ -116,98 +89,87 @@ function fallbackTranslation(action: string, resource: string): string {
 }
 
 // GET /api/activity
-router.get('/', authenticateToken, async (req: Request, res: Response) => {
+router.get('/', async (req: Request, res: Response) => {
   try {
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 20));
-    const skip = parseInt(req.query.offset as string) || (page - 1) * limit;
+    const skip = Math.max(0, parseInt(req.query.offset as string) || (page - 1) * limit);
     const severity = req.query.severity as string | undefined;
-    const search = req.query.search as string | undefined;
+    const search = typeof req.query.search === 'string' ? req.query.search.trim().slice(0, 200) : undefined;
     const kind = req.query.kind as string | undefined;
     const category = req.query.category as string | undefined;
+    const elevated = isElevatedRole(req.user?.role);
+    // A sandboxed elevated delegate keeps host-operator powers by design, but
+    // workspace-facing metadata must follow the same actor boundary as Files,
+    // Projects, and quick search. Only an unsandboxed elevated actor receives
+    // the global activity/IP view.
+    const globalActivityView = elevated && req.user?.sandboxEnabled !== true;
 
-    // Build scope filter
-    const scopeFilter: any = {};
+    const filters: any[] = [];
     if (kind === 'system_alert') {
-      scopeFilter.action = 'SYSTEM_ALERT';
+      if (!globalActivityView) {
+        res.status(403).json({ error: 'System activity requires administrator access' });
+        return;
+      }
+      filters.push({ action: 'SYSTEM_ALERT' });
     } else if (kind === 'user') {
-      scopeFilter.userId = req.user!.userId;
-      scopeFilter.NOT = { action: 'SYSTEM_ALERT' };
-    } else {
-      scopeFilter.OR = [
-        { userId: req.user!.userId },
-        { action: 'SYSTEM_ALERT' },
-        { action: 'IP_BLOCKED' },
-        { action: 'IP_UNBLOCKED' },
-        { action: 'LOGIN_FAILED' },
-      ];
+      filters.push({ userId: req.user!.userId }, { NOT: { action: 'SYSTEM_ALERT' } });
+    } else if (!globalActivityView) {
+      filters.push({ userId: req.user!.userId });
     }
 
     // Category filter
     if (category === 'logins' || category === 'auth') {
-      scopeFilter.action = { in: ['LOGIN', 'LOGIN_FAILED', 'LOGOUT', 'AUTH_ERROR'] };
+      filters.push({ action: { in: ['LOGIN', 'LOGIN_FAILED', 'LOGOUT', 'AUTH_ERROR'] } });
     } else if (category === 'git') {
-      scopeFilter.action = { in: ['GIT_ERROR'], startsWith: undefined as any };
-      delete scopeFilter.action;
-      scopeFilter.OR = [
+      filters.push({ OR: [
         { action: { startsWith: 'PROJECT_GIT' } },
         { action: 'GIT_ERROR' },
-      ];
+      ] });
     } else if (category === 'deploys' || category === 'deploy') {
-      scopeFilter.OR = [
+      filters.push({ OR: [
         { action: { startsWith: 'PROJECT_DEPLOY' } },
         { resource: 'deploy' },
-      ];
+      ] });
     } else if (category === 'system') {
-      scopeFilter.OR = [
+      filters.push({ OR: [
         { action: { in: ['SYSTEM_ALERT', 'METRICS_COLLECT', 'TERMINAL_EXEC'] } },
         { resource: { in: ['system', 'database', 'filesystem'] } },
         { action: { in: ['DB_ERROR', 'FS_ERROR'] } },
-      ];
+      ] });
     } else if (category === 'agent_chat' || category === 'agent' || category === 'ai') {
-      scopeFilter.OR = [
+      filters.push({ OR: [
         { action: { startsWith: 'MARCUS' } },
         { action: { in: ['API_ERROR', 'AUTH_ERROR', 'FRONTEND_ERROR'] } },
         { resource: { in: ['agent_chat', 'gateway', 'openclaw'] } },
-      ];
+      ] });
     } else if (category === 'files') {
-      scopeFilter.OR = [
+      filters.push({ OR: [
         { action: { startsWith: 'FILE_' } },
         { action: { startsWith: 'APP_' } },
         { resource: { in: ['file', 'app'] } },
-      ];
+      ] });
     } else if (category === 'bot_traps' || category === 'security') {
-      scopeFilter.action = { in: ['IP_BLOCKED', 'IP_UNBLOCKED', 'REGISTRATION_BLOCKED'] };
+      filters.push({ action: { in: ['IP_BLOCKED', 'IP_UNBLOCKED', 'REGISTRATION_BLOCKED'] } });
     } else if (category === 'errors') {
-      // Errors filter: show ALL errors (user's own + system-wide) — override scope
-      delete scopeFilter.OR;
-      scopeFilter.AND = [
-        {
-          OR: [
-            { action: { endsWith: '_ERROR' } },
-            { severity: { in: ['ERROR', 'CRITICAL'] } },
-          ],
-        },
-      ];
+      filters.push({ OR: [
+        { action: { endsWith: '_ERROR' } },
+        { severity: { in: ['ERROR', 'CRITICAL'] } },
+      ] });
     }
 
-    if (severity) scopeFilter.severity = severity;
+    if (severity && ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'].includes(severity)) {
+      filters.push({ severity });
+    }
 
-    const where: any = search
-      ? {
-          AND: [
-            scopeFilter,
-            {
-              OR: [
-                { action: { contains: search, mode: 'insensitive' } },
-                { resource: { contains: search, mode: 'insensitive' } },
-                { translatedMessage: { contains: search, mode: 'insensitive' } },
-                { ipAddress: { contains: search, mode: 'insensitive' } },
-              ],
-            },
-          ],
-        }
-      : scopeFilter;
+    if (search) filters.push({ OR: [
+      { action: { contains: search, mode: 'insensitive' } },
+      { resource: { contains: search, mode: 'insensitive' } },
+      { translatedMessage: { contains: search, mode: 'insensitive' } },
+      ...(globalActivityView ? [{ ipAddress: { contains: search, mode: 'insensitive' } }] : []),
+    ] });
+
+    const where: any = filters.length ? { AND: filters } : {};
 
     const [activities, total] = await Promise.all([
       prisma.activityLog.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take: limit }),
@@ -236,17 +198,21 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
 });
 
 // POST /api/activity/unblock-ip
-router.post('/unblock-ip', authenticateToken, async (req: Request, res: Response) => {
+router.post('/unblock-ip', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { ip, activityId } = req.body;
-    if (!ip) { res.status(400).json({ error: 'IP address required' }); return; }
+    if (typeof ip !== 'string' || !net.isIP(ip)) { res.status(400).json({ error: 'Valid IP address required' }); return; }
+    if (activityId !== undefined && (typeof activityId !== 'string' || activityId.length > 100)) {
+      res.status(400).json({ error: 'Invalid activity ID' });
+      return;
+    }
 
     // Remove from in-memory set
     blockedIPs.delete(ip);
 
     // Update activity log entry
     if (activityId) {
-      const entry = await prisma.activityLog.findUnique({ where: { id: activityId } });
+      const entry = await prisma.activityLog.findFirst({ where: { id: activityId, action: 'IP_BLOCKED', ipAddress: ip } });
       if (entry) {
         const meta = (entry.metadata as any) || {};
         await prisma.activityLog.update({
@@ -257,8 +223,12 @@ router.post('/unblock-ip', authenticateToken, async (req: Request, res: Response
     }
 
     // Also update all IP_BLOCKED entries for this IP
-    const entries = await prisma.activityLog.findMany({ where: { action: 'IP_BLOCKED', ipAddress: ip } });
-    for (const entry of entries) {
+    const entries = await prisma.activityLog.findMany({
+      where: { action: 'IP_BLOCKED', ipAddress: ip },
+      orderBy: { createdAt: 'desc' },
+      take: 500,
+    });
+    await Promise.all(entries.map(async (entry) => {
       const meta = (entry.metadata as any) || {};
       if (!meta.unblocked) {
         await prisma.activityLog.update({
@@ -266,7 +236,7 @@ router.post('/unblock-ip', authenticateToken, async (req: Request, res: Response
           data: { metadata: { ...meta, unblocked: true, unblockedAt: new Date().toISOString(), unblockedBy: req.user!.userId } },
         });
       }
-    }
+    }));
 
     // Log the unblock
     await prisma.activityLog.create({
@@ -289,18 +259,15 @@ router.post('/unblock-ip', authenticateToken, async (req: Request, res: Response
 });
 
 // POST /api/activity/heartbeat - Session activity heartbeat
-router.post('/heartbeat', authenticateToken, async (req: Request, res: Response) => {
+router.post('/heartbeat', async (req: Request, res: Response) => {
   try {
-    // Update the user's most recent session's last activity
-    const session = await prisma.session.findFirst({
+    // Compatibility heartbeat. Authentication proves the actor; the bounded
+    // lookup confirms session presence without extending the configured expiry.
+    await prisma.session.findFirst({
       where: { userId: req.user!.userId },
       orderBy: { createdAt: 'desc' },
+      select: { id: true },
     });
-    if (session) {
-      // We can't add last_activity_at without migration, so store in metadata approach
-      // Instead, update the session's expiresAt to extend it (lightweight)
-      // The createdAt vs now gives us session duration
-    }
     res.json({ ok: true });
   } catch {
     res.json({ ok: true });
@@ -308,7 +275,7 @@ router.post('/heartbeat', authenticateToken, async (req: Request, res: Response)
 });
 
 // POST /api/activity/archive - Archive old entries (120+ days)
-router.post('/archive', authenticateToken, async (req: Request, res: Response) => {
+router.post('/archive', requireOwner, async (req: Request, res: Response) => {
   try {
     const cutoff = new Date(Date.now() - 120 * 24 * 60 * 60 * 1000);
 
@@ -340,10 +307,23 @@ router.post('/archive', authenticateToken, async (req: Request, res: Response) =
 });
 
 // POST /api/activity/report-error - Frontend error reporting
-router.post('/report-error', authenticateToken, async (req: Request, res: Response) => {
+router.post('/report-error', async (req: Request, res: Response) => {
   try {
     const { message, stack, componentName, endpoint, context, severity: clientSeverity } = req.body;
-    if (!message) { res.status(400).json({ error: 'message required' }); return; }
+    if (typeof message !== 'string' || !message.trim() || message.length > 4000) {
+      res.status(400).json({ error: 'message must be 1–4000 characters' });
+      return;
+    }
+    if (stack !== undefined && (typeof stack !== 'string' || stack.length > 64 * 1024)) {
+      res.status(400).json({ error: 'stack trace is invalid or too large' });
+      return;
+    }
+    for (const value of [componentName, endpoint, context]) {
+      if (value !== undefined && (typeof value !== 'string' || value.length > 1000)) {
+        res.status(400).json({ error: 'error context is invalid or too large' });
+        return;
+      }
+    }
 
     const action = endpoint ? 'API_ERROR' : 'FRONTEND_ERROR';
     const resource = endpoint ? 'api' : 'frontend';
@@ -357,30 +337,11 @@ router.post('/report-error', authenticateToken, async (req: Request, res: Respon
       endpoint,
       ipAddress: req.ip,
       userAgent: req.headers['user-agent'],
+      stackTrace: stack,
+      componentName,
+      context,
       severity: sev,
     });
-
-    // If there's a stack trace, update the metadata on the just-created entry
-    if (stack) {
-      const recent = await prisma.activityLog.findFirst({
-        where: { userId: req.user!.userId, action },
-        orderBy: { createdAt: 'desc' },
-      });
-      if (recent) {
-        const meta = (recent.metadata as any) || {};
-        await prisma.activityLog.update({
-          where: { id: recent.id },
-          data: {
-            metadata: {
-              ...meta,
-              stackTrace: stack,
-              componentName,
-              context,
-            },
-          },
-        });
-      }
-    }
 
     res.json({ logged: true });
   } catch (error) {
@@ -390,8 +351,12 @@ router.post('/report-error', authenticateToken, async (req: Request, res: Respon
 });
 
 // POST /api/activity/seed
-router.post('/seed', authenticateToken, async (req: Request, res: Response) => {
+router.post('/seed', requireOwner, async (req: Request, res: Response) => {
   try {
+    if (config.nodeEnv === 'production') {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
     const userId = req.user!.userId;
     const now = new Date();
     const sampleEvents = [

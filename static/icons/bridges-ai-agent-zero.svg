@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Agent Zero authenticated local UI launcher">
+  <defs><linearGradient id="g" x1="20" y1="16" x2="108" y2="112"><stop stop-color="#ff5876"/><stop offset="1" stop-color="#8526d9"/></linearGradient></defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="#130713" stroke="#f7a4ff" stroke-width="4"/>
+  <path d="M64 23 101 43v42L64 105 27 85V43l37-20Z" fill="url(#g)" opacity=".93"/>
+  <text x="64" y="74" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="30" font-weight="800" fill="#fff">A0</text>
+</svg>

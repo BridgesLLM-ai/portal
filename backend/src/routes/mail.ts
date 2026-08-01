@@ -6,11 +6,13 @@
  * Rate limited on send operations.
  */
 
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import multer from 'multer';
+import rateLimit from 'express-rate-limit';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import os from 'os';
 import { authenticateToken } from '../middleware/auth';
 import { requireApproved } from '../middleware/requireApproved';
 import { getUserMailAccounts, getUserMailCredentials } from '../services/userMailService';
@@ -37,28 +39,253 @@ import {
   saveSignature,
   getUnreadCount,
   syncAutoForwardRule,
+  MAX_MAIL_ATTACHMENT_BYTES,
+  normalizeAttachmentName,
+  normalizeContentType,
 } from '../services/mailService';
-import { getUserUploadDir } from './files';
+import { ensureToolMirror, getUserUploadDir, removeToolMirror } from './files';
+import { comparePassword } from '../utils/password';
+import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
+import {
+  normalizeMailListRequest,
+  normalizeMailSearchQuery,
+  validateMailSignaturePayload,
+} from '../services/mailRequestPolicy';
+import { config } from '../config/env';
+import {
+  issueMailAttachmentCapabilityToken,
+  verifyMailAttachmentCapabilityToken,
+} from '../services/mailAttachmentCapability';
+import { portalFeatureUnavailableResponse } from '../utils/portalFeatureCapabilities';
 
 const router = Router();
 
-const STALWART_SUPPORT_USER = process.env.STALWART_SUPPORT_USER || 'support';
-const STALWART_SUPPORT_PASS = process.env.STALWART_SUPPORT_PASS || '';
-const STALWART_NOREPLY_USER = process.env.STALWART_NOREPLY_USER || 'noreply';
-const STALWART_NOREPLY_PASS = process.env.STALWART_NOREPLY_PASS || '';
-const EXTRA_SHARED_MAIL_ACCOUNT_ID = process.env.EXTRA_SHARED_MAIL_ACCOUNT_ID || '';
-const EXTRA_SHARED_MAIL_LABEL = process.env.EXTRA_SHARED_MAIL_LABEL || 'Shared Mailbox';
-const EXTRA_SHARED_MAIL_AUTH_PATH = process.env.EXTRA_SHARED_MAIL_AUTH_PATH || '';
-const MAIL_DOMAIN = process.env.MAIL_DOMAIN || 'localhost';
-
-// Multer for file attachment uploads (max 25MB per file, max 10 files)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024, files: 10 },
+const credentialRevealLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.userId || req.ip || 'unknown',
+  message: { error: 'Too many credential reveal attempts. Try again later.' },
 });
 
+// Setup can provision mail after this router is imported. Read mutable mail
+// configuration at request time so the first post-install test does not use
+// the empty values captured during process startup.
+function getStalwartSupportUser() { return process.env.STALWART_SUPPORT_USER || 'support'; }
+function getStalwartSupportPass() { return process.env.STALWART_SUPPORT_PASS || ''; }
+function getStalwartNoreplyUser() { return process.env.STALWART_NOREPLY_USER || 'noreply'; }
+function getStalwartNoreplyPass() { return process.env.STALWART_NOREPLY_PASS || ''; }
+function getExtraSharedMailAccountId() { return process.env.EXTRA_SHARED_MAIL_ACCOUNT_ID || ''; }
+function getExtraSharedMailLabel() { return process.env.EXTRA_SHARED_MAIL_LABEL || 'Shared Mailbox'; }
+function getExtraSharedMailAuthPath() { return process.env.EXTRA_SHARED_MAIL_AUTH_PATH || ''; }
+function getMailDomain() { return process.env.MAIL_DOMAIN || 'localhost'; }
+
+const MAIL_UPLOAD_DIR = path.join(os.tmpdir(), 'bridgesllm-mail-attachments');
+
+function initializeMailUploadStorage(): string {
+  return ensureRuntimeDirectory(MAIL_UPLOAD_DIR, { mode: 0o700, enforceMode: true });
+}
+
+// Mail uploads land on disk first so a multipart request cannot allocate the
+// aggregate attachment set in the Portal heap. The handler applies the 25 MB
+// message-wide ceiling before reading and scanning files one at a time.
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, callback) => {
+      try {
+        callback(null, initializeMailUploadStorage());
+      } catch (error: any) {
+        callback(error, MAIL_UPLOAD_DIR);
+      }
+    },
+    filename: (_req, _file, callback) => callback(null, `${Date.now()}-${crypto.randomBytes(12).toString('hex')}`),
+  }),
+  limits: {
+    fileSize: MAX_MAIL_ATTACHMENT_BYTES,
+    files: 5,
+    fields: 1,
+    fieldSize: 512 * 1024,
+  },
+});
+
+function getUploadedMailFiles(req: Request): Express.Multer.File[] {
+  return (req.files as Express.Multer.File[]) || [];
+}
+
+function cleanupUploadedMailFiles(req: Request): void {
+  for (const file of getUploadedMailFiles(req)) {
+    if (!file.path || path.dirname(file.path) !== MAIL_UPLOAD_DIR) continue;
+    try { fs.unlinkSync(file.path); } catch {}
+  }
+}
+
+function validateUploadSet(files: Express.Multer.File[]): string | null {
+  const totalBytes = files.reduce((sum, file) => sum + Number(file.size || 0), 0);
+  if (totalBytes > MAX_MAIL_ATTACHMENT_BYTES) {
+    return 'Attachments exceed the 25 MB total message limit';
+  }
+  return null;
+}
+
+function parseMailUploads(req: Request, res: Response, next: NextFunction): void {
+  upload.array('attachments', 5)(req, res, (error: any) => {
+    if (!error) {
+      next();
+      return;
+    }
+    cleanupUploadedMailFiles(req);
+    if (error instanceof multer.MulterError) {
+      res.status(413).json({ error: 'Mail attachments exceed the allowed file, count, or form-size limit' });
+      return;
+    }
+    next(error);
+  });
+}
+
+const MAX_MAIL_BODY_CHARS = 2 * 1024 * 1024;
+const MAX_MAIL_RECIPIENTS = 100;
+
+function parseMultipartData(req: Request): Record<string, any> | null {
+  if (!req.is('multipart/form-data')) return req.body || {};
+  try {
+    const parsed = JSON.parse(typeof req.body?.data === 'string' ? req.body.data : '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function validateRecipients(...groups: Array<any[] | undefined>): string | null {
+  const recipients = groups.flatMap(group => Array.isArray(group) ? group : []);
+  if (!recipients.length) return 'Recipients (to) required';
+  if (recipients.length > MAX_MAIL_RECIPIENTS) return `A message can have at most ${MAX_MAIL_RECIPIENTS} recipients`;
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  for (const recipient of recipients) {
+    if (
+      !recipient
+      || typeof recipient !== 'object'
+      || typeof recipient.email !== 'string'
+      || recipient.email.length > 320
+      || !emailRegex.test(recipient.email)
+      || (recipient.name !== undefined && (typeof recipient.name !== 'string' || recipient.name.length > 200))
+    ) {
+      return 'One or more recipient addresses are invalid';
+    }
+  }
+  return null;
+}
+
+function validateOptionalIdList(value: unknown): value is string[] | undefined {
+  return value === undefined || (
+    Array.isArray(value)
+    && value.length <= 100
+    && value.every(item => typeof item === 'string' && item.length > 0 && item.length <= 998)
+  );
+}
+
+function mailClientSettings(username: string) {
+  const domain = getMailDomain();
+  return {
+    username,
+    email: `${username}@${domain}`,
+    imap: {
+      server: `mail.${domain}`,
+      port: 993,
+      security: 'SSL/TLS',
+    },
+    smtp: {
+      server: `mail.${domain}`,
+      port: 587,
+      security: 'STARTTLS',
+    },
+  };
+}
+
+function validateRequiredIdList(value: unknown): value is string[] {
+  return Array.isArray(value)
+    && value.length > 0
+    && value.length <= 200
+    && value.every(item => typeof item === 'string' && item.length > 0 && item.length <= 512);
+}
+
+function attachmentCapabilityFromHeader(req: Request): string {
+  return String(req.get('x-mail-attachment-capability') || '').trim();
+}
+
+function setAttachmentDownloadHeaders(res: Response, contentType: string, filename: string): void {
+  const fallbackName = filename
+    .replace(/[^\x20-\x7e]/g, '_')
+    .replace(/["\\]/g, '_')
+    .slice(0, 180) || 'attachment';
+  const encodedName = encodeURIComponent(filename)
+    .replace(/[!'()*]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Content-Disposition', `attachment; filename="${fallbackName}"; filename*=UTF-8''${encodedName}`);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+}
+
+async function requireCleanAttachment(
+  req: Request,
+  res: Response,
+  buffer: Buffer,
+  filename: string,
+  contentType: string,
+): Promise<boolean> {
+  const scanResult = await scanBuffer(buffer, filename);
+  if (scanResult.clean) return true;
+
+  await prisma.activityLog.create({
+    data: {
+      userId: req.user!.userId,
+      action: scanResult.scannerAvailable ? 'MALWARE_BLOCKED' : 'MAIL_ATTACHMENT_SCAN_UNAVAILABLE',
+      resource: 'mail',
+      severity: scanResult.scannerAvailable ? 'CRITICAL' : 'WARNING',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      translatedMessage: scanResult.scannerAvailable
+        ? `🦠 Malware blocked: "${filename}" — ${scanResult.threat}`
+        : `Mail attachment delivery blocked because scanning was unavailable: "${filename}"`,
+      metadata: {
+        filename,
+        threat: scanResult.threat || null,
+        contentType,
+        scannerAvailable: scanResult.scannerAvailable,
+      },
+    },
+  }).catch(() => undefined);
+  res.status(scanResult.scannerAvailable ? 400 : 503).json({
+    error: scanResult.scannerAvailable
+      ? `Attachment rejected: malware detected (${scanResult.threat || 'threat detected'})`
+      : 'Attachment delivery is temporarily unavailable because malware scanning could not complete',
+  });
+  return false;
+}
+
 // All mail routes require interactive portal access
-router.use(authenticateToken, requireApproved);
+router.use(authenticateToken, requireApproved, (req: Request, res: Response, next: NextFunction) => {
+  const unavailable = portalFeatureUnavailableResponse('mail');
+  if (unavailable) {
+    res.status(409).json(unavailable);
+    return;
+  }
+  const account = req.query.account;
+  if (account !== undefined && (typeof account !== 'string' || account.length < 1 || account.length > 512)) {
+    res.status(400).json({ error: 'Mail account selector is invalid' });
+    return;
+  }
+  next();
+});
+
+router.param('id', (_req: Request, res: Response, next: NextFunction, value: string) => {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) {
+    res.status(400).json({ error: 'Message identifier is invalid' });
+    return;
+  }
+  next();
+});
 
 // ── Account Resolution ────────────────────────────────────────
 
@@ -80,14 +307,15 @@ function getRequestedAccountId(req: Request): string | undefined {
 }
 
 function readExtraSharedMailCredentials(): SharedMailCredentials | null {
-  if (!EXTRA_SHARED_MAIL_AUTH_PATH) return null;
+  const authPath = getExtraSharedMailAuthPath();
+  if (!authPath) return null;
   try {
-    const raw = JSON.parse(fs.readFileSync(EXTRA_SHARED_MAIL_AUTH_PATH, 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(authPath, 'utf8'));
     const user = typeof raw.user === 'string' ? raw.user.trim() : '';
     const pass = typeof raw.pass === 'string' ? raw.pass : '';
     const email = typeof raw.email === 'string' && raw.email.trim()
       ? raw.email.trim()
-      : `${EXTRA_SHARED_MAIL_ACCOUNT_ID || user}@${MAIL_DOMAIN}`;
+      : `${getExtraSharedMailAccountId() || user}@${getMailDomain()}`;
     if (!user || !pass) return null;
     return { user, pass, email };
   } catch {
@@ -96,9 +324,10 @@ function readExtraSharedMailCredentials(): SharedMailCredentials | null {
 }
 
 function isSharedMailboxAccount(accountId?: string): boolean {
+  const extraSharedAccountId = getExtraSharedMailAccountId();
   return accountId === 'support'
     || accountId === 'noreply'
-    || (!!EXTRA_SHARED_MAIL_ACCOUNT_ID && accountId === EXTRA_SHARED_MAIL_ACCOUNT_ID);
+    || (!!extraSharedAccountId && accountId === extraSharedAccountId);
 }
 
 async function getSelectedPersonalMailboxCredentials(req: Request) {
@@ -120,12 +349,12 @@ async function resolveAccount(req: Request): Promise<ResolvedAccount | null | 'n
   const isAdmin = isElevatedRole(req.user?.role);
 
   if (accountParam === 'support') {
-    return isAdmin ? { user: STALWART_SUPPORT_USER, pass: STALWART_SUPPORT_PASS, email: `support@${MAIL_DOMAIN}` } : null;
+    return isAdmin ? { user: getStalwartSupportUser(), pass: getStalwartSupportPass(), email: `support@${getMailDomain()}` } : null;
   }
   if (accountParam === 'noreply') {
-    return isAdmin ? { user: STALWART_NOREPLY_USER, pass: STALWART_NOREPLY_PASS, email: `noreply@${MAIL_DOMAIN}` } : null;
+    return isAdmin ? { user: getStalwartNoreplyUser(), pass: getStalwartNoreplyPass(), email: `noreply@${getMailDomain()}` } : null;
   }
-  if (EXTRA_SHARED_MAIL_ACCOUNT_ID && accountParam === EXTRA_SHARED_MAIL_ACCOUNT_ID) {
+  if (getExtraSharedMailAccountId() && accountParam === getExtraSharedMailAccountId()) {
     const extraSharedMailbox = readExtraSharedMailCredentials();
     return isAdmin && extraSharedMailbox ? extraSharedMailbox : null;
   }
@@ -133,20 +362,25 @@ async function resolveAccount(req: Request): Promise<ResolvedAccount | null | 'n
   const creds = await getSelectedPersonalMailboxCredentials(req);
   if (!creds) return 'no_mailbox';
 
-  return { user: creds.username, pass: creds.password, email: `${creds.username}@${MAIL_DOMAIN}` };
+  return { user: creds.username, pass: creds.password, email: `${creds.username}@${getMailDomain()}` };
 }
 
 // ── Rate limiting for send operations ─────────────────────────
-const sendTimestamps: number[] = [];
+const sendTimestampsByPrincipal = new Map<string, number[]>();
 const SEND_RATE_LIMIT = 20;
 const SEND_RATE_WINDOW = 60 * 60 * 1000;
 
-function checkSendRateLimit(): boolean {
+function consumeSendRateLimit(principal: string): boolean {
   const now = Date.now();
-  while (sendTimestamps.length && sendTimestamps[0] < now - SEND_RATE_WINDOW) {
-    sendTimestamps.shift();
+  for (const [key, timestamps] of sendTimestampsByPrincipal) {
+    while (timestamps.length && timestamps[0] < now - SEND_RATE_WINDOW) timestamps.shift();
+    if (!timestamps.length) sendTimestampsByPrincipal.delete(key);
   }
-  return sendTimestamps.length < SEND_RATE_LIMIT;
+  const timestamps = sendTimestampsByPrincipal.get(principal) || [];
+  if (timestamps.length >= SEND_RATE_LIMIT) return false;
+  timestamps.push(now);
+  sendTimestampsByPrincipal.set(principal, timestamps);
+  return true;
 }
 
 // ── GET /api/mail/accounts ────────────────────────────────────
@@ -161,7 +395,7 @@ router.get('/accounts', async (req: Request, res: Response) => {
       accounts.push({
         id: account.id,
         label: account.username,
-        email: `${account.username}@${MAIL_DOMAIN}`,
+        email: `${account.username}@${getMailDomain()}`,
         isPrimary: account.isPrimary,
         kind: 'personal',
       });
@@ -170,11 +404,11 @@ router.get('/accounts', async (req: Request, res: Response) => {
     if (isAdmin) {
       const extraSharedMailbox = readExtraSharedMailCredentials();
       accounts.push(
-        { id: 'support', label: 'Shared Support', email: `support@${MAIL_DOMAIN}`, kind: 'shared' },
-        { id: 'noreply', label: 'Shared No-Reply', email: `noreply@${MAIL_DOMAIN}`, kind: 'shared' },
+        { id: 'support', label: 'Shared Support', email: `support@${getMailDomain()}`, kind: 'shared' },
+        { id: 'noreply', label: 'Shared No-Reply', email: `noreply@${getMailDomain()}`, kind: 'shared' },
       );
-      if (EXTRA_SHARED_MAIL_ACCOUNT_ID && extraSharedMailbox) {
-        accounts.push({ id: EXTRA_SHARED_MAIL_ACCOUNT_ID, label: EXTRA_SHARED_MAIL_LABEL, email: extraSharedMailbox.email, kind: 'shared' });
+      if (getExtraSharedMailAccountId() && extraSharedMailbox) {
+        accounts.push({ id: getExtraSharedMailAccountId(), label: getExtraSharedMailLabel(), email: extraSharedMailbox.email, kind: 'shared' });
       }
     }
     
@@ -209,15 +443,19 @@ router.get('/mailboxes', async (req: Request, res: Response) => {
 router.get('/unread', async (req: Request, res: Response) => {
   try {
     const account = await resolveAccount(req);
-    if (account === 'no_mailbox' || !account) {
-      res.json({ unread: 0 });
+    if (account === 'no_mailbox') {
+      res.json({ unread: 0, available: false, reason: 'no_mailbox' });
+      return;
+    }
+    if (!account) {
+      res.status(403).json({ error: 'Access denied' });
       return;
     }
     const count = await getUnreadCount(account.user, account.pass);
-    res.json({ unread: count });
+    res.json({ unread: count, available: true });
   } catch (error: any) {
     console.error('[mail] getUnreadCount error:', error.message);
-    res.json({ unread: 0 });
+    res.status(503).json({ error: 'Unread count is temporarily unavailable' });
   }
 });
 
@@ -234,14 +472,29 @@ router.get('/messages', async (req: Request, res: Response) => {
       return;
     }
 
-    const { mailboxId, mailboxRole, position, limit, sort } = req.query;
+    const { mailboxId, mailboxRole } = req.query;
+    if (
+      (mailboxId !== undefined && (typeof mailboxId !== 'string' || mailboxId.length > 512))
+      || (mailboxRole !== undefined && (typeof mailboxRole !== 'string' || mailboxRole.length > 100))
+    ) {
+      res.status(400).json({ error: 'Mailbox selector is invalid' });
+      return;
+    }
+    let pagination;
+    let query;
+    try {
+      pagination = normalizeMailListRequest(req.query as Record<string, unknown>);
+      query = normalizeMailSearchQuery(req.query.query);
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Mail pagination is invalid' });
+      return;
+    }
     const effectiveRole = (mailboxRole as string) || 'inbox';
     const result = await listEmails(account.user, account.pass, {
       mailboxId: mailboxId as string,
       mailboxRole: effectiveRole,
-      position: position ? parseInt(position as string) : 0,
-      limit: limit ? Math.min(parseInt(limit as string), 100) : 50,
-      sort: sort === 'date-asc' ? 'date-asc' : 'date-desc',
+      query,
+      ...pagination,
     });
     res.json(result);
   } catch (error: any) {
@@ -259,7 +512,26 @@ router.get('/messages/:id', async (req: Request, res: Response) => {
       return;
     }
     const email = await getEmail(req.params.id, account.user, account.pass);
-    res.json(email);
+    const attachments = email.attachments.map((attachment) => {
+      const filename = normalizeAttachmentName(attachment.name);
+      const contentType = normalizeContentType(attachment.type);
+      return {
+        ...attachment,
+        name: filename,
+        type: contentType,
+        downloadToken: attachment.isDangerous
+          ? null
+          : issueMailAttachmentCapabilityToken({
+              actorId: req.user!.userId,
+              accountUser: account.user,
+              blobId: attachment.blobId,
+              filename,
+              contentType,
+            }, config.jwtSecret),
+      };
+    });
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ ...email, attachments });
   } catch (error: any) {
     console.error('[mail] getEmail error:', error.message);
     res.status(500).json({ error: 'Failed to fetch email' });
@@ -274,17 +546,28 @@ router.get('/attachments/:blobId', async (req: Request, res: Response) => {
       res.status(403).json({ error: 'No mailbox' });
       return;
     }
-    const { name, type } = req.query;
+    const verified = verifyMailAttachmentCapabilityToken(
+      attachmentCapabilityFromHeader(req),
+      {
+        actorId: req.user!.userId,
+        accountUser: account.user,
+        blobId: req.params.blobId,
+      },
+      config.jwtSecret,
+    );
+    if (!verified) {
+      res.status(403).json({ error: 'Attachment authorization is invalid or expired. Refresh the message and try again.' });
+      return;
+    }
     const result = await downloadAttachment(
       req.params.blobId,
-      (name as string) || 'attachment',
-      (type as string) || 'application/octet-stream',
+      verified.filename,
+      verified.contentType,
       account.user,
       account.pass,
     );
-    res.setHeader('Content-Type', result.contentType);
-    res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
-    res.setHeader('X-Content-Type-Options', 'nosniff');
+    if (!(await requireCleanAttachment(req, res, result.buffer, result.filename, result.contentType))) return;
+    setAttachmentDownloadHeaders(res, result.contentType, result.filename);
     res.send(result.buffer);
   } catch (error: any) {
     console.error('[mail] downloadAttachment error:', error.message);
@@ -297,7 +580,7 @@ router.get('/attachments/:blobId', async (req: Request, res: Response) => {
 });
 
 // ── POST /api/mail/send ───────────────────────────────────────
-router.post('/send', upload.array('attachments', 10), async (req: Request, res: Response) => {
+router.post('/send', parseMailUploads, async (req: Request, res: Response) => {
   try {
     const account = await resolveAccount(req);
     if (account === 'no_mailbox' || !account) {
@@ -305,55 +588,53 @@ router.post('/send', upload.array('attachments', 10), async (req: Request, res: 
       return;
     }
 
-    if (!checkSendRateLimit()) {
-      res.status(429).json({ error: 'Rate limit exceeded. Max 20 emails per hour.' });
+    const data = parseMultipartData(req);
+    if (!data) {
+      res.status(400).json({ error: 'Invalid mail request data' });
       return;
     }
-    
-    let to: any[], cc: any[] | undefined, bcc: any[] | undefined;
-    let subject: string, textBody: string | undefined, htmlBody: string | undefined;
-    let inReplyTo: string[] | undefined, references: string[] | undefined;
-    
-    if (req.is('multipart/form-data')) {
-      const data = JSON.parse(req.body.data || '{}');
-      to = data.to;
-      cc = data.cc;
-      bcc = data.bcc;
-      subject = data.subject;
-      textBody = data.textBody;
-      htmlBody = data.htmlBody;
-      inReplyTo = data.inReplyTo;
-      references = data.references;
-    } else {
-      ({ to, cc, bcc, subject, textBody, htmlBody, inReplyTo, references } = req.body);
-    }
-    
-    if (!to || !Array.isArray(to) || !to.length) {
-      res.status(400).json({ error: 'Recipients (to) required' });
+    const { to, cc, bcc, subject, textBody, htmlBody, inReplyTo, references } = data;
+    const recipientError = validateRecipients(to, cc, bcc);
+    if (!Array.isArray(to) || to.length === 0 || recipientError) {
+      res.status(400).json({ error: recipientError || 'Recipients (to) required' });
       return;
     }
-    if (!subject) {
-      res.status(400).json({ error: 'Subject required' });
+    if (typeof subject !== 'string' || subject.trim().length === 0 || subject.length > 998) {
+      res.status(400).json({ error: 'Subject must be between 1 and 998 characters' });
+      return;
+    }
+    if (
+      (textBody !== undefined && typeof textBody !== 'string')
+      || (htmlBody !== undefined && typeof htmlBody !== 'string')
+      || (typeof textBody === 'string' && textBody.length > MAX_MAIL_BODY_CHARS)
+      || (typeof htmlBody === 'string' && htmlBody.length > MAX_MAIL_BODY_CHARS)
+    ) {
+      res.status(400).json({ error: 'Email body is invalid or exceeds the 2 MB limit' });
       return;
     }
     if (!textBody && !htmlBody) {
       res.status(400).json({ error: 'Email body required' });
       return;
     }
-    
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    const allRecipients = [...to, ...(cc || []), ...(bcc || [])];
-    for (const r of allRecipients) {
-      if (!r.email || !emailRegex.test(r.email)) {
-        res.status(400).json({ error: `Invalid email address: ${r.email}` });
-        return;
-      }
+    if (!validateOptionalIdList(inReplyTo) || !validateOptionalIdList(references)) {
+      res.status(400).json({ error: 'Mail threading identifiers are invalid' });
+      return;
     }
     
     const uploadedAttachments: { blobId: string; type: string; name: string; size: number }[] = [];
-    const files = (req.files as Express.Multer.File[]) || [];
+    const files = getUploadedMailFiles(req);
+    const uploadSetError = validateUploadSet(files);
+    if (uploadSetError) {
+      res.status(413).json({ error: uploadSetError });
+      return;
+    }
+    if (!consumeSendRateLimit(`${req.user!.userId}:${account.user}`)) {
+      res.status(429).json({ error: 'Rate limit exceeded. Max 20 emails per hour.' });
+      return;
+    }
     for (const file of files) {
-      const uploaded = await uploadBlob(file.buffer, file.mimetype, account.user, account.pass);
+      const fileBuffer = await fs.promises.readFile(file.path);
+      const uploaded = await uploadBlob(fileBuffer, file.mimetype, account.user, account.pass, file.originalname);
       uploadedAttachments.push({
         blobId: uploaded.blobId,
         type: file.mimetype,
@@ -361,8 +642,6 @@ router.post('/send', upload.array('attachments', 10), async (req: Request, res: 
         size: file.size,
       });
     }
-    
-    sendTimestamps.push(Date.now());
     
     const result = await sendEmail({
       from: account.email,
@@ -373,11 +652,13 @@ router.post('/send', upload.array('attachments', 10), async (req: Request, res: 
   } catch (error: any) {
     console.error('[mail] sendEmail error:', error.message);
     res.status(500).json({ error: 'Failed to send email' });
+  } finally {
+    cleanupUploadedMailFiles(req);
   }
 });
 
 // ── POST /api/mail/forward ────────────────────────────────────
-router.post('/forward', upload.array('attachments', 10), async (req: Request, res: Response) => {
+router.post('/forward', parseMailUploads, async (req: Request, res: Response) => {
   try {
     const account = await resolveAccount(req);
     if (account === 'no_mailbox' || !account) {
@@ -385,38 +666,41 @@ router.post('/forward', upload.array('attachments', 10), async (req: Request, re
       return;
     }
 
-    if (!checkSendRateLimit()) {
-      res.status(429).json({ error: 'Rate limit exceeded. Max 20 emails per hour.' });
+    const data = parseMultipartData(req);
+    if (!data) {
+      res.status(400).json({ error: 'Invalid mail request data' });
       return;
     }
-    
-    let originalId: string, to: any[], cc: any[] | undefined, bcc: any[] | undefined, body: string;
-    
-    if (req.is('multipart/form-data')) {
-      const data = JSON.parse(req.body.data || '{}');
-      originalId = data.originalId;
-      to = data.to;
-      cc = data.cc;
-      bcc = data.bcc;
-      body = data.body || '';
-    } else {
-      ({ originalId, to, cc, bcc, body } = req.body);
-      body = body || '';
-    }
-    
-    if (!originalId) {
-      res.status(400).json({ error: 'originalId required' });
+    const { originalId, to, cc, bcc } = data;
+    const body = data.body || '';
+    if (typeof originalId !== 'string' || originalId.length === 0 || originalId.length > 512) {
+      res.status(400).json({ error: 'originalId is invalid' });
       return;
     }
-    if (!to || !Array.isArray(to) || !to.length) {
-      res.status(400).json({ error: 'Recipients (to) required' });
+    const recipientError = validateRecipients(to, cc, bcc);
+    if (!Array.isArray(to) || to.length === 0 || recipientError) {
+      res.status(400).json({ error: recipientError || 'Recipients (to) required' });
+      return;
+    }
+    if (typeof body !== 'string' || body.length > MAX_MAIL_BODY_CHARS) {
+      res.status(400).json({ error: 'Forward body is invalid or exceeds the 2 MB limit' });
       return;
     }
     
     const additionalAttachments: { blobId: string; type: string; name: string; size: number }[] = [];
-    const files = (req.files as Express.Multer.File[]) || [];
+    const files = getUploadedMailFiles(req);
+    const uploadSetError = validateUploadSet(files);
+    if (uploadSetError) {
+      res.status(413).json({ error: uploadSetError });
+      return;
+    }
+    if (!consumeSendRateLimit(`${req.user!.userId}:${account.user}`)) {
+      res.status(429).json({ error: 'Rate limit exceeded. Max 20 emails per hour.' });
+      return;
+    }
     for (const file of files) {
-      const uploaded = await uploadBlob(file.buffer, file.mimetype, account.user, account.pass);
+      const fileBuffer = await fs.promises.readFile(file.path);
+      const uploaded = await uploadBlob(fileBuffer, file.mimetype, account.user, account.pass, file.originalname);
       additionalAttachments.push({
         blobId: uploaded.blobId,
         type: file.mimetype,
@@ -424,8 +708,6 @@ router.post('/forward', upload.array('attachments', 10), async (req: Request, re
         size: file.size,
       });
     }
-    
-    sendTimestamps.push(Date.now());
     
     const result = await forwardEmail(
       originalId, to, cc, bcc, body,
@@ -436,6 +718,8 @@ router.post('/forward', upload.array('attachments', 10), async (req: Request, re
   } catch (error: any) {
     console.error('[mail] forwardEmail error:', error.message);
     res.status(500).json({ error: 'Failed to forward email' });
+  } finally {
+    cleanupUploadedMailFiles(req);
   }
 });
 
@@ -464,8 +748,8 @@ router.post('/messages/:id/move', async (req: Request, res: Response) => {
       return;
     }
     const { targetMailboxId } = req.body;
-    if (!targetMailboxId) {
-      res.status(400).json({ error: 'targetMailboxId required' });
+    if (typeof targetMailboxId !== 'string' || targetMailboxId.length === 0 || targetMailboxId.length > 512) {
+      res.status(400).json({ error: 'targetMailboxId is invalid' });
       return;
     }
     await moveEmail(req.params.id, targetMailboxId, account.user, account.pass);
@@ -485,7 +769,11 @@ router.post('/messages/:id/flag', async (req: Request, res: Response) => {
       return;
     }
     const { flagged } = req.body;
-    await toggleFlag(req.params.id, !!flagged, account.user, account.pass);
+    if (typeof flagged !== 'boolean') {
+      res.status(400).json({ error: 'flagged must be a boolean' });
+      return;
+    }
+    await toggleFlag(req.params.id, flagged, account.user, account.pass);
     res.json({ success: true });
   } catch (error: any) {
     console.error('[mail] toggleFlag error:', error.message);
@@ -502,7 +790,11 @@ router.post('/messages/:id/read', async (req: Request, res: Response) => {
       return;
     }
     const { read } = req.body;
-    await markRead(req.params.id, read !== false, account.user, account.pass);
+    if (typeof read !== 'boolean') {
+      res.status(400).json({ error: 'read must be a boolean' });
+      return;
+    }
+    await markRead(req.params.id, read, account.user, account.pass);
     res.json({ success: true });
   } catch (error: any) {
     console.error('[mail] markRead error:', error.message);
@@ -519,11 +811,15 @@ router.post('/bulk/read', async (req: Request, res: Response) => {
       return;
     }
     const { emailIds, read } = req.body;
-    if (!emailIds || !Array.isArray(emailIds) || !emailIds.length) {
-      res.status(400).json({ error: 'emailIds array required' });
+    if (!validateRequiredIdList(emailIds)) {
+      res.status(400).json({ error: 'emailIds must contain 1–200 valid IDs' });
       return;
     }
-    await bulkMarkRead(emailIds, read !== false, account.user, account.pass);
+    if (typeof read !== 'boolean') {
+      res.status(400).json({ error: 'read must be a boolean' });
+      return;
+    }
+    await bulkMarkRead(emailIds, read, account.user, account.pass);
     res.json({ success: true });
   } catch (error: any) {
     console.error('[mail] bulkMarkRead error:', error.message);
@@ -540,8 +836,8 @@ router.post('/bulk/trash', async (req: Request, res: Response) => {
       return;
     }
     const { emailIds } = req.body;
-    if (!emailIds || !Array.isArray(emailIds) || !emailIds.length) {
-      res.status(400).json({ error: 'emailIds array required' });
+    if (!validateRequiredIdList(emailIds)) {
+      res.status(400).json({ error: 'emailIds must contain 1–200 valid IDs' });
       return;
     }
     await bulkTrash(emailIds, account.user, account.pass);
@@ -561,12 +857,12 @@ router.post('/bulk/move', async (req: Request, res: Response) => {
       return;
     }
     const { emailIds, targetMailboxId } = req.body;
-    if (!emailIds || !Array.isArray(emailIds) || !emailIds.length) {
-      res.status(400).json({ error: 'emailIds array required' });
+    if (!validateRequiredIdList(emailIds)) {
+      res.status(400).json({ error: 'emailIds must contain 1–200 valid IDs' });
       return;
     }
-    if (!targetMailboxId) {
-      res.status(400).json({ error: 'targetMailboxId required' });
+    if (typeof targetMailboxId !== 'string' || targetMailboxId.length === 0 || targetMailboxId.length > 512) {
+      res.status(400).json({ error: 'targetMailboxId is invalid' });
       return;
     }
     await bulkMove(emailIds, targetMailboxId, account.user, account.pass);
@@ -606,7 +902,7 @@ router.get('/signature', async (req: Request, res: Response) => {
       const logoSetting = await prisma.systemSetting.findFirst({ where: { key: 'logoUrl' } });
       const portalName = settings?.value || 'BridgesLLM Portal';
       const logoUrl = logoSetting?.value || '';
-      const email = `${mailbox?.username || creds.username}@${MAIL_DOMAIN}`;
+      const email = `${mailbox?.username || creds.username}@${getMailDomain()}`;
       const displayName = mailbox?.username || creds.username;
 
       const defaultText = `${displayName}\n${email}\n${portalName}`;
@@ -624,6 +920,11 @@ router.get('/signature', async (req: Request, res: Response) => {
 router.put('/signature', async (req: Request, res: Response) => {
   try {
     const { signature, signatureHtml } = req.body;
+    const signatureError = validateMailSignaturePayload(signature, signatureHtml);
+    if (signatureError) {
+      res.status(400).json({ error: signatureError });
+      return;
+    }
     const accountParam = (req.query.account as string) || '';
     const creds = await getUserMailCredentials(req.user!.userId, accountParam || undefined);
 
@@ -716,7 +1017,7 @@ router.put('/forward-settings', async (req: Request, res: Response) => {
         return;
       }
       // Don't allow forwarding to self (infinite loop)
-      if (autoForwardTo.toLowerCase() === `${creds.username}@${MAIL_DOMAIN}`.toLowerCase()) {
+      if (autoForwardTo.toLowerCase() === `${creds.username}@${getMailDomain()}`.toLowerCase()) {
         res.status(400).json({ error: 'Cannot forward to your own portal email' });
         return;
       }
@@ -762,24 +1063,53 @@ router.get('/credentials', async (req: Request, res: Response) => {
       return;
     }
 
-    res.json({
-      username: creds.username,
-      email: `${creds.username}@${MAIL_DOMAIN}`,
-      password: creds.password,
-      imap: {
-        server: `mail.${MAIL_DOMAIN}`,
-        port: 993,
-        security: 'SSL/TLS',
-      },
-      smtp: {
-        server: `mail.${MAIL_DOMAIN}`,
-        port: 587,
-        security: 'STARTTLS',
-      },
-    });
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+    res.json({ ...mailClientSettings(creds.username), passwordRequired: true });
   } catch (error: any) {
     console.error('[mail] credentials error:', error.message);
     res.status(500).json({ error: 'Failed to get credentials' });
+  }
+});
+
+// Revealing a reusable IMAP/SMTP password is materially more sensitive than
+// opening the mailbox with the current Portal session. Require recent proof of
+// the user's Portal password and never return the secret from a passive GET.
+router.post('/credentials/reveal', credentialRevealLimiter, async (req: Request, res: Response) => {
+  try {
+    const accountId = getRequestedAccountId(req);
+    if (isSharedMailboxAccount(accountId)) {
+      res.status(400).json({ error: 'Setup credentials are only available for personal mailboxes' });
+      return;
+    }
+    const currentPassword = typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
+    if (!currentPassword || currentPassword.length > 256) {
+      res.status(400).json({ error: 'Current Portal password is required' });
+      return;
+    }
+
+    const [creds, user] = await Promise.all([
+      getSelectedPersonalMailboxCredentials(req),
+      prisma.user.findUnique({
+        where: { id: req.user!.userId },
+        select: { passwordHash: true },
+      }),
+    ]);
+    if (!creds) {
+      res.status(404).json({ error: 'No mailbox configured' });
+      return;
+    }
+    if (!user || !(await comparePassword(currentPassword, user.passwordHash))) {
+      res.status(401).json({ error: 'Current Portal password is incorrect' });
+      return;
+    }
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+    res.json({ ...mailClientSettings(creds.username), password: creds.password });
+  } catch (error: any) {
+    console.error('[mail] credentials reveal error:', error.message);
+    res.status(500).json({ error: 'Failed to reveal credentials' });
   }
 });
 
@@ -815,7 +1145,113 @@ function generateDefaultSignatureHtml(name: string, email: string, portalName: s
 }
 
 // ── POST /api/mail/attachments/:blobId/save-to-files ──────────
-const MAX_SAVE_SIZE = 50 * 1024 * 1024; // 50MB
+const MAX_SAVE_SIZE = MAX_MAIL_ATTACHMENT_BYTES;
+
+interface PersistMailAttachmentInput {
+  userId: string;
+  filename: string;
+  contentType: string;
+  buffer: Buffer;
+  ipAddress?: string;
+  userAgent?: string;
+}
+
+interface PersistMailAttachmentDependencies {
+  createFile: (data: {
+    userId: string;
+    path: string;
+    originalName: string;
+    size: bigint;
+    mimeType: string;
+  }) => Promise<any>;
+  deleteFile: (id: string) => Promise<unknown>;
+  logActivity: (data: {
+    userId: string;
+    action: string;
+    resource: string;
+    resourceId: string;
+    severity: 'INFO';
+    ipAddress?: string;
+    userAgent?: string;
+  }) => Promise<unknown>;
+  getUploadDir: (userId: string) => string;
+  createToolMirror: (userId: string, sourcePath: string, fileName?: string) => string;
+  deleteToolMirror: (userId: string, fileName: string) => void;
+}
+
+const defaultPersistMailAttachmentDependencies: PersistMailAttachmentDependencies = {
+  createFile: (data) => prisma.file.create({ data }),
+  deleteFile: (id) => prisma.file.delete({ where: { id } }),
+  logActivity: (data) => prisma.activityLog.create({ data }),
+  getUploadDir: getUserUploadDir,
+  createToolMirror: ensureToolMirror,
+  deleteToolMirror: removeToolMirror,
+};
+
+/**
+ * Persist a verified mail attachment as one Portal file. Filesystem, database,
+ * and OpenClaw media-mirror writes use compensating rollback so a partial
+ * failure cannot leave an untracked attachment or a dangling File row.
+ */
+export async function persistMailAttachmentToFiles(
+  input: PersistMailAttachmentInput,
+  dependencies: PersistMailAttachmentDependencies = defaultPersistMailAttachmentDependencies,
+): Promise<any> {
+  const safeName = path.basename(input.filename)
+    .replace(/[\u0000-\u001f\u007f"\\/]/g, '_')
+    .trim()
+    .slice(0, 255) || 'attachment';
+  const rawExtension = path.extname(safeName);
+  const extension = /^\.[a-zA-Z0-9]{1,16}$/.test(rawExtension) ? rawExtension : '';
+  const storedName = `${crypto.randomUUID()}${extension}`;
+  const userDir = dependencies.getUploadDir(input.userId);
+  const finalPath = path.join(userDir, storedName);
+  const temporaryPath = path.join(userDir, `.${storedName}.${crypto.randomBytes(8).toString('hex')}.tmp`);
+  let createdFile: any;
+  let mirrorCreated = false;
+  let finalCreated = false;
+
+  try {
+    fs.writeFileSync(temporaryPath, input.buffer, { flag: 'wx', mode: 0o600 });
+    fs.renameSync(temporaryPath, finalPath);
+    finalCreated = true;
+
+    createdFile = await dependencies.createFile({
+      userId: input.userId,
+      path: storedName,
+      originalName: safeName,
+      size: BigInt(input.buffer.length),
+      mimeType: input.contentType,
+    });
+
+    dependencies.createToolMirror(input.userId, finalPath, storedName);
+    mirrorCreated = true;
+
+    await dependencies.logActivity({
+      userId: input.userId,
+      action: 'FILE_UPLOAD',
+      resource: 'file',
+      resourceId: createdFile.id,
+      severity: 'INFO',
+      ipAddress: input.ipAddress,
+      userAgent: input.userAgent,
+    }).catch(() => undefined);
+
+    return createdFile;
+  } catch (error) {
+    if (mirrorCreated) {
+      try { dependencies.deleteToolMirror(input.userId, storedName); } catch {}
+    }
+    if (createdFile?.id) {
+      try { await dependencies.deleteFile(createdFile.id); } catch {}
+    }
+    if (finalCreated) {
+      try { fs.unlinkSync(finalPath); } catch {}
+    }
+    try { fs.unlinkSync(temporaryPath); } catch {}
+    throw error;
+  }
+}
 
 router.post('/attachments/:blobId/save-to-files', async (req: Request, res: Response) => {
   try {
@@ -825,9 +1261,22 @@ router.post('/attachments/:blobId/save-to-files', async (req: Request, res: Resp
       return;
     }
 
-    const { filename, contentType } = req.body;
-    if (!filename || !contentType) {
-      res.status(400).json({ error: 'filename and contentType required' });
+    const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+    if (
+      typeof req.params.blobId !== 'string'
+      || req.params.blobId.length < 1
+      || req.params.blobId.length > 2048
+    ) {
+      res.status(400).json({ error: 'Attachment identifier is invalid' });
+      return;
+    }
+    const verified = verifyMailAttachmentCapabilityToken(token, {
+      actorId: req.user!.userId,
+      accountUser: account.user,
+      blobId: req.params.blobId,
+    }, config.jwtSecret);
+    if (!verified) {
+      res.status(403).json({ error: 'Attachment authorization is invalid or expired. Refresh the message and try again.' });
       return;
     }
 
@@ -836,14 +1285,14 @@ router.post('/attachments/:blobId/save-to-files', async (req: Request, res: Resp
     try {
       result = await downloadAttachment(
         req.params.blobId,
-        filename,
-        contentType,
+        verified.filename,
+        verified.contentType,
         account.user,
         account.pass,
       );
     } catch (err: any) {
       if (err.message.includes('blocked')) {
-        res.status(400).json({ error: 'This attachment type is blocked for security reasons' });
+        res.status(403).json({ error: 'This attachment type is blocked for security reasons' });
         return;
       }
       throw err;
@@ -851,61 +1300,20 @@ router.post('/attachments/:blobId/save-to-files', async (req: Request, res: Resp
 
     // Enforce max size
     if (result.buffer.length > MAX_SAVE_SIZE) {
-      res.status(400).json({ error: 'Attachment too large (max 50MB)' });
+      res.status(413).json({ error: 'Attachment is too large to save (25 MB maximum)' });
       return;
     }
 
-    // Virus scan before saving
-    const scanResult = await scanBuffer(result.buffer, filename);
-    if (!scanResult.clean) {
-      await prisma.activityLog.create({
-        data: {
-          userId: req.user!.userId,
-          action: 'MALWARE_BLOCKED',
-          resource: 'mail',
-          severity: 'CRITICAL',
-          ipAddress: req.ip,
-          userAgent: req.headers['user-agent'],
-          translatedMessage: `🦠 Malware blocked: "${filename}" — ${scanResult.threat}`,
-          metadata: { filename, threat: scanResult.threat, contentType },
-        },
-      }).catch(() => {});
-      res.status(400).json({ error: `File rejected: malware detected (${scanResult.threat})` });
-      return;
-    }
+    if (!(await requireCleanAttachment(req, res, result.buffer, result.filename, result.contentType))) return;
 
-    // Write to user's upload directory
     const userId = req.user!.userId;
-    const userDir = getUserUploadDir(userId);
-    fs.mkdirSync(userDir, { recursive: true });
-
-    const ext = path.extname(filename) || '';
-    const uniqueFilename = `${crypto.randomUUID()}${ext}`;
-    const filePath = path.join(userDir, uniqueFilename);
-    fs.writeFileSync(filePath, result.buffer);
-
-    // Create File record in DB
-    const file = await prisma.file.create({
-      data: {
-        userId,
-        path: uniqueFilename,
-        originalName: filename,
-        size: BigInt(result.buffer.length),
-        mimeType: contentType,
-      },
-    });
-
-    // Log activity
-    await prisma.activityLog.create({
-      data: {
-        userId,
-        action: 'FILE_UPLOAD',
-        resource: 'file',
-        resourceId: file.id,
-        severity: 'INFO',
-        ipAddress: req.ip,
-        userAgent: req.headers['user-agent'],
-      },
+    const file = await persistMailAttachmentToFiles({
+      userId,
+      filename: result.filename,
+      contentType: result.contentType,
+      buffer: result.buffer,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
     });
 
     res.json({

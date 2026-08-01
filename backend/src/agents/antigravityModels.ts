@@ -7,6 +7,10 @@ export interface AntigravityModelDescriptor {
 
 let cachedModelList: { expiresAt: number; models: AntigravityModelDescriptor[] } | null = null;
 
+export function invalidateAntigravityModelCache(): void {
+  cachedModelList = null;
+}
+
 function slugifyModelName(name: string): string {
   return name
     .trim()
@@ -52,6 +56,7 @@ export function listAntigravityModelsFromCli(): AntigravityModelDescriptor[] {
       env: {
         ...process.env,
         NO_COLOR: '1',
+        AGY_CLI_DISABLE_AUTO_UPDATE: '1',
         SSH_CONNECTION: process.env.SSH_CONNECTION || 'portal-model-discovery 127.0.0.1 127.0.0.1 0',
       },
       timeout: 10000,

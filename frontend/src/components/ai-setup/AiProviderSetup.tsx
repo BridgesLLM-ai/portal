@@ -1,16 +1,20 @@
-import { useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, ChevronRight, Cpu, Loader2, RefreshCw } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { AlertTriangle, ChevronRight, Cpu, Loader2, RefreshCw, Trash2, X } from 'lucide-react';
 import client from '../../api/client';
+import ViewportModal from '../ViewportModal';
 import ApiKeySetupFlow from './ApiKeySetupFlow';
+import AwsSdkSetupFlow from './AwsSdkSetupFlow';
 import DeviceCodeFlow from './DeviceCodeFlow';
 import NativeCliSetupFlow from './NativeCliSetupFlow';
 import OAuthSetupFlow from './OAuthSetupFlow';
 import OpenClawProviderPicker from './OpenClawProviderPicker';
+import ProviderAuthChoice from './ProviderAuthChoice';
 import type { ProviderStatus } from './ProviderCard';
-import ProviderCard from './ProviderCard';
 import QuickStartBanner from './QuickStartBanner';
 import SetupTokenFlow from './SetupTokenFlow';
-import { PROVIDERS, getProviderConfig, type ProviderUIConfig } from './providerConfig';
+import { getProviderConfig, parseProviderCatalog, type ProviderAuthType, type ProviderUIConfig } from './providerConfig';
+import { getProviderRemovalConfirmation } from './providerRemovalContract';
+import { useSettingsMutationCoordinator } from '../settings/SettingsMutationContext';
 
 interface AiSetupStatusResponse {
   openclawInstalled: boolean;
@@ -28,41 +32,104 @@ interface AiProviderSetupProps {
   apiBase: string;
   onComplete?: () => void;
   compact?: boolean;
+  onNativeModelSelected?: (provider: 'GEMINI', model: string) => Promise<boolean | void> | boolean | void;
+  additionalProviderCards?: ReactNode;
 }
 
-export default function AiProviderSetup({ mode, apiBase, onComplete, compact = false }: AiProviderSetupProps) {
+export default function AiProviderSetup({ mode, apiBase, onComplete, compact = false, onNativeModelSelected, additionalProviderCards }: AiProviderSetupProps) {
+  const settingsMutation = useSettingsMutationCoordinator();
+  const settingsClaim = settingsMutation?.claim;
+  const settingsRelease = settingsMutation?.release;
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<AiSetupStatusResponse | null>(null);
+  const [providers, setProviders] = useState<ProviderUIConfig[]>([]);
   const [activeSetup, setActiveSetup] = useState<ProviderUIConfig | null>(null);
+  const [activeAuthType, setActiveAuthType] = useState<ProviderAuthType | null>(null);
   const [activeDeviceFlow, setActiveDeviceFlow] = useState(false);
-  const [activeNativeCliFlow, setActiveNativeCliFlow] = useState<'claude-code' | 'codex' | 'gemini' | null>(null);
+  const [activeNativeCliFlow, setActiveNativeCliFlow] = useState<'claude-code' | 'codex' | 'gemini' | 'grok' | null>(null);
   const [showProviderPicker, setShowProviderPicker] = useState(false);
+  const [removalTarget, setRemovalTarget] = useState<{
+    provider: ProviderUIConfig;
+    operationId: string;
+  } | null>(null);
+  const [removalConfirmation, setRemovalConfirmation] = useState('');
+  const [removingProvider, setRemovingProvider] = useState(false);
+  const [removalError, setRemovalError] = useState<string | null>(null);
+  const settingsFlowOwnerRef = useRef<string | null>(null);
 
-  const loadStatus = async (silent = false) => {
+  const claimSettingsFlow = useCallback((settingsOwner: string) => {
+    if (settingsFlowOwnerRef.current) return false;
+    if (settingsClaim && !settingsClaim(settingsOwner)) return false;
+    settingsFlowOwnerRef.current = settingsOwner;
+    return true;
+  }, [settingsClaim]);
+
+  const releaseSettingsFlow = useCallback(() => {
+    const settingsOwner = settingsFlowOwnerRef.current;
+    if (!settingsOwner) return;
+    settingsFlowOwnerRef.current = null;
+    settingsRelease?.(settingsOwner);
+  }, [settingsRelease]);
+
+  const loadStatus = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     else setRefreshing(true);
     setError(null);
     try {
-      const { data } = await client.get<AiSetupStatusResponse>(`${apiBase}/status`);
-      setStatus(data);
+      const [statusResponse, catalogResponse] = await Promise.all([
+        client.get<AiSetupStatusResponse>(`${apiBase}/status`, {
+          params: silent ? { refreshProviderReadiness: '1' } : undefined,
+        }),
+        client.get<unknown>(`${apiBase}/catalog`),
+      ]);
+      setStatus(statusResponse.data);
+      setProviders(parseProviderCatalog(catalogResponse.data));
     } catch (err: any) {
       setError(err?.response?.data?.error || err?.message || 'Failed to load AI provider status');
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  };
+  }, [apiBase]);
 
   useEffect(() => {
     void loadStatus();
-  }, [apiBase]);
+  }, [loadStatus]);
 
   const statusMap = useMemo(
     () => new Map((status?.providers || []).map((p) => [p.id, p])),
     [status?.providers],
   );
+
+  const beginProviderSetup = (provider: ProviderUIConfig | null) => {
+    setActiveSetup(provider);
+    setActiveAuthType(provider?.authOptions?.length ? null : (provider?.primaryAuthType || null));
+  };
+
+  const beginOwnedProviderSetup = (provider: ProviderUIConfig) => {
+    if (provider.guidedSetup.status !== 'available') return false;
+    if (!claimSettingsFlow(`settings:ai-provider:${provider.id}`)) return false;
+    beginProviderSetup(provider);
+    return true;
+  };
+
+  const closeProviderSetup = () => {
+    setActiveSetup(null);
+    setActiveAuthType(null);
+    releaseSettingsFlow();
+  };
+
+  const closeDeviceFlow = () => {
+    setActiveDeviceFlow(false);
+    releaseSettingsFlow();
+  };
+
+  const closeNativeCliFlow = () => {
+    setActiveNativeCliFlow(null);
+    releaseSettingsFlow();
+  };
 
   const handleCardChoose = (id: string) => {
     if (id === 'openclaw') {
@@ -70,21 +137,12 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
       return;
     }
     if (id === 'github-copilot') {
+      if (!claimSettingsFlow('settings:ai-provider:github-copilot')) return;
       setActiveDeviceFlow(true);
       return;
     }
-    const provider = getProviderConfig(id);
-    setActiveSetup(provider);
-  };
-
-  const handleRemove = async (providerId: string) => {
-    if (!window.confirm(`Remove ${providerId} from the AI provider configuration?`)) return;
-    try {
-      await client.delete(`${apiBase}/provider/${providerId}`);
-      await loadStatus(true);
-    } catch (err: any) {
-      setError(err?.response?.data?.error || err?.message || `Failed to remove ${providerId}`);
-    }
+    const provider = getProviderConfig(providers, id);
+    if (provider) beginOwnedProviderSetup(provider);
   };
 
   const handleComplete = async () => {
@@ -94,19 +152,142 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
   };
 
   const handleNativeCliLogin = (nativeProvider: string) => {
-    const providerMap: Record<string, 'claude-code' | 'codex' | 'gemini'> = {
+    const providerMap: Record<string, 'claude-code' | 'codex' | 'gemini' | 'grok'> = {
       'CLAUDE_CODE': 'claude-code',
       'CODEX': 'codex',
       'GEMINI': 'gemini',
+      'GROK': 'grok',
       'claude-code': 'claude-code',
       'codex': 'codex',
       'gemini': 'gemini',
+      'grok': 'grok',
     };
     const mapped = providerMap[nativeProvider];
-    if (mapped) {
+    if (mapped && claimSettingsFlow(`settings:ai-provider:native:${mapped}`)) {
       setActiveNativeCliFlow(mapped);
     }
   };
+
+  const beginProviderRemoval = (provider: ProviderUIConfig) => {
+    if (!claimSettingsFlow(`settings:ai-provider:remove:${provider.id}`)) return;
+    setShowProviderPicker(false);
+    setRemovalTarget({ provider, operationId: globalThis.crypto.randomUUID() });
+    setRemovalConfirmation('');
+    setRemovalError(null);
+  };
+
+  const closeProviderRemoval = () => {
+    if (removingProvider) return;
+    setRemovalTarget(null);
+    setRemovalConfirmation('');
+    setRemovalError(null);
+    releaseSettingsFlow();
+  };
+
+  const submitProviderRemoval = async () => {
+    if (!removalTarget || removalConfirmation !== removalTarget.provider.id || removingProvider) return;
+    setRemovingProvider(true);
+    setRemovalError(null);
+    try {
+      await client.delete(`${apiBase}/provider/${encodeURIComponent(removalTarget.provider.id)}`, {
+        data: {
+          operationId: removalTarget.operationId,
+          confirmationProvider: removalTarget.provider.id,
+        },
+      });
+      await loadStatus(true);
+      setRemovalTarget(null);
+      setRemovalConfirmation('');
+      releaseSettingsFlow();
+    } catch (err: any) {
+      if (err?.response?.data?.operationDisposition === 'not_admitted') {
+        setRemovalTarget((current) => current
+          ? { ...current, operationId: globalThis.crypto.randomUUID() }
+          : current);
+      }
+      setRemovalError(err?.response?.data?.error || err?.message || 'Provider disconnect could not complete safely.');
+    } finally {
+      setRemovingProvider(false);
+    }
+  };
+
+  const providerRemovalDialog = removalTarget ? (
+    <ViewportModal
+      open
+      onDismiss={closeProviderRemoval}
+      className="bg-black/60 p-4 backdrop-blur-sm"
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="provider-removal-title"
+        className="w-full max-w-lg rounded-2xl border border-red-500/20 bg-slate-950 text-white shadow-2xl"
+      >
+        <div className="flex items-start justify-between gap-3 border-b border-slate-800 px-5 py-4">
+          <div>
+            <h2 id="provider-removal-title" className="text-lg font-semibold">
+              Disconnect {removalTarget.provider.name}
+            </h2>
+            <p className="mt-1 text-sm text-slate-400">
+              Portal will remove only the exact Portal-owned API-key profile and its model-routing references.
+            </p>
+          </div>
+          <button
+            type="button"
+            aria-label="Close provider disconnect"
+            onClick={closeProviderRemoval}
+            disabled={removingProvider}
+            className="rounded-lg border border-slate-800 p-2 text-slate-400 transition hover:text-white disabled:opacity-50"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="space-y-4 px-5 py-5">
+          <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+            {getProviderRemovalConfirmation(removalTarget.provider.id)}
+          </div>
+          <label className="block text-sm text-slate-300">
+            Provider id
+            <input
+              value={removalConfirmation}
+              onChange={(event) => setRemovalConfirmation(event.target.value)}
+              disabled={removingProvider}
+              autoComplete="off"
+              spellCheck={false}
+              className="mt-2 w-full rounded-xl border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-sm text-white outline-none focus:border-red-400 disabled:opacity-60"
+              placeholder={removalTarget.provider.id}
+            />
+          </label>
+          {removalError ? (
+            <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-100">
+              {removalError}
+            </div>
+          ) : null}
+          <div className="flex flex-wrap justify-end gap-2">
+            <button
+              type="button"
+              onClick={closeProviderRemoval}
+              disabled={removingProvider}
+              className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-300 transition hover:bg-slate-900 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => void submitProviderRemoval()}
+              disabled={removingProvider || removalConfirmation !== removalTarget.provider.id}
+              className="inline-flex items-center gap-2 rounded-xl bg-red-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-red-400 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {removingProvider ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+              {removingProvider ? 'Disconnecting…' : 'Disconnect provider'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </ViewportModal>
+  ) : null;
+
+  useEffect(() => () => releaseSettingsFlow(), [releaseSettingsFlow]);
 
   // ── Compact layout (sidebar drawer) ──────────────────────────────
   if (compact) {
@@ -154,44 +335,73 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
         ) : null}
 
         {/* Provider buttons */}
-        {!loading ? (
-          <QuickStartBanner onChoose={handleCardChoose} onNativeCliLogin={handleNativeCliLogin} statusMap={statusMap} compact />
+        {!loading || additionalProviderCards ? (
+          <QuickStartBanner
+            onChoose={handleCardChoose}
+            onNativeCliLogin={handleNativeCliLogin}
+            statusMap={statusMap}
+            compact
+            additionalCards={additionalProviderCards}
+            showBuiltInCards={!loading}
+          />
         ) : null}
 
         {/* Modals */}
         {showProviderPicker ? (
           <OpenClawProviderPicker
+            providers={providers}
             statusMap={statusMap}
-            onSelect={(provider) => { setShowProviderPicker(false); setActiveSetup(provider); }}
-            onDeviceFlow={() => { setShowProviderPicker(false); setActiveDeviceFlow(true); }}
-            onNativeCliFlow={(provider) => { setShowProviderPicker(false); setActiveNativeCliFlow(provider); }}
+            onSelect={(provider) => {
+              if (!beginOwnedProviderSetup(provider)) return;
+              setShowProviderPicker(false);
+            }}
+            onRemove={beginProviderRemoval}
+            onDeviceFlow={() => {
+              if (!claimSettingsFlow('settings:ai-provider:github-copilot')) return;
+              setShowProviderPicker(false);
+              setActiveDeviceFlow(true);
+            }}
             onClose={() => setShowProviderPicker(false)}
           />
         ) : null}
-        {activeSetup?.primaryAuthType === 'api_key' ? (
-          <ApiKeySetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
+        {providerRemovalDialog}
+        {activeSetup && !activeAuthType && activeSetup.authOptions?.length ? (
+          <ProviderAuthChoice provider={activeSetup} onSelect={setActiveAuthType} onCancel={closeProviderSetup} />
         ) : null}
-        {activeSetup?.primaryAuthType === 'oauth' ? (
-          <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
+        {activeSetup && activeAuthType === 'api_key' ? (
+          <ApiKeySetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={closeProviderSetup} />
         ) : null}
-        {activeSetup?.primaryAuthType === 'setup_token' ? (
+        {activeSetup && activeAuthType === 'oauth' ? (
+          <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={closeProviderSetup} />
+        ) : null}
+        {activeSetup && activeAuthType === 'aws_sdk' ? (
+          <AwsSdkSetupFlow
+            provider={activeSetup}
+            status={statusMap.get(activeSetup.id) || null}
+            refreshing={refreshing}
+            onRefresh={() => loadStatus(true)}
+            onCancel={closeProviderSetup}
+          />
+        ) : null}
+        {activeSetup && activeAuthType === 'setup_token' ? (
           <SetupTokenFlow
             provider={activeSetup}
             status={statusMap.get(activeSetup.id) || null}
             apiBase={apiBase}
             onComplete={handleComplete}
-            onCancel={() => setActiveSetup(null)}
+            onCancel={closeProviderSetup}
             onNativeCliLogin={() => {
               setActiveSetup(null);
+              setActiveAuthType(null);
               setActiveNativeCliFlow('claude-code');
             }}
           />
         ) : null}
         {activeDeviceFlow ? (
-          <DeviceCodeFlow apiBase={apiBase} onComplete={async () => { await handleComplete(); setActiveDeviceFlow(false); }} onCancel={() => setActiveDeviceFlow(false)} />
+          <DeviceCodeFlow apiBase={apiBase} onComplete={async () => { await handleComplete(); closeDeviceFlow(); }} onCancel={closeDeviceFlow} />
         ) : null}
         {activeNativeCliFlow ? (
-          <NativeCliSetupFlow provider={activeNativeCliFlow} apiBase={apiBase} onComplete={async () => { await handleComplete(); setActiveNativeCliFlow(null); }} onCancel={() => setActiveNativeCliFlow(null)} />
+          <NativeCliSetupFlow provider={activeNativeCliFlow} apiBase={apiBase} onComplete={async () => { await handleComplete(); closeNativeCliFlow(); }} onCancel={closeNativeCliFlow} onModelSelected={onNativeModelSelected} />
         ) : null}
       </div>
     );
@@ -263,45 +473,64 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
       ) : null}
 
       {/* ── Four cards ── */}
-      {!loading ? (
-        <QuickStartBanner onChoose={handleCardChoose} onNativeCliLogin={handleNativeCliLogin} statusMap={statusMap} />
+      {!loading || additionalProviderCards ? (
+        <QuickStartBanner
+          onChoose={handleCardChoose}
+          onNativeCliLogin={handleNativeCliLogin}
+          statusMap={statusMap}
+          additionalCards={additionalProviderCards}
+          showBuiltInCards={!loading}
+        />
       ) : null}
 
       {/* ── Modals ── */}
       {showProviderPicker ? (
         <OpenClawProviderPicker
+          providers={providers}
           statusMap={statusMap}
           onSelect={(provider) => {
+            if (!beginOwnedProviderSetup(provider)) return;
             setShowProviderPicker(false);
-            setActiveSetup(provider);
           }}
+          onRemove={beginProviderRemoval}
           onDeviceFlow={() => {
+            if (!claimSettingsFlow('settings:ai-provider:github-copilot')) return;
             setShowProviderPicker(false);
             setActiveDeviceFlow(true);
-          }}
-          onNativeCliFlow={(provider) => {
-            setShowProviderPicker(false);
-            setActiveNativeCliFlow(provider);
           }}
           onClose={() => setShowProviderPicker(false)}
         />
       ) : null}
+      {providerRemovalDialog}
 
-      {activeSetup?.primaryAuthType === 'api_key' ? (
-        <ApiKeySetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
+      {activeSetup && !activeAuthType && activeSetup.authOptions?.length ? (
+        <ProviderAuthChoice provider={activeSetup} onSelect={setActiveAuthType} onCancel={closeProviderSetup} />
       ) : null}
-      {activeSetup?.primaryAuthType === 'oauth' ? (
-        <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={() => setActiveSetup(null)} />
+      {activeSetup && activeAuthType === 'api_key' ? (
+        <ApiKeySetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={closeProviderSetup} />
       ) : null}
-      {activeSetup?.primaryAuthType === 'setup_token' ? (
+      {activeSetup && activeAuthType === 'oauth' ? (
+        <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={closeProviderSetup} />
+      ) : null}
+      {activeSetup && activeAuthType === 'aws_sdk' ? (
+        <AwsSdkSetupFlow
+          provider={activeSetup}
+          status={statusMap.get(activeSetup.id) || null}
+          refreshing={refreshing}
+          onRefresh={() => loadStatus(true)}
+          onCancel={closeProviderSetup}
+        />
+      ) : null}
+      {activeSetup && activeAuthType === 'setup_token' ? (
         <SetupTokenFlow
           provider={activeSetup}
           status={statusMap.get(activeSetup.id) || null}
           apiBase={apiBase}
           onComplete={handleComplete}
-          onCancel={() => setActiveSetup(null)}
+          onCancel={closeProviderSetup}
           onNativeCliLogin={() => {
             setActiveSetup(null);
+            setActiveAuthType(null);
             setActiveNativeCliFlow('claude-code');
           }}
         />
@@ -309,16 +538,17 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
       {activeDeviceFlow ? (
         <DeviceCodeFlow
           apiBase={apiBase}
-          onComplete={async () => { await handleComplete(); setActiveDeviceFlow(false); }}
-          onCancel={() => setActiveDeviceFlow(false)}
+          onComplete={async () => { await handleComplete(); closeDeviceFlow(); }}
+          onCancel={closeDeviceFlow}
         />
       ) : null}
       {activeNativeCliFlow ? (
         <NativeCliSetupFlow
           provider={activeNativeCliFlow}
           apiBase={apiBase}
-          onComplete={async () => { await handleComplete(); setActiveNativeCliFlow(null); }}
-          onCancel={() => setActiveNativeCliFlow(null)}
+          onComplete={async () => { await handleComplete(); closeNativeCliFlow(); }}
+          onCancel={closeNativeCliFlow}
+          onModelSelected={onNativeModelSelected}
         />
       ) : null}
 

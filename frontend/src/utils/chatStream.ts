@@ -68,28 +68,10 @@ export function mergeAssistantStream(
   const chunk = typeof incoming === 'string' ? incoming : '';
   if (!chunk) return current;
   if (opts?.replace) return chunk;
-  if (!current) return chunk;
-  if (chunk === current) return current;
-  if (chunk.startsWith(current)) return chunk;
-
-  // Some transports occasionally resend a large suffix or a cumulative snapshot
-  // without setting `replace`. Only apply de-duplication heuristics to sizeable
-  // chunks, otherwise single-character/token deltas like "l" or " " get eaten
-  // and words lose letters/spaces while streaming.
-  const smartDedupeMinChars = 8;
-  if (chunk.length >= smartDedupeMinChars) {
-    if (current.startsWith(chunk) || current.endsWith(chunk) || current.includes(chunk)) {
-      return current;
-    }
-
-    const maxOverlap = Math.min(current.length, chunk.length);
-    for (let overlap = maxOverlap; overlap >= smartDedupeMinChars; overlap--) {
-      if (current.slice(-overlap) === chunk.slice(0, overlap)) {
-        return current + chunk.slice(overlap);
-      }
-    }
-  }
-
+  // Stream semantics come from the transport, not the text. Providers mark
+  // cumulative snapshots with `replace`; every other event is a delta. Content
+  // heuristics corrupt legitimate repeated output (for example, "test 123"
+  // emitted hundreds of times) and overlapping code/text fragments.
   return current + chunk;
 }
 
@@ -102,30 +84,53 @@ export function mergeThinkingStream(
   if (!chunk) return current;
   if (opts?.replace) return chunk;
   if (!current) return chunk;
-  if (chunk === current) return current;
   const normalizedCurrent = current.trim().toLowerCase();
   const normalizedChunk = chunk.trim().toLowerCase();
   if ((normalizedCurrent === 'thinking…' || normalizedCurrent === 'thinking...')
     && normalizedChunk !== normalizedCurrent) {
     return chunk;
   }
-  if (chunk.startsWith(current)) return chunk;
+  return current + chunk;
+}
 
-  const smartDedupeMinChars = 8;
-  if (chunk.length >= smartDedupeMinChars) {
-    if (current.startsWith(chunk) || current.endsWith(chunk) || current.includes(chunk)) {
-      return current;
-    }
+/**
+ * Remove text already represented by graduated pre/tool/post segments from a
+ * cumulative provider final. Returns only the genuinely new terminal tail.
+ * If the final is not a cumulative mirror, it is returned unchanged.
+ */
+export function reconcileCumulativeFinalTail(
+  graduatedText: readonly string[],
+  rawFinalContent: string,
+): string {
+  const finalContent = String(rawFinalContent || '');
+  const represented = graduatedText.filter((value) => String(value || '').trim());
+  if (!finalContent || represented.length === 0) return finalContent;
 
-    const maxOverlap = Math.min(current.length, chunk.length);
-    for (let overlap = maxOverlap; overlap >= smartDedupeMinChars; overlap--) {
-      if (current.slice(-overlap) === chunk.slice(0, overlap)) {
-        return current + chunk.slice(overlap);
-      }
+  let cursor = 0;
+  let matched = 0;
+  for (const value of represented) {
+    const text = String(value || '');
+    const index = finalContent.indexOf(text, cursor);
+    if (index < 0 || finalContent.slice(cursor, index).trim()) {
+      matched = 0;
+      break;
     }
+    cursor = index + text.length;
+    matched += 1;
+  }
+  if (matched === represented.length) {
+    return finalContent.slice(cursor).replace(/^\s+/, '');
   }
 
-  return current + chunk;
+  const normalize = (value: string) => value.replace(/\s+/g, ' ').trim();
+  const representedComparable = normalize(represented.join(''));
+  const finalComparable = normalize(finalContent);
+  if (!representedComparable) return finalContent;
+  if (finalComparable === representedComparable) return '';
+  if (finalComparable.startsWith(`${representedComparable} `)) {
+    return finalComparable.slice(representedComparable.length).trimStart();
+  }
+  return finalContent;
 }
 
 const GENERIC_THINKING_PLACEHOLDER_RE = /^(?:🧠\s*)?(?:agent is thinking|thinking)(?:\s*(?:\.|…|\.\.\.))*$/i;

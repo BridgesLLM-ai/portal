@@ -59,9 +59,15 @@ export function useAgentRuntime(options: {
   session?: string;
   model?: string;
   agentId?: string;
+  canSend?: boolean;
+  onSendBlocked?: () => void;
   onSessionResolved?: (resolvedId: string) => void;
 }) {
   const ctx = useChatState();
+  const sendMessage = ctx.sendMessage;
+  const cancelStream = ctx.cancelStream;
+  const canSend = options.canSend !== false;
+  const onSendBlocked = options.onSendBlocked;
   const prevSessionRef = useRef<string | undefined>();
   const onSessionResolvedRef = useRef(options.onSessionResolved);
   onSessionResolvedRef.current = options.onSessionResolved;
@@ -106,17 +112,21 @@ export function useAgentRuntime(options: {
     async (appendMsg: AppendMessage) => {
       const text = extractTextFromAppendMessage(appendMsg);
       if (!text.trim()) return;
+      if (!canSend) {
+        onSendBlocked?.();
+        return;
+      }
       // Play send sound
       try { sounds.click(); } catch {}
-      await ctx.sendMessage(text);
+      await sendMessage(text);
     },
-    [ctx.sendMessage],
+    [canSend, onSendBlocked, sendMessage],
   );
 
   // assistant-ui onCancel callback
   const onCancel = useCallback(async () => {
-    await ctx.cancelStream();
-  }, [ctx.cancelStream]);
+    await cancelStream();
+  }, [cancelStream]);
 
   const store: ExternalStoreAdapter<ChatMessage> = {
     // Always tell assistant-ui the thread is "not running" so the Send button
@@ -148,7 +158,9 @@ export function useAgentRuntime(options: {
     streamingPhase: ctx.streamingPhase,
     activeToolName: ctx.activeToolName,
     thinkingContent: ctx.thinkingContent,
+    thinkingSubject: ctx.thinkingSubject,
     streamSegments: ctx.streamSegments,
+    activityTitles: ctx.activityTitles,
     pendingApproval: ctx.pendingApproval,
     pendingApprovals: ctx.pendingApprovals,
     pendingApprovalCount: ctx.pendingApprovalCount,

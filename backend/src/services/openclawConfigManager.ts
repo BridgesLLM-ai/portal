@@ -1,15 +1,22 @@
 import fs from 'fs';
 import path from 'path';
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import { isDeepStrictEqual } from 'util';
 import type { AgentProviderName } from '../agents/AgentProvider.interface';
 import {
   getNativeCliAuthStatus,
+  getNativeCliAuthStatusAsync,
   getNativeProviderLinkedToOpenClawProvider,
+  type NativeCliAuthStatus,
   type NativeCliAuthState,
 } from '../agents/nativeCliAuth';
 import { AI_PROVIDERS } from '../config/aiProviders';
 import { buildOpenClawCliEnv, extractJsonFromCliOutput, normalizePortalModelId, repairClaudeSubscriptionConfig } from '../utils/openclawCli';
+import {
+  createAmazonBedrockReadiness,
+  getAmazonBedrockReadiness,
+  type ProviderReadiness,
+} from './amazonBedrockReadiness';
 
 const HOME_DIR = process.env.HOME || '/root';
 const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(HOME_DIR, '.openclaw');
@@ -19,7 +26,7 @@ export const MODELS_JSON_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agen
 export const CODEX_EXTERNAL_CLI_PROFILE_ID = 'openai:codex-cli';
 export const CODEX_CLI_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
 export const OPENCLAW_CODEX_HOME_AUTH_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'codex-home', 'auth.json');
-export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.7.1';
+export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.7.1-1';
 const LEGACY_OPENCLAW_HOME = path.join(HOME_DIR, '.clawdbot');
 const LEGACY_PLUGIN_INSTALLS_PATH = path.join(OPENCLAW_HOME, 'plugins', 'installs.json');
 const LEGACY_GLOBAL_CODEX_PLUGIN_DIR = path.join(OPENCLAW_HOME, 'npm', 'node_modules', '@openclaw', 'codex');
@@ -27,9 +34,19 @@ const OPENCLAW_SQLITE_PATH = path.join(OPENCLAW_HOME, 'state', 'openclaw.sqlite'
 const OPENCLAW_AUTH_STORE_MANAGER = 'openclaw-auth-store';
 const OPENCLAW_AUTH_STORE_CACHE_MS = 30_000;
 let openClawAuthStoreProfilesCache: { expiresAt: number; profiles: Record<string, AuthProfile> } | null = null;
+let openClawAuthStoreProfilesCacheGeneration = 0;
+const openClawAuthStoreProfilesRefreshes: Partial<Record<'strict' | 'lenient', {
+  generation: number;
+  promise: Promise<Record<string, AuthProfile>>;
+}>> = {};
+
+export function invalidateOpenClawAuthStoreProfilesCache(): void {
+  openClawAuthStoreProfilesCache = null;
+  openClawAuthStoreProfilesCacheGeneration += 1;
+}
 
 export interface AuthProfile {
-  type: 'api_key' | 'token' | 'oauth';
+  type: 'api_key' | 'token' | 'oauth' | 'unknown';
   provider: string;
   key?: string;
   token?: string;
@@ -79,7 +96,7 @@ export interface OpenClawUpgradeStateRestoreResult {
 
 export interface ProviderStatus {
   id: string;
-  status: 'configured' | 'unconfigured' | 'error' | 'expired' | 'cooldown';
+  status: 'configured' | 'unconfigured' | 'error' | 'expired' | 'cooldown' | 'manual';
   authType: string | null;
   profileId: string | null;
   currentModel: string | null;
@@ -94,6 +111,14 @@ export interface ProviderStatus {
   nativeCliAuthMessage: string | null;
   nativeCliLoginCommand: string | null;
   requiresSeparateNativeLogin: boolean;
+  readiness: ProviderReadiness | null;
+}
+
+interface ProviderStatusOptions {
+  authStoreProfiles?: Record<string, AuthProfile>;
+  authStoreError?: string | null;
+  nativeAuthStatuses?: Partial<Record<AgentProviderName, NativeCliAuthStatus>>;
+  providerReadiness?: Partial<Record<string, ProviderReadiness>>;
 }
 
 function safeReadJson<T>(targetPath: string, fallback: T): T {
@@ -807,7 +832,10 @@ export function readOpenClawConfig(): any {
 function normalizeAuthStoreType(rawType: unknown): AuthProfile['type'] {
   const type = String(rawType || '').trim();
   if (type === 'api_key' || type === 'token' || type === 'oauth') return type;
-  return 'oauth';
+  // Never promote a new, missing, or malformed OpenClaw credential type to
+  // OAuth. Destructive callers may only admit an explicitly attested OAuth
+  // profile; preserving "unknown" lets those callers fail closed.
+  return 'unknown';
 }
 
 function parseAuthStoreExpires(rawExpires: unknown): number | undefined {
@@ -824,7 +852,7 @@ function parseAuthStoreExpires(rawExpires: unknown): number | undefined {
 function normalizeOpenClawAuthStoreProfile(profileId: string, rawProfile: any): AuthProfile | null {
   const id = String(profileId || rawProfile?.id || rawProfile?.profileId || '').trim();
   if (!id) return null;
-  const provider = String(rawProfile?.provider || id.split(':')[0] || '').trim();
+  const provider = String(rawProfile?.provider || id.split(':')[0] || '').trim().toLowerCase();
   if (!provider) return null;
 
   const profile: AuthProfile = {
@@ -841,53 +869,197 @@ function normalizeOpenClawAuthStoreProfile(profileId: string, rawProfile: any): 
   return profile;
 }
 
-function readOpenClawAuthStoreProfiles(): Record<string, AuthProfile> {
+export function parseOpenClawAuthStoreProfiles(raw: string): Record<string, AuthProfile> {
+  const parsed = JSON.parse(extractJsonFromCliOutput(raw));
+  const profiles: Record<string, AuthProfile> = {};
+  let entries: Array<[string, unknown]>;
+  const arrayEntries = (rows: unknown[]): Array<[string, unknown]> => rows.map((entry, index) => {
+    if (!isPlainRecord(entry)) {
+      throw new Error(`OpenClaw auth-store profile ${index} is not an object`);
+    }
+    const rawId = entry.id ?? entry.profileId;
+    if (typeof rawId !== 'string' || !rawId.trim()) {
+      throw new Error(`OpenClaw auth-store profile ${index} has no valid id`);
+    }
+    return [rawId.trim(), entry];
+  });
+
+  if (Array.isArray(parsed)) {
+    entries = arrayEntries(parsed);
+  } else {
+    if (!isPlainRecord(parsed) || !Object.prototype.hasOwnProperty.call(parsed, 'profiles')) {
+      throw new Error('OpenClaw auth-store inventory has an unsupported root shape');
+    }
+    if (Array.isArray(parsed.profiles)) {
+      entries = arrayEntries(parsed.profiles);
+    } else if (isPlainRecord(parsed.profiles)) {
+      entries = Object.entries(parsed.profiles);
+    } else {
+      throw new Error('OpenClaw auth-store inventory profiles is not an array or object');
+    }
+  }
+
+  for (const [profileId, rawProfile] of entries) {
+    if (!isPlainRecord(rawProfile)) {
+      throw new Error(`OpenClaw auth-store profile ${profileId || '<unknown>'} is not an object`);
+    }
+    const id = profileId.trim();
+    if (!id || isBlockedObjectKey(id)) {
+      throw new Error('OpenClaw auth-store profile has an invalid id');
+    }
+    for (const field of ['id', 'profileId'] as const) {
+      if (!Object.prototype.hasOwnProperty.call(rawProfile, field)) continue;
+      if (typeof rawProfile[field] !== 'string' || rawProfile[field].trim() !== id) {
+        throw new Error(`OpenClaw auth-store profile ${id} has a conflicting ${field}`);
+      }
+    }
+    if (typeof rawProfile.provider !== 'string' || !rawProfile.provider.trim()) {
+      throw new Error(`OpenClaw auth-store profile ${id} has no valid provider`);
+    }
+    const credentialTypes = (['type', 'mode', 'authType'] as const)
+      .filter((field) => Object.prototype.hasOwnProperty.call(rawProfile, field))
+      .map((field) => rawProfile[field]);
+    if (credentialTypes.some((credentialType) => (
+      typeof credentialType !== 'string' || !credentialType.trim()
+    ))) {
+      throw new Error(`OpenClaw auth-store profile ${id} has a malformed credential type`);
+    }
+    if (new Set(credentialTypes.map((credentialType) => credentialType.trim())).size > 1) {
+      throw new Error(`OpenClaw auth-store profile ${id} has conflicting credential types`);
+    }
+    if (Object.prototype.hasOwnProperty.call(profiles, id)) {
+      throw new Error(`OpenClaw auth-store profile id ${id} is duplicated`);
+    }
+    const normalized = normalizeOpenClawAuthStoreProfile(id, rawProfile);
+    if (!normalized) throw new Error(`OpenClaw auth-store profile ${id} could not be normalized`);
+    profiles[id] = normalized;
+  }
+
+  return profiles;
+}
+
+function buildOpenClawAuthListArgs(provider?: string): string[] {
+  const normalizedProvider = String(provider || '').trim();
+  const args = ['models', 'auth', '--agent', 'main', 'list'];
+  if (normalizedProvider) args.push('--provider', normalizedProvider);
+  args.push('--json');
+  return args;
+}
+
+export function readOpenClawAuthStoreProfiles(
+  provider?: string,
+  options?: { strict?: boolean },
+): Record<string, AuthProfile> {
   if (!process.env.PORTAL_ENABLE_OPENCLAW_AUTH_STORE_PROBE && process.env.NODE_ENV === 'test') {
     return {};
   }
 
   const now = Date.now();
-  if (openClawAuthStoreProfilesCache && openClawAuthStoreProfilesCache.expiresAt > now) {
+  const normalizedProvider = String(provider || '').trim();
+  if (!options?.strict && !normalizedProvider && openClawAuthStoreProfilesCache && openClawAuthStoreProfilesCache.expiresAt > now) {
     return openClawAuthStoreProfilesCache.profiles;
   }
 
   try {
-    const raw = execFileSync('openclaw', ['models', 'auth', 'list', '--json'], {
+    const raw = execFileSync('openclaw', buildOpenClawAuthListArgs(normalizedProvider), {
       encoding: 'utf8',
       env: buildOpenClawCliEnv(),
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 10_000,
     });
-    const parsed = JSON.parse(extractJsonFromCliOutput(raw));
-    const profiles: Record<string, AuthProfile> = {};
-    const entries: Array<[string, any]> = Array.isArray(parsed)
-      ? parsed.map((entry: any) => [String(entry?.id || entry?.profileId || ''), entry])
-      : Array.isArray(parsed?.profiles)
-        ? parsed.profiles.map((entry: any) => [String(entry?.id || entry?.profileId || ''), entry])
-        : (parsed?.profiles && typeof parsed.profiles === 'object')
-          ? Object.entries(parsed.profiles)
-          : [];
+    const profiles = parseOpenClawAuthStoreProfiles(raw);
 
-    for (const [profileId, rawProfile] of entries) {
-      const id = String(profileId || rawProfile?.id || rawProfile?.profileId || '').trim();
-      const normalized = normalizeOpenClawAuthStoreProfile(id, rawProfile);
-      if (normalized && id) profiles[id] = normalized;
+    if (!normalizedProvider) {
+      openClawAuthStoreProfilesCache = { expiresAt: now + OPENCLAW_AUTH_STORE_CACHE_MS, profiles };
     }
-
-    openClawAuthStoreProfilesCache = { expiresAt: now + OPENCLAW_AUTH_STORE_CACHE_MS, profiles };
     return profiles;
   } catch {
-    if (openClawAuthStoreProfilesCache) return openClawAuthStoreProfilesCache.profiles;
+    if (options?.strict) {
+      throw new Error(`OpenClaw could not verify ${normalizedProvider || 'the'} saved authentication profiles.`);
+    }
+    if (!normalizedProvider && openClawAuthStoreProfilesCache) return openClawAuthStoreProfilesCache.profiles;
     return {};
   }
 }
 
-export function readAuthProfiles(): AuthProfilesFile {
+export async function readOpenClawAuthStoreProfilesAsync(
+  provider?: string,
+  options?: { strict?: boolean },
+): Promise<Record<string, AuthProfile>> {
+  if (!process.env.PORTAL_ENABLE_OPENCLAW_AUTH_STORE_PROBE && process.env.NODE_ENV === 'test') {
+    return {};
+  }
+
+  const normalizedProvider = String(provider || '').trim();
+  const now = Date.now();
+  if (!options?.strict && !normalizedProvider && openClawAuthStoreProfilesCache && openClawAuthStoreProfilesCache.expiresAt > now) {
+    return openClawAuthStoreProfilesCache.profiles;
+  }
+
+  const generation = openClawAuthStoreProfilesCacheGeneration;
+  const refreshKind = options?.strict ? 'strict' : 'lenient';
+  const existingRefresh = openClawAuthStoreProfilesRefreshes[refreshKind];
+  if (
+    !normalizedProvider
+    && existingRefresh
+    && existingRefresh.generation === generation
+  ) {
+    return existingRefresh.promise;
+  }
+
+  const execute = new Promise<Record<string, AuthProfile>>((resolve, reject) => {
+    execFile('openclaw', buildOpenClawAuthListArgs(normalizedProvider), {
+      encoding: 'utf8',
+      env: buildOpenClawCliEnv(),
+      timeout: 10_000,
+      maxBuffer: 2 * 1024 * 1024,
+    }, (error, stdout) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      try {
+        resolve(parseOpenClawAuthStoreProfiles(stdout));
+      } catch (parseError) {
+        reject(parseError);
+      }
+    });
+  }).then((profiles) => {
+    if (!normalizedProvider && openClawAuthStoreProfilesCacheGeneration === generation) {
+      openClawAuthStoreProfilesCache = {
+        expiresAt: Date.now() + OPENCLAW_AUTH_STORE_CACHE_MS,
+        profiles,
+      };
+    }
+    return profiles;
+  }).catch(() => {
+    if (options?.strict) {
+      throw new Error(`OpenClaw could not verify ${normalizedProvider || 'the'} saved authentication profiles.`);
+    }
+    if (!normalizedProvider && openClawAuthStoreProfilesCache) {
+      return openClawAuthStoreProfilesCache.profiles;
+    }
+    return {};
+  });
+
+  if (!normalizedProvider) {
+    openClawAuthStoreProfilesRefreshes[refreshKind] = { generation, promise: execute };
+    const clearRefresh = () => {
+      if (openClawAuthStoreProfilesRefreshes[refreshKind]?.promise === execute) {
+        delete openClawAuthStoreProfilesRefreshes[refreshKind];
+      }
+    };
+    void execute.then(clearRefresh, clearRefresh);
+  }
+
+  return execute;
+}
+
+function readAuthProfilesWithAuthStore(authStoreProfiles: Record<string, AuthProfile>): AuthProfilesFile {
   const stored = safeReadJson<AuthProfilesFile>(AUTH_PROFILES_PATH, { version: 2, profiles: {} });
   const config = safeReadJson<any>(CONFIG_PATH, {});
   const configProfiles = normalizeAuthProfiles(config?.auth?.profiles);
   const storedProfiles = normalizeAuthProfiles(stored.profiles);
-  const authStoreProfiles = readOpenClawAuthStoreProfiles();
 
   return {
     ...stored,
@@ -900,6 +1072,33 @@ export function readAuthProfiles(): AuthProfilesFile {
   };
 }
 
+export function readAuthProfiles(): AuthProfilesFile {
+  return readAuthProfilesWithAuthStore(readOpenClawAuthStoreProfiles());
+}
+
+/**
+ * Read the merged authentication inventory only when OpenClaw's authoritative
+ * store can be attested. Destructive/cancellation paths must use this variant:
+ * the ordinary reader intentionally tolerates a temporarily unavailable CLI,
+ * which is useful for status pages but is not proof that a credential is
+ * absent.
+ */
+export function readAuthProfilesStrict(): AuthProfilesFile {
+  return readAuthProfilesWithAuthStore(readOpenClawAuthStoreProfiles(undefined, { strict: true }));
+}
+
+/**
+ * Async counterpart to readAuthProfilesStrict for request/background paths.
+ * Destructive lifecycle convergence must not run OpenClaw's bounded CLI probe
+ * through execFileSync because a control-plane outage would stall Express's
+ * event loop for the full command timeout.
+ */
+export async function readAuthProfilesStrictAsync(): Promise<AuthProfilesFile> {
+  return readAuthProfilesWithAuthStore(
+    await readOpenClawAuthStoreProfilesAsync(undefined, { strict: true }),
+  );
+}
+
 export function getProviderAuthAliases(provider: string): Set<string> {
   const normalized = String(provider || '').trim();
   if (normalized === 'anthropic' || normalized === 'claude-cli') {
@@ -909,15 +1108,22 @@ export function getProviderAuthAliases(provider: string): Set<string> {
 }
 
 export function getStaleProviderProfileIds(
-  profiles: Record<string, Pick<AuthProfile, 'provider'> | undefined>,
+  profiles: Record<string, (Pick<AuthProfile, 'provider'> & Partial<Pick<AuthProfile, 'type'>>) | undefined>,
   provider: string,
   preferredProfileId: string,
+  preferredMode?: 'api_key' | 'token' | 'oauth',
 ): string[] {
   const aliases = getProviderAuthAliases(provider);
   return Object.keys(profiles || {}).filter((profileId) => {
     if (profileId === preferredProfileId) return false;
-    const profileProvider = profiles?.[profileId]?.provider;
-    return typeof profileProvider === 'string' && aliases.has(profileProvider);
+    const profile = profiles?.[profileId];
+    const profileProvider = profile?.provider;
+    if (typeof profileProvider !== 'string' || !aliases.has(profileProvider)) return false;
+    // xAI supports two materially different transports under the same provider:
+    // subscription OAuth and public API-key billing. Replacing one must not
+    // destroy the other credential path.
+    if (provider === 'xai' && preferredMode && profile?.type && profile.type !== preferredMode) return false;
+    return true;
   });
 }
 
@@ -931,7 +1137,7 @@ export function cleanupStaleProviderAuthProfiles(
   if (!authProfiles.profiles) authProfiles.profiles = {};
 
   const preferredProfile = authProfiles.profiles[preferredProfileId];
-  const removedProfileIds = getStaleProviderProfileIds(authProfiles.profiles, provider, preferredProfileId);
+  const removedProfileIds = getStaleProviderProfileIds(authProfiles.profiles, provider, preferredProfileId, mode);
 
   for (const profileId of removedProfileIds) {
     delete authProfiles.profiles[profileId];
@@ -964,7 +1170,11 @@ export function cleanupStaleProviderAuthProfiles(
   if (!config.auth.order) config.auth.order = {};
 
   for (const [profileId, profile] of Object.entries<any>(config.auth.profiles || {})) {
-    if (profileId !== preferredProfileId && aliases.has(profile?.provider)) {
+    const preserveAlternateXaiMode = provider === 'xai'
+      && mode
+      && String(profile?.mode || profile?.type || '').trim()
+      && String(profile?.mode || profile?.type || '').trim() !== mode;
+    if (profileId !== preferredProfileId && aliases.has(profile?.provider) && !preserveAlternateXaiMode) {
       delete config.auth.profiles[profileId];
     }
   }
@@ -979,7 +1189,9 @@ export function cleanupStaleProviderAuthProfiles(
   for (const alias of aliases) {
     delete config.auth.order[alias];
   }
-  config.auth.order[provider] = [preferredProfileId];
+  if (provider !== 'xai') {
+    config.auth.order[provider] = [preferredProfileId];
+  }
 
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
   return { removedProfileIds };
@@ -1038,7 +1250,6 @@ const PROVIDER_API_CONFIG: Record<string, { baseUrl: string; api: string; auth?:
   'mistral': { baseUrl: 'https://api.mistral.ai/v1', api: 'openai-completions' },
   'groq': { baseUrl: 'https://api.groq.com/openai/v1', api: 'openai-completions' },
   'together': { baseUrl: 'https://api.together.xyz/v1', api: 'openai-completions' },
-  'xai': { baseUrl: 'https://api.x.ai/v1', api: 'openai-responses' },
 };
 
 const PROVIDER_RUNTIME_CATALOG_CONFIG: Record<string, ProviderRuntimeCatalogConfig> = {
@@ -1048,7 +1259,7 @@ const PROVIDER_RUNTIME_CATALOG_CONFIG: Record<string, ProviderRuntimeCatalogConf
   'google-antigravity': {},
 };
 
-const PROVIDERS_REQUIRING_RUNTIME_MODEL_CATALOG = new Set(['google-gemini-cli', 'google-antigravity']);
+const PROVIDERS_REQUIRING_RUNTIME_MODEL_CATALOG = new Set(['google-gemini-cli']);
 const RUNTIME_ONLY_MODEL_PROVIDERS = new Set(Object.keys(PROVIDER_RUNTIME_CATALOG_CONFIG));
 
 function getProviderRuntimeCatalogConfig(provider: string): ProviderRuntimeCatalogConfig | null {
@@ -1119,10 +1330,233 @@ function writeProviderSecret(options: {
  * API keys for non-OAuth providers.
  */
 export function saveProviderApiKey(provider: string, apiKey: string): { profileId: string } {
+  if (provider === 'xai') {
+    return saveProviderApiKeyToOpenClawAuthStore(provider, apiKey);
+  }
   const authType = isApiKeyProvider(provider) ? 'api_key' : 'token';
   const profileId = `${provider}:default`;
   writeProviderSecret({ provider, profileId, authType, secret: apiKey });
   return { profileId };
+}
+
+export type ProviderApiKeyCommitState = 'committed' | 'absent' | 'indeterminate';
+
+/**
+ * Carries the only safe conclusion Portal can make after OpenClaw's credential
+ * control plane throws.  In particular, the presence of a fixed profile id is
+ * not proof that a rotated key was written when that profile existed before
+ * the attempt.
+ */
+export class ProviderApiKeySaveError extends Error {
+  readonly credentialState: ProviderApiKeyCommitState;
+  readonly profileId: string;
+
+  constructor(message: string, credentialState: ProviderApiKeyCommitState, profileId: string) {
+    super(message);
+    this.name = 'ProviderApiKeySaveError';
+    this.credentialState = credentialState;
+    this.profileId = profileId;
+  }
+}
+
+/**
+ * Bundled providers use OpenClaw's locked, per-agent SQLite auth store. Keep
+ * credentials off argv/process listings by piping the value to the supported
+ * CLI, then prove that the committed profile is visible through the same
+ * control plane the gateway reads.
+ */
+export function saveProviderApiKeyToOpenClawAuthStore(
+  provider: string,
+  apiKey: string,
+  profileId = `${provider}:portal-api-key`,
+): { profileId: string } {
+  const normalizedProvider = String(provider || '').trim();
+  const normalizedProfileId = String(profileId || '').trim();
+  const normalizedKey = String(apiKey || '').trim();
+  if (!normalizedProvider || !normalizedProfileId || !normalizedKey) {
+    throw new Error('Provider, profile id, and API key are required.');
+  }
+
+  let profileExistedBefore = false;
+  try {
+    invalidateOpenClawAuthStoreProfilesCache();
+    const existing = readOpenClawAuthStoreProfiles(normalizedProvider, { strict: true })[normalizedProfileId];
+    profileExistedBefore = existing?.provider === normalizedProvider && existing.type === 'api_key';
+  } catch (error: any) {
+    throw new ProviderApiKeySaveError(
+      `OpenClaw credential preflight failed before the ${normalizedProvider} API key was changed: ${error?.message || 'auth store unavailable'}`,
+      'indeterminate',
+      normalizedProfileId,
+    );
+  }
+
+  try {
+    execFileSync('openclaw', [
+      'models',
+      'auth',
+      '--agent',
+      'main',
+      'paste-api-key',
+      '--provider',
+      normalizedProvider,
+      '--profile-id',
+      normalizedProfileId,
+    ], {
+      encoding: 'utf8',
+      env: buildOpenClawCliEnv(),
+      input: `${normalizedKey}\n`,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    });
+  } catch (error: any) {
+    const stderr = typeof error?.stderr === 'string'
+      ? error.stderr
+      : error?.stderr?.toString?.('utf8') || '';
+    const safeMessage = stderr
+      .split(normalizedKey).join('[REDACTED]')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 500);
+    let credentialState: ProviderApiKeyCommitState = profileExistedBefore ? 'indeterminate' : 'absent';
+    if (!profileExistedBefore) {
+      try {
+        invalidateOpenClawAuthStoreProfilesCache();
+        const afterFailure = readOpenClawAuthStoreProfiles(normalizedProvider, { strict: true })[normalizedProfileId];
+        if (afterFailure?.provider === normalizedProvider && afterFailure.type === 'api_key') {
+          credentialState = 'committed';
+        }
+      } catch {
+        credentialState = 'indeterminate';
+      }
+    }
+    throw new ProviderApiKeySaveError(
+      safeMessage || `OpenClaw failed to save the ${normalizedProvider} API key.`,
+      credentialState,
+      normalizedProfileId,
+    );
+  }
+
+  let stored: any;
+  try {
+    invalidateOpenClawAuthStoreProfilesCache();
+    stored = readOpenClawAuthStoreProfiles(normalizedProvider, { strict: true })[normalizedProfileId];
+  } catch (error: any) {
+    throw new ProviderApiKeySaveError(
+      `OpenClaw accepted the ${normalizedProvider} API key, but Portal could not verify the saved profile: ${error?.message || 'auth store unavailable'}`,
+      'indeterminate',
+      normalizedProfileId,
+    );
+  }
+  if (!stored || stored.provider !== normalizedProvider || stored.type !== 'api_key') {
+    throw new ProviderApiKeySaveError(
+      `OpenClaw did not confirm the ${normalizedProvider} API-key profile after saving it.`,
+      'indeterminate',
+      normalizedProfileId,
+    );
+  }
+
+  try {
+    clearProviderAuthOrder(normalizedProvider);
+  } catch (error: any) {
+    throw new ProviderApiKeySaveError(
+      `The ${normalizedProvider} API key was saved, but authentication routing cleanup failed: ${error?.message || 'unknown error'}`,
+      'committed',
+      normalizedProfileId,
+    );
+  }
+
+  return { profileId: normalizedProfileId };
+}
+
+/**
+ * Remove explicit auth ordering from both OpenClaw's locked auth store and the
+ * JSON compatibility layer. An explicit order is an allowlist, so keeping only
+ * the latest xAI profile would silently disable the alternate OAuth/API-key
+ * credential path.
+ */
+export function clearProviderAuthOrder(provider: string): void {
+  const normalizedProvider = String(provider || '').trim();
+  if (!normalizedProvider) throw new Error('Provider is required to clear authentication order.');
+
+  try {
+    const orderOutput = execFileSync('openclaw', [
+      'models',
+      'auth',
+      '--agent',
+      'main',
+      'order',
+      'get',
+      '--provider',
+      normalizedProvider,
+      '--json',
+    ], {
+      encoding: 'utf8',
+      env: buildOpenClawCliEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 15_000,
+      maxBuffer: 1024 * 1024,
+    });
+    const currentOrder = JSON.parse(extractJsonFromCliOutput(orderOutput))?.order;
+    // OpenClaw 2026.7.1 treats clearing an absent order as an error instead of
+    // an idempotent no-op. Only issue the mutation when an override exists.
+    if (Array.isArray(currentOrder) && currentOrder.length > 0) {
+      execFileSync('openclaw', [
+        'models',
+        'auth',
+        '--agent',
+        'main',
+        'order',
+        'clear',
+        '--provider',
+        normalizedProvider,
+      ], {
+        encoding: 'utf8',
+        env: buildOpenClawCliEnv(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 15_000,
+        maxBuffer: 1024 * 1024,
+      });
+    }
+  } catch {
+    throw new Error(`OpenClaw could not clear the ${normalizedProvider} authentication order.`);
+  }
+
+  const readConfigOrderStrict = (): Record<string, unknown> => {
+    if (!fs.existsSync(CONFIG_PATH)) return {};
+    let config: any;
+    try {
+      config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    } catch {
+      throw new Error('OpenClaw configuration is unreadable; authentication order was not changed.');
+    }
+    const order = config?.auth?.order;
+    if (order === undefined) return {};
+    if (!order || typeof order !== 'object' || Array.isArray(order)) {
+      throw new Error('OpenClaw authentication order is malformed; it was not changed.');
+    }
+    return order;
+  };
+  if (!(normalizedProvider in readConfigOrderStrict())) return;
+
+  // Use OpenClaw's base-hash-checked config writer. A direct read/rename here
+  // can overwrite an unrelated gateway or CLI update that lands in between.
+  const configPath = `auth.order[${JSON.stringify(normalizedProvider)}]`;
+  try {
+    execFileSync('openclaw', ['config', 'unset', configPath], {
+      encoding: 'utf8',
+      env: buildOpenClawCliEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 15_000,
+      maxBuffer: 1024 * 1024,
+    });
+  } catch {
+    if (!(normalizedProvider in readConfigOrderStrict())) return;
+    throw new Error(`OpenClaw could not clear the ${normalizedProvider} configuration auth order without overwriting a concurrent change.`);
+  }
+  if (normalizedProvider in readConfigOrderStrict()) {
+    throw new Error(`OpenClaw did not confirm removal of the ${normalizedProvider} configuration auth order.`);
+  }
 }
 
 export function saveProviderToken(provider: string, token: string): { profileId: string } {
@@ -1240,6 +1674,9 @@ export function pinCodexExternalCliAuthProfile(profileId = CODEX_EXTERNAL_CLI_PR
 function normalizeProviderRuntimeModelId(provider: string, modelId: string): string | null {
   const raw = String(modelId || '').trim();
   if (!raw) return null;
+  if (provider === 'google-gemini-cli' && raw.startsWith('google/')) {
+    return raw.slice('google/'.length);
+  }
   const prefix = `${provider}/`;
   return raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
 }
@@ -1327,7 +1764,16 @@ export function cleanupInvalidRuntimeOnlyModelProvidersFromOpenClawConfig(): str
   return cleanup.removedProviders;
 }
 
-export function registerProviderRuntimeModels(provider: string, modelIds: string[]): { changed: boolean; addedModels: string[] } {
+export function registerProviderRuntimeModels(
+  provider: string,
+  modelIds: string[],
+  options?: { preserveProviderTransport?: boolean },
+): { changed: boolean; addedModels: string[] } {
+  // Subscription-backed provider plugins can select a different endpoint from
+  // their API-key transport. Their runtime catalog is plugin-owned and must not
+  // be rewritten with Portal's public API defaults after OAuth completes.
+  if (options?.preserveProviderTransport) return { changed: false, addedModels: [] };
+
   const runtimeConfig = getProviderRuntimeCatalogConfig(provider);
   if (!runtimeConfig) return { changed: false, addedModels: [] };
 
@@ -1382,12 +1828,32 @@ export function pinProviderAuthProfile(provider: string, profileId: string, mode
   cleanupStaleProviderAuthProfiles(provider, profileId, mode);
 }
 
-export function getProviderStatuses(): ProviderStatus[] {
+export function getProviderStatuses(options: ProviderStatusOptions = {}): ProviderStatus[] {
   const config = readOpenClawConfig();
-  const authProfiles = readAuthProfiles();
+  const hasInjectedAuthStore = Object.prototype.hasOwnProperty.call(options, 'authStoreProfiles');
+  let authStoreProfiles: Record<string, AuthProfile> = options.authStoreProfiles || {};
+  let xaiAuthStoreError: string | null = options.authStoreError || null;
+  if (!hasInjectedAuthStore) {
+    try {
+      authStoreProfiles = readOpenClawAuthStoreProfiles(undefined, { strict: true });
+    } catch (error: any) {
+      authStoreProfiles = {};
+      xaiAuthStoreError = error?.message || 'OpenClaw xAI auth store is unavailable.';
+    }
+  }
+  const authProfiles = readAuthProfilesWithAuthStore(authStoreProfiles);
   const modelsData = safeReadJson<any>(MODELS_JSON_PATH, { providers: {} });
   const configProfiles = config?.auth?.profiles ?? {};
-  const storedProfiles = authProfiles?.profiles ?? {};
+  const storedProfiles = { ...(authProfiles?.profiles ?? {}) };
+  // xAI credentials are authoritative only in OpenClaw's locked store. Remove
+  // legacy/config shadows, then merge a strict provider-scoped read so a
+  // control-plane outage cannot masquerade as a clean disconnect.
+  for (const [profileId, profile] of Object.entries<any>(storedProfiles)) {
+    if (profile?.provider === 'xai') delete storedProfiles[profileId];
+  }
+  for (const [profileId, profile] of Object.entries(authStoreProfiles)) {
+    if (profile?.provider === 'xai') storedProfiles[profileId] = profile;
+  }
   const usageStats = authProfiles?.usageStats ?? {};
   const authOrder = config?.auth?.order ?? {};
   const defaultModel = getDefaultModel();
@@ -1435,17 +1901,35 @@ export function getProviderStatuses(): ProviderStatus[] {
     const hasConfigProfile = Boolean(matchingConfigProfileId);
     const hasOrderedProfile = Boolean(profileId && orderedProfileIds.includes(profileId));
     const hasStoredProfile = Boolean(matchingStoredProfileId);
-    const hasAnyProviderConfig = hasConfigProfile || hasOrderedProfile || (provider.authTypes.includes('api_key') && hasRuntimeProviderConfig);
+    // xAI's bundled plugin owns a model/provider catalog even after every
+    // credential is disconnected. Catalog presence is not authentication
+    // evidence and must not turn a clean disconnect into a false error state.
+    const runtimeConfigIsCredentialEvidence = provider.id !== 'xai'
+      && provider.authTypes.includes('api_key')
+      && hasRuntimeProviderConfig;
+    const hasAnyProviderConfig = hasConfigProfile || hasOrderedProfile || runtimeConfigIsCredentialEvidence;
     const regularProfileConfigured = Boolean(profileId && hasAnyProviderConfig && hasStoredProfile);
     const providerOrder = authOrderKeys.map((key) => authOrder?.[key]).find((value) => Array.isArray(value));
     const excludedByAuthOrder = Array.isArray(providerOrder) && providerOrder.length === 0;
+    const configuredModelEntries = config?.agents?.defaults?.models;
+    const defaultModelEntry = defaultModel && configuredModelEntries && typeof configuredModelEntries === 'object'
+      ? (configuredModelEntries[defaultModel]
+        || Object.entries<any>(configuredModelEntries).find(([modelId]) => normalizePortalModelId(modelId) === defaultModel)?.[1])
+      : null;
+    const defaultModelRuntimeId = String(defaultModelEntry?.agentRuntime?.id || '').trim();
     const currentModel = provider.id === 'anthropic'
       ? (defaultModel && defaultModel.startsWith('anthropic/') ? defaultModel : null)
       : provider.id === 'openai-codex'
         ? (defaultModel && (defaultModel.startsWith('codex/') || defaultModel.startsWith('openai-codex/') || defaultModel.startsWith('openai/')) ? defaultModel : null)
         : provider.id === 'google-antigravity'
-          ? (defaultModel && defaultModel.startsWith('google-antigravity/') ? defaultModel : null)
-          : (defaultModel && defaultModel.startsWith(`${provider.id}/`) ? defaultModel : null);
+          // Native Antigravity selections belong to Agent Chat's GEMINI
+          // harness and must never be represented as the OpenClaw default.
+          ? null
+          : provider.id === 'google-gemini-cli'
+            ? (defaultModel && defaultModel.startsWith('google/') && defaultModelRuntimeId === 'google-gemini-cli' ? defaultModel : null)
+            : provider.id === 'google'
+              ? (defaultModel && defaultModel.startsWith('google/') && defaultModelRuntimeId !== 'google-gemini-cli' ? defaultModel : null)
+              : (defaultModel && defaultModel.startsWith(`${provider.id}/`) ? defaultModel : null);
 
     let status: ProviderStatus['status'] = 'unconfigured';
     let error: string | null = null;
@@ -1453,9 +1937,27 @@ export function getProviderStatuses(): ProviderStatus[] {
     let effectiveProfileId: string | null = null;
     let effectiveAuthType: string | null = null;
     const nativeProvider = getNativeProviderLinkedToOpenClawProvider(provider.id);
-    const nativeAuth = nativeProvider ? getNativeCliAuthStatus(nativeProvider) : null;
+    const nativeAuth = nativeProvider
+      ? (options.nativeAuthStatuses?.[nativeProvider] || getNativeCliAuthStatus(nativeProvider))
+      : null;
+    const readiness = options.providerReadiness?.[provider.id] || null;
 
-    if (provider.primaryAuthType === 'native_cli') {
+    if (provider.primaryAuthType === 'aws_sdk') {
+      effectiveAuthType = 'aws_sdk';
+      if (readiness?.state === 'ready') {
+        status = 'configured';
+      } else if (readiness?.state === 'missing_plugin' || readiness?.state === 'plugin_unavailable') {
+        status = 'error';
+        error = readiness.message;
+      } else if (readiness?.state === 'probe_error') {
+        status = 'error';
+        error = readiness.message;
+      } else {
+        status = 'manual';
+        warning = readiness?.message
+          || 'AWS credentials are owned by the OpenClaw gateway host, not Portal. Readiness has not been checked yet.';
+      }
+    } else if (provider.primaryAuthType === 'native_cli') {
       if (nativeAuth?.status === 'authenticated') {
         status = 'configured';
         effectiveAuthType = 'cli';
@@ -1496,7 +1998,7 @@ export function getProviderStatuses(): ProviderStatus[] {
         status === 'configured'
         && PROVIDERS_REQUIRING_RUNTIME_MODEL_CATALOG.has(provider.id)
         && currentModel
-        && currentModel.startsWith(`${provider.id}/`)
+        && (currentModel.startsWith(`${provider.id}/`) || provider.id === 'google-gemini-cli')
         && !providerCatalogContainsModel(provider.id, modelsData?.providers?.[provider.id], currentModel)
         && !providerCatalogContainsModel(provider.id, config?.models?.providers?.[provider.id], currentModel)
       ) {
@@ -1512,6 +2014,13 @@ export function getProviderStatuses(): ProviderStatus[] {
       error = hasAnyProviderConfig && !hasStoredProfile
         ? 'Provider configuration exists but credentials are missing from the OpenClaw auth store.'
         : 'Stored credentials exist in the OpenClaw auth store but provider config is missing.';
+    }
+
+    if (provider.id === 'xai' && xaiAuthStoreError) {
+      status = 'error';
+      effectiveProfileId = null;
+      effectiveAuthType = null;
+      error = `Portal could not verify saved xAI credentials through OpenClaw's locked auth store. Retry status or Disconnect xAI after the control plane recovers. ${xaiAuthStoreError}`;
     }
 
     return {
@@ -1531,6 +2040,52 @@ export function getProviderStatuses(): ProviderStatus[] {
       nativeCliAuthMessage: nativeAuth?.message || null,
       nativeCliLoginCommand: nativeAuth?.loginCommand || null,
       requiresSeparateNativeLogin: Boolean(nativeAuth?.requiresSeparateLogin),
+      readiness,
     };
   });
+}
+
+export async function getProviderStatusesAsync(options: {
+  forceProviderReadiness?: boolean;
+} = {}): Promise<ProviderStatus[]> {
+  const nativeProviders = Array.from(new Set(
+    AI_PROVIDERS
+      .map((provider) => getNativeProviderLinkedToOpenClawProvider(provider.id))
+      .filter((provider): provider is AgentProviderName => Boolean(provider)),
+  ));
+  const nativeAuthEntriesPromise = Promise.all(nativeProviders.map(async (provider) => (
+    [provider, await getNativeCliAuthStatusAsync(provider)] as const
+  )));
+  const bedrockReadinessPromise = getAmazonBedrockReadiness({
+    force: options.forceProviderReadiness,
+  }).catch(() => createAmazonBedrockReadiness(
+    'probe_error',
+    Date.now(),
+    'Portal could not complete the read-only Bedrock readiness check. No configuration was changed; use Check again.',
+  ));
+
+  try {
+    const [authStoreProfiles, nativeAuthEntries, bedrockReadiness] = await Promise.all([
+      readOpenClawAuthStoreProfilesAsync(undefined, { strict: true }),
+      nativeAuthEntriesPromise,
+      bedrockReadinessPromise,
+    ]);
+    return getProviderStatuses({
+      authStoreProfiles,
+      authStoreError: null,
+      nativeAuthStatuses: Object.fromEntries(nativeAuthEntries),
+      providerReadiness: { 'amazon-bedrock': bedrockReadiness },
+    });
+  } catch (error: any) {
+    const [nativeAuthEntries, bedrockReadiness] = await Promise.all([
+      nativeAuthEntriesPromise.catch(() => [] as Array<readonly [AgentProviderName, NativeCliAuthStatus]>),
+      bedrockReadinessPromise,
+    ]);
+    return getProviderStatuses({
+      authStoreProfiles: {},
+      authStoreError: error?.message || 'OpenClaw xAI auth store is unavailable.',
+      nativeAuthStatuses: Object.fromEntries(nativeAuthEntries),
+      providerReadiness: { 'amazon-bedrock': bedrockReadiness },
+    });
+  }
 }

@@ -2,6 +2,31 @@
 set -euo pipefail
 
 ROOT="${1:-/usr/lib/node_modules/openclaw/dist}"
+STRICT_MODE="${PORTAL_OPENCLAW_HOTFIX_STRICT:-0}"
+REQUIRED_PACKAGE_VERSION="${PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION:-}"
+
+[[ -d "${ROOT}" ]] || { echo "OpenClaw dist directory not found: ${ROOT}" >&2; exit 1; }
+
+if [[ -n "${REQUIRED_PACKAGE_VERSION}" ]]; then
+  python3 - "${ROOT}" "${REQUIRED_PACKAGE_VERSION}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve()
+expected = sys.argv[2]
+package_json = root.parent / "package.json"
+try:
+    package = json.loads(package_json.read_text())
+except Exception as error:
+    raise SystemExit(f"could not read OpenClaw package metadata at {package_json}: {error}")
+if package.get("name") != "openclaw" or package.get("version") != expected:
+    raise SystemExit(
+        f"refusing to patch untested package {package.get('name')}@{package.get('version')}; "
+        f"expected openclaw@{expected}"
+    )
+PY
+fi
 
 resolve_bundle() {
   python3 - "$ROOT" "$@" <<'PY'
@@ -81,6 +106,23 @@ for candidate in sorted(root.glob('cli-shared-*.js'), key=lambda p: (p.stat().st
 PY
 )"
 FAILED_PATCHES=()
+
+require_strict_bundle() {
+  local label="$1" target="$2"
+  if [[ "${STRICT_MODE}" == "1" && ( -z "${target}" || ! -f "${target}" ) ]]; then
+    FAILED_PATCHES+=("missing-${label}")
+  fi
+}
+
+require_strict_bundle "compaction-tools" "${COMPACT_TOOLS_BUNDLE}"
+require_strict_bundle "agent-runner-runtime" "${AGENT_RUNNER_RUNTIME}"
+require_strict_bundle "heartbeat-detector" "${HEARTBEAT_DETECTOR_FILE:-${HEARTBEAT_EVENTS_FILTER:-${HEARTBEAT_RUNNER}}}"
+require_strict_bundle "heartbeat-runner" "${HEARTBEAT_RUNNER}"
+require_strict_bundle "reply-routing" "${GET_REPLY_FILE}"
+require_strict_bundle "claude-permission" "${CLAUDE_CLI_SHARED}"
+require_strict_bundle "gemini-cli-backend" "${CLI_BACKEND}"
+require_strict_bundle "gemini-parser" "${GEMINI_PARSER_TARGET:-${CLAUDE_LIVE_SESSION:-${EXECUTE_RUNTIME}}}"
+require_strict_bundle "execute-runtime" "${EXECUTE_RUNTIME}"
 
 HEARTBEAT_DETECTOR_FILE="${HEARTBEAT_EVENTS_FILTER:-$HEARTBEAT_RUNNER}"
 GEMINI_PARSER_TARGET="${CLAUDE_LIVE_SESSION:-$EXECUTE_RUNTIME}"
@@ -258,14 +300,51 @@ else
 fi
 
 if [[ -n "$CLI_BACKEND" && -f "$CLI_BACKEND" ]]; then
-python3 - "$CLI_BACKEND" <<'PY' || FAILED_PATCHES+=("gemini-cli-backend")
+python3 - "$CLI_BACKEND" "$STRICT_MODE" <<'PY' || FAILED_PATCHES+=("gemini-cli-backend")
 from pathlib import Path
+import re
 import sys
 
 p = Path(sys.argv[1])
+strict = sys.argv[2] == "1"
 text = p.read_text()
 
-if 'jsonlDialect: "gemini-stream-json"' in text and '"--output-format",\n\t\t\t\t"stream-json",' in text and '"--yolo",' in text:
+def arg_block(candidate: str, key: str) -> str:
+    marker = f"{key}: ["
+    start = candidate.find(marker)
+    if start < 0:
+        return ""
+    end = candidate.find("]", start + len(marker))
+    return candidate[start:end + 1] if end >= 0 else ""
+
+def has_stream_json(block: str) -> bool:
+    return bool(re.search(r'"--output-format",\s*"stream-json"', block))
+
+def has_noninteractive_approval(block: str) -> bool:
+    return (
+        '"--yolo"' in block
+        or bool(re.search(r'"--approval-mode",\s*"auto_edit"', block))
+    )
+
+def contract_failures(candidate: str) -> list[str]:
+    failures = []
+    fresh_args = arg_block(candidate, "args")
+    resume_args = arg_block(candidate, "resumeArgs")
+    if not has_stream_json(fresh_args):
+        failures.append("fresh stream-json arguments")
+    if not has_stream_json(resume_args):
+        failures.append("resume stream-json arguments")
+    if 'output: "jsonl",' not in candidate:
+        failures.append("jsonl output mode")
+    if 'jsonlDialect: "gemini-stream-json"' not in candidate:
+        failures.append("Gemini stream-json dialect")
+    if not has_noninteractive_approval(fresh_args):
+        failures.append("fresh non-interactive approval")
+    if not has_noninteractive_approval(resume_args):
+        failures.append("resume non-interactive approval")
+    return failures
+
+if not contract_failures(text):
     print(f"gemini cli backend already patched: {p}")
     raise SystemExit(0)
 
@@ -298,17 +377,31 @@ for old, new, label in replacements:
     text = text.replace(old, new, 1)
     changed = True
 
-if changed:
-    p.write_text(text)
-    if missing:
-        print(f"patched gemini cli backend partially; skipped unsupported snippets {missing}: {p}")
-    else:
+failures = contract_failures(text)
+if not failures:
+    if changed:
+        p.write_text(text)
         print(f"patched gemini cli backend: {p}")
-else:
-    if missing:
-        print(f"gemini cli backend patch not needed or unsupported for current bundle; missing snippets {missing}: {p}")
     else:
         print(f"gemini cli backend already patched: {p}")
+elif strict:
+    details = ", ".join(failures)
+    missing_details = f"; unavailable replacements: {', '.join(missing)}" if missing else ""
+    raise SystemExit(
+        f"Gemini CLI backend compatibility contract is incomplete in {p}: "
+        f"{details}{missing_details}"
+    )
+elif changed:
+    p.write_text(text)
+    print(
+        f"patched gemini cli backend partially; missing contract markers "
+        f"{failures}; skipped unsupported snippets {missing}: {p}"
+    )
+else:
+    print(
+        f"gemini cli backend patch not needed or unsupported for current bundle; "
+        f"missing contract markers {failures}; missing snippets {missing}: {p}"
+    )
 PY
 else
   echo "skipping Gemini CLI backend patch: backend bundle not found under $ROOT"
@@ -713,6 +806,7 @@ for candidate in sorted(root.glob('register.runtime-*.js'), key=lambda p: (p.sta
         break
 PY
 )"
+require_strict_bundle "sonnet5-cost-runtime" "${REGISTER_RUNTIME_BUNDLE}"
 if [[ -n "$REGISTER_RUNTIME_BUNDLE" && -f "$REGISTER_RUNTIME_BUNDLE" ]]; then
 python3 - "$REGISTER_RUNTIME_BUNDLE" <<'PY' || FAILED_PATCHES+=("sonnet5-cost-guard")
 from pathlib import Path
@@ -757,6 +851,7 @@ for candidate in sorted(root.glob('cli-watchdog-defaults-*.js'), key=lambda p: (
         break
 PY
 )"
+require_strict_bundle "cli-watchdog-defaults" "${WATCHDOG_DEFAULTS_BUNDLE}"
 if [[ -n "$WATCHDOG_DEFAULTS_BUNDLE" && -f "$WATCHDOG_DEFAULTS_BUNDLE" ]]; then
 python3 - "$WATCHDOG_DEFAULTS_BUNDLE" <<'PY' || FAILED_PATCHES+=("cli-no-output-watchdog")
 from pathlib import Path
@@ -792,7 +887,7 @@ if [[ -n "$GET_REPLY_FILE" ]]; then
   grep -n 'normalizedIncomingTo === "heartbeat" && params.persistedLastTo' "$GET_REPLY_FILE"
 fi
 if [[ -n "$CLI_BACKEND" && -f "$CLI_BACKEND" ]]; then
-  grep -n 'stream-json\|gemini-stream-json' "$CLI_BACKEND" || true
+  grep -n 'stream-json\|gemini-stream-json' "$CLI_BACKEND" || [[ "${STRICT_MODE}" != "1" ]]
 fi
 if [[ -n "$COMPACT_TOOLS_BUNDLE" && -f "$COMPACT_TOOLS_BUNDLE" ]]; then
   grep -nF 'memoryFlushWritePath: params.memoryFlushWritePath' "$COMPACT_TOOLS_BUNDLE" || true
@@ -801,12 +896,68 @@ if [[ -n "$AGENT_RUNNER_RUNTIME" && -f "$AGENT_RUNNER_RUNTIME" ]]; then
   grep -nF 'canAttemptFlush && shouldForceFlushByTranscriptSize' "$AGENT_RUNNER_RUNTIME" || true
 fi
 if [[ -n "$GEMINI_PARSER_TARGET" ]]; then
-  grep -nF 'function isGeminiCliProvider(providerId)' "$GEMINI_PARSER_TARGET" || true
-  grep -nF 'function parseGeminiCliStreamingDelta(params)' "$GEMINI_PARSER_TARGET" || true
-  grep -nF 'function dispatchGeminiCliStreamingToolEvent(params)' "$GEMINI_PARSER_TARGET" || true
+  grep -nF 'function isGeminiCliProvider(providerId)' "$GEMINI_PARSER_TARGET" || [[ "${STRICT_MODE}" != "1" ]]
+  grep -nF 'function parseGeminiCliStreamingDelta(params)' "$GEMINI_PARSER_TARGET" || [[ "${STRICT_MODE}" != "1" ]]
+  grep -nF 'function dispatchGeminiCliStreamingToolEvent(params)' "$GEMINI_PARSER_TARGET" || [[ "${STRICT_MODE}" != "1" ]]
+  grep -nF 'parseGeminiCliStreamingDelta({' "$GEMINI_PARSER_TARGET" || [[ "${STRICT_MODE}" != "1" ]]
+  grep -nF 'dispatchGeminiCliStreamingToolEvent({' "$GEMINI_PARSER_TARGET" || [[ "${STRICT_MODE}" != "1" ]]
 fi
 if [[ -n "$EXECUTE_RUNTIME" ]]; then
-  grep -nF 'onToolUseStart: emitCliToolUseStart' "$EXECUTE_RUNTIME" || grep -nF 'onToolEvent: (event) => {' "$EXECUTE_RUNTIME" || true
+  grep -nF 'onToolUseStart: emitCliToolUseStart' "$EXECUTE_RUNTIME" || grep -nF 'onToolEvent: (event) => {' "$EXECUTE_RUNTIME" || [[ "${STRICT_MODE}" != "1" ]]
+fi
+if [[ "${STRICT_MODE}" == "1" ]]; then
+  python3 - "$CLI_BACKEND" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+text = Path(sys.argv[1]).read_text()
+
+def arg_block(candidate: str, key: str) -> str:
+    marker = f"{key}: ["
+    start = candidate.find(marker)
+    if start < 0:
+        return ""
+    end = candidate.find("]", start + len(marker))
+    return candidate[start:end + 1] if end >= 0 else ""
+
+def has_stream_json(block: str) -> bool:
+    return bool(re.search(r'"--output-format",\s*"stream-json"', block))
+
+def has_noninteractive_approval(block: str) -> bool:
+    return (
+        '"--yolo"' in block
+        or bool(re.search(r'"--approval-mode",\s*"auto_edit"', block))
+    )
+
+fresh_args = arg_block(text, "args")
+resume_args = arg_block(text, "resumeArgs")
+required = {
+    "fresh stream-json arguments": has_stream_json(fresh_args),
+    "resume stream-json arguments": has_stream_json(resume_args),
+    "jsonl output mode": 'output: "jsonl",' in text,
+    "Gemini stream-json dialect": 'jsonlDialect: "gemini-stream-json"' in text,
+    "fresh non-interactive approval": has_noninteractive_approval(fresh_args),
+    "resume non-interactive approval": has_noninteractive_approval(resume_args),
+}
+missing = [label for label, present in required.items() if not present]
+if missing:
+    raise SystemExit(
+        "Gemini CLI backend post-patch verification failed: " + ", ".join(missing)
+    )
+PY
+  grep -nF 'function isGeminiCliProvider(providerId)' "$GEMINI_PARSER_TARGET"
+  grep -nF 'function parseGeminiCliStreamingDelta(params)' "$GEMINI_PARSER_TARGET"
+  grep -nF 'function dispatchGeminiCliStreamingToolEvent(params)' "$GEMINI_PARSER_TARGET"
+  grep -nF 'parseGeminiCliStreamingDelta({' "$GEMINI_PARSER_TARGET"
+  grep -nF 'dispatchGeminiCliStreamingToolEvent({' "$GEMINI_PARSER_TARGET"
+  if ! grep -nF 'onToolUseStart: emitCliToolUseStart' "$EXECUTE_RUNTIME"; then
+    grep -nF 'onToolEvent: (event) => {' "$EXECUTE_RUNTIME"
+  fi
+  grep -nF 'process.getuid() === 0' "$CLAUDE_CLI_SHARED"
+  grep -nF 'params.model.cost && params.model.cost.input === cost.input' "$REGISTER_RUNTIME_BUNDLE"
+  grep -nF 'minMs: 9e5' "$WATCHDOG_DEFAULTS_BUNDLE"
+  [[ "$(grep -cF 'minMs: 9e5' "$WATCHDOG_DEFAULTS_BUNDLE")" -ge 2 ]]
 fi
 
 validate_js_bundle() {
@@ -827,7 +978,7 @@ validate_no_duplicate_function() {
   fi
 }
 
-for bundle in "$HEARTBEAT_EVENTS_FILTER" "$HEARTBEAT_RUNNER" "$GET_REPLY_FILE" "$COMPACT_TOOLS_BUNDLE" "$AGENT_RUNNER_RUNTIME" "$CLI_BACKEND" "$CLAUDE_CLI_SHARED" "$GEMINI_PARSER_TARGET" "$EXECUTE_RUNTIME"; do
+for bundle in "$HEARTBEAT_EVENTS_FILTER" "$HEARTBEAT_RUNNER" "$GET_REPLY_FILE" "$COMPACT_TOOLS_BUNDLE" "$AGENT_RUNNER_RUNTIME" "$CLI_BACKEND" "$CLAUDE_CLI_SHARED" "$GEMINI_PARSER_TARGET" "$EXECUTE_RUNTIME" "$REGISTER_RUNTIME_BUNDLE" "$WATCHDOG_DEFAULTS_BUNDLE"; do
   validate_js_bundle "$bundle"
 done
 validate_no_duplicate_function "$GEMINI_PARSER_TARGET" "parseGeminiCliStreamingDelta"

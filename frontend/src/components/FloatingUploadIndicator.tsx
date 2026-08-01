@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, ChevronUp, ChevronDown, Pause, Play, XCircle, CheckCircle, AlertCircle } from 'lucide-react';
 import { useUploadStore, GlobalUpload } from '../stores/uploadStore';
-import { formatBytes, formatSpeed, formatTime } from '../utils/smartUpload';
+import { formatSpeed, formatTime } from '../utils/smartUpload';
 import ViewportOverlay from './ViewportOverlay';
 
 function UploadCard({ u }: { u: GlobalUpload }) {
@@ -19,24 +19,24 @@ function UploadCard({ u }: { u: GlobalUpload }) {
     <div className="px-3 py-2.5 border-b border-white/5 last:border-0">
       <div className="flex items-center justify-between gap-2 mb-1">
         <div className="flex items-center gap-1.5 min-w-0 flex-1">
-          <span className="text-[10px]">{routeLabel}</span>
+          <span className="text-[10px]" aria-hidden="true">{routeLabel}</span>
           <span className="text-xs text-white truncate">{u.fileName}</span>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
           {isComplete && <CheckCircle size={12} className="text-emerald-400" />}
           {isError && <AlertCircle size={12} className="text-red-400" />}
           {isActive && (
-            <button onClick={() => u.controller.pause()} className="p-0.5 text-slate-500 hover:text-amber-400">
+            <button aria-label={`Pause upload of ${u.fileName}`} onClick={() => u.controller.pause()} className="inline-flex size-7 items-center justify-center text-slate-500 hover:text-amber-400">
               <Pause size={10} />
             </button>
           )}
           {isPaused && (
-            <button onClick={() => u.controller.resume()} className="p-0.5 text-amber-400 hover:text-emerald-400">
+            <button aria-label={`Resume upload of ${u.fileName}`} onClick={() => u.controller.resume()} className="inline-flex size-7 items-center justify-center text-amber-400 hover:text-emerald-400">
               <Play size={10} />
             </button>
           )}
           {(isActive || isPaused) && (
-            <button onClick={() => u.controller.cancel()} className="p-0.5 text-slate-500 hover:text-red-400">
+            <button aria-label={`Cancel upload of ${u.fileName}`} onClick={() => u.controller.cancel()} className="inline-flex size-7 items-center justify-center text-slate-500 hover:text-red-400">
               <XCircle size={10} />
             </button>
           )}
@@ -50,6 +50,11 @@ function UploadCard({ u }: { u: GlobalUpload }) {
       {/* Progress bar */}
       <div className="relative h-1 bg-white/5 rounded-full overflow-hidden">
         <div
+          role="progressbar"
+          aria-label={`Upload progress for ${u.fileName}`}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={isComplete ? 100 : pct}
           className={`absolute left-0 top-0 h-full rounded-full transition-all duration-500 ${
             isComplete ? 'bg-emerald-500' :
             isError ? 'bg-red-500' :
@@ -102,11 +107,13 @@ export default function FloatingUploadIndicator() {
       >
       {/* Collapsed pill */}
       <button
+        aria-expanded={expanded}
+        aria-controls="global-upload-details"
         onClick={() => setExpanded(!expanded)}
         className={`flex items-center gap-2 px-3 py-2 rounded-xl backdrop-blur-xl shadow-2xl transition-all border ${
           hasActive
-            ? 'bg-[#0D1130]/95 border-emerald-500/30 hover:border-emerald-500/50'
-            : 'bg-[#0D1130]/95 border-white/10 hover:border-white/20'
+            ? 'bg-theme-surface/95 border-emerald-500/30 hover:border-emerald-500/50'
+            : 'bg-theme-surface/95 border-theme-border hover:border-theme-border-strong'
         }`}
       >
         <div className="relative w-5 h-5">
@@ -116,7 +123,7 @@ export default function FloatingUploadIndicator() {
             <CheckCircle size={14} className="text-emerald-400" />
           )}
         </div>
-        <span className="text-xs text-white font-medium">
+        <span className="text-xs text-theme-text font-medium">
           {hasActive
             ? `${activeUploads.length} upload${activeUploads.length > 1 ? 's' : ''}`
             : `${recentUploads.length} done`
@@ -132,10 +139,11 @@ export default function FloatingUploadIndicator() {
       <AnimatePresence>
         {expanded && (
           <motion.div
+            id="global-upload-details"
             initial={{ opacity: 0, y: 10, height: 0 }}
             animate={{ opacity: 1, y: 0, height: 'auto' }}
             exit={{ opacity: 0, y: 10, height: 0 }}
-            className="mt-2 w-[min(20rem,calc(100vw-2rem))] bg-[#0D1130]/95 border border-white/10 rounded-xl backdrop-blur-xl shadow-2xl overflow-hidden"
+            className="mt-2 w-[min(20rem,calc(100vw-2rem))] bg-theme-surface/95 border border-theme-border rounded-xl backdrop-blur-xl shadow-2xl overflow-hidden"
           >
             {activeUploads.length > 0 && (
               <>

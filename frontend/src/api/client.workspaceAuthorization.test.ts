@@ -1,0 +1,147 @@
+// @vitest-environment jsdom
+import axios, {
+  AxiosError,
+  type AxiosAdapter,
+  type AxiosResponse,
+  type InternalAxiosRequestConfig,
+} from 'axios';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { useAuthStore } from '../contexts/AuthContext';
+import {
+  PORTAL_AUTHORIZATION_VERSION_HEADER,
+  StaleWorkspaceAuthorizationResponseError,
+  resetWorkspaceAuthorizationForTests,
+} from '../utils/workspaceAuthorization';
+import client from './client';
+
+const originalAdapter = client.defaults.adapter;
+
+function actor(id: string, authorizationVersion: number) {
+  return {
+    id,
+    email: `${id}@example.com`,
+    username: id,
+    role: 'SUB_ADMIN' as const,
+    authorizationVersion,
+  };
+}
+
+function axiosResponse(
+  config: InternalAxiosRequestConfig,
+  authorizationVersion: number,
+): AxiosResponse {
+  return {
+    data: { ok: true },
+    status: 200,
+    statusText: 'OK',
+    headers: {
+      [PORTAL_AUTHORIZATION_VERSION_HEADER.toLowerCase()]: String(authorizationVersion),
+    },
+    config,
+  };
+}
+
+describe('Axios workspace authorization request identity', () => {
+  beforeEach(() => {
+    resetWorkspaceAuthorizationForTests();
+    useAuthStore.setState({
+      user: actor('user-1', 3),
+      isAuthenticated: true,
+      sessionRestoreError: false,
+    });
+  });
+
+  afterEach(() => {
+    client.defaults.adapter = originalAdapter;
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('stamps the actor generation on workspace requests', async () => {
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => (
+      axiosResponse(config, 3)
+    ));
+    client.defaults.adapter = adapter as AxiosAdapter;
+
+    await expect(client.get('/files')).resolves.toMatchObject({ data: { ok: true } });
+
+    const config = adapter.mock.calls[0][0];
+    expect(config.headers.get(PORTAL_AUTHORIZATION_VERSION_HEADER)).toBe('3');
+  });
+
+  it('rejects a response whose original actor is no longer signed in', async () => {
+    let settle!: (response: AxiosResponse) => void;
+    const adapter = vi.fn((config: InternalAxiosRequestConfig) => (
+      new Promise<AxiosResponse>((resolve) => {
+        settle = (response) => resolve({ ...response, config });
+      })
+    ));
+    client.defaults.adapter = adapter as AxiosAdapter;
+    const request = client.get('/files');
+    await vi.waitFor(() => expect(adapter).toHaveBeenCalledTimes(1));
+
+    useAuthStore.setState({ user: actor('user-2', 1) });
+    settle(axiosResponse(adapter.mock.calls[0][0], 3));
+
+    await expect(request).rejects.toBeInstanceOf(StaleWorkspaceAuthorizationResponseError);
+  });
+
+  it('does not replay a 401 request under a different user after refresh settles', async () => {
+    let settleRefresh!: () => void;
+    const refresh = new Promise<void>((resolve) => {
+      settleRefresh = resolve;
+    });
+    vi.spyOn(axios, 'post').mockImplementation(async () => {
+      await refresh;
+      return {} as AxiosResponse;
+    });
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+      throw new AxiosError(
+        'Unauthorized',
+        'ERR_BAD_REQUEST',
+        config,
+        undefined,
+        {
+          data: { error: 'expired' },
+          status: 401,
+          statusText: 'Unauthorized',
+          headers: {
+            [PORTAL_AUTHORIZATION_VERSION_HEADER.toLowerCase()]: '3',
+          },
+          config,
+        },
+      );
+    });
+    client.defaults.adapter = adapter as AxiosAdapter;
+
+    const request = client.post('/files/mutate', { value: 'user-1 payload' });
+    const rejected = expect(request).rejects.toBeInstanceOf(
+      StaleWorkspaceAuthorizationResponseError,
+    );
+    await vi.waitFor(() => expect(axios.post).toHaveBeenCalledTimes(1));
+    useAuthStore.setState({ user: actor('user-2', 1), isAuthenticated: true });
+    settleRefresh();
+
+    await rejected;
+    expect(adapter).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not replay a network retry under a different signed-in actor', async () => {
+    vi.useFakeTimers();
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+      throw new AxiosError('Network unavailable', 'ERR_NETWORK', config);
+    });
+    client.defaults.adapter = adapter as AxiosAdapter;
+
+    const request = client.post('/files/mutate', { value: 'user-1 payload' });
+    const rejected = expect(request).rejects.toBeInstanceOf(
+      StaleWorkspaceAuthorizationResponseError,
+    );
+    await vi.waitFor(() => expect(adapter).toHaveBeenCalledTimes(1));
+    useAuthStore.setState({ user: actor('user-2', 1), isAuthenticated: true });
+    await vi.advanceTimersByTimeAsync(500);
+
+    await rejected;
+    expect(adapter).toHaveBeenCalledTimes(1);
+  });
+});

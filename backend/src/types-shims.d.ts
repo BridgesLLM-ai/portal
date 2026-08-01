@@ -1,5 +1,4 @@
 declare module 'sanitize-html';
-declare module 'geoip-lite';
 declare module 'jsonwebtoken';
 declare module 'bcrypt';
 declare module 'cookie-parser';

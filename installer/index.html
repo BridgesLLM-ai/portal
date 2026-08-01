@@ -159,50 +159,50 @@
   <div class="container">
     <div class="logo">🌉</div>
     <h1>BridgesLLM Portal</h1>
-    <p class="subtitle">Self-hosted AI portal with local inference, email, and more.</p>
+    <p class="subtitle">A self-hosted OpenClaw workstation for a supported Ubuntu or Debian VPS.</p>
     
     <div class="install-box">
       <h2>One-Command Install</h2>
       <div class="command">
         <button class="copy-btn" onclick="copyCommand(this)">Copy</button>
-        curl -fsSL https://install.bridgesllm.ai/install.sh | sudo bash
+        curl -fsSL https://bridgesllm.ai/install.sh | sudo bash
       </div>
       <div class="requirements">
         <h3>Requirements</h3>
         <ul>
-          <li>Ubuntu 22/24 or Debian 12</li>
-          <li>2GB+ RAM</li>
-          <li>10GB+ disk space</li>
+          <li>Ubuntu 22.04+ or Debian 12+</li>
+          <li>3.5GB+ RAM</li>
+          <li>35GB+ free disk</li>
           <li>Root/sudo access</li>
-          <li>Ports 80, 443 available</li>
-          <li>A domain name</li>
+          <li>Compatible Docker host for Project Chat</li>
+          <li>Domain recommended, not required</li>
         </ul>
       </div>
     </div>
     
     <div class="features">
       <div class="feature">
-        <h3>🤖 Local AI</h3>
-        <p>Run Ollama models locally without API keys</p>
+        <h3>🤖 Agent Chat</h3>
+        <p>Use OpenClaw and the provider paths available to your accounts</p>
       </div>
       <div class="feature">
-        <h3>📧 Email Server</h3>
-        <p>Built-in Stalwart for notifications & user inboxes</p>
+        <h3>🧰 Project Workspaces</h3>
+        <p>Files, code, apps, and qualified project-bound agent runtimes</p>
       </div>
       <div class="feature">
-        <h3>🔐 Auto HTTPS</h3>
-        <p>Caddy handles TLS certificates automatically</p>
+        <h3>🔐 Signed Updates</h3>
+        <p>Operator-triggered updates verify the release artifact and can roll back</p>
       </div>
       <div class="feature">
-        <h3>⚡ Quick Setup</h3>
-        <p>Setup wizard guides you through configuration</p>
+        <h3>⚙️ Optional Services</h3>
+        <p>Readiness cards guide domains, mail, Remote Desktop, and local models</p>
       </div>
     </div>
     
     <div class="footer">
       <p>
-        <a href="https://github.com/bridgesllm/portal">GitHub</a> · 
-        <a href="https://bridgesllm.ai">Website</a> · 
+        <a href="https://github.com/BridgesLLM-ai/portal">GitHub</a> ·
+        <a href="https://bridgesllm.ai">Website</a> ·
         <a href="/install.sh">View Script</a>
       </p>
     </div>
@@ -210,7 +210,7 @@
   
   <script>
     function copyCommand(btn) {
-      const cmd = 'curl -fsSL https://install.bridgesllm.ai/install.sh | sudo bash';
+      const cmd = 'curl -fsSL https://bridgesllm.ai/install.sh | sudo bash';
       navigator.clipboard.writeText(cmd).then(() => {
         btn.textContent = 'Copied!';
         btn.classList.add('copied');

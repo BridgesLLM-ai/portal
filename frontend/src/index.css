@@ -139,6 +139,54 @@ html, body {
   66% { transform: translate(-20px, 20px) scale(0.95); }
 }
 
+/* Respect the operating-system motion preference across CSS and Framer Motion.
+   Removing the fixed blurred blobs also avoids needless GPU work on low-spec
+   clients that have reduced motion enabled. */
+@media (prefers-reduced-motion: reduce) {
+  html:focus-within {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .ambient-bg::before,
+  .ambient-bg::after {
+    display: none;
+  }
+}
+
+/* Per-device performance mode. Auto mode enables this on constrained clients;
+   users can override it from Settings → Theme without changing server-wide
+   branding. Expensive fixed blur layers are the usual culprit when a weak
+   desktop GPU makes the Portal feel slower than a modern phone. */
+html[data-effects='reduced'] *,
+html[data-effects='reduced'] *::before,
+html[data-effects='reduced'] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+
+html[data-effects='reduced'] .ambient-bg::before,
+html[data-effects='reduced'] .ambient-bg::after {
+  display: none;
+}
+
+html[data-effects='reduced'] .glass,
+html[data-effects='reduced'] .glass-sm,
+html[data-effects='reduced'] [class*='backdrop-blur'] {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
 /* ─── Scrollbar ─── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -356,4 +404,19 @@ select optgroup {
   -ms-interpolation-mode: bicubic;
   -webkit-backface-visibility: hidden;
   backface-visibility: hidden;
+}
+
+/* Indeterminate progress sweep for long-running confirmation operations.
+   Communicates "alive" for actions whose real duration is unknown (5s–30s+). */
+@keyframes typed-confirmation-progress-sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+.typed-confirmation-progress-sweep {
+  animation: typed-confirmation-progress-sweep 1.15s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .typed-confirmation-progress-sweep {
+    animation-duration: 2.4s;
+  }
 }

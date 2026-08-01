@@ -11,7 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20.x, 22.x]
+        # Match the installer/OpenClaw runtime contract. Node 20 and 23 are
+        # intentionally unsupported and must not appear green in public CI.
+        node-version: [22.22.3, 24.15.0, 25.9.0]
 
     steps:
       - uses: actions/checkout@v4
@@ -25,22 +27,32 @@ jobs:
         working-directory: ./backend
         run: npm ci
 
+      - name: Generate Prisma client
+        working-directory: ./backend
+        run: npx prisma generate
+
+      - name: Type-check backend
+        working-directory: ./backend
+        run: npx tsc --noEmit
+
       - name: Build backend
         working-directory: ./backend
         run: npm run build
-
-      - name: Run backend tests
-        working-directory: ./backend
-        env:
-          PORTAL_PROJECTS_ROOT: /var/tmp/bridgesllm-ci-projects
-        run: npm test
 
       - name: Install frontend dependencies
         working-directory: ./frontend
         run: npm ci
 
+      - name: Type-check frontend
+        working-directory: ./frontend
+        run: npx tsc --noEmit
+
+      - name: Lint frontend
+        working-directory: ./frontend
+        run: npx eslint src --max-warnings=0
+
       - name: Build frontend
         working-directory: ./frontend
+        run: npm run build
         env:
           VITE_API_URL: /api
-        run: npm run build

@@ -539,27 +539,6 @@ export class OpenClawGatewayClient {
   }
 
   /**
-   * Interrupt an active run and send a real user steering message.
-   */
-  async steerSession(sessionKey: string, message: string): Promise<{ runId: string | null; interruptedActiveRun: boolean }> {
-    this.currentSessionKey = sessionKey;
-    this.activeRunSessionKey = sessionKey;
-    await this.subscribeSession(sessionKey);
-    const idempotencyKey = clientRandomId();
-
-    const result = await this.request<{ runId?: string; interruptedActiveRun?: boolean }>('sessions.steer', {
-      key: sessionKey,
-      message,
-      idempotencyKey,
-    });
-
-    return {
-      runId: typeof result?.runId === 'string' && result.runId.trim() ? result.runId.trim() : null,
-      interruptedActiveRun: result?.interruptedActiveRun === true,
-    };
-  }
-
-  /**
    * Load message history for a session.
    */
   async loadHistory(sessionKey: string, limit = 200): Promise<GatewayHistoryResponse> {

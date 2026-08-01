@@ -37,7 +37,61 @@ export interface StoredError {
 let errorIdCounter = 0;
 
 function notifyListeners() {
-  for (const fn of listeners) fn([...errorStore]);
+  for (const fn of listeners) {
+    try { fn([...errorStore]); } catch { /* Diagnostic listeners must not break the app. */ }
+  }
+}
+
+function boundedString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  return value.slice(0, maxLength);
+}
+
+function sanitizeDebugValue(value: unknown, seen: WeakSet<object>, depth = 0): unknown {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
+  if (typeof value === 'string') return value.slice(0, 2_000);
+  if (typeof value === 'bigint' || typeof value === 'symbol' || typeof value === 'function') return String(value).slice(0, 2_000);
+  if (value instanceof Error) {
+    return { name: value.name, message: value.message.slice(0, 2_000), stack: value.stack?.slice(0, 8_000) };
+  }
+  if (!value || typeof value !== 'object') return String(value).slice(0, 2_000);
+  if (seen.has(value)) return '[Circular]';
+  if (depth >= 4) return '[Max depth]';
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.slice(0, 50).map(item => sanitizeDebugValue(item, seen, depth + 1));
+  }
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value).slice(0, 50)) {
+    const sanitizedItem = sanitizeDebugValue(item, seen, depth + 1);
+    if (sanitizedItem !== undefined) {
+      result[key.slice(0, 200)] = sanitizedItem;
+    }
+  }
+  return result;
+}
+
+function sanitizeDebug(debug: Record<string, unknown> | undefined): Record<string, unknown> {
+  return (sanitizeDebugValue(debug || {}, new WeakSet()) as Record<string, unknown>) || {};
+}
+
+function diagnosticLocation(): { url?: string; route?: string } {
+  if (typeof window === 'undefined') return {};
+  // Query strings and fragments routinely contain OAuth codes, reset tokens,
+  // and app state. They are not needed to identify the failing route.
+  return {
+    url: `${window.location.origin}${window.location.pathname}`,
+    route: window.location.pathname,
+  };
+}
+
+function safeJsonStringify(value: unknown, maxLength: number): string {
+  try {
+    return JSON.stringify(value).slice(0, maxLength);
+  } catch {
+    return '{}';
+  }
 }
 
 export function subscribeErrors(fn: (errors: StoredError[]) => void): () => void {
@@ -75,53 +129,72 @@ export function reportError(payload: ErrorReportPayload) {
     debug,
   } = payload;
 
+  const safeMessage = boundedString(message, 4_000) || 'Unknown error';
+  const safeStack = boundedString(stack, 64 * 1024);
+  const safeEndpoint = boundedString(endpoint, 1_000);
+  const safeComponentName = boundedString(componentName, 1_000);
+  const safeContext = boundedString(context, 1_000);
+  const location = diagnosticLocation();
+  const safeDebug = sanitizeDebug({
+    ...sanitizeDebug(debug),
+    stack: safeStack,
+    endpoint: safeEndpoint,
+    componentName: safeComponentName,
+    context: safeContext,
+    userAgent: typeof navigator === 'undefined' ? undefined : navigator.userAgent.slice(0, 1_000),
+    ...location,
+    title: typeof document === 'undefined' ? undefined : document.title.slice(0, 500),
+  });
+
   const stored: StoredError = {
     id: `err-${++errorIdCounter}-${Date.now()}`,
-    message,
+    message: safeMessage,
     category,
     severity,
     timestamp: new Date().toISOString(),
-    debug: {
-      ...debug,
-      stack,
-      endpoint,
-      componentName,
-      context,
-      userAgent: navigator.userAgent,
-      url: window.location.href,
-      route: window.location.pathname + window.location.search + window.location.hash,
-      title: document.title,
-    },
+    debug: safeDebug,
   };
 
   errorStore = [stored, ...errorStore].slice(0, MAX_ERRORS);
   notifyListeners();
 
   // Play error sound
-  sounds.error();
+  try { sounds.error(); } catch { /* Sound is best effort. */ }
 
   // Send to backend (non-blocking, fire-and-forget)
-  activityAPI.reportError({
-    message,
-    stack,
-    endpoint,
-    componentName,
-    context: context || JSON.stringify(debug || {}),
-    severity,
-  }).catch(() => {});
+  try {
+    activityAPI.reportError({
+      message: safeMessage,
+      stack: safeStack,
+      endpoint: safeEndpoint,
+      componentName: safeComponentName,
+      context: safeContext || safeJsonStringify(sanitizeDebug(debug), 1_000),
+      severity,
+    }).catch(() => {});
+  } catch { /* Reporting must never become another application error. */ }
 }
 
 /**
  * Convenience: extract + report an error from any thrown value.
  */
-export function captureError(err: unknown, category: ErrorCategory = 'frontend', contextMsg?: string) {
+export function captureError(
+  err: unknown,
+  category: ErrorCategory = 'frontend',
+  contextOrOptions?: string | Readonly<{ context?: string; endpoint?: string }>,
+) {
+  const contextMsg = typeof contextOrOptions === 'string'
+    ? contextOrOptions
+    : contextOrOptions?.context;
+  const endpoint = typeof contextOrOptions === 'string'
+    ? undefined
+    : contextOrOptions?.endpoint;
   const extracted = extractError(err, contextMsg);
   reportError({
     message: extracted.message,
     category,
     severity: extracted.status && extracted.status >= 500 ? 'CRITICAL' : 'ERROR',
     stack: extracted.detail,
-    endpoint: undefined,
+    endpoint,
     context: contextMsg,
     debug: {
       hint: extracted.hint,
@@ -136,7 +209,7 @@ export function captureError(err: unknown, category: ErrorCategory = 'frontend',
  * Export errors as JSON for sharing/debugging.
  */
 export function exportErrorsJSON(): string {
-  return JSON.stringify(errorStore, null, 2);
+  try { return JSON.stringify(errorStore, null, 2); } catch { return '[]'; }
 }
 
 

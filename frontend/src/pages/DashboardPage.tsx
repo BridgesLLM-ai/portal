@@ -1,19 +1,30 @@
-import { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense, useContext } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { UNSAFE_NavigationContext } from 'react-router-dom';
 // Link removed — onboarding cards removed
 import { io, Socket } from 'socket.io-client';
 import { metricsAPI, alertsAPI, systemStatsAPI, type SystemStats } from '../api/endpoints';
 import { Metrics, ActivityLog } from '../types';
 import ActivityLogTable from '../components/ActivityLogTable';
 import client from '../api/client';
+import { maintenanceAPI, type MaintenanceSeverity, type MaintenanceStatus } from '../api/maintenance';
 import { useAuthStore } from '../contexts/AuthContext';
 import { isElevated, isOwner } from '../utils/authz';
+import { mergeDashboardMetricHistory } from '../utils/dashboardMetrics';
+import { maintenancePollDelayMs, shouldPollMaintenance } from './settingsAdminContract';
+import TypedConfirmationDialog from '../components/TypedConfirmationDialog';
 import {
-  Cpu, HardDrive, Wifi,
+  createFreshBackupForUpdate,
+  describeUpdateBackup,
+  waitForExpectedPortalVersion,
+  type PortalUpdatePreparation,
+} from '../utils/updatePreparation';
+import {
+  Cpu, HardDrive,
   AlertTriangle, MemoryStick,
   ArrowDown, ArrowUp, RefreshCw,
   Gauge, Layers, Timer, Loader2,
-  ShieldAlert, Wrench, CheckCircle2,
+  ShieldAlert, Wrench, CheckCircle2, ChevronDown,
 } from 'lucide-react';
 
 const LazyDashboardCharts = lazy(() => import('../components/dashboard/DashboardCharts'));
@@ -36,51 +47,59 @@ type OpenClawVersionStatus = {
   checkedAt?: string;
 };
 
-type MaintenanceSeverity = 'healthy' | 'info' | 'warning' | 'critical';
-type MaintenanceAction = {
-  id: string;
-  label: string;
-  description: string;
-  risk: 'safe' | 'scheduled' | 'manual';
-  downtimeExpected: boolean;
-  requiresOwner: boolean;
+type ReleaseClass = 'hotfix' | 'security' | 'feature' | 'maintenance';
+type VerifiedReleaseDetails = {
+  version: string;
+  releasedAt: string;
+  releaseClass: ReleaseClass;
+  highlights: string[];
+  provenance: 'signed-release-manifest';
 };
-type MaintenanceIssue = {
-  id: string;
-  title: string;
-  detail: string;
-  severity: Exclude<MaintenanceSeverity, 'healthy'>;
-  category: 'security' | 'updates' | 'services' | 'disk' | 'backups' | 'system';
-  recommendation: string;
-  actionId?: string;
-  downtimeExpected?: boolean;
-  automationSafe: boolean;
-};
-type MaintenanceCompatibility = {
-  policy: 'guarded';
-  summary: string;
-  components: Array<{
-    id: string;
-    label: string;
-    installedVersion: string | null;
-    supportedVersion: string;
-    policy: 'self-update-only' | 'known-compatible' | 'manual-review' | 'blocked-until-confirmed';
-    status: 'ok' | 'review' | 'blocked' | 'unknown';
-    note: string;
-  }>;
-};
-type MaintenanceStatus = {
-  checkedAt: string;
-  status: MaintenanceSeverity;
-  summary: string;
-  host: { hostname: string; os: string; kernel: string; uptimeSeconds: number };
-  issues: MaintenanceIssue[];
-  actions: MaintenanceAction[];
-  reboot?: { required: boolean; packages: string[] };
-  compatibility?: MaintenanceCompatibility;
+type UpdateStatus = {
+  current: string;
+  latest: string | null;
+  updateAvailable: boolean;
+  details: VerifiedReleaseDetails | null;
+  detailsStatus: 'verified' | 'unavailable';
+  preparation?: PortalUpdatePreparation;
 };
 
+type PortalUpdatePlan = 'create-backup' | 'use-current' | 'skip-backup';
+
 const MAINTENANCE_DISMISS_KEY = 'dashboard-maintenance-dismissed-signature';
+const DASHBOARD_MAINTENANCE_MAX_POLL_ATTEMPTS = 6;
+const DASHBOARD_MAINTENANCE_POLL_DEADLINE_MS = 45_000;
+const DASHBOARD_MAINTENANCE_MAX_POLL_DELAY_MS = 8_000;
+const DASHBOARD_GATEWAY_FORCE_PROBE_MAX_ATTEMPTS = 3;
+const DASHBOARD_GATEWAY_FORCE_PROBE_INITIAL_DELAY_MS = 1_600;
+const DASHBOARD_GATEWAY_FORCE_PROBE_MAX_DELAY_MS = 5_000;
+
+type RenderableMaintenanceStatus = MaintenanceStatus & {
+  host: NonNullable<MaintenanceStatus['host']>;
+};
+
+type MaintenancePollBudget = {
+  startedAt: number;
+  attempts: number;
+};
+
+function isMaintenanceStatus(value: unknown): value is MaintenanceStatus {
+  if (!value || typeof value !== 'object') return false;
+  const status = value as Partial<MaintenanceStatus>;
+  return ['healthy', 'info', 'warning', 'critical'].includes(String(status.status))
+    && typeof status.summary === 'string'
+    && (status.checkedAt === null || typeof status.checkedAt === 'string')
+    && Array.isArray(status.issues)
+    && Array.isArray(status.actions);
+}
+
+function hasRenderableMaintenanceHost(status: MaintenanceStatus): status is RenderableMaintenanceStatus {
+  return Boolean(status.host
+    && typeof status.host.hostname === 'string'
+    && typeof status.host.os === 'string'
+    && typeof status.host.kernel === 'string'
+    && Number.isFinite(status.host.uptimeSeconds));
+}
 
 function maintenanceDismissSignature(status: MaintenanceStatus): string {
   const issues = [...(status.issues || [])]
@@ -95,15 +114,6 @@ function maintenanceDismissSignature(status: MaintenanceStatus): string {
 
 /* ─── helpers ──────────────────────────────────────────── */
 
-function formatBytes(bytes: number | bigint | string, decimals = 1): string {
-  const b = typeof bytes === 'string' ? parseFloat(bytes) : Number(bytes);
-  if (b === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(b) / Math.log(k));
-  return (b / Math.pow(k, i)).toFixed(decimals) + ' ' + sizes[i];
-}
-
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
@@ -111,6 +121,18 @@ function formatUptime(seconds: number): string {
   if (d > 0) return `${d}d ${h}h`;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+// Adaptive rate units: an idle appliance sits at a few hundred B/s, which a
+// fixed MB/s tile rendered as a dead-looking "0.00MB/s".
+function formatNetworkRate(bytesPerSecond: number): { value: string; unit: string } {
+  if (bytesPerSecond >= 1024 * 1024) {
+    return { value: (bytesPerSecond / 1024 / 1024).toFixed(2), unit: 'MB/s' };
+  }
+  if (bytesPerSecond >= 1024) {
+    return { value: (bytesPerSecond / 1024).toFixed(1), unit: 'KB/s' };
+  }
+  return { value: String(Math.round(bytesPerSecond)), unit: 'B/s' };
 }
 
 function statusColor(v: number): string {
@@ -125,12 +147,6 @@ function statusClass(v: number): string {
   return 'from-red-500/20 to-red-500/5 border-red-500/20';
 }
 
-function statusBg(v: number): string {
-  if (v < 50) return 'bg-emerald-500';
-  if (v < 80) return 'bg-amber-500';
-  return 'bg-red-500';
-}
-
 function maintenanceTone(status: MaintenanceSeverity): string {
   if (status === 'critical') return 'border-red-500/30 bg-red-500/10 text-red-100';
   if (status === 'warning') return 'border-amber-500/30 bg-amber-500/10 text-amber-100';
@@ -143,6 +159,53 @@ function maintenanceDot(status: MaintenanceSeverity): string {
   if (status === 'warning') return 'bg-amber-400';
   if (status === 'info') return 'bg-cyan-400';
   return 'bg-emerald-400';
+}
+
+function verifiedUpdateDetails(status: UpdateStatus | null): VerifiedReleaseDetails | null {
+  const details = status?.details;
+  if (!details
+    || status?.detailsStatus !== 'verified'
+    || details.provenance !== 'signed-release-manifest'
+    || details.version !== status.latest
+    || !['hotfix', 'security', 'feature', 'maintenance'].includes(details.releaseClass)
+    || !/^\d{4}-\d{2}-\d{2}$/.test(details.releasedAt)
+    || !Array.isArray(details.highlights)
+    || details.highlights.length < 1
+    || details.highlights.length > 5
+    || details.highlights.some((highlight) => typeof highlight !== 'string'
+      || highlight !== highlight.trim()
+      || Array.from(highlight).length < 1
+      || Array.from(highlight).length > 200
+      || /[\u0000-\u001f\u007f]/.test(highlight))
+    || new Set(details.highlights).size !== details.highlights.length) {
+    return null;
+  }
+  return details;
+}
+
+function releaseClassLabel(releaseClass: ReleaseClass): string {
+  if (releaseClass === 'hotfix') return 'Hotfix';
+  if (releaseClass === 'security') return 'Security';
+  if (releaseClass === 'feature') return 'Feature drop';
+  return 'Maintenance';
+}
+
+function releaseClassTone(releaseClass: ReleaseClass): string {
+  if (releaseClass === 'hotfix') return 'border-amber-400/30 bg-amber-500/15 text-amber-100';
+  if (releaseClass === 'security') return 'border-red-400/30 bg-red-500/15 text-red-100';
+  if (releaseClass === 'feature') return 'border-violet-400/30 bg-violet-500/15 text-violet-100';
+  return 'border-slate-400/25 bg-slate-500/15 text-slate-200';
+}
+
+function formatReleaseDate(value: string): string {
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleDateString(undefined, {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    timeZone: 'UTC',
+  });
 }
 
 /* ─── animation variants ───────────────────────────────── */
@@ -265,8 +328,16 @@ function getPrimaryDisk(disks: SystemStats['disk'] | undefined) {
   return disks.find(d => d.mount === '/') || disks[0];
 }
 
+function hasNetworkTelemetry(metric: Metrics | null | undefined): boolean {
+  if (!metric) return false;
+  return metric.metadata?.networkMetricsAvailable ?? !metric.metadata?.lightweightCollector;
+}
+
 export default function DashboardPage() {
+  const navigationContext = useContext(UNSAFE_NavigationContext);
+  const routerNavigator = navigationContext?.navigator;
   const user = useAuthStore((state) => state.user);
+  const canViewOperatorDiagnostics = isElevated(user);
   const canRunSelfUpdate = isOwner(user);
   const canReconnectGateway = isElevated(user);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
@@ -275,23 +346,52 @@ export default function DashboardPage() {
   const [connected, setConnected] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [activeAlerts, setActiveAlerts] = useState<ActivityLog[]>([]);
-  const [updateStatus, setUpdateStatus] = useState<{ current: string; latest: string | null; updateAvailable: boolean } | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [updateBannerDismissed, setUpdateBannerDismissed] = useState(false);
+  const [updateDetailsExpanded, setUpdateDetailsExpanded] = useState(false);
   const [updateInProgress, setUpdateInProgress] = useState(false);
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  const [updatePlan, setUpdatePlan] = useState<PortalUpdatePlan>('create-backup');
   const [openClawStatus, setOpenClawStatus] = useState<'checking' | 'connected' | 'misconfigured' | 'offline'>('checking');
   const [openClawIssues, setOpenClawIssues] = useState<string[]>([]);
   const [openClawVersion, setOpenClawVersion] = useState<OpenClawVersionStatus | null>(null);
-  const [maintenanceStatus, setMaintenanceStatus] = useState<MaintenanceStatus | null>(null);
+  const [maintenanceStatus, setMaintenanceStatus] = useState<RenderableMaintenanceStatus | null>(null);
+  const [maintenanceProbe, setMaintenanceProbe] = useState<MaintenanceStatus | null>(null);
+  const [maintenancePageVisible, setMaintenancePageVisible] = useState(
+    () => typeof document === 'undefined' || document.visibilityState !== 'hidden',
+  );
   // Background system checks run independently of the metric gauges. Each one
   // reports its own progress so slow scans (apt, OpenClaw probes) read as
   // "checks running" instead of a stalled dashboard.
   type SystemCheckState = 'pending' | 'done' | 'error';
-  const [systemChecks, setSystemChecks] = useState<Record<'openclaw' | 'updates' | 'maintenance', SystemCheckState>>({
+  type SystemCheckKey = 'openclaw' | 'updates' | 'maintenance';
+  const [systemChecks, setSystemChecks] = useState<Record<SystemCheckKey, SystemCheckState>>({
     openclaw: 'pending',
     updates: 'pending',
     maintenance: 'pending',
   });
+  // Server-side cooldowns decide whether a view re-executes a check
+  //; the page only reports how old each rendered result is and
+  // lets each check be refreshed on its own without touching the other two.
+  const [checkedAt, setCheckedAt] = useState<Record<SystemCheckKey, number | null>>({
+    openclaw: null,
+    updates: null,
+    maintenance: null,
+  });
+  const [checkRefreshing, setCheckRefreshing] = useState<Record<SystemCheckKey, boolean>>({
+    openclaw: false,
+    updates: false,
+    maintenance: false,
+  });
+  const [checkAgeTick, setCheckAgeTick] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setCheckAgeTick(t => t + 1), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const markCheckedAt = useCallback((key: SystemCheckKey, at: number | null) => {
+    setCheckedAt(prev => (prev[key] === at ? prev : { ...prev, [key]: at }));
+  }, []);
   const [maintenanceDismissedSignature, setMaintenanceDismissedSignature] = useState(() => {
     try {
       return localStorage.getItem(MAINTENANCE_DISMISS_KEY) || '';
@@ -305,6 +405,102 @@ export default function DashboardPage() {
   // readiness + recentActivity sections removed per design cleanup
   const socketRef = useRef<Socket | null>(null);
   const alertSocketRef = useRef<Socket | null>(null);
+  const updateSubmissionRef = useRef(false);
+  const updateNavigationReleaseRef = useRef<(() => void) | null>(null);
+  const updateNavigationGuardRef = useRef<{
+    url: string;
+    state: unknown;
+    historyIndex: number | null;
+  } | null>(null);
+  const gatewayActionRef = useRef<'restart' | 'reconnect' | null>(null);
+  const maintenanceRequestSequenceRef = useRef(0);
+  const maintenancePollBudgetRef = useRef<MaintenancePollBudget | null>(null);
+
+  const releaseUpdateNavigationLock = useCallback(() => {
+    updateNavigationReleaseRef.current?.();
+    updateNavigationReleaseRef.current = null;
+    updateNavigationGuardRef.current = null;
+  }, []);
+
+  const acquireUpdateNavigationLock = useCallback(() => {
+    if (updateNavigationReleaseRef.current) return;
+    const originalPush = routerNavigator?.push;
+    const originalReplace = routerNavigator?.replace;
+    const originalGo = routerNavigator?.go;
+    const blockedPush = () => undefined;
+    const blockedReplace = () => undefined;
+    const blockedGo = () => undefined;
+    if (routerNavigator) {
+      routerNavigator.push = blockedPush;
+      routerNavigator.replace = blockedReplace;
+      routerNavigator.go = blockedGo;
+    }
+    const browserHistoryIndex = window.history.state?.idx;
+    updateNavigationGuardRef.current = {
+      url: window.location.href,
+      state: window.history.state,
+      historyIndex: typeof browserHistoryIndex === 'number' ? browserHistoryIndex : null,
+    };
+    updateNavigationReleaseRef.current = () => {
+      if (!routerNavigator) return;
+      if (routerNavigator.push === blockedPush && originalPush) routerNavigator.push = originalPush;
+      if (routerNavigator.replace === blockedReplace && originalReplace) routerNavigator.replace = originalReplace;
+      if (routerNavigator.go === blockedGo && originalGo) routerNavigator.go = originalGo;
+    };
+  }, [routerNavigator]);
+
+  useEffect(() => {
+    const ownsUpdateInteraction = (target: EventTarget | null) => {
+      if (!(target instanceof Element)) return false;
+      const modalLayer = target.closest('[data-viewport-modal-layer="true"]');
+      if (!modalLayer) return false;
+      const modalRoot = modalLayer.closest<HTMLElement>('[data-viewport-overlay-root="true"]');
+      return Boolean(
+        modalRoot
+        && !modalRoot.hasAttribute('inert')
+        && modalRoot.getAttribute('aria-hidden') !== 'true',
+      );
+    };
+    const preventUpdateUnload = (event: BeforeUnloadEvent) => {
+      if (!updateSubmissionRef.current) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    const preventOutsideUpdateInteraction = (event: Event) => {
+      if (!updateSubmissionRef.current || ownsUpdateInteraction(event.target)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+    };
+    const preventHistoryTraversal = (event: PopStateEvent) => {
+      if (!updateSubmissionRef.current) return;
+      const guard = updateNavigationGuardRef.current;
+      if (!guard) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      const nextIndex = window.history.state?.idx;
+      if (guard.historyIndex !== null && typeof nextIndex === 'number') {
+        const distanceToOwner = guard.historyIndex - nextIndex;
+        if (distanceToOwner !== 0) window.history.go(distanceToOwner);
+        return;
+      }
+      window.history.pushState(guard.state, '', guard.url);
+    };
+
+    window.addEventListener('beforeunload', preventUpdateUnload);
+    window.addEventListener('popstate', preventHistoryTraversal, true);
+    document.addEventListener('pointerdown', preventOutsideUpdateInteraction, true);
+    document.addEventListener('click', preventOutsideUpdateInteraction, true);
+    return () => {
+      window.removeEventListener('beforeunload', preventUpdateUnload);
+      window.removeEventListener('popstate', preventHistoryTraversal, true);
+      document.removeEventListener('pointerdown', preventOutsideUpdateInteraction, true);
+      document.removeEventListener('click', preventOutsideUpdateInteraction, true);
+    };
+  }, []);
+
+  useEffect(() => releaseUpdateNavigationLock, [releaseUpdateNavigationLock]);
 
   // Metrics socket is critical to the page, so keep it on the immediate path
   useEffect(() => {
@@ -330,13 +526,7 @@ export default function DashboardPage() {
       };
       setMetrics(m);
       setLastUpdate(new Date());
-      setHistory(prev => {
-        const sixHoursAgo = Date.now() - 6 * 60 * 60 * 1000;
-        const filtered = [...prev, m].filter(
-          x => new Date(x.timestamp).getTime() > sixHoursAgo
-        );
-        return filtered;
-      });
+      setHistory(prev => mergeDashboardMetricHistory(prev, [m]));
     });
 
     socketRef.current = socket;
@@ -348,6 +538,7 @@ export default function DashboardPage() {
 
   // Alerts are secondary dashboard data, so keep their live connection off the initial mount path
   useEffect(() => {
+    if (!canViewOperatorDiagnostics) return;
     const wsUrl = import.meta.env.VITE_WS_URL || import.meta.env.VITE_API_URL?.replace('/api', '') || window.location.origin;
     let cancelled = false;
     const timer = window.setTimeout(() => {
@@ -376,7 +567,7 @@ export default function DashboardPage() {
       alertSocketRef.current?.disconnect();
       alertSocketRef.current = null;
     };
-  }, []);
+  }, [canViewOperatorDiagnostics]);
 
 
 
@@ -385,7 +576,7 @@ export default function DashboardPage() {
     try {
       const [m, s, h] = await Promise.all([
         metricsAPI.latest().catch(() => null),
-        systemStatsAPI.latest().catch(() => null),
+        canViewOperatorDiagnostics ? systemStatsAPI.latest().catch(() => null) : Promise.resolve(null),
         metricsAPI.history(6).catch(() => []),
       ]);
       if (m) setMetrics(m);
@@ -393,9 +584,9 @@ export default function DashboardPage() {
         setSystemStats(s);
         setLastUpdate(new Date());
       }
-      if (Array.isArray(h)) setHistory(h);
+      if (Array.isArray(h)) setHistory(mergeDashboardMetricHistory([], h));
     } catch (err) { console.error('[Dashboard] Failed to fetch core data:', err); }
-  }, []);
+  }, [canViewOperatorDiagnostics]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
@@ -423,17 +614,236 @@ export default function DashboardPage() {
   const needsForcedGatewayVersionProbe = useCallback((gateway: any) => {
     const status = gateway?.openclawVersion;
     const reason = String(status?.reason || '').toLowerCase();
-    return Boolean(status?.lightweight || reason.includes('probe scheduled') || reason.includes('probe already running'));
+    const gatewayReady = gateway?.connected === true
+      && gateway?.wsConnected === true
+      && gateway?.modelsConfigured === true;
+    if (!gatewayReady || status?.mismatch === true || status?.restartRecommended === true) return false;
+
+    return Boolean(
+      status?.lightweight
+      || reason.includes('probe scheduled')
+      || reason.includes('probe already running')
+      // A healthy authenticated Portal connection paired with a failed CLI
+      // version probe is internally inconsistent, and commonly happens while
+      // OpenClaw is still settling after an update. Retry it briefly instead
+      // of leaving the mounted Dashboard on a cached "runtime unknown" card.
+      || status?.probeOk === false,
+    );
   }, []);
+
+  const markSystemCheck = useCallback((key: 'openclaw' | 'updates' | 'maintenance', state: SystemCheckState) => {
+    setSystemChecks(prev => (prev[key] === state ? prev : { ...prev, [key]: state }));
+  }, []);
+
+  const loadDashboardMaintenance = useCallback(async (forceRefresh = false) => {
+    const requestSequence = ++maintenanceRequestSequenceRef.current;
+    try {
+      const maintenance = await maintenanceAPI.getStatus(forceRefresh, { silent: true });
+      if (requestSequence !== maintenanceRequestSequenceRef.current) return;
+      if (!isMaintenanceStatus(maintenance)) {
+        maintenancePollBudgetRef.current = null;
+        markSystemCheck('maintenance', 'error');
+        return;
+      }
+
+      if (maintenance.ready !== false) {
+        markCheckedAt('maintenance', Date.now() - (typeof maintenance.cacheAgeMs === 'number' ? maintenance.cacheAgeMs : 0));
+      }
+      setMaintenanceProbe(maintenance);
+      const refreshPending = maintenance.ready === false
+        || maintenance.refreshing === true
+        || (maintenance.retryAfterMs || 0) > 0;
+      const renderable = maintenance.ready !== false && hasRenderableMaintenanceHost(maintenance);
+      if (renderable) setMaintenanceStatus(maintenance);
+      const coldRefreshFailed = maintenance.ready === false
+        && typeof maintenance.refreshError === 'string'
+        && maintenance.refreshError.trim().length > 0;
+      if (coldRefreshFailed) {
+        maintenancePollBudgetRef.current = null;
+        markSystemCheck('maintenance', 'error');
+        return;
+      }
+      if (refreshPending) {
+        maintenancePollBudgetRef.current ||= { startedAt: Date.now(), attempts: 0 };
+      } else {
+        maintenancePollBudgetRef.current = null;
+      }
+      markSystemCheck('maintenance', refreshPending ? 'pending' : renderable ? 'done' : 'error');
+    } catch {
+      if (requestSequence === maintenanceRequestSequenceRef.current) {
+        maintenancePollBudgetRef.current = null;
+        markSystemCheck('maintenance', 'error');
+      }
+    }
+  }, [markCheckedAt, markSystemCheck]);
+
+  // Per-check refresh: each button bypasses only its own check's
+  // server cooldown. The main dashboard refresh never reaches these paths.
+  const refreshSystemCheck = useCallback(async (key: SystemCheckKey) => {
+    setCheckRefreshing(prev => (prev[key] ? prev : { ...prev, [key]: true }));
+    markSystemCheck(key, 'pending');
+    try {
+      if (key === 'openclaw') {
+        const { data } = await client.get('/gateway/health?forceVersion=1', { _silent: true } as any);
+        applyGatewayHealth(data);
+        markCheckedAt('openclaw', typeof data?.checkedAt === 'number' ? data.checkedAt : Date.now());
+        markSystemCheck('openclaw', 'done');
+      } else if (key === 'updates') {
+        const { data } = await client.post('/admin/check-updates', { force: true }, { _silent: true } as any);
+        if (data) {
+          setUpdateStatus(data);
+          markCheckedAt('updates', typeof data?.checkedAt === 'number' ? data.checkedAt : Date.now());
+        }
+        markSystemCheck('updates', data ? 'done' : 'error');
+      } else {
+        await loadDashboardMaintenance(true);
+      }
+    } catch {
+      markSystemCheck(key, 'error');
+    } finally {
+      setCheckRefreshing(prev => (prev[key] ? { ...prev, [key]: false } : prev));
+    }
+  }, [applyGatewayHealth, loadDashboardMaintenance, markCheckedAt, markSystemCheck]);
+
+  const checkAges = useMemo(() => {
+    const describe = (at: number | null): string | null => {
+      if (at === null) return null;
+      const minutes = Math.max(0, Math.round((Date.now() - at) / 60_000));
+      if (minutes < 1) return 'Checked just now';
+      if (minutes === 1) return 'Checked 1 min ago';
+      if (minutes < 120) return `Checked ${minutes} min ago`;
+      return `Checked ${Math.round(minutes / 60)} h ago`;
+    };
+    return {
+      openclaw: describe(checkedAt.openclaw),
+      updates: describe(checkedAt.updates),
+      maintenance: describe(checkedAt.maintenance),
+    };
+    // checkAgeTick re-derives the labels every 30 seconds.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [checkedAt, checkAgeTick]);
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      const pageVisible = document.visibilityState !== 'hidden';
+      if (pageVisible) maintenancePollBudgetRef.current = null;
+      setMaintenancePageVisible(pageVisible);
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
+
+  useEffect(() => {
+    if (!canViewOperatorDiagnostics) {
+      maintenancePollBudgetRef.current = null;
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void loadDashboardMaintenance();
+    }, 1200);
+    return () => {
+      window.clearTimeout(timer);
+      maintenanceRequestSequenceRef.current += 1;
+      maintenancePollBudgetRef.current = null;
+    };
+  }, [canViewOperatorDiagnostics, loadDashboardMaintenance]);
+
+  useEffect(() => {
+    if (!canViewOperatorDiagnostics || !maintenanceProbe || !shouldPollMaintenance({
+      pageVisible: maintenancePageVisible,
+      ready: maintenanceProbe.ready,
+      refreshing: maintenanceProbe.refreshing,
+      retryAfterMs: maintenanceProbe.retryAfterMs,
+      hasActiveJob: false,
+    })) return;
+    if (maintenanceProbe.ready === false
+      && typeof maintenanceProbe.refreshError === 'string'
+      && maintenanceProbe.refreshError.trim().length > 0) {
+      markSystemCheck('maintenance', 'error');
+      return;
+    }
+
+    const budget = maintenancePollBudgetRef.current
+      ||= { startedAt: Date.now(), attempts: 0 };
+    const elapsedMs = Date.now() - budget.startedAt;
+    const remainingMs = DASHBOARD_MAINTENANCE_POLL_DEADLINE_MS - elapsedMs;
+    if (budget.attempts >= DASHBOARD_MAINTENANCE_MAX_POLL_ATTEMPTS || remainingMs <= 0) {
+      markSystemCheck('maintenance', 'error');
+      return;
+    }
+
+    const requestedDelayMs = maintenancePollDelayMs({
+      retryAfterMs: maintenanceProbe.retryAfterMs,
+      hasActiveJob: false,
+    });
+    const backoffDelayMs = Math.min(
+      DASHBOARD_MAINTENANCE_MAX_POLL_DELAY_MS,
+      requestedDelayMs * (2 ** budget.attempts),
+    );
+    const pollDelayMs = Math.max(requestedDelayMs, backoffDelayMs);
+    const deadlineExpiresFirst = pollDelayMs >= remainingMs;
+    const timer = window.setTimeout(() => {
+      if (deadlineExpiresFirst) {
+        markSystemCheck('maintenance', 'error');
+        return;
+      }
+      const currentBudget = maintenancePollBudgetRef.current;
+      if (!currentBudget
+        || currentBudget !== budget
+        || currentBudget.attempts >= DASHBOARD_MAINTENANCE_MAX_POLL_ATTEMPTS
+        || Date.now() - currentBudget.startedAt >= DASHBOARD_MAINTENANCE_POLL_DEADLINE_MS) {
+        markSystemCheck('maintenance', 'error');
+        return;
+      }
+      currentBudget.attempts += 1;
+      void loadDashboardMaintenance();
+    }, Math.min(pollDelayMs, remainingMs));
+    return () => window.clearTimeout(timer);
+  }, [canViewOperatorDiagnostics, loadDashboardMaintenance, maintenancePageVisible, maintenanceProbe, markSystemCheck]);
 
   // Defer non-critical startup checks so the main dashboard cards can settle
   // first, then run every check INDEPENDENTLY: one slow scan (apt, OpenClaw
   // version probes) must never hold back the others or the metric gauges.
   useEffect(() => {
+    if (!canViewOperatorDiagnostics) return;
     let cancelled = false;
     let forceProbeTimer: number | undefined;
+    let forcedProbeAttempts = 0;
     const markCheck = (key: 'openclaw' | 'updates' | 'maintenance', state: SystemCheckState) => {
       if (!cancelled) setSystemChecks(prev => (prev[key] === state ? prev : { ...prev, [key]: state }));
+    };
+    const scheduleForcedGatewayVersionProbe = (delayMs: number) => {
+      if (cancelled || forcedProbeAttempts >= DASHBOARD_GATEWAY_FORCE_PROBE_MAX_ATTEMPTS) return;
+      forceProbeTimer = window.setTimeout(async () => {
+        if (cancelled) return;
+        forcedProbeAttempts += 1;
+        try {
+          const { data } = await client.get('/gateway/health?forceVersion=1', { _silent: true } as any);
+          if (cancelled) return;
+          applyGatewayHealth(data);
+          if (
+            needsForcedGatewayVersionProbe(data)
+            && forcedProbeAttempts < DASHBOARD_GATEWAY_FORCE_PROBE_MAX_ATTEMPTS
+          ) {
+            const nextDelayMs = Math.min(
+              DASHBOARD_GATEWAY_FORCE_PROBE_MAX_DELAY_MS,
+              DASHBOARD_GATEWAY_FORCE_PROBE_INITIAL_DELAY_MS * (2 ** forcedProbeAttempts),
+            );
+            scheduleForcedGatewayVersionProbe(nextDelayMs);
+          }
+        } catch (err) {
+          if (cancelled) return;
+          if (forcedProbeAttempts < DASHBOARD_GATEWAY_FORCE_PROBE_MAX_ATTEMPTS) {
+            const nextDelayMs = Math.min(
+              DASHBOARD_GATEWAY_FORCE_PROBE_MAX_DELAY_MS,
+              DASHBOARD_GATEWAY_FORCE_PROBE_INITIAL_DELAY_MS * (2 ** forcedProbeAttempts),
+            );
+            scheduleForcedGatewayVersionProbe(nextDelayMs);
+          } else {
+            console.error('[Dashboard] Forced OpenClaw version probe failed:', err);
+          }
+        }
+      }, delayMs);
     };
 
     const timer = window.setTimeout(() => {
@@ -459,6 +869,7 @@ export default function DashboardPage() {
         .then((upd) => {
           if (cancelled) return;
           if (upd) {
+            markCheckedAt('updates', typeof upd?.checkedAt === 'number' ? upd.checkedAt : null);
             setUpdateStatus(upd);
             const latest = typeof upd?.latest === 'string' ? upd.latest : null;
             if (latest && localStorage.getItem(`dashboard-update-dismissed:${latest}`) === 'true') {
@@ -471,31 +882,18 @@ export default function DashboardPage() {
         })
         .catch(() => markCheck('updates', 'error'));
 
-      client.get('/gateway/health', { _silent: true } as any)
+      client.get('/gateway/health?cooldown=1', { _silent: true } as any)
         .then(({ data: gateway }) => {
           if (cancelled) return;
           applyGatewayHealth(gateway);
+          markCheckedAt('openclaw', typeof gateway?.checkedAt === 'number' ? gateway.checkedAt : Date.now());
           markCheck('openclaw', 'done');
           if (needsForcedGatewayVersionProbe(gateway)) {
-            forceProbeTimer = window.setTimeout(async () => {
-              try {
-                const { data } = await client.get('/gateway/health?forceVersion=1', { _silent: true } as any);
-                if (!cancelled) applyGatewayHealth(data);
-              } catch (err) {
-                if (!cancelled) console.error('[Dashboard] Forced OpenClaw version probe failed:', err);
-              }
-            }, 1600);
+            scheduleForcedGatewayVersionProbe(DASHBOARD_GATEWAY_FORCE_PROBE_INITIAL_DELAY_MS);
           }
         })
         .catch(() => markCheck('openclaw', 'error'));
 
-      client.get('/system/maintenance', { _silent: true } as any)
-        .then(({ data: maintenance }) => {
-          if (cancelled) return;
-          if (maintenance) setMaintenanceStatus(maintenance);
-          markCheck('maintenance', maintenance ? 'done' : 'error');
-        })
-        .catch(() => markCheck('maintenance', 'error'));
     }, 1200);
 
     return () => {
@@ -503,7 +901,7 @@ export default function DashboardPage() {
       window.clearTimeout(timer);
       if (forceProbeTimer !== undefined) window.clearTimeout(forceProbeTimer);
     };
-  }, [applyGatewayHealth, canRunSelfUpdate, needsForcedGatewayVersionProbe]);
+  }, [applyGatewayHealth, canRunSelfUpdate, canViewOperatorDiagnostics, markCheckedAt, needsForcedGatewayVersionProbe]);
 
   // Fallback polling if WebSocket disconnects
   useEffect(() => {
@@ -512,7 +910,7 @@ export default function DashboardPage() {
       try {
         const [m, s] = await Promise.all([
           metricsAPI.latest().catch(() => null),
-          systemStatsAPI.latest().catch(() => null),
+          canViewOperatorDiagnostics ? systemStatsAPI.latest().catch(() => null) : Promise.resolve(null),
         ]);
         if (m) setMetrics(m);
         if (s) {
@@ -522,7 +920,7 @@ export default function DashboardPage() {
       } catch (err) { console.error('[Dashboard] Metrics poll error:', err); }
     }, 10000);
     return () => clearInterval(iv);
-  }, [connected]);
+  }, [canViewOperatorDiagnostics, connected]);
 
   // Defer chart bundle work until the cards have had a chance to render first
   useEffect(() => {
@@ -545,8 +943,8 @@ export default function DashboardPage() {
   const cpuHistory = useMemo(() => history.map(m => m.cpuUsage), [history]);
   const memHistory = useMemo(() => history.map(m => m.memoryUsage), [history]);
   const diskHistory = useMemo(() => history.map(m => m.diskUsage), [history]);
-  const netInHistory = useMemo(() => history.map(m => Number(m.networkIn) / 1024 / 1024), [history]);
-  const netOutHistory = useMemo(() => history.map(m => Number(m.networkOut) / 1024 / 1024), [history]);
+  const netInHistory = useMemo(() => history.filter(hasNetworkTelemetry).map(m => Number(m.networkIn) / 1024 / 1024), [history]);
+  const netOutHistory = useMemo(() => history.filter(hasNetworkTelemetry).map(m => Number(m.networkOut) / 1024 / 1024), [history]);
   const processHistory = useMemo(() => history.map(m => m.processCount), [history]);
 
   const chartData = useMemo(() => history.map((m) => ({
@@ -554,25 +952,38 @@ export default function DashboardPage() {
     cpu: m.cpuUsage,
     memory: m.memoryUsage,
     disk: m.diskUsage,
-    netIn: Number(m.networkIn) / 1024 / 1024,
-    netOut: Number(m.networkOut) / 1024 / 1024,
+    // Samples without a genuine rate measurement gap the chart instead of
+    // drawing a false zero line.
+    netIn: hasNetworkTelemetry(m) ? Number(m.networkIn) / 1024 / 1024 : null,
+    netOut: hasNetworkTelemetry(m) ? Number(m.networkOut) / 1024 / 1024 : null,
   })), [history]);
 
   const primaryDisk = getPrimaryDisk(systemStats?.disk);
-  const uptimeSeconds = systemStats?.uptime || 0;
-  const cpuCores = systemStats?.cpu?.perCore?.length || 0;
-  const memUsedGB = systemStats?.memory?.used ? (systemStats.memory.used / 1073741824).toFixed(1) : '—';
-  const memTotalGB = systemStats?.memory?.total ? (systemStats.memory.total / 1073741824).toFixed(1) : '—';
-  const diskTotalGB = primaryDisk?.total ? (primaryDisk.total / 1073741824).toFixed(0) : '—';
+  const metricMemoryTotal = Number(metrics?.memoryTotal || 0);
+  const metricMemoryUsed = Number(metrics?.metadata?.memoryUsedBytes ?? (metricMemoryTotal * ((metrics?.memoryUsage || 0) / 100)));
+  const metricDiskTotal = Number(metrics?.diskTotal || 0);
+  const uptimeSeconds = systemStats?.uptime ?? Number(metrics?.metadata?.uptimeSeconds || 0);
+  const cpuCores = systemStats?.cpu?.perCore?.length || Number(metrics?.metadata?.cpuCores || 0);
+  const memoryUsed = systemStats?.memory?.used ?? metricMemoryUsed;
+  const memoryTotal = systemStats?.memory?.total ?? metricMemoryTotal;
+  const diskTotal = primaryDisk?.total ?? metricDiskTotal;
+  const memUsedGB = memoryUsed > 0 ? (memoryUsed / 1073741824).toFixed(1) : '—';
+  const memTotalGB = memoryTotal > 0 ? (memoryTotal / 1073741824).toFixed(1) : '—';
+  const diskTotalGB = diskTotal > 0 ? (diskTotal / 1073741824).toFixed(0) : '—';
   const currentCpuUsage = systemStats?.cpu?.overall ?? metrics?.cpuUsage;
   const currentMemoryUsage = systemStats?.memory?.usagePercent ?? metrics?.memoryUsage;
   const currentDiskUsage = primaryDisk?.usagePercent ?? metrics?.diskUsage;
   const currentNetworkIn = metrics?.networkIn;
   const currentNetworkOut = metrics?.networkOut;
+  const networkTelemetryAvailable = hasNetworkTelemetry(metrics);
   const currentProcessCount = systemStats?.processes ?? metrics?.processCount;
   const loadAvg = systemStats ? [systemStats.loadAverage['1min'], systemStats.loadAverage['5min'], systemStats.loadAverage['15min']] : (metrics?.loadAverage || []);
 
   const showUpdateBanner = Boolean(updateStatus?.updateAvailable && updateStatus.latest && !updateBannerDismissed);
+  const updateDetails = useMemo(() => verifiedUpdateDetails(updateStatus), [updateStatus]);
+  const updateBackup = updateStatus?.preparation?.backup;
+  const updateBackupDescription = useMemo(() => describeUpdateBackup(updateBackup), [updateBackup]);
+  const updateBackupRunning = updateBackup?.state === 'running';
   const visibleMaintenanceIssues = maintenanceStatus?.issues?.slice(0, 5) || [];
   const maintenanceSignature = useMemo(() => (
     maintenanceStatus ? maintenanceDismissSignature(maintenanceStatus) : ''
@@ -584,6 +995,7 @@ export default function DashboardPage() {
       localStorage.setItem(`dashboard-update-dismissed:${updateStatus.latest}`, 'true');
     }
     setUpdateBannerDismissed(true);
+    setUpdateDetailsExpanded(false);
   };
 
   const dismissMaintenanceBanner = () => {
@@ -595,9 +1007,10 @@ export default function DashboardPage() {
   };
 
   const restartOpenClawGateway = useCallback(async () => {
-    if (!canReconnectGateway) return;
+    if (!canReconnectGateway || gatewayActionRef.current) return;
+    gatewayActionRef.current = 'restart';
+    setRestartingGateway(true);
     try {
-      setRestartingGateway(true);
       const { data } = await client.post('/gateway/restart');
       const nextVersion = data?.after || data?.openclawVersion || null;
       setOpenClawVersion(nextVersion);
@@ -612,45 +1025,129 @@ export default function DashboardPage() {
       setOpenClawStatus('misconfigured');
       setOpenClawIssues([err?.response?.data?.message || err?.response?.data?.error || 'OpenClaw gateway restart request failed.']);
     } finally {
+      gatewayActionRef.current = null;
       setRestartingGateway(false);
       fetchData();
     }
   }, [canReconnectGateway, fetchData]);
 
-  const runSelfUpdate = useCallback(async () => {
-    if (!canRunSelfUpdate) return;
+  const reconnectOpenClawGateway = useCallback(async () => {
+    if (!canReconnectGateway || gatewayActionRef.current) return;
+    gatewayActionRef.current = 'reconnect';
+    setReconnecting(true);
+    try {
+      const { data } = await client.post('/gateway/reconnect');
+      if (data?.ok) {
+        setOpenClawStatus('connected');
+        setOpenClawIssues([]);
+      } else {
+        setOpenClawIssues([data?.message || 'Reconnect failed']);
+      }
+    } catch {
+      setOpenClawIssues(['Reconnect request failed']);
+    } finally {
+      gatewayActionRef.current = null;
+      setReconnecting(false);
+      fetchData();
+    }
+  }, [canReconnectGateway, fetchData]);
+
+  const runSelfUpdate = useCallback(async (confirmation: string) => {
+    if (!canRunSelfUpdate || updateSubmissionRef.current) return;
+    const expectedVersion = String(updateStatus?.latest || '').trim();
+    if (!expectedVersion) {
+      setUpdateMessage('The reviewed update version is unavailable. Refresh update status before retrying.');
+      return;
+    }
+    updateSubmissionRef.current = true;
+    acquireUpdateNavigationLock();
     try {
       setUpdateInProgress(true);
-      setUpdateMessage('Updating... This may take a minute.');
-      const { data } = await client.post('/admin/self-update');
+      let backupDecision: 'use-current' | 'proceed-without-fresh' = updatePlan === 'skip-backup'
+        ? 'proceed-without-fresh'
+        : 'use-current';
+
+      if (updatePlan === 'create-backup') {
+        await createFreshBackupForUpdate({
+          startDailyBackup: async () => {
+            const { data } = await client.post('/backups/create', { type: 'daily' });
+            return data;
+          },
+          getBackupStatus: async () => {
+            const { data } = await client.get('/backups/status', { _silent: true } as any);
+            return data;
+          },
+          getBackupReadiness: async () => {
+            const { data } = await client.get<UpdateStatus>('/admin/update-status', { _silent: true } as any);
+            setUpdateStatus(data);
+            return data.preparation?.backup || null;
+          },
+        }, {
+          onProgress: setUpdateMessage,
+        });
+        backupDecision = 'use-current';
+      }
+
+      setUpdateMessage(backupDecision === 'use-current'
+        ? 'Verifying the recent backup and starting the reviewed signed release…'
+        : 'Backup warning acknowledged. Starting the signed updater…');
+      const { data } = await client.post('/admin/self-update', {
+        confirmation,
+        backupDecision,
+        expectedVersion,
+      });
       const logFile = data?.logFile;
       if (logFile) {
         try {
           await client.get(`/admin/self-update/log?file=${encodeURIComponent(logFile)}`, { _silent: true } as any);
         } catch {}
       }
-      await new Promise(resolve => setTimeout(resolve, 5000));
-
-      const deadline = Date.now() + 120000;
-      while (Date.now() < deadline) {
-        try {
-          const res = await fetch('/health', { cache: 'no-store' });
-          if (res.ok) {
-            setUpdateMessage('Update complete! Refreshing...');
-            window.location.reload();
-            return;
-          }
-        } catch {}
-        await new Promise(resolve => setTimeout(resolve, 2000));
+      const installedExpectedVersion = await waitForExpectedPortalVersion(expectedVersion);
+      if (installedExpectedVersion) {
+        setUpdateMessage('Update complete. Refreshing…');
+        updateSubmissionRef.current = false;
+        setUpdateInProgress(false);
+        releaseUpdateNavigationLock();
+        window.location.reload();
+        return;
       }
 
-      setUpdateMessage('Update may have failed. Check server logs.');
+      setUpdateMessage('The updater did not report the new version within 10 minutes. Check the update log before retrying.');
+      updateSubmissionRef.current = false;
       setUpdateInProgress(false);
+      releaseUpdateNavigationLock();
     } catch (err: any) {
-      setUpdateMessage(err?.response?.data?.error || 'Update may have failed. Check server logs.');
+      const serverPreparation = err?.response?.data?.preparation as PortalUpdatePreparation | undefined;
+      if (serverPreparation) {
+        setUpdateStatus((current) => current ? { ...current, preparation: serverPreparation } : current);
+      }
+      const responseLost = !err?.response;
+      const updaterAlreadyRunning = err?.response?.data?.code === 'PORTAL_UPDATE_BUSY';
+      if (responseLost || updaterAlreadyRunning) {
+        setUpdateMessage(responseLost
+          ? 'The updater response was interrupted. Portal is checking the installed version before allowing another attempt…'
+          : 'Another signed update is already running. Portal is waiting for its installed-version proof…');
+        const installedExpectedVersion = await waitForExpectedPortalVersion(expectedVersion);
+        if (installedExpectedVersion) {
+          setUpdateMessage('Update complete. Refreshing…');
+          updateSubmissionRef.current = false;
+          setUpdateInProgress(false);
+          releaseUpdateNavigationLock();
+          window.location.reload();
+          return;
+        }
+        setUpdateMessage('Portal could not confirm the reviewed version within 10 minutes. Check the updater log and refresh update status before retrying.');
+        updateSubmissionRef.current = false;
+        setUpdateInProgress(false);
+        releaseUpdateNavigationLock();
+        return;
+      }
+      setUpdateMessage(err?.response?.data?.error || err?.message || 'The update was not started. Check the update log before retrying.');
+      updateSubmissionRef.current = false;
       setUpdateInProgress(false);
+      releaseUpdateNavigationLock();
     }
-  }, [canRunSelfUpdate]);
+  }, [acquireUpdateNavigationLock, canRunSelfUpdate, releaseUpdateNavigationLock, updatePlan, updateStatus?.latest]);
 
   return (
     <motion.div
@@ -661,8 +1158,8 @@ export default function DashboardPage() {
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div className="min-w-0">
-          <h1 className="text-xl sm:text-2xl font-bold tracking-tight">Server Dashboard</h1>
-          <p className="text-slate-500 text-xs sm:text-sm mt-1">Real-time system monitoring & analytics</p>
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight">{canViewOperatorDiagnostics ? 'Server Dashboard' : 'Portal Dashboard'}</h1>
+          <p className="text-slate-500 text-xs sm:text-sm mt-1">Recent resource telemetry and portal activity</p>
         </div>
         <div className="flex items-center gap-2 sm:gap-3 flex-shrink-0">
           {/* Connection status */}
@@ -679,68 +1176,178 @@ export default function DashboardPage() {
             onClick={fetchData}
             className="p-2 rounded-lg hover:bg-white/5 transition-colors text-slate-400 hover:text-white min-w-[44px] min-h-[44px] flex items-center justify-center"
             title="Refresh"
+            aria-label="Refresh dashboard metrics"
           >
             <RefreshCw size={16} />
           </button>
         </div>
       </div>
 
-      {showUpdateBanner && updateStatus?.latest && (
+      {canViewOperatorDiagnostics && showUpdateBanner && updateStatus?.latest && (
         <motion.div
           initial={{ opacity: 0, y: -12 }}
           animate={{ opacity: 1, y: 0 }}
           className="relative overflow-hidden rounded-2xl border border-cyan-400/20 bg-gradient-to-r from-cyan-500/15 via-sky-500/10 to-blue-500/15 p-5 shadow-[0_0_30px_rgba(34,211,238,0.12)]"
         >
           <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(45,212,191,0.18),transparent_35%)] pointer-events-none" />
-          <div className="relative flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <div>
-              <p className="text-sm font-semibold text-cyan-200">Update available: v{updateStatus.latest} (you have v{updateStatus.current})</p>
+          <div className="relative">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-sm font-semibold text-cyan-200">Update available: v{updateStatus.latest} (you have v{updateStatus.current})</p>
+                  {updateDetails && (
+                    <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ${releaseClassTone(updateDetails.releaseClass)}`}>
+                      {releaseClassLabel(updateDetails.releaseClass)}
+                    </span>
+                  )}
+                </div>
               <p className="mt-1 text-sm text-slate-300">
                 {canRunSelfUpdate
                   ? 'Install the latest portal bundle to pick up fixes and improvements.'
                   : 'A newer portal bundle is available. Only the owner can install updates from this dashboard.'}
               </p>
-              {canRunSelfUpdate && updateMessage && (
-                <p className="mt-2 text-sm text-cyan-50">{updateMessage}</p>
-              )}
-            </div>
-            <div className="flex flex-wrap gap-3">
-              {canRunSelfUpdate ? (
-                <button
-                  onClick={runSelfUpdate}
-                  disabled={updateInProgress}
-                  className="inline-flex items-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/80 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-70"
-                >
-                  {updateInProgress ? <Loader2 size={16} className="animate-spin" /> : null}
-                  Update Now
-                </button>
-              ) : (
-                <div className="inline-flex items-center rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-300">
-                  Owner access required
+              {canRunSelfUpdate && (
+                <div className={`mt-3 flex max-w-2xl items-start gap-2.5 rounded-xl border bg-theme-surface px-3 py-2.5 ${
+                  updateBackupDescription.tone === 'good'
+                    ? 'border-emerald-400/25'
+                    : updateBackupDescription.tone === 'info'
+                      ? 'border-cyan-400/25'
+                      : 'border-amber-400/30'
+                }`}>
+                  {updateBackupDescription.tone === 'good' ? (
+                    <CheckCircle2 size={16} className="mt-0.5 flex-none text-emerald-400" aria-hidden="true" />
+                  ) : updateBackupDescription.tone === 'info' ? (
+                    <Loader2 size={16} className="mt-0.5 flex-none animate-spin text-cyan-400" aria-hidden="true" />
+                  ) : (
+                    <AlertTriangle size={16} className="mt-0.5 flex-none text-amber-400" aria-hidden="true" />
+                  )}
+                  <div>
+                    <p className="text-xs font-semibold text-theme-text">{updateBackupDescription.label}</p>
+                    <p className="mt-0.5 text-xs leading-5 text-theme-text-muted">{updateBackupDescription.detail}</p>
+                  </div>
                 </div>
               )}
-              <button
-                onClick={dismissUpdateBanner}
-                disabled={updateInProgress}
-                className="rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
-              >
-                Dismiss
-              </button>
+              {canRunSelfUpdate && updateMessage && !updateDialogOpen && (
+                <p className="mt-2 text-sm text-theme-text">{updateMessage}</p>
+              )}
+              </div>
+              <div className="flex flex-wrap gap-3">
+                <button
+                  id="dashboard-update-details-toggle"
+                  type="button"
+                  onClick={() => setUpdateDetailsExpanded((expanded) => !expanded)}
+                  aria-expanded={updateDetailsExpanded}
+                  aria-controls={updateDetailsExpanded ? 'dashboard-update-details' : undefined}
+                  className="inline-flex items-center gap-2 rounded-xl border border-cyan-300/20 bg-cyan-400/10 px-4 py-2 text-sm font-medium text-cyan-100 transition hover:bg-cyan-400/15"
+                >
+                  {updateDetailsExpanded ? 'Hide details' : 'View details'}
+                  <ChevronDown
+                    size={16}
+                    className={`transition-transform ${updateDetailsExpanded ? 'rotate-180' : ''}`}
+                    aria-hidden="true"
+                  />
+                </button>
+                {canRunSelfUpdate ? (
+                  <button
+                    onClick={() => {
+                      setUpdatePlan(updateBackup?.state === 'fresh' ? 'use-current' : 'create-backup');
+                      setUpdateDialogOpen(true);
+                      setUpdateMessage(null);
+                    }}
+                    disabled={updateDialogOpen || updateInProgress || updateBackupRunning}
+                    className="inline-flex items-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/80 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-70"
+                  >
+                    {updateBackupRunning && !updateDialogOpen ? <Loader2 size={16} className="animate-spin" /> : null}
+                    {updateDialogOpen ? 'Update dialog open' : updateBackupRunning ? 'Backup running' : 'Review & update'}
+                  </button>
+                ) : (
+                  <div className="inline-flex items-center rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-300">
+                    Owner access required
+                  </div>
+                )}
+                <button
+                  onClick={dismissUpdateBanner}
+                  disabled={updateInProgress}
+                  className="rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  Dismiss
+                </button>
+              </div>
             </div>
+
+            <AnimatePresence initial={false}>
+              {updateDetailsExpanded && (
+                <motion.div
+                  id="dashboard-update-details"
+                  role="region"
+                  aria-labelledby="dashboard-update-details-toggle"
+                  initial={{ opacity: 0, y: -6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -6 }}
+                  className="overflow-hidden"
+                >
+                  <div className="mt-4 border-t border-cyan-200/10 pt-4">
+                    {updateDetails ? (
+                      <div className="grid gap-4 lg:grid-cols-[minmax(0,220px)_1fr]">
+                        <div className="text-sm text-slate-300">
+                          <p className="font-medium text-white">{releaseClassLabel(updateDetails.releaseClass)} release</p>
+                          <p className="mt-1 text-xs text-slate-400">Released {formatReleaseDate(updateDetails.releasedAt)}</p>
+                          <p className="mt-2 inline-flex items-center gap-1.5 text-xs text-emerald-200">
+                            <CheckCircle2 size={14} aria-hidden="true" />
+                            Verified signed release metadata
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-semibold uppercase tracking-wide text-cyan-200">Highlights</p>
+                          <ul className="mt-2 space-y-2 text-sm text-slate-200">
+                            {updateDetails.highlights.map((highlight, index) => (
+                              <li key={`${index}-${highlight}`} className="flex gap-2">
+                                <span className="mt-2 h-1.5 w-1.5 flex-none rounded-full bg-cyan-300" aria-hidden="true" />
+                                <span>{highlight}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex gap-3 rounded-xl border border-white/10 bg-black/10 p-3 text-sm text-slate-300">
+                        <AlertTriangle size={17} className="mt-0.5 flex-none text-amber-300" aria-hidden="true" />
+                        <div>
+                          <p className="font-medium text-slate-100">Verified update details are unavailable.</p>
+                          <p className="mt-1 text-xs text-slate-400">
+                            The signed updater will still verify the release bundle before making changes. No unverified release notes are shown here.
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
         </motion.div>
       )}
 
-      {Object.values(systemChecks).some((state) => state === 'pending') && (
+      {canViewOperatorDiagnostics && (
         <motion.div
           initial={{ opacity: 0, y: -10 }}
           animate={{ opacity: 1, y: 0 }}
           className="rounded-2xl border border-white/[0.08] bg-white/[0.03] p-5 backdrop-blur-xl"
         >
           <div className="flex items-center gap-2">
-            <Loader2 size={16} className="animate-spin text-violet-300" />
-            <h3 className="text-sm font-semibold text-white">System checks running</h3>
-            <span className="text-xs text-slate-500">Server metrics load independently — these background scans can take a moment on a busy host.</span>
+            {Object.values(systemChecks).some((state) => state === 'pending')
+              ? <Loader2 size={16} className="animate-spin text-violet-300" />
+              : Object.values(systemChecks).some((state) => state === 'error')
+                ? <AlertTriangle size={16} className="text-amber-300" />
+                : <CheckCircle2 size={16} className="text-emerald-400" />}
+            <h3 className="text-sm font-semibold text-white">
+              {Object.values(systemChecks).some((state) => state === 'pending')
+                ? 'System checks running'
+                : Object.values(systemChecks).some((state) => state === 'error')
+                  ? 'Some system checks could not complete'
+                  : 'System checks'}
+            </h3>
+            <span className="text-xs text-slate-500">Each check keeps its last result until you refresh it — opening the dashboard does not rerun them.</span>
           </div>
           <div className="mt-4 grid gap-3 md:grid-cols-3">
             {([
@@ -751,13 +1358,31 @@ export default function DashboardPage() {
               <div key={key} className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-medium text-slate-200">{label}</span>
-                  {systemChecks[key] === 'pending' ? (
-                    <span className="text-[10px] uppercase tracking-wide text-violet-300">Scanning</span>
-                  ) : systemChecks[key] === 'done' ? (
-                    <CheckCircle2 size={14} className="text-emerald-400" />
-                  ) : (
-                    <AlertTriangle size={14} className="text-amber-400" />
-                  )}
+                  <div className="flex items-center gap-1.5">
+                    {systemChecks[key] === 'pending' ? (
+                      <span className="text-[10px] uppercase tracking-wide text-violet-300">Scanning</span>
+                    ) : systemChecks[key] === 'done' ? (
+                      <CheckCircle2 size={14} className="text-emerald-400" />
+                    ) : (
+                      <AlertTriangle size={14} className="text-amber-400" />
+                    )}
+                    {(key !== 'updates' || canRunSelfUpdate) && (
+                      <button
+                        onClick={() => { void refreshSystemCheck(key); }}
+                        disabled={checkRefreshing[key] || systemChecks[key] === 'pending'}
+                        className="rounded-md p-1 text-slate-400 transition-colors hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                        title={`Refresh ${label} check`}
+                        aria-label={`Refresh ${label} check`}
+                      >
+                        {checkRefreshing[key] ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="mt-1 text-[11px] text-slate-500">
+                  {systemChecks[key] === 'pending'
+                    ? 'Checking…'
+                    : checkAges[key] ?? (systemChecks[key] === 'error' ? 'Last attempt failed' : 'Not checked yet')}
                 </div>
                 <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-white/[0.06]">
                   {systemChecks[key] === 'pending' ? (
@@ -772,7 +1397,7 @@ export default function DashboardPage() {
         </motion.div>
       )}
 
-      {showMaintenanceBanner && maintenanceStatus && (
+      {canViewOperatorDiagnostics && showMaintenanceBanner && maintenanceStatus && (
         <motion.div
           initial={{ opacity: 0, y: -10 }}
           animate={{ opacity: 1, y: 0 }}
@@ -789,7 +1414,7 @@ export default function DashboardPage() {
               </div>
               <p className="mt-1 text-sm text-slate-300">{maintenanceStatus.summary}</p>
               <p className="mt-1 text-xs text-slate-500">
-                {maintenanceStatus.host.os} · kernel {maintenanceStatus.host.kernel} · checked {new Date(maintenanceStatus.checkedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                {maintenanceStatus.host.os} · kernel {maintenanceStatus.host.kernel} · checked {maintenanceStatus.checkedAt ? new Date(maintenanceStatus.checkedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}
               </p>
             </div>
             <div className="flex flex-wrap gap-2">
@@ -873,6 +1498,7 @@ export default function DashboardPage() {
         </motion.div>
       )}
 
+      {canViewOperatorDiagnostics && (
       <div className="flex flex-wrap items-start gap-3">
         <div className={`inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm ${
           openClawStatus === 'connected' ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300'
@@ -903,7 +1529,8 @@ export default function DashboardPage() {
             {canReconnectGateway ? (
               <button
                 onClick={restartOpenClawGateway}
-                disabled={restartingGateway}
+                disabled={restartingGateway || reconnecting}
+                aria-busy={restartingGateway}
                 className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-cyan-300/30 bg-cyan-500/20 hover:bg-cyan-500/30 px-3 py-1 text-xs font-medium text-cyan-100 transition disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {restartingGateway ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
@@ -921,24 +1548,9 @@ export default function DashboardPage() {
             <span className="flex-1 min-w-[14rem]">{openClawIssues[0]}</span>
             {canReconnectGateway ? (
               <button
-                onClick={async () => {
-                  setReconnecting(true);
-                  try {
-                    const { data } = await client.post('/gateway/reconnect');
-                    if (data?.ok) {
-                      setOpenClawStatus('connected');
-                      setOpenClawIssues([]);
-                    } else {
-                      setOpenClawIssues([data?.message || 'Reconnect failed']);
-                    }
-                  } catch {
-                    setOpenClawIssues(['Reconnect request failed']);
-                  } finally {
-                    setReconnecting(false);
-                    fetchData();
-                  }
-                }}
-                disabled={reconnecting}
+                onClick={reconnectOpenClawGateway}
+                disabled={reconnecting || restartingGateway}
+                aria-busy={reconnecting}
                 className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-amber-400/30 bg-amber-500/20 hover:bg-amber-500/30 px-3 py-1 text-xs font-medium text-amber-200 transition disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {reconnecting ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
@@ -959,10 +1571,11 @@ export default function DashboardPage() {
           </div>
         )}
       </div>
+      )}
 
       {/* Critical Alert Banner */}
       <AnimatePresence>
-        {activeAlerts.filter(a => (a.severity === 'CRITICAL' || a.severity === 'ERROR') && !(a.metadata as any)?.dismissedAt).length > 0 && (
+        {canViewOperatorDiagnostics && activeAlerts.filter(a => (a.severity === 'CRITICAL' || a.severity === 'ERROR') && !(a.metadata as any)?.dismissedAt).length > 0 && (
           <motion.div
             initial={{ opacity: 0, y: -10, height: 0 }}
             animate={{ opacity: 1, y: 0, height: 'auto' }}
@@ -994,6 +1607,8 @@ export default function DashboardPage() {
                       </span>
                     </div>
                     <button
+                      type="button"
+                      aria-label={`Dismiss ${alert.resource} alert`}
                       onClick={async () => {
                         // Optimistically mark as dismissed in local state
                         setActiveAlerts(prev => prev.map(a => 
@@ -1026,13 +1641,13 @@ export default function DashboardPage() {
       >
         <MetricCard
           icon={Cpu}
-          label="CPU Usage"
+          label={systemStats ? 'CPU Usage' : 'CPU Load'}
           color="#10B981"
           value={currentCpuUsage?.toFixed(1) ?? '—'}
           unit="%"
           percent={currentCpuUsage}
           sparkData={cpuHistory}
-          subtitle={cpuCores ? `${cpuCores} cores` : undefined}
+          subtitle={systemStats ? (cpuCores ? `${cpuCores} cores` : undefined) : '1-minute load normalized by core count'}
         />
         <MetricCard
           icon={MemoryStick}
@@ -1058,17 +1673,19 @@ export default function DashboardPage() {
           icon={ArrowDown}
           label="Network In"
           color="#06B6D4"
-          value={currentNetworkIn ? (Number(currentNetworkIn) / 1024 / 1024).toFixed(2) : '—'}
-          unit="MB/s"
+          value={networkTelemetryAvailable && currentNetworkIn !== undefined && currentNetworkIn !== null ? formatNetworkRate(Number(currentNetworkIn)).value : '—'}
+          unit={networkTelemetryAvailable && currentNetworkIn !== undefined && currentNetworkIn !== null ? formatNetworkRate(Number(currentNetworkIn)).unit : 'MB/s'}
           sparkData={netInHistory}
+          subtitle={networkTelemetryAvailable ? undefined : 'telemetry unavailable'}
         />
         <MetricCard
           icon={ArrowUp}
           label="Network Out"
           color="#F59E0B"
-          value={currentNetworkOut ? (Number(currentNetworkOut) / 1024 / 1024).toFixed(2) : '—'}
-          unit="MB/s"
+          value={networkTelemetryAvailable && currentNetworkOut !== undefined && currentNetworkOut !== null ? formatNetworkRate(Number(currentNetworkOut)).value : '—'}
+          unit={networkTelemetryAvailable && currentNetworkOut !== undefined && currentNetworkOut !== null ? formatNetworkRate(Number(currentNetworkOut)).unit : 'MB/s'}
           sparkData={netOutHistory}
+          subtitle={networkTelemetryAvailable ? undefined : 'telemetry unavailable'}
         />
         <MetricCard
           icon={Layers}
@@ -1093,14 +1710,14 @@ export default function DashboardPage() {
           color="#14B8A6"
           value={uptimeSeconds ? formatUptime(uptimeSeconds) : '—'}
           unit=""
-          subtitle={systemStats?.hostname || ''}
+          subtitle={systemStats?.hostname || metrics?.metadata?.hostname || ''}
         />
       </motion.div>
 
       {/* Charts */}
       {showCharts ? (
         <Suspense fallback={<div className="grid grid-cols-1 lg:grid-cols-2 gap-5"><div className="glass p-5 h-[304px] flex items-center justify-center text-slate-500 text-sm">Loading charts…</div><div className="glass p-5 h-[304px] flex items-center justify-center text-slate-500 text-sm">Loading charts…</div></div>}>
-          <LazyDashboardCharts chartData={chartData} />
+          <LazyDashboardCharts chartData={chartData} networkAvailable={networkTelemetryAvailable} />
         </Suspense>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-5" aria-hidden="true">
@@ -1117,6 +1734,147 @@ export default function DashboardPage() {
       >
         <ActivityLogTable />
       </motion.div>
+
+      <TypedConfirmationDialog
+        open={updateDialogOpen}
+        title={`Install Portal ${updateStatus?.latest ? `v${updateStatus.latest}` : 'update'}`}
+        description="Review the release and recovery plan, then confirm the owner-only update."
+        confirmationPhrase={updateStatus?.preparation?.confirmationPhrase || 'UPDATE PORTAL'}
+        confirmLabel={updatePlan === 'create-backup'
+          ? 'Back up & update'
+          : updatePlan === 'skip-backup'
+            ? 'Update without backup'
+            : 'Install update'}
+        busyLabel={updatePlan === 'create-backup' ? 'Backing up safely…' : 'Starting signed updater…'}
+        busy={updateInProgress}
+        tone="warning"
+        onCancel={() => {
+          if (!updateSubmissionRef.current) setUpdateDialogOpen(false);
+        }}
+        onConfirm={(confirmation) => { void runSelfUpdate(confirmation); }}
+        details={(
+          <div className="space-y-4">
+            <div className="rounded-xl border border-theme-border bg-theme-bg p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-theme-text">
+                    v{updateStatus?.current || '—'} → v{updateStatus?.latest || '—'}
+                  </p>
+                  <p className="mt-0.5 text-xs text-theme-text-muted">
+                    {updateDetails
+                      ? `${releaseClassLabel(updateDetails.releaseClass)} released ${formatReleaseDate(updateDetails.releasedAt)}`
+                      : 'The signed updater will verify the release bundle before installation.'}
+                  </p>
+                </div>
+                {updateDetails && (
+                  <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ${releaseClassTone(updateDetails.releaseClass)}`}>
+                    {releaseClassLabel(updateDetails.releaseClass)}
+                  </span>
+                )}
+              </div>
+              {updateDetails && (
+                <ul className="mt-3 space-y-1.5 text-xs leading-5 text-theme-text-muted">
+                  {updateDetails.highlights.map((highlight) => (
+                    <li key={highlight} className="flex gap-2">
+                      <span className="mt-2 h-1 w-1 flex-none rounded-full bg-cyan-400" aria-hidden="true" />
+                      <span>{highlight}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div className={`rounded-xl border bg-theme-surface p-3 ${
+              updateBackupDescription.tone === 'good'
+                ? 'border-emerald-400/25'
+                : updateBackupDescription.tone === 'info'
+                  ? 'border-cyan-400/25'
+                  : 'border-amber-400/30'
+            }`}>
+              <p className="text-sm font-semibold text-theme-text">{updateBackupDescription.label}</p>
+              <p className="mt-1 text-xs leading-5 text-theme-text-muted">{updateBackupDescription.detail}</p>
+            </div>
+
+            <fieldset className="space-y-2">
+              <legend className="mb-2 text-xs font-semibold uppercase tracking-wide text-theme-text-muted">Recovery plan</legend>
+              {updateBackup?.state === 'fresh' && (
+                <label aria-label="Use the recent backup" htmlFor="portal-update-use-current" className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${
+                  updatePlan === 'use-current'
+                    ? 'accent-active'
+                    : 'border-theme-border bg-theme-surface accent-hover'
+                }`}>
+                  <input
+                    id="portal-update-use-current"
+                    type="radio"
+                    name="portal-update-plan"
+                    value="use-current"
+                    checked={updatePlan === 'use-current'}
+                    onChange={() => setUpdatePlan('use-current')}
+                    disabled={updateInProgress}
+                    className="mt-1"
+                    style={{ accentColor: 'var(--accent, #6366f1)' }}
+                  />
+                  <span>
+                    <span className="block text-sm font-semibold text-theme-text">Use the recent backup</span>
+                    <span className="mt-0.5 block text-xs leading-5 text-theme-text-muted">Fastest path; the server will recheck freshness before the updater starts.</span>
+                  </span>
+                </label>
+              )}
+              <label aria-label="Create a fresh backup, then update" htmlFor="portal-update-create-backup" className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${
+                updatePlan === 'create-backup'
+                  ? 'accent-active'
+                  : 'border-theme-border bg-theme-surface accent-hover'
+              }`}>
+                <input
+                  id="portal-update-create-backup"
+                  type="radio"
+                  name="portal-update-plan"
+                  value="create-backup"
+                  checked={updatePlan === 'create-backup'}
+                  onChange={() => setUpdatePlan('create-backup')}
+                  disabled={updateInProgress}
+                  className="mt-1"
+                  style={{ accentColor: 'var(--accent, #6366f1)' }}
+                />
+                <span>
+                  <span className="block text-sm font-semibold text-theme-text">Create a fresh backup, then update</span>
+                  <span className="mt-0.5 block text-xs leading-5 text-theme-text-muted">Recommended. Portal waits for the archive to finish before starting the signed updater.</span>
+                </span>
+              </label>
+              {updateBackup?.state !== 'fresh' && (
+                <label aria-label="Continue without a fresh backup" htmlFor="portal-update-skip-backup" className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${
+                  updatePlan === 'skip-backup'
+                    ? 'accent-active'
+                    : 'border-theme-border bg-theme-surface accent-hover'
+                }`}>
+                  <input
+                    id="portal-update-skip-backup"
+                    type="radio"
+                    name="portal-update-plan"
+                    value="skip-backup"
+                    checked={updatePlan === 'skip-backup'}
+                    onChange={() => setUpdatePlan('skip-backup')}
+                    disabled={updateInProgress}
+                    className="mt-1"
+                    style={{ accentColor: 'var(--accent, #6366f1)' }}
+                  />
+                  <AlertTriangle size={16} className="mt-0.5 flex-none text-amber-300" aria-hidden="true" />
+                  <span>
+                    <span className="block text-sm font-semibold text-theme-text">Continue without a fresh backup</span>
+                    <span className="mt-0.5 block text-xs leading-5 text-theme-text-muted">Available for emergencies, but recovery may rely on an older archive or the updater rollback dump.</span>
+                  </span>
+                </label>
+              )}
+            </fieldset>
+
+            {updateMessage && (
+              <div role="status" className="rounded-xl border border-cyan-400/25 bg-cyan-500/10 px-3 py-2 text-xs leading-5 text-theme-text">
+                {updateMessage}
+              </div>
+            )}
+          </div>
+        )}
+      />
     </motion.div>
   );
 }

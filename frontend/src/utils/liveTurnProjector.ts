@@ -95,10 +95,9 @@ export function finishMatchingToolCall<TToolCall extends LiveTurnToolCall>(
   params: { toolCallId?: string; toolName?: string; result?: string; status?: unknown; endedAt?: number },
 ): { toolCalls: TToolCall[]; changed: boolean; completedTool: TToolCall | null } {
   const calls = Array.isArray(toolCalls) ? [...toolCalls] : [];
-  const idx = calls.findIndex((call) => (
-    Boolean(params.toolCallId && call.id === params.toolCallId)
-    || Boolean(params.toolName && call.name === params.toolName)
-  ));
+  const idx = params.toolCallId
+    ? calls.findIndex((call) => call.id === params.toolCallId)
+    : calls.findIndex((call) => Boolean(params.toolName && call.name === params.toolName));
   if (idx < 0) return { toolCalls: calls, changed: false, completedTool: null };
   const completed = {
     ...calls[idx],
@@ -185,14 +184,14 @@ export function updateRunningToolCallInMessage<TMessage extends LiveTurnMessage>
   const projectedMessages = messages.map((message) => {
     if (!assistantId || message.id !== assistantId) return message;
     const calls = Array.isArray(message.toolCalls) ? [...message.toolCalls] as LiveTurnToolCall[] : [];
-    const idx = calls.findIndex((call) => (
-      call.status === 'running'
-      && (
-        Boolean(params.toolCallId && call.id === params.toolCallId)
-        || Boolean(params.toolName && call.name === params.toolName)
-      )
-    ));
-    const runningIdx = idx >= 0 ? idx : calls.findIndex((call) => call.status === 'running');
+    const idx = params.toolCallId
+      ? calls.findIndex((call) => call.status === 'running' && call.id === params.toolCallId)
+      : calls.findIndex((call) => call.status === 'running' && Boolean(params.toolName && call.name === params.toolName));
+    // Once the server supplies an ID, never fall back to an unrelated running
+    // tool: parallel same-name calls may complete in reverse order.
+    const runningIdx = idx >= 0
+      ? idx
+      : (!params.toolCallId && !params.toolName ? calls.findIndex((call) => call.status === 'running') : -1);
     if (runningIdx >= 0) {
       calls[runningIdx] = {
         ...calls[runningIdx],

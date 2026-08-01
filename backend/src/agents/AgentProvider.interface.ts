@@ -8,13 +8,51 @@
 // ── Types ───────────────────────────────────────────────────────────────────
 
 /** Provider identifiers — kept in sync with the Prisma AgentProviderType enum. */
-export type AgentProviderName = 'OPENCLAW' | 'CLAUDE_CODE' | 'CODEX' | 'AGENT_ZERO' | 'GEMINI' | 'OLLAMA';
+export type AgentProviderName = 'OPENCLAW' | 'CLAUDE_CODE' | 'CODEX' | 'GROK' | 'AGENT_ZERO' | 'GEMINI' | 'OLLAMA';
 
 /** Opaque session handle returned by startSession. */
 export type AgentSessionId = string;
 
+/**
+ * Server-owned execution trust zones. These are authorization boundaries, not
+ * UI hints: Agent Chat runs as a host operator, while Project Chat must remain
+ * inside its project sandbox.
+ */
+export type AgentExecutionScope = 'HOST_OPERATOR' | 'PROJECT_SANDBOX';
+
+interface AgentExecutionContextBase {
+  readonly scope: AgentExecutionScope;
+  readonly source: 'PORTAL_SERVER';
+  readonly userId: string;
+}
+
+export interface HostOperatorExecutionContext extends AgentExecutionContextBase {
+  readonly scope: 'HOST_OPERATOR';
+}
+
+export interface ProjectSandboxExecutionContext extends AgentExecutionContextBase {
+  readonly scope: 'PROJECT_SANDBOX';
+  /** Immutable server-owned ProjectIdentity UUID, never a user-controlled name. */
+  readonly projectId: string;
+  /** Workspace owner may differ from the authenticated actor for elevated shared workspaces. */
+  readonly workspaceOwnerId: string;
+  readonly projectName: string;
+  readonly canonicalRoot: string;
+  readonly rootDevice: string;
+  readonly rootInode: string;
+  readonly rootBirthtimeNs: string;
+  readonly runtimePolicyVersion: string;
+  readonly egressPolicyVersion: string;
+  readonly runtimeImageDigest: string;
+  readonly policyFingerprint: string;
+}
+
+export type AgentExecutionContext = HostOperatorExecutionContext | ProjectSandboxExecutionContext;
+
 /** Configuration passed when starting a new agent session. */
 export interface AgentSessionConfig {
+  /** Immutable, server-assigned execution boundary for this session. */
+  readonly executionContext: AgentExecutionContext;
   /** Model override, e.g. "anthropic/claude-haiku-4-5" */
   model?: string;
   /** Free-form provider-specific options */
@@ -46,6 +84,16 @@ export interface SenderIdentity {
   userId: string;
   /** Portal role, when available, for provider-side approval gating. */
   role?: string;
+  /** Exact server-attested authorization generation admitted for this turn. */
+  authorizationVersion?: number;
+  /** Server-owned idempotency identity for a durable provider turn. */
+  requestId?: string;
+  /**
+   * Internal server callback invoked immediately after the provider accepts
+   * the external dispatch. Provider code must await it before exposing any
+   * successful send settlement.
+   */
+  onProviderDispatchAccepted?(upstreamRunId: string): Promise<void>;
 }
 
 /** Result returned after a (possibly streamed) sendMessage completes. */
@@ -53,6 +101,13 @@ export interface AgentSendResult {
   /** The full assembled response text. */
   fullText: string;
   /** Provider-specific metadata (token counts, model used, etc.) */
+  metadata?: Record<string, unknown>;
+}
+
+/** Authoritative result of changing (or clearing) a live session model. */
+export interface AgentSessionModelResult {
+  /** Canonical provider model/preset stored for the session; null means default. */
+  model: string | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -74,6 +129,18 @@ export interface AgentSessionSummary {
   metadata?: Record<string, unknown>;
 }
 
+/** Exact immutable identity supplied only after a Project cleanup adapter has
+ * removed and re-attested the provider-owned external runtime boundary. */
+export interface AttestedProjectRuntimeCleanup {
+  readonly userId: string;
+  readonly projectId: string;
+  readonly canonicalRoot: string;
+  readonly rootDevice: string;
+  readonly rootInode: string;
+  readonly rootBirthtimeNs: string;
+  readonly sessionIds: readonly string[];
+}
+
 // ── Interface ───────────────────────────────────────────────────────────────
 
 export interface AgentProvider {
@@ -87,7 +154,7 @@ export interface AgentProvider {
    * Start a new conversational session.
    * @returns External session identifier managed by the provider.
    */
-  startSession(userId: string, config?: AgentSessionConfig): Promise<AgentSessionId>;
+  startSession(userId: string, config: AgentSessionConfig): Promise<AgentSessionId>;
 
   /**
    * Send a user message and stream the response back.
@@ -120,7 +187,24 @@ export interface AgentProvider {
   terminateSession(sessionId: AgentSessionId): Promise<void>;
 
   /**
-   * Abort an in-flight run if the provider supports it.
+   * Apply a model change to an already-created provider session. Implementations
+   * must not resolve until the provider runtime and Portal's durable session
+   * record agree. A null model deliberately clears the session override.
    */
-  abortActiveRun?(sessionId: AgentSessionId): Promise<boolean>;
+  setSessionModel?(
+    sessionId: AgentSessionId,
+    model: string | null,
+  ): Promise<AgentSessionModelResult>;
+
+  /**
+   * Abort an in-flight run if the provider supports it.
+   * When supplied, runId is an optimistic-concurrency guard: providers must
+   * leave a newer run untouched when the identifier does not match.
+   */
+  abortActiveRun?(sessionId: AgentSessionId, runId?: string): Promise<boolean>;
+
+  /** Retire process-local Project reservations only after an external cleanup
+   * adapter has proved exact runtime absence. Implementations must reject a
+   * newer or differently-bound in-memory operation. */
+  convergeAttestedProjectCleanup?(input: AttestedProjectRuntimeCleanup): Promise<void>;
 }

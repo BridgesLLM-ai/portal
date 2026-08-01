@@ -1,13 +1,17 @@
-version: '3.8'
-
+# Advanced host-integration layout, not a portable replacement for install.sh.
+# The backend service expects the listed /root, /opt, /portal, and /var paths
+# plus companion host services to exist. Contributors normally run only the
+# postgres service; see CONTRIBUTING.md.
 services:
   postgres:
-    image: postgres:15-alpine
+    # Match the installer/runtime support matrix. Existing PostgreSQL 15 named
+    # volumes must be migrated with pg_dump/pg_restore before switching images.
+    image: postgres:16-alpine
     container_name: bridgesllm-db
     restart: unless-stopped
     environment:
       POSTGRES_USER: bridges
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD before running Docker Compose}
       POSTGRES_DB: bridgesllm_portal
     ports:
       - "127.0.0.1:5432:5432"
@@ -28,27 +32,24 @@ services:
 
   backend:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: backend/Dockerfile
     container_name: bridgesllm-backend
     restart: unless-stopped
-    # Keep Docker aligned with the live systemd deployment by loading the same
-    # backend env file for JWT / gateway auth material.
+    # This file is intentionally untracked. CONTRIBUTING.md documents the
+    # local variables it must contain; never copy production secrets into it.
     env_file:
-      - ./backend/.env.production
+      - ./backend/.env
     environment:
       NODE_ENV: production
-      DATABASE_URL: "postgresql://bridges:${POSTGRES_PASSWORD}@bridgesllm-db:5432/bridgesllm_portal"
+      DATABASE_URL: "postgresql://bridges:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD before running Docker Compose}@bridgesllm-db:5432/bridgesllm_portal"
       PORT: 3001
       HOST: 0.0.0.0
       CORS_ORIGIN: "${PORTAL_DOMAIN:-https://localhost}"
       OLLAMA_API_URL: "http://host.docker.internal:11436"
-      OLLAMA_MODEL: "qwen3:4b"
+      OLLAMA_MODEL: "qwen3.5:4b"
       OPENCLAW_API_URL: "http://host.docker.internal:18789"
       OPENCLAW_GATEWAY_URL: "http://host.docker.internal:18789"
-      FRED_API_KEY: "${FRED_API_KEY}"
-      GUACAMOLE_USERNAME: "${GUACAMOLE_USERNAME}"
-      GUACAMOLE_PASSWORD: "${GUACAMOLE_PASSWORD}"
       PORTAL_NATIVE_AGENT_SESSIONS_DIR: "/root/.openclaw/portal-native-agent-sessions"
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -58,10 +59,6 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ./backend/src:/app/src
-      - ./backend/dist:/app/dist
-      - ./backend/node_modules:/app/node_modules
-      - ./frontend/dist:/frontend/dist:ro
       - /portal/projects:/portal/projects:rw
       - ${PORTAL_ROOT:-/opt/bridgesllm}/assets:${PORTAL_ROOT:-/opt/bridgesllm}/assets:rw
       - /root/backups:/root/backups:rw
@@ -107,7 +104,6 @@ services:
 
   # novnc-bridge removed — noVNC static files are now served directly by Express
   # and websockify runs as a host systemd service (bridges-rd-websockify.service).
-  # See Phase 1 of the noVNC architecture fix (March 2026).
 
 volumes:
   postgres_data:

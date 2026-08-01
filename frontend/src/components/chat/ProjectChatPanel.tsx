@@ -1,12 +1,11 @@
 /**
  * ProjectChatPanel — Self-contained chat panel for project agents.
  * 
- * Has its OWN WebSocket connection (not shared with ChatStateProvider singleton).
- * Manages its own message state, streaming, tool calls, compaction.
+ * Uses the Portal-owned durable Project turn replay API for every provider.
+ * Manages its own message state, replay projection, tool calls, compaction.
  * Replicates the quality of ChatInterface: markdown, tool pills, status bar, file upload.
  */
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { createPortal } from 'react-dom';
+import React, { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Bot, X, Trash2, Send, Loader2, ChevronRight, ChevronDown,
@@ -17,14 +16,21 @@ import MarkdownRenderer from './MarkdownRenderer';
 import SlashCommandMenu from './SlashCommandMenu';
 import { ExecApprovalModal } from './ExecApprovalModal';
 import client from '../../api/client';
-import { authAPI } from '../../api/auth';
 import { gatewayAPI, projectsAPI } from '../../api/endpoints';
+import { workspaceAuthorizedFetch } from '../../utils/workspaceAuthorizedFetch';
+import type {
+  ProjectChatPersistedMessage,
+  ProjectChatProviderCapability,
+  ProjectChatProviderName,
+  ProjectChatProviderQualificationStatus,
+} from '../../api/endpoints';
 import { useIsMobile } from '../../hooks/useIsMobile';
 import {
   extractThinkingChunk,
   isControlOnlyAssistantContent,
   mergeAssistantStream,
   mergeThinkingStream,
+  reconcileCumulativeFinalTail,
   sanitizeAssistantContent,
   sanitizeAssistantChunk,
   stripOpenClawReplyTags,
@@ -45,7 +51,6 @@ import {
   buildCompletedToolCall,
   buildRunningToolCall,
   finishMatchingToolCallInMessage,
-  finishRunningToolCallInMessage,
   getLastRunningToolCall,
   updateRunningToolCallInMessage,
 } from '../../utils/liveTurnProjector';
@@ -53,21 +58,101 @@ import { normalizePortalStreamEventFromTurnEvent } from '../../utils/runtimeTurn
 import ComposerStatusBadge from './ComposerStatusBadge';
 import CompactionNoticeBlock from './CompactionNoticeBlock';
 import ToolGlyph from './ToolGlyph';
+import ProjectProviderMenu, {
+  normalizeProjectQualificationRetryAt,
+  projectQualificationRecoveryAction,
+  type ProjectProviderQualificationFailure,
+  type ProjectQualificationRecoveryRole,
+} from './ProjectProviderMenu';
+import AnchoredPopover from '../AnchoredPopover';
+import ViewportModal from '../ViewportModal';
 import { getRailSafeStatusText, resolveMaintenanceRailStatus } from './maintenanceRailLifecycle';
-import { getToolPresentation, getToolStatusText, getToolSummary, isCompactionNotice, resolveToolName } from '../../utils/toolPresentation';
+import { getToolPresentation, getToolStatusText, getToolSummary, isAskQuestionTool, isCompactionNotice, resolveToolName } from '../../utils/toolPresentation';
 import {
   pruneExpiredExecApprovals,
   removeExecApproval,
   upsertExecApproval,
 } from '../../utils/execApprovalQueue';
+import {
+  buildUnavailableProjectProviderCapabilities,
+  canSendToProjectProvider,
+  canSwitchProjectProvider,
+  presentProjectProviderQualifications,
+  resolveProjectProviderCapabilities,
+  type ProjectProviderVerificationState,
+} from './projectChatProviderState';
+import { selectNewestWindow } from '../../utils/timelineWindow';
+import {
+  PROJECT_CHAT_MESSAGE_WINDOW_SIZE,
+  PROJECT_CHAT_TOOL_WINDOW_SIZE,
+  getProjectChatRenderDelay,
+  getProjectReplayPollDelay,
+} from '../../utils/projectChatPerformance';
+import {
+  historyConfirmsPendingProjectChatSend,
+  inspectProjectChatPendingSend,
+  reconcilePendingProjectChatSend,
+  runCoordinatedProjectChatSend,
+  runCoordinatedProjectChatReset,
+  subscribeProjectChatSendState,
+  type PendingProjectChatSend,
+  ProjectChatPendingStateError,
+  type ProjectChatSendScope,
+} from '../../utils/projectChatPendingSend';
+import { resolveProjectChatPendingMessageStatus } from '../../utils/projectChatMessageStatus';
+import { useAuthStore } from '../../contexts/AuthContext';
+import { sanitizeThinkingSubject } from '../../utils/thinkingSubject';
+import { AskQuestionCard, AskQuestionAnswerProvider, parseAskQuestionPayload, useAskQuestionAnswer } from './AskQuestionCard';
+import AskUserQuestionCard from './AskUserQuestionCard';
+import type { AskUserQuestionRequest } from './AskUserQuestionCard';
 
-import type { ToolCall, ChatMessage, StreamingPhase, ExecApprovalRequest } from '../../contexts/ChatStateProvider';
+import type {
+  ToolCall,
+  ChatMessage,
+  StreamingPhase,
+  ExecApprovalRequest,
+  SessionControlMutationKind,
+} from '../../contexts/ChatStateProvider';
 
 /* ═══ Types ═══ */
+
+export type ProjectChatActivity = Readonly<{
+  kind: 'provider-qualification';
+  projectName: string;
+  provider: 'OPENCLAW' | 'CODEX' | 'CLAUDE_CODE' | 'AGENT_ZERO' | 'GEMINI' | 'OLLAMA';
+  token: number;
+}> | Readonly<{
+  kind: 'session-control';
+  projectName: string;
+  provider: 'OPENCLAW';
+  sessionKey: string;
+  control: 'thinking' | 'reasoning' | 'fastMode';
+  token: number;
+}> | Readonly<{
+  kind: 'provider-transition';
+  projectName: string;
+  provider: ProjectChatProviderName;
+  previousProvider: ProjectChatProviderName | null;
+  sessionKey: string | null;
+  previousModel: string;
+  requestedModel: string;
+  stateVersion: number;
+  token: number;
+}> | Readonly<{
+  kind: 'model-switch';
+  projectName: string;
+  provider: ProjectChatProviderName;
+  sessionKey: string;
+  previousModel: string;
+  requestedModel: string;
+  stateVersion: number;
+  token: number;
+}>;
 
 interface ProjectChatPanelProps {
   projectName: string;
   onClose: () => void;
+  onActivityChange?: (activity: Readonly<ProjectChatActivity>, active: boolean) => boolean;
 }
 
 interface PendingAttachment {
@@ -78,22 +163,387 @@ interface PendingAttachment {
   type: 'image' | 'text' | 'other';
   previewUrl?: string;
   textContent?: string;
-  fileId?: string;
-  serverPath?: string;
-  toolUrl?: string;
+  projectPath?: string;
   uploadStatus?: 'uploading' | 'done' | 'error';
   uploadError?: string;
+}
+
+interface AgentZeroProjectModelOption {
+  value: string;
+  label: string;
+}
+
+type QualifiableProjectProvider = ProjectChatProviderQualificationStatus['provider'];
+type ProjectQualificationProgress = Readonly<{
+  projectName: string;
+  provider: QualifiableProjectProvider;
+  label: string;
+  stage: 'checking' | 'refreshing';
+}>;
+
+const DIRECT_QUALIFICATION_PRIORITY: readonly QualifiableProjectProvider[] = [
+  'OPENCLAW',
+  'CODEX',
+  'CLAUDE_CODE',
+  'AGENT_ZERO',
+  'GEMINI',
+  'OLLAMA',
+];
+
+const AUTOMATIC_QUALIFICATION_SUPPRESSION_STORAGE_KEY =
+  'portal:project-chat:auto-qualification-suppression:v1';
+const AUTOMATIC_QUALIFICATION_SUPPRESSION_TTL_MS = 15 * 60_000;
+const MAX_AUTOMATIC_QUALIFICATION_SUPPRESSION_TTL_MS = 60 * 60_000;
+const MAX_AUTOMATIC_QUALIFICATION_SUPPRESSIONS = 64;
+type AutomaticQualificationSuppressionDisposition =
+  | 'AUTO_ONLY'
+  | 'HOST_MAINTENANCE'
+  | 'IDENTITY_UNAVAILABLE_NON_RETRYABLE'
+  | 'NON_RETRYABLE'
+  | 'RATE_LIMITED';
+
+type AutomaticQualificationSuppression = Readonly<{
+  key: string;
+  expiresAt: number;
+  disposition: AutomaticQualificationSuppressionDisposition;
+  retryAt: string | null;
+}>;
+
+const automaticQualificationMemorySuppressions = new Map<
+  string,
+  AutomaticQualificationSuppression
+>();
+
+function automaticQualificationSuppressionKey(
+  actorUserId: string,
+  projectIdentityId: string | null,
+  provider: QualifiableProjectProvider,
+): string | null {
+  const actor = actorUserId.trim();
+  const project = projectIdentityId?.trim() || '';
+  if (!actor || !project || actor.length > 256 || project.length > 256) return null;
+  return JSON.stringify([actor, project, provider]);
+}
+
+function qualificationSuppressionStorage(): Storage | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+function readAutomaticQualificationSuppressions(
+  storage: Storage,
+  now: number,
+): AutomaticQualificationSuppression[] {
+  try {
+    const raw = storage.getItem(AUTOMATIC_QUALIFICATION_SUPPRESSION_STORAGE_KEY);
+    if (!raw) return [];
+    if (raw.length > 64 * 1024) {
+      storage.removeItem(AUTOMATIC_QUALIFICATION_SUPPRESSION_STORAGE_KEY);
+      return [];
+    }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .flatMap((entry): AutomaticQualificationSuppression[] => {
+        if (
+          entry === null
+          || typeof entry !== 'object'
+          || typeof entry.key !== 'string'
+          || entry.key.length > 1_000
+          || !Number.isSafeInteger(entry.expiresAt)
+          || entry.expiresAt <= now
+          || entry.expiresAt > now + MAX_AUTOMATIC_QUALIFICATION_SUPPRESSION_TTL_MS
+        ) return [];
+        const disposition: AutomaticQualificationSuppressionDisposition = (
+          entry.disposition === 'HOST_MAINTENANCE'
+          || entry.disposition === 'IDENTITY_UNAVAILABLE_NON_RETRYABLE'
+          || entry.disposition === 'NON_RETRYABLE'
+          || entry.disposition === 'RATE_LIMITED'
+          || entry.disposition === 'AUTO_ONLY'
+        )
+          ? entry.disposition
+          : 'AUTO_ONLY';
+        const retryAt = disposition === 'RATE_LIMITED'
+          ? normalizeProjectQualificationRetryAt(entry.retryAt, now)
+          : null;
+        if (disposition === 'RATE_LIMITED' && !retryAt) return [];
+        return [{
+          key: entry.key,
+          expiresAt: entry.expiresAt,
+          disposition,
+          retryAt,
+        }];
+      })
+      .sort((left, right) => left.expiresAt - right.expiresAt)
+      .slice(-MAX_AUTOMATIC_QUALIFICATION_SUPPRESSIONS);
+  } catch {
+    return [];
+  }
+}
+
+function writeAutomaticQualificationSuppressions(
+  storage: Storage,
+  entries: AutomaticQualificationSuppression[],
+): void {
+  try {
+    if (entries.length === 0) {
+      storage.removeItem(AUTOMATIC_QUALIFICATION_SUPPRESSION_STORAGE_KEY);
+      return;
+    }
+    storage.setItem(
+      AUTOMATIC_QUALIFICATION_SUPPRESSION_STORAGE_KEY,
+      JSON.stringify(entries.slice(-MAX_AUTOMATIC_QUALIFICATION_SUPPRESSIONS)),
+    );
+  } catch {
+    // A blocked session store must not prevent explicit provider preparation.
+  }
+}
+
+function pruneAutomaticQualificationMemorySuppressions(now: number): void {
+  for (const [key, entry] of automaticQualificationMemorySuppressions) {
+    if (
+      !Number.isSafeInteger(entry.expiresAt)
+      || entry.expiresAt <= now
+      || entry.expiresAt > now + MAX_AUTOMATIC_QUALIFICATION_SUPPRESSION_TTL_MS
+    ) {
+      automaticQualificationMemorySuppressions.delete(key);
+    }
+  }
+  while (
+    automaticQualificationMemorySuppressions.size
+    > MAX_AUTOMATIC_QUALIFICATION_SUPPRESSIONS
+  ) {
+    const oldestKey = automaticQualificationMemorySuppressions.keys().next().value;
+    if (typeof oldestKey !== 'string') break;
+    automaticQualificationMemorySuppressions.delete(oldestKey);
+  }
+}
+
+function readAutomaticQualificationSuppression(
+  key: string,
+  now = Date.now(),
+): AutomaticQualificationSuppression | null {
+  pruneAutomaticQualificationMemorySuppressions(now);
+  const memoryEntry = automaticQualificationMemorySuppressions.get(key);
+  if (memoryEntry && memoryEntry.expiresAt > now) return memoryEntry;
+  const storage = qualificationSuppressionStorage();
+  if (!storage) return null;
+  const entries = readAutomaticQualificationSuppressions(storage, now);
+  writeAutomaticQualificationSuppressions(storage, entries);
+  const storedEntry = entries.find((entry) => entry.key === key) || null;
+  if (storedEntry) {
+    automaticQualificationMemorySuppressions.delete(key);
+    automaticQualificationMemorySuppressions.set(key, storedEntry);
+    pruneAutomaticQualificationMemorySuppressions(now);
+  }
+  return storedEntry;
+}
+
+function isAutomaticQualificationSuppressed(key: string, now = Date.now()): boolean {
+  return readAutomaticQualificationSuppression(key, now) !== null;
+}
+
+function suppressAutomaticQualification(
+  key: string,
+  options: Readonly<{
+    disposition?: AutomaticQualificationSuppressionDisposition;
+    retryAt?: string | null;
+  }> = {},
+  now = Date.now(),
+): AutomaticQualificationSuppression {
+  pruneAutomaticQualificationMemorySuppressions(now);
+  const disposition = options.disposition || 'AUTO_ONLY';
+  const normalizedRetryAt = disposition === 'RATE_LIMITED'
+    ? (
+        normalizeProjectQualificationRetryAt(options.retryAt, now)
+        || new Date(now + AUTOMATIC_QUALIFICATION_SUPPRESSION_TTL_MS).toISOString()
+      )
+    : null;
+  const expiresAt = normalizedRetryAt
+    ? Date.parse(normalizedRetryAt)
+    : now + AUTOMATIC_QUALIFICATION_SUPPRESSION_TTL_MS;
+  const suppression: AutomaticQualificationSuppression = {
+    key,
+    expiresAt,
+    disposition,
+    retryAt: normalizedRetryAt,
+  };
+  automaticQualificationMemorySuppressions.delete(key);
+  automaticQualificationMemorySuppressions.set(key, suppression);
+  pruneAutomaticQualificationMemorySuppressions(now);
+  const storage = qualificationSuppressionStorage();
+  if (!storage) return suppression;
+  const entries = readAutomaticQualificationSuppressions(storage, now)
+    .filter((entry) => entry.key !== key);
+  entries.push(suppression);
+  writeAutomaticQualificationSuppressions(storage, entries);
+  return suppression;
+}
+
+function clearAutomaticQualificationSuppression(key: string | null): void {
+  if (!key) return;
+  automaticQualificationMemorySuppressions.delete(key);
+  const storage = qualificationSuppressionStorage();
+  if (!storage) return;
+  const now = Date.now();
+  writeAutomaticQualificationSuppressions(
+    storage,
+    readAutomaticQualificationSuppressions(storage, now)
+      .filter((entry) => entry.key !== key),
+  );
+}
+
+const SAFE_PROJECT_QUALIFICATION_ERROR_MESSAGES: Readonly<Record<string, (
+  label: string,
+) => string>> = Object.freeze({
+  PROJECT_QUALIFICATION_REQUIRED: (label) => `${label} must be prepared for this project before it can be used.`,
+  PROJECT_QUALIFICATION_FAILED: (label) => `Portal could not prepare ${label} for this project. Review the provider setup and try again.`,
+  PROJECT_QUALIFICATION_RATE_LIMITED: () => 'Too many Project provider preparation attempts. Wait for the current window to reset.',
+  PROJECT_QUALIFICATION_IDENTITY_UNAVAILABLE: () => 'Portal could not safely verify this project’s immutable identity for provider preparation.',
+  PROJECT_RUNTIME_POLICY_FAILED: () => 'The provider’s confined project runtime did not pass its server security checks. The Portal host must be updated or repaired before retrying.',
+  PROJECT_PROVIDER_AUTH_REQUIRED: (label) => `${label} must be reconnected in AI Settings before it can be prepared for this project.`,
+  PROJECT_PROVIDER_BACKEND_UNAVAILABLE: (label) => `${label} is unavailable on this Portal host. Check the provider service and try again.`,
+  PROJECT_PROVIDER_MODEL_REJECTED: (label) => `${label} rejected the selected project model. Choose an available model and try again.`,
+  PROJECT_PROVIDER_RATE_LIMITED: (label) => `${label} is rate limited. Wait a moment and try again.`,
+  PROJECT_PROVIDER_TIMED_OUT: (label) => `${label} did not finish its project security check in time. Try again.`,
+  // both of these reached the user as the generic "review the provider
+  // setup" fallback, which names neither the cause nor the fix. The first is
+  // the ordinary outcome of preparing a provider that has no usable model on
+  // this host; the second only means the open view is out of date.
+  PROJECT_MODEL_SWITCH_REJECTED: (label) => `${label} has no usable model for this project. Choose a different model or provider.`,
+  PROJECT_CHAT_VERSION_CONFLICT: () => 'This Project Chat view is out of date. Refresh the project, then try again.',
+  AGENT_ZERO_PROJECT_MODEL_INVALID: () => 'Select a currently connected Agent Zero model before preparing this project.',
+  ANTIGRAVITY_PROJECT_MODEL_UNAVAILABLE: () => 'The selected Antigravity model is unavailable for this project.',
+  CLAUDE_CODE_PROJECT_MODEL_UNAVAILABLE: () => 'The selected Claude Code model is unavailable for this project.',
+  CODEX_PROJECT_MODEL_UNAVAILABLE: () => 'The selected Codex model is unavailable for this project.',
+  OLLAMA_PROJECT_MODEL_UNAVAILABLE: () => 'The selected Ollama model is unavailable for this project.',
+});
+
+function failureFromAutomaticQualificationSuppression(
+  suppression: AutomaticQualificationSuppression,
+  label: string,
+): ProjectProviderQualificationFailure | null {
+  if (suppression.disposition === 'HOST_MAINTENANCE') {
+    return {
+      message: SAFE_PROJECT_QUALIFICATION_ERROR_MESSAGES.PROJECT_RUNTIME_POLICY_FAILED(label),
+      code: 'PROJECT_RUNTIME_POLICY_FAILED',
+      retryable: false,
+      recovery: 'HOST_MAINTENANCE',
+      retryAt: null,
+      suppressionExpiresAt: new Date(suppression.expiresAt).toISOString(),
+    };
+  }
+  if (suppression.disposition === 'IDENTITY_UNAVAILABLE_NON_RETRYABLE') {
+    return {
+      message: SAFE_PROJECT_QUALIFICATION_ERROR_MESSAGES.PROJECT_QUALIFICATION_IDENTITY_UNAVAILABLE(label),
+      code: 'PROJECT_QUALIFICATION_IDENTITY_UNAVAILABLE',
+      retryable: false,
+      recovery: null,
+      retryAt: null,
+      suppressionExpiresAt: new Date(suppression.expiresAt).toISOString(),
+    };
+  }
+  if (suppression.disposition === 'NON_RETRYABLE') {
+    return {
+      message: `Portal could not safely prepare ${label} for this project. An Owner or Sub Admin must review the Portal host before retrying.`,
+      code: 'PROJECT_QUALIFICATION_FAILED',
+      retryable: false,
+      recovery: null,
+      retryAt: null,
+      suppressionExpiresAt: new Date(suppression.expiresAt).toISOString(),
+    };
+  }
+  if (suppression.disposition === 'RATE_LIMITED' && suppression.retryAt) {
+    return {
+      message: SAFE_PROJECT_QUALIFICATION_ERROR_MESSAGES.PROJECT_QUALIFICATION_RATE_LIMITED(label),
+      code: 'PROJECT_QUALIFICATION_RATE_LIMITED',
+      retryable: true,
+      recovery: null,
+      retryAt: suppression.retryAt,
+      suppressionExpiresAt: new Date(suppression.expiresAt).toISOString(),
+    };
+  }
+  return null;
+}
+
+function safeProjectQualificationError(
+  error: any,
+  label: string,
+): ProjectProviderQualificationFailure {
+  const payload = error?.response?.data;
+  const code = typeof payload?.code === 'string' ? payload.code : '';
+  const safeMessage = SAFE_PROJECT_QUALIFICATION_ERROR_MESSAGES[code];
+  const safePayload = typeof safeMessage === 'function';
+  const runtimePolicyFailure = code === 'PROJECT_RUNTIME_POLICY_FAILED';
+  const rateLimited = code === 'PROJECT_QUALIFICATION_RATE_LIMITED';
+  const explicitRetryable = typeof payload?.retryable === 'boolean'
+    ? payload.retryable
+    : null;
+  return {
+    message: safePayload
+      ? safeMessage(label)
+      : `Portal could not prepare ${label} for this project. Review the provider setup and try again.`,
+    code: safePayload ? code : 'PROJECT_QUALIFICATION_FAILED',
+    retryable: runtimePolicyFailure
+      ? false
+      : explicitRetryable ?? true,
+    recovery: runtimePolicyFailure
+      ? 'HOST_MAINTENANCE'
+      : null,
+    retryAt: rateLimited
+      ? (
+          normalizeProjectQualificationRetryAt(payload?.retryAt)
+          || new Date(Date.now() + AUTOMATIC_QUALIFICATION_SUPPRESSION_TTL_MS).toISOString()
+        )
+      : null,
+  };
 }
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'adaptive' | 'max' | 'ultra';
 type ReasoningVisibility = 'off' | 'on' | 'stream';
 
 const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'adaptive', 'high', 'xhigh', 'max', 'ultra'];
+type ProjectSessionControlKind = Exclude<SessionControlMutationKind, 'compactionModel'>;
+type ProjectSessionControlValue = ThinkingLevel | ReasoningVisibility | boolean;
+type ProjectSessionControlMutation = Readonly<{
+  generation: number;
+  kind: ProjectSessionControlKind;
+  provider: ProjectChatProviderName;
+  session: string;
+  previous: ProjectSessionControlValue;
+  requested: ProjectSessionControlValue;
+  activity: Extract<ProjectChatActivity, { kind: 'session-control' }>;
+}>;
+type ProjectProviderTransitionActivity = Extract<ProjectChatActivity, { kind: 'provider-transition' }>;
+type ProjectModelSwitchActivity = Extract<ProjectChatActivity, { kind: 'model-switch' }>;
+type ProjectTransitionActivity = ProjectProviderTransitionActivity | ProjectModelSwitchActivity;
+
+function readProjectSessionControlValue(payload: any, kind: ProjectSessionControlKind): ProjectSessionControlValue | undefined {
+  const session = payload?.session && typeof payload.session === 'object' ? payload.session : payload;
+  if (!session || typeof session !== 'object') return undefined;
+  if (kind === 'fastMode') {
+    const candidate = session.fastMode ?? session.settings?.fastMode;
+    return typeof candidate === 'boolean' ? candidate : undefined;
+  }
+  const candidate = kind === 'thinking'
+    ? (session.thinkingLevel ?? session.thinking ?? session.settings?.thinking)
+    : (session.reasoningLevel ?? session.reasoning ?? session.settings?.reasoning);
+  const normalized = typeof candidate === 'string' ? candidate.trim().toLowerCase() : '';
+  if (kind === 'thinking') {
+    return THINKING_LEVELS.includes(normalized as ThinkingLevel) ? normalized as ThinkingLevel : undefined;
+  }
+  return ['off', 'on', 'stream'].includes(normalized) ? normalized as ReasoningVisibility : undefined;
+}
 const REASONING_VISIBILITY_LABELS: Record<ReasoningVisibility, string> = {
   off: 'Hidden',
   on: 'Visible',
   stream: 'Stream',
 };
+export const PROJECT_CHAT_HISTORY_PAGE_SIZE = 100;
 const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
   off: 'Off',
   minimal: 'Minimal',
@@ -118,150 +568,141 @@ function resolveAvailableModelId(model: string, availableModels: string[]): stri
   return resolvePortalModelFromCatalog(model, availableModels);
 }
 
-/* ═══ WS Manager (local, not shared) ═══ */
+/* ═══ Durable Project replay contract ═══ */
 
-type WsEventHandler = (data: any) => void;
-
-interface LocalWsManager {
-  send: (data: any) => boolean;
-  addHandler: (handler: WsEventHandler) => void;
-  removeHandler: (handler: WsEventHandler) => void;
-  onDisconnect: (cb: () => void) => (() => void);
-  onReconnect: (cb: () => void) => (() => void);
-  isConnected: () => boolean;
-  reconnect: () => void;
-  close: () => void;
+export class ProjectReplayContractError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProjectReplayContractError';
+  }
 }
 
-function createLocalWsManager(url: string): LocalWsManager {
-  let ws: WebSocket | null = null;
-  let intentionallyClosed = false;
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let reconnectAttempts = 0;
-  let wasConnectedBefore = false;
-  const handlers = new Set<WsEventHandler>();
-  const disconnectCallbacks = new Set<() => void>();
-  const reconnectCallbacks = new Set<() => void>();
+export function resolveVerifiedProjectModelResponse(
+  capability: Pick<ProjectChatProviderCapability, 'displayName' | 'supportsModelSelection'>,
+  data: any,
+): string {
+  if (!capability.supportsModelSelection) return '';
+  const model = canonicalizePortalModelId(String(data?.model || ''));
+  if (data?.modelValidated !== true || !model) {
+    throw new ProjectReplayContractError(
+      `Portal did not return a validated ${capability.displayName} Project model.`,
+    );
+  }
+  return model;
+}
 
-  function connect() {
-    if (intentionallyClosed) return;
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-    try {
-      ws = new WebSocket(url);
-    } catch {
-      scheduleReconnect();
-      return;
+export interface ProjectReplayBatch {
+  events: any[];
+  nextCursor: number;
+  stateVersion: number;
+  sessionKey: string;
+}
+
+const PROJECT_PROVIDER_REVERIFICATION_CODES = new Set([
+  'PROJECT_PROVIDER_UNSUPPORTED',
+  'PROJECT_CHAT_HANDOFF_CONFLICT',
+  'PROJECT_CHAT_INVALID_INPUT',
+  'PROJECT_CHAT_PROVIDER_MISMATCH',
+  'PROJECT_CHAT_REQUEST_REPLAY',
+  'PROJECT_CHAT_STATE_CORRUPT',
+  'PROJECT_CHAT_STATE_NOT_FOUND',
+  'PROJECT_CHAT_TURN_ACTIVE',
+  'PROJECT_CHAT_VERSION_CONFLICT',
+  'PROJECT_MODEL_VERIFICATION_FAILED',
+  'PROJECT_QUALIFICATION_FAILED',
+  'PROJECT_QUALIFICATION_REQUIRED',
+]);
+
+function isProjectProviderReverificationError(error: any): boolean {
+  const code = error?.response?.data?.code;
+  return typeof code === 'string' && PROJECT_PROVIDER_REVERIFICATION_CODES.has(code);
+}
+
+function isDefinitiveProjectSendRejection(error: any): boolean {
+  return error?.response?.data?.admissionStatus === 'never_admitted';
+}
+
+export function resolveProjectReplayBatch(
+  snapshot: any,
+  expected: {
+    provider: ProjectChatProviderName;
+    sessionKey: string;
+    minimumStateVersion: number;
+    afterSeq: number;
+    turnId?: string | null;
+  },
+): ProjectReplayBatch {
+  if (!Number.isSafeInteger(expected.afterSeq) || expected.afterSeq < 0) {
+    throw new ProjectReplayContractError('Project replay requested an invalid cursor.');
+  }
+  if (!Number.isSafeInteger(expected.minimumStateVersion) || expected.minimumStateVersion < 0) {
+    throw new ProjectReplayContractError('Project replay expected an invalid coordination version.');
+  }
+  if (typeof expected.sessionKey !== 'string' || !expected.sessionKey.trim()) {
+    throw new ProjectReplayContractError('Project replay expected an invalid provider session.');
+  }
+  if (expected.turnId != null && (typeof expected.turnId !== 'string' || !expected.turnId.trim())) {
+    throw new ProjectReplayContractError('Project replay expected an invalid active turn.');
+  }
+  if (snapshot?.provider !== expected.provider) {
+    throw new ProjectReplayContractError(
+      `Project replay provider mismatch: expected ${expected.provider}, received ${String(snapshot?.provider || 'none')}`,
+    );
+  }
+  if (typeof snapshot?.sessionKey !== 'string' || !snapshot.sessionKey.trim()) {
+    throw new ProjectReplayContractError('Project replay did not return a provider session.');
+  }
+  if (expected.turnId) {
+    if (snapshot?.runId !== expected.turnId) {
+      throw new ProjectReplayContractError('Project replay did not match the verified active turn.');
     }
-
-    ws.onopen = () => {
-      wasConnectedBefore = true;
-      reconnectAttempts = 0;
-      for (const cb of reconnectCallbacks) {
-        try { cb(); } catch (err) { console.error('[project-ws] reconnect callback error:', err); }
-      }
-    };
-
-    ws.onmessage = (event) => {
-      let data: any;
-      try { data = JSON.parse(event.data); } catch { return; }
-      for (const handler of handlers) {
-        try { handler(data); } catch (err) { console.error('[project-ws] Handler error:', err); }
-      }
-    };
-
-    ws.onclose = (event) => {
-      ws = null;
-
-      const isAuthFailure = event.code === 4001 || event.code === 4003 ||
-        event.reason?.toLowerCase().includes('unauthorized') ||
-        event.reason?.toLowerCase().includes('forbidden') ||
-        event.reason?.toLowerCase().includes('expired');
-
-      if (isAuthFailure && !intentionallyClosed) {
-        authAPI.refresh()
-          .then(() => {
-            reconnectAttempts = 0;
-            scheduleReconnect();
-          })
-          .catch((err) => {
-            console.warn('[project-ws] token refresh failed, stopping reconnect:', err);
-            intentionallyClosed = true;
-            for (const cb of disconnectCallbacks) {
-              try { cb(); } catch (callbackErr) { console.error('[project-ws] disconnect callback error:', callbackErr); }
-            }
-          });
-        return;
-      }
-
-      if (!intentionallyClosed) {
-        for (const cb of disconnectCallbacks) {
-          try { cb(); } catch (err) { console.error('[project-ws] disconnect callback error:', err); }
-        }
-        scheduleReconnect();
-      }
-    };
-
-    ws.onerror = () => {};
+  } else if (snapshot.sessionKey !== expected.sessionKey) {
+    throw new ProjectReplayContractError('Project replay session did not match the verified provider session.');
+  }
+  if (!Number.isSafeInteger(snapshot?.stateVersion) || snapshot.stateVersion < expected.minimumStateVersion) {
+    throw new ProjectReplayContractError('Project replay coordination version is missing or stale.');
+  }
+  if (!Number.isSafeInteger(snapshot?.lineCount) || snapshot.lineCount < expected.afterSeq) {
+    throw new ProjectReplayContractError('Project replay cursor is missing or moved backwards.');
   }
 
-  function scheduleReconnect() {
-    if (reconnectTimer || intentionallyClosed) return;
-    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
-    reconnectAttempts++;
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      connect();
-    }, delay);
+  const rawEvents = Array.isArray(snapshot?.events) ? snapshot.events : [];
+  const bySequence = new Map<number, any>();
+  for (const event of rawEvents) {
+    const sequence = event?.seq;
+    if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence > snapshot.lineCount) {
+      throw new ProjectReplayContractError('Project replay returned an invalid event sequence.');
+    }
+    if (sequence > expected.afterSeq && !bySequence.has(sequence)) {
+      bySequence.set(sequence, event);
+    }
   }
-
-  connect();
+  const events = [...bySequence.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, event]) => event);
+  let expectedSequence = expected.afterSeq + 1;
+  for (const event of events) {
+    if (event.seq !== expectedSequence) {
+      throw new ProjectReplayContractError(
+        `Project replay returned a sequence gap at ${expectedSequence}.`,
+      );
+    }
+    expectedSequence += 1;
+  }
+  if (snapshot.lineCount > expected.afterSeq && events.length === 0) {
+    throw new ProjectReplayContractError('Project replay omitted events after the requested cursor.');
+  }
+  const nextCursor = events.reduce(
+    (cursor, event) => Math.max(cursor, Number(event.seq)),
+    expected.afterSeq,
+  );
 
   return {
-    send(data: any): boolean {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-      try { ws.send(JSON.stringify(data)); return true; } catch { return false; }
-    },
-    addHandler(handler: WsEventHandler) { handlers.add(handler); },
-    removeHandler(handler: WsEventHandler) { handlers.delete(handler); },
-    onDisconnect(cb: () => void) {
-      disconnectCallbacks.add(cb);
-      return () => { disconnectCallbacks.delete(cb); };
-    },
-    onReconnect(cb: () => void) {
-      reconnectCallbacks.add(cb);
-      return () => { reconnectCallbacks.delete(cb); };
-    },
-    isConnected() { return ws !== null && ws.readyState === WebSocket.OPEN; },
-    reconnect() {
-      intentionallyClosed = false;
-      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      if (ws) {
-        try { ws.close(); } catch {}
-        ws = null;
-      }
-      connect();
-    },
-    close() {
-      intentionallyClosed = true;
-      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      if (ws) { try { ws.close(); } catch {} ws = null; }
-      handlers.clear();
-      disconnectCallbacks.clear();
-      reconnectCallbacks.clear();
-    },
+    events,
+    nextCursor,
+    stateVersion: snapshot.stateVersion,
+    sessionKey: snapshot.sessionKey,
   };
-}
-
-function getWsUrl(): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const apiUrl = import.meta.env.VITE_API_URL || '';
-  if (apiUrl) {
-    if (apiUrl.startsWith('http')) {
-      return apiUrl.replace(/^http/, 'ws') + '/gateway/ws';
-    }
-    return protocol + '//' + window.location.host + apiUrl + '/gateway/ws';
-  }
-  return protocol + '//' + window.location.host + '/api/gateway/ws';
 }
 
 /* ═══ Helpers ═══ */
@@ -375,6 +816,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
   const rawContent = typeof m.content === 'string' ? m.content : '';
   const sanitizedHistoryText = sanitizeHistoryMessageText(rawContent);
   const rawThinkingContent = typeof m.thinkingContent === 'string' ? sanitizeAssistantContent(m.thinkingContent) : '';
+  const rawThinkingSubject = sanitizeThinkingSubject(m.thinkingSubject);
   const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
   if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOrMaintenanceAssistantContent(rawContent) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
     return null;
@@ -401,19 +843,35 @@ function parseHistoryMessage(m: any): ChatMessage | null {
     provenance: m.provenance || ((m.__openclaw?.kind === 'compaction' || isCompactionNotice(sanitizedHistoryText)) ? 'compaction' : undefined),
     model: typeof m.model === 'string' ? m.model : undefined,
     thinkingContent: rawThinkingContent || undefined,
+    thinkingSubject: rawThinkingSubject || undefined,
   };
   if (m.toolCalls) {
     msg.toolCalls = m.toolCalls.map((tc: any) => ({
       id: tc.id || nextId(),
       name: tc.name,
       arguments: tc.arguments,
-      startedAt: Date.now(),
-      endedAt: Date.now(),
-      status: 'done' as const,
+      result: typeof tc.result === 'string' ? tc.result : undefined,
+      startedAt: Number.isFinite(tc.startedAt) ? tc.startedAt : Date.now(),
+      endedAt: Number.isFinite(tc.endedAt) ? tc.endedAt : undefined,
+      status: tc.status === 'running' || tc.status === 'error' ? tc.status : 'done' as const,
+      order: Number.isSafeInteger(tc.order) ? tc.order : undefined,
     }));
   }
   if (Array.isArray(m.segments)) {
-    msg.segments = m.segments;
+    msg.segments = m.segments.flatMap((segment: any) => {
+      const text = typeof segment?.text === 'string' ? sanitizeAssistantContent(segment.text) : '';
+      const kind = segment.kind === 'thinking' ? 'thinking' as const : 'text' as const;
+      const subject = kind === 'thinking' ? sanitizeThinkingSubject(segment?.subject) : '';
+      if (!text.trim() && !subject) return [];
+      return [{
+        text,
+        ...(subject ? { subject } : {}),
+        position: segment.position === 'before' || segment.position === 'between' ? segment.position : 'after',
+        kind,
+        ts: Number.isFinite(segment.ts) ? segment.ts : undefined,
+        order: Number.isSafeInteger(segment.order) ? segment.order : undefined,
+      }];
+    });
   }
   if (m.role === 'toolResult') {
     msg.toolCallId = m.toolCallId;
@@ -423,6 +881,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
 }
 
 const HISTORY_REPLAY_DUPLICATE_WINDOW_MS = 5_000;
+const PROJECT_STREAM_TIMEOUT_MS = 10 * 60_000;
 
 function normalizeHistoryReplayContent(content: string): string {
   return (content || '').replace(/\r\n/g, '\n').trim();
@@ -469,10 +928,63 @@ function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
   return deduped;
 }
 
+function parseProjectChatHistoryMessages(
+  messages: ProjectChatPersistedMessage[],
+  provider: ProjectChatProviderName,
+  runtime: string,
+): ChatMessage[] {
+  return dedupeHistoryMessages(messages
+    .map((message) => parseHistoryMessage({
+      ...message,
+      provenance: `${getProjectProviderLabel(message.provider || provider)} • ${message.runtime || runtime}`,
+    }))
+    .filter(Boolean) as ChatMessage[]);
+}
+
+export function mergeProjectChatHistoryPages(
+  olderMessages: ChatMessage[],
+  currentMessages: ChatMessage[],
+): ChatMessage[] {
+  const currentIds = new Set(currentMessages.map((message) => message.id).filter(Boolean));
+  return dedupeHistoryMessages([
+    ...olderMessages.filter((message) => !currentIds.has(message.id)),
+    ...currentMessages,
+  ]);
+}
+
+function getProjectProviderLabel(provider: ProjectChatProviderName): string {
+  if (provider === 'OPENCLAW') return 'OpenClaw';
+  if (provider === 'CLAUDE_CODE') return 'Claude Code';
+  if (provider === 'AGENT_ZERO') return 'Agent Zero';
+  if (provider === 'GROK') return 'Grok Build';
+  if (provider === 'GEMINI') return 'Antigravity';
+  return provider
+    .toLowerCase()
+    .split('_')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
 /* ═══ Sub-components ═══ */
 
-function ToolCallPill({ tool }: { tool: ToolCall }) {
+const ToolCallPill = React.memo(function ToolCallPill({ tool }: { tool: ToolCall }) {
   const [expanded, setExpanded] = useState(false);
+  const onAnswerQuestion = useAskQuestionAnswer();
+  const askPayload = useMemo(
+    () => (isAskQuestionTool(tool.name) ? parseAskQuestionPayload(tool.arguments) : null),
+    [tool.name, tool.arguments],
+  );
+  if (askPayload && onAnswerQuestion) {
+    return (
+      <div className="px-3">
+        <AskQuestionCard
+          payload={askPayload}
+          answered={tool.result || undefined}
+          onSubmit={onAnswerQuestion}
+        />
+      </div>
+    );
+  }
   const duration = tool.endedAt ? ((tool.endedAt - tool.startedAt) / 1000).toFixed(1) : null;
   const hasDetails = !!(tool.result || tool.arguments);
   const summary = getToolSummary(tool);
@@ -529,7 +1041,230 @@ function ToolCallPill({ tool }: { tool: ToolCall }) {
       </div>
     </motion.div>
   );
+});
+
+const BoundedProjectToolCalls = React.memo(function BoundedProjectToolCalls({
+  tools,
+  messageKey,
+}: {
+  tools: readonly ToolCall[];
+  messageKey: string;
+}) {
+  const [revealedEarlier, setRevealedEarlier] = useState(0);
+  useEffect(() => setRevealedEarlier(0), [messageKey]);
+  const windowed = useMemo(
+    () => selectNewestWindow(tools, PROJECT_CHAT_TOOL_WINDOW_SIZE, revealedEarlier),
+    [revealedEarlier, tools],
+  );
+
+  if (tools.length === 0) return null;
+
+  return (
+    <div className="mb-1">
+      {windowed.hiddenCount > 0 ? (
+        <div className="flex justify-center px-2 py-1">
+          <button
+            type="button"
+            onClick={() => setRevealedEarlier((current) => current + PROJECT_CHAT_TOOL_WINDOW_SIZE)}
+            className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2.5 py-1 text-[10px] text-slate-400 transition-colors hover:border-white/[0.14] hover:bg-white/[0.06] hover:text-slate-200"
+          >
+            Show earlier tools · {windowed.hiddenCount} hidden
+          </button>
+        </div>
+      ) : null}
+      {windowed.items.map((tool) => <ToolCallPill key={tool.id} tool={tool} />)}
+    </div>
+  );
+});
+
+export function reconcileProjectPresentationSegments(
+  rawSegments: NonNullable<ChatMessage['segments']>,
+  rawCanonicalContent: string,
+  rawTools: readonly ToolCall[] = [],
+): NonNullable<ChatMessage['segments']> {
+  const canonicalContent = String(rawCanonicalContent || '').trim();
+  const segments = rawSegments.map((segment) => ({ ...segment }));
+  if (!canonicalContent) return segments;
+
+  const textIndexes = segments
+    .map((segment, index) => ({ segment, index }))
+    .filter(({ segment }) => segment.kind !== 'thinking' && Boolean(segment.text?.trim()));
+  if (textIndexes.some(({ segment }) => segment.text.trim() === canonicalContent)) {
+    return segments;
+  }
+
+  const canonicalComparable = canonicalContent.replace(/\s+/g, ' ');
+  const combinedComparable = textIndexes
+    .map(({ segment }) => segment.text.trim())
+    .join(' ')
+    .replace(/\s+/g, ' ');
+  if (combinedComparable === canonicalComparable) {
+    return segments;
+  }
+
+  const finalTail = reconcileCumulativeFinalTail(
+    textIndexes.map(({ segment }) => segment.text),
+    canonicalContent,
+  ).trim();
+  if (!finalTail) return segments;
+
+  const latestToolOrder = rawTools.reduce(
+    (current, tool) => (
+      typeof tool.order === 'number' && Number.isFinite(tool.order)
+        ? Math.max(current, tool.order)
+        : current
+    ),
+    -1,
+  );
+  const latestToolTimestamp = rawTools.reduce(
+    (current, tool) => Math.max(
+      current,
+      Number.isFinite(tool.endedAt) ? Number(tool.endedAt) : Number(tool.startedAt) || 0,
+    ),
+    0,
+  );
+  const lastTextEntry = textIndexes[textIndexes.length - 1];
+  const lastTextOrder = typeof lastTextEntry?.segment.order === 'number'
+    ? lastTextEntry.segment.order
+    : null;
+  const lastTextTimestamp = typeof lastTextEntry?.segment.ts === 'number'
+    ? lastTextEntry.segment.ts
+    : 0;
+  const toolFollowsLastText = lastTextEntry
+    ? (
+        lastTextOrder != null && latestToolOrder >= 0
+          ? latestToolOrder > lastTextOrder
+          : latestToolTimestamp > lastTextTimestamp
+      )
+    : false;
+  const consumedGraduatedText = finalTail !== canonicalContent;
+
+  // A lone prefix at the end of the timeline is merely a lagging snapshot;
+  // replace it. If a tool follows, preserve that prefix where it occurred and
+  // append only the new residual tail after the tool.
+  if (
+    consumedGraduatedText
+    && textIndexes.length === 1
+    && lastTextEntry
+    && !toolFollowsLastText
+  ) {
+    segments[lastTextEntry.index] = {
+      ...lastTextEntry.segment,
+      text: canonicalContent,
+    };
+    return segments;
+  }
+
+  const appendedText = consumedGraduatedText ? finalTail : canonicalContent;
+  if (!appendedText) return segments;
+
+  const maxOrder = [...segments, ...rawTools].reduce(
+    (current, segment) => (
+      typeof segment.order === 'number' && Number.isFinite(segment.order)
+        ? Math.max(current, segment.order)
+        : current
+    ),
+    -1,
+  );
+  const maxTimestamp = Math.max(Date.now(), ...segments.map(
+    (segment) => (
+      typeof segment.ts === 'number' && Number.isFinite(segment.ts)
+        ? segment.ts
+        : 0
+    ),
+  ), ...rawTools.map(
+    (tool) => (
+      Number.isFinite(tool.endedAt)
+        ? Number(tool.endedAt)
+        : Number.isFinite(tool.startedAt) ? Number(tool.startedAt) : 0
+    ),
+  ));
+  segments.push({
+    text: appendedText,
+    kind: 'text',
+    position: 'after',
+    order: maxOrder + 1,
+    ts: maxTimestamp + 1,
+  });
+  return segments;
 }
+
+const ProjectActivityTimeline = React.memo(function ProjectActivityTimeline({
+  messageId,
+  segments,
+  tools,
+}: {
+  messageId: string;
+  segments: NonNullable<ChatMessage['segments']>;
+  tools: readonly ToolCall[];
+}) {
+  const timeline = useMemo(() => [
+    ...segments.map((segment, index) => ({
+      kind: 'segment' as const,
+      segment,
+      order: typeof segment.order === 'number' ? segment.order : null,
+      ts: typeof segment.ts === 'number' ? segment.ts : index,
+      key: `segment-${index}`,
+    })),
+    ...tools.map((tool, index) => ({
+      kind: 'tool' as const,
+      tool,
+      order: typeof tool.order === 'number' ? tool.order : null,
+      ts: Number.isFinite(tool.startedAt) ? tool.startedAt : segments.length + index,
+      key: `tool-${tool.id}-${index}`,
+    })),
+  ].sort((left, right) => {
+    // Durable replay sequence is authoritative. Provider timestamps can be
+    // skewed or sampled on different clocks, so use them only for legacy
+    // records that do not carry a sequence/order value.
+    if (left.order != null && right.order != null) {
+      return (left.order - right.order) || (left.ts - right.ts);
+    }
+    return (left.ts - right.ts) || ((left.order ?? 0) - (right.order ?? 0));
+  }), [segments, tools]);
+  const [revealedEarlier, setRevealedEarlier] = useState(0);
+  useEffect(() => setRevealedEarlier(0), [messageId]);
+  const windowed = useMemo(
+    () => selectNewestWindow(timeline, 80, revealedEarlier),
+    [revealedEarlier, timeline],
+  );
+  return (
+    <div className="space-y-1">
+      {windowed.hiddenCount > 0 ? (
+        <div className="flex justify-center px-2 py-1">
+          <button
+            type="button"
+            onClick={() => setRevealedEarlier((current) => current + 80)}
+            className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2.5 py-1 text-[10px] text-slate-400"
+          >
+            Show earlier activity · {windowed.hiddenCount} hidden
+          </button>
+        </div>
+      ) : null}
+      {windowed.items.map((item) => item.kind === 'tool' ? (
+        <ToolCallPill key={`${messageId}-${item.key}`} tool={item.tool} />
+      ) : (
+        <div key={`${messageId}-${item.key}`} className="flex gap-2 items-start px-3 py-1">
+          <div className={`w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5 text-[8px] font-bold ${item.segment.kind === 'thinking' ? 'bg-violet-500/20 text-violet-300' : 'bg-emerald-500/20 text-emerald-400'}`}>
+            {item.segment.kind === 'thinking' ? <Sparkles size={10} /> : 'AI'}
+          </div>
+          <div className={`flex-1 min-w-0 max-w-[90%] rounded-2xl rounded-bl-sm border px-3 py-2 ${item.segment.kind === 'thinking' ? 'border-violet-400/15 bg-violet-500/[0.08]' : 'border-white/[0.08] bg-white/[0.06]'}`}>
+            {item.segment.kind === 'thinking' ? (
+              <div className="mb-1 text-[9px] font-medium uppercase tracking-wide text-violet-200/75">
+                thinking{item.segment.subject ? ` · ${item.segment.subject}` : ''}
+              </div>
+            ) : null}
+            {item.segment.text ? (
+              <div className="text-[11px] leading-relaxed">
+                <MarkdownRenderer content={item.segment.text} isStreaming={false} />
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+});
 
 function ToolResultPill({ message }: { message: ChatMessage }) {
   const [expanded, setExpanded] = useState(false);
@@ -600,7 +1335,7 @@ function AttachmentChip({ attachment, onRemove }: { attachment: PendingAttachmen
       {isUploading ? <Loader2 size={10} className="animate-spin text-amber-400" /> : <Paperclip size={10} className="text-slate-400" />}
       <span className="max-w-[80px] truncate">{attachment.name}</span>
       {isUploading ? <span className="text-amber-400/60 text-[8px]">…</span> : null}
-      <button onClick={onRemove} className="ml-0.5 text-slate-500 hover:text-slate-200"><X size={9} /></button>
+      <button aria-label={`Remove attachment ${attachment.name}`} onClick={onRemove} className="ml-0.5 text-slate-500 hover:text-slate-200"><X size={9} /></button>
     </div>
   );
 }
@@ -628,95 +1363,115 @@ function ModelMeta({ modelId, compact = false }: { modelId: string; compact?: bo
   );
 }
 
-function ModelPickerDropdown({ open, onClose, children }: { open: boolean; onClose: () => void; children: React.ReactNode }) {
-  const [isMobile, setIsMobile] = useState(false);
-
-  useEffect(() => {
-    const mq = window.matchMedia('(max-width: 639px)');
-    setIsMobile(mq.matches);
-    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
-    mq.addEventListener('change', handler);
-    return () => mq.removeEventListener('change', handler);
-  }, []);
-
-  if (!open) return null;
-
-  if (isMobile) {
-    return createPortal(
-      <>
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 bg-black/60 z-[9998]" onClick={onClose} />
-        <motion.div initial={{ opacity: 0, y: 100 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 100 }} transition={{ type: 'spring', damping: 25, stiffness: 300 }} className="fixed inset-x-0 bottom-0 z-[9999] px-3 pb-3">
-          <div className="rounded-xl bg-[#1A1F3A] border border-white/[0.08] shadow-2xl shadow-black/50 overflow-hidden max-h-[70vh]">
-            <div className="flex items-center justify-between px-3 pt-2.5 pb-1.5 border-b border-white/[0.06]">
-              <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Select Model</span>
-              <button onClick={onClose} className="p-1 rounded-lg text-slate-500 hover:text-slate-300">
-                <X size={14} />
-              </button>
-            </div>
-            <div className="overflow-y-auto max-h-[60vh] overscroll-contain">{children}</div>
-          </div>
-        </motion.div>
-      </>,
-      document.body,
-    );
-  }
-
+function ModelPickerDropdown({
+  open,
+  onClose,
+  anchorRef,
+  children,
+}: {
+  open: boolean;
+  onClose: () => void;
+  anchorRef: React.RefObject<HTMLButtonElement>;
+  children: React.ReactNode;
+}) {
   return (
-    <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={{ duration: 0.15 }} className="absolute top-full right-0 mt-1 w-64 rounded-xl bg-[#1A1F3A] border border-white/[0.08] shadow-xl shadow-black/40 z-[100]">
-      {children}
-    </motion.div>
+    <AnchoredPopover
+      open={open}
+      anchorRef={anchorRef}
+      width={288}
+      mobileBreakpoint={767}
+      onDismiss={(reason) => {
+        onClose();
+        if (reason === 'escape') anchorRef.current?.focus();
+      }}
+    >
+      <motion.div
+        initial={{ opacity: 0, y: -4 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.15 }}
+        role="dialog"
+        aria-label="Select model"
+        className="flex min-h-0 max-h-full w-full flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-[#1A1F3A] shadow-2xl shadow-black/50"
+      >
+        <div className="flex items-center justify-between border-b border-white/[0.06] px-3 pb-1.5 pt-2.5">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Select Model</span>
+          <button type="button" aria-label="Close model selector" onClick={onClose} className="rounded-lg p-1 text-slate-500 hover:text-slate-300">
+            <X size={14} />
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">{children}</div>
+      </motion.div>
+    </AnchoredPopover>
   );
 }
 
-function ProjectModelPicker({ value, onChange, models }: { value: string; onChange: (model: string) => void; models: string[] }) {
+function ProjectModelPicker({
+  value,
+  onChange,
+  models,
+  disabled = false,
+  exactCatalogOnly = false,
+}: {
+  value: string;
+  onChange: (model: string) => void;
+  models: string[];
+  disabled?: boolean;
+  exactCatalogOnly?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const [custom, setCustom] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
-    const isMobile = window.matchMedia('(max-width: 639px)').matches;
-    if (isMobile) return;
-    function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [open]);
+    if (!disabled) return;
+    setOpen(false);
+    setCustom(false);
+  }, [disabled]);
 
   if (models.length === 0) return null;
 
   return (
-    <div ref={ref} className="relative">
-      <button onClick={() => setOpen(!open)} className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.10] border border-white/[0.08] text-[11px] text-slate-400 hover:text-slate-200 transition-colors" title={value || 'Default model'}>
+    <div className="relative">
+      <button
+        ref={triggerRef}
+        type="button"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-label="Select project chat model"
+        onClick={() => setOpen(!open)}
+        disabled={disabled}
+        className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.10] border border-white/[0.08] text-[11px] text-slate-400 hover:text-slate-200 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+        title={disabled ? 'Model selection is unavailable while the project runtime is changing' : value || 'Default model'}
+      >
         <Code2 size={13} className="sm:hidden flex-shrink-0" />
         <div className="hidden sm:flex items-center gap-1.5 min-w-0 max-w-[220px]">
           {value ? <ModelMeta modelId={value} compact /> : <span className="truncate max-w-[140px]">Default model</span>}
         </div>
         <ChevronDown size={12} className={`transition-transform ${open ? 'rotate-180' : ''} hidden sm:block`} />
       </button>
-      <ModelPickerDropdown open={open} onClose={() => { setOpen(false); setCustom(false); }}>
-        <div className="p-1 max-h-80 overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
-          <button onClick={() => { onChange(''); setCustom(false); setOpen(false); }} className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs transition-colors ${!value ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'}`}>
+      <ModelPickerDropdown open={open} anchorRef={triggerRef} onClose={() => { setOpen(false); setCustom(false); }}>
+        <div className="p-1 scrollbar-thin scrollbar-thumb-white/10">
+          {!exactCatalogOnly && <button onClick={() => { onChange(''); setCustom(false); setOpen(false); }} className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs transition-colors ${!value ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'}`}>
             <span className="flex-1 text-left">Default</span>
             {!value && <Check size={12} className="text-violet-400" />}
-          </button>
+          </button>}
           {models.map((m) => (
-            <button key={m} onClick={() => { onChange(m); setCustom(false); setOpen(false); }} className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs transition-colors ${value === m ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'}`}>
+            <button key={m} aria-label={`Select model ${m}`} onClick={() => { onChange(m); setCustom(false); setOpen(false); }} className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs transition-colors ${value === m ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'}`}>
               <ModelMeta modelId={m} />
               {value === m && <Check size={12} className="text-violet-400 flex-shrink-0" />}
             </button>
           ))}
-          <div className="border-t border-white/[0.06] mt-1 pt-1">
+          {!exactCatalogOnly && <div className="border-t border-white/[0.06] mt-1 pt-1">
             {custom ? (
               <div className="px-2 py-1">
-                <input autoFocus className="w-full bg-black/30 border border-white/[0.08] rounded-lg px-2.5 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-violet-500/40" placeholder="Custom model name" value={value} onChange={(e) => onChange(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') setOpen(false); }} />
+                <input aria-label="Custom model name" autoFocus className="w-full bg-black/30 border border-white/[0.08] rounded-lg px-2.5 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-violet-500/40" placeholder="Custom model name" value={value} onChange={(e) => onChange(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') setOpen(false); }} />
               </div>
             ) : (
               <button onClick={() => setCustom(true)} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-slate-400 hover:bg-white/[0.04] hover:text-slate-200">
                 Custom model…
               </button>
             )}
-          </div>
+          </div>}
         </div>
       </ModelPickerDropdown>
     </div>
@@ -725,37 +1480,259 @@ function ProjectModelPicker({ value, onChange, models }: { value: string; onChan
 
 /* ═══ Main Component ═══ */
 
-export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPanelProps) {
+export default function ProjectChatPanel({ projectName, onClose, onActivityChange }: ProjectChatPanelProps) {
   const isMobile = useIsMobile();
+  const actorUserId = useAuthStore((state) => state.user?.id || '');
+  const actorRole = useAuthStore((state) => state.user?.role || '');
+  const hostRecoveryRole: ProjectQualificationRecoveryRole = actorRole === 'OWNER'
+    ? 'OWNER'
+    : actorRole === 'SUB_ADMIN'
+      ? 'SUB_ADMIN'
+      : 'USER';
+  const hostRecoveryAction = projectQualificationRecoveryAction(hostRecoveryRole);
 
   // Session state
   const [sessionKey, setSessionKey] = useState<string | null>(null);
   const [agentId, setAgentId] = useState<string | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<ProjectChatProviderName>('OPENCLAW');
+  const [serverSelectedProvider, setServerSelectedProvider] = useState<ProjectChatProviderName | null>(null);
+  const [projectIdentityId, setProjectIdentityId] = useState<string | null>(null);
+  const [projectChatStateVersion, setProjectChatStateVersion] = useState<number | null>(null);
+  const [providerVerificationState, setProviderVerificationState] = useState<ProjectProviderVerificationState>('unknown');
+  const [providerTransitionPending, setProviderTransitionPending] = useState(true);
+  const [selectedRuntime, setSelectedRuntime] = useState('unverified-project-runtime');
+  const [providerCapabilities, setProviderCapabilities] = useState<ProjectChatProviderCapability[]>(() => (
+    buildUnavailableProjectProviderCapabilities(
+      'Project provider verification has not completed. No provider can be selected or used yet.',
+    )
+  ));
   const [selectedModel, setSelectedModel] = useState<string>(() =>
-    canonicalizePortalModelId(localStorage.getItem(`agent-model-${projectName}`) || '')
+    canonicalizePortalModelId(
+      localStorage.getItem(`agent-model-${projectName}-OPENCLAW`)
+      || localStorage.getItem(`agent-model-${projectName}`)
+      || '',
+    )
   );
   const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [modelCatalogError, setModelCatalogError] = useState<string | null>(null);
   const [sessionReady, setSessionReady] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
+  const [projectMoveNotice, setProjectMoveNotice] = useState<{
+    projectId: string;
+    title: string;
+    message: string;
+  } | null>(null);
+  const [projectMigrationPending, setProjectMigrationPending] = useState(false);
+  const [projectMigrationError, setProjectMigrationError] = useState<string | null>(null);
   const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
+  const [boundProviders, setBoundProviders] = useState<string[]>([]);
+  const [pendingProviderSwitch, setPendingProviderSwitch] = useState<ProjectChatProviderName | null>(null);
+  const selectedProviderCapability = useMemo(
+    () => providerCapabilities.find((entry) => entry.provider === selectedProvider) || null,
+    [providerCapabilities, selectedProvider],
+  );
+  const providerSupportsAttachments = selectedProviderCapability?.supportsAttachments === true;
+  const providerSupportsModelSelection = selectedProviderCapability?.supportsModelSelection === true;
+  const providerSupportsAbort = selectedProviderCapability?.supportsAbort === true;
+  const providerSupportsReset = selectedProviderCapability?.supportsReset === true;
 
   // Chat state
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isRunning, setIsRunning] = useState(false);
+  const [terminalHistoryPending, setTerminalHistoryPending] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [isLoadingOlderHistory, setIsLoadingOlderHistory] = useState(false);
+  const [isExportingChat, setIsExportingChat] = useState(false);
+  const [olderHistoryError, setOlderHistoryError] = useState<string | null>(null);
+  const [historyPagination, setHistoryPagination] = useState<{
+    hasMore: boolean;
+    nextCursor: string | null;
+  }>({ hasMore: false, nextCursor: null });
   const [streamingPhase, setStreamingPhase] = useState<StreamingPhase>('idle');
   const [activeToolName, setActiveToolName] = useState<string | null>(null);
-  const activeToolNameRef = useRef<string | null>(null);
   const [statusText, setStatusText] = useState<string | null>(null);
+  const [pendingSend, setPendingSend] = useState<PendingProjectChatSend | null>(null);
+  const [queuedComposerMessage, setQueuedComposerMessage] = useState<string | null>(null);
+  const queuedComposerMessageRef = useRef<string | null>(null);
+  const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
+  const [pendingQuestionAnswerPending, setPendingQuestionAnswerPending] = useState(false);
+  const [pendingSendStorageError, setPendingSendStorageError] = useState<string | null>(null);
   const [thinkingContent, setThinkingContent] = useState<string>('');
   const thinkingContentRef = useRef('');
-  useEffect(() => { thinkingContentRef.current = thinkingContent; }, [thinkingContent]);
-  useEffect(() => { activeToolNameRef.current = activeToolName; }, [activeToolName]);
+  const [thinkingSubject, setThinkingSubject] = useState<string>('');
+  const thinkingSubjectRef = useRef('');
   const [pendingApprovals, setPendingApprovals] = useState<ExecApprovalRequest[]>([]);
   const pendingApproval = pendingApprovals[0] || null;
   const [compactionPhase, setCompactionPhase] = useState<'idle' | 'compacting' | 'compacted'>('idle');
   const compactionPhaseRef = useRef<'idle' | 'compacting' | 'compacted'>('idle');
-  const [wsConnected, setWsConnected] = useState(false);
+  const [transportConnected, setTransportConnected] = useState(false);
+  // "Connection lost, reconnecting…" is only true after a stream actually
+  // existed; a cold open that is still connecting for the first time must
+  // render as connecting, not as a loss.
+  const hasEverConnectedRef = useRef(false);
+  const [replayRetryNonce, setReplayRetryNonce] = useState(0);
+  const [providerRefreshNonce, setProviderRefreshNonce] = useState(0);
+  const [providerQualifications, setProviderQualifications] = useState<Partial<Record<ProjectChatProviderName, ProjectChatProviderQualificationStatus>>>({});
+  // Last preparation failure per provider so the menu drawer keeps the
+  // actionable explanation (sign-in needed, backend offline) after the
+  // transient alert banner clears.
+  const [providerQualificationFailures, setProviderQualificationFailures] = useState<Partial<
+    Record<ProjectChatProviderName, ProjectProviderQualificationFailure>
+  >>({});
+  const [qualificationRetryClock, setQualificationRetryClock] = useState(() => Date.now());
+  const [qualificationPending, setQualificationPending] = useState(false);
+  const [qualificationProgress, setQualificationProgress] = useState<ProjectQualificationProgress | null>(null);
+
+  useEffect(() => {
+    if (!actorUserId || !projectIdentityId) return;
+    const restoredFailures: Partial<
+      Record<ProjectChatProviderName, ProjectProviderQualificationFailure>
+    > = {};
+    const verifiedProviders: ProjectChatProviderName[] = [];
+    for (const provider of DIRECT_QUALIFICATION_PRIORITY) {
+      const key = automaticQualificationSuppressionKey(
+        actorUserId,
+        projectIdentityId,
+        provider,
+      );
+      if (!key) continue;
+      const qualification = providerQualifications[provider];
+      if (qualification?.status === 'QUALIFIED') {
+        clearAutomaticQualificationSuppression(key);
+        verifiedProviders.push(provider);
+        continue;
+      }
+      const suppression = readAutomaticQualificationSuppression(key);
+      if (!suppression) continue;
+      const failure = failureFromAutomaticQualificationSuppression(
+        suppression,
+        getProjectProviderLabel(provider),
+      );
+      if (failure) restoredFailures[provider] = failure;
+    }
+    if (verifiedProviders.length === 0 && Object.keys(restoredFailures).length === 0) return;
+    setProviderQualificationFailures((current) => {
+      const next = { ...current };
+      for (const provider of verifiedProviders) delete next[provider];
+      for (const [provider, failure] of Object.entries(restoredFailures)) {
+        const typedProvider = provider as ProjectChatProviderName;
+        if (!next[typedProvider] && failure) next[typedProvider] = failure;
+      }
+      return next;
+    });
+  }, [actorUserId, projectIdentityId, providerQualifications]);
+
+  useEffect(() => {
+    if (transportConnected) hasEverConnectedRef.current = true;
+  }, [transportConnected]);
+  useEffect(() => {
+    const now = Date.now();
+    const retryDeadlines = Object.values(providerQualificationFailures)
+      .map((failure) => normalizeProjectQualificationRetryAt(failure?.retryAt, now))
+      .filter((retryAt): retryAt is string => retryAt !== null)
+      .map((retryAt) => Date.parse(retryAt));
+    const suppressionDeadlines = Object.values(providerQualificationFailures)
+      .map((failure) => {
+        const value = failure?.suppressionExpiresAt;
+        if (typeof value !== 'string' || value.length === 0 || value.length > 64) return null;
+        const timestamp = Date.parse(value);
+        return Number.isFinite(timestamp)
+          && timestamp <= now + MAX_AUTOMATIC_QUALIFICATION_SUPPRESSION_TTL_MS
+          ? timestamp
+          : null;
+      })
+      .filter((timestamp): timestamp is number => timestamp !== null);
+    const nextDeadline = [...retryDeadlines, ...suppressionDeadlines]
+      .sort((left, right) => left - right)[0];
+    if (!Number.isFinite(nextDeadline)) return undefined;
+    const timeout = window.setTimeout(
+      () => {
+        const firedAt = Date.now();
+        const expiredProviders = Object.entries(providerQualificationFailures)
+          .filter(([, failure]) => {
+            const expiresAt = Date.parse(failure?.suppressionExpiresAt || '');
+            return Number.isFinite(expiresAt) && expiresAt <= firedAt;
+          })
+          .map(([provider]) => provider as ProjectChatProviderName);
+        for (const provider of expiredProviders) {
+          clearAutomaticQualificationSuppression(
+            automaticQualificationSuppressionKey(
+              actorUserId,
+              projectIdentityId,
+              provider as QualifiableProjectProvider,
+            ),
+          );
+        }
+        if (expiredProviders.length > 0) {
+          setProviderQualificationFailures((current) => {
+            const next = { ...current };
+            for (const provider of expiredProviders) delete next[provider];
+            return next;
+          });
+        }
+        setQualificationRetryClock(firedAt);
+      },
+      Math.max(25, nextDeadline - now + 25),
+    );
+    return () => window.clearTimeout(timeout);
+  }, [
+    actorUserId,
+    projectIdentityId,
+    providerQualificationFailures,
+    qualificationRetryClock,
+  ]);
+  useEffect(() => {
+    hasEverConnectedRef.current = false;
+  }, [projectName]);
+  const qualificationLeaseRef = useRef<Readonly<ProjectChatActivity> | null>(null);
+  const qualificationTokenRef = useRef(0);
+  /**
+   * Automatic qualification is a one-shot convenience, so cap it at a single
+   * attempt per mounted project/provider. Suppression bookkeeping alone is not
+   * a sufficient bound: a host that answers "qualified" while its capability
+   * readback still reports the provider unqualified clears the suppression on
+   * every pass and would otherwise spin this panel against the endpoint
+   * forever. Everything past the first attempt stays manual.
+   */
+  const automaticQualificationAttemptsRef = useRef<Set<string>>(new Set());
+  const [projectTransitionActivity, setProjectTransitionActivity] = useState<ProjectTransitionActivity | null>(null);
+  const projectTransitionActivityRef = useRef<ProjectTransitionActivity | null>(null);
+  const projectTransitionActivityTokenRef = useRef(0);
+  const onActivityChangeRef = useRef(onActivityChange);
+  onActivityChangeRef.current = onActivityChange;
+  const [agentZeroQualificationModel, setAgentZeroQualificationModel] = useState(() => (
+    canonicalizePortalModelId(localStorage.getItem(`agent-model-${projectName}-AGENT_ZERO`) || '')
+  ));
+  const [agentZeroProjectModels, setAgentZeroProjectModels] = useState<AgentZeroProjectModelOption[]>([]);
+  const [agentZeroModelsLoading, setAgentZeroModelsLoading] = useState(false);
+  const [agentZeroModelsError, setAgentZeroModelsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setQualificationProgress(null);
+    queuedComposerMessageRef.current = null;
+    setQueuedComposerMessage(null);
+    setProjectMigrationPending(false);
+    setProjectMigrationError(null);
+  }, [projectName]);
+
+  const directQualificationProvider = useMemo<QualifiableProjectProvider | null>(() => {
+    const selectedQualification = selectedProvider === 'GROK'
+      ? null
+      : providerQualifications[selectedProvider];
+    if (
+      selectedQualification
+      && selectedQualification.status !== 'QUALIFIED'
+      && selectedQualification.status !== 'UNAVAILABLE'
+    ) {
+      return selectedProvider as QualifiableProjectProvider;
+    }
+    for (const provider of DIRECT_QUALIFICATION_PRIORITY) {
+      const qualification = providerQualifications[provider];
+      if (!qualification) continue;
+      if (qualification.status !== 'QUALIFIED' && qualification.status !== 'UNAVAILABLE') return provider;
+    }
+    return Object.keys(providerQualifications).length === 0 ? 'OPENCLAW' : null;
+  }, [providerQualifications, selectedProvider]);
 
   // Input state
   const [input, setInput] = useState('');
@@ -763,16 +1740,19 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
+  const slashMenuId = React.useId();
   const [showSessionControls, setShowSessionControls] = useState(false);
   const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>('high');
-  const [reasoningVisibility, setReasoningVisibility] = useState<ReasoningVisibility>('off');
+  const [reasoningVisibility, setReasoningVisibility] = useState<ReasoningVisibility>('stream');
   const [fastModeEnabled, setFastModeEnabled] = useState(false);
-  const [thinkingPending, setThinkingPending] = useState(false);
+  const [sessionControlMutation, setSessionControlMutation] = useState<ProjectSessionControlKind | null>(null);
+  const [sessionControlError, setSessionControlError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const sessionControlsTriggerRef = useRef<HTMLButtonElement>(null);
+  const slashMenuBlurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Refs
-  const wsRef = useRef<LocalWsManager | null>(null);
   const streamingAssistantIdRef = useRef<string | null>(null);
   const assembledRef = useRef('');
   const lastSegmentStartRef = useRef(0);
@@ -785,9 +1765,407 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const compactionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionKeyRef = useRef<string | null>(null);
+  const providerRef = useRef<ProjectChatProviderName>(selectedProvider);
+  const thinkingLevelRef = useRef<ThinkingLevel>(thinkingLevel);
+  const reasoningVisibilityRef = useRef<ReasoningVisibility>(reasoningVisibility);
+  const fastModeEnabledRef = useRef(fastModeEnabled);
+  const sessionControlMutationRef = useRef<ProjectSessionControlMutation | null>(null);
+  const sessionControlGenerationRef = useRef(0);
+  const sessionControlActivityTokenRef = useRef(0);
+  const runtimeRef = useRef(selectedRuntime);
   const historyGenRef = useRef(0);
+  const olderHistoryLoadInFlightRef = useRef(false);
+  const loadOlderHistoryRef = useRef<() => void>(() => {});
   const modelRef = useRef(selectedModel);
-  const pendingAutoCommitRef = useRef(false);
+  const sendPendingRef = useRef(false);
+  const pendingQuestionsRef = useRef<AskUserQuestionRequest[]>([]);
+  const pendingQuestionsReadyRef = useRef(false);
+  const pendingQuestionPollGenerationRef = useRef(0);
+  const pendingQuestionComposerAnswerRef = useRef<{
+    id: string;
+    text: string;
+    inFlight: boolean;
+  } | null>(null);
+  const pendingActiveSteerRef = useRef<{
+    requestId: string;
+    text: string;
+    turnId: string;
+    sessionKey: string;
+    inFlight: boolean;
+  } | null>(null);
+  const pendingSendRef = useRef<PendingProjectChatSend | null>(null);
+  const replayCursorRef = useRef(0);
+  const activeReplayTurnIdRef = useRef<string | null>(null);
+  const serverSelectedProviderRef = useRef<ProjectChatProviderName | null>(null);
+  const projectChatStateVersionRef = useRef<number | null>(null);
+  const projectIdentityIdRef = useRef<string | null>(null);
+  const providerVerificationStateRef = useRef<ProjectProviderVerificationState>('unknown');
+  const providerTransitionPendingRef = useRef(true);
+  const providerCapabilitiesRef = useRef(providerCapabilities);
+  const pendingTextRenderRef = useRef<{
+    assistantId: string;
+    content: string;
+    generation: number;
+  } | null>(null);
+  const pendingThinkingRenderRef = useRef<{
+    assistantId: string | null;
+    content: string;
+    generation: number;
+  } | null>(null);
+
+  const replacePendingQuestions = useCallback((questions: AskUserQuestionRequest[]) => {
+    pendingQuestionsRef.current = questions;
+    const pendingAnswer = pendingQuestionComposerAnswerRef.current;
+    if (pendingAnswer && !questions.some((entry) => entry.id === pendingAnswer.id)) {
+      pendingQuestionComposerAnswerRef.current = null;
+      setPendingQuestionAnswerPending(false);
+    }
+    setPendingQuestions(questions);
+  }, []);
+
+  const settlePendingQuestion = useCallback((id: string) => {
+    replacePendingQuestions(pendingQuestionsRef.current.filter((entry) => entry.id !== id));
+  }, [replacePendingQuestions]);
+
+  const refreshPendingQuestions = useCallback(async () => {
+    const requestedSession = sessionKeyRef.current;
+    if (
+      !requestedSession
+      || providerRef.current !== 'OPENCLAW'
+      || serverSelectedProviderRef.current !== 'OPENCLAW'
+      || !isStreamActiveRef.current
+    ) return;
+    const generation = pendingQuestionPollGenerationRef.current;
+    const data = await gatewayAPI.pendingQuestions(requestedSession);
+    if (
+      generation !== pendingQuestionPollGenerationRef.current
+      || sessionKeyRef.current !== requestedSession
+      || providerRef.current !== 'OPENCLAW'
+      || serverSelectedProviderRef.current !== 'OPENCLAW'
+      || !isStreamActiveRef.current
+    ) return;
+    const now = Date.now();
+    replacePendingQuestions((Array.isArray(data?.questions) ? data.questions : []).filter((entry) => (
+      entry?.sessionKey === requestedSession
+      && entry.state === 'pending'
+      && entry.expiresAt > now
+      && entry.surface === 'project-chat'
+    )));
+    pendingQuestionsReadyRef.current = true;
+  }, [replacePendingQuestions]);
+
+  const claimProjectTransitionActivity = useCallback((activity: ProjectTransitionActivity) => {
+    if (
+      projectTransitionActivityRef.current
+      || qualificationLeaseRef.current
+      || sessionControlMutationRef.current
+    ) return false;
+    projectTransitionActivityRef.current = activity;
+    if (onActivityChangeRef.current?.(activity, true) === false) {
+      projectTransitionActivityRef.current = null;
+      return false;
+    }
+    setProjectTransitionActivity(activity);
+    return true;
+  }, []);
+
+  useEffect(() => {
+    if (providerTransitionPending) return;
+    const activity = projectTransitionActivityRef.current;
+    if (!activity) return;
+    projectTransitionActivityRef.current = null;
+    onActivityChangeRef.current?.(activity, false);
+    setProjectTransitionActivity(null);
+  }, [providerTransitionPending]);
+  const textRenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const thinkingRenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (slashMenuBlurTimerRef.current) {
+      clearTimeout(slashMenuBlurTimerRef.current);
+      slashMenuBlurTimerRef.current = null;
+    }
+  }, []);
+
+  const rememberPendingSend = useCallback((pending: PendingProjectChatSend | null) => {
+    pendingSendRef.current = pending;
+    setPendingSend(pending);
+  }, []);
+
+  const pendingSendScope = useMemo<ProjectChatSendScope | null>(() => (
+    actorUserId && projectIdentityId
+      ? { actorUserId, projectId: projectIdentityId, provider: selectedProvider }
+      : null
+  ), [actorUserId, projectIdentityId, selectedProvider]);
+
+  const refreshPendingSendState = useCallback((scope: ProjectChatSendScope) => {
+    try {
+      const inspected = inspectProjectChatPendingSend(scope);
+      if (inspected.status === 'corrupt') {
+        rememberPendingSend(null);
+        setPendingSendStorageError(
+          `${inspected.reason} Clear Project Chat to restore a safe delivery state.`,
+        );
+        return inspected;
+      }
+      setPendingSendStorageError(null);
+      rememberPendingSend(inspected.pending);
+      return inspected;
+    } catch (error: any) {
+      rememberPendingSend(null);
+      setPendingSendStorageError(
+        error?.message || 'Project Chat could not read its preserved delivery state.',
+      );
+      return { status: 'corrupt' as const, pending: null, reason: String(error?.message || error) };
+    }
+  }, [rememberPendingSend]);
+
+  useEffect(() => {
+    if (!pendingSendScope) {
+      rememberPendingSend(null);
+      setPendingSendStorageError(null);
+      return undefined;
+    }
+    refreshPendingSendState(pendingSendScope);
+    return subscribeProjectChatSendState(
+      pendingSendScope,
+      () => { refreshPendingSendState(pendingSendScope); },
+    );
+  }, [pendingSendScope, refreshPendingSendState, rememberPendingSend]);
+
+  const confirmPendingSend = useCallback(async (messageId: string) => {
+    const pending = pendingSendRef.current;
+    const immutableProjectId = projectIdentityIdRef.current;
+    if (!pending || pending.messageId !== messageId || !actorUserId || !immutableProjectId) return false;
+    const scope: ProjectChatSendScope = {
+      actorUserId,
+      projectId: immutableProjectId,
+      provider: pending.provider,
+    };
+    try {
+      await reconcilePendingProjectChatSend({
+        scope,
+        resolve: async (current) => (
+          current.messageId === messageId ? 'confirmed' : 'ambiguous'
+        ),
+      });
+      refreshPendingSendState(scope);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [actorUserId, refreshPendingSendState]);
+
+  const pendingSendMessageId = pendingSend?.messageId || null;
+  useEffect(() => {
+    const pending = pendingSendRef.current;
+    const immutableProjectId = projectIdentityId;
+    if (
+      !pending
+      || pending.messageId !== pendingSendMessageId
+      || !immutableProjectId
+      || pendingSendStorageError
+      || sendPendingRef.current
+    ) return undefined;
+    const scope: ProjectChatSendScope = {
+      actorUserId,
+      projectId: immutableProjectId,
+      provider: pending.provider,
+    };
+    let cancelled = false;
+    void reconcilePendingProjectChatSend({
+      scope,
+      resolve: async (current) => resolveProjectChatPendingMessageStatus({
+        scope,
+        pending: current,
+        probe: () => projectsAPI.agentMessageStatus(projectName, {
+          provider: current.provider,
+          messageId: current.messageId,
+          messageFingerprint: current.payloadFingerprint,
+        }),
+      }),
+    }).then(() => {
+      if (!cancelled) refreshPendingSendState(scope);
+    }).catch((error: any) => {
+      if (cancelled) return;
+      if (Number(error?.response?.status) === 409) {
+        setPendingSendStorageError(
+          error?.response?.data?.error
+          || 'Project Chat could not safely reconcile this preserved delivery ID. Clear Project Chat before retrying.',
+        );
+      }
+    });
+    return () => { cancelled = true; };
+  }, [
+    actorUserId,
+    pendingSendMessageId,
+    pendingSendStorageError,
+    projectIdentityId,
+    projectName,
+    refreshPendingSendState,
+  ]);
+
+  thinkingLevelRef.current = thinkingLevel;
+  reasoningVisibilityRef.current = reasoningVisibility;
+  fastModeEnabledRef.current = fastModeEnabled;
+
+  const flushPendingTextRender = useCallback(() => {
+    if (textRenderTimerRef.current) {
+      clearTimeout(textRenderTimerRef.current);
+      textRenderTimerRef.current = null;
+    }
+    const pending = pendingTextRenderRef.current;
+    pendingTextRenderRef.current = null;
+    if (!pending || pending.generation !== historyGenRef.current) return;
+    setMessages((prev) => prev.map((message) => (
+      message.id === pending.assistantId
+        ? { ...message, content: pending.content }
+        : message
+    )));
+  }, []);
+
+  const flushPendingThinkingRender = useCallback(() => {
+    if (thinkingRenderTimerRef.current) {
+      clearTimeout(thinkingRenderTimerRef.current);
+      thinkingRenderTimerRef.current = null;
+    }
+    const pending = pendingThinkingRenderRef.current;
+    pendingThinkingRenderRef.current = null;
+    if (!pending || pending.generation !== historyGenRef.current) return;
+    setThinkingContent(pending.content);
+    if (!pending.assistantId) return;
+    setMessages((prev) => prev.map((message) => (
+      message.id === pending.assistantId
+        ? { ...message, thinkingContent: pending.content || undefined }
+        : message
+    )));
+  }, []);
+
+  const flushPendingLiveRenders = useCallback(() => {
+    flushPendingTextRender();
+    flushPendingThinkingRender();
+  }, [flushPendingTextRender, flushPendingThinkingRender]);
+
+  const clearPendingLiveRenders = useCallback(() => {
+    if (textRenderTimerRef.current) clearTimeout(textRenderTimerRef.current);
+    if (thinkingRenderTimerRef.current) clearTimeout(thinkingRenderTimerRef.current);
+    textRenderTimerRef.current = null;
+    thinkingRenderTimerRef.current = null;
+    pendingTextRenderRef.current = null;
+    pendingThinkingRenderRef.current = null;
+  }, []);
+
+  const scheduleTextRender = useCallback((assistantId: string | null, content: string) => {
+    if (!assistantId) return;
+    pendingTextRenderRef.current = {
+      assistantId,
+      content,
+      generation: historyGenRef.current,
+    };
+    if (textRenderTimerRef.current) return;
+    textRenderTimerRef.current = setTimeout(
+      flushPendingTextRender,
+      getProjectChatRenderDelay(document.visibilityState),
+    );
+  }, [flushPendingTextRender]);
+
+  const scheduleThinkingRender = useCallback((assistantId: string | null, content: string) => {
+    pendingThinkingRenderRef.current = {
+      assistantId,
+      content,
+      generation: historyGenRef.current,
+    };
+    if (thinkingRenderTimerRef.current) return;
+    thinkingRenderTimerRef.current = setTimeout(
+      flushPendingThinkingRender,
+      getProjectChatRenderDelay(document.visibilityState),
+    );
+  }, [flushPendingThinkingRender]);
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') flushPendingLiveRenders();
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [flushPendingLiveRenders]);
+
+  useEffect(() => () => clearPendingLiveRenders(), [clearPendingLiveRenders]);
+
+  const providerTurnActive = isRunning || isStreamActiveRef.current;
+  const providerSwitchAllowed = canSwitchProjectProvider({
+    verificationState: providerVerificationState,
+    serverSelectedProvider,
+    turnActive: providerTurnActive,
+    transitionPending: providerTransitionPending,
+  });
+  const requiresExactModelCatalog = selectedProvider === 'OPENCLAW'
+    || selectedProvider === 'AGENT_ZERO';
+  const selectedModelIsAvailable = availableModels.includes(
+    canonicalizePortalModelId(selectedModel),
+  );
+  const providerSendAllowed = canSendToProjectProvider({
+    verificationState: providerVerificationState,
+    serverSelectedProvider,
+    renderedProvider: selectedProvider,
+    selectedCapability: selectedProviderCapability,
+    sessionReady,
+    turnActive: providerTurnActive,
+    transitionPending: providerTransitionPending,
+  }) && (
+    !requiresExactModelCatalog || selectedModelIsAvailable
+  ) && Boolean(projectIdentityId) && !pendingSendStorageError;
+  const modelCatalogBlocksInput = Boolean(modelCatalogError)
+    && providerVerificationState === 'ready'
+    && !qualificationPending;
+  const providerAcceptsActiveInput = isRunning
+    && selectedProvider === 'OPENCLAW'
+    && serverSelectedProvider === 'OPENCLAW'
+    && providerVerificationState === 'ready'
+    && !providerTransitionPending
+    && selectedProviderCapability?.selectable === true
+    && selectedProviderCapability.executionScope === 'PROJECT_SANDBOX'
+    && Boolean(sessionKey)
+    && Boolean(activeReplayTurnIdRef.current);
+  const composerAcceptsInput = providerAcceptsActiveInput
+    ? !pendingQuestionAnswerPending
+    : !isRunning
+      && !queuedComposerMessage
+      && !pendingSendStorageError
+      && !modelCatalogBlocksInput;
+  const hasVerifiedProjectConnection = providerVerificationState === 'ready'
+    && !providerTransitionPending
+    && sessionReady
+    && selectedProviderCapability?.selectable === true
+    && selectedProviderCapability.executionScope === 'PROJECT_SANDBOX'
+    && (!requiresExactModelCatalog || selectedModelIsAvailable);
+  // While a preparation is actively running, the progress panel owns the
+  // truth; rendering this failure banner beside it told the operator the
+  // check "did not complete" during its very first attempt.
+  const showUnavailableProviderBanner = (
+    providerVerificationState === 'failed'
+    || (
+      providerVerificationState === 'ready'
+      && selectedProviderCapability?.selectable !== true
+    )
+  ) && !qualificationPending && qualificationProgress === null;
+  const directQualificationFailure = directQualificationProvider
+    ? providerQualificationFailures[directQualificationProvider]
+    : undefined;
+  const unavailableProviderDetail = providerVerificationState === 'failed'
+    ? 'The isolated runtime check did not complete.'
+    : directQualificationFailure?.message
+      || 'This provider has not been prepared for this project yet.';
+  const directQualificationRetryAt = normalizeProjectQualificationRetryAt(
+    directQualificationFailure?.retryAt,
+    qualificationRetryClock,
+  );
+  const directQualificationRetryDeferred = directQualificationRetryAt !== null;
+  const directQualificationRetryBlocked = directQualificationFailure?.retryable === false
+    || directQualificationRetryDeferred;
+  const idleProjectConnectionStatus = hasVerifiedProjectConnection && !isRunning
+    ? `${selectedProviderCapability?.displayName || getProjectProviderLabel(selectedProvider)} Project agent verified and ready`
+    : null;
 
   useEffect(() => {
     const activeAssistantId = streamingAssistantIdRef.current;
@@ -813,22 +2191,6 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     });
   }, []);
 
-  const requestAutoCommit = useCallback((runModel?: string | null) => {
-    if (!pendingAutoCommitRef.current) return;
-    pendingAutoCommitRef.current = false;
-    const normalizedModel = canonicalizePortalModelId(String(runModel || modelRef.current || '')) || undefined;
-    void projectsAPI.autoCommit(projectName, normalizedModel ? { model: normalizedModel } : {})
-      .then((result) => {
-        const commit = result?.commit;
-        if (result?.committed && commit?.hash) {
-          appendSystemNotice(`Committed ${commit.hash}: ${commit.message || 'Assistant update'}`);
-        }
-      })
-      .catch((err) => {
-        console.warn('[ProjectChatPanel] Auto-commit failed:', err);
-      });
-  }, [appendSystemNotice, projectName]);
-
   const applyMaintenanceState = useCallback((update: {
     phase: 'start' | 'end';
     content?: string | null;
@@ -840,6 +2202,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     const maintenanceKind = update.maintenanceKind || 'maintenance';
 
     if (update.phase === 'start') {
+      clearPendingLiveRenders();
       const noticeText = content || (maintenanceKind === 'compaction' ? 'Compacting context…' : 'Context maintenance in progress…');
       if (compactionTimerRef.current) {
         clearTimeout(compactionTimerRef.current);
@@ -848,6 +2211,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       compactionPhaseRef.current = 'compacting';
       setCompactionPhase('compacting');
       setStatusText(noticeText);
+      thinkingContentRef.current = '';
       setThinkingContent('');
       return;
     }
@@ -878,7 +2242,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       setStatusText((prev) => (prev === noticeText ? null : prev));
       compactionTimerRef.current = null;
     }, 3000);
-  }, [appendSystemNotice]);
+  }, [appendSystemNotice, clearPendingLiveRenders]);
 
   const applyCompactionSnapshotState = useCallback((phase?: unknown) => {
     if (phase !== 'idle' && phase !== 'compacting' && phase !== 'compacted') return;
@@ -907,22 +2271,140 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   const scrollRef = useRef<HTMLDivElement>(null);
   const isScrolledUp = useRef(false);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
+  const [revealedEarlierMessages, setRevealedEarlierMessages] = useState(0);
+  const messageWindow = useMemo(
+    () => selectNewestWindow(messages, PROJECT_CHAT_MESSAGE_WINDOW_SIZE, revealedEarlierMessages),
+    [messages, revealedEarlierMessages],
+  );
+  const visibleMessageStartIndex = messages.length - messageWindow.items.length;
+  const messageRevealAnchorRef = useRef<{
+    sessionKey: string;
+    scrollHeight: number;
+    scrollTop: number;
+  } | null>(null);
+  const messageWindowSessionKey = `${projectName}:${selectedProvider}:${sessionKey || ''}`;
 
-  useEffect(() => { sessionKeyRef.current = sessionKey; }, [sessionKey]);
+  useEffect(() => {
+    messageRevealAnchorRef.current = null;
+    setRevealedEarlierMessages(0);
+  }, [messageWindowSessionKey]);
+
+  useLayoutEffect(() => {
+    const anchor = messageRevealAnchorRef.current;
+    if (!anchor) return;
+    messageRevealAnchorRef.current = null;
+    if (anchor.sessionKey !== messageWindowSessionKey) return;
+    const container = scrollRef.current;
+    if (!container) return;
+    container.scrollTop = anchor.scrollTop + Math.max(0, container.scrollHeight - anchor.scrollHeight);
+  }, [messageWindowSessionKey, revealedEarlierMessages]);
+
+  const revealEarlierMessages = useCallback(() => {
+    const container = scrollRef.current;
+    if (container) {
+      messageRevealAnchorRef.current = {
+        sessionKey: messageWindowSessionKey,
+        scrollHeight: container.scrollHeight,
+        scrollTop: container.scrollTop,
+      };
+    }
+    setRevealedEarlierMessages((current) => current + PROJECT_CHAT_MESSAGE_WINDOW_SIZE);
+  }, [messageWindowSessionKey]);
+
+  useEffect(() => {
+    sessionKeyRef.current = sessionKey;
+    providerRef.current = selectedProvider;
+    sessionControlGenerationRef.current += 1;
+    // A parent-owned session mutation must keep its navigation lease until
+    // the PATCH plus canonical readback settles. If the scope changes despite
+    // that guard, invalidate its response generation without silently
+    // releasing the immutable operation owner.
+    if (!sessionControlMutationRef.current) {
+      setSessionControlMutation(null);
+      setSessionControlError(null);
+    }
+  }, [selectedProvider, sessionKey]);
+  useEffect(() => { runtimeRef.current = selectedRuntime; }, [selectedRuntime]);
   useEffect(() => { modelRef.current = selectedModel; }, [selectedModel]);
+  useEffect(() => { serverSelectedProviderRef.current = serverSelectedProvider; }, [serverSelectedProvider]);
+  useEffect(() => { projectChatStateVersionRef.current = projectChatStateVersion; }, [projectChatStateVersion]);
+  useEffect(() => { providerVerificationStateRef.current = providerVerificationState; }, [providerVerificationState]);
+  useEffect(() => { providerTransitionPendingRef.current = providerTransitionPending; }, [providerTransitionPending]);
+  useEffect(() => { providerCapabilitiesRef.current = providerCapabilities; }, [providerCapabilities]);
+
+  useEffect(() => {
+    pendingQuestionPollGenerationRef.current += 1;
+    pendingQuestionComposerAnswerRef.current = null;
+    pendingActiveSteerRef.current = null;
+    pendingQuestionsReadyRef.current = false;
+    setPendingQuestionAnswerPending(false);
+    replacePendingQuestions([]);
+    if (
+      !isRunning
+      || selectedProvider !== 'OPENCLAW'
+      || serverSelectedProvider !== 'OPENCLAW'
+      || !sessionKey
+    ) return undefined;
+
+    let cancelled = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        await refreshPendingQuestions();
+      } catch {
+        // Keep the last confirmed card mounted. The next bounded poll retries.
+      } finally {
+        inFlight = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => {
+      if (!cancelled) void poll();
+    }, 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      pendingQuestionPollGenerationRef.current += 1;
+    };
+  }, [
+    isRunning,
+    projectName,
+    refreshPendingQuestions,
+    replacePendingQuestions,
+    selectedProvider,
+    serverSelectedProvider,
+    sessionKey,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
-    if (!sessionKey) {
+    const expectedSession = sessionKey;
+    const expectedProvider = selectedProvider;
+    const expectedGeneration = sessionControlGenerationRef.current;
+    if (!expectedSession || selectedProvider !== 'OPENCLAW') {
+      thinkingLevelRef.current = 'high';
       setThinkingLevel('high');
+      reasoningVisibilityRef.current = 'off';
       setReasoningVisibility('off');
+      fastModeEnabledRef.current = false;
       setFastModeEnabled(false);
       return;
     }
 
+    const isCurrent = () => (
+      !cancelled
+      && !sessionControlMutationRef.current
+      && sessionControlGenerationRef.current === expectedGeneration
+      && sessionKeyRef.current === expectedSession
+      && providerRef.current === expectedProvider
+    );
     gatewayAPI.sessionInfo(sessionKey, { silent: true })
       .then((data) => {
-        if (cancelled) return;
+        if (
+          !isCurrent()
+        ) return;
         const actualModel = normalizeModelId(
           {
             provider: data?.session?.modelProvider || data?.session?.currentModel?.provider,
@@ -943,10 +2425,12 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           setSelectedModel((prev) => prev === actualModel ? prev : actualModel);
         }
         if (THINKING_LEVELS.includes(rawThinking as ThinkingLevel)) {
+          thinkingLevelRef.current = rawThinking as ThinkingLevel;
           setThinkingLevel(rawThinking as ThinkingLevel);
         } else {
           const modelStr = String(actualModel || '').toLowerCase();
           const adaptiveDefault = /claude-(opus|sonnet)-4[._-](5|6|7|8|9)|claude-(opus|sonnet)-[5-9]/.test(modelStr);
+          thinkingLevelRef.current = adaptiveDefault ? 'adaptive' : 'high';
           setThinkingLevel(adaptiveDefault ? 'adaptive' : 'high');
         }
         const rawReasoning = String(
@@ -955,61 +2439,178 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           || data?.session?.settings?.reasoning
           || '',
         ).toLowerCase();
-        setReasoningVisibility(['off', 'on', 'stream'].includes(rawReasoning) ? rawReasoning as ReasoningVisibility : 'off');
-        setFastModeEnabled(Boolean(
+        if (['off', 'on', 'stream'].includes(rawReasoning)) {
+          const nextReasoning = rawReasoning as ReasoningVisibility;
+          reasoningVisibilityRef.current = nextReasoning;
+          setReasoningVisibility(nextReasoning);
+        } else {
+          // Creation defaults are a server-owned, atomic invariant. Never
+          // race a user's explicit upstream choice with a client-side patch.
+          reasoningVisibilityRef.current = 'off';
+          setReasoningVisibility('off');
+        }
+        const nextFastMode = Boolean(
           data?.session?.fastMode
           ?? data?.session?.settings?.fastMode
           ?? false,
-        ));
+        );
+        fastModeEnabledRef.current = nextFastMode;
+        setFastModeEnabled(nextFastMode);
       })
       .catch(() => {
-        if (!cancelled) {
-          setThinkingLevel('high');
-          setReasoningVisibility('off');
-          setFastModeEnabled(false);
-        }
+        if (!isCurrent()) return;
+        thinkingLevelRef.current = 'high';
+        setThinkingLevel('high');
+        reasoningVisibilityRef.current = 'off';
+        setReasoningVisibility('off');
+        fastModeEnabledRef.current = false;
+        setFastModeEnabled(false);
+        setSessionControlError(
+          'Could not read this Project session’s reasoning setting. Its existing value was left unchanged.',
+        );
       });
 
     return () => {
       cancelled = true;
     };
-  }, [sessionKey]);
+  }, [sessionKey, selectedProvider]);
 
   // Persist model selection
   useEffect(() => {
-    localStorage.setItem(`agent-model-${projectName}`, canonicalizePortalModelId(selectedModel));
-  }, [selectedModel, projectName]);
+    if (selectedProviderCapability?.supportsModelSelection !== true) return;
+    const normalized = canonicalizePortalModelId(selectedModel);
+    localStorage.setItem(`agent-model-${projectName}-${selectedProvider}`, normalized);
+    if (selectedProvider === 'OPENCLAW') {
+      localStorage.setItem(`agent-model-${projectName}`, normalized);
+    }
+  }, [selectedModel, selectedProvider, selectedProviderCapability, projectName]);
+
+  const loadAgentZeroProjectModels = useCallback(async (): Promise<string[]> => {
+    setAgentZeroModelsLoading(true);
+    setAgentZeroModelsError(null);
+    try {
+      const catalog = await projectsAPI.agentZeroProjectModels(projectName);
+      const options = (Array.isArray(catalog?.providers) ? catalog.providers : [])
+        .filter((provider) => provider.connectionState === 'connected')
+        .flatMap((provider) => (Array.isArray(provider.models) ? provider.models : []).map((model) => ({
+          value: `${provider.providerId}/${String(model.id || '').trim()}`,
+          label: `${provider.displayName} · ${String(model.displayName || model.id || '').trim()}`,
+        })))
+        .filter((option) => option.value.split('/').slice(1).join('/').trim().length > 0);
+      const uniqueOptions = Array.from(
+        new Map(options.map((option) => [option.value, option])).values(),
+      );
+      setAgentZeroProjectModels(uniqueOptions);
+      setAgentZeroQualificationModel((current) => {
+        const stored = canonicalizePortalModelId(
+          localStorage.getItem(`agent-model-${projectName}-AGENT_ZERO`) || '',
+        );
+        const candidate = canonicalizePortalModelId(current || stored);
+        return uniqueOptions.some((option) => option.value === candidate) ? candidate : '';
+      });
+      if (uniqueOptions.length === 0) {
+        setAgentZeroModelsError(
+          'Connect an Agent Zero account and verify its live model catalog before using it in this project.',
+        );
+      }
+      return uniqueOptions.map((option) => option.value);
+    } catch (error: any) {
+      setAgentZeroProjectModels([]);
+      setAgentZeroModelsError(
+        error?.response?.data?.error
+        || error?.message
+        || 'Agent Zero OAuth models could not be verified.',
+      );
+      throw error;
+    } finally {
+      setAgentZeroModelsLoading(false);
+    }
+  }, [projectName]);
+
+  useEffect(() => {
+    if (!agentZeroQualificationModel) return;
+    localStorage.setItem(
+      `agent-model-${projectName}-AGENT_ZERO`,
+      agentZeroQualificationModel,
+    );
+  }, [agentZeroQualificationModel, projectName]);
+
+  useEffect(() => {
+    const qualification = providerQualifications.AGENT_ZERO;
+    if (!qualification || qualification.status === 'QUALIFIED') return;
+    void loadAgentZeroProjectModels().catch(() => undefined);
+  }, [loadAgentZeroProjectModels, providerQualifications.AGENT_ZERO]);
 
   const loadAvailableModels = useCallback(async () => {
-    const data = await gatewayAPI.models();
-    const models = Array.isArray(data?.models)
-      ? Array.from(new Set(data.models.map((m: any) => canonicalizePortalModelId(String(m?.id || '').trim())).filter(Boolean)))
+    const requestedProvider = selectedProvider;
+    const capability = providerCapabilitiesRef.current.find((entry) => entry.provider === requestedProvider);
+    if (capability?.supportsModelSelection !== true) {
+      setAvailableModels([]);
+      setModelCatalogError(null);
+      return [];
+    }
+    const models: string[] = requestedProvider === 'AGENT_ZERO'
+      ? await loadAgentZeroProjectModels()
       : [];
+    if (requestedProvider !== 'AGENT_ZERO') {
+      const data = requestedProvider === 'OPENCLAW'
+        ? await projectsAPI.projectChatModels(projectName)
+        : await gatewayAPI.models(requestedProvider);
+      models.push(...(
+        Array.isArray(data?.models)
+          ? Array.from(new Set(data.models.map((m: any) => canonicalizePortalModelId(String(m?.id || '').trim())).filter(Boolean))) as string[]
+          : []
+      ));
+    }
+    if (providerRef.current !== requestedProvider) return [];
     setAvailableModels(models);
+    setModelCatalogError(
+      requestedProvider === 'OPENCLAW' && models.length === 0
+        ? 'No authenticated embedded model is available for this OpenClaw Project agent. Reconnect a supported provider, then retry.'
+        : null,
+    );
     // If no model selected or selected model isn't available, pick the first discovered option.
     // Provider-owned aliases are resolved against the live catalog while preserving
     // the user's selected provider family when both aliases are present.
     setSelectedModel(prev => {
+      if (requestedProvider === 'OPENCLAW' && models.length === 0) {
+        return prev;
+      }
+      if (requestedProvider === 'AGENT_ZERO') {
+        const exact = canonicalizePortalModelId(prev);
+        return models.includes(exact) ? exact : '';
+      }
       const resolved = resolveAvailableModelId(prev, models);
       return resolved || models[0] || '';
     });
     return models;
-  }, []);
+  }, [loadAgentZeroProjectModels, projectName, selectedProvider]);
 
   useEffect(() => {
+    if (!providerSupportsModelSelection) {
+      setAvailableModels([]);
+      setModelCatalogError(null);
+      return;
+    }
     let cancelled = false;
     const timer = window.setTimeout(() => {
       loadAvailableModels().catch((err) => {
         if (!cancelled) {
+          setAvailableModels([]);
+          setModelCatalogError(
+            selectedProvider === 'OPENCLAW'
+              ? 'Portal could not verify an authenticated embedded model for this OpenClaw Project agent. Reconnect a supported provider, then retry.'
+              : null,
+          );
           console.error('[ProjectChatPanel] Failed to load models:', err);
         }
       });
-    }, 1200);
+    }, selectedProvider === 'OPENCLAW' ? 0 : 1200);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [loadAvailableModels]);
+  }, [loadAvailableModels, providerSupportsModelSelection, selectedProvider]);
 
   // Mark session as active for auto-restore
   useEffect(() => {
@@ -1025,7 +2626,20 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     const up = dist > 80;
     setShowScrollBtn(up);
     isScrolledUp.current = up;
-  }, []);
+    if (el.scrollTop <= 48 && !isLoadingHistory && !isLoadingOlderHistory) {
+      if (messageWindow.hiddenCount > 0) {
+        revealEarlierMessages();
+      } else if (historyPagination.hasMore) {
+        loadOlderHistoryRef.current();
+      }
+    }
+  }, [
+    historyPagination.hasMore,
+    isLoadingHistory,
+    isLoadingOlderHistory,
+    messageWindow.hiddenCount,
+    revealEarlierMessages,
+  ]);
 
   const scrollToBottom = useCallback((smooth = true) => {
     const el = scrollRef.current;
@@ -1047,88 +2661,29 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
   }, [isRunning, scrollToBottom]);
 
   // ── Watchdog ──
-  // Claude/fable turns can go quiet for several minutes between text, tool, and
-  // thinking bursts. Keep Project Chat aligned with main Agent Chat so it does
-  // not clear a healthy long-running turn at the old 3-minute cliff.
-  const STREAM_TIMEOUT_MS = 10 * 60_000;
-
+  // The durable poll loop resets this while Portal still reports an active
+  // turn. It therefore measures loss of the Portal replay transport, not gaps
+  // between provider text/tool/thinking events. Transport silence must never
+  // invent a terminal event: the durable replay cursor remains authoritative.
   const resetWatchdog = useCallback(() => {
     if (watchdogRef.current) clearTimeout(watchdogRef.current);
     if (!isStreamActiveRef.current) return;
-    watchdogRef.current = setTimeout(async () => {
-      if (!isStreamActiveRef.current) return;
-      const sk = sessionKeyRef.current;
-      const currentToolName = activeToolNameRef.current;
-
-      try {
-        if (sk) {
-          const { data } = await client.get('/gateway/stream-status', {
-            params: { session: sk, provider: 'OPENCLAW' },
-            _silent: true,
-          } as any);
-
-          if (data?.active) {
-            const phase: StreamingPhase = data.phase === 'tool'
-              ? 'tool'
-              : data.phase === 'streaming'
-                ? 'streaming'
-                : 'thinking';
-            const runningTool = Array.isArray(data.toolCalls)
-              ? getLastRunningToolCall(data.toolCalls as ToolCall[])
-              : null;
-            const snapshotToolName = resolveToolName(data.toolName, data.name, runningTool?.name, currentToolName || undefined);
-            const rawStatusText = getRailSafeStatusText(typeof data.statusText === 'string' ? data.statusText.trim() : '');
-            const fallbackStatus = snapshotToolName
-              ? getToolStatusText(snapshotToolName)
-              : phase === 'streaming'
-                ? 'Still responding…'
-                : 'Still working…';
-
-            isStreamActiveRef.current = true;
-            setIsRunning(true);
-            setStreamingPhase(phase);
-            setActiveToolName(snapshotToolName || null);
-            setStatusText(rawStatusText || fallbackStatus);
-            applyCompactionSnapshotState(data.compactionPhase);
-            resetWatchdog();
-            return;
-          }
+    const arm = () => {
+      watchdogRef.current = setTimeout(() => {
+        watchdogRef.current = null;
+        if (!isStreamActiveRef.current) return;
+        // Browsers can suspend hidden tabs for hours. Keep the durable turn
+        // alive without causing background-only render churn or a false error.
+        if (document.visibilityState !== 'hidden') {
+          setTransportConnected(false);
+          setConnectionNotice('Durable replay is delayed — reconnecting…');
+          setStatusText('Waiting for durable replay…');
         }
-      } catch (err) {
-        console.warn('[ProjectChat] Stream watchdog verification failed:', err);
-        if (currentToolName || hasRealToolEventsRef.current || compactionPhaseRef.current !== 'idle') {
-          setIsRunning(true);
-          setStreamingPhase(currentToolName ? 'tool' : 'thinking');
-          setStatusText(currentToolName ? getToolStatusText(currentToolName) : 'Reconnecting to stream…');
-          resetWatchdog();
-          return;
-        }
-      }
-
-      const cid = streamingAssistantIdRef.current;
-      const ft = assembledRef.current.substring(lastSegmentStartRef.current);
-      const shouldHideTurn = !ft.trim() && !hasRealToolEventsRef.current && !thinkingContentRef.current.trim();
-      isStreamActiveRef.current = false;
-      setIsRunning(false);
-      setStreamingPhase('idle');
-      setStatusText(null);
-      setThinkingContent('');
-      setActiveToolName(null);
-      compactionPhaseRef.current = 'idle';
-      setCompactionPhase('idle');
-      if (compactionTimerRef.current) { clearTimeout(compactionTimerRef.current); compactionTimerRef.current = null; }
-      if (cid) {
-        if (shouldHideTurn) {
-          setMessages(prev => prev.filter(m => m.id !== cid));
-        } else if (ft) {
-          setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: ft + '\n\n*(stream interrupted)*' } : m));
-        }
-        streamingAssistantIdRef.current = null;
-      }
-      resumeSeededContentRef.current = false;
-      suppressLiveBubbleContentRef.current = false;
-    }, STREAM_TIMEOUT_MS);
-  }, [applyCompactionSnapshotState]);
+        arm();
+      }, PROJECT_STREAM_TIMEOUT_MS);
+    };
+    arm();
+  }, []);
 
   const clearWatchdog = useCallback(() => {
     if (watchdogRef.current) { clearTimeout(watchdogRef.current); watchdogRef.current = null; }
@@ -1162,7 +2717,6 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     snapshot: any,
     expectedSession: string,
     expectedGen: number,
-    manager?: LocalWsManager | null,
   ) => {
     if (!snapshot?.active || isStaleSessionLoad(expectedSession, expectedGen)) return false;
 
@@ -1243,26 +2797,40 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       )));
     }
 
-    manager?.send({ type: 'reconnect', session: expectedSession, provider: 'OPENCLAW' });
     resetWatchdog();
     return true;
   }, [applyCompactionSnapshotState, ensureStreamingAssistant, isStaleSessionLoad, resetWatchdog]);
 
   const loadHistorySnapshot = useCallback(async (
     session: string,
-    options: { expectedGen?: number; manager?: LocalWsManager | null; hydrateActiveStream?: boolean } = {},
+    options: { expectedGen?: number } = {},
   ) => {
     const expectedGen = options.expectedGen ?? historyGenRef.current;
-    const { data } = await client.get('/gateway/history', {
-      params: { session, provider: 'OPENCLAW', enhanced: '1' },
-      _silent: true,
-    } as any);
+    const provider = providerRef.current;
+    const portalData = await projectsAPI.chatHistory(projectName, provider, {
+      limit: PROJECT_CHAT_HISTORY_PAGE_SIZE,
+    });
 
     if (isStaleSessionLoad(session, expectedGen)) return null;
 
-    const loaded = data?.messages ? data.messages.map(parseHistoryMessage).filter(Boolean) as ChatMessage[] : [];
+    const portalMessages = Array.isArray(portalData?.messages) ? portalData.messages : [];
+    const pending = pendingSendRef.current;
+    if (pending && await historyConfirmsPendingProjectChatSend(pending, portalMessages)) {
+      await confirmPendingSend(pending.messageId);
+    }
+    const loaded = parseProjectChatHistoryMessages(
+      portalMessages,
+      provider,
+      runtimeRef.current,
+    );
+    const pagination = portalData?.pagination;
+    setHistoryPagination({
+      hasMore: pagination?.hasMore === true && typeof pagination?.nextCursor === 'string',
+      nextCursor: typeof pagination?.nextCursor === 'string' ? pagination.nextCursor : null,
+    });
+    setOlderHistoryError(null);
     setMessages(prev => {
-      const next = dedupeHistoryMessages(loaded);
+      const next = loaded;
 
       const historyUserContent = new Set(
         next
@@ -1282,15 +2850,96 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     });
     setSessionError(null);
 
-    if (options.hydrateActiveStream !== false && data?.activeStream?.active) {
-      applyActiveStreamSnapshot(data.activeStream, session, expectedGen, options.manager || null);
+    return { messages: loaded };
+  }, [confirmPendingSend, isStaleSessionLoad, projectName]);
+
+  const loadOlderHistory = useCallback(async () => {
+    if (
+      olderHistoryLoadInFlightRef.current
+      || !historyPagination.hasMore
+      || !historyPagination.nextCursor
+    ) return;
+
+    const expectedGen = historyGenRef.current;
+    const expectedSession = sessionKeyRef.current || '';
+    const expectedProvider = providerRef.current;
+    const cursor = historyPagination.nextCursor;
+    const container = scrollRef.current;
+    if (container) {
+      messageRevealAnchorRef.current = {
+        sessionKey: messageWindowSessionKey,
+        scrollHeight: container.scrollHeight,
+        scrollTop: container.scrollTop,
+      };
     }
 
-    return { messages: loaded, activeStream: data?.activeStream || null };
-  }, [applyActiveStreamSnapshot, isStaleSessionLoad]);
+    olderHistoryLoadInFlightRef.current = true;
+    setIsLoadingOlderHistory(true);
+    setOlderHistoryError(null);
+    try {
+      const page = await projectsAPI.chatHistory(projectName, expectedProvider, {
+        limit: PROJECT_CHAT_HISTORY_PAGE_SIZE,
+        before: cursor,
+      });
+      if (
+        historyGenRef.current !== expectedGen
+        || (sessionKeyRef.current || '') !== expectedSession
+        || providerRef.current !== expectedProvider
+      ) return;
+
+      const olderPortalMessages = Array.isArray(page?.messages) ? page.messages : [];
+      const pending = pendingSendRef.current;
+      if (pending && await historyConfirmsPendingProjectChatSend(pending, olderPortalMessages)) {
+        await confirmPendingSend(pending.messageId);
+      }
+      const older = parseProjectChatHistoryMessages(
+        olderPortalMessages,
+        expectedProvider,
+        runtimeRef.current,
+      );
+      setMessages((current) => mergeProjectChatHistoryPages(older, current));
+      if (older.length > 0) {
+        setRevealedEarlierMessages((current) => current + older.length);
+      } else {
+        messageRevealAnchorRef.current = null;
+      }
+      setHistoryPagination({
+        hasMore: page?.pagination?.hasMore === true
+          && typeof page?.pagination?.nextCursor === 'string',
+        nextCursor: typeof page?.pagination?.nextCursor === 'string'
+          ? page.pagination.nextCursor
+          : null,
+      });
+    } catch (error: any) {
+      messageRevealAnchorRef.current = null;
+      setOlderHistoryError(
+        String(error?.response?.data?.error || error?.message || 'Earlier Project Chat history could not be loaded.'),
+      );
+    } finally {
+      olderHistoryLoadInFlightRef.current = false;
+      if (
+        historyGenRef.current === expectedGen
+        && (sessionKeyRef.current || '') === expectedSession
+        && providerRef.current === expectedProvider
+      ) {
+        setIsLoadingOlderHistory(false);
+      }
+    }
+  }, [
+    historyPagination.hasMore,
+    historyPagination.nextCursor,
+    messageWindowSessionKey,
+    confirmPendingSend,
+    projectName,
+  ]);
+
+  useEffect(() => {
+    loadOlderHistoryRef.current = () => { void loadOlderHistory(); };
+  }, [loadOlderHistory]);
 
   const clearResumeSeededContent = useCallback((assistantId?: string | null) => {
     if (!resumeSeededContentRef.current) return;
+    flushPendingLiveRenders();
     resumeSeededContentRef.current = false;
     assembledRef.current = '';
     lastSegmentStartRef.current = 0;
@@ -1299,9 +2948,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     if (cid) {
       setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: '' } : m));
     }
-  }, []);
+  }, [flushPendingLiveRenders]);
 
   const finalizeStreamingAssistant = useCallback(() => {
+    flushPendingLiveRenders();
     const cid = streamingAssistantIdRef.current;
     const finalContent = assembledRef.current.substring(lastSegmentStartRef.current) || assembledRef.current || '';
     if (cid) {
@@ -1324,73 +2974,78 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       }
     }
     isStreamActiveRef.current = false;
+    thinkingContentRef.current = '';
+    setThinkingContent('');
+    thinkingSubjectRef.current = '';
+    setThinkingSubject('');
     resumeSeededContentRef.current = false;
     suppressLiveBubbleContentRef.current = false;
     streamingAssistantIdRef.current = null;
-  }, []);
-
-  const syncStreamState = useCallback(async (
-    manager: LocalWsManager | null,
-    options: { reloadHistoryIfIdle?: boolean } = {},
-    context: { expectedSession?: string; expectedGen?: number } = {},
-  ) => {
-    const currentSession = context.expectedSession || sessionKeyRef.current;
-    const expectedGen = context.expectedGen ?? historyGenRef.current;
-    if (!currentSession) return false;
-
-    const { data } = await client.get('/gateway/stream-status', {
-      params: { session: currentSession, provider: 'OPENCLAW' },
-      _silent: true,
-    } as any);
-
-    if (isStaleSessionLoad(currentSession, expectedGen)) return false;
-
-    if (data.active) {
-      return applyActiveStreamSnapshot(data, currentSession, expectedGen, manager);
-    }
-
-    clearWatchdog();
-    if (isStreamActiveRef.current) {
-      isStreamActiveRef.current = false;
-      suppressLiveBubbleContentRef.current = false;
-      setIsRunning(false);
-      setStreamingPhase('idle');
-      setStatusText(null);
-      setActiveToolName(null);
-      applyCompactionSnapshotState('idle');
-      streamingAssistantIdRef.current = null;
-    }
-
-    if (options.reloadHistoryIfIdle) {
-      setIsLoadingHistory(true);
-      try {
-        await loadHistorySnapshot(currentSession, {
-          expectedGen,
-          manager,
-          hydrateActiveStream: false,
-        });
-      } finally {
-        if (!isStaleSessionLoad(currentSession, expectedGen)) {
-          setIsLoadingHistory(false);
-        }
-      }
-    }
-
-    return false;
-  }, [applyActiveStreamSnapshot, applyCompactionSnapshotState, clearWatchdog, isStaleSessionLoad, loadHistorySnapshot]);
+  }, [flushPendingLiveRenders]);
 
   const appendThinkingChunk = useCallback((assistantId: string | null, chunk: string, opts?: { replace?: boolean }) => {
     if (!chunk) return;
     const nextThinking = mergeThinkingStream(thinkingContentRef.current, chunk, opts);
     thinkingContentRef.current = nextThinking;
-    setThinkingContent(nextThinking);
-    if (!assistantId) return;
-    setMessages(prev => prev.map(m =>
-      m.id === assistantId
-        ? { ...m, thinkingContent: mergeThinkingStream(m.thinkingContent || '', chunk, opts) }
-        : m
-    ));
-  }, []);
+    scheduleThinkingRender(assistantId, nextThinking);
+  }, [scheduleThinkingRender]);
+
+  const graduateLiveThinkingPhase = useCallback((assistantId?: string | null) => {
+    flushPendingLiveRenders();
+    const text = thinkingContentRef.current;
+    const subject = thinkingSubjectRef.current;
+    if (!text.trim() && !subject) return false;
+    const targetId = assistantId || streamingAssistantIdRef.current;
+    if (targetId) {
+      const ts = Date.now();
+      setMessages((previous) => previous.map((message) => (
+        message.id === targetId
+          ? {
+              ...message,
+              segments: [
+                ...(message.segments || []),
+                {
+                  text,
+                  ...(subject ? { subject } : {}),
+                  kind: 'thinking',
+                  position: 'after',
+                  ts,
+                },
+              ],
+            }
+          : message
+      )));
+    }
+    thinkingContentRef.current = '';
+    setThinkingContent('');
+    thinkingSubjectRef.current = '';
+    setThinkingSubject('');
+    return true;
+  }, [flushPendingLiveRenders]);
+
+  const applyLiveThinkingSubject = useCallback((
+    assistantId: string | null,
+    rawSubject: unknown,
+  ) => {
+    const subject = sanitizeThinkingSubject(rawSubject);
+    if (!subject) return '';
+    if (
+      subject !== thinkingSubjectRef.current
+      && (thinkingContentRef.current.trim() || thinkingSubjectRef.current)
+    ) {
+      graduateLiveThinkingPhase(assistantId);
+    }
+    thinkingSubjectRef.current = subject;
+    setThinkingSubject(subject);
+    if (assistantId) {
+      setMessages((previous) => previous.map((message) => (
+        message.id === assistantId
+          ? { ...message, thinkingSubject: subject }
+          : message
+      )));
+    }
+    return subject;
+  }, [graduateLiveThinkingPhase]);
 
   const resolveApproval = useCallback(async (
     approvalId: string,
@@ -1434,10 +3089,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     return () => clearInterval(interval);
   }, [pendingApprovals.length]);
 
-  // ── WS Event Handler ──
-  const handleWsEvent = useCallback((rawData: any) => {
+  // ── Durable replay event handler ──
+  const handleReplayEvent = useCallback((rawData: any) => {
     const data = normalizePortalStreamEventFromTurnEvent(rawData);
-    setWsConnected(true);
+    setTransportConnected(true);
     setConnectionNotice(null);
     const passthrough = ['connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_status', 'stream_ended', 'run_resumed', 'exec_approval', 'exec_approval_resolved'];
     const autoCreateBubbleTypes = ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
@@ -1493,6 +3148,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       case 'thinking': {
         if (!assistantId && !isStreamActiveRef.current) break;
         clearResumeSeededContent(assistantId);
+        applyLiveThinkingSubject(assistantId, data.subject);
         appendThinkingChunk(
           assistantId,
           extractThinkingChunk('thinking', data.content, assembledRef.current.length > 0),
@@ -1535,6 +3191,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       case 'tool_start': {
         clearResumeSeededContent(assistantId);
         hasRealToolEventsRef.current = true;
+        graduateLiveThinkingPhase(assistantId);
         const toolName = resolveToolName(data.toolName, data.name, data.content, 'tool');
         if (assembledRef.current && assembledRef.current.trim().length > 0) {
           lastSegmentStartRef.current = lastRawTextLenRef.current;
@@ -1542,7 +3199,9 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setStatusText(getToolStatusText(toolName));
         setStreamingPhase('tool');
         setActiveToolName(toolName);
-        const toolId = 'tool-' + (++toolCounterRef.current);
+        const toolId = typeof data.toolCallId === 'string' && data.toolCallId.trim()
+          ? data.toolCallId.trim()
+          : `tool-${String(data.runId || activeReplayTurnIdRef.current || 'run')}-${String(data.seq || ++toolCounterRef.current)}`;
         const toolArgs = data.toolArgs || undefined;
         setMessages(prev => appendToolCallToMessage(prev, assistantId, buildRunningToolCall({
           id: toolId,
@@ -1570,7 +3229,9 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         const toolResult = data.toolResult || data.content || 'Completed';
         let nextRunningToolName: string | null = null;
         setMessages(prev => {
-          const projection = finishRunningToolCallInMessage(prev, assistantId, {
+          const projection = finishMatchingToolCallInMessage(prev, assistantId, {
+            toolCallId: data.toolCallId,
+            toolName: resolveToolName(data.toolName, data.name, data.content, 'tool'),
             result: String(toolResult),
             status: data.status,
           });
@@ -1646,6 +3307,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         break;
       }
       case 'segment_break': {
+        flushPendingLiveRenders();
         const ct = assembledRef.current.substring(lastSegmentStartRef.current);
         if (ct.trim()) {
           setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, content: ct } : m));
@@ -1675,11 +3337,13 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         setStreamingPhase('streaming');
         setActiveToolName(null);
         const cid = streamingAssistantIdRef.current;
-        setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: st } : m));
+        scheduleTextRender(cid, st);
         break;
       }
       case 'done': {
         clearWatchdog();
+        flushPendingLiveRenders();
+        const hadLiveThinking = graduateLiveThinkingPhase(assistantId);
         const fst = assembledRef.current.substring(lastSegmentStartRef.current);
         const rawFinal = typeof data.content === 'string' ? data.content : '';
         const hasFinal = rawFinal.length > 0 && !isControlOrMaintenanceAssistantContent(rawFinal);
@@ -1692,11 +3356,20 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             : (typeof data?.model === 'string' ? data.model : '')
         );
         const cid = streamingAssistantIdRef.current;
-        const shouldHideTurn = !fc.trim() && !hasRealToolEventsRef.current && !thinkingContentRef.current.trim();
+        const shouldHideTurn = !fc.trim()
+          && !hasRealToolEventsRef.current
+          && !hadLiveThinking;
         setStatusText(null);
         setStreamingPhase('idle');
         setIsRunning(false);
+        // Execution is terminal, but the durable assistant row may still be
+        // committing. Keep a separate hydration retry alive after the live
+        // poll state becomes idle.
+        setTerminalHistoryPending(true);
+        thinkingContentRef.current = '';
         setThinkingContent('');
+        thinkingSubjectRef.current = '';
+        setThinkingSubject('');
         setPendingApprovals([]);
         if (compactionPhaseRef.current === 'compacting') {
           compactionPhaseRef.current = 'idle';
@@ -1716,20 +3389,24 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             ));
           }
         }
-        requestAutoCommit(model || modelRef.current);
         break;
       }
       case 'error': {
+        flushPendingLiveRenders();
+        graduateLiveThinkingPhase(assistantId);
         if (assistantId) {
           setMessages(prev => prev.map(m =>
             m.id === assistantId ? { ...m, content: '⚠️ ' + (data.content || 'Unknown error') } : m
           ));
         }
-        pendingAutoCommitRef.current = false;
         setStatusText(null);
         setStreamingPhase('idle');
+        thinkingContentRef.current = '';
         setThinkingContent('');
+        thinkingSubjectRef.current = '';
+        setThinkingSubject('');
         setIsRunning(false);
+        setTerminalHistoryPending(true);
         setPendingApprovals([]);
         isStreamActiveRef.current = false;
         streamingAssistantIdRef.current = null;
@@ -1782,14 +3459,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           const st = fullText.substring(lastSegmentStartRef.current);
           assembledRef.current = fullText;
           const cid = streamingAssistantIdRef.current;
-          setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: st } : m));
+          scheduleTextRender(cid, st);
         } else {
           resumeSeededContentRef.current = false;
         }
         break;
       }
       case 'connected':
-        setWsConnected(true);
+        setTransportConnected(true);
         setConnectionNotice(null);
         break;
       case 'run_resumed': {
@@ -1804,19 +3481,13 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         break;
       }
       case 'stream_ended':
-        setIsRunning(false);
-        setStreamingPhase('idle');
-        setStatusText(null);
-        setThinkingContent('');
         setPendingApprovals([]);
-        setActiveToolName(null);
         clearWatchdog();
         finalizeStreamingAssistant();
-        requestAutoCommit(modelRef.current);
         break;
       case 'stream_status':
         if (data.active) {
-          applyActiveStreamSnapshot(data, sessionKeyRef.current || '', historyGenRef.current, wsRef.current);
+          applyActiveStreamSnapshot(data, sessionKeyRef.current || '', historyGenRef.current);
           break;
         }
         if (isStreamActiveRef.current && (data.safeToClear === true || data.inactiveReason === 'terminal' || data.inactiveReason === 'stale')) {
@@ -1825,7 +3496,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           setIsRunning(false);
           setStreamingPhase('idle');
           setStatusText(null);
+          thinkingContentRef.current = '';
           setThinkingContent('');
+          thinkingSubjectRef.current = '';
+          setThinkingSubject('');
           setPendingApprovals([]);
           setActiveToolName(null);
           streamingAssistantIdRef.current = null;
@@ -1836,131 +3510,351 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       case 'keepalive':
         break;
     }
-  }, [activeToolName, applyActiveStreamSnapshot, applyMaintenanceState, clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, thinkingContent, finalizeStreamingAssistant, requestAutoCommit]);
+  }, [activeToolName, appendSystemNotice, applyActiveStreamSnapshot, applyLiveThinkingSubject, applyMaintenanceState, clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, ensureStreamingAssistant, finalizeStreamingAssistant, flushPendingLiveRenders, graduateLiveThinkingPhase, scheduleTextRender]);
 
-  const handleWsEventRef = useRef(handleWsEvent);
-  useEffect(() => { handleWsEventRef.current = handleWsEvent; }, [handleWsEvent]);
+  const handleReplayEventRef = useRef(handleReplayEvent);
+  useEffect(() => { handleReplayEventRef.current = handleReplayEvent; }, [handleReplayEvent]);
 
-  // ── Ensure session + WS setup on mount ──
+  // ── Verify the provider session and restore its durable replay on mount ──
   useEffect(() => {
     let cancelled = false;
-    let cleanupTransport: (() => void) | null = null;
+    clearPendingLiveRenders();
+    thinkingContentRef.current = '';
+    setThinkingContent('');
     const myGen = ++historyGenRef.current;
+    olderHistoryLoadInFlightRef.current = false;
+    messageRevealAnchorRef.current = null;
+    setIsLoadingOlderHistory(false);
+    setOlderHistoryError(null);
+    setHistoryPagination({ hasMore: false, nextCursor: null });
 
     async function init() {
+      let resolvedProviderState: ReturnType<typeof resolveProjectProviderCapabilities> | null = null;
+      let sessionHandshakeCompleted = false;
+      let initialHistoryLoad: Promise<{ messages: ChatMessage[] } | null> | null = null;
       try {
+        projectIdentityIdRef.current = null;
+        setProjectIdentityId(null);
+        providerVerificationStateRef.current = 'verifying';
+        setProviderVerificationState('verifying');
+        providerTransitionPendingRef.current = true;
+        setProviderTransitionPending(true);
+        serverSelectedProviderRef.current = null;
+        setServerSelectedProvider(null);
+        const pendingCapabilities = buildUnavailableProjectProviderCapabilities(
+          'Project provider verification is in progress. No provider can be selected or used yet.',
+        );
+        providerCapabilitiesRef.current = pendingCapabilities;
+        setProviderCapabilities(pendingCapabilities);
         setIsLoadingHistory(true);
         setSessionReady(false);
         setSessionError(null);
-        setWsConnected(false);
-        setConnectionNotice('Connecting to project agent…');
+        setProjectMoveNotice(null);
+        setTransportConnected(false);
+        setConnectionNotice('Preparing sandbox → Connecting agent');
 
-        const { data } = await client.post(
-          `/projects/${projectName}/assistant/ensure-session`,
-          {}
-        );
+        let capabilityData = await projectsAPI.projectChatProviders(projectName);
+        if (capabilityData?.migration?.required === true) {
+          const { projectId, title, message } = capabilityData.migration;
+          if (!projectId?.trim() || !title?.trim() || !message?.trim()) {
+            throw new Error('Portal returned an incomplete project move instruction.');
+          }
+          if (cancelled || historyGenRef.current !== myGen) return;
+          setProjectMoveNotice({ projectId, title, message });
+          providerVerificationStateRef.current = 'failed';
+          setProviderVerificationState('failed');
+          providerTransitionPendingRef.current = false;
+          setProviderTransitionPending(false);
+          setConnectionNotice(null);
+          setIsLoadingHistory(false);
+          return;
+        }
+        const runtimeTransitionDeadline = Date.now() + (5 * 60_000);
+        let runtimeTransitionAttempt = 0;
+        while (
+          capabilityData?.coordination?.runtimeTransitionActive === true
+          && !capabilityData?.coordination?.activeTurn
+        ) {
+          if (cancelled || historyGenRef.current !== myGen) return;
+          setConnectionNotice('Another tab is preparing the project runtime — waiting for it to finish…');
+          if (Date.now() >= runtimeTransitionDeadline) {
+            throw new Error('The project runtime transition did not finish before its admission lease expired.');
+          }
+          const retryDelay = Math.min(1_000, 100 + (runtimeTransitionAttempt * 100));
+          runtimeTransitionAttempt += 1;
+          await new Promise((resolve) => setTimeout(resolve, retryDelay));
+          if (cancelled || historyGenRef.current !== myGen) return;
+          capabilityData = await projectsAPI.projectChatProviders(projectName);
+        }
         if (cancelled || historyGenRef.current !== myGen) return;
+        const verifiedProjectId = typeof capabilityData?.executionContext?.projectId === 'string'
+          ? capabilityData.executionContext.projectId.trim()
+          : '';
+        if (
+          capabilityData?.executionContext?.scope !== 'PROJECT_SANDBOX'
+          || !verifiedProjectId
+        ) {
+          throw new Error('Portal did not return a verified immutable Project Chat identity.');
+        }
+        projectIdentityIdRef.current = verifiedProjectId;
+        setProjectIdentityId(verifiedProjectId);
+        setProviderQualifications(presentProjectProviderQualifications(capabilityData?.qualifications));
+        setBoundProviders(
+          Array.isArray(capabilityData?.bindings)
+            ? capabilityData.bindings.map((entry: any) => String(entry?.provider || '')).filter(Boolean)
+            : [],
+        );
+        const stateVersion = capabilityData?.coordination?.stateVersion;
+        if (!Number.isSafeInteger(stateVersion) || stateVersion < 0) {
+          throw new Error('Portal did not return a valid Project Chat coordination version.');
+        }
+        projectChatStateVersionRef.current = stateVersion;
+        setProjectChatStateVersion(stateVersion);
+        resolvedProviderState = resolveProjectProviderCapabilities(capabilityData);
+        providerCapabilitiesRef.current = resolvedProviderState.providers;
+        setProviderCapabilities(resolvedProviderState.providers);
+        if (!resolvedProviderState.activeProvider || !resolvedProviderState.activeCapability) {
+          throw new Error(resolvedProviderState.error || 'Project provider verification failed');
+        }
+        const provider = resolvedProviderState.activeProvider;
+        const providerCapability = resolvedProviderState.activeCapability;
+        const activeTurn = capabilityData?.coordination?.activeTurn || null;
+        if (
+          activeTurn
+          && (
+            typeof activeTurn.id !== 'string'
+            || !activeTurn.id.trim()
+            || activeTurn.provider !== provider
+          )
+        ) {
+          throw new Error('Portal returned an invalid active Project provider turn.');
+        }
+        activeReplayTurnIdRef.current = activeTurn?.id || null;
+        serverSelectedProviderRef.current = provider;
+        setServerSelectedProvider(provider);
+        providerRef.current = provider;
+        runtimeRef.current = providerCapability.runtime;
+        setSelectedRuntime(providerCapability.runtime);
+        if (provider !== selectedProvider) setSelectedProvider(provider);
+        if (resolvedProviderState.error) {
+          providerVerificationStateRef.current = 'ready';
+          setProviderVerificationState('ready');
+          providerTransitionPendingRef.current = false;
+          setProviderTransitionPending(false);
+          setConnectionNotice(null);
+          setQualificationProgress(null);
+          setSessionError(resolvedProviderState.error);
+          setIsLoadingHistory(false);
+          return;
+        }
 
-        const { sessionKey: sk, agentId: aid, model: m } = data;
+        const providerModel = providerCapability.supportsModelSelection
+          ? canonicalizePortalModelId(
+              capabilityData?.qualifiedModels?.[provider as Exclude<ProjectChatProviderName, 'GROK'>]
+              || capabilityData?.bindings?.find((entry) => entry.provider === provider)?.model
+              || (
+                provider !== 'OPENCLAW'
+                  ? localStorage.getItem(`agent-model-${projectName}-${provider}`)
+                  : ''
+              ),
+            )
+          : '';
+        if (providerModel) {
+          modelRef.current = providerModel;
+          setSelectedModel(providerModel);
+        }
+        // Render the Portal-owned transcript immediately: switching between
+        // projects must feel instant. The sandbox handshake below only gates
+        // sending, not reading.
+        initialHistoryLoad = loadHistorySnapshot(sessionKeyRef.current || '', { expectedGen: myGen })
+          .then((result) => {
+            if (!cancelled && historyGenRef.current === myGen) setIsLoadingHistory(false);
+            return result;
+          })
+          .catch(() => null);
+        setConnectionNotice(`Connecting to ${providerCapability.displayName} project runtime…`);
+
+        const { data } = activeTurn
+          ? await client.get(`/projects/${encodeURIComponent(projectName)}/assistant/resume-session`, {
+              params: { provider, turnId: activeTurn.id },
+            })
+          : await client.post(
+              `/projects/${encodeURIComponent(projectName)}/assistant/ensure-session`,
+              {
+                provider,
+                stateVersion,
+                // Automatic OpenClaw handshakes let the server reconcile its
+                // exact-agent binding against the live catalog. Browser state
+                // is never authoritative model-admission evidence.
+                ...(provider !== 'OPENCLAW' && providerModel ? { model: providerModel } : {}),
+              },
+            );
+        if (cancelled || historyGenRef.current !== myGen) return;
+        if (data?.provider !== provider) {
+          throw new Error(`Project session provider mismatch: expected ${provider}, received ${String(data?.provider || 'none')}`);
+        }
+        const verifiedResponseModel = resolveVerifiedProjectModelResponse(providerCapability, data);
+        // A fresh ensure legitimately advances the coordination version. An
+        // active-turn resume is read-only and returns that turn's unchanged
+        // version. Either path may never regress.
+        if (!Number.isSafeInteger(data?.stateVersion) || data.stateVersion < stateVersion) {
+          throw new Error('Project Chat coordination changed while the provider session was being verified.');
+        }
+        projectChatStateVersionRef.current = data.stateVersion;
+        setProjectChatStateVersion(data.stateVersion);
+        sessionHandshakeCompleted = true;
+        providerVerificationStateRef.current = 'ready';
+        setProviderVerificationState('ready');
+
+        const { sessionKey: sk, agentId: aid } = data;
+        if (typeof sk !== 'string' || !sk.trim()) {
+          throw new Error('Portal did not return the verified Project provider session.');
+        }
         sessionKeyRef.current = sk;
         setSessionKey(sk);
         setAgentId(aid);
-        if (m) setSelectedModel(canonicalizePortalModelId(m));
-
-        const manager = createLocalWsManager(getWsUrl());
-        wsRef.current = manager;
-
-        const stableHandler = (d: any) => {
-          if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) return;
-          handleWsEventRef.current(d);
-        };
-
-        const unsubDisconnect = manager.onDisconnect(() => {
-          if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) return;
-          setWsConnected(false);
-          setConnectionNotice(
-            isStreamActiveRef.current
-              ? 'Connection lost — reconnecting to the live stream…'
-              : 'Connection lost — reconnecting…'
-          );
-          if (isStreamActiveRef.current) {
-            setIsRunning(true);
-            setStreamingPhase(prev => prev === 'idle' ? 'thinking' : prev);
-            setStatusText('Reconnecting to stream…');
-          }
-        });
-
-        const unsubReconnect = manager.onReconnect(async () => {
-          if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) return;
-          setWsConnected(true);
-          setConnectionNotice(null);
-          try {
-            await syncStreamState(manager, { reloadHistoryIfIdle: true }, { expectedSession: sk, expectedGen: myGen });
-          } catch (err) {
-            console.warn('[ProjectChat] Reconnect sync failed:', err);
-          }
-        });
-
-        cleanupTransport = () => {
-          manager.removeHandler(stableHandler);
-          unsubDisconnect();
-          unsubReconnect();
-        };
-        manager.addHandler(stableHandler);
-
-        const waitForInitialConnect = new Promise<void>((resolve) => {
-          if (manager.isConnected()) { resolve(); return; }
-          const check = setInterval(() => {
-            if (manager.isConnected() || cancelled || historyGenRef.current !== myGen) {
-              clearInterval(check);
-              resolve();
-            }
-          }, 100);
-          setTimeout(() => {
-            clearInterval(check);
-            resolve();
-          }, 3000);
-        });
-
-        const historyResult = await loadHistorySnapshot(sk, {
-          expectedGen: myGen,
-          hydrateActiveStream: true,
-        });
-
-        if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) {
-          cleanupTransport?.();
-          manager.close();
-          return;
+        if (data?.provider) {
+          providerRef.current = data.provider;
+          setSelectedProvider(data.provider);
+        }
+        if (data?.runtime) {
+          runtimeRef.current = data.runtime;
+          setSelectedRuntime(data.runtime);
+        }
+        if (verifiedResponseModel) {
+          modelRef.current = verifiedResponseModel;
+          setSelectedModel(verifiedResponseModel);
         }
 
-        await waitForInitialConnect;
+        replayCursorRef.current = 0;
+        const preloadedHistory = initialHistoryLoad ? await initialHistoryLoad : null;
+        if (!preloadedHistory) {
+          setIsLoadingHistory(true);
+          await loadHistorySnapshot(sk, { expectedGen: myGen });
+        }
+        if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) return;
 
-        if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) {
-          cleanupTransport?.();
-          manager.close();
-          return;
+        const replaySnapshot = await projectsAPI.agentPoll(
+          projectName,
+          0,
+          0,
+          provider,
+          activeReplayTurnIdRef.current,
+        );
+        if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) return;
+        const replayBatch = resolveProjectReplayBatch(replaySnapshot, {
+          provider,
+          sessionKey: sk,
+          minimumStateVersion: data.stateVersion,
+          afterSeq: 0,
+          turnId: activeReplayTurnIdRef.current,
+        });
+        if (replayBatch.sessionKey !== sk) {
+          sessionKeyRef.current = replayBatch.sessionKey;
+          setSessionKey(replayBatch.sessionKey);
+        }
+        // Replay reads may observe a version legitimately advanced by any
+        // interim admission; only a REGRESSION is a contract violation.
+        if (!activeReplayTurnIdRef.current && replayBatch.stateVersion < data.stateVersion) {
+          throw new ProjectReplayContractError('Project Chat coordination changed while replay was being restored.');
+        }
+        projectChatStateVersionRef.current = replayBatch.stateVersion;
+        setProjectChatStateVersion(replayBatch.stateVersion);
+
+        const replayActive = Boolean(replaySnapshot?.active || replaySnapshot?.isProcessing);
+        const terminalEvent = replayBatch.events.find(
+          (event) => event?.type === 'done' || event?.type === 'error',
+        );
+        if (terminalEvent && terminalEvent.seq !== replaySnapshot.lineCount) {
+          throw new ProjectReplayContractError('Project replay returned events after a terminal event.');
+        }
+        const deferredTerminal = replayActive ? terminalEvent : undefined;
+        const replayEvents = deferredTerminal
+          ? replayBatch.events.filter((event) => event.seq < deferredTerminal.seq)
+          : replayBatch.events;
+        const projectedCursor = deferredTerminal
+          ? deferredTerminal.seq - 1
+          : replayBatch.nextCursor;
+        if (replayActive) {
+          ensureStreamingAssistant();
+          isStreamActiveRef.current = true;
+          setIsRunning(true);
+          setStreamingPhase('thinking');
+          for (const event of replayEvents) {
+            handleReplayEventRef.current({ ...event, sessionKey: replayBatch.sessionKey });
+          }
+          replayCursorRef.current = projectedCursor;
+          const replayCaughtUp = projectedCursor === replaySnapshot.lineCount;
+          if (replayCaughtUp && !assembledRef.current && typeof replaySnapshot?.text === 'string' && replaySnapshot.text) {
+            handleReplayEventRef.current({
+              type: 'text',
+              content: replaySnapshot.text,
+              replace: true,
+              sessionKey: replayBatch.sessionKey,
+            });
+          }
+          if (isStreamActiveRef.current) resetWatchdog();
+        } else if (replaySnapshot?.complete) {
+          replayCursorRef.current = projectedCursor;
+          setTerminalHistoryPending(true);
+          await loadHistorySnapshot(sk, { expectedGen: myGen });
+          if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) return;
+          setTerminalHistoryPending(false);
+        } else {
+          replayCursorRef.current = projectedCursor;
         }
 
-        setWsConnected(manager.isConnected());
+        setTransportConnected(true);
+        setConnectionNotice(null);
         setSessionReady(true);
-
-        if (manager.isConnected()) {
-          setConnectionNotice(null);
-          if (historyResult?.activeStream?.active) {
-            manager.send({ type: 'reconnect', session: sk, provider: 'OPENCLAW' });
-          } else {
-            await syncStreamState(manager, { reloadHistoryIfIdle: false }, { expectedSession: sk, expectedGen: myGen });
-          }
-        } else if (!historyResult?.activeStream?.active) {
-          setConnectionNotice('Live chat socket is still reconnecting…');
-        }
-
-        if (!cancelled && historyGenRef.current === myGen) {
-          setIsLoadingHistory(false);
-        }
+        setQualificationProgress(null);
+        providerTransitionPendingRef.current = false;
+        setProviderTransitionPending(false);
+        setIsLoadingHistory(false);
       } catch (err: any) {
         if (!cancelled && historyGenRef.current === myGen) {
-          setSessionError(err?.message || 'Failed to initialize session');
+          const reason = String(err?.response?.data?.error || err?.message || 'Failed to initialize session');
+          const readinessFailure = (
+            err instanceof ProjectReplayContractError
+            || isProjectProviderReverificationError(err)
+            || !resolvedProviderState
+            || !resolvedProviderState.activeProvider
+          );
+          const displayReason = readinessFailure
+            ? 'Project Chat could not prepare its current provider. Retry preparation for this project.'
+            : reason;
+          if (readinessFailure) {
+            activeReplayTurnIdRef.current = null;
+            const failedCapabilities = buildUnavailableProjectProviderCapabilities(
+              'Project provider preparation did not complete.',
+            );
+            providerCapabilitiesRef.current = failedCapabilities;
+            setProviderCapabilities(failedCapabilities);
+            serverSelectedProviderRef.current = null;
+            setServerSelectedProvider(null);
+            providerVerificationStateRef.current = 'failed';
+            setProviderVerificationState('failed');
+          } else if (!sessionHandshakeCompleted && resolvedProviderState?.activeProvider) {
+            const failedCapabilities = resolvedProviderState!.providers.map((capability) => (
+              capability.provider === resolvedProviderState!.activeProvider
+                ? {
+                    ...capability,
+                    selectable: false,
+                    executionScope: null,
+                    reason: `Session verification failed: ${displayReason}`,
+                  } as ProjectChatProviderCapability
+                : capability
+            ));
+            providerCapabilitiesRef.current = failedCapabilities;
+            setProviderCapabilities(failedCapabilities);
+            providerVerificationStateRef.current = 'ready';
+            setProviderVerificationState('ready');
+          }
+          providerTransitionPendingRef.current = false;
+          setProviderTransitionPending(false);
+          setConnectionNotice(null);
+          setQualificationProgress(null);
+          setSessionError(displayReason);
           setIsLoadingHistory(false);
         }
       }
@@ -1970,49 +3864,475 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
     return () => {
       cancelled = true;
-      cleanupTransport?.();
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
+      clearPendingLiveRenders();
       if (watchdogRef.current) clearTimeout(watchdogRef.current);
       if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
     };
-  }, [projectName, loadHistorySnapshot, syncStreamState]);
+  }, [clearPendingLiveRenders, ensureStreamingAssistant, loadHistorySnapshot, projectName, providerRefreshNonce, resetWatchdog, selectedProvider]);
+
+  // Every qualified Project provider replays through the Portal-owned broker.
+  // The cursor advances only through events actually projected, so bounded
+  // replay pages remain gap-free across long turns and browser refreshes.
+  useEffect(() => {
+    if (!sessionReady || (!isRunning && !terminalHistoryPending)) return;
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let pollInFlight = false;
+    let wakeRequested = false;
+    let pollBlockedUntil = 0;
+    const provider = serverSelectedProviderRef.current;
+    const initialVerifiedSession = sessionKeyRef.current;
+    const expectedTurnId = activeReplayTurnIdRef.current;
+    const expectedGen = historyGenRef.current;
+
+    const failClosed = (reason: string) => {
+      if (cancelled || historyGenRef.current !== expectedGen) return;
+      const failedCapabilities = buildUnavailableProjectProviderCapabilities(
+        `Project provider selection must be re-verified: ${reason}`,
+      );
+      providerCapabilitiesRef.current = failedCapabilities;
+      setProviderCapabilities(failedCapabilities);
+      serverSelectedProviderRef.current = null;
+      setServerSelectedProvider(null);
+      providerVerificationStateRef.current = 'failed';
+      setProviderVerificationState('failed');
+      providerTransitionPendingRef.current = false;
+      setProviderTransitionPending(false);
+      setSessionReady(false);
+      setTransportConnected(false);
+      setConnectionNotice(null);
+      setSessionError(reason);
+      clearWatchdog();
+      activeReplayTurnIdRef.current = null;
+      isStreamActiveRef.current = false;
+      setIsRunning(false);
+      setStreamingPhase('idle');
+      setStatusText(null);
+      setActiveToolName(null);
+      setPendingApprovals([]);
+    };
+
+    if (
+      !provider
+      || provider !== selectedProvider
+      || providerRef.current !== provider
+      || providerVerificationStateRef.current !== 'ready'
+      || typeof initialVerifiedSession !== 'string'
+      || !initialVerifiedSession.trim()
+    ) {
+      failClosed('The active Project provider session is no longer verified.');
+      return;
+    }
+    let verifiedSession = initialVerifiedSession;
+
+    const schedule = (delay: number) => {
+      if (cancelled) return;
+      if (timer) clearTimeout(timer);
+      const effectiveDelay = Math.max(0, delay, pollBlockedUntil - Date.now());
+      timer = setTimeout(() => {
+        timer = null;
+        void poll();
+      }, effectiveDelay);
+    };
+
+    const requestImmediatePoll = () => {
+      if (cancelled) return;
+      if (pollInFlight) {
+        wakeRequested = true;
+        return;
+      }
+      schedule(0);
+    };
+
+    const poll = async () => {
+      if (cancelled) return;
+      if (pollInFlight) {
+        wakeRequested = true;
+        return;
+      }
+      pollInFlight = true;
+      try {
+        const afterSeq = replayCursorRef.current;
+        const minimumStateVersion = projectChatStateVersionRef.current;
+        if (typeof minimumStateVersion !== 'number' || !Number.isSafeInteger(minimumStateVersion) || minimumStateVersion < 0) {
+          throw new ProjectReplayContractError('Project replay coordination state is no longer verified.');
+        }
+        const snapshot = await projectsAPI.agentPoll(
+          projectName,
+          afterSeq,
+          0,
+          provider,
+          expectedTurnId,
+        );
+        pollBlockedUntil = 0;
+        if (
+          cancelled
+          || historyGenRef.current !== expectedGen
+          || providerRef.current !== provider
+          || serverSelectedProviderRef.current !== provider
+          || sessionKeyRef.current !== verifiedSession
+          || activeReplayTurnIdRef.current !== expectedTurnId
+        ) return;
+
+        const replayBatch = resolveProjectReplayBatch(snapshot, {
+          provider,
+          sessionKey: verifiedSession,
+          minimumStateVersion,
+          afterSeq,
+          turnId: expectedTurnId,
+        });
+        const replayActive = Boolean(snapshot?.active || snapshot?.isProcessing);
+        if (replayActive && !expectedTurnId) {
+          throw new ProjectReplayContractError('Project replay returned an unverified active turn.');
+        }
+        if (replayBatch.sessionKey !== verifiedSession) {
+          verifiedSession = replayBatch.sessionKey;
+          sessionKeyRef.current = verifiedSession;
+          setSessionKey(verifiedSession);
+        }
+        const terminalEvent = replayBatch.events.find(
+          (event: any) => event?.type === 'done' || event?.type === 'error',
+        );
+        if (terminalEvent && terminalEvent.seq !== snapshot.lineCount) {
+          throw new ProjectReplayContractError('Project replay returned events after a terminal event.');
+        }
+        const deferredTerminal = replayActive ? terminalEvent : undefined;
+        const replayEvents = deferredTerminal
+          ? replayBatch.events.filter((event: any) => event.seq < deferredTerminal.seq)
+          : replayBatch.events;
+        const projectedCursor = deferredTerminal
+          ? deferredTerminal.seq - 1
+          : replayBatch.nextCursor;
+
+        projectChatStateVersionRef.current = replayBatch.stateVersion;
+        setProjectChatStateVersion(replayBatch.stateVersion);
+        if (snapshot?.runtime) {
+          runtimeRef.current = snapshot.runtime;
+          setSelectedRuntime(snapshot.runtime);
+        }
+
+        if (replayActive && !streamingAssistantIdRef.current) {
+          ensureStreamingAssistant();
+          isStreamActiveRef.current = true;
+          setIsRunning(true);
+          setStreamingPhase('thinking');
+        }
+        for (const event of replayEvents) {
+          handleReplayEventRef.current({ ...event, sessionKey: verifiedSession });
+        }
+        replayCursorRef.current = projectedCursor;
+
+        setTransportConnected(true);
+        setConnectionNotice(null);
+        const replayCaughtUp = projectedCursor === snapshot.lineCount;
+        if (replayActive) {
+          if (replayCaughtUp && !assembledRef.current && typeof snapshot?.text === 'string' && snapshot.text) {
+            handleReplayEventRef.current({
+              type: 'text',
+              content: snapshot.text,
+              replace: true,
+              sessionKey: verifiedSession,
+            });
+          }
+          isStreamActiveRef.current = true;
+          setIsRunning(true);
+          setStreamingPhase(prev => prev === 'idle' ? 'thinking' : prev);
+          resetWatchdog();
+          schedule(getProjectReplayPollDelay({
+            visibility: document.visibilityState,
+            replayCaughtUp,
+            active: true,
+            deferredTerminal: Boolean(deferredTerminal),
+          }));
+          return;
+        }
+
+        if (!replayCaughtUp) {
+          schedule(getProjectReplayPollDelay({
+            visibility: document.visibilityState,
+            replayCaughtUp: false,
+          }));
+          return;
+        }
+
+        if (snapshot?.complete && !terminalEvent && isStreamActiveRef.current) {
+          handleReplayEventRef.current({
+            type: snapshot?.status === 'error' ? 'error' : 'done',
+            content: snapshot?.error || snapshot?.text || '',
+            sessionKey: verifiedSession,
+          });
+        }
+
+        if (snapshot?.complete) {
+          await loadHistorySnapshot(verifiedSession, { expectedGen });
+          if (!cancelled && historyGenRef.current === expectedGen) {
+            // Finalize the turn locally and stay ready for the next message —
+            // like Agent Chat. A completed turn does NOT invalidate the
+            // verified provider/session, so DON'T tear down and re-verify
+            // (that dropped the connection after every single message).
+            activeReplayTurnIdRef.current = null;
+            isStreamActiveRef.current = false;
+            setIsRunning(false);
+            setStreamingPhase('idle');
+            setStatusText(null);
+            setActiveToolName(null);
+            clearWatchdog();
+            setTransportConnected(true);
+            setConnectionNotice(null);
+            setTerminalHistoryPending(false);
+          }
+          return;
+        }
+
+        schedule(getProjectReplayPollDelay({
+          visibility: document.visibilityState,
+          replayCaughtUp: true,
+          active: false,
+        }));
+      } catch (error: any) {
+        if (cancelled) return;
+        const reason = error?.response?.data?.error || error?.message || 'Project replay verification failed';
+        // A deleted project is a terminal, quiet state — not an error storm.
+        if (error?.response?.status === 404 && /project not found/i.test(String(reason))) {
+          setTransportConnected(false);
+          setConnectionNotice(null);
+          setSessionReady(false);
+          setSessionError('This project was deleted.');
+          return;
+        }
+        if (error instanceof ProjectReplayContractError || isProjectProviderReverificationError(error)) {
+          failClosed(reason);
+          return;
+        }
+        console.warn('[ProjectChat] Project replay poll failed:', error);
+        setTransportConnected(false);
+        const retryAfter = typeof error?.response?.headers?.get === 'function'
+          ? error.response.headers.get('retry-after')
+          : error?.response?.headers?.['retry-after'];
+        const retryDelay = getProjectReplayPollDelay({
+          visibility: document.visibilityState,
+          failed: true,
+          retryAfter,
+        });
+        if (error?.response?.status === 429) {
+          pollBlockedUntil = Math.max(pollBlockedUntil, Date.now() + retryDelay);
+          setConnectionNotice('Portal replay is rate limited — retrying when the polling window resets…');
+        } else {
+          setConnectionNotice('Portal replay connection interrupted — retrying…');
+        }
+        schedule(retryDelay);
+      } finally {
+        pollInFlight = false;
+        if (wakeRequested && !cancelled) {
+          wakeRequested = false;
+          schedule(0);
+        }
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') requestImmediatePoll();
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    void poll();
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      if (timer) clearTimeout(timer);
+    };
+  }, [clearWatchdog, ensureStreamingAssistant, isRunning, loadHistorySnapshot, projectName, replayRetryNonce, resetWatchdog, selectedProvider, sessionReady, terminalHistoryPending]);
 
   // ── Send message ──
-  const sendMessage = useCallback((text: string) => {
+  const sendMessage = useCallback(async (text: string, draftText: string = text) => {
     const sk = sessionKeyRef.current;
-    if (!sk || isStreamActiveRef.current) return false;
+    const provider = serverSelectedProviderRef.current;
+    const requestStateVersion = projectChatStateVersionRef.current;
+    const selectedCapability = provider
+      ? providerCapabilitiesRef.current.find((entry) => entry.provider === provider) || null
+      : null;
+    if (
+      !sk
+      || !provider
+      || providerVerificationStateRef.current !== 'ready'
+      || providerTransitionPendingRef.current
+      || providerRef.current !== provider
+      || typeof requestStateVersion !== 'number'
+      || !Number.isSafeInteger(requestStateVersion)
+      || requestStateVersion < 0
+      || selectedCapability?.selectable !== true
+      || selectedCapability.executionScope !== 'PROJECT_SANDBOX'
+      || isStreamActiveRef.current
+      || sendPendingRef.current
+    ) return false;
 
-    const manager = wsRef.current;
-    if (!manager || !manager.isConnected()) {
-      setWsConnected(false);
-      setConnectionNotice('Connection lost — reconnecting. Your draft is still in the composer.');
-      manager?.reconnect();
+    const immutableProjectId = projectIdentityIdRef.current;
+    if (!actorUserId || !immutableProjectId || pendingSendStorageError) return false;
+    pendingQuestionComposerAnswerRef.current = null;
+    pendingActiveSteerRef.current = null;
+    pendingQuestionsReadyRef.current = false;
+    setPendingQuestionAnswerPending(false);
+    replacePendingQuestions([]);
+    const scope: ProjectChatSendScope = {
+      actorUserId,
+      projectId: immutableProjectId,
+      provider,
+    };
+    const requestModel = selectedCapability.supportsModelSelection
+      ? resolveAvailableModelId(modelRef.current, availableModels)
+      : '';
+    sendPendingRef.current = true;
+    setSessionReady(false);
+    let verificationFailure = false;
+    let stagedSend: PendingProjectChatSend | null = null;
+    let acceptedData: any = null;
+    let acceptedTurnId = '';
+    let verifiedResponseModel = '';
+    try {
+      const coordinated = await runCoordinatedProjectChatSend({
+        scope,
+        draftText,
+        payloadText: text,
+        model: requestModel,
+        classifyError: (error) => (
+          isDefinitiveProjectSendRejection(error) ? 'never-admitted' : 'ambiguous'
+        ),
+        onStaged: (staged) => {
+          const persistedPending: PendingProjectChatSend = {
+            schema: staged.schema,
+            actorUserId: staged.actorUserId,
+            projectId: staged.projectId,
+            provider: staged.provider,
+            messageId: staged.messageId,
+            draftFingerprint: staged.draftFingerprint,
+            payloadFingerprint: staged.payloadFingerprint,
+            model: staged.model,
+            attemptStartedAt: staged.attemptStartedAt,
+            createdAt: staged.createdAt,
+          };
+          stagedSend = persistedPending;
+          rememberPendingSend(persistedPending);
+        },
+        dispatch: async (staged) => {
+          const { data } = await client.post(`/projects/${encodeURIComponent(projectName)}/assistant/send`, {
+            provider,
+            stateVersion: requestStateVersion,
+            message: staged.payloadText,
+            messageId: staged.messageId,
+            ...(selectedCapability.supportsModelSelection ? { model: staged.model } : {}),
+          });
+          if (data?.provider !== provider) {
+            throw new ProjectReplayContractError(
+              `Project send provider mismatch: expected ${provider}, received ${String(data?.provider || 'none')}`,
+            );
+          }
+          const responseProjectId = typeof data?.executionContext?.projectId === 'string'
+            ? data.executionContext.projectId.trim()
+            : '';
+          if (responseProjectId !== immutableProjectId) {
+            throw new ProjectReplayContractError('Project send returned a mismatched immutable project identity.');
+          }
+          const responseModel = resolveVerifiedProjectModelResponse(selectedCapability, data);
+          if (
+            !Number.isSafeInteger(data?.stateVersion)
+            || data.stateVersion < requestStateVersion
+          ) {
+            throw new ProjectReplayContractError('Project send returned a missing or stale coordination version.');
+          }
+          const turnId = typeof data?.turnId === 'string' && data.turnId.trim()
+            ? data.turnId
+            : typeof data?.runId === 'string' && data.runId.trim()
+              ? data.runId
+              : '';
+          if (!turnId) {
+            throw new ProjectReplayContractError('Project send did not return a durable turn.');
+          }
+          if (typeof data?.sessionKey !== 'string' || !data.sessionKey.trim()) {
+            throw new ProjectReplayContractError('Project send did not return a provider session.');
+          }
+          if (
+            serverSelectedProviderRef.current !== provider
+            || providerRef.current !== provider
+            || sessionKeyRef.current !== sk
+            || projectIdentityIdRef.current !== immutableProjectId
+          ) {
+            throw new ProjectReplayContractError('Project provider verification changed while the message was being sent.');
+          }
+          return { data, turnId, responseModel };
+        },
+      });
+      stagedSend = coordinated.staged;
+      if (coordinated.confirmedBeforeDispatch) {
+        refreshPendingSendState(scope);
+        sendPendingRef.current = false;
+        setSessionReady(true);
+        setSessionError(null);
+        await loadHistorySnapshot(sk);
+        return true;
+      }
+      acceptedData = coordinated.value.data;
+      acceptedTurnId = coordinated.value.turnId;
+      verifiedResponseModel = coordinated.value.responseModel;
+      refreshPendingSendState(scope);
+      if (acceptedData?.runtime) {
+        runtimeRef.current = acceptedData.runtime;
+        setSelectedRuntime(acceptedData.runtime);
+      }
+      if (verifiedResponseModel) {
+        modelRef.current = verifiedResponseModel;
+        setSelectedModel(verifiedResponseModel);
+      }
+      projectChatStateVersionRef.current = acceptedData.stateVersion;
+      setProjectChatStateVersion(acceptedData.stateVersion);
+      activeReplayTurnIdRef.current = acceptedTurnId;
+      if (acceptedData.sessionKey !== sk) {
+        sessionKeyRef.current = acceptedData.sessionKey;
+        setSessionKey(acceptedData.sessionKey);
+      }
+      replayCursorRef.current = 0;
+    } catch (error: any) {
+      const reason = error?.response?.data?.error || error?.message || 'Failed to send project message';
+      refreshPendingSendState(scope);
+      verificationFailure = error instanceof ProjectReplayContractError
+        || isProjectProviderReverificationError(error);
+      if (verificationFailure) {
+        activeReplayTurnIdRef.current = null;
+        const failedCapabilities = buildUnavailableProjectProviderCapabilities(
+          `Project provider selection must be re-verified: ${reason}`,
+        );
+        providerCapabilitiesRef.current = failedCapabilities;
+        setProviderCapabilities(failedCapabilities);
+        serverSelectedProviderRef.current = null;
+        setServerSelectedProvider(null);
+        providerVerificationStateRef.current = 'failed';
+        setProviderVerificationState('failed');
+        providerTransitionPendingRef.current = false;
+        setProviderTransitionPending(false);
+        setTransportConnected(false);
+      }
+      setSessionError(reason);
+      sendPendingRef.current = false;
+      setSessionReady(!verificationFailure);
       return false;
     }
-
-    const sent = manager.send({
-      type: 'send',
-      message: text,
-      session: sk,
-      provider: 'OPENCLAW',
-      agentId: agentId,
-      model: resolveAvailableModelId(modelRef.current, availableModels),
-    });
-
-    if (!sent) {
-      setWsConnected(false);
-      setConnectionNotice('Couldn’t reach the live chat socket. Reconnecting now — your draft is still in the composer.');
-      manager.reconnect();
+    if (!stagedSend) {
+      sendPendingRef.current = false;
+      setSessionReady(false);
+      setSessionError('Project Chat did not preserve a delivery identity.');
       return false;
     }
+    const userMsg: ChatMessage = {
+      id: stagedSend.messageId,
+      role: 'user',
+      content: text,
+      createdAt: new Date(),
+    };
+    sendPendingRef.current = false;
+    setSessionReady(true);
+    setSessionError(null);
 
-    const userMsg: ChatMessage = { id: nextId(), role: 'user', content: text, createdAt: new Date() };
     setMessages(prev => [...prev, userMsg]);
 
-    pendingAutoCommitRef.current = true;
     assembledRef.current = '';
     lastSegmentStartRef.current = 0;
     lastRawTextLenRef.current = 0;
@@ -2020,7 +4340,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     hasRealToolEventsRef.current = false;
     resumeSeededContentRef.current = false;
     suppressLiveBubbleContentRef.current = false;
+    clearPendingLiveRenders();
+    thinkingContentRef.current = '';
     setThinkingContent('');
+    thinkingSubjectRef.current = '';
+    setThinkingSubject('');
     setStatusText(null);
     setStreamingPhase('thinking');
     setActiveToolName(null);
@@ -2031,19 +4355,323 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     setIsRunning(true);
     isStreamActiveRef.current = true;
     resetWatchdog();
+    setTransportConnected(true);
     setConnectionNotice(null);
     return true;
-  }, [agentId, availableModels, resetWatchdog]);
+  }, [
+    actorUserId,
+    availableModels,
+    clearPendingLiveRenders,
+    loadHistorySnapshot,
+    pendingSendStorageError,
+    projectName,
+    refreshPendingSendState,
+    replacePendingQuestions,
+    rememberPendingSend,
+    resetWatchdog,
+  ]);
+
+  const answerPendingProjectQuestion = useCallback(async (rawText: string) => {
+    const text = String(rawText || '').trim();
+    const session = sessionKeyRef.current;
+    const turnId = activeReplayTurnIdRef.current;
+    if (
+      !text
+      || !session
+      || !turnId
+      || serverSelectedProviderRef.current !== 'OPENCLAW'
+      || providerRef.current !== 'OPENCLAW'
+      || providerVerificationStateRef.current !== 'ready'
+      || providerTransitionPendingRef.current
+      || !isStreamActiveRef.current
+    ) return false;
+
+    if (!pendingQuestionsReadyRef.current) {
+      try {
+        await refreshPendingQuestions();
+      } catch {
+        setSessionError('Portal could not verify whether this Project turn is waiting on a question. Retry in a moment.');
+        return false;
+      }
+    }
+    const requests = pendingQuestionsRef.current.filter((entry) => (
+      entry.sessionKey === session
+      && entry.state === 'pending'
+      && entry.expiresAt > Date.now()
+    ));
+    if (requests.length === 0) {
+      const stateVersion = projectChatStateVersionRef.current;
+      if (!Number.isSafeInteger(stateVersion)) {
+        setSessionError('Project coordination changed before Portal could steer this turn.');
+        return false;
+      }
+      let existingSteer = pendingActiveSteerRef.current;
+      if (
+        existingSteer
+        && (existingSteer.sessionKey !== session || existingSteer.turnId !== turnId)
+      ) {
+        pendingActiveSteerRef.current = null;
+        existingSteer = null;
+      }
+      if (existingSteer?.inFlight) return false;
+      if (existingSteer && existingSteer.text !== text) {
+        setSessionError('The previous steering message has an unknown outcome. Retry it unchanged.');
+        return false;
+      }
+      const steer = existingSteer || {
+        requestId: nextId(),
+        text,
+        turnId,
+        sessionKey: session,
+        inFlight: false,
+      };
+      steer.inFlight = true;
+      pendingActiveSteerRef.current = steer;
+      setPendingQuestionAnswerPending(true);
+      setSessionError(null);
+      try {
+        const { data } = await client.post(
+          `/projects/${encodeURIComponent(projectName)}/assistant/answer-input`,
+          {
+            provider: 'OPENCLAW',
+            stateVersion,
+            turnId,
+            requestId: steer.requestId,
+            message: text,
+          },
+        );
+        if (
+          data?.accepted !== true
+          || data?.provider !== 'OPENCLAW'
+          || data?.turnId !== turnId
+          || data?.sessionKey !== session
+          || data?.requestId !== steer.requestId
+        ) {
+          throw new ProjectReplayContractError(
+            'Portal did not confirm steering for this exact active Project turn.',
+          );
+        }
+        pendingActiveSteerRef.current = null;
+        setPendingQuestionAnswerPending(false);
+        if (
+          activeReplayTurnIdRef.current === turnId
+          && sessionKeyRef.current === session
+          && providerRef.current === 'OPENCLAW'
+        ) {
+          const localMessageId = `active-steer:${steer.requestId}`;
+          setMessages((previous) => previous.some((entry) => entry.id === localMessageId)
+            ? previous
+            : [...previous, {
+                id: localMessageId,
+                role: 'user' as const,
+                content: text,
+                createdAt: new Date(),
+              }]);
+          setSessionError(null);
+        }
+        return true;
+      } catch (error: any) {
+        steer.inFlight = false;
+        pendingActiveSteerRef.current = steer;
+        setPendingQuestionAnswerPending(false);
+        setSessionError(
+          error?.response?.data?.error
+            || error?.message
+            || 'Steering delivery is unconfirmed. Retry the same text.',
+        );
+        if ([400, 404, 409].includes(Number(error?.response?.status))) {
+          pendingActiveSteerRef.current = null;
+        }
+        return false;
+      }
+    }
+    if (requests.length !== 1) {
+      setSessionError('More than one question is waiting. Use the inline cards so each answer reaches the correct prompt.');
+      return false;
+    }
+    const request = requests[0];
+    if (request.questions.length !== 1) {
+      setSessionError('This prompt needs more than one answer. Use its inline card so every field is preserved.');
+      return false;
+    }
+    const question = request.questions[0];
+    if (question.isSecret === true) {
+      setSessionError('This prompt expects a secret. Use its protected inline field instead of the chat composer.');
+      return false;
+    }
+    if (question.options.length > 0 && question.isOther !== true) {
+      setSessionError('This prompt accepts only its listed choices. Use the inline card to select one.');
+      return false;
+    }
+
+    let existing = pendingQuestionComposerAnswerRef.current;
+    if (existing && existing.id !== request.id) {
+      pendingQuestionComposerAnswerRef.current = null;
+      existing = null;
+    }
+    if (existing?.inFlight) return false;
+    if (existing && existing.text !== text) {
+      setSessionError(
+        'The previous answer has an unknown outcome. Retry it unchanged or use the inline question card.',
+      );
+      return false;
+    }
+    const pending = existing || {
+      id: request.id,
+      text,
+      inFlight: false,
+    };
+    pending.inFlight = true;
+    pendingQuestionComposerAnswerRef.current = pending;
+    setPendingQuestionAnswerPending(true);
+    setSessionError(null);
+    try {
+      const answers = Object.create(null) as Record<string, string>;
+      answers[question.id] = text;
+      const receipt = await gatewayAPI.answerQuestion(request.id, answers);
+      if (receipt?.ok !== true || receipt?.id !== request.id || receipt?.state !== 'answered') {
+        throw new Error('Portal did not confirm this exact answer.');
+      }
+      pendingQuestionComposerAnswerRef.current = null;
+      setPendingQuestionAnswerPending(false);
+      if (
+        activeReplayTurnIdRef.current === turnId
+        && sessionKeyRef.current === session
+        && providerRef.current === 'OPENCLAW'
+      ) {
+        settlePendingQuestion(request.id);
+        const localMessageId = `ask-user-answer:${request.id}`;
+        setMessages((previous) => previous.some((entry) => entry.id === localMessageId)
+          ? previous
+          : [...previous, {
+              id: localMessageId,
+              role: 'user' as const,
+              content: text,
+              createdAt: new Date(),
+            }]);
+        setSessionError(null);
+      }
+      return true;
+    } catch (error: any) {
+      pending.inFlight = false;
+      pendingQuestionComposerAnswerRef.current = pending;
+      setPendingQuestionAnswerPending(false);
+      setSessionError(
+        error?.response?.data?.error
+          || error?.message
+          || 'Answer delivery is unconfirmed. Retry the same text or use the inline card.',
+      );
+      if ([404, 409].includes(Number(error?.response?.status))) {
+        pendingQuestionComposerAnswerRef.current = null;
+        void refreshPendingQuestions().catch(() => undefined);
+      }
+      return false;
+    }
+  }, [projectName, refreshPendingQuestions, settlePendingQuestion]);
+
+  const submitAskQuestionAnswer = useCallback((answerText: string) => {
+    const trimmed = (answerText || '').trim();
+    if (!trimmed) return;
+    if (isStreamActiveRef.current && providerRef.current === 'OPENCLAW') {
+      void answerPendingProjectQuestion(trimmed);
+      return;
+    }
+    void sendMessage(trimmed);
+  }, [answerPendingProjectQuestion, sendMessage]);
 
   // ── Cancel stream ──
-  const cancelStream = useCallback(() => {
-    const manager = wsRef.current;
-    const sk = sessionKeyRef.current;
-    if (manager && manager.isConnected() && sk) {
-      manager.send({ type: 'abort', session: sk });
+
+  const cancelStream = useCallback(async (): Promise<boolean> => {
+    const provider = serverSelectedProviderRef.current;
+    const stateVersion = projectChatStateVersionRef.current;
+    const expectedTurnId = activeReplayTurnIdRef.current;
+    const failClosed = (reason: string) => {
+      const failedCapabilities = buildUnavailableProjectProviderCapabilities(
+        `Project provider selection must be re-verified: ${reason}`,
+      );
+      providerCapabilitiesRef.current = failedCapabilities;
+      setProviderCapabilities(failedCapabilities);
+      serverSelectedProviderRef.current = null;
+      setServerSelectedProvider(null);
+      providerVerificationStateRef.current = 'failed';
+      setProviderVerificationState('failed');
+      providerTransitionPendingRef.current = false;
+      setProviderTransitionPending(false);
+      setSessionReady(false);
+      setTransportConnected(false);
+      setConnectionNotice(null);
+      setSessionError(reason);
+      clearWatchdog();
+      activeReplayTurnIdRef.current = null;
+      isStreamActiveRef.current = false;
+      setIsRunning(false);
+      setStreamingPhase('idle');
+      setStatusText(null);
+      setActiveToolName(null);
+      setPendingApprovals([]);
+    };
+
+    if (
+      !provider
+      || !expectedTurnId
+      || providerRef.current !== provider
+      || providerVerificationStateRef.current !== 'ready'
+      || typeof stateVersion !== 'number'
+      || !Number.isSafeInteger(stateVersion)
+      || stateVersion < 0
+    ) {
+      failClosed('The active Project provider coordination state is no longer verified.');
+      return false;
     }
+    const capability = providerCapabilitiesRef.current.find((entry) => entry.provider === provider);
+    if (capability?.supportsAbort !== true) {
+      failClosed(`${capability?.displayName || provider} does not expose a verified abort capability.`);
+      return false;
+    }
+
+    setStatusText('Stopping current response…');
+    try {
+      const result = await projectsAPI.agentAbort(projectName, provider, stateVersion);
+      if (result?.provider !== provider) {
+        throw new ProjectReplayContractError(
+          `Project abort provider mismatch: expected ${provider}, received ${String(result?.provider || 'none')}`,
+        );
+      }
+      if (!Number.isSafeInteger(result?.stateVersion) || result.stateVersion < stateVersion) {
+        throw new ProjectReplayContractError('Project abort returned a missing or stale coordination version.');
+      }
+      if (result?.aborted === true && result?.turnId !== expectedTurnId) {
+        throw new ProjectReplayContractError('Project abort did not match the verified active turn.');
+      }
+      if (serverSelectedProviderRef.current !== provider || providerRef.current !== provider) {
+        throw new ProjectReplayContractError('Project provider verification changed while cancellation was pending.');
+      }
+      projectChatStateVersionRef.current = result.stateVersion;
+      setProjectChatStateVersion(result.stateVersion);
+      if (result?.runtime) {
+        runtimeRef.current = result.runtime;
+        setSelectedRuntime(result.runtime);
+      }
+      if (result?.aborted !== true) {
+        setStatusText('Response already finished — refreshing replay…');
+        setReplayRetryNonce((value) => value + 1);
+        return false;
+      }
+      activeReplayTurnIdRef.current = null;
+    } catch (error: any) {
+      const reason = error?.response?.data?.error || error?.message || 'Failed to stop the Project response';
+      if (error instanceof ProjectReplayContractError || isProjectProviderReverificationError(error)) {
+        failClosed(reason);
+      } else {
+        console.warn('[ProjectChat] Project turn abort failed:', error);
+        setSessionError(reason);
+        setStatusText('Stop was not confirmed; the response remains active.');
+      }
+      return false;
+    }
+
     clearWatchdog();
-    pendingAutoCommitRef.current = false;
+    flushPendingLiveRenders();
     isStreamActiveRef.current = false;
     setIsRunning(false);
     setStreamingPhase('idle');
@@ -2058,19 +4686,70 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       if (ft) setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: ft + '\n\n*(cancelled)*' } : m));
       streamingAssistantIdRef.current = null;
     }
-  }, [clearWatchdog]);
+    return true;
+  }, [clearWatchdog, flushPendingLiveRenders, projectName]);
 
   // ── Clear chat ──
   const clearChat = useCallback(async () => {
+    if (sessionControlMutationRef.current || projectTransitionActivityRef.current) return;
     try {
-      // Close current WS (kill the stream if active)
-      if (isStreamActiveRef.current) cancelStream();
+      if (isStreamActiveRef.current && !(await cancelStream())) return;
 
-      pendingAutoCommitRef.current = false;
-      await client.post(`/projects/${projectName}/assistant/reset`);
+      const provider = serverSelectedProviderRef.current;
+      const stateVersion = projectChatStateVersionRef.current;
+      const immutableProjectId = projectIdentityIdRef.current;
+      if (
+        !provider
+        || !immutableProjectId
+        || providerRef.current !== provider
+        || typeof stateVersion !== 'number'
+        || !Number.isSafeInteger(stateVersion)
+        || stateVersion < 0
+      ) {
+        throw new ProjectReplayContractError('Project provider verification is required before clearing chat.');
+      }
+      const capability = providerCapabilitiesRef.current.find((entry) => entry.provider === provider);
+      if (capability?.supportsReset !== true) {
+        throw new ProjectReplayContractError(
+          `${capability?.displayName || provider} does not expose a verified reset capability.`,
+        );
+      }
+      providerTransitionPendingRef.current = true;
+      setProviderTransitionPending(true);
+      setSessionReady(false);
+      await runCoordinatedProjectChatReset({
+        actorUserId,
+        projectId: immutableProjectId,
+        reset: async () => {
+          const { data } = await client.post(`/projects/${encodeURIComponent(projectName)}/assistant/reset`, {
+            provider,
+            stateVersion,
+          });
+          if (data?.provider !== provider) {
+            throw new ProjectReplayContractError(
+              `Project reset provider mismatch: expected ${provider}, received ${String(data?.provider || 'none')}`,
+            );
+          }
+          if (
+            data?.success !== true
+            || !Number.isSafeInteger(data?.stateVersion)
+            || data.stateVersion < stateVersion
+          ) {
+            throw new ProjectReplayContractError('Project reset did not return an authoritative completion state.');
+          }
+          return data;
+        },
+      });
+      activeReplayTurnIdRef.current = null;
+      setPendingSendStorageError(null);
+      rememberPendingSend(null);
+      clearPendingLiveRenders();
       setMessages([]);
       setStatusText(null);
+      thinkingContentRef.current = '';
       setThinkingContent('');
+      thinkingSubjectRef.current = '';
+      setThinkingSubject('');
       setStreamingPhase('idle');
       setIsRunning(false);
       setPendingApprovals([]);
@@ -2079,52 +4758,137 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       assembledRef.current = '';
       lastSegmentStartRef.current = 0;
       lastRawTextLenRef.current = 0;
-
-      // Re-ensure session (gets fresh sessionKey after reset)
-      const { data } = await client.post(`/projects/${projectName}/assistant/ensure-session`, {});
-      setSessionKey(data.sessionKey);
-      setAgentId(data.agentId);
-      sessionKeyRef.current = data.sessionKey;
-    } catch (err) {
+      sessionKeyRef.current = null;
+      setSessionKey(null);
+      setAgentId(null);
+      setSessionReady(false);
+      setTransportConnected(false);
+      setProviderRefreshNonce((value) => value + 1);
+    } catch (err: any) {
       console.error('[ProjectChat] Clear error:', err);
+      const reason = err?.response?.data?.error || err?.message || 'Failed to clear Project Chat';
+      if (err instanceof ProjectChatPendingStateError) {
+        setPendingSendStorageError(reason);
+      }
+      if (
+        err instanceof ProjectReplayContractError
+        || err instanceof ProjectChatPendingStateError
+        || isProjectProviderReverificationError(err)
+      ) {
+        const failedCapabilities = buildUnavailableProjectProviderCapabilities(
+          `Project provider selection must be re-verified: ${reason}`,
+        );
+        providerCapabilitiesRef.current = failedCapabilities;
+        setProviderCapabilities(failedCapabilities);
+        serverSelectedProviderRef.current = null;
+        setServerSelectedProvider(null);
+        providerVerificationStateRef.current = 'failed';
+        setProviderVerificationState('failed');
+        setTransportConnected(false);
+      } else {
+        setSessionReady(true);
+      }
+      providerTransitionPendingRef.current = false;
+      setProviderTransitionPending(false);
+      setSessionError(reason);
     }
-  }, [projectName, cancelStream]);
+  }, [actorUserId, cancelStream, clearPendingLiveRenders, projectName, rememberPendingSend]);
 
   // ── File upload ──
   const uploadFile = useCallback(async (file: File, attachId: string) => {
     const formData = new FormData();
     formData.append('file', file);
+    const provider = serverSelectedProviderRef.current;
+    const stateVersion = projectChatStateVersionRef.current;
+    if (
+      !provider
+      || providerRef.current !== provider
+      || providerVerificationStateRef.current !== 'ready'
+      || !Number.isSafeInteger(stateVersion)
+      || stateVersion == null
+      || stateVersion < 0
+    ) {
+      setPendingAttachments(prev => prev.map(a => a.id === attachId ? {
+        ...a,
+        uploadStatus: 'error' as const,
+        uploadError: 'Project provider verification is required before attaching files.',
+      } : a));
+      return;
+    }
+    const capability = providerCapabilitiesRef.current.find((entry) => entry.provider === provider);
+    if (capability?.supportsAttachments !== true) {
+      setPendingAttachments(prev => prev.map(a => a.id === attachId ? {
+        ...a,
+        uploadStatus: 'error' as const,
+        uploadError: `${capability?.displayName || provider} does not expose a verified attachment capability.`,
+      } : a));
+      return;
+    }
+    formData.append('provider', provider);
+    formData.append('stateVersion', String(stateVersion));
     try {
-      const resp = await fetch('/api/files/', { method: 'POST', credentials: 'include', body: formData });
-      if (!resp.ok) throw new Error(`Upload failed: ${resp.status}`);
-      const data = await resp.json();
-      const fileId = typeof data?.id === 'string' ? data.id : undefined;
-      const serverPath = typeof data?.diskPath === 'string' ? data.diskPath : undefined;
-      const toolUrl = typeof data?.toolUrl === 'string' ? data.toolUrl : undefined;
-      setPendingAttachments(prev => prev.map(a => a.id === attachId ? { ...a, fileId, serverPath, toolUrl, uploadStatus: 'done' as const } : a));
+      const resp = await workspaceAuthorizedFetch(
+        `/api/projects/${encodeURIComponent(projectName)}/assistant/attachments`,
+        { method: 'POST', credentials: 'include', body: formData },
+      );
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data?.error || `Upload failed: ${resp.status}`);
+      if (data?.provider !== provider || data?.stateVersion !== stateVersion) {
+        throw new Error('Project attachment response did not match the verified provider state.');
+      }
+      const projectPath = typeof data?.projectPath === 'string' ? data.projectPath.trim() : '';
+      const projectPathSegments = projectPath.split('/');
+      if (
+        !projectPath
+        || projectPath.startsWith('/')
+        || projectPath.includes('\\')
+        || projectPath.includes('\0')
+        || projectPath.includes(':')
+        || projectPathSegments.some((segment: string) => !segment || segment === '.' || segment === '..')
+      ) {
+        throw new Error('Project attachment response did not contain a safe project-relative path.');
+      }
+      setPendingAttachments(prev => prev.map(a => a.id === attachId ? {
+        ...a,
+        projectPath,
+        uploadStatus: 'done' as const,
+      } : a));
     } catch (err: any) {
       setPendingAttachments(prev => prev.map(a => a.id === attachId ? { ...a, uploadStatus: 'error' as const, uploadError: err.message } : a));
     }
-  }, []);
+  }, [projectName]);
 
   const handleFileSelect = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
+    const capability = providerCapabilitiesRef.current.find((entry) => entry.provider === providerRef.current);
+    if (capability?.supportsAttachments !== true) {
+      appendSystemNotice(
+        `${capability?.displayName || getProjectProviderLabel(providerRef.current)} does not expose a verified Project attachment capability.`,
+      );
+      return;
+    }
     const newAttachments: PendingAttachment[] = [];
     for (const file of Array.from(files)) {
       const id = `pattach-${Date.now()}-${Math.random()}`;
       const isImage = file.type.startsWith('image/');
       const isText = file.type.startsWith('text/') || /\.(js|ts|tsx|jsx|py|rb|go|rs|java|c|cpp|h|css|html|json|yaml|yml|md|sh|bash|toml|ini|env)$/i.test(file.name);
-      const att: PendingAttachment = { id, file, name: file.name, size: file.size, type: isImage ? 'image' : isText ? 'text' : 'other' };
-      if (isImage) { att.previewUrl = URL.createObjectURL(file); att.uploadStatus = 'uploading'; }
+      const att: PendingAttachment = {
+        id,
+        file,
+        name: file.name,
+        size: file.size,
+        type: isImage ? 'image' : isText ? 'text' : 'other',
+        uploadStatus: 'uploading',
+      };
+      if (isImage) att.previewUrl = URL.createObjectURL(file);
       if (isText && file.size < 100 * 1024) { try { att.textContent = await file.text(); } catch {} }
-      else if (!isText) { att.uploadStatus = 'uploading'; }
       newAttachments.push(att);
     }
     setPendingAttachments(prev => [...prev, ...newAttachments]);
     for (const att of newAttachments) {
-      if (att.uploadStatus === 'uploading') uploadFile(att.file, att.id);
+      void uploadFile(att.file, att.id);
     }
-  }, [uploadFile]);
+  }, [appendSystemNotice, uploadFile]);
 
   const removeAttachment = useCallback((id: string) => {
     setPendingAttachments(prev => {
@@ -2139,20 +4903,13 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     if (pendingAttachments.length === 0) return '';
     const parts: string[] = [];
     for (const att of pendingAttachments) {
-      const fileHref = att.fileId
-        ? `/files?file=${encodeURIComponent(att.fileId)}`
-        : att.serverPath
-          ? `/files?path=${encodeURIComponent(att.serverPath)}`
-          : '';
-      const portalUrl = fileHref ? `${window.location.origin}${fileHref}` : '';
-      const diskPathLine = att.serverPath ? `- server_path: ${att.serverPath}` : null;
-      const toolUrlLine = att.toolUrl ? `- tool_url: ${att.toolUrl}` : null;
-      const portalLine = portalUrl ? `- portal_url: ${portalUrl}` : null;
+      if (att.uploadStatus !== 'done' || !att.projectPath) continue;
+      const projectPathLine = `- project_path: ${att.projectPath}`;
       if (att.type === 'text' && att.textContent) {
         parts.push([
           `Attached text file: ${att.name}`,
-          diskPathLine,
-          portalLine,
+          projectPathLine,
+          'The project_path is relative to the current project workspace. Do not use a host path or Portal URL.',
           'The file content is inlined below.',
           `\`\`\`${att.name}\n${att.textContent}\n\`\`\``,
         ].filter(Boolean).join('\n'));
@@ -2161,33 +4918,23 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       const typeHint = att.type === 'image'
         ? [
             'This is an image attachment.',
-            'IMPORTANT: prefer tool_url when present because the gateway host may differ from the portal host.',
-            att.toolUrl
-              ? `Use the image tool with image="${att.toolUrl}".`
-              : att.serverPath
-                ? `Use the image tool with image="${att.serverPath}".`
-                : 'Use the image tool on tool_url or server_path.',
-            'Do not say you cannot access the image unless the tool itself returns an error.',
+            `Open ${att.projectPath} from the current project workspace using project-local file access.`,
+            'Do not use a host path or Portal URL.',
+            'Do not say you cannot access the image unless the project-local tool itself returns an error.',
           ].join(' ')
         : /\.pdf$/i.test(att.name)
           ? [
               'This is a PDF attachment.',
-              'IMPORTANT: prefer tool_url when present because the gateway host may differ from the portal host.',
-              att.toolUrl
-                ? `Use the pdf tool with pdf="${att.toolUrl}".`
-                : att.serverPath
-                  ? `Use the pdf tool with pdf="${att.serverPath}".`
-                  : 'Use the pdf tool on tool_url or server_path.',
-              'Do not say you cannot access the PDF unless the tool itself returns an error.',
+              `Open ${att.projectPath} from the current project workspace using project-local file access.`,
+              'Do not use a host path or Portal URL.',
+              'Do not say you cannot access the PDF unless the project-local tool itself returns an error.',
             ].join(' ')
-          : 'This file is attached on disk. Use tool_url or server_path to inspect it if needed.';
+          : 'This file is available only at project_path inside the current project workspace.';
       parts.push([
         `Attached file: ${att.name}`,
         `- kind: ${att.type}`,
         `- size: ${att.size} bytes`,
-        diskPathLine,
-        toolUrlLine,
-        portalLine,
+        projectPathLine,
         typeHint,
       ].filter(Boolean).join('\n'));
     }
@@ -2235,51 +4982,186 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     });
   }, []);
 
-  const exportChatMarkdown = useCallback(() => {
-    const lines = messages.map((msg) => {
-      const heading = msg.role === 'user'
+  const exportChatMarkdown = useCallback(async () => {
+    if (isExportingChat) return;
+    const expectedGen = historyGenRef.current;
+    const provider = providerRef.current;
+    setIsExportingChat(true);
+    try {
+      const exported: ProjectChatPersistedMessage[] = [];
+      const seenMessageIds = new Set<string>();
+      const seenCursors = new Set<string>();
+      let before: string | null = null;
+
+      while (true) {
+        const page = await projectsAPI.chatHistory(projectName, provider, {
+          limit: PROJECT_CHAT_HISTORY_PAGE_SIZE,
+          before,
+        });
+        if (historyGenRef.current !== expectedGen || providerRef.current !== provider) {
+          throw new Error('Project Chat changed while the transcript was being exported.');
+        }
+        const pageMessages = Array.isArray(page?.messages) ? page.messages : [];
+        for (const message of pageMessages) {
+          const id = String(message.id || '');
+          if (id && seenMessageIds.has(id)) continue;
+          if (id) seenMessageIds.add(id);
+          exported.push(message);
+        }
+
+        const nextCursor = typeof page?.pagination?.nextCursor === 'string'
+          ? page.pagination.nextCursor
+          : null;
+        if (page?.pagination?.hasMore !== true || !nextCursor) break;
+        if (seenCursors.has(nextCursor)) {
+          throw new Error('Project Chat export received a repeated history cursor.');
+        }
+        seenCursors.add(nextCursor);
+        before = nextCursor;
+      }
+
+      exported.sort((left, right) => {
+        const time = Date.parse(String(left.timestamp || '')) - Date.parse(String(right.timestamp || ''));
+        if (Number.isFinite(time) && time !== 0) return time;
+        return String(left.id || '').localeCompare(String(right.id || ''));
+      });
+      const lines = exported.map((msg) => {
+        const heading = msg.role === 'user'
         ? '## User'
         : msg.role === 'assistant'
           ? '## Assistant'
           : msg.role === 'system'
             ? '## System'
             : '## Tool';
-      return `${heading}\n\n${msg.content || ''}`;
-    });
-    const blob = new Blob([`# ${projectName} Project Chat\n\n${lines.join('\n\n---\n\n')}\n`], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `${projectName}-project-chat.md`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
-    appendSystemMessage('Exported chat as markdown.');
-  }, [appendSystemMessage, messages, projectName]);
+        return `${heading}\n\n${msg.content || ''}`;
+      });
+      const blob = new Blob([`# ${projectName} Project Chat\n\n${lines.join('\n\n---\n\n')}\n`], { type: 'text/markdown;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `${projectName}-project-chat.md`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      appendSystemMessage(`Exported ${exported.length} transcript messages as markdown.`);
+    } catch (error: any) {
+      appendSystemMessage(
+        String(error?.response?.data?.error || error?.message || 'Project Chat export failed.'),
+      );
+    } finally {
+      setIsExportingChat(false);
+    }
+  }, [appendSystemMessage, isExportingChat, projectName]);
 
   const showSessionStatus = useCallback(async () => {
     try {
       const [statusRes, modelRes] = await Promise.allSettled([
-        client.get(`/projects/${encodeURIComponent(projectName)}/chat/session-status`),
-        client.get(`/projects/${encodeURIComponent(projectName)}/assistant/active-model`),
+        client.get(`/projects/${encodeURIComponent(projectName)}/chat/session-status`, { params: { provider: providerRef.current } }),
+        client.get(`/projects/${encodeURIComponent(projectName)}/assistant/active-model`, { params: { provider: providerRef.current } }),
       ]);
       const statusData = statusRes.status === 'fulfilled' ? statusRes.value.data : null;
       const modelData = modelRes.status === 'fulfilled' ? modelRes.value.data : null;
+      const verifiedActiveModel = modelData?.verified === true
+        ? canonicalizePortalModelId(String(modelData.activeModel || ''))
+        : '';
       const lines = [
         `Project: ${projectName}`,
-        `Gateway session: ${statusData?.active ? 'active' : 'inactive'}`,
-        `WebSocket: ${wsConnected ? 'connected' : 'disconnected'}`,
+        `Provider: ${getProjectProviderLabel(providerRef.current)}`,
+        `Runtime: ${runtimeRef.current}`,
+        'Execution scope: PROJECT_SANDBOX',
+        `Provider session: ${statusData?.active ? 'active' : 'inactive'}`,
+        `Portal transport: ${transportConnected ? 'connected' : 'disconnected'}`,
         `Session key: ${sessionKeyRef.current || 'not ready'}`,
         `Configured model: ${selectedModel || 'not set'}`,
-        `Active model: ${modelData?.activeModel || statusData?.model || 'unknown'}`,
+        `Active model: ${verifiedActiveModel || 'unverified'}`,
       ];
       if (statusData?.dbStatus) lines.push(`DB status: ${statusData.dbStatus}`);
       appendSystemMessage(lines.join('\n'));
     } catch (err: any) {
       appendSystemMessage(`Failed to load session status: ${err?.response?.data?.error || err?.message || 'Unknown error'}`);
     }
-  }, [appendSystemMessage, projectName, selectedModel, wsConnected]);
+  }, [appendSystemMessage, projectName, selectedModel, transportConnected]);
+
+  const ensureVerifiedProjectModel = useCallback(async (model: string) => {
+    const provider = serverSelectedProviderRef.current;
+    const stateVersion = projectChatStateVersionRef.current;
+    const verifiedSession = sessionKeyRef.current;
+    if (
+      !provider
+      || providerRef.current !== provider
+      || typeof verifiedSession !== 'string'
+      || !verifiedSession.trim()
+      || typeof stateVersion !== 'number'
+      || !Number.isSafeInteger(stateVersion)
+      || stateVersion < 0
+    ) {
+      throw new ProjectReplayContractError('Project provider verification is required before changing models.');
+    }
+    const capability = providerCapabilitiesRef.current.find((entry) => entry.provider === provider);
+    if (capability?.supportsModelSelection !== true) {
+      throw new ProjectReplayContractError(
+        `${capability?.displayName || provider} does not expose a verified model-selection capability.`,
+      );
+    }
+    let admittedStateVersion = stateVersion;
+    if (provider === 'AGENT_ZERO') {
+      const qualified = await projectsAPI.qualifyProjectChatProvider(
+        projectName,
+        'AGENT_ZERO',
+        canonicalizePortalModelId(model),
+      );
+      if (qualified?.provider !== 'AGENT_ZERO'
+        || qualified?.qualification?.status !== 'QUALIFIED'
+        || !Number.isSafeInteger(qualified?.stateVersion)
+        || qualified.stateVersion < admittedStateVersion) {
+        throw new ProjectReplayContractError(
+          'Portal did not prove the selected Agent Zero OAuth model before changing the session.',
+        );
+      }
+      admittedStateVersion = qualified.stateVersion;
+      projectChatStateVersionRef.current = admittedStateVersion;
+      setProjectChatStateVersion(admittedStateVersion);
+      setProviderQualifications((current) => ({
+        ...current,
+        AGENT_ZERO: qualified.qualification,
+      }));
+    }
+    const { data } = await client.post(`/projects/${encodeURIComponent(projectName)}/assistant/ensure-session`, {
+      provider,
+      stateVersion: admittedStateVersion,
+      model,
+    });
+    if (data?.provider !== provider) {
+      throw new ProjectReplayContractError(
+        `Project model provider mismatch: expected ${provider}, received ${String(data?.provider || 'none')}`,
+      );
+    }
+    const verifiedModel = resolveVerifiedProjectModelResponse(capability, data);
+    if (data?.sessionKey !== verifiedSession) {
+      throw new ProjectReplayContractError('Project model change did not retain the verified provider session.');
+    }
+    // Runtime admission bumps the coordination version on every ensure; the
+    // returned version is proof our change committed. Genuine interleaving is
+    // rejected server-side with a 409.
+    if (!Number.isSafeInteger(data?.stateVersion) || data.stateVersion < admittedStateVersion) {
+      throw new ProjectReplayContractError('Project coordination changed while the model was being updated.');
+    }
+    projectChatStateVersionRef.current = data.stateVersion;
+    setProjectChatStateVersion(data.stateVersion);
+    if (
+      serverSelectedProviderRef.current !== provider
+      || providerRef.current !== provider
+      || sessionKeyRef.current !== verifiedSession
+    ) {
+      throw new ProjectReplayContractError('Project provider verification changed while the model was being updated.');
+    }
+    if (data?.runtime) {
+      runtimeRef.current = data.runtime;
+      setSelectedRuntime(data.runtime);
+    }
+    return { ...data, model: verifiedModel };
+  }, [projectName]);
 
   const maybeExecuteSlashCommand = useCallback(async () => {
     const parsed = parseSlashCommand(input);
@@ -2293,37 +5175,118 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         return true;
       case '/new':
       case '/clear':
+        if (providerCapabilitiesRef.current.find((entry) => entry.provider === providerRef.current)?.supportsReset !== true) {
+          appendSystemMessage('This Project provider does not expose a verified reset capability.');
+          return true;
+        }
         await clearChat();
         return true;
       case '/stop':
         if (isRunning) {
-          cancelStream();
+          if (providerCapabilitiesRef.current.find((entry) => entry.provider === providerRef.current)?.supportsAbort !== true) {
+            appendSystemMessage('This Project provider does not expose a verified abort capability.');
+            return true;
+          }
+          void cancelStream();
           appendSystemMessage('Stopping current response…');
         } else {
           appendSystemMessage('No active response to stop.');
         }
         return true;
       case '/models': {
+        if (providerCapabilitiesRef.current.find((entry) => entry.provider === providerRef.current)?.supportsModelSelection !== true) {
+          appendSystemMessage('This Project provider does not expose model selection.');
+          return true;
+        }
         const models = availableModels.length > 0 ? availableModels : await loadAvailableModels();
         const list = models.length > 0 ? models.join('\n') : 'No models available';
         appendSystemMessage(`Available models:\n${list}`);
         return true;
       }
       case '/model': {
+        if (providerCapabilitiesRef.current.find((entry) => entry.provider === providerRef.current)?.supportsModelSelection !== true) {
+          appendSystemMessage('This Project provider does not expose model selection.');
+          return true;
+        }
         if (!rawArg) {
           appendSystemMessage('Usage: /model <model-id>');
           return true;
         }
         const nextModel = canonicalizePortalModelId(rawArg);
+        const provider = serverSelectedProviderRef.current;
+        const verifiedSession = sessionKeyRef.current;
+        const stateVersion = projectChatStateVersionRef.current;
+        if (
+          !provider
+          || !verifiedSession
+          || !Number.isSafeInteger(stateVersion)
+          || stateVersion == null
+          || stateVersion < 0
+        ) {
+          appendSystemMessage('Project provider verification is required before changing models.');
+          return true;
+        }
+        if (
+          (provider === 'OPENCLAW' || provider === 'AGENT_ZERO')
+          && !availableModels.includes(nextModel)
+        ) {
+          appendSystemMessage(`${nextModel} is not available to this exact Project agent.`);
+          return true;
+        }
+        const activity: ProjectModelSwitchActivity = Object.freeze({
+          kind: 'model-switch' as const,
+          projectName,
+          provider,
+          sessionKey: verifiedSession,
+          previousModel: modelRef.current,
+          requestedModel: nextModel,
+          stateVersion,
+          token: ++projectTransitionActivityTokenRef.current,
+        });
+        if (!claimProjectTransitionActivity(activity)) {
+          appendSystemMessage('Another project operation is still running. Wait for it to finish before changing models.');
+          return true;
+        }
+        providerTransitionPendingRef.current = true;
+        setProviderTransitionPending(true);
+        setSessionReady(false);
+        setConnectionNotice(`Switching this project session to ${nextModel}…`);
         try {
-          const { data } = await client.post(`/projects/${encodeURIComponent(projectName)}/assistant/ensure-session`, { model: nextModel });
+          const data = await ensureVerifiedProjectModel(nextModel);
+          if (projectTransitionActivityRef.current !== activity) {
+            throw new ProjectReplayContractError('Project model-switch ownership changed before the server response settled.');
+          }
           const resolvedModel = canonicalizePortalModelId(String(data?.model || nextModel));
           setSelectedModel(resolvedModel);
           modelRef.current = resolvedModel;
           localStorage.setItem(`agent-model-${projectName}`, resolvedModel);
           appendSystemMessage(data?.modelWarning || `Model switched to ${resolvedModel}`);
         } catch (err: any) {
-          appendSystemMessage(`Failed to switch model to ${nextModel}: ${err?.response?.data?.error || err?.message || 'Unknown error'}`);
+          const reason = err?.response?.data?.error || err?.message || 'Unknown error';
+          appendSystemMessage(`Failed to switch model to ${nextModel}: ${reason}`);
+          if (providerRef.current === 'AGENT_ZERO'
+            || err instanceof ProjectReplayContractError
+            || isProjectProviderReverificationError(err)) {
+            const failedCapabilities = buildUnavailableProjectProviderCapabilities(
+              `Project provider selection must be re-verified: ${reason}`,
+            );
+            providerCapabilitiesRef.current = failedCapabilities;
+            setProviderCapabilities(failedCapabilities);
+            serverSelectedProviderRef.current = null;
+            setServerSelectedProvider(null);
+            providerVerificationStateRef.current = 'failed';
+            setProviderVerificationState('failed');
+            setTransportConnected(false);
+          } else {
+            setSessionReady(true);
+          }
+          return true;
+        } finally {
+          if (projectTransitionActivityRef.current === activity) {
+            providerTransitionPendingRef.current = false;
+            setProviderTransitionPending(false);
+            setConnectionNotice(null);
+          }
         }
         return true;
       }
@@ -2331,18 +5294,59 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         await showSessionStatus();
         return true;
       case '/export':
-        exportChatMarkdown();
+        void exportChatMarkdown();
         return true;
       default:
         return false;
     }
-  }, [appendSystemMessage, availableModels, cancelStream, clearChat, exportChatMarkdown, input, isRunning, loadAvailableModels, projectName, showSessionStatus]);
+  }, [appendSystemMessage, availableModels, cancelStream, claimProjectTransitionActivity, clearChat, ensureVerifiedProjectModel, exportChatMarkdown, input, isRunning, loadAvailableModels, projectName, showSessionStatus]);
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || isRunning || !sessionReady) return;
-    const stillUploading = pendingAttachments.some(a => a.uploadStatus === 'uploading');
-    if (stillUploading) return;
+    if (!input.trim()) return;
+    if (isRunning) {
+      if (!providerAcceptsActiveInput) {
+        setSessionError('This Project provider does not accept input during an active turn.');
+        return;
+      }
+      if (pendingAttachments.length > 0) {
+        setSessionError('Attachments cannot be added while answering an active OpenClaw turn.');
+        return;
+      }
+      if (await maybeExecuteSlashCommand()) {
+        setInput('');
+        setShowSlashMenu(false);
+        setSlashCommands([]);
+        setSelectedSlashIndex(0);
+        return;
+      }
+      const sent = await answerPendingProjectQuestion(input);
+      if (sent) {
+        setInput('');
+        setShowSlashMenu(false);
+        setSlashCommands([]);
+        setSelectedSlashIndex(0);
+      }
+      return;
+    }
+    if (!providerSendAllowed) {
+      if (modelCatalogError && providerVerificationStateRef.current === 'ready') {
+        setSessionError(modelCatalogError);
+        return;
+      }
+      if (pendingAttachments.length > 0) {
+        setSessionError('Wait for the project agent to be ready before sending attachments.');
+        return;
+      }
+      const queued = input.trim();
+      queuedComposerMessageRef.current = queued;
+      setQueuedComposerMessage(queued);
+      setInput('');
+      setConnectionNotice('Preparing sandbox → Connecting agent');
+      return;
+    }
+    const attachmentsReady = pendingAttachments.every(a => a.uploadStatus === 'done' && Boolean(a.projectPath));
+    if (!attachmentsReady) return;
     if (await maybeExecuteSlashCommand()) {
       setInput('');
       setShowSlashMenu(false);
@@ -2350,9 +5354,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       setSelectedSlashIndex(0);
       return;
     }
+    const draftText = input.trim();
     const attachText = buildAttachmentText();
-    const fullMessage = attachText + input.trim();
-    const sent = sendMessage(fullMessage);
+    const fullMessage = attachText + draftText;
+    const sent = await sendMessage(fullMessage, draftText);
     if (sent) {
       setInput('');
       setPendingAttachments([]);
@@ -2360,62 +5365,568 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
       setSlashCommands([]);
       setSelectedSlashIndex(0);
     }
-  }, [input, isRunning, sessionReady, pendingAttachments, maybeExecuteSlashCommand, buildAttachmentText, sendMessage]);
+  }, [
+    buildAttachmentText,
+    input,
+    isRunning,
+    maybeExecuteSlashCommand,
+    modelCatalogError,
+    pendingAttachments,
+    providerAcceptsActiveInput,
+    providerSendAllowed,
+    answerPendingProjectQuestion,
+    sendMessage,
+  ]);
+
+  useEffect(() => {
+    const queued = queuedComposerMessageRef.current;
+    if (!queued || !providerSendAllowed) return;
+    queuedComposerMessageRef.current = null;
+    setQueuedComposerMessage(null);
+    void sendMessage(queued, queued).then((sent) => {
+      if (sent) return;
+      queuedComposerMessageRef.current = queued;
+      setQueuedComposerMessage(queued);
+      setInput((current) => current || queued);
+    });
+  }, [providerSendAllowed, sendMessage]);
+
+  const handleProviderChange = useCallback(async (
+    nextProvider: ProjectChatProviderName,
+    options: { confirmed?: boolean } = {},
+  ) => {
+    if (sessionControlMutationRef.current || projectTransitionActivityRef.current) return;
+    const currentServerProvider = serverSelectedProviderRef.current;
+    if (
+      !canSwitchProjectProvider({
+        verificationState: providerVerificationStateRef.current,
+        serverSelectedProvider: currentServerProvider,
+        turnActive: isStreamActiveRef.current,
+        transitionPending: providerTransitionPendingRef.current,
+      })
+      || nextProvider === currentServerProvider
+    ) return;
+    if (pendingAttachments.length > 0) {
+      appendSystemNotice('Remove pending attachments before switching Project Chat providers.');
+      return;
+    }
+    const capability = providerCapabilitiesRef.current.find((entry) => entry.provider === nextProvider);
+    if (!capability?.selectable || capability.executionScope !== 'PROJECT_SANDBOX') {
+      appendSystemNotice(capability?.reason || `${getProjectProviderLabel(nextProvider)} is not available for Projects.`);
+      return;
+    }
+    // Switching to a provider this project has never used starts a fresh
+    // agent. The shared project transcript is preserved, but the new agent
+    // does not inherit the previous agent's working memory — that deserves
+    // one explicit confirmation, and only the first time.
+    if (!options.confirmed && !boundProviders.includes(nextProvider)) {
+      setPendingProviderSwitch(nextProvider);
+      return;
+    }
+    setPendingProviderSwitch(null);
+
+    const storedModel = canonicalizePortalModelId(
+      capability.supportsModelSelection
+        ? localStorage.getItem(`agent-model-${projectName}-${nextProvider}`) || ''
+        : '',
+    );
+    const stateVersion = projectChatStateVersionRef.current;
+    if (!Number.isSafeInteger(stateVersion) || stateVersion == null || stateVersion < 0) {
+      setSessionError('Project Chat coordination state must be refreshed before switching providers.');
+      return;
+    }
+    const previousProvider = currentServerProvider;
+    const previousSession = sessionKeyRef.current;
+    const activity: ProjectProviderTransitionActivity = Object.freeze({
+      kind: 'provider-transition' as const,
+      projectName,
+      provider: nextProvider,
+      previousProvider,
+      sessionKey: previousSession,
+      previousModel: modelRef.current,
+      requestedModel: storedModel,
+      stateVersion,
+      token: ++projectTransitionActivityTokenRef.current,
+    });
+    if (!claimProjectTransitionActivity(activity)) {
+      setSessionError('Another project operation is still running. Wait for it to finish before switching providers.');
+      return;
+    }
+
+    try {
+      providerTransitionPendingRef.current = true;
+      setProviderTransitionPending(true);
+      setSessionReady(false);
+      setSessionError(null);
+      setConnectionNotice(`Switching to ${capability.displayName}…`);
+      const result = await projectsAPI.selectProjectChatProvider(
+        projectName,
+        nextProvider,
+        stateVersion,
+        capability.supportsModelSelection ? storedModel : undefined,
+      );
+      if (
+        projectTransitionActivityRef.current !== activity
+        || serverSelectedProviderRef.current !== previousProvider
+        || sessionKeyRef.current !== previousSession
+      ) {
+        throw new Error('Project provider-switch ownership changed before the server response settled.');
+      }
+      if (result?.provider !== nextProvider) {
+        throw new Error(`Project provider switch mismatch: expected ${nextProvider}, received ${String(result?.provider || 'none')}`);
+      }
+      const verifiedSwitchedModel = resolveVerifiedProjectModelResponse(capability, result);
+      serverSelectedProviderRef.current = nextProvider;
+      activeReplayTurnIdRef.current = null;
+      setServerSelectedProvider(nextProvider);
+      setBoundProviders((prev) => (prev.includes(nextProvider) ? prev : [...prev, nextProvider]));
+      providerRef.current = nextProvider;
+      runtimeRef.current = result.runtime || capability.runtime;
+      const switchedModel = verifiedSwitchedModel
+        || canonicalizePortalModelId(String(storedModel || ''));
+      modelRef.current = switchedModel;
+      setAvailableModels([]);
+      setModelCatalogError(null);
+      setSelectedModel(switchedModel);
+      setSelectedRuntime(runtimeRef.current);
+      setSelectedProvider(nextProvider);
+      if (result.sessionKey) {
+        sessionKeyRef.current = result.sessionKey;
+        setSessionKey(result.sessionKey);
+      }
+      if (result.agentId) setAgentId(result.agentId);
+      if (!Number.isSafeInteger(result?.stateVersion) || result.stateVersion < 0) {
+        throw new Error('Portal did not confirm the Project Chat provider switch version.');
+      }
+      projectChatStateVersionRef.current = result.stateVersion;
+      setProjectChatStateVersion(result.stateVersion);
+      appendSystemNotice(
+        `${result.resumed ? 'Resumed' : 'Created'} ${capability.displayName} project binding. Portal transcript preserved.`,
+      );
+    } catch (error: any) {
+      const reason = error?.response?.data?.error || error?.message || 'Provider switch failed';
+      const failedCapabilities = buildUnavailableProjectProviderCapabilities(
+        `Project provider selection must be re-verified after the failed switch: ${reason}`,
+      );
+      providerCapabilitiesRef.current = failedCapabilities;
+      setProviderCapabilities(failedCapabilities);
+      serverSelectedProviderRef.current = null;
+      setServerSelectedProvider(null);
+      providerVerificationStateRef.current = 'failed';
+      setProviderVerificationState('failed');
+      providerTransitionPendingRef.current = false;
+      setProviderTransitionPending(false);
+      setSessionReady(false);
+      setConnectionNotice(null);
+      setSessionError(reason);
+    }
+  }, [appendSystemNotice, boundProviders, claimProjectTransitionActivity, pendingAttachments.length, projectName]);
+
+  const handleProviderQualification = useCallback(async (
+    provider: 'OPENCLAW' | 'CODEX' | 'CLAUDE_CODE' | 'AGENT_ZERO' | 'GEMINI' | 'OLLAMA',
+    options: { automatic?: boolean } = {},
+  ) => {
+    if (
+      qualificationLeaseRef.current
+      || sessionControlMutationRef.current
+      || projectTransitionActivityRef.current
+      || isStreamActiveRef.current
+      || providerTransitionPendingRef.current
+    ) return;
+    const label = getProjectProviderLabel(provider);
+    const exactAgentZeroModel = canonicalizePortalModelId(agentZeroQualificationModel);
+    if (provider === 'AGENT_ZERO'
+      && !agentZeroProjectModels.some((option) => option.value === exactAgentZeroModel)) {
+      setSessionError('Select a model from a currently connected Agent Zero OAuth provider before qualification.');
+      return;
+    }
+    const lease = Object.freeze({
+      kind: 'provider-qualification' as const,
+      projectName,
+      provider,
+      token: ++qualificationTokenRef.current,
+    });
+    qualificationLeaseRef.current = lease;
+    if (onActivityChangeRef.current?.(lease, true) === false) {
+      qualificationLeaseRef.current = null;
+      setSessionError('Another project operation is still running. Wait for it to finish before preparing a provider.');
+      return;
+    }
+    const suppressionKey = automaticQualificationSuppressionKey(
+      actorUserId,
+      projectIdentityIdRef.current,
+      provider,
+    );
+    if (options.automatic && suppressionKey) {
+      suppressAutomaticQualification(suppressionKey);
+    }
+    setQualificationPending(true);
+    setQualificationProgress({
+      projectName,
+      provider,
+      label,
+      stage: 'checking',
+    });
+    setSessionError(null);
+    setConnectionNotice(null);
+    try {
+      const qualificationModel = provider === 'AGENT_ZERO'
+        ? exactAgentZeroModel
+        : provider === 'OLLAMA' && providerRef.current === 'OLLAMA'
+          ? resolveAvailableModelId(modelRef.current, availableModels)
+          : '';
+      const result = qualificationModel
+        ? await projectsAPI.qualifyProjectChatProvider(projectName, provider, qualificationModel)
+        : await projectsAPI.qualifyProjectChatProvider(projectName, provider);
+      if (qualificationLeaseRef.current !== lease || lease.projectName !== projectName) return;
+      if (result?.provider !== provider || result?.qualification?.status !== 'QUALIFIED') {
+        throw new Error(`Portal could not prepare ${label} for this project.`);
+      }
+      const presentedQualification = presentProjectProviderQualifications({
+        [provider]: result.qualification,
+      })[provider];
+      setProviderQualifications((current) => ({
+        ...current,
+        ...(presentedQualification ? { [provider]: presentedQualification } : {}),
+      }));
+      clearAutomaticQualificationSuppression(suppressionKey);
+      setProviderQualificationFailures((current) => {
+        if (!(provider in current)) return current;
+        const next = { ...current };
+        delete next[provider];
+        return next;
+      });
+      setQualificationProgress({
+        projectName,
+        provider,
+        label,
+        stage: 'refreshing',
+      });
+      // The provider refresh below replaces the pre-qualification capability
+      // snapshot. Model discovery is tied to that refreshed capability so it
+      // cannot race ahead with stale admission evidence or run twice.
+      setProviderRefreshNonce((value) => value + 1);
+    } catch (error: any) {
+      if (qualificationLeaseRef.current !== lease) return;
+      setConnectionNotice(null);
+      setQualificationProgress(null);
+      const presentedError = safeProjectQualificationError(error, label);
+      let suppression: AutomaticQualificationSuppression | null = null;
+      if (suppressionKey) {
+        suppression = suppressAutomaticQualification(
+          suppressionKey,
+          presentedError.recovery === 'HOST_MAINTENANCE' && presentedError.retryable === false
+            ? { disposition: 'HOST_MAINTENANCE' }
+            : presentedError.code === 'PROJECT_QUALIFICATION_RATE_LIMITED'
+              ? { disposition: 'RATE_LIMITED', retryAt: presentedError.retryAt }
+              : presentedError.retryable === false
+                ? {
+                    disposition: presentedError.code === 'PROJECT_QUALIFICATION_IDENTITY_UNAVAILABLE'
+                      ? 'IDENTITY_UNAVAILABLE_NON_RETRYABLE'
+                      : 'NON_RETRYABLE',
+                  }
+              : { disposition: 'AUTO_ONLY' },
+        );
+      }
+      const presentedFailure = suppression && (
+        presentedError.retryable === false
+        || presentedError.code === 'PROJECT_QUALIFICATION_RATE_LIMITED'
+      )
+        ? {
+            ...presentedError,
+            suppressionExpiresAt: new Date(suppression.expiresAt).toISOString(),
+          }
+        : presentedError;
+      setSessionError(presentedFailure.message);
+      setProviderQualificationFailures((current) => ({
+        ...current,
+        [provider]: presentedFailure,
+      }));
+    } finally {
+      if (qualificationLeaseRef.current === lease) {
+        qualificationLeaseRef.current = null;
+        onActivityChangeRef.current?.(lease, false);
+        setQualificationPending(false);
+      }
+    }
+  }, [
+    agentZeroProjectModels,
+    agentZeroQualificationModel,
+    actorUserId,
+    availableModels,
+    projectName,
+  ]);
+
+  useEffect(() => {
+    if (
+      selectedProvider === 'GROK'
+      || qualificationPending
+      || projectTransitionActivity
+      || sessionControlMutation
+      || providerVerificationState !== 'ready'
+    ) return;
+    const qualification = providerQualifications[selectedProvider];
+    if (
+      !qualification
+      || qualification.status === 'QUALIFIED'
+      || qualification.status === 'UNAVAILABLE'
+    ) return;
+    const key = automaticQualificationSuppressionKey(
+      actorUserId,
+      projectIdentityId,
+      selectedProvider as QualifiableProjectProvider,
+    );
+    if (!key || isAutomaticQualificationSuppressed(key)) return;
+    if (automaticQualificationAttemptsRef.current.has(key)) return;
+    automaticQualificationAttemptsRef.current.add(key);
+    void handleProviderQualification(
+      selectedProvider as QualifiableProjectProvider,
+      { automatic: true },
+    );
+  }, [
+    actorUserId,
+    handleProviderQualification,
+    projectIdentityId,
+    projectName,
+    projectTransitionActivity,
+    providerQualifications,
+    providerVerificationState,
+    qualificationPending,
+    qualificationRetryClock,
+    selectedProvider,
+    sessionControlMutation,
+  ]);
+
+  useEffect(() => () => {
+    const lease = qualificationLeaseRef.current;
+    if (!lease) return;
+    qualificationLeaseRef.current = null;
+    onActivityChangeRef.current?.(lease, false);
+  }, []);
 
   // ── Model change ──
   const handleModelChange = useCallback(async (newModel: string) => {
+    if (
+      sessionControlMutationRef.current
+      || projectTransitionActivityRef.current
+      || !sessionReady
+      || isStreamActiveRef.current
+      || sendPendingRef.current
+      || providerCapabilitiesRef.current.find((entry) => entry.provider === providerRef.current)?.supportsModelSelection !== true
+    ) return;
     const normalizedModel = canonicalizePortalModelId(newModel);
     if (normalizedModel === modelRef.current) return;
+    const previousModel = modelRef.current;
+    const provider = serverSelectedProviderRef.current;
+    const verifiedSession = sessionKeyRef.current;
+    const stateVersion = projectChatStateVersionRef.current;
+    if (
+      !provider
+      || !verifiedSession
+      || !Number.isSafeInteger(stateVersion)
+      || stateVersion == null
+      || stateVersion < 0
+    ) {
+      setSessionError('Project provider verification is required before changing models.');
+      return;
+    }
+    if (
+      (provider === 'OPENCLAW' || provider === 'AGENT_ZERO')
+      && !availableModels.includes(normalizedModel)
+    ) {
+      setSessionError(`${normalizedModel} is not available to this exact Project agent.`);
+      return;
+    }
+    const activity: ProjectModelSwitchActivity = Object.freeze({
+      kind: 'model-switch' as const,
+      projectName,
+      provider,
+      sessionKey: verifiedSession,
+      previousModel,
+      requestedModel: normalizedModel,
+      stateVersion,
+      token: ++projectTransitionActivityTokenRef.current,
+    });
+    if (!claimProjectTransitionActivity(activity)) {
+      setSessionError('Another project operation is still running. Wait for it to finish before changing models.');
+      return;
+    }
     setSelectedModel(normalizedModel);
     modelRef.current = normalizedModel;
+    providerTransitionPendingRef.current = true;
+    setProviderTransitionPending(true);
+    setSessionReady(false);
+    setSessionError(null);
+    setConnectionNotice(`Switching this project session to ${normalizedModel}…`);
     // Patch the session model only for an actual user-initiated model change.
     if (sessionKeyRef.current) {
       try {
-        const { data } = await client.post(`/projects/${projectName}/assistant/ensure-session`, { model: normalizedModel });
+        const data = await ensureVerifiedProjectModel(normalizedModel);
+        if (projectTransitionActivityRef.current !== activity) {
+          throw new ProjectReplayContractError('Project model-switch ownership changed before the server response settled.');
+        }
         const resolvedModel = canonicalizePortalModelId(String(data?.model || normalizedModel));
         setSelectedModel(resolvedModel);
         modelRef.current = resolvedModel;
-      } catch {}
+        setSessionReady(true);
+      } catch (error: any) {
+        setSelectedModel(previousModel);
+        modelRef.current = previousModel;
+        const message = error?.response?.data?.error || error?.message || 'Model change failed';
+        setSessionError(message);
+        appendSystemNotice(`Model change failed: ${message}`);
+        if (providerRef.current === 'AGENT_ZERO'
+          || error instanceof ProjectReplayContractError
+          || isProjectProviderReverificationError(error)) {
+          const failedCapabilities = buildUnavailableProjectProviderCapabilities(
+            `Project provider selection must be re-verified: ${message}`,
+          );
+          providerCapabilitiesRef.current = failedCapabilities;
+          setProviderCapabilities(failedCapabilities);
+          serverSelectedProviderRef.current = null;
+          setServerSelectedProvider(null);
+          providerVerificationStateRef.current = 'failed';
+          setProviderVerificationState('failed');
+          setTransportConnected(false);
+        } else {
+          setSessionReady(true);
+        }
+      }
+    } else {
+      setSessionReady(true);
     }
-  }, [projectName]);
+    if (projectTransitionActivityRef.current === activity) {
+      providerTransitionPendingRef.current = false;
+      setProviderTransitionPending(false);
+      setConnectionNotice(null);
+    }
+  }, [appendSystemNotice, availableModels, claimProjectTransitionActivity, ensureVerifiedProjectModel, projectName, sessionReady]);
 
-  const handleThinkingLevelChange = useCallback(async (nextLevel: ThinkingLevel) => {
-    const sk = sessionKeyRef.current;
-    if (!sk) return;
-    setThinkingLevel(nextLevel);
-    setThinkingPending(true);
-    try {
-      await gatewayAPI.patchSession(sk, { thinking: nextLevel }, 'OPENCLAW');
-    } catch (err) {
-      console.error('[ProjectChatPanel] Failed to patch thinking level:', err);
-    } finally {
-      setThinkingPending(false);
+  const applyProjectSessionControlValue = useCallback((
+    kind: ProjectSessionControlKind,
+    value: ProjectSessionControlValue,
+  ) => {
+    if (kind === 'thinking') {
+      const next = value as ThinkingLevel;
+      thinkingLevelRef.current = next;
+      setThinkingLevel(next);
+      return;
     }
+    if (kind === 'reasoning') {
+      const next = value as ReasoningVisibility;
+      reasoningVisibilityRef.current = next;
+      setReasoningVisibility(next);
+      return;
+    }
+    const next = Boolean(value);
+    fastModeEnabledRef.current = next;
+    setFastModeEnabled(next);
   }, []);
 
-  const handleReasoningVisibilityChange = useCallback(async (nextLevel: ReasoningVisibility) => {
-    const sk = sessionKeyRef.current;
-    if (!sk) return;
-    setReasoningVisibility(nextLevel);
-    try {
-      await gatewayAPI.patchSession(sk, { reasoning: nextLevel }, 'OPENCLAW');
-    } catch (err) {
-      console.error('[ProjectChatPanel] Failed to patch reasoning visibility:', err);
-      appendSystemNotice('Failed to update reasoning visibility.');
+  const mutateProjectSessionControl = useCallback(async (
+    kind: ProjectSessionControlKind,
+    requested: ProjectSessionControlValue,
+    previous: ProjectSessionControlValue,
+  ) => {
+    const mutationSession = sessionKeyRef.current;
+    const mutationProvider = providerRef.current;
+    if (
+      !mutationSession
+      || mutationProvider !== 'OPENCLAW'
+      || projectTransitionActivityRef.current
+    ) return;
+
+    const active = sessionControlMutationRef.current;
+    if (active && active.session === mutationSession && active.provider === mutationProvider) return;
+    const activity = Object.freeze({
+      kind: 'session-control' as const,
+      projectName,
+      provider: 'OPENCLAW' as const,
+      sessionKey: mutationSession,
+      control: kind,
+      token: ++sessionControlActivityTokenRef.current,
+    });
+    if (onActivityChangeRef.current?.(activity, true) === false) {
+      setSessionControlError('Another project operation is still running. Wait for it to finish before changing session controls.');
+      return;
     }
-  }, [appendSystemNotice]);
+    const snapshot: ProjectSessionControlMutation = Object.freeze({
+      generation: ++sessionControlGenerationRef.current,
+      kind,
+      provider: mutationProvider,
+      session: mutationSession,
+      previous,
+      requested,
+      activity,
+    });
+    sessionControlMutationRef.current = snapshot;
+    setSessionControlMutation(kind);
+    setSessionControlError(null);
+    applyProjectSessionControlValue(kind, requested);
+
+    const isCurrent = () => (
+      sessionControlMutationRef.current === snapshot
+      && sessionControlGenerationRef.current === snapshot.generation
+      && sessionKeyRef.current === snapshot.session
+      && providerRef.current === snapshot.provider
+    );
+    const setting = kind === 'thinking'
+      ? { thinking: requested }
+      : kind === 'reasoning'
+        ? { reasoning: requested }
+        : { fastMode: requested };
+
+    try {
+      const patchResult = await gatewayAPI.patchSession(snapshot.session, setting, snapshot.provider);
+      if (!isCurrent()) return;
+      let canonical = readProjectSessionControlValue(patchResult, kind);
+      if (canonical === undefined) {
+        const fresh = await gatewayAPI.sessionInfo(snapshot.session, { silent: true });
+        if (!isCurrent()) return;
+        canonical = readProjectSessionControlValue(fresh, kind);
+      }
+      if (canonical === undefined) throw new Error('The server did not confirm the updated session setting.');
+      applyProjectSessionControlValue(kind, canonical);
+    } catch (error: any) {
+      if (!isCurrent()) return;
+      let canonical = snapshot.previous;
+      try {
+        const fresh = await gatewayAPI.sessionInfo(snapshot.session, { silent: true });
+        if (!isCurrent()) return;
+        canonical = readProjectSessionControlValue(fresh, kind) ?? snapshot.previous;
+      } catch {
+        // Fall back to the last confirmed value after an ambiguous failure.
+      }
+      applyProjectSessionControlValue(kind, canonical);
+      if (canonical !== snapshot.requested) {
+        const detail = error?.response?.data?.detail
+          || error?.response?.data?.error
+          || error?.message
+          || `Failed to update ${kind === 'fastMode' ? 'fast mode' : kind}.`;
+        setSessionControlError(String(detail));
+      }
+      console.error(`[ProjectChatPanel] Failed to patch ${kind}:`, error);
+    } finally {
+      if (sessionControlMutationRef.current === snapshot) {
+        sessionControlMutationRef.current = null;
+        onActivityChangeRef.current?.(snapshot.activity, false);
+        setSessionControlMutation(null);
+      }
+    }
+  }, [applyProjectSessionControlValue, projectName]);
+
+  const handleThinkingLevelChange = useCallback(async (nextLevel: ThinkingLevel) => {
+    await mutateProjectSessionControl('thinking', nextLevel, thinkingLevelRef.current);
+  }, [mutateProjectSessionControl]);
+
+  const handleReasoningVisibilityChange = useCallback(async (nextLevel: ReasoningVisibility) => {
+    await mutateProjectSessionControl('reasoning', nextLevel, reasoningVisibilityRef.current);
+  }, [mutateProjectSessionControl]);
 
   const handleFastModeToggle = useCallback(async () => {
-    const sk = sessionKeyRef.current;
-    if (!sk) return;
-    try {
-      await gatewayAPI.patchSession(sk, { fastMode: !fastModeEnabled }, 'OPENCLAW');
-      setFastModeEnabled((prev) => !prev);
-    } catch (err) {
-      console.error('[ProjectChatPanel] Failed to patch fast mode:', err);
-      appendSystemNotice('Failed to update fast mode.');
-    }
-  }, [appendSystemNotice, fastModeEnabled]);
+    const previous = fastModeEnabledRef.current;
+    await mutateProjectSessionControl('fastMode', !previous, previous);
+  }, [mutateProjectSessionControl]);
 
   // ── Speech recognition ──
   const [isListening, setIsListening] = useState(false);
@@ -2457,15 +5968,128 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
     handleFileSelect(e.dataTransfer.files);
   }, [handleFileSelect]);
 
+  const handleProjectMigration = useCallback(async () => {
+    if (projectMigrationPending) return;
+    setProjectMigrationPending(true);
+    setProjectMigrationError(null);
+    try {
+      const result = await projectsAPI.migrateLegacyProjectInPlace(projectName);
+      if (
+        result?.migrated !== true
+        || !result.projectId
+        || result.projectId !== projectMoveNotice?.projectId
+        || !Number.isSafeInteger(result.generation)
+        || !result.integrity?.manifestSha256
+      ) {
+        throw new Error('Portal could not confirm the project migration.');
+      }
+      setProjectMoveNotice(null);
+      setConnectionNotice('Preparing sandbox → Connecting agent');
+      setProviderRefreshNonce((value) => value + 1);
+    } catch (error: any) {
+      setProjectMigrationError(
+        String(
+          error?.response?.data?.error
+          || 'Portal could not finish preparing this project. Its original files remain unchanged.',
+        ),
+      );
+    } finally {
+      setProjectMigrationPending(false);
+    }
+  }, [projectMigrationPending, projectMoveNotice?.projectId, projectName]);
+
   // ── Render ──
-  return (
+  const projectMovePanel = projectMoveNotice ? (
     <motion.div
+      role={isMobile ? 'dialog' : 'region'}
+      aria-modal={isMobile ? 'true' : undefined}
+      aria-label={`Project Chat for ${projectName}`}
       initial={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
       animate={isMobile ? { opacity: 1, x: 0 } : { width: 448, opacity: 1 }}
       exit={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
       transition={{ duration: 0.15 }}
       className={isMobile
-        ? 'fixed inset-0 z-50 flex flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
+        ? 'flex h-full w-full flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
+        : 'border-l border-white/5 flex flex-col overflow-hidden flex-shrink-0 bg-[#080B20]/95 backdrop-blur-sm'}
+    >
+      <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <Bot size={14} className="flex-shrink-0 text-emerald-400" />
+          <span className="text-xs font-medium text-white">Project Chat</span>
+          <span className="truncate text-[10px] text-slate-500" title={projectName}>{projectName}</span>
+        </div>
+        <button
+          type="button"
+          aria-label="Close project chat"
+          onClick={onClose}
+          className="rounded p-1 text-slate-500 transition-colors hover:bg-white/5 hover:text-white"
+        >
+          <X size={14} />
+        </button>
+      </div>
+      <div className="flex flex-1 items-center justify-center overflow-auto p-5">
+        <section
+          aria-labelledby="project-chat-move-title"
+          className="w-full max-w-sm rounded-2xl border border-amber-400/20 bg-amber-500/[0.07] p-5 shadow-xl shadow-black/20"
+        >
+          <div className="mb-3 flex size-10 items-center justify-center rounded-xl bg-amber-400/10 text-amber-200">
+            <Bot size={20} />
+          </div>
+          <h2 id="project-chat-move-title" className="text-sm font-semibold text-white">
+            {projectMoveNotice.title}
+          </h2>
+          <p className="mt-2 text-xs leading-relaxed text-slate-300">
+            {projectMoveNotice.message}
+          </p>
+          {projectMigrationError && (
+            <p role="alert" className="mt-3 rounded-lg border border-red-400/25 bg-red-500/10 p-2 text-[11px] leading-relaxed text-red-100">
+              {projectMigrationError}
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={() => { void handleProjectMigration(); }}
+            disabled={projectMigrationPending}
+            data-contrast-check="legacy-migration-primary"
+            className="mt-4 inline-flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl bg-amber-300 px-4 py-2 text-xs font-semibold text-slate-950 transition-opacity disabled:cursor-wait disabled:opacity-70"
+          >
+            {projectMigrationPending ? (
+              <>
+                <Loader2 size={14} className="animate-spin" />
+                Checking project safety…
+              </>
+            ) : (
+              <>
+                Check and prepare project
+                <ChevronRight size={14} />
+              </>
+            )}
+          </button>
+          <a
+            href={`/api/projects/${encodeURIComponent(projectName)}/download?mode=full`}
+            className="mt-3 inline-flex min-h-[36px] w-full items-center justify-center gap-2 rounded-xl border border-white/10 px-4 py-2 text-[11px] font-medium text-slate-300 transition-colors hover:bg-white/5 hover:text-white"
+          >
+            Download a backup (optional)
+          </a>
+          <p className="mt-3 text-[10px] leading-relaxed text-slate-400">
+            If preparation is allowed, your project identity, share links, hosted apps, and deployment stay attached while a verified source snapshot is parked. If preserved 3.x agent evidence remains, nothing changes.
+          </p>
+        </section>
+      </div>
+    </motion.div>
+  ) : null;
+
+  const panel = (
+    <motion.div
+      role={isMobile ? 'dialog' : undefined}
+      aria-modal={isMobile ? 'true' : undefined}
+      aria-label={isMobile ? `Project Chat for ${projectName}` : undefined}
+      initial={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
+      animate={isMobile ? { opacity: 1, x: 0 } : { width: 448, opacity: 1 }}
+      exit={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
+      transition={{ duration: 0.15 }}
+      className={isMobile
+        ? 'flex h-full w-full flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
         : 'border-l border-white/5 flex flex-col overflow-hidden flex-shrink-0 bg-[#080B20]/95 backdrop-blur-sm'}
       onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
       onDragLeave={() => setDragOver(false)}
@@ -2477,40 +6101,127 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           <Bot size={14} className="text-emerald-400 flex-shrink-0" />
           <span className="text-xs font-medium text-white flex-shrink-0">Agent</span>
           <span className="text-[10px] text-slate-500 truncate" title={projectName}>{projectName}</span>
-          <span className={`text-[8px] px-1.5 py-0.5 rounded-full flex-shrink-0 ${wsConnected ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
-            {wsConnected ? '●' : '○'}
+          <span className={`text-[8px] px-1.5 py-0.5 rounded-full flex-shrink-0 ${transportConnected ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
+            {transportConnected ? '●' : '○'}
           </span>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0 relative">
-          {/* Model selector */}
-          <ProjectModelPicker
-            value={selectedModel}
-            onChange={handleModelChange}
-            models={availableModels}
+          <ProjectProviderMenu
+            providers={providerCapabilities}
+            qualifications={providerQualifications}
+            qualificationFailures={providerQualificationFailures}
+            hostRecoveryRole={hostRecoveryRole}
+            qualificationRetryNow={qualificationRetryClock}
+            selectedProvider={selectedProvider}
+            disabled={!providerSwitchAllowed || qualificationPending || sessionControlMutation !== null || projectTransitionActivity !== null}
+            qualificationPending={qualificationPending}
+            onSelect={(provider) => { void handleProviderChange(provider); }}
+            onQualify={(provider) => {
+              if (provider !== 'GROK') void handleProviderQualification(provider);
+            }}
+            agentZeroModel={agentZeroQualificationModel}
+            agentZeroModels={agentZeroProjectModels}
+            agentZeroModelsLoading={agentZeroModelsLoading}
+            agentZeroModelsError={agentZeroModelsError}
+            onAgentZeroModelChange={setAgentZeroQualificationModel}
           />
+          {/* Model selector */}
+          {providerSupportsModelSelection && (
+            <ProjectModelPicker
+              value={selectedModel}
+              onChange={handleModelChange}
+              models={availableModels}
+              disabled={!providerSendAllowed || sessionControlMutation !== null || projectTransitionActivity !== null}
+              exactCatalogOnly={selectedProvider === 'OPENCLAW' || selectedProvider === 'AGENT_ZERO'}
+            />
+          )}
           <button
-            onClick={() => setShowSessionControls(v => !v)}
+            ref={sessionControlsTriggerRef}
+            type="button"
+            aria-label="Session controls"
+            aria-haspopup="dialog"
+            aria-expanded={showSessionControls}
+            onClick={() => {
+              if (
+                showSessionControls
+                && (sessionControlMutationRef.current || projectTransitionActivityRef.current)
+              ) return;
+              setShowSessionControls(v => !v);
+            }}
             className={`p-1 rounded transition-colors ${showSessionControls ? 'bg-cyan-500/15 text-cyan-300' : 'hover:bg-white/5 text-slate-500 hover:text-cyan-300'}`}
             title="Session Controls"
           >
             <Wrench size={12} />
           </button>
-          {showSessionControls && (
-            <div className="absolute right-0 top-full mt-2 w-72 rounded-xl border border-white/10 bg-[#0B0F22]/98 backdrop-blur-xl shadow-2xl p-3 z-30">
+          <AnchoredPopover
+            open={showSessionControls}
+            anchorRef={sessionControlsTriggerRef}
+            width={288}
+            mobileBreakpoint={767}
+            onDismiss={(reason) => {
+              if (sessionControlMutationRef.current) return;
+              setShowSessionControls(false);
+              if (reason === 'escape') sessionControlsTriggerRef.current?.focus();
+            }}
+          >
+            <div role="dialog" aria-label="Session controls" aria-busy={sessionControlMutation !== null} className="min-h-0 max-h-full w-full overflow-y-auto overscroll-contain rounded-xl border border-theme-border bg-theme-surface p-3 shadow-2xl backdrop-blur-xl">
               <div className="flex items-center justify-between mb-2">
                 <div>
                   <div className="text-xs font-medium text-white">Session Controls</div>
-                  <div className="text-[10px] text-slate-500">Control this OpenClaw project agent directly.</div>
+                  <div className="text-[10px] text-slate-500">Provider-bound controls for this isolated project workspace.</div>
                 </div>
-                <button onClick={() => setShowSessionControls(false)} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white">
+                <button
+                  type="button"
+                  aria-label="Close session controls"
+                  disabled={sessionControlMutation !== null}
+                  onClick={() => {
+                    if (!sessionControlMutationRef.current) setShowSessionControls(false);
+                  }}
+                  className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white disabled:cursor-wait disabled:opacity-40"
+                >
                   <X size={12} />
                 </button>
               </div>
               <div className="space-y-1.5 text-[11px] text-slate-300 mb-3">
+                <div><span className="text-slate-500">Provider:</span> <span className="text-slate-200">{selectedProviderCapability?.displayName || getProjectProviderLabel(selectedProvider)}</span></div>
+                <div><span className="text-slate-500">Runtime:</span> <span className="text-slate-200 break-all">{selectedRuntime}</span></div>
+                <div><span className="text-slate-500">Scope:</span> <span className="text-emerald-300">PROJECT_SANDBOX</span></div>
+                <div><span className="text-slate-500">Agent:</span> <span className="text-slate-200 break-all">{agentId || 'starting…'}</span></div>
                 <div><span className="text-slate-500">Session:</span> <span className="text-slate-200 break-all">{sessionKey || 'starting…'}</span></div>
-                <div><span className="text-slate-500">Model:</span> <span className="text-slate-200">{selectedModel || 'not set'}</span></div>
-                <div><span className="text-slate-500">Connection:</span> <span className={wsConnected ? 'text-emerald-300' : 'text-amber-300'}>{wsConnected ? 'connected' : 'disconnected'}</span></div>
+                <div><span className="text-slate-500">Model:</span> <span className="text-slate-200">{providerSupportsModelSelection ? selectedModel || 'not set' : 'provider-managed'}</span></div>
+                <div><span className="text-slate-500">Authentication:</span> <span className={selectedProviderCapability?.requiresOAuth ? 'text-cyan-300' : 'text-slate-300'}>{selectedProviderCapability?.requiresOAuth ? 'OAuth required' : 'Portal-managed'}</span></div>
+                <div><span className="text-slate-500">Connection:</span> <span className={transportConnected ? 'text-emerald-300' : 'text-amber-300'}>{transportConnected ? 'connected' : 'disconnected'}</span></div>
+                <div><span className="text-slate-500">Attachments:</span> <span className={providerSupportsAttachments ? 'text-emerald-300' : 'text-amber-300'}>{providerSupportsAttachments ? 'available' : 'not supported'}</span></div>
               </div>
+              {sessionControlMutation && (
+                <div role="status" className="mb-3 flex items-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-2 py-2 text-[10px] text-cyan-100">
+                  <Loader2 size={11} className="animate-spin" aria-hidden="true" />
+                  {sessionControlMutation === 'thinking'
+                    ? 'Saving thinking level…'
+                    : sessionControlMutation === 'reasoning'
+                      ? 'Saving reasoning visibility…'
+                      : 'Saving fast mode…'}
+                </div>
+              )}
+              {sessionControlError && (
+                <div role="alert" className="mb-3 rounded-lg border border-red-500/25 bg-red-500/10 px-2 py-2 text-[10px] leading-relaxed text-red-200">
+                  {sessionControlError}
+                </div>
+              )}
+              {providerCapabilities.some((entry) => !entry.selectable) && (
+                <details className="mb-3 rounded-lg border border-amber-500/10 bg-amber-500/[0.04] px-2 py-2 text-[10px] leading-relaxed text-slate-400">
+                  <summary className="cursor-pointer text-amber-200/80">Why other providers are unavailable</summary>
+                  <div className="mt-2 space-y-2">
+                    {providerCapabilities.filter((entry) => !entry.selectable).map((entry) => (
+                      <div key={entry.provider}>
+                        <span className="font-medium text-slate-200">{entry.displayName}:</span> {entry.reason}
+                      </div>
+                    ))}
+                    <div>Host-operator Agent Chat access is never inherited by a Project Chat provider.</div>
+                  </div>
+                </details>
+              )}
+              {selectedProvider === 'OPENCLAW' && <>
               <div className="mb-3 rounded-lg border border-white/6 bg-black/20 px-2 py-2">
                 <div className="flex items-center gap-2 mb-2">
                   <Sparkles size={12} className={thinkingLevel !== 'off' ? 'text-violet-300' : 'text-slate-500'} />
@@ -2520,12 +6231,13 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                   </div>
                 </div>
                 <input
+                  aria-label="Thinking level"
                   type="range"
                   min={0}
                   max={THINKING_LEVELS.length - 1}
                   step={1}
                   value={Math.max(0, THINKING_LEVELS.indexOf(thinkingLevel))}
-                  disabled={!sessionKey || thinkingPending}
+                  disabled={!sessionKey || sessionControlMutation !== null}
                   onChange={(e) => {
                     const next = THINKING_LEVELS[Number(e.target.value)] || 'off';
                     void handleThinkingLevelChange(next);
@@ -2534,7 +6246,6 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                 />
                 <div className="mt-1 text-[10px] text-slate-400">
                   Current: <span className={`font-semibold uppercase ${thinkingLevel === 'adaptive' ? 'text-cyan-300' : 'text-violet-300'}`}>{THINKING_LEVEL_LABELS[thinkingLevel]}</span>
-                  {thinkingPending && <span className="ml-2 text-slate-500">Saving…</span>}
                 </div>
               </div>
               <div className="mb-3 rounded-lg border border-white/6 bg-black/20 px-2 py-2">
@@ -2546,9 +6257,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                   </div>
                 </div>
                 <select
+                  aria-label="Reasoning visibility"
                   value={reasoningVisibility}
                   onChange={(e) => { void handleReasoningVisibilityChange(e.target.value as ReasoningVisibility); }}
-                  disabled={!sessionKey}
+                  disabled={!sessionKey || sessionControlMutation !== null}
                   className="w-full rounded-lg border border-white/10 bg-[#111735] px-2 py-1.5 text-[11px] text-slate-200 disabled:opacity-50"
                 >
                   <option value="off">Hidden</option>
@@ -2571,8 +6283,11 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                       </div>
                     </div>
                     <button
+                      type="button"
+                      aria-label="Toggle Codex fast mode"
+                      aria-pressed={fastModeEnabled}
                       onClick={() => { void handleFastModeToggle(); }}
-                      disabled={!sessionKey}
+                      disabled={!sessionKey || sessionControlMutation !== null}
                       className={`relative h-5 w-10 rounded-full transition-colors ${fastModeEnabled ? 'bg-amber-500' : 'bg-white/10'} disabled:opacity-50`}
                     >
                       <span
@@ -2585,25 +6300,43 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                   </div>
                 </div>
               )}
+              </>}
               <div className="grid grid-cols-2 gap-2 mb-3">
-                <button onClick={() => { void showSessionStatus(); setShowSessionControls(false); }} className="px-2 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-slate-200">Status</button>
-                <button onClick={() => { exportChatMarkdown(); setShowSessionControls(false); }} className="px-2 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-slate-200">Export</button>
-                <button onClick={() => { if (isRunning) cancelStream(); setShowSessionControls(false); }} className="px-2 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-slate-200 disabled:opacity-50" disabled={!isRunning}>Stop</button>
-                <button onClick={() => { void clearChat(); setShowSessionControls(false); }} className="px-2 py-2 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-xs text-amber-200">New Session</button>
+                <button onClick={() => { void showSessionStatus(); setShowSessionControls(false); }} disabled={sessionControlMutation !== null} className="px-2 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-slate-200 disabled:cursor-wait disabled:opacity-50">Status</button>
+                <button
+                  onClick={() => { void exportChatMarkdown(); setShowSessionControls(false); }}
+                  disabled={isExportingChat || sessionControlMutation !== null}
+                  className="px-2 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-slate-200 disabled:cursor-wait disabled:opacity-50"
+                >
+                  {isExportingChat ? 'Exporting…' : 'Export'}
+                </button>
+                <button onClick={() => { if (isRunning) void cancelStream(); setShowSessionControls(false); }} className="px-2 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-slate-200 disabled:opacity-50" disabled={!isRunning || !providerSupportsAbort || sessionControlMutation !== null}>Stop</button>
+                <button onClick={() => { void clearChat(); setShowSessionControls(false); }} disabled={!providerSupportsReset || sessionControlMutation !== null} className="px-2 py-2 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-xs text-amber-200 disabled:opacity-50">New Session</button>
               </div>
               <div className="rounded-lg border border-white/6 bg-black/20 px-2 py-2 text-[10px] text-slate-400 leading-relaxed">
                 Slash commands: <span className="text-slate-200">/new</span>, <span className="text-slate-200">/stop</span>, <span className="text-slate-200">/status</span>, <span className="text-slate-200">/models</span>, <span className="text-slate-200">/model &lt;id&gt;</span>, <span className="text-slate-200">/clear</span>, <span className="text-slate-200">/export</span>
               </div>
             </div>
-          )}
+          </AnchoredPopover>
           {/* Clear chat */}
-          {messages.length > 0 && (
-            <button onClick={clearChat} className="p-1 rounded hover:bg-white/5 text-slate-600 hover:text-amber-400 transition-colors" title="Clear chat">
+          {messages.length > 0 && providerSupportsReset && (
+            <button onClick={clearChat} disabled={sessionControlMutation !== null} className="p-1 rounded hover:bg-white/5 text-slate-600 hover:text-amber-400 transition-colors disabled:cursor-wait disabled:opacity-40" title="Clear chat">
               <Trash2 size={11} />
             </button>
           )}
           {/* Close */}
-          <button onClick={onClose} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white transition-colors">
+          <button
+            aria-label="Close project chat"
+            disabled={sessionControlMutation !== null || qualificationPending || projectTransitionActivity !== null}
+            onClick={() => {
+              if (
+                !sessionControlMutationRef.current
+                && !qualificationLeaseRef.current
+                && !projectTransitionActivityRef.current
+              ) onClose();
+            }}
+            className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white transition-colors disabled:cursor-wait disabled:opacity-40"
+          >
             <X size={14} />
           </button>
         </div>
@@ -2611,7 +6344,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
       {/* Drag overlay */}
       <AnimatePresence>
-        {dragOver && (
+        {dragOver && providerSupportsAttachments && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -2625,19 +6358,185 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
       {/* Session error */}
       {sessionError && (
-        <div className="px-3 py-2 bg-red-500/10 border-b border-red-500/20 text-[11px] text-red-400 flex items-center gap-2">
+        <div role="alert" className="px-3 py-2 bg-red-500/10 border-b border-red-500/20 text-[11px] text-red-400 flex items-center gap-2">
           <XCircle size={12} />
           <span>{sessionError}</span>
         </div>
       )}
 
-      {connectionNotice && !sessionError && (
-        <div className="px-3 py-2 bg-amber-500/10 border-b border-amber-500/20 text-[11px] text-amber-300 flex items-center gap-2">
-          <RotateCcw size={12} className={!wsConnected ? 'animate-spin' : ''} />
-          <span className="flex-1 min-w-0">{connectionNotice}</span>
-          {!wsConnected && (
+      {!sessionError && modelCatalogError && (
+        <div role="alert" className="px-3 py-2 bg-red-500/10 border-b border-red-500/20 text-[11px] text-red-400 flex items-center gap-2">
+          <XCircle size={12} />
+          <span>{modelCatalogError}</span>
+        </div>
+      )}
+
+      {pendingSendStorageError && (
+        <div role="alert" className="flex items-center gap-2 border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-[11px] text-red-300">
+          <XCircle size={12} className="flex-shrink-0" />
+          <span>{pendingSendStorageError}</span>
+        </div>
+      )}
+
+      {pendingSend && (
+        <div
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className="flex items-center gap-2 border-b border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200"
+        >
+          <RotateCcw size={12} className="flex-shrink-0" />
+          <span className="min-w-0 flex-1">
+            Delivery confirmation is pending. Project Chat is checking the durable message ID and will unlock automatically when status or any history page confirms it. Do not send a different message; use Clear Chat only if you intend to abandon this delivery.
+          </span>
+        </div>
+      )}
+
+      {showUnavailableProviderBanner && (
+        <div className="flex items-center gap-2 border-b border-red-500/15 bg-red-500/[0.04] px-3 py-2 text-[10px] text-theme-text-muted">
+          <XCircle size={12} className="flex-shrink-0 text-red-300" />
+          <div className="min-w-0 flex-1">
+            <div className="font-medium text-red-300">No Project Chat provider is verified</div>
+            <div className="mt-0.5 truncate">{unavailableProviderDetail}</div>
+          </div>
+          {directQualificationProvider && !directQualificationRetryBlocked && (
             <button
-              onClick={() => wsRef.current?.reconnect()}
+              type="button"
+              aria-label={`Prepare ${getProjectProviderLabel(directQualificationProvider)} for this project`}
+              disabled={qualificationPending || projectTransitionActivity !== null || sessionControlMutation !== null}
+              onClick={() => { void handleProviderQualification(directQualificationProvider); }}
+              className="flex-shrink-0 rounded-md border border-amber-400/25 bg-amber-500/10 px-2 py-1 font-medium text-amber-100 transition-colors hover:bg-amber-500/20 disabled:cursor-wait disabled:opacity-50"
+            >
+              Prepare {getProjectProviderLabel(directQualificationProvider)}
+            </button>
+          )}
+          {directQualificationRetryBlocked ? (
+            directQualificationRetryDeferred && directQualificationRetryAt ? (
+              <span className="flex-shrink-0 font-medium text-amber-200">
+                Try again after{' '}
+                <time dateTime={directQualificationRetryAt}>
+                  {new Intl.DateTimeFormat(undefined, {
+                    hour: 'numeric',
+                    minute: '2-digit',
+                  }).format(new Date(directQualificationRetryAt))}
+                </time>
+              </span>
+            ) : directQualificationProvider
+              && directQualificationFailure?.recovery === 'HOST_MAINTENANCE' ? (
+              <div className="flex flex-shrink-0 items-center gap-2">
+                {hostRecoveryAction ? (
+                  <a
+                    href={hostRecoveryAction.href}
+                    className="rounded-md border border-violet-400/25 bg-violet-500/10 px-2 py-1 font-medium text-violet-100 transition-colors hover:bg-violet-500/20"
+                  >
+                    {hostRecoveryAction.label}
+                  </a>
+                ) : (
+                  <span className="font-medium text-amber-200">
+                    Contact an Owner or Sub Admin
+                  </span>
+                )}
+                <button
+                  type="button"
+                  aria-label={`Recheck ${getProjectProviderLabel(directQualificationProvider)} after host repair`}
+                  disabled={qualificationPending || projectTransitionActivity !== null || sessionControlMutation !== null}
+                  onClick={() => { void handleProviderQualification(directQualificationProvider); }}
+                  className="rounded-md border border-theme-border bg-theme-surface px-2 py-1 font-medium text-theme-text transition-colors hover:bg-theme-bg disabled:cursor-wait disabled:opacity-50"
+                >
+                  Recheck after repair
+                </button>
+              </div>
+            ) : (
+              <span className="flex-shrink-0 font-medium text-amber-200">
+                Host repair required
+              </span>
+            )
+          ) : (
+            <button
+              type="button"
+              onClick={() => setProviderRefreshNonce((value) => value + 1)}
+              className="flex-shrink-0 rounded-md border border-theme-border bg-theme-surface px-2 py-1 font-medium text-theme-text hover:bg-theme-bg"
+            >
+              Retry
+            </button>
+          )}
+        </div>
+      )}
+
+      {pendingProviderSwitch && (
+        <div className="px-3 py-2.5 bg-cyan-500/10 border-b border-cyan-500/20 text-[11px] text-cyan-100 flex items-center gap-3">
+          <span className="flex-1 min-w-0">
+            Switch to {getProjectProviderLabel(pendingProviderSwitch)}? This starts a fresh {getProjectProviderLabel(pendingProviderSwitch)} agent for this project.
+            Your project conversation stays, but the new agent does not inherit the current agent's working memory.
+          </span>
+          <button
+            onClick={() => { const target = pendingProviderSwitch; setPendingProviderSwitch(null); if (target) void handleProviderChange(target, { confirmed: true }); }}
+            className="px-2.5 py-1 rounded-md bg-cyan-500/20 border border-cyan-400/30 hover:bg-cyan-500/30 transition-colors text-[10px] font-semibold text-cyan-100"
+          >
+            Switch provider
+          </button>
+          <button
+            onClick={() => setPendingProviderSwitch(null)}
+            className="px-2.5 py-1 rounded-md border border-white/10 hover:bg-white/5 transition-colors text-[10px] font-medium text-slate-300"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {qualificationProgress?.projectName === projectName && (
+        <div
+          role="status"
+          aria-label={`${qualificationProgress.label} preparation progress`}
+          aria-live="polite"
+          aria-atomic="true"
+          className="border-b border-amber-500/20 bg-amber-500/[0.07] px-3 py-2 text-[10px]"
+        >
+          <div className="mb-1.5 font-medium text-amber-100">
+            Preparing {qualificationProgress.label} for this project
+          </div>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+            {[
+              { label: 'Request accepted', state: 'done' as const },
+              {
+                label: 'Preparing sandbox',
+                state: qualificationProgress.stage === 'checking' ? 'active' as const : 'done' as const,
+              },
+              {
+                label: 'Connecting agent',
+                state: qualificationProgress.stage === 'refreshing' ? 'active' as const : 'pending' as const,
+              },
+            ].map((step) => (
+              <span key={step.label} className="flex items-center gap-1.5">
+                {step.state === 'done' ? (
+                  <span aria-hidden="true" className="flex h-3 w-3 items-center justify-center rounded-full bg-emerald-500/25 text-[8px] leading-none text-emerald-300">✓</span>
+                ) : step.state === 'active' ? (
+                  <Loader2 aria-hidden="true" size={12} className="animate-spin text-amber-300" />
+                ) : (
+                  <span aria-hidden="true" className="h-3 w-3 rounded-full border border-white/15" />
+                )}
+                <span className={step.state === 'pending' ? 'text-slate-500' : 'text-slate-200'}>{step.label}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {connectionNotice && !sessionError && !qualificationProgress && (
+        <div
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className="px-3 py-2 bg-amber-500/10 border-b border-amber-500/20 text-[11px] text-amber-300 flex items-center gap-2"
+        >
+          <RotateCcw size={12} className={!transportConnected ? 'animate-spin' : ''} />
+          <span className="flex-1 min-w-0">{connectionNotice}</span>
+          {!transportConnected && (
+            <button
+              onClick={() => {
+                setConnectionNotice('Retrying Portal replay…');
+                setReplayRetryNonce((value) => value + 1);
+              }}
               className="px-2 py-0.5 rounded-md border border-amber-500/20 hover:bg-amber-500/10 transition-colors text-[10px] font-medium"
             >
               Retry now
@@ -2665,11 +6564,39 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
           <div className="text-center py-12 px-4">
             <Bot size={28} className="mx-auto mb-2 text-emerald-400/30" />
             <p className="text-xs text-slate-500 mb-1">Ask Agent about <strong className="text-slate-400">{projectName}</strong></p>
-            <p className="text-[10px] text-slate-600">WebSocket streaming • Tool calls • File uploads</p>
+            <p className="text-[10px] text-slate-600">Durable replay • Tool calls • File uploads</p>
           </div>
         ) : (
           <div className="py-2 space-y-0.5">
-            {messages.map((msg, idx) => {
+            {messageWindow.hiddenCount > 0 || historyPagination.hasMore || olderHistoryError ? (
+              <div className="flex justify-center px-3 py-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (messageWindow.hiddenCount > 0) revealEarlierMessages();
+                    else loadOlderHistoryRef.current();
+                  }}
+                  disabled={isLoadingOlderHistory}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.03] px-3 py-1.5 text-[11px] text-slate-400 transition-colors hover:border-white/[0.14] hover:bg-white/[0.06] hover:text-slate-200 disabled:cursor-wait disabled:opacity-60"
+                >
+                  {isLoadingOlderHistory ? <Loader2 size={11} className="animate-spin" /> : null}
+                  {isLoadingOlderHistory
+                    ? 'Loading earlier messages…'
+                    : olderHistoryError
+                      ? 'Retry earlier messages'
+                      : messageWindow.hiddenCount > 0
+                        ? `Show earlier messages · ${messageWindow.hiddenCount} loaded`
+                        : 'Load earlier messages'}
+                </button>
+                {olderHistoryError ? (
+                  <span className="ml-2 max-w-[55%] self-center truncate text-[10px] text-amber-300" title={olderHistoryError}>
+                    {olderHistoryError}
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
+            {messageWindow.items.map((msg, visibleIdx) => {
+              const idx = visibleMessageStartIndex + visibleIdx;
               const isLast = idx === messages.length - 1;
               const isCurrentlyStreaming = isLast && isRunning && msg.role === 'assistant';
 
@@ -2703,6 +6630,17 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
               if (msg.role === 'assistant') {
                 const toolCalls = msg.toolCalls || [];
+                const rawOrderedSegments = Array.isArray(msg.segments)
+                  ? msg.segments.filter((segment) => Boolean(segment?.text?.trim() || segment?.subject))
+                  : [];
+                const orderedSegments = rawOrderedSegments.length > 0
+                  ? (
+                      isCurrentlyStreaming
+                        ? rawOrderedSegments
+                        : reconcileProjectPresentationSegments(rawOrderedSegments, msg.content || '', toolCalls)
+                    )
+                  : rawOrderedSegments;
+                const hasOrderedTimeline = orderedSegments.length > 0;
                 const hasRunningTool = toolCalls.some(tc => tc.status === 'running');
                 const suppressCurrentBubbleText = isCurrentlyStreaming && (
                   streamingPhase !== 'streaming'
@@ -2711,12 +6649,22 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                   || !!activeToolName
                   || !!statusText
                 );
-                const rawVisibleContent = suppressCurrentBubbleText ? '' : msg.content;
+                const canonicalContent = String(msg.content || '').trim();
+                const rawVisibleContent = suppressCurrentBubbleText
+                  || (!isCurrentlyStreaming && hasOrderedTimeline && Boolean(canonicalContent))
+                  ? ''
+                  : msg.content;
                 const visibleThinkingContent = (isCurrentlyStreaming && thinkingContent.trim())
                   ? thinkingContent
+                  : hasOrderedTimeline
+                    ? ''
                   : (msg.thinkingContent || '');
+                const visibleThinkingSubject = isCurrentlyStreaming
+                  ? thinkingSubject
+                  : hasOrderedTimeline ? '' : (msg.thinkingSubject || '');
                 const hasThinkingContent = !!visibleThinkingContent.trim();
-                const liveStatusPlaceholder = isCurrentlyStreaming && !rawVisibleContent.trim() && !hasThinkingContent
+                const hasThinkingPresentation = hasThinkingContent || Boolean(visibleThinkingSubject);
+                const liveStatusPlaceholder = isCurrentlyStreaming && !rawVisibleContent.trim() && !hasThinkingPresentation
                   ? String(statusText || (activeToolName ? getToolStatusText(activeToolName) : '') || '').trim()
                   : '';
                 const visibleContent = rawVisibleContent || liveStatusPlaceholder;
@@ -2724,35 +6672,40 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                 const hasAssistantContent = !!rawVisibleContent.trim();
                 const modelLabel = msg.model ? modelDisplayName(msg.model) : '';
                 const timeLabel = msg.createdAt ? msg.createdAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
-                const showMessageBubble = hasContent || (isCurrentlyStreaming && !hasThinkingContent);
-                const showMeta = hasThinkingContent || hasAssistantContent || toolCalls.length > 0;
+                const showMessageBubble = hasContent || (isCurrentlyStreaming && !hasThinkingPresentation);
+                const showMeta = hasThinkingPresentation || hasAssistantContent || toolCalls.length > 0;
 
                 return (
                   <div key={msg.id} className="px-3 py-1.5 group">
 
-                    {/* Tool call pills */}
-                    {toolCalls.length > 0 && (
-                      <div className="mb-1">
-                        {toolCalls.map(tc => <ToolCallPill key={tc.id} tool={tc} />)}
-                      </div>
+                    {hasOrderedTimeline ? (
+                      <ProjectActivityTimeline
+                        messageId={msg.id}
+                        segments={orderedSegments}
+                        tools={toolCalls}
+                      />
+                    ) : (
+                      <BoundedProjectToolCalls tools={toolCalls} messageKey={msg.id} />
                     )}
 
-                    {(hasThinkingContent || showMessageBubble) && (
+                    {(hasThinkingPresentation || showMessageBubble) && (
                       <div className="flex gap-2 items-start">
                         <div className="w-5 h-5 rounded-full bg-emerald-500/20 flex items-center justify-center flex-shrink-0 mt-0.5 text-[8px] font-bold text-emerald-400">
                           AI
                         </div>
                         <div className="flex-1 min-w-0 max-w-[90%]">
-                          {hasThinkingContent && (
+                          {hasThinkingPresentation && (
                             <div className="mb-1.5 rounded-2xl rounded-bl-sm border border-violet-400/15 bg-violet-500/[0.08] px-3 py-2 shadow-lg shadow-black/10">
                               <div className="mb-1 flex items-center gap-1.5 text-[9px] font-medium uppercase tracking-wide text-violet-200/75">
                                 <Sparkles size={10} className="text-violet-300/75" />
-                                <span>thinking</span>
+                                <span>thinking{visibleThinkingSubject ? ` · ${visibleThinkingSubject}` : ''}</span>
                                 {isCurrentlyStreaming && !hasContent ? <span className="h-1 w-1 rounded-full bg-violet-300/70 animate-pulse" /> : null}
                               </div>
-                              <div className={`text-[11px] leading-relaxed ${isCurrentlyStreaming && !hasContent ? 'streaming-cursor' : ''}`}>
-                                <MarkdownRenderer content={visibleThinkingContent} isStreaming={isCurrentlyStreaming && !hasContent} />
-                              </div>
+                              {hasThinkingContent ? (
+                                <div className={`text-[11px] leading-relaxed ${isCurrentlyStreaming && !hasContent ? 'streaming-cursor' : ''}`}>
+                                  <MarkdownRenderer content={visibleThinkingContent} isStreaming={isCurrentlyStreaming && !hasContent} />
+                                </div>
+                              ) : null}
                             </div>
                           )}
 
@@ -2827,21 +6780,30 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         )}
       </AnimatePresence>
 
-      {/* Stream status rail */}
-      <AnimatePresence>
-        {(isRunning || compactionPhase !== 'idle' || Boolean(statusText) || (!wsConnected && Boolean(connectionNotice))) && (
-          <ComposerStatusBadge
-            phase={isRunning ? streamingPhase : 'idle'}
-            toolName={activeToolName}
-            statusText={statusText}
-            showConnectionLost={!wsConnected && Boolean(connectionNotice)}
-            compactionPhase={compactionPhase}
-          />
-        )}
-      </AnimatePresence>
+      {/* Project runtime status rail. Keep the verified idle state mounted so
+          completion does not look like the provider disconnected. */}
+      <div className={providerVerificationState === 'ready' ? 'min-h-[40px]' : undefined}>
+        <AnimatePresence initial={false}>
+          {(Boolean(idleProjectConnectionStatus) || isRunning || compactionPhase !== 'idle' || Boolean(statusText) || (!transportConnected && Boolean(connectionNotice))) && (
+            <ComposerStatusBadge
+              phase={isRunning ? streamingPhase : 'idle'}
+              toolName={activeToolName}
+              statusText={statusText}
+              showConnectionLost={hasEverConnectedRef.current && !transportConnected && Boolean(connectionNotice)}
+              compactionPhase={compactionPhase}
+              contextSummary={idleProjectConnectionStatus ? {
+                text: 'text-emerald-300/85',
+                dot: 'bg-emerald-400',
+                label: idleProjectConnectionStatus,
+                detail: 'Durable replay ready',
+              } : null}
+            />
+          )}
+        </AnimatePresence>
+      </div>
 
       {/* Composer */}
-      {pendingApproval && (
+      {selectedProvider === 'OPENCLAW' && pendingApproval && (
         <ExecApprovalModal
           key={pendingApproval.id}
           approval={pendingApproval}
@@ -2855,6 +6817,14 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         isRunning ? 'border-amber-500/20 bg-[#0a0a14]/50' : 'border-white/5 bg-[#0a0a14]/30'
       }`}>
         <div className="px-3 pt-2 pb-3">
+          {pendingQuestions.map((request) => (
+            <AskUserQuestionCard
+              key={request.id}
+              request={request}
+              onSettled={settlePendingQuestion}
+            />
+          ))}
+
           {/* Attachment chips */}
           {pendingAttachments.length > 0 && (
             <div className="flex flex-wrap gap-1.5 mb-2">
@@ -2866,9 +6836,10 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
           <form onSubmit={handleSubmit} className="flex items-end gap-1.5">
             {/* Attach button */}
-            {!isRunning && (
+            {!isRunning && providerSendAllowed && providerSupportsAttachments && (
               <button
                 type="button"
+                aria-label="Attach files"
                 onClick={() => fileInputRef.current?.click()}
                 className="flex-shrink-0 p-2 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-white/[0.06] transition-colors"
                 title="Attach file"
@@ -2877,6 +6848,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
               </button>
             )}
             <input
+              aria-label="Choose files to attach"
               ref={fileInputRef}
               type="file"
               multiple
@@ -2887,6 +6859,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             {/* Text input */}
             <div className="relative flex-1">
               <textarea
+                aria-label="Message project agent"
                 ref={inputRef}
                 value={input}
                 onChange={e => {
@@ -2921,25 +6894,63 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
                     void handleSubmit(e as any);
                   }
                 }}
-                placeholder={isRunning ? 'Agent is responding…' : `Message Agent…`}
-                disabled={isRunning || !sessionReady}
+                placeholder={providerAcceptsActiveInput
+                  ? pendingQuestions.length > 0
+                    ? 'Answer the waiting question…'
+                    : 'Guide this active turn…'
+                  : isRunning
+                    ? 'Agent is responding…'
+                  : queuedComposerMessage
+                    ? 'Message queued while the sandbox is prepared…'
+                  : providerVerificationState === 'ready'
+                    ? 'Message Agent…'
+                    : 'Message Agent while Portal prepares the sandbox…'}
+                aria-haspopup="listbox"
+                aria-controls={showSlashMenu && slashCommands.length > 0 && providerSendAllowed ? slashMenuId : undefined}
+                aria-activedescendant={showSlashMenu && slashCommands.length > 0 && providerSendAllowed ? `${slashMenuId}-option-${selectedSlashIndex}` : undefined}
+                disabled={!composerAcceptsInput}
                 className={`w-full resize-none rounded-xl px-3 py-2 text-[11px] placeholder-slate-600 focus:outline-none transition-all min-h-[36px] max-h-[120px] overflow-y-auto ${
                   isRunning
-                    ? 'bg-amber-500/[0.04] border border-amber-500/15 text-slate-500 cursor-not-allowed'
+                    ? providerAcceptsActiveInput
+                      ? 'bg-violet-500/[0.04] border border-violet-500/20 text-white focus:ring-1 focus:ring-violet-500/30'
+                      : 'bg-amber-500/[0.04] border border-amber-500/15 text-slate-500 cursor-not-allowed'
                     : 'bg-white/[0.06] border border-white/[0.08] text-white focus:ring-1 focus:ring-emerald-500/30'
                 }`}
                 rows={1}
+                onBlur={(event) => {
+                  if (slashMenuBlurTimerRef.current) {
+                    clearTimeout(slashMenuBlurTimerRef.current);
+                  }
+                  const ownerDocument = event.currentTarget.ownerDocument;
+                  const htmlElement = ownerDocument.defaultView?.HTMLElement;
+                  slashMenuBlurTimerRef.current = setTimeout(() => {
+                    slashMenuBlurTimerRef.current = null;
+                    const activeElement = ownerDocument.activeElement;
+                    const focusInsideMenu = activeElement !== null
+                      && htmlElement !== undefined
+                      && activeElement instanceof htmlElement
+                      && Boolean(activeElement.closest('[data-slash-command-menu="true"]'));
+                    if (inputRef.current !== activeElement && !focusInsideMenu) {
+                      setShowSlashMenu(false);
+                    }
+                  }, 100);
+                }}
                 onInput={e => {
                   const t = e.currentTarget;
                   t.style.height = 'auto';
                   t.style.height = `${Math.min(t.scrollHeight, 120)}px`;
                 }}
               />
-              {showSlashMenu && slashCommands.length > 0 && !isRunning && (
+              {showSlashMenu && slashCommands.length > 0 && providerSendAllowed && (
                 <SlashCommandMenu
+                  id={slashMenuId}
+                  open
+                  anchorRef={inputRef}
                   commands={slashCommands}
                   selectedIndex={selectedSlashIndex}
+                  onNavigate={setSelectedSlashIndex}
                   onSelect={insertSlashCommand}
+                  onDismiss={() => setShowSlashMenu(false)}
                 />
               )}
             </div>
@@ -2948,6 +6959,7 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
             {speechSupported && (
               <button
                 type="button"
+                aria-label={isListening ? 'Stop dictation' : 'Start dictation'}
                 onClick={toggleMic}
                 className={`flex-shrink-0 p-2 rounded-lg transition-all ${
                   isListening ? 'bg-red-500/20 text-red-400 animate-pulse' : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.06]'
@@ -2960,17 +6972,35 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
 
             {/* Send / Stop button */}
             {isRunning ? (
-              <button
-                type="button"
-                onClick={cancelStream}
-                className="flex-shrink-0 p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-colors border border-red-500/20"
-              >
-                <StopCircle size={14} />
-              </button>
+              <div className="flex flex-shrink-0 items-center gap-1">
+                {providerAcceptsActiveInput && (
+                  <button
+                    type="submit"
+                    aria-label={pendingQuestions.length > 0
+                      ? 'Answer the waiting project question'
+                      : 'Guide the active project turn'}
+                    disabled={!input.trim() || pendingQuestionAnswerPending}
+                    className="p-2 rounded-lg bg-violet-500/20 text-violet-300 hover:bg-violet-500/30 disabled:opacity-30 disabled:cursor-not-allowed transition-colors border border-violet-500/20"
+                  >
+                    <Send size={14} />
+                  </button>
+                )}
+                {providerSupportsAbort && (
+                  <button
+                    type="button"
+                    aria-label="Stop project agent response"
+                    onClick={() => { void cancelStream(); }}
+                    className="p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-colors border border-red-500/20"
+                  >
+                    <StopCircle size={14} />
+                  </button>
+                )}
+              </div>
             ) : (
               <button
                 type="submit"
-                disabled={!input.trim() || !sessionReady || pendingAttachments.some(a => a.uploadStatus === 'uploading')}
+                aria-label="Send message to project agent"
+                disabled={!input.trim() || !composerAcceptsInput || pendingAttachments.some(a => a.uploadStatus !== 'done' || !a.projectPath)}
                 className="flex-shrink-0 p-2 rounded-lg bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
               >
                 <Send size={14} />
@@ -2980,5 +7010,31 @@ export default function ProjectChatPanel({ projectName, onClose }: ProjectChatPa
         </div>
       </div>
     </motion.div>
+  );
+
+  const renderedPanel = projectMovePanel || panel;
+  const renderedPanelWithAnswerProvider = (
+    <AskQuestionAnswerProvider value={submitAskQuestionAnswer}>
+      {renderedPanel}
+    </AskQuestionAnswerProvider>
+  );
+
+  if (!isMobile) return renderedPanelWithAnswerProvider;
+
+  return (
+    <ViewportModal
+      open
+      onDismiss={() => {
+        if (
+          !sessionControlMutationRef.current
+          && !qualificationLeaseRef.current
+          && !projectTransitionActivityRef.current
+        ) onClose();
+      }}
+      dismissible={sessionControlMutation === null && !qualificationPending && projectTransitionActivity === null}
+      className="items-stretch justify-stretch bg-[#080B20]/98 backdrop-blur-sm"
+    >
+      {renderedPanelWithAnswerProvider}
+    </ViewportModal>
   );
 }

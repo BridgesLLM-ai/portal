@@ -2,7 +2,7 @@
  * Path Sandbox Middleware
  * 
  * Prevents project agents and API consumers from accessing files outside
- * their designated project directory (/portal/projects/{userId}/{projectName}/).
+ * their designated directory under the configured PORTAL_PROJECTS_ROOT.
  * 
  * Protects against: directory traversal, symlink escapes, absolute paths,
  * access to system directories, and access to portal source code.
@@ -10,10 +10,23 @@
 
 import { Request, Response, NextFunction } from 'express';
 import path from 'path';
-import fs from 'fs';
 import { prisma } from '../config/database';
+import { isPathContained, resolveContainedPath } from '../services/containedPath';
+import { getWorkspaceOwnerId } from '../utils/workspaceScope';
 
-const PROJECTS_BASE = process.env.PORTAL_PROJECTS_ROOT || path.join(process.env.PORTAL_ROOT || '/portal', 'projects');
+export interface ProjectPathSandboxOptions {
+  projectsBase?: string;
+}
+
+export function resolveProjectsBase(options: ProjectPathSandboxOptions = {}): string {
+  return path.resolve(
+    options.projectsBase
+      || process.env.PORTAL_PROJECTS_ROOT
+      || path.join(process.env.PORTAL_DATA_ROOT || process.env.PORTAL_ROOT || '/portal', 'projects'),
+  );
+}
+
+const PROJECTS_BASE = resolveProjectsBase();
 
 // Directories that must NEVER be accessible from project contexts
 const BLOCKED_PREFIXES = [
@@ -47,75 +60,57 @@ const ESCALATION_THRESHOLD = 3;
 export function validateProjectPath(
   requestedPath: string,
   userId: string,
-  projectName: string
-): { allowed: true; resolvedPath: string } | { allowed: false; reason: string } {
-  
-  const allowedBase = path.resolve(path.join(PROJECTS_BASE, userId, projectName));
-
-  // Reject empty paths
-  if (!requestedPath || !requestedPath.trim()) {
+  projectName: string,
+  options: ProjectPathSandboxOptions = {},
+): { allowed: true; resolvedPath: string } | { allowed: false; reason: string; notFound?: boolean } {
+  if (typeof requestedPath !== 'string' || !requestedPath.trim()) {
     return { allowed: false, reason: 'Empty path' };
   }
-
-  // Reject absolute paths that don't start with allowed base
-  if (path.isAbsolute(requestedPath) && !requestedPath.startsWith(allowedBase)) {
-    return { allowed: false, reason: `Absolute path outside project: ${requestedPath}` };
+  if (!/^[a-zA-Z0-9_-]+$/.test(userId)
+      || !projectName
+      || path.basename(projectName) !== projectName
+      || projectName.includes('\\')) {
+    return { allowed: false, reason: 'Invalid project identity' };
   }
 
-  // Resolve the path relative to project dir
-  const resolved = path.isAbsolute(requestedPath)
-    ? path.resolve(requestedPath)
-    : path.resolve(allowedBase, requestedPath);
-
-  // Primary check: must be within project directory
-  if (!resolved.startsWith(allowedBase + '/') && resolved !== allowedBase) {
-    return { allowed: false, reason: `Path escapes project sandbox: ${resolved}` };
-  }
-
-  // Check against blocked system directories
-  for (const blocked of BLOCKED_PREFIXES) {
-    if (resolved.startsWith(blocked + '/') || resolved === blocked) {
-      return { allowed: false, reason: `Access to system directory blocked: ${blocked}` };
-    }
-  }
-
-  // Check against portal source directories
-  for (const portalDir of PORTAL_DIRS) {
-    if (resolved.startsWith(portalDir + '/') || resolved === portalDir) {
-      return { allowed: false, reason: `Access to portal directory blocked: ${portalDir}` };
-    }
-  }
-
-  // Symlink check: if the path exists, resolve symlinks and re-validate
+  let allowedBase: string;
   try {
-    if (fs.existsSync(resolved)) {
-      const realPath = fs.realpathSync(resolved);
-      if (!realPath.startsWith(allowedBase + '/') && realPath !== allowedBase) {
-        return { allowed: false, reason: `Symlink escapes project sandbox: ${resolved} -> ${realPath}` };
-      }
-
-      // Check symlink target against blocked dirs
-      for (const blocked of BLOCKED_PREFIXES) {
-        if (realPath.startsWith(blocked + '/') || realPath === blocked) {
-          return { allowed: false, reason: `Symlink points to blocked directory: ${realPath}` };
-        }
-      }
-      for (const portalDir of PORTAL_DIRS) {
-        if (realPath.startsWith(portalDir + '/') || realPath === portalDir) {
-          return { allowed: false, reason: `Symlink points to portal directory: ${realPath}` };
-        }
-      }
+    const projectsBase = Object.keys(options).length > 0 ? resolveProjectsBase(options) : PROJECTS_BASE;
+    const ownerRoot = resolveContainedPath(projectsBase, userId, { mustExist: true, kind: 'directory' });
+    allowedBase = resolveContainedPath(ownerRoot, projectName, { mustExist: true, kind: 'directory' });
+  } catch (error: any) {
+    // A Project that simply is not there is a 404, not an accusation. This is
+    // the ordinary state right after a delete or rename — and answering
+    // "Access denied: path outside project sandbox" made routine lifecycle
+    // transitions look like a security failure, while the sibling `/tree` and
+    // Project Chat routes already answered "Project not found".
+    const message = String(error?.message || '');
+    const missing = /path does not exist/i.test(message) || error?.code === 'ENOENT';
+    if (missing) {
+      return { allowed: false, reason: 'Project not found', notFound: true };
     }
-  } catch {
-    // If we can't resolve symlinks (broken link, etc.), allow if path check passed
+    return { allowed: false, reason: 'Project sandbox root is missing or unsafe' };
   }
 
-  // Check for null bytes (path injection)
-  if (requestedPath.includes('\0')) {
-    return { allowed: false, reason: 'Null byte in path' };
+  let relativePath = requestedPath;
+  if (path.isAbsolute(requestedPath)) {
+    const absolutePath = path.resolve(requestedPath);
+    if (!isPathContained(allowedBase, absolutePath) || absolutePath === allowedBase) {
+      return { allowed: false, reason: `Absolute path outside project: ${requestedPath}` };
+    }
+    relativePath = path.relative(allowedBase, absolutePath).split(path.sep).join('/');
   }
 
-  return { allowed: true, resolvedPath: resolved };
+  try {
+    const resolvedPath = resolveContainedPath(allowedBase, relativePath, { mustExist: false });
+    return { allowed: true, resolvedPath };
+  } catch (error: any) {
+    const detail = String(error?.message || 'invalid path');
+    if (/symbolic link/i.test(detail)) {
+      return { allowed: false, reason: `Symlink escapes project sandbox: ${requestedPath}` };
+    }
+    return { allowed: false, reason: `Path escapes project sandbox: ${requestedPath}` };
+  }
 }
 
 /**
@@ -176,18 +171,27 @@ async function logViolation(
  * Expects routes like: /api/projects/:name/files/*
  * File path comes from: req.params[0], req.query.path, req.body.filePath, req.body.path
  */
-export function projectPathSandbox(req: Request, res: Response, next: NextFunction): void {
-  const userId = req.user?.userId;
+const COLLECTION_ROUTE_NAMES = new Set(['clone', 'models', 'upload-zip', 'create-from-upload']);
+
+export async function projectPathSandbox(req: Request, res: Response, next: NextFunction): Promise<void> {
   const projectName = req.params.name || req.params.projectName;
 
   // If no project context, skip (non-project routes)
-  if (!projectName || !userId) {
+  if (!projectName || COLLECTION_ROUTE_NAMES.has(projectName) || !req.user) {
     next();
     return;
   }
 
+  let userId: string;
+  try {
+    userId = await getWorkspaceOwnerId(req.user);
+  } catch {
+    res.status(403).json({ error: 'Unable to resolve project workspace' });
+    return;
+  }
+
   // Collect all possible file path sources
-  const pathSources: string[] = [];
+  const pathSources: unknown[] = [];
   
   // Route wildcard param (e.g., /files/*)
   if (req.params[0]) pathSources.push(req.params[0]);
@@ -200,14 +204,29 @@ export function projectPathSandbox(req: Request, res: Response, next: NextFuncti
   if (req.body?.filePath) pathSources.push(req.body.filePath);
   if (req.body?.path) pathSources.push(req.body.path);
   if (req.body?.targetPath) pathSources.push(req.body.targetPath);
+  if (req.body?.oldPath) pathSources.push(req.body.oldPath);
+  if (req.body?.newPath) pathSources.push(req.body.newPath);
+  if (req.body?.destinationPath) pathSources.push(req.body.destinationPath);
 
   // Validate each path source
   for (const filePath of pathSources) {
     if (!filePath) continue;
+    if (typeof filePath !== 'string') {
+      void logViolation(userId, projectName, '[non-string path]', 'Invalid path type', req);
+      res.status(400).json({ error: 'Invalid project path' });
+      return;
+    }
     
     const result = validateProjectPath(filePath, userId, projectName);
     if (!result.allowed) {
-      logViolation(userId, projectName, filePath, result.reason, req);
+      // A missing Project is not a containment violation. Logging it as one
+      // also polluted the security activity log every time someone opened a
+      // file in a Project that had just been deleted or renamed.
+      if (result.notFound) {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+      void logViolation(userId, projectName, filePath, result.reason, req);
       res.status(403).json({ 
         error: 'Access denied: path outside project sandbox',
         detail: result.reason,
@@ -223,19 +242,31 @@ export function projectPathSandbox(req: Request, res: Response, next: NextFuncti
  * Middleware for the AI routes that access project files.
  * Validates project + filePath from request body/query.
  */
-export function aiPathSandbox(req: Request, res: Response, next: NextFunction): void {
-  const userId = req.user?.userId;
+export async function aiPathSandbox(req: Request, res: Response, next: NextFunction): Promise<void> {
   const projectName = req.body?.projectName || req.query?.project as string;
   const filePath = req.body?.filePath || req.query?.path as string;
 
-  if (!userId || !projectName || !filePath) {
+  if (!projectName || !filePath || !req.user) {
     next();
+    return;
+  }
+
+  if (typeof projectName !== 'string' || typeof filePath !== 'string') {
+    res.status(400).json({ error: 'Invalid project path' });
+    return;
+  }
+
+  let userId: string;
+  try {
+    userId = await getWorkspaceOwnerId(req.user);
+  } catch {
+    res.status(403).json({ error: 'Unable to resolve project workspace' });
     return;
   }
 
   const result = validateProjectPath(filePath, userId, projectName);
   if (!result.allowed) {
-    logViolation(userId, projectName, filePath, result.reason, req);
+    void logViolation(userId, projectName, filePath, result.reason, req);
     res.status(403).json({
       error: 'Access denied: path outside project sandbox',
       detail: result.reason,

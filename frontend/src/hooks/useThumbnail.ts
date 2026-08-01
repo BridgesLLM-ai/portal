@@ -97,7 +97,7 @@ export function useThumbnails(fileIds: string[]): Record<string, string> {
       cancelled = true;
       Object.values(blobUrls).forEach(url => URL.revokeObjectURL(url));
     };
-  }, [fileIds.join(',')]);
+  }, [fileIds]);
 
   return thumbnails;
 }

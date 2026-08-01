@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Ollama local runtime terminal launcher">
+  <defs><linearGradient id="g" x1="20" y1="16" x2="108" y2="112"><stop stop-color="#b9f7ff"/><stop offset="1" stop-color="#3c8faa"/></linearGradient></defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="#07131a" stroke="#b9f7ff" stroke-width="4"/>
+  <path d="M39 52c0-13 10-23 25-23s25 10 25 23v38H39V52Z" fill="url(#g)" opacity=".9"/>
+  <circle cx="54" cy="58" r="4" fill="#07131a"/><circle cx="74" cy="58" r="4" fill="#07131a"/>
+  <text x="64" y="82" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="21" font-weight="800" fill="#07131a">OL</text>
+</svg>

@@ -13,6 +13,7 @@ export type RuntimeTurnEventType =
   | 'turn_done';
 
 export interface RuntimeTurnEventTool {
+  id?: string;
   name?: string;
   arguments?: unknown;
   result?: unknown;
@@ -24,6 +25,7 @@ export interface RuntimeTurnEvent {
   type: RuntimeTurnEventType;
   seq?: number;
   text?: string;
+  subject?: string;
   replace?: boolean;
   runId?: string;
   model?: string;
@@ -37,11 +39,13 @@ export interface RuntimeTurnEvent {
 export interface PortalStreamEventFromTurnEvent {
   type?: string;
   content?: string;
+  subject?: string;
   runId?: string;
   model?: string;
   provenance?: string;
   sessionKey?: string;
   toolName?: string;
+  toolCallId?: string;
   toolArgs?: unknown;
   toolResult?: unknown;
   status?: 'running' | 'done' | 'error';
@@ -91,7 +95,9 @@ export function normalizePortalStreamEventFromTurnEvent<T extends Record<string,
   if (!mappedType) return payload as T & PortalStreamEventFromTurnEvent;
 
   const text = typeof turnEvent.text === 'string' ? turnEvent.text : '';
+  const subject = typeof turnEvent.subject === 'string' ? turnEvent.subject : '';
   const toolName = typeof turnEvent.tool?.name === 'string' ? turnEvent.tool.name : undefined;
+  const toolCallId = typeof turnEvent.tool?.id === 'string' ? turnEvent.tool.id : undefined;
   const toolStatus = turnEvent.tool?.status === 'error'
     ? 'error'
     : turnEvent.tool?.status === 'running'
@@ -104,12 +110,14 @@ export function normalizePortalStreamEventFromTurnEvent<T extends Record<string,
     ...payload,
     type: mappedType,
     content: text || payload?.content || '',
+    subject: subject || payload?.subject,
     runId: turnEvent.runId || payload?.runId,
     model: turnEvent.model || payload?.model,
     provenance: turnEvent.provenance || payload?.provenance,
     sessionKey: turnEvent.sessionKey || payload?.sessionKey,
     ...(turnEvent.replace === true ? { replace: true } : {}),
     ...(toolName ? { toolName } : {}),
+    ...(toolCallId ? { toolCallId } : {}),
     ...(turnEvent.tool?.arguments !== undefined ? { toolArgs: turnEvent.tool.arguments } : {}),
     ...(turnEvent.tool?.result !== undefined ? { toolResult: turnEvent.tool.result } : {}),
     ...(toolStatus ? { status: toolStatus } : {}),

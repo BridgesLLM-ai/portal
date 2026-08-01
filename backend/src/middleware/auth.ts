@@ -3,6 +3,10 @@ import { verifyAccessToken, JwtPayload } from '../utils/jwt';
 import { prisma } from '../config/database';
 import { blockedIPs, extractIP } from '../utils/auth-tracking';
 import { canAccessPortal, isElevatedRole } from '../utils/authz';
+import {
+  admitWorkspaceAuthorizationRequest,
+  settleWorkspaceAuthorizationRequestIfResponseEnded,
+} from '../services/workspaceAuthorizationBarrier';
 
 declare global {
   namespace Express {
@@ -14,6 +18,7 @@ declare global {
 
 const AUTH_LOG_DEDUPE_WINDOW_MS = 60_000;
 const authFailureLogState = new Map<string, { lastLoggedAt: number; suppressedCount: number }>();
+export const AUTHORIZATION_VERSION_HEADER = 'X-Portal-Authorization-Version';
 
 function logAuthFailure(kind: 'Missing token' | 'Invalid token', req: Request) {
   const ip = extractIP(req);
@@ -55,10 +60,27 @@ function getTokenFromRequest(req: Request): string | undefined {
 async function loadAuthorizedUser(payload: JwtPayload) {
   const user = await prisma.user.findUnique({
     where: { id: payload.userId },
-    select: { id: true, email: true, role: true, accountStatus: true, isActive: true, sandboxEnabled: true },
+    select: {
+      id: true,
+      email: true,
+      role: true,
+      accountStatus: true,
+      isActive: true,
+      sandboxEnabled: true,
+      authorizationVersion: true,
+    },
   } as any);
 
   if (!user || !canAccessPortal((user as any).accountStatus, user.isActive)) {
+    return null;
+  }
+
+  // Access tokens issued before this migration are generation 1. That keeps
+  // existing sessions alive until the first authorization-impacting change,
+  // while every later change fails closed immediately.
+  const tokenAuthorizationVersion = payload.authorizationVersion ?? 1;
+  const currentAuthorizationVersion = Number((user as any).authorizationVersion ?? 1);
+  if (tokenAuthorizationVersion !== currentAuthorizationVersion) {
     return null;
   }
 
@@ -68,7 +90,20 @@ async function loadAuthorizedUser(payload: JwtPayload) {
     role: user.role,
     accountStatus: (user as any).accountStatus,
     sandboxEnabled: user.sandboxEnabled,
+    authorizationVersion: currentAuthorizationVersion,
   } satisfies JwtPayload;
+}
+
+function applyAuthorizationResponsePolicy(res: Response, user: JwtPayload): void {
+  res.setHeader(AUTHORIZATION_VERSION_HEADER, String(user.authorizationVersion ?? 1));
+  res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+}
+
+function requestAuthorizationVersion(req: Request): number | null {
+  const value = String(req.get(AUTHORIZATION_VERSION_HEADER) || '').trim();
+  if (!value) return null;
+  if (!/^[1-9]\d{0,9}$/.test(value)) return Number.NaN;
+  return Number(value);
 }
 
 /**
@@ -96,9 +131,26 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
     return;
   }
 
+  // Admission precedes the database read. Otherwise a scope-changing commit
+  // can land after the query snapshot but before this continuation registers
+  // with the barrier, allowing one old-generation request through after the
+  // fence has already reopened.
+  if (!admitWorkspaceAuthorizationRequest(req, res, payload.userId)) return;
   const authorizedUser = await loadAuthorizedUser(payload);
   if (!authorizedUser) {
     res.status(403).json({ error: 'Account is no longer authorized' });
+    return;
+  }
+  if (settleWorkspaceAuthorizationRequestIfResponseEnded(req, res)) return;
+
+  applyAuthorizationResponsePolicy(res, authorizedUser);
+  const requestedVersion = requestAuthorizationVersion(req);
+  if (requestedVersion !== null && requestedVersion !== authorizedUser.authorizationVersion) {
+    res.status(409).json({
+      error: 'Workspace authorization changed. Reload the Portal before continuing.',
+      code: 'WORKSPACE_SCOPE_CHANGED',
+      authorizationVersion: authorizedUser.authorizationVersion,
+    });
     return;
   }
 
@@ -118,8 +170,11 @@ export async function browserAuthRedirect(req: Request, res: Response, next: Nex
   if (token) {
     const payload = verifyAccessToken(token);
     if (payload) {
+      if (!admitWorkspaceAuthorizationRequest(req, res, payload.userId)) return;
       const authorizedUser = await loadAuthorizedUser(payload);
       if (authorizedUser) {
+        if (settleWorkspaceAuthorizationRequestIfResponseEnded(req, res)) return;
+        applyAuthorizationResponsePolicy(res, authorizedUser);
         req.user = authorizedUser;
         return next();
       }
@@ -166,6 +221,7 @@ export async function browserAssetAuth(req: Request, res: Response, next: NextFu
     return;
   }
 
+  applyAuthorizationResponsePolicy(res, authorizedUser);
   req.user = authorizedUser;
   next();
 }

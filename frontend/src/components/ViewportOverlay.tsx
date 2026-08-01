@@ -1,4 +1,4 @@
-import { CSSProperties, ReactNode, useEffect, useState } from 'react';
+import { CSSProperties, ReactNode, useLayoutEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 
 type ViewportAnchor = 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | 'center' | 'fill';
@@ -49,7 +49,7 @@ function getViewportRect(): ViewportRect {
 function useVisualViewportRect() {
   const [rect, setRect] = useState<ViewportRect>(() => getViewportRect());
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     let frame = 0;
     const update = () => {
       window.cancelAnimationFrame(frame);
@@ -113,12 +113,9 @@ export default function ViewportOverlay({
   margin = '1rem',
   blockPage = false,
 }: ViewportOverlayProps) {
-  const [mounted, setMounted] = useState(false);
   const rect = useVisualViewportRect();
 
-  useEffect(() => setMounted(true), []);
-
-  if (!mounted || typeof document === 'undefined') return null;
+  if (typeof document === 'undefined') return null;
 
   return createPortal(
     <div

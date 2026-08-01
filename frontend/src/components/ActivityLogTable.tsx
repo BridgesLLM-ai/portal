@@ -1,16 +1,17 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { activityAPI } from '../api/endpoints';
 import type { ActivityLog } from '../types/index';
 import {
   Shield, ShieldOff, LogIn, LogOut, GitBranch, Server,
   AlertTriangle, Info, AlertCircle, Bug, Zap, Search,
-  ChevronLeft, ChevronRight, Activity, Filter, Archive,
+  ChevronLeft, ChevronRight, Activity, Archive,
   Monitor, Smartphone, Tablet, Globe, Lock, Unlock,
   Copy, Check, Bot, FileText, Upload, Download, Trash2,
   Terminal, BarChart3, Plus, Minus,
 } from 'lucide-react';
 import { useToast } from '../hooks/useToast';
 import { ToastContainer } from './Toast';
+import ConfirmDialog from './ConfirmDialog';
 
 const ITEMS_PER_PAGE = 20;
 
@@ -194,6 +195,26 @@ interface Props {
   standalone?: boolean;
 }
 
+type ActivityMutation =
+  | { kind: 'unblock'; activityId: string; ip: string }
+  | { kind: 'archive-confirm' }
+  | { kind: 'archive' };
+
+function activityMutationError(error: unknown, fallback: string): string {
+  if (typeof error === 'object' && error !== null) {
+    const response = 'response' in error
+      ? (error as { response?: { data?: { error?: unknown; message?: unknown } } }).response
+      : undefined;
+    const apiMessage = response?.data?.error ?? response?.data?.message;
+    if (typeof apiMessage === 'string' && apiMessage.trim()) return apiMessage.trim();
+    if ('message' in error && typeof (error as { message?: unknown }).message === 'string') {
+      const message = (error as { message: string }).message.trim();
+      if (message) return message;
+    }
+  }
+  return fallback;
+}
+
 export default function ActivityLogTable({ standalone = false }: Props) {
   const [logs, setLogs] = useState<ActivityLog[]>([]);
   const [total, setTotal] = useState(0);
@@ -203,23 +224,16 @@ export default function ActivityLogTable({ standalone = false }: Props) {
   const [search, setSearch] = useState('');
   const [severity, setSeverity] = useState('');
   const [loading, setLoading] = useState(false);
-  const [unblocking, setUnblocking] = useState<string | null>(null);
+  const [activeMutation, setActiveMutation] = useState<ActivityMutation | null>(null);
+  const mutationAdmissionRef = useRef<ActivityMutation | null>(null);
+  const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
   const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
-  const [expandedMeta, setExpandedMeta] = useState<Set<string>>(new Set());
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const toast = useToast();
 
   const toggleErrorExpand = (id: string) => {
     setExpandedErrors((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  };
-
-  const toggleMeta = (id: string) => {
-    setExpandedMeta((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
@@ -254,30 +268,67 @@ export default function ActivityLogTable({ standalone = false }: Props) {
   }, [fetchLogs]);
 
   const handleUnblock = async (ip: string, activityId: string) => {
-    setUnblocking(activityId);
+    if (mutationAdmissionRef.current) return;
+    const admission: ActivityMutation = { kind: 'unblock', activityId, ip };
+    mutationAdmissionRef.current = admission;
+    setActiveMutation(admission);
     try {
       await activityAPI.unblockIP(ip, activityId);
       toast.success(`IP ${ip} has been unblocked`);
-      fetchLogs();
-    } catch {
-      toast.error(`Failed to unblock IP`);
+      await fetchLogs();
+    } catch (error) {
+      toast.error(activityMutationError(error, `Failed to unblock ${ip}`));
     } finally {
-      setUnblocking(null);
+      if (mutationAdmissionRef.current === admission) {
+        mutationAdmissionRef.current = null;
+        setActiveMutation(null);
+      }
     }
+  };
+
+  const requestArchive = () => {
+    if (mutationAdmissionRef.current) return;
+    const admission: ActivityMutation = { kind: 'archive-confirm' };
+    mutationAdmissionRef.current = admission;
+    setActiveMutation(admission);
+    setArchiveError(null);
+    setArchiveDialogOpen(true);
+  };
+
+  const cancelArchive = () => {
+    if (mutationAdmissionRef.current?.kind === 'archive') return;
+    mutationAdmissionRef.current = null;
+    setActiveMutation(null);
+    setArchiveError(null);
+    setArchiveDialogOpen(false);
   };
 
   const handleArchive = async () => {
-    if (!confirm('Archive activity entries older than 120 days?')) return;
+    if (!archiveDialogOpen || mutationAdmissionRef.current?.kind !== 'archive-confirm') return;
+    const admission: ActivityMutation = { kind: 'archive' };
+    mutationAdmissionRef.current = admission;
+    setActiveMutation(admission);
+    setArchiveError(null);
     try {
       const res = await activityAPI.archive();
-      alert(`Archived ${res.archived} entries`);
-      fetchLogs();
-    } catch {
-      alert('Failed to archive');
+      await fetchLogs();
+      toast.success(`Archived ${res.archived} activit${res.archived === 1 ? 'y' : 'ies'}`);
+      if (mutationAdmissionRef.current === admission) {
+        mutationAdmissionRef.current = null;
+        setActiveMutation(null);
+        setArchiveDialogOpen(false);
+      }
+    } catch (error) {
+      if (mutationAdmissionRef.current === admission) {
+        const retryAdmission: ActivityMutation = { kind: 'archive-confirm' };
+        mutationAdmissionRef.current = retryAdmission;
+        setActiveMutation(retryAdmission);
+        setArchiveError(activityMutationError(error, 'Failed to archive old activity entries.'));
+      }
     }
   };
 
-  const activeAccent = categoryThemeMap[category] || 'emerald';
+  const archiveBusy = activeMutation?.kind === 'archive';
 
   return (
     <>
@@ -295,8 +346,10 @@ export default function ActivityLogTable({ standalone = false }: Props) {
             </div>
             {standalone && (
               <button
-                onClick={handleArchive}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-white/5 border border-white/10 text-slate-400 hover:text-white hover:bg-white/10 transition-all duration-200"
+                aria-label="Archive old activity entries"
+                onClick={requestArchive}
+                disabled={activeMutation !== null}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-white/5 border border-white/10 text-slate-400 hover:text-white hover:bg-white/10 transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Archive size={12} />
                 Archive Old
@@ -337,6 +390,7 @@ export default function ActivityLogTable({ standalone = false }: Props) {
               <input
                 value={search}
                 onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+                aria-label="Search activity log"
                 placeholder="Search..."
                 className="w-full pl-7 pr-2 py-1.5 text-xs rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:border-emerald-500/50 focus:outline-none transition-colors"
               />
@@ -345,6 +399,7 @@ export default function ActivityLogTable({ standalone = false }: Props) {
             <select
               value={severity}
               onChange={(e) => { setSeverity(e.target.value); setPage(1); }}
+              aria-label="Filter activity log by severity"
               className="px-2 py-1.5 text-xs rounded-lg bg-white/5 border border-white/10 text-white appearance-none cursor-pointer"
             >
               <option value="">All Levels</option>
@@ -377,10 +432,7 @@ export default function ActivityLogTable({ standalone = false }: Props) {
                 const meta = log.metadata as any;
                 const isBlocked = log.action === 'IP_BLOCKED';
                 const isUnblocked = meta?.unblocked === true;
-                const isError = log.action.endsWith('_ERROR') || log.severity === 'ERROR' || log.severity === 'CRITICAL';
-                const isGit = log.action.startsWith('PROJECT_GIT');
                 const isDeploy = log.action.startsWith('PROJECT_DEPLOY');
-                const isLogin = log.action === 'LOGIN' || log.action === 'LOGOUT' || log.action === 'LOGIN_FAILED';
                 const isBotTrap = log.action === 'IP_BLOCKED' || log.action === 'IP_UNBLOCKED';
                 const hasIpInfo = meta && (meta.ip || meta.geo || meta.device);
 
@@ -637,11 +689,14 @@ export default function ActivityLogTable({ standalone = false }: Props) {
                         {isBlocked && !isUnblocked && (meta?.ip || log.ipAddress) && (
                           <button
                             onClick={() => handleUnblock(meta?.ip || log.ipAddress!, log.id)}
-                            disabled={unblocking === log.id}
+                            disabled={activeMutation !== null}
+                            aria-busy={activeMutation?.kind === 'unblock' && activeMutation.activityId === log.id}
                             className="mt-2 flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 border border-emerald-500/20 transition-all duration-200 disabled:opacity-50"
                           >
                             <Unlock size={12} />
-                            {unblocking === log.id ? 'Unblocking...' : `Unblock ${meta?.ip || log.ipAddress}`}
+                            {activeMutation?.kind === 'unblock' && activeMutation.activityId === log.id
+                              ? 'Unblocking…'
+                              : `Unblock ${meta?.ip || log.ipAddress}`}
                           </button>
                         )}
                       </div>
@@ -661,6 +716,7 @@ export default function ActivityLogTable({ standalone = false }: Props) {
             </span>
             <div className="flex items-center gap-1">
               <button
+                aria-label="Previous activity page"
                 onClick={() => setPage(Math.max(1, page - 1))}
                 disabled={page <= 1}
                 className="p-1.5 rounded-lg hover:bg-white/5 text-slate-400 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
@@ -676,7 +732,7 @@ export default function ActivityLogTable({ standalone = false }: Props) {
                     key={p}
                     onClick={() => setPage(p)}
                     className={`w-7 h-7 text-xs rounded-lg transition-colors ${
-                      p === page ? 'bg-emerald-500/20 text-emerald-400 font-medium' : 'text-slate-500 hover:bg-white/5'
+                      p === page ? 'accent-active font-medium' : 'text-slate-500 hover:bg-white/5'
                     }`}
                   >
                     {p}
@@ -684,6 +740,7 @@ export default function ActivityLogTable({ standalone = false }: Props) {
                 );
               })}
               <button
+                aria-label="Next activity page"
                 onClick={() => setPage(Math.min(pages, page + 1))}
                 disabled={page >= pages}
                 className="p-1.5 rounded-lg hover:bg-white/5 text-slate-400 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
@@ -694,6 +751,20 @@ export default function ActivityLogTable({ standalone = false }: Props) {
           </div>
         )}
       </div>
+      <ConfirmDialog
+        open={archiveDialogOpen}
+        title="Archive old activity?"
+        message="Archive activity entries older than 120 days?"
+        detail="Recent security and operational history will remain available."
+        error={archiveError}
+        confirmLabel="Archive old entries"
+        busy={archiveBusy}
+        busyLabel="Archiving…"
+        variant="warning"
+        icon="warning"
+        onConfirm={() => { void handleArchive(); }}
+        onCancel={cancelArchive}
+      />
     </>
   );
 }

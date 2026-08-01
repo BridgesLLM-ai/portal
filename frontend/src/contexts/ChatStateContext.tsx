@@ -2,9 +2,10 @@
  * ChatStateContext — Resilient chat state that survives route navigation.
  *
  * Architecture:
- * - ChatStateProvider wraps the app (inside auth, outside router outlet)
+ * - ChatStateProvider wraps only the Agent Chat route
  * - Owns all chat state: messages, streaming phase, WS connection, etc.
- * - WS event handler stays registered regardless of which page is active
+ * - Leaving Agent Chat releases browser-side sockets/timers; the server-owned
+ *   session continues and history/replay recovers it when the route remounts
  * - useAgentRuntime becomes a thin consumer that wires into assistant-ui
  *
  * The WsManager singleton and event processing logic are lifted here from

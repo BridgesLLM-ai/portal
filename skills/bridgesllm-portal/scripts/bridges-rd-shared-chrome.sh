@@ -3,29 +3,36 @@
 # Always starts clean, pins device scale at 1, and matches the active VNC resolution.
 set -euo pipefail
 
-DISABLE_FILE="${BRIDGES_SHARED_CHROME_DISABLE_FILE:-/run/bridges-shared-chrome.disabled}"
-if [ -e "$DISABLE_FILE" ]; then
-  echo "Shared Chrome launch disabled: $(cat "$DISABLE_FILE" 2>/dev/null || true)" >&2
-  exit 75
-fi
-
 USER_URL="${1:-https://www.google.com/}"
 
 # Never let root own or mutate the shared browser profile.
 if [ "$(id -u)" = "0" ]; then
   if id bridgesrd >/dev/null 2>&1; then
-    # Source canonical desktop env if available, fall back to inline exports
-    ENV_FILE="/home/bridgesrd/.bridges-rd-env"
-    if [ -f "$ENV_FILE" ]; then
-      ENV_CMD=". $ENV_FILE;"
-    else
-      ENV_CMD="export DISPLAY=:1; export XDG_RUNTIME_DIR=/tmp/bridges-rd-runtime; export PULSE_SERVER=unix:/tmp/bridges-rd-runtime/pulse/native; export SDL_AUDIODRIVER=pulseaudio;"
-    fi
-    exec su - bridgesrd -c "${ENV_CMD} /usr/local/bin/bridges-rd-shared-chrome.sh $(printf '%q' "$USER_URL")"
+    # Avoid a login-PAM session: pam_systemd would move Chrome out of the
+    # caller's service cgroup and a login shell may strand an ssh-agent.
+    exec /usr/bin/setpriv \
+      --reuid=bridgesrd \
+      --regid=bridgesrd \
+      --init-groups \
+      -- /usr/bin/env -i \
+      HOME=/home/bridgesrd \
+      USER=bridgesrd \
+      LOGNAME=bridgesrd \
+      SHELL=/bin/bash \
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      LANG="${LANG:-C.UTF-8}" \
+      /usr/local/bin/bridges-rd-shared-chrome.sh "$USER_URL"
   fi
   echo "ERROR: Must not run shared browser as root without bridgesrd user" >&2
   exit 1
 fi
+
+if [ "$(id -un)" != "bridgesrd" ]; then
+  echo "ERROR: Shared browser must run as the bridgesrd account" >&2
+  exit 1
+fi
+
+umask 077
 
 # Source canonical desktop env (written by VNC launcher / RD setup)
 ENV_FILE="/home/bridgesrd/.bridges-rd-env"
@@ -34,6 +41,7 @@ if [ -f "$ENV_FILE" ]; then
 else
   # Fallback for older installs
   export DISPLAY="${DISPLAY:-:1}"
+  export XAUTHORITY="${XAUTHORITY:-/home/bridgesrd/.Xauthority}"
   export XDG_RUNTIME_DIR=/tmp/bridges-rd-runtime
   export PULSE_SERVER=unix:/tmp/bridges-rd-runtime/pulse/native
   export SDL_AUDIODRIVER=pulseaudio
@@ -78,10 +86,12 @@ JSON
 JS
 }
 
-PROFILE_ROOT="/tmp/bridges-agent-browser"
-PROFILE_DIR="${PROFILE_ROOT}/profile"
-NAV_EXTENSION_DIR="${PROFILE_ROOT}/nav-extension"
-WARMUP_FILE="${PROFILE_ROOT}/warmup.html"
+STATE_ROOT="/home/bridgesrd/.config/bridges-agent-browser"
+SESSION_ROOT="${STATE_ROOT}/session"
+PROFILE_DIR="${SESSION_ROOT}/profile"
+NAV_EXTENSION_DIR="${SESSION_ROOT}/nav-extension"
+WARMUP_FILE="${SESSION_ROOT}/warmup.html"
+LOG_DIR="${STATE_ROOT}/logs"
 CDP_PORT=18801
 
 CHROME_BIN="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium-browser || command -v chromium || true)"
@@ -104,9 +114,13 @@ read_vnc_geometry() {
 
 read -r VNC_W VNC_H < <(read_vnc_geometry)
 
-rm -rf "$PROFILE_ROOT" 2>/dev/null || true
+mkdir -p "$STATE_ROOT" "$LOG_DIR"
+chmod 700 "$STATE_ROOT" "$LOG_DIR"
+rm -rf "$SESSION_ROOT" 2>/dev/null || true
 mkdir -p "$PROFILE_DIR/Default"
+chmod 700 "$SESSION_ROOT" "$PROFILE_DIR" "$PROFILE_DIR/Default"
 write_nav_extension "$NAV_EXTENSION_DIR"
+chmod 700 "$NAV_EXTENSION_DIR"
 
 cat > "$PROFILE_DIR/Default/Preferences" <<PREFS
 {
@@ -520,15 +534,7 @@ fit_active_window_to_vnc() {
   --new-window \
   --no-first-run \
   --no-default-browser-check \
-  --no-sandbox \
-  --disable-gpu \
-  --disable-gpu-sandbox \
-  --disable-gpu-compositing \
-  --disable-accelerated-2d-canvas \
-  --disable-accelerated-video-decode \
-  --disable-setuid-sandbox \
   --disable-dev-shm-usage \
-  --renderer-process-limit=2 \
   --disable-background-networking \
   --disable-sync \
   --disable-translate \

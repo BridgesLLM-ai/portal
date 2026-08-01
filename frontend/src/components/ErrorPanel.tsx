@@ -1,13 +1,14 @@
-import { useState, useEffect, useMemo } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useState, useEffect, useMemo, useId, useRef } from 'react';
+import { motion } from 'framer-motion';
 import {
   X, AlertCircle, Zap, AlertTriangle, Bug, Copy, Check,
-  Download, Trash2, Search, Filter, ChevronDown, ChevronUp,
+  Download, Trash2, Search, ChevronDown, ChevronUp,
 } from 'lucide-react';
 import {
   subscribeErrors, clearErrors, exportErrorsJSON,
-  type StoredError, type ErrorCategory,
+  type StoredError,
 } from '../utils/errorHandler';
+import ViewportModal from './ViewportModal';
 
 const categoryLabels: Record<string, string> = {
   agent_chat: 'Agent Chat',
@@ -33,6 +34,8 @@ interface Props {
 }
 
 export default function ErrorPanel({ open, onClose }: Props) {
+  const panelTitleId = useId();
+  const panelRef = useRef<HTMLDivElement>(null);
   const [errors, setErrors] = useState<StoredError[]>([]);
   const [search, setSearch] = useState('');
   const [filterCategory, setFilterCategory] = useState<string>('');
@@ -95,31 +98,28 @@ export default function ErrorPanel({ open, onClose }: Props) {
   }, [errors]);
 
   return (
-    <AnimatePresence>
-      {open && (
-        <>
-          {/* Backdrop */}
+    <ViewportModal
+      open={open}
+      onDismiss={onClose}
+      initialFocusRef={panelRef}
+      className="bg-black/40 !items-stretch !justify-end"
+    >
           <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 bg-black/40 z-50"
-            onClick={onClose}
-          />
-
-          {/* Panel */}
-          <motion.div
+            ref={panelRef}
             initial={{ x: '100%' }}
             animate={{ x: 0 }}
-            exit={{ x: '100%' }}
             transition={{ type: 'spring', damping: 30, stiffness: 300 }}
-            className="fixed right-0 top-0 bottom-0 w-full max-w-lg bg-[#0D1130] border-l border-white/10 z-50 flex flex-col shadow-2xl"
+            className="relative h-full w-full max-w-lg bg-theme-surface text-theme-text border-l border-theme-border flex flex-col shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={panelTitleId}
+            tabIndex={-1}
           >
             {/* Header */}
             <div className="flex items-center justify-between p-4 border-b border-white/10">
               <div className="flex items-center gap-2">
                 <Bug size={18} className="text-red-400" />
-                <h2 className="text-lg font-semibold text-white">Error Log</h2>
+                <h2 id={panelTitleId} className="text-lg font-semibold text-theme-text">Error Log</h2>
                 <span className="text-xs text-slate-500">({errors.length})</span>
               </div>
               <div className="flex items-center gap-1">
@@ -128,6 +128,7 @@ export default function ErrorPanel({ open, onClose }: Props) {
                   disabled={errors.length === 0}
                   className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors disabled:opacity-30"
                   title="Export as JSON"
+                  aria-label="Export error log as JSON"
                 >
                   <Download size={16} />
                 </button>
@@ -136,12 +137,14 @@ export default function ErrorPanel({ open, onClose }: Props) {
                   disabled={errors.length === 0}
                   className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-red-400 transition-colors disabled:opacity-30"
                   title="Clear all"
+                  aria-label="Clear error log"
                 >
                   <Trash2 size={16} />
                 </button>
                 <button
                   onClick={onClose}
                   className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors"
+                  aria-label="Close error log"
                 >
                   <X size={16} />
                 </button>
@@ -156,13 +159,15 @@ export default function ErrorPanel({ open, onClose }: Props) {
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
                   placeholder="Search errors..."
-                  className="w-full pl-7 pr-2 py-1.5 text-xs rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:border-red-500/50 focus:outline-none"
+                  aria-label="Search error log"
+                  className="w-full pl-7 pr-2 py-1.5 text-xs rounded-lg bg-theme-surface-raised border border-theme-border text-theme-text placeholder-slate-500 focus:border-red-500/50 focus:outline-none"
                 />
               </div>
               <select
                 value={filterCategory}
                 onChange={(e) => setFilterCategory(e.target.value)}
-                className="px-2 py-1.5 text-xs rounded-lg bg-white/5 border border-white/10 text-white appearance-none cursor-pointer"
+                aria-label="Filter errors by category"
+                className="px-2 py-1.5 text-xs rounded-lg bg-theme-surface-raised border border-theme-border text-theme-text appearance-none cursor-pointer"
               >
                 <option value="">All Types</option>
                 {availableCategories.map(c => (
@@ -172,7 +177,8 @@ export default function ErrorPanel({ open, onClose }: Props) {
               <select
                 value={filterSeverity}
                 onChange={(e) => setFilterSeverity(e.target.value)}
-                className="px-2 py-1.5 text-xs rounded-lg bg-white/5 border border-white/10 text-white appearance-none cursor-pointer"
+                aria-label="Filter errors by severity"
+                className="px-2 py-1.5 text-xs rounded-lg bg-theme-surface-raised border border-theme-border text-theme-text appearance-none cursor-pointer"
               >
                 <option value="">All Severity</option>
                 <option value="CRITICAL">Critical</option>
@@ -210,13 +216,15 @@ export default function ErrorPanel({ open, onClose }: Props) {
                                 {new Date(error.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                               </span>
                             </div>
-                            <p className="text-sm text-white mt-1 break-words">{error.message}</p>
+                            <p className="text-sm text-theme-text mt-1 break-words">{error.message}</p>
 
                             {/* Debug toggle */}
                             <div className="flex items-center gap-2 mt-2">
                               <button
                                 onClick={() => toggleExpand(error.id)}
                                 className="flex items-center gap-1 text-[11px] text-slate-500 hover:text-slate-300 transition-colors"
+                                aria-expanded={isExpanded}
+                                aria-controls={`error-debug-${error.id}`}
                               >
                                 {isExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
                                 {isExpanded ? 'Hide' : 'View'} Debug Info
@@ -232,7 +240,7 @@ export default function ErrorPanel({ open, onClose }: Props) {
 
                             {/* Expanded debug */}
                             {isExpanded && (
-                              <div className="mt-2 p-3 rounded-lg bg-black/30 border border-white/5 text-xs space-y-1.5">
+                              <div id={`error-debug-${error.id}`} className="mt-2 p-3 rounded-lg bg-theme-surface-raised border border-theme-border text-xs space-y-1.5">
                                 {debug.endpoint && (
                                   <div className="text-slate-400">
                                     <span className="text-slate-500">Endpoint:</span> <code className="text-red-300">{debug.endpoint}</code>
@@ -266,7 +274,7 @@ export default function ErrorPanel({ open, onClose }: Props) {
                                 {debug.stack && (
                                   <details className="mt-1">
                                     <summary className="text-slate-500 cursor-pointer hover:text-slate-400 text-[10px]">Stack Trace</summary>
-                                    <pre className="mt-1 p-2 rounded bg-black/40 text-[10px] text-slate-400 overflow-x-auto whitespace-pre-wrap max-h-40 overflow-y-auto">
+                                    <pre className="mt-1 p-2 rounded bg-theme-surface-strong text-[10px] text-theme-text-subtle overflow-x-auto whitespace-pre-wrap max-h-40 overflow-y-auto">
                                       {debug.stack}
                                     </pre>
                                   </details>
@@ -282,8 +290,6 @@ export default function ErrorPanel({ open, onClose }: Props) {
               )}
             </div>
           </motion.div>
-        </>
-      )}
-    </AnimatePresence>
+    </ViewportModal>
   );
 }

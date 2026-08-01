@@ -8,6 +8,7 @@ CDP_PORT="${SHARED_BROWSER_CDP_PORT:-18801}"
 CDP_BASE="http://127.0.0.1:${CDP_PORT}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NODE_SCRIPT="${SCRIPT_DIR}/cdp-client.mjs"
+LAUNCHER_LOG="/home/bridgesrd/.config/bridges-agent-browser/logs/launcher.log"
 
 ACTION="${1:-help}"
 shift || true
@@ -87,9 +88,15 @@ case "$ACTION" in
       echo "ERROR: Shared browser launcher not found at ${LAUNCHER}. Run Remote Desktop setup first."
       exit 1
     fi
-    # Shell-escape the URL to prevent injection via special characters
-    SAFE_URL="$(printf '%q' "$URL")"
-    su - bridgesrd -c "bash -lc '${LAUNCHER} ${SAFE_URL} >/tmp/bridges-agent-browser.log 2>&1 &'" 2>/dev/null
+    # Preserve the URL as one argv value; never interpolate it into a shell command.
+    if [ "$(id -u)" -eq 0 ]; then
+      runuser -u bridgesrd -- nohup "$LAUNCHER" "$URL" >/dev/null 2>&1 &
+    elif [ "$(id -un)" = "bridgesrd" ]; then
+      nohup "$LAUNCHER" "$URL" >/dev/null 2>&1 &
+    else
+      echo "ERROR: Launch requires root or the bridgesrd account." >&2
+      exit 77
+    fi
     # Wait for CDP to come up
     for i in $(seq 1 15); do
       if curl -sf "${CDP_BASE}/json/version" >/dev/null 2>&1; then
@@ -98,7 +105,7 @@ case "$ACTION" in
       fi
       sleep 1
     done
-    echo "ERROR: Shared browser launched but CDP not responding after 15s. Check /tmp/bridges-agent-browser.log"
+    echo "ERROR: Shared browser launched but CDP not responding after 15s. Check ${LAUNCHER_LOG}"
     exit 1
     ;;
 

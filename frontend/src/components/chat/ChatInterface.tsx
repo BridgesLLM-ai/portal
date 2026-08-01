@@ -10,18 +10,19 @@
  * 5. Stream status shown through the shared status rail
  * 6. Tool use as centered iMessage-style system notification pills
  */
+import { AskQuestionCard, AskQuestionAnswerProvider, parseAskQuestionPayload, useAskQuestionAnswer } from './AskQuestionCard';
+import AskUserQuestionCard from './AskUserQuestionCard';
 import {
   AssistantRuntimeProvider,
   ThreadPrimitive,
   ComposerPrimitive,
 } from '@assistant-ui/react';
-import { useAgentRuntime, type ChatMessage, type ToolCall, type ExecApprovalRequest } from './useAgentRuntime';
-import { useChatState, type OpenClawSessionTelemetry } from '../../contexts/ChatStateProvider';
+import { useAgentRuntime, type ChatMessage, type ToolCall } from './useAgentRuntime';
+import { useChatState, type OpenClawSessionTelemetry, type SessionControlMutationKind } from '../../contexts/ChatStateProvider';
 import { useExecApprovals } from './useExecApprovals';
 import { ExecApprovalModal } from './ExecApprovalModal';
 import MarkdownRenderer from './MarkdownRenderer';
-import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
-import { createPortal } from 'react-dom';
+import React, { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo } from 'react';
 import {
   Send, StopCircle, Pencil, Settings, X, ChevronDown,
   Check, RefreshCw, Wrench, Loader2, CheckCircle2, XCircle, ShieldAlert, Radio,
@@ -31,15 +32,29 @@ import {
 import { motion, AnimatePresence } from 'framer-motion';
 import AgentSelector, { type AgentSelection } from './AgentSelector';
 import ImagePickerCropper from '../ImagePickerCropper';
+import AnchoredPopover from '../AnchoredPopover';
+import ViewportModal from '../ViewportModal';
+import TypedConfirmationDialog from '../TypedConfirmationDialog';
 import AiProviderSetup from '../ai-setup/AiProviderSetup';
 import { useAuthStore } from '../../contexts/AuthContext';
 import { isElevated, isOwner } from '../../utils/authz';
-import { agentToolsAPI, AgentTool } from '../../api/agentTools';
+import { workspaceAuthorizedFetch } from '../../utils/workspaceAuthorizedFetch';
+import { buildPersistedChatAttachmentText } from '../../utils/chatAttachmentPersistence';
+import {
+  agentToolsAPI,
+  toolInstallConfirmationPhrase,
+  waitForToolInstallJob,
+  type AgentTool,
+} from '../../api/agentTools';
 import { gatewayAPI, type CompatibilityHotfixStatus } from '../../api/endpoints';
 import SlashCommandMenu from './SlashCommandMenu';
-import { findSlashCommand, matchSlashCommands, parseSlashCommand, type SlashCommand } from '../../utils/slashCommands';
+import { matchSlashCommands, type SlashCommand } from '../../utils/slashCommands';
 import { mergeExecApprovalQueues } from '../../utils/execApprovalQueue';
 import { executeSlashCommand } from '../../utils/slashCommandExecutor';
+import {
+  createLocalSlashCommandCoordinator,
+  type LocalSlashCommandEvent,
+} from '../../utils/localSlashCommandClaim';
 import client from '../../api/client';
 import sounds from '../../utils/sounds';
 import { usePublicSettings } from '../../hooks/usePublicSettings';
@@ -51,11 +66,59 @@ import {
   getModelProviderLabel,
   getModelRuntimeLabel,
   getShortModelLabel,
+  isKnownOpenClawCatalogModelId,
 } from '../../utils/modelId';
 import ComposerStatusBadge from './ComposerStatusBadge';
 import CompactionNoticeBlock from './CompactionNoticeBlock';
 import ToolGlyph from './ToolGlyph';
-import { getToolPresentation, getToolSummary, isCompactionNotice } from '../../utils/toolPresentation';
+import { getToolPresentation, getToolSummary, isAskQuestionTool, isCompactionNotice } from '../../utils/toolPresentation';
+import { anchoredScrollTop, selectNewestWindow } from '../../utils/timelineWindow';
+import { supportsAgentChatStop } from '../../utils/agentChatRunLifecycle';
+import {
+  isAgentZeroDefaultModelAlias,
+  normalizeAgentChatModelCatalog,
+  normalizeAgentChatProvider,
+  resolveAgentZeroCatalogModel,
+} from '../../utils/agentChatModelSelection';
+import {
+  createAgentChatProviderModelRequestGate,
+  getAgentChatProviderModelsCache,
+  invalidateAgentChatProviderModelsCache,
+  setAgentChatProviderModelsCache,
+} from '../../utils/agentChatProviderModelsCache';
+import {
+  assessAgentChatProviderAvailability,
+  formatAgentChatProviderCatalogLoadError,
+  isAgentChatSelectedProviderRevalidationPending,
+  isAgentChatProviderCatalogAbortError,
+  loadAgentChatProviderCatalog,
+  reduceAgentChatSelectedProviderRevalidation,
+  type AgentChatProviderAvailabilityAssessment,
+  type AgentChatProviderCatalogEntry,
+  type AgentChatProviderCatalogSnapshotMetadata,
+  type AgentChatSelectedProviderRevalidationState,
+} from '../../utils/agentChatProviderCatalog';
+import { isAgentChatLaunchBoundModelError } from '../../utils/agentChatModelSwitch';
+import { reconcileCumulativeFinalTail } from '../../utils/chatStream';
+
+const MESSAGE_WINDOW_SIZE = 80;
+const TOOL_WINDOW_SIZE = 40;
+const LazyAgentZeroSetupPanel = React.lazy(() => import('../settings/AgentZeroSetupPanel'));
+
+function downloadChatMarkdown(messages: ChatMessage[]) {
+  const markdown = messages
+    .map((message) => `## ${message.role}\n\n${message.content || ''}`)
+    .join('\n\n');
+  const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `chat-export-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.md`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
 
 /* ─── Per-agent identity ────────────────────────────────────────────────── */
 
@@ -120,6 +183,21 @@ const AGENTS: AgentIdentity[] = [
     sendHover: 'hover:bg-sky-600',
     sendShadow: 'shadow-sky-500/20',
     provenance: 'via Codex CLI',
+  },
+  {
+    name: 'Grok Build',
+    initials: 'GR',
+    providerName: 'GROK',
+    color: 'text-orange-300',
+    bgLight: 'bg-orange-500/[0.06]',
+    borderColor: 'border-orange-500/15',
+    avatarBg: 'bg-orange-600/20',
+    avatarText: 'text-orange-300',
+    accentRing: 'focus:ring-orange-500/40 focus:border-orange-500/30',
+    sendBg: 'bg-orange-500',
+    sendHover: 'hover:bg-orange-600',
+    sendShadow: 'shadow-orange-500/20',
+    provenance: 'via Grok Build CLI',
   },
   {
     name: 'Agent Zero',
@@ -191,18 +269,37 @@ const OPENCLAW_MODEL_FALLBACK = [
   'openai/gpt-5.6-luna',
   'openai/gpt-5.5',
   'anthropic/claude-fable-5',
+  'anthropic/claude-opus-5',
   'anthropic/claude-sonnet-4-6',
   'anthropic/claude-opus-4-8',
   'anthropic/claude-haiku-4-5',
 ];
 
 function isKnownOpenClawCatalogModel(modelId: string): boolean {
-  const normalized = canonicalizePortalModelId(modelId);
-  return /^(anthropic|codex|google|google-gemini-cli|google-antigravity|openai|openai-codex|openrouter)\//.test(normalized);
+  return isKnownOpenClawCatalogModelId(modelId);
 }
 
 function modelDisplayName(modelId: string): string {
   return getModelDisplayName(modelId, modelId || 'Default model');
+}
+
+function modelSelectionErrorMessage(error: any, fallback: string): string {
+  const extractText = (value: unknown, depth = 0): string => {
+    if (typeof value === 'string') return value.trim();
+    if (!value || typeof value !== 'object' || depth > 3) return '';
+    const record = value as Record<string, unknown>;
+    for (const key of ['userMessage', 'message', 'detail', 'error', 'reason']) {
+      const nested = extractText(record[key], depth + 1);
+      if (nested) return nested;
+    }
+    return '';
+  };
+  const raw = (
+    extractText(error?.response?.data)
+    || extractText(error)
+    || fallback
+  ).replace(/\s+/g, ' ').trim();
+  return raw.length > 280 ? `${raw.slice(0, 277)}…` : raw;
 }
 
 function ModelMeta({ modelId, compact = false }: { modelId: string; compact?: boolean }) {
@@ -221,19 +318,6 @@ function ModelMeta({ modelId, compact = false }: { modelId: string; compact?: bo
     </div>
   );
 }
-
-const MODEL_STORAGE_PREFIX = 'agentChats.lastModel.';
-
-const providerModelsCache = new Map<string, {
-  models: string[];
-  capabilities?: {
-    supportsModelSelection?: boolean;
-    modelSelectionMode?: string;
-    supportsCustomModelInput?: boolean;
-    canEnumerateModels?: boolean;
-    modelCatalogKind?: string;
-  };
-}>();
 
 const providerCommandsCache = new Map<string, {
   slashCommands: SlashCommandInfo[];
@@ -258,116 +342,205 @@ interface ProviderCapabilities {
   followUpMode?: 'interrupt_and_send' | 'queued_follow_up' | string;
 }
 
-/* ─── Model Picker Dropdown ─────────────────────────────────────────────── */
-
-/** Mobile-safe dropdown: portal bottom-sheet on mobile, absolute on desktop */
-function ModelPickerDropdown({ open, onClose, children }: { open: boolean; onClose: () => void; children: React.ReactNode }) {
-  const [isMobile, setIsMobile] = useState(false);
-  useEffect(() => {
-    const mq = window.matchMedia('(max-width: 639px)');
-    setIsMobile(mq.matches);
-    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
-    mq.addEventListener('change', handler);
-    return () => mq.removeEventListener('change', handler);
-  }, []);
-
-  if (!open) return null;
-
-  if (isMobile) {
-    return createPortal(
-      <>
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          className="fixed inset-0 bg-black/60 z-[9998]"
-          onClick={onClose}
-        />
-        <motion.div
-          initial={{ opacity: 0, y: 100 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: 100 }}
-          transition={{ type: 'spring', damping: 25, stiffness: 300 }}
-          className="fixed inset-x-0 bottom-0 z-[9999] px-3 pb-3"
-        >
-          <div className="rounded-xl bg-[#1A1F3A] border border-white/[0.08] shadow-2xl shadow-black/50 overflow-hidden max-h-[70vh]">
-            <div className="flex items-center justify-between px-3 pt-2.5 pb-1.5 border-b border-white/[0.06]">
-              <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Select Model</span>
-              <button onClick={onClose} className="p-1 rounded-lg text-slate-500 hover:text-slate-300">
-                <X size={14} />
-              </button>
-            </div>
-            <div className="overflow-y-auto max-h-[60vh] overscroll-contain">
-              {children}
-            </div>
-          </div>
-        </motion.div>
-      </>,
-      document.body,
-    );
-  }
-
+export function ProviderAvailabilityBarrier({
+  assessment,
+  loading = false,
+  onRetry,
+}: {
+  assessment: AgentChatProviderAvailabilityAssessment;
+  loading?: boolean;
+  onRetry?: () => void;
+}) {
+  if (assessment.canSend || !assessment.message) return null;
+  const checking = assessment.status === 'checking' && !assessment.retryable;
   return (
-    <motion.div
-      initial={{ opacity: 0, y: -4 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -4 }}
-      transition={{ duration: 0.15 }}
-      className="absolute top-full right-0 mt-1 w-64 rounded-xl bg-[#1A1F3A] border border-white/[0.08] shadow-xl shadow-black/40 z-[100]"
+    <div
+      id="agent-chat-provider-availability"
+      role={checking ? 'status' : 'alert'}
+      aria-live={checking ? 'polite' : 'assertive'}
+      className="flex items-center gap-2 border-b border-amber-500/15 bg-amber-500/[0.07] px-3 py-2 text-xs text-amber-100"
+    >
+      {checking || loading ? (
+        <Loader2 size={14} className="shrink-0 animate-spin text-amber-300" aria-hidden="true" />
+      ) : (
+        <ShieldAlert size={14} className="shrink-0 text-amber-300" aria-hidden="true" />
+      )}
+      <span className="min-w-0 flex-1">{assessment.message}</span>
+      {assessment.retryable && onRetry && !loading && (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="min-h-[32px] rounded-lg border border-amber-300/20 px-2.5 font-medium text-amber-50 hover:bg-amber-500/10"
+        >
+          Retry provider availability
+        </button>
+      )}
+    </div>
+  );
+}
+
+export function BlockedAgentChatSendButton({
+  title,
+  describedBy,
+  className,
+  children,
+}: {
+  title: string;
+  describedBy?: string;
+  className: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      disabled
+      aria-disabled="true"
+      aria-label={title}
+      aria-describedby={describedBy}
+      className={className}
+      title={title}
     >
       {children}
-    </motion.div>
+    </button>
+  );
+}
+
+/* ─── Model Picker Dropdown ─────────────────────────────────────────────── */
+
+/** Shared viewport-aware popover: anchored on desktop and modal bottom-sheet on mobile. */
+function ModelPickerDropdown({
+  open,
+  onClose,
+  children,
+  anchorRef,
+  id,
+}: {
+  open: boolean;
+  onClose: () => void;
+  children: React.ReactNode;
+  anchorRef: React.RefObject<HTMLButtonElement>;
+  id: string;
+}) {
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const update = () => setIsMobile((window.visualViewport?.width || window.innerWidth) <= 767);
+    update();
+    window.addEventListener('resize', update);
+    window.addEventListener('orientationchange', update);
+    window.visualViewport?.addEventListener('resize', update);
+    return () => {
+      window.removeEventListener('resize', update);
+      window.removeEventListener('orientationchange', update);
+      window.visualViewport?.removeEventListener('resize', update);
+    };
+  }, []);
+
+  return (
+    <AnchoredPopover
+      open={open}
+      anchorRef={anchorRef}
+      onDismiss={(reason) => {
+        onClose();
+        if (reason === 'escape') anchorRef.current?.focus();
+      }}
+      width={256}
+      align="end"
+      margin={12}
+      mobileBreakpoint={767}
+      zIndex={1300}
+      ariaLabel="Available chat models"
+      className="max-h-[70dvh] overflow-hidden rounded-xl border border-white/[0.08] bg-[#1A1F3A] shadow-2xl shadow-black/50"
+    >
+      <div id={id} role="dialog" aria-label="Available chat models" className="flex min-h-0 max-h-full flex-col overflow-hidden">
+        {isMobile && (
+          <div className="flex items-center justify-between border-b border-white/[0.06] px-3 pb-1.5 pt-2.5">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Select Model</span>
+            <button type="button" aria-label="Close model selector" onClick={onClose} className="min-h-[36px] min-w-[36px] rounded-lg text-slate-500 hover:text-slate-300">
+              <X size={14} className="mx-auto" />
+            </button>
+          </div>
+        )}
+        {children}
+      </div>
+    </AnchoredPopover>
   );
 }
 
 
-function ModelPicker({
-  provider,
+export function ModelPicker({
   value,
   onChange,
   models,
   loading = false,
+  error = null,
   supportsCustomModelInput = true,
   modelCatalogKind = 'dynamic',
   disabled = false,
+  allowDefaultModel = true,
+  required = false,
+  emptyMessage = 'No selectable models are available.',
+  unavailableModelIds = [],
   onOpen,
+  onRetry,
 }: {
-  provider: string;
   value: string;
   onChange: (model: string) => void;
   models: string[];
   loading?: boolean;
+  error?: string | null;
   supportsCustomModelInput?: boolean;
   modelCatalogKind?: 'none' | 'declared' | 'dynamic';
   disabled?: boolean;
+  allowDefaultModel?: boolean;
+  required?: boolean;
+  emptyMessage?: string;
+  /**
+   * Models the catalog knows about but cannot run right now, usually because
+   * their provider is not connected. They used to be dropped silently, so a
+   * model the operator expected simply was not there.
+   */
+  unavailableModelIds?: string[];
   onOpen?: () => void;
+  onRetry?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [custom, setCustom] = useState(false);
+  const [customDraft, setCustomDraft] = useState(value);
   const isCustomOnlyCatalog = modelCatalogKind === 'none' && models.length === 0;
-  const ref = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const dropdownId = React.useId();
+
+  const close = useCallback(() => {
+    setOpen(false);
+    setCustom(false);
+    setCustomDraft(value);
+  }, [value]);
+
+  const submitCustomModel = useCallback(() => {
+    const nextModel = customDraft.trim();
+    if (!nextModel) return;
+    onChange(nextModel);
+    close();
+  }, [close, customDraft, onChange]);
 
   useEffect(() => {
     if (disabled) setOpen(false);
   }, [disabled]);
 
-  useEffect(() => {
-    const isMobile = window.matchMedia('(max-width: 639px)').matches;
-    if (isMobile) return;
-    function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [open]);
+  if (models.length === 0 && !supportsCustomModelInput && !loading && !error && !required) return null;
 
-  if (models.length === 0 && !supportsCustomModelInput) return null;
+  const emptySelectionLabel = required ? 'Select model' : 'Default model';
 
   return (
-    <div ref={ref} className="relative">
+    <div className="relative">
       <button
+        ref={triggerRef}
+        type="button"
+        aria-label="Chat model"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls={open ? dropdownId : undefined}
+        aria-busy={loading}
         onClick={() => {
           if (disabled) return;
           if (!open) onOpen?.();
@@ -375,22 +548,39 @@ function ModelPicker({
         }}
         disabled={disabled}
         className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg border text-[11px] transition-colors ${disabled ? 'bg-white/[0.03] border-white/[0.05] text-slate-500 cursor-not-allowed opacity-60' : 'bg-white/[0.06] hover:bg-white/[0.10] border-white/[0.08] text-slate-400 hover:text-slate-200'}`}
-        title={disabled ? 'Finish or abort the current response before switching models' : (value || 'Default model')}
+        title={disabled ? 'Finish or abort the current response before switching models' : (error || value || emptySelectionLabel)}
       >
         {/* Icon-only on mobile, text on desktop */}
-        {loading ? <Loader2 size={13} className="sm:hidden flex-shrink-0 animate-spin" /> : <Code2 size={13} className="sm:hidden flex-shrink-0" />}
+        {loading
+          ? <Loader2 size={13} className="sm:hidden flex-shrink-0 animate-spin" />
+          : error
+            ? <XCircle size={13} className="flex-shrink-0 text-red-300" />
+            : <Code2 size={13} className="sm:hidden flex-shrink-0" />}
         <div className="hidden sm:flex items-center gap-1.5 min-w-0 max-w-[220px]">
           {loading ? <Loader2 size={12} className="flex-shrink-0 animate-spin text-violet-300" /> : null}
-          {value ? <ModelMeta modelId={value} compact /> : <span className="truncate max-w-[120px]">Default model</span>}
+          {value ? <ModelMeta modelId={value} compact /> : <span className="truncate max-w-[120px]">{emptySelectionLabel}</span>}
         </div>
         <ChevronDown size={12} className={`transition-transform ${open ? 'rotate-180' : ''} hidden sm:block`} />
       </button>
-      <ModelPickerDropdown open={open} onClose={() => { setOpen(false); setCustom(false); }}>
-        <div className="p-1 max-h-80 overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
+      <ModelPickerDropdown open={open} onClose={close} anchorRef={triggerRef} id={dropdownId}>
+        <div className="min-h-0 max-h-80 overflow-y-auto overscroll-contain p-1 scrollbar-thin scrollbar-thumb-white/10">
           {loading && (
             <div className="px-3 py-2 text-[11px] text-slate-400 border-b border-white/[0.06] flex items-center gap-2">
               <Loader2 size={12} className="animate-spin text-violet-300" />
               Loading models…
+            </div>
+          )}
+          {error && (
+            <div className="border-b border-red-500/15 bg-red-500/[0.06] px-3 py-2 text-[11px] text-red-200" role="alert">
+              <div className="flex items-start gap-2">
+                <XCircle size={12} className="mt-0.5 shrink-0" aria-hidden="true" />
+                <span className="min-w-0 flex-1">{error}</span>
+              </div>
+              {onRetry && (
+                <button type="button" onClick={onRetry} disabled={loading} className="mt-2 inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-red-400/20 bg-red-500/10 px-2.5 text-[11px] text-red-100 disabled:opacity-50">
+                  <RefreshCw size={12} className={loading ? 'animate-spin' : ''} /> Retry model catalog
+                </button>
+              )}
             </div>
           )}
           {isCustomOnlyCatalog && (
@@ -398,18 +588,28 @@ function ModelPicker({
               This provider does not publish a model catalog here. Enter the exact model ID manually.
             </div>
           )}
-          <button
-            onClick={() => { onChange(''); setCustom(false); setOpen(false); }}
-            className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs transition-colors ${
-              !value ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'
-            }`}
-          >
-            <span className="flex-1 text-left">Default</span>
-            {!value && <Check size={12} className="text-violet-400" />}
-          </button>
+          {!loading && !error && models.length === 0 && required && (
+            <div className="border-b border-amber-500/15 bg-amber-500/[0.06] px-3 py-2 text-[11px] leading-5 text-amber-100" role="status">
+              {emptyMessage}
+            </div>
+          )}
+          {allowDefaultModel && (
+            <button
+              type="button"
+              onClick={() => { onChange(''); setCustom(false); setOpen(false); }}
+              className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs transition-colors ${
+                !value ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'
+              }`}
+            >
+              <span className="flex-1 text-left">Default</span>
+              {!value && <Check size={12} className="text-violet-400" />}
+            </button>
+          )}
           {models.map((m) => (
             <button
+              type="button"
               key={m}
+              aria-label={`Select model ${m}`}
               onClick={() => { onChange(m); setCustom(false); setOpen(false); }}
               className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs transition-colors ${
                 value === m ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'
@@ -419,22 +619,40 @@ function ModelPicker({
               {value === m && <Check size={12} className="text-violet-400 flex-shrink-0" />}
             </button>
           ))}
+          {unavailableModelIds.length > 0 && (
+            <div className="border-t border-white/[0.06] mt-1 pt-2 px-3 pb-1">
+              <p className="text-[11px] leading-4 text-slate-500">
+                {unavailableModelIds.length} model{unavailableModelIds.length === 1 ? '' : 's'} hidden
+                because their provider is not connected
+                {unavailableModelIds.length <= 4 ? ` — ${unavailableModelIds.join(', ')}` : ''}.
+                Connect it in Settings → AI Providers.
+              </p>
+            </div>
+          )}
           {supportsCustomModelInput && (
           <div className="border-t border-white/[0.06] mt-1 pt-1">
             {custom ? (
               <div className="px-2 py-1">
                 <input
+                  aria-label="Custom model name"
                   autoFocus
                   className="w-full bg-black/30 border border-white/[0.08] rounded-lg px-2.5 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-violet-500/40"
                   placeholder="Custom model name"
-                  value={value}
-                  onChange={(e) => onChange(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') setOpen(false); }}
+                  value={customDraft}
+                  onChange={(e) => setCustomDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') submitCustomModel();
+                    if (e.key === 'Escape') close();
+                  }}
                 />
+                <button type="button" onClick={submitCustomModel} disabled={!customDraft.trim()} className="mt-2 inline-flex min-h-[36px] w-full items-center justify-center rounded-lg border border-violet-500/25 bg-violet-500/10 px-3 text-xs font-medium text-violet-100 disabled:cursor-not-allowed disabled:opacity-45">
+                  Apply model
+                </button>
               </div>
             ) : (
               <button
-                onClick={() => setCustom(true)}
+                type="button"
+                onClick={() => { setCustomDraft(value); setCustom(true); }}
                 className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-slate-400 hover:bg-white/[0.04] hover:text-slate-200"
               >
                 Custom model…
@@ -448,163 +666,50 @@ function ModelPicker({
   );
 }
 
-/* ─── Agent Tools Settings Drawer (sessions panel moved to AgentSelector) ── */
-
-// GatewaySession interface still needed by handleViewGatewaySession
-interface GatewaySession {
-  key?: string;
-  id?: string;
-  sessionId?: string;
-  status?: string;
-  lastActivityAt?: string;
-  createdAt?: string;
-  metadata?: Record<string, unknown>;
-  agent?: string;
-  channel?: string;
-  title?: string;
-  preview?: string;
-  isMainSession?: boolean;
-}
-
-function GatewaySessionsPanel({ onViewSession }: { onViewSession: (sessionKey: string) => void }) {
-  const [sessions, setSessions] = useState<GatewaySession[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [expanded, setExpanded] = useState(true);
-  const initialLoadDone = useRef(false);
-
-  const fetchSessions = useCallback(async () => {
-    if (!initialLoadDone.current) setLoading(true);
-    try {
-      const { data } = await client.get('/gateway/sessions');
-      const list = data.sessions || [];
-      setSessions(Array.isArray(list) ? list : Object.values(list));
-    } catch {
-      setSessions([]);
-    } finally {
-      setLoading(false);
-      initialLoadDone.current = true;
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchSessions();
-    const interval = setInterval(fetchSessions, 30000);
-    return () => clearInterval(interval);
-  }, [fetchSessions]);
-
-  const getSessionKey = (s: GatewaySession) => s.key || s.sessionId || s.id || '';
-
-  const formatTime = (dateStr?: string) => {
-    if (!dateStr) return '';
-    try {
-      const d = new Date(dateStr);
-      const diffMin = Math.floor((Date.now() - d.getTime()) / 60000);
-      if (diffMin < 1) return 'just now';
-      if (diffMin < 60) return `${diffMin}m ago`;
-      const diffHr = Math.floor(diffMin / 60);
-      if (diffHr < 24) return `${diffHr}h ago`;
-      return `${Math.floor(diffHr / 24)}d ago`;
-    } catch { return ''; }
-  };
-
-  const getSessionLabel = (s: GatewaySession) => {
-    const title = typeof s.title === 'string' ? s.title.trim() : '';
-    if (title) return title;
-
-    const preview = typeof s.preview === 'string' ? s.preview.trim() : '';
-    if (preview && preview.length <= 72) return preview;
-
-    const key = getSessionKey(s);
-    if (!key) return 'Unknown';
-
-    const parts = key.split(':');
-    const agentName = parts[1] || 'main';
-    const sessionName = parts[parts.length - 1] || 'main';
-    const normalizedName = sessionName
-      .replace(/^portal-[a-f0-9]{8}-/i, '')
-      .replace(/[-_]+/g, ' ')
-      .trim();
-
-    if (sessionName === 'main') {
-      return agentName === 'main' ? 'Main session' : `${agentName} / main session`;
-    }
-
-    if (normalizedName && !/^[a-f0-9-]{24,}$/i.test(normalizedName)) {
-      return agentName === 'main' ? normalizedName : `${agentName} / ${normalizedName}`;
-    }
-
-    return agentName === 'main'
-      ? `Session ${sessionName.slice(0, 8)}`
-      : `${agentName} / ${sessionName.slice(0, 8)}`;
-  };
-
+export function AgentZeroRecoveryCard({
+  message,
+  retrying = false,
+  onRetry,
+  onRepair,
+}: {
+  message: string;
+  retrying?: boolean;
+  onRetry: () => void;
+  onRepair?: () => void;
+}) {
   return (
-    <div className="px-3 pb-2">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="flex items-center justify-between w-full px-2 py-1.5 group"
-      >
-        <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider flex items-center gap-1.5">
-          <Radio size={10} className="text-emerald-400" />
-          Gateway Sessions
-        </span>
-        <div className="flex items-center gap-1">
-          {sessions.length > 0 && (
-            <span className="text-[9px] bg-emerald-500/15 text-emerald-400 px-1.5 py-0.5 rounded-full font-medium">
-              {sessions.length}
-            </span>
-          )}
-          <ChevronDown size={12} className={`text-slate-500 transition-transform ${expanded ? '' : '-rotate-90'}`} />
+    <div
+      role="alert"
+      className="mx-auto w-full max-w-xl rounded-2xl border border-amber-400/25 bg-amber-500/[0.08] px-4 py-4 text-left shadow-lg shadow-black/10"
+    >
+      <div className="flex items-start gap-3">
+        <ShieldAlert size={18} className="mt-0.5 shrink-0 text-amber-300" aria-hidden="true" />
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold text-amber-100">Agent Zero needs attention</div>
+          <div className="mt-1 text-xs leading-5 text-amber-100/80">{message}</div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={onRetry}
+              disabled={retrying}
+              className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-amber-300/25 bg-amber-400/10 px-3 text-xs font-medium text-amber-50 transition-colors hover:bg-amber-400/20 disabled:cursor-wait disabled:opacity-60"
+            >
+              <RefreshCw size={13} className={retrying ? 'animate-spin' : ''} />
+              {retrying ? 'Retrying…' : 'Retry Agent Zero'}
+            </button>
+            {onRepair ? (
+              <button
+                type="button"
+                onClick={onRepair}
+                disabled={retrying}
+                className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-white/[0.10] bg-white/[0.05] px-3 text-xs font-medium text-slate-200 transition-colors hover:bg-white/[0.09] disabled:cursor-wait disabled:opacity-60"
+              >
+                <Wrench size={13} /> Repair managed runtime
+              </button>
+            ) : null}
+          </div>
         </div>
-      </button>
-
-      <AnimatePresence>
-        {expanded && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.15 }}
-            className="overflow-hidden"
-          >
-            {loading ? (
-              <div className="flex items-center justify-center py-4 text-slate-500 text-xs">
-                <Loader2 size={12} className="animate-spin mr-1.5" />
-                Loading…
-              </div>
-            ) : sessions.length === 0 ? (
-              <div className="text-center py-3 text-slate-600 text-[11px]">
-                No active gateway sessions
-              </div>
-            ) : (
-              <div className="space-y-0.5 max-h-[200px] overflow-y-auto">
-                {sessions.map((s, idx) => {
-                  const key = getSessionKey(s);
-                  return (
-                    <button
-                      key={key || idx}
-                      onClick={() => onViewSession(key)}
-                      className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-left text-xs text-slate-400 hover:text-slate-200 hover:bg-white/[0.03] transition-all"
-                    >
-                      <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                        s.status === 'active' ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'
-                      }`} />
-                      <div className="flex-1 min-w-0">
-                        <div className="truncate font-medium text-[11px]">{getSessionLabel(s)}</div>
-                        <div className="text-[10px] text-slate-500/70 mt-0.5 flex items-center gap-1">
-                          {s.channel && <span>{s.channel}</span>}
-                          {(s.channel && (s.lastActivityAt || s.createdAt)) && <span>·</span>}
-                          <span>{formatTime(s.lastActivityAt || s.createdAt)}</span>
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </motion.div>
-        )}
-      </AnimatePresence>
+      </div>
     </div>
   );
 }
@@ -643,6 +748,211 @@ function supportsOpenClawFastModeModel(model?: string | null): boolean {
     || normalized.startsWith('openai-codex/');
 }
 
+type HeartbeatModelMutationSnapshot = Readonly<{
+  generation: number;
+  sessionKey: string;
+  previous: string;
+  requested: string;
+}>;
+
+type HeartbeatModelLoadSnapshot = Readonly<{
+  generation: number;
+  sessionKey: string;
+}>;
+
+function readHeartbeatModelValue(payload: any): string | undefined {
+  if (!payload || typeof payload !== 'object' || !Object.prototype.hasOwnProperty.call(payload, 'value')) {
+    return undefined;
+  }
+  if (payload.value === null) return '';
+  return typeof payload.value === 'string' ? payload.value.trim() : undefined;
+}
+
+function heartbeatModelMutationError(error: any, fallback: string): string {
+  return String(
+    error?.response?.data?.detail
+    || error?.response?.data?.error
+    || error?.message
+    || fallback,
+  );
+}
+
+/**
+ * Owns the global heartbeat-model setting from one concrete Agent Chat session.
+ *
+ * A ref-backed lease closes the same-render admission window, while the request
+ * generation and session snapshot prevent an older load/save from repainting a
+ * newly selected session. A successful PATCH is never treated as canonical:
+ * only a fresh config-path readback may update the visible value.
+ */
+export function useAgentChatHeartbeatModel({
+  enabled,
+  sessionKey,
+}: {
+  enabled: boolean;
+  sessionKey: string;
+}) {
+  const [heartbeatModel, setHeartbeatModel] = useState('');
+  const [heartbeatModelLoading, setHeartbeatModelLoading] = useState(false);
+  const [heartbeatModelMutating, setHeartbeatModelMutating] = useState(false);
+  const [heartbeatModelError, setHeartbeatModelError] = useState<string | null>(null);
+  const heartbeatModelRef = useRef('');
+  const scopeRef = useRef({ enabled, sessionKey });
+  const mountedRef = useRef(true);
+  const generationRef = useRef(0);
+  const loadRef = useRef<HeartbeatModelLoadSnapshot | null>(null);
+  const mutationRef = useRef<HeartbeatModelMutationSnapshot | null>(null);
+
+  scopeRef.current = { enabled, sessionKey };
+  heartbeatModelRef.current = heartbeatModel;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      generationRef.current += 1;
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    generationRef.current += 1;
+    loadRef.current = null;
+    setHeartbeatModelError(null);
+    if (!enabled) {
+      heartbeatModelRef.current = '';
+      setHeartbeatModel('');
+      if (!mutationRef.current) setHeartbeatModelLoading(false);
+    }
+  }, [enabled, sessionKey]);
+
+  const isCurrentScope = useCallback((targetSessionKey: string) => (
+    mountedRef.current
+    && scopeRef.current.enabled
+    && scopeRef.current.sessionKey === targetSessionKey
+  ), []);
+
+  const loadHeartbeatModel = useCallback(async () => {
+    const scope = scopeRef.current;
+    if (!scope.enabled || mutationRef.current) return;
+    const activeLoad = loadRef.current;
+    if (activeLoad?.sessionKey === scope.sessionKey) return;
+
+    const snapshot = Object.freeze({
+      generation: ++generationRef.current,
+      sessionKey: scope.sessionKey,
+    });
+    loadRef.current = snapshot;
+    setHeartbeatModelLoading(true);
+    setHeartbeatModelError(null);
+    try {
+      const data = await gatewayAPI.getConfigPath('agents.defaults.heartbeat.model');
+      if (
+        loadRef.current !== snapshot
+        || generationRef.current !== snapshot.generation
+        || !isCurrentScope(snapshot.sessionKey)
+      ) return;
+      const value = readHeartbeatModelValue(data);
+      if (value === undefined) throw new Error('The server did not return a heartbeat model value.');
+      heartbeatModelRef.current = value;
+      setHeartbeatModel(value);
+    } catch (error) {
+      if (
+        loadRef.current !== snapshot
+        || generationRef.current !== snapshot.generation
+        || !isCurrentScope(snapshot.sessionKey)
+      ) return;
+      console.error('[ChatInterface] Failed to load heartbeat model:', error);
+      setHeartbeatModelError('Could not load the heartbeat model right now.');
+    } finally {
+      if (loadRef.current === snapshot) loadRef.current = null;
+      if (
+        generationRef.current === snapshot.generation
+        && isCurrentScope(snapshot.sessionKey)
+        && mutationRef.current === null
+      ) {
+        setHeartbeatModelLoading(false);
+      }
+    }
+  }, [isCurrentScope]);
+
+  const setHeartbeatModelValue = useCallback((nextModel: string): boolean => {
+    const scope = scopeRef.current;
+    // The path is global, so an accepted mutation owns admission across session
+    // changes until its PATCH and canonical readback both settle.
+    if (!scope.enabled || mutationRef.current) return false;
+
+    const snapshot = Object.freeze({
+      generation: ++generationRef.current,
+      sessionKey: scope.sessionKey,
+      previous: heartbeatModelRef.current,
+      requested: String(nextModel || '').trim(),
+    });
+    mutationRef.current = snapshot;
+    loadRef.current = null;
+    setHeartbeatModelMutating(true);
+    setHeartbeatModelLoading(true);
+    setHeartbeatModelError(null);
+
+    void (async () => {
+      let patchAccepted = false;
+      try {
+        await gatewayAPI.patchConfigPath(
+          'agents.defaults.heartbeat.model',
+          snapshot.requested || null,
+        );
+        patchAccepted = true;
+
+        const fresh = await gatewayAPI.getConfigPath('agents.defaults.heartbeat.model');
+        if (
+          mutationRef.current !== snapshot
+          || generationRef.current !== snapshot.generation
+          || !isCurrentScope(snapshot.sessionKey)
+        ) return;
+        const canonical = readHeartbeatModelValue(fresh);
+        if (canonical === undefined) {
+          throw new Error('The server did not confirm the saved heartbeat model.');
+        }
+        heartbeatModelRef.current = canonical;
+        setHeartbeatModel(canonical);
+        if (canonical !== snapshot.requested) {
+          setHeartbeatModelError('The server kept a different heartbeat model. Its confirmed value is shown.');
+        } else {
+          setHeartbeatModelError(null);
+        }
+      } catch (error) {
+        if (
+          mutationRef.current !== snapshot
+          || generationRef.current !== snapshot.generation
+          || !isCurrentScope(snapshot.sessionKey)
+        ) return;
+        console.error('[ChatInterface] Failed to update heartbeat model:', error);
+        heartbeatModelRef.current = snapshot.previous;
+        setHeartbeatModel(snapshot.previous);
+        setHeartbeatModelError(patchAccepted
+          ? 'The heartbeat model update was accepted, but its saved value could not be verified. The previous confirmed value remains shown; retry after checking the live setting.'
+          : heartbeatModelMutationError(error, 'Could not update the heartbeat model.'));
+      } finally {
+        if (mutationRef.current === snapshot) mutationRef.current = null;
+        if (mountedRef.current && mutationRef.current === null) {
+          setHeartbeatModelMutating(false);
+          setHeartbeatModelLoading(false);
+        }
+      }
+    })();
+    return true;
+  }, [isCurrentScope]);
+
+  return {
+    heartbeatModel,
+    heartbeatModelLoading,
+    heartbeatModelMutating,
+    heartbeatModelError,
+    loadHeartbeatModel,
+    setHeartbeatModel: setHeartbeatModelValue,
+    isHeartbeatModelMutationActive: () => mutationRef.current !== null,
+  };
+}
+
 interface SessionControlsProps {
   loading?: boolean;
   thinkingLevel: ThinkingLevel;
@@ -666,12 +976,14 @@ interface SessionControlsProps {
   onSetReasoningVisibility: (level: ReasoningVisibility) => void;
   onToggleFastMode: () => void;
   onSetCompactionModelOverride: (model: string) => void;
-  onSetHeartbeatModel: (model: string) => void;
+  onSetHeartbeatModel: (model: string) => boolean | void;
   availableModels: string[];
   compactionAvailableModels?: string[];
   compactionModelLoading?: boolean;
   compactionModelError?: string | null;
   compactionModelOptionsLoading?: boolean;
+  sessionControlMutation?: SessionControlMutationKind | null;
+  sessionControlsError?: string | null;
   sessionControlsSupported: boolean;
   onPanelOpen?: () => void;
   disabled?: boolean;
@@ -679,7 +991,7 @@ interface SessionControlsProps {
   sessionKey?: string;
 }
 
-function SessionControls({
+export function SessionControls({
   loading = false,
   thinkingLevel,
   thinkingOptions = [],
@@ -707,6 +1019,8 @@ function SessionControls({
   compactionModelLoading = false,
   compactionModelError = null,
   compactionModelOptionsLoading = false,
+  sessionControlMutation = null,
+  sessionControlsError = null,
   sessionControlsSupported,
   onPanelOpen,
   disabled,
@@ -715,10 +1029,59 @@ function SessionControls({
 }: SessionControlsProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [localThinking, setLocalThinking] = useState(thinkingLevel);
+  const [thinkingDebouncePending, setThinkingDebouncePending] = useState(false);
+  const [heartbeatAdmissionPending, setHeartbeatAdmissionPending] = useState(false);
   const localThinkingRef = useRef<number | null>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  // Sync local thinking with prop when it changes (e.g., after API confirms)
-  useEffect(() => { setLocalThinking(thinkingLevel); }, [thinkingLevel]);
+  const heartbeatAdmissionRef = useRef(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const controlsBusy = sessionControlMutation !== null
+    || thinkingDebouncePending
+    || heartbeatModelLoading
+    || heartbeatAdmissionPending;
+  const isControlsBusy = () => controlsBusy || heartbeatAdmissionRef.current;
+  // Sync local thinking with the last server-confirmed/optimistic parent value.
+  // Including mutation ownership also rolls back a debounced slider value when
+  // another control claimed the session before its timer fired.
+  useEffect(() => {
+    if (localThinkingRef.current) {
+      window.clearTimeout(localThinkingRef.current);
+      localThinkingRef.current = null;
+    }
+    setThinkingDebouncePending(false);
+    setLocalThinking(thinkingLevel);
+  }, [thinkingLevel, sessionControlMutation, sessionKey]);
+  useEffect(() => () => {
+    if (localThinkingRef.current) window.clearTimeout(localThinkingRef.current);
+  }, []);
+  useEffect(() => {
+    heartbeatAdmissionRef.current = heartbeatModelLoading;
+    if (!heartbeatModelLoading) setHeartbeatAdmissionPending(false);
+  }, [heartbeatModelLoading, sessionKey]);
+
+  const handleHeartbeatModelSelection = (nextModel: string) => {
+    if (isControlsBusy()) return;
+    // Claim the surface before React can publish the parent's loading state so
+    // a second DOM event in this render cannot submit or close the popover.
+    heartbeatAdmissionRef.current = true;
+    let accepted: boolean | void;
+    try {
+      accepted = onSetHeartbeatModel(nextModel);
+    } catch (error) {
+      heartbeatAdmissionRef.current = false;
+      throw error;
+    }
+    if (accepted === true) {
+      setHeartbeatAdmissionPending(true);
+      return;
+    }
+    heartbeatAdmissionRef.current = false;
+  };
+
+  const blockHeartbeatOwnedInteraction = (event: React.SyntheticEvent) => {
+    if (!heartbeatAdmissionRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+  };
   const effectiveCompactionModels = Array.from(new Set([
     ...compactionAvailableModels,
     ...(compactionModelOverride && !compactionAvailableModels.includes(compactionModelOverride) ? [compactionModelOverride] : []),
@@ -748,29 +1111,22 @@ function SessionControls({
     : (visibleThinkingLevels.includes('high') ? 'high' : (visibleThinkingLevels[0] || 'off'));
   const thinkingIndex = Math.max(0, visibleThinkingLevels.indexOf(effectiveThinking));
 
-  // Close on click outside
-  useEffect(() => {
-    if (!isOpen) return;
-    const handleClick = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setIsOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [isOpen]);
-
   // Extract short model name for display
   const shortModel = getShortModelLabel(currentModel, 'default');
 
   return (
-    <div ref={containerRef} className="relative">
+    <div className="relative">
       <button
+        ref={triggerRef}
+        type="button"
         onClick={() => {
+          if (isOpen && isControlsBusy()) return;
           if (!isOpen) onPanelOpen?.();
           setIsOpen(!isOpen);
         }}
         disabled={disabled}
+        aria-haspopup="dialog"
+        aria-expanded={isOpen}
         className={`p-1.5 rounded-lg transition-colors ${
           (thinkingLevel !== 'off') || reasoningVisibility !== 'off' || fastModeEnabled
             ? 'text-emerald-400 bg-emerald-500/[0.12] hover:bg-emerald-500/[0.2]'
@@ -781,27 +1137,81 @@ function SessionControls({
         <Settings2 size={16} />
       </button>
 
-      <AnimatePresence>
-        {isOpen && (
-          <motion.div
-            initial={{ opacity: 0, y: -4, scale: 0.95 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: -4, scale: 0.95 }}
-            transition={{ duration: 0.15 }}
-            className="absolute right-0 top-full mt-2 w-64 rounded-xl border border-white/[0.08] bg-[#0D1130] shadow-xl z-50 overflow-hidden"
+      <AnchoredPopover
+        open={isOpen}
+        anchorRef={triggerRef}
+        onDismiss={(reason) => {
+          if (isControlsBusy()) return;
+          setIsOpen(false);
+          if (reason === 'escape') triggerRef.current?.focus();
+        }}
+        width={320}
+        align="end"
+        margin={12}
+        mobileBreakpoint={767}
+        zIndex={1300}
+        ariaLabel="Session controls"
+        className="max-h-[70dvh] overflow-hidden rounded-xl border border-white/[0.08] bg-[#0D1130] shadow-2xl shadow-black/50"
+      >
+          <div
+            role="dialog"
+            aria-label="Session controls"
+            aria-busy={controlsBusy}
+            onPointerDownCapture={blockHeartbeatOwnedInteraction}
+            onClickCapture={blockHeartbeatOwnedInteraction}
+            onChangeCapture={blockHeartbeatOwnedInteraction}
+            className="flex min-h-0 max-h-full flex-col overflow-hidden"
           >
-            <div className="px-3 py-2.5 border-b border-white/[0.06]">
-              <div className="text-xs font-medium text-white">Session Controls</div>
-              <div className="text-[10px] text-slate-500 mt-0.5 font-mono truncate">
-                {sessionKey ? sessionKey.split(':').slice(-1)[0] : 'No session'}
+            <div className="flex shrink-0 items-start justify-between gap-3 border-b border-white/[0.06] px-3 py-2.5">
+              <div className="min-w-0">
+                <div className="text-xs font-medium text-white">Session Controls</div>
+                <div className="mt-0.5 truncate font-mono text-[10px] text-slate-500">
+                  {sessionKey ? sessionKey.split(':').slice(-1)[0] : 'No session'}
+                </div>
               </div>
+              <button
+                type="button"
+                aria-label="Close session controls"
+                disabled={controlsBusy}
+                onClick={() => {
+                  if (isControlsBusy()) return;
+                  setIsOpen(false);
+                  triggerRef.current?.focus();
+                }}
+                className="grid min-h-[36px] min-w-[36px] place-items-center rounded-lg text-slate-500 transition hover:bg-white/[0.05] hover:text-slate-200 disabled:cursor-wait disabled:opacity-40"
+              >
+                <X size={14} />
+              </button>
             </div>
 
-            <div className="p-2.5 space-y-2">
+            <div className="min-h-0 space-y-2 overflow-y-auto overscroll-contain p-2.5">
               {loading && (
                 <div className="flex items-center gap-2 rounded-lg border border-white/[0.08] bg-white/[0.03] px-2.5 py-2 text-[11px] text-slate-300">
                   <Loader2 size={12} className="animate-spin text-violet-300" />
                   Loading live session controls…
+                </div>
+              )}
+
+              {(sessionControlMutation || thinkingDebouncePending || heartbeatModelLoading || heartbeatAdmissionPending) && (
+                <div role="status" className="flex items-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-2.5 py-2 text-[11px] text-cyan-100">
+                  <Loader2 size={12} className="animate-spin" aria-hidden="true" />
+                  {heartbeatAdmissionPending
+                    ? 'Saving heartbeat model…'
+                    : heartbeatModelLoading
+                      ? 'Loading heartbeat model…'
+                    : sessionControlMutation === 'thinking' || thinkingDebouncePending
+                    ? 'Saving thinking level…'
+                    : sessionControlMutation === 'reasoning'
+                      ? 'Saving reasoning visibility…'
+                      : sessionControlMutation === 'fastMode'
+                        ? 'Saving fast mode…'
+                        : 'Saving compaction model…'}
+                </div>
+              )}
+
+              {sessionControlsError && (
+                <div role="alert" className="rounded-lg border border-red-500/25 bg-red-500/10 px-2.5 py-2 text-[11px] leading-relaxed text-red-200">
+                  {sessionControlsError}
                 </div>
               )}
 
@@ -818,18 +1228,22 @@ function SessionControls({
                   </div>
                 </div>
                 <input
+                  aria-label="Thinking level"
                   type="range"
                   min={0}
                   max={visibleThinkingLevels.length - 1}
                   step={1}
                   value={Math.max(0, thinkingIndex)}
-                  disabled={disabled || loading || !sessionControlsSupported}
+                  disabled={disabled || loading || controlsBusy || !sessionControlsSupported}
                   onChange={(e) => {
                     // Update visual position immediately (local state via parent)
                     const idx = Number(e.target.value);
                     const next = visibleThinkingLevels[idx] || 'off';
                     if (localThinkingRef.current) clearTimeout(localThinkingRef.current);
+                    setThinkingDebouncePending(true);
                     localThinkingRef.current = window.setTimeout(() => {
+                      localThinkingRef.current = null;
+                      setThinkingDebouncePending(false);
                       onSetThinkingLevel(next);
                     }, 400);
                     // Optimistic visual update without API call
@@ -860,9 +1274,10 @@ function SessionControls({
                   </div>
                 </div>
                 <select
+                  aria-label="Reasoning visibility"
                   value={reasoningVisibility}
                   onChange={(e) => onSetReasoningVisibility(e.target.value as ReasoningVisibility)}
-                  disabled={disabled || loading || !sessionControlsSupported}
+                  disabled={disabled || loading || controlsBusy || !sessionControlsSupported}
                   className="w-full rounded-lg border border-white/[0.08] bg-[#141A43] px-2 py-1.5 text-xs text-slate-200 disabled:opacity-50"
                 >
                   <option value="off">Hidden</option>
@@ -885,10 +1300,13 @@ function SessionControls({
                       </div>
                     </div>
                     <button
+                      type="button"
+                      aria-label="Toggle Codex fast mode"
+                      aria-pressed={fastModeEnabled}
                       onClick={() => {
                         onToggleFastMode();
                       }}
-                      disabled={disabled || loading || !sessionControlsSupported}
+                      disabled={disabled || loading || controlsBusy || !sessionControlsSupported}
                       className={`relative w-10 h-5 rounded-full transition-colors ${
                         fastModeEnabled ? 'bg-amber-500' : 'bg-white/[0.12]'
                       } disabled:opacity-50`}
@@ -916,9 +1334,10 @@ function SessionControls({
                     </div>
                   </div>
                   <select
+                    aria-label="Heartbeat model"
                     value={heartbeatModel}
-                    onChange={(e) => onSetHeartbeatModel(e.target.value)}
-                    disabled={disabled || loading || heartbeatModelLoading || effectiveHeartbeatModels.length === 0}
+                    onChange={(e) => handleHeartbeatModelSelection(e.target.value)}
+                    disabled={disabled || loading || controlsBusy || heartbeatModelLoading || effectiveHeartbeatModels.length === 0}
                     className="w-full rounded-lg border border-white/[0.08] bg-[#141A43] px-2 py-1.5 text-xs text-slate-200 disabled:opacity-50"
                   >
                     <option value="">Default</option>
@@ -929,7 +1348,7 @@ function SessionControls({
                     ))}
                   </select>
                   {heartbeatModelError && (
-                    <div className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[10px] leading-relaxed text-amber-200">
+                    <div role="alert" className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[10px] leading-relaxed text-amber-200">
                       {heartbeatModelError}
                     </div>
                   )}
@@ -945,9 +1364,10 @@ function SessionControls({
                   </div>
                 </div>
                 <select
+                  aria-label="Compaction model"
                   value={compactionModelOverride}
                   onChange={(e) => onSetCompactionModelOverride(e.target.value)}
-                  disabled={disabled || loading || compactionModelLoading || compactionModelOptionsLoading || effectiveCompactionModels.length === 0}
+                  disabled={disabled || loading || controlsBusy || compactionModelLoading || compactionModelOptionsLoading || effectiveCompactionModels.length === 0}
                   className="w-full rounded-lg border border-white/[0.08] bg-[#141A43] px-2 py-1.5 text-xs text-slate-200 disabled:opacity-50"
                 >
                   <option value="">{compactionModelOptionsLoading ? 'Loading models…' : 'Default'}</option>
@@ -990,14 +1410,17 @@ function SessionControls({
                   <div className="flex items-center justify-between gap-2">
                     <button
                       onClick={() => onRefreshCompatibilityHotfix?.()}
-                      disabled={disabled || compatibilityHotfixLoading || compatibilityHotfixApplying}
+                      disabled={disabled || controlsBusy || compatibilityHotfixLoading || compatibilityHotfixApplying}
                       className="flex items-center gap-1 text-[10px] text-slate-400 hover:text-white disabled:opacity-50"
                     >
                       <RefreshCw size={11} /> Refresh
                     </button>
                     <button
-                      onClick={() => onApplyCompatibilityHotfix?.()}
-                      disabled={disabled || compatibilityHotfixApplying || compatibilityHotfixLoading || !compatibilityHotfixStatus?.supported}
+                      onClick={() => {
+                        setIsOpen(false);
+                        onApplyCompatibilityHotfix?.();
+                      }}
+                      disabled={disabled || controlsBusy || compatibilityHotfixApplying || compatibilityHotfixLoading || !compatibilityHotfixStatus?.supported || !onApplyCompatibilityHotfix}
                       className="inline-flex min-h-[32px] items-center justify-center rounded-md border border-amber-200/70 bg-gradient-to-r from-amber-300 via-amber-400 to-amber-500 px-2.5 py-1 text-[10px] font-semibold text-slate-950 shadow-[0_8px_20px_rgba(245,158,11,0.24)] transition-all hover:-translate-y-0.5 hover:from-amber-200 hover:via-amber-300 hover:to-amber-400 hover:shadow-[0_12px_24px_rgba(245,158,11,0.3)] disabled:translate-y-0 disabled:cursor-not-allowed disabled:border-white/[0.08] disabled:bg-white/[0.08] disabled:bg-none disabled:text-slate-200 disabled:shadow-none"
                     >
                       {compatibilityHotfixApplying ? 'Applying…' : compatibilityHotfixStatus?.applied ? 'Reapply + restart' : 'Apply + restart'}
@@ -1016,27 +1439,110 @@ function SessionControls({
               </div>
 
             </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+          </div>
+      </AnchoredPopover>
     </div>
+  );
+}
+
+export function CompatibilityHotfixConfirmationDialog({
+  open,
+  status,
+  onClose,
+  onVerified,
+  onBusyChange,
+}: {
+  open: boolean;
+  status: CompatibilityHotfixStatus | null;
+  onClose: () => void;
+  onVerified: (status: CompatibilityHotfixStatus, message: string) => void;
+  onBusyChange?: (busy: boolean) => void;
+}) {
+  const [applying, setApplying] = useState(false);
+  const [applyError, setApplyError] = useState<string | null>(null);
+  const attemptRef = useRef<Readonly<{ confirmation: string }> | null>(null);
+
+  useEffect(() => {
+    if (open) setApplyError(null);
+  }, [open]);
+
+  const setBusy = useCallback((busy: boolean) => {
+    setApplying(busy);
+    onBusyChange?.(busy);
+  }, [onBusyChange]);
+
+  const apply = useCallback(async (confirmation: string) => {
+    if (attemptRef.current) return;
+    const snapshot = Object.freeze({ confirmation: String(confirmation || '').trim() });
+    attemptRef.current = snapshot;
+    setApplyError(null);
+    setBusy(true);
+    try {
+      const result = await gatewayAPI.applyCompatibilityHotfix(snapshot.confirmation);
+      if (attemptRef.current !== snapshot) return;
+      if (result?.ok !== true || result?.status?.applied !== true) {
+        throw new Error(result?.message || 'The gateway restart completed without verifying the compatibility hotfix.');
+      }
+      onVerified(result.status, result.message || 'Compatibility hotfix applied.');
+      onClose();
+    } catch (error: any) {
+      if (attemptRef.current !== snapshot) return;
+      const detail = error?.response?.data?.detail
+        || error?.response?.data?.error
+        || error?.message
+        || 'Failed to apply compatibility hotfix.';
+      setApplyError(String(detail));
+    } finally {
+      if (attemptRef.current === snapshot) {
+        attemptRef.current = null;
+        setBusy(false);
+      }
+    }
+  }, [onClose, onVerified, setBusy]);
+
+  return (
+    <TypedConfirmationDialog
+      open={open}
+      title="Apply OpenClaw compatibility hotfix?"
+      description="This updates the installed OpenClaw compatibility bundle and restarts the gateway. Active agent turns may be interrupted."
+      confirmationPhrase={status?.confirmationPhrase || null}
+      confirmLabel="Apply hotfix + restart"
+      busyLabel="Applying hotfix + restarting…"
+      busy={applying}
+      tone="warning"
+      details={applyError ? (
+        <div role="alert" className="rounded-xl border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+          {applyError}
+        </div>
+      ) : null}
+      onCancel={() => {
+        if (!attemptRef.current) onClose();
+      }}
+      onConfirm={(confirmation) => { void apply(confirmation); }}
+    />
   );
 }
 
 /* ─── Agent Settings Drawer (providers + tools) ───────────────────────── */
 
-function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete }: { open: boolean; onClose: () => void; onAiProviderSetupComplete?: () => void }) {
+export function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete, onNativeModelSelected }: { open: boolean; onClose: () => void; onAiProviderSetupComplete?: () => void; onNativeModelSelected?: (provider: 'GEMINI', model: string) => Promise<boolean | void> | boolean | void }) {
   const { user } = useAuthStore();
   const isAdmin = isElevated(user);
+  const owner = isOwner(user);
   const [tools, setTools] = useState<AgentTool[]>([]);
   const [toolsLoading, setToolsLoading] = useState(true);
   const [installing, setInstalling] = useState<string | null>(null);
   const [installStatus, setInstallStatus] = useState<Record<string, 'running' | 'success' | 'error'>>({});
+  const [pendingToolInstall, setPendingToolInstall] = useState<AgentTool | null>(null);
+  const installAdmissionRef = useRef<{ toolId: string } | null>(null);
+  const [toolInstallError, setToolInstallError] = useState<string | null>(null);
+  const drawerTitleId = React.useId();
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
 
-  const loadTools = useCallback(async () => {
+  const loadTools = useCallback(async (refresh = false) => {
     setToolsLoading(true);
     try {
-      const data = await agentToolsAPI.list();
+      const data = await agentToolsAPI.list(refresh);
       setTools(data.tools || []);
     } catch {
       setTools([]);
@@ -1049,74 +1555,102 @@ function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete }: { ope
     if (open) loadTools();
   }, [open, loadTools]);
 
-  const handleInstall = async (toolId: string) => {
-    if (!isAdmin) return;
+  const handleInstall = async (tool: AgentTool, confirmation: string) => {
+    if (!isAdmin || installAdmissionRef.current) return;
+    const toolId = tool.id;
+    const admission = { toolId };
+    installAdmissionRef.current = admission;
     setInstalling(toolId);
+    setToolInstallError(null);
     setInstallStatus((prev) => ({ ...prev, [toolId]: 'running' }));
     try {
-      await agentToolsAPI.install(toolId);
+      const started = await agentToolsAPI.install(toolId, confirmation);
+      setPendingToolInstall(null);
+      await waitForToolInstallJob(started.jobId);
       setInstallStatus((prev) => ({ ...prev, [toolId]: 'success' }));
-      loadTools();
-    } catch {
+      await loadTools(true);
+    } catch (error: any) {
       setInstallStatus((prev) => ({ ...prev, [toolId]: 'error' }));
+      if (pendingToolInstall?.id === toolId) {
+        setToolInstallError(error?.response?.data?.error || error?.message || `${tool.name} failed. Inspect Tasks for retained output.`);
+      }
     } finally {
+      if (installAdmissionRef.current === admission) installAdmissionRef.current = null;
       setInstalling(null);
     }
   };
 
   return (
-    <AnimatePresence>
-      {open && (
-        <>
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 bg-black/60 backdrop-blur-[2px] z-40"
-            onClick={onClose}
-          />
+    <>
+      <ViewportModal
+        open={open}
+        onDismiss={onClose}
+        dismissible={!installing}
+        initialFocusRef={closeButtonRef}
+        className="bg-black/60 backdrop-blur-[2px]"
+      >
+        <div className="flex h-full w-full justify-end">
           <motion.div
             initial={{ x: '100%' }}
             animate={{ x: 0 }}
-            exit={{ x: '100%' }}
             transition={{ type: 'spring', damping: 25, stiffness: 300 }}
-            className="fixed right-0 top-0 bottom-0 w-[360px] max-w-[90vw] bg-slate-900 border-l border-slate-700/50 z-50 flex flex-col shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={drawerTitleId}
+            className="flex h-full w-[360px] max-w-[90vw] flex-col border-l border-slate-700/50 bg-slate-900 shadow-2xl"
           >
-            {/* Header */}
-            <div className="flex items-center justify-between px-5 py-3.5 border-b border-slate-800">
+            <div className="flex items-center justify-between border-b border-slate-800 px-5 py-3.5">
               <div className="min-w-0">
-                <h2 className="text-sm font-semibold text-white">Settings</h2>
+                <h2 id={drawerTitleId} className="text-sm font-semibold text-white">Agent settings</h2>
                 {toolsLoading ? (
-                  <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-sky-300">
+                  <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-sky-300" role="status">
                     <Loader2 size={10} className="animate-spin" />
                     Loading settings…
                   </div>
                 ) : null}
               </div>
               <button
+                ref={closeButtonRef}
+                type="button"
+                aria-label="Close agent settings"
+                aria-busy={Boolean(installing)}
+                disabled={Boolean(installing)}
                 onClick={onClose}
-                className="rounded-lg p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+                className="grid min-h-[40px] min-w-[40px] place-items-center rounded-lg text-slate-400 transition-colors hover:bg-slate-800 hover:text-white disabled:cursor-wait disabled:opacity-50"
               >
-                <X size={16} />
+                {installing ? <Loader2 size={16} className="animate-spin" /> : <X size={16} />}
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto px-4 py-4 space-y-5">
+            <div className="min-h-0 flex-1 space-y-5 overflow-y-auto overscroll-contain px-4 py-4">
               {!isAdmin && (
-                <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2.5 text-amber-200 text-xs flex items-center gap-2">
+                <div className="flex items-center gap-2 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-200">
                   <ShieldAlert size={14} />
                   Admin access required.
                 </div>
               )}
 
-              {/* ─── AI Providers ─── */}
               {isAdmin && (
-                <AiProviderSetup mode="settings" apiBase="/ai-setup" compact onComplete={onAiProviderSetupComplete} />
+                <AiProviderSetup
+                  mode="settings"
+                  apiBase="/ai-setup"
+                  compact
+                  onComplete={onAiProviderSetupComplete}
+                  onNativeModelSelected={onNativeModelSelected}
+                  additionalProviderCards={owner ? (
+                    <React.Suspense fallback={<div role="status" className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2.5 text-xs text-slate-400"><Loader2 size={14} className="animate-spin" />Loading Agent Zero…</div>}>
+                      <LazyAgentZeroSetupPanel
+                        view="providers"
+                        compact
+                        onProviderConnectionsChanged={onAiProviderSetupComplete}
+                      />
+                    </React.Suspense>
+                  ) : null}
+                />
               )}
 
-              {/* ─── Coding Tools (collapsed) ─── */}
               <details className="group">
-                <summary className="cursor-pointer list-none flex items-center gap-1.5 text-[10px] font-semibold text-slate-500 uppercase tracking-wider hover:text-slate-400 transition-colors select-none">
+                <summary className="flex cursor-pointer list-none select-none items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-500 transition-colors hover:text-slate-400">
                   <Wrench className="h-3 w-3" />
                   Coding Tools
                 </summary>
@@ -1134,34 +1668,37 @@ function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete }: { ope
                           <div key={tool.id} className="flex items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2">
                             <div className="min-w-0 flex-1">
                               <div className="flex items-center gap-1.5">
-                                <span className="text-xs font-medium text-white truncate">{tool.name}</span>
-                                {installed ? (
-                                  <CheckCircle2 size={10} className="shrink-0 text-emerald-400" />
-                                ) : null}
+                                <span className="truncate text-xs font-medium text-white">{tool.name}</span>
+                                {installed ? <CheckCircle2 size={10} className="shrink-0 text-emerald-400" /> : null}
                               </div>
-                              {installed && tool.status.version && (
-                                <div className="text-[10px] text-slate-500 font-mono mt-0.5">v{tool.status.version}</div>
-                              )}
+                              {installed && tool.status.version && <div className="mt-0.5 font-mono text-[10px] text-slate-500">v{tool.status.version}</div>}
+                              {status === 'success' && <div role="status" className="mt-0.5 text-[10px] text-emerald-400">Install verified</div>}
+                              {status === 'error' && <div role="alert" className="mt-0.5 text-[10px] text-red-400">Install failed — inspect Tasks</div>}
                             </div>
                             {isAdmin && tool.install.length > 0 && (
                               <button
-                                onClick={() => handleInstall(tool.id)}
-                                disabled={installing === tool.id}
-                                className="shrink-0 rounded-md bg-slate-800 px-2 py-1 text-[10px] font-medium text-slate-300 hover:bg-slate-700 hover:text-white disabled:opacity-50 transition-colors"
+                                type="button"
+                                aria-label={`${installed ? 'Update' : 'Install'} ${tool.name}`}
+                                onClick={() => {
+                                  if (installAdmissionRef.current) return;
+                                  setToolInstallError(null);
+                                  setPendingToolInstall(tool);
+                                }}
+                                disabled={installing !== null}
+                                aria-busy={status === 'running'}
+                                className="shrink-0 rounded-md bg-slate-800 px-2 py-1 text-[10px] font-medium text-slate-300 transition-colors hover:bg-slate-700 hover:text-white disabled:opacity-50"
                               >
-                                {status === 'running' ? (
-                                  <Loader2 size={10} className="animate-spin" />
-                                ) : (
-                                  installed ? 'Update' : 'Install'
-                                )}
+                                {status === 'running' ? <span className="inline-flex items-center gap-1"><Loader2 size={10} className="animate-spin" />{installed ? 'Updating…' : 'Installing…'}</span> : installed ? 'Update' : 'Install'}
                               </button>
                             )}
                           </div>
                         );
                       })}
                       <button
-                        onClick={loadTools}
-                        className="mt-1 flex w-full items-center justify-center gap-1 rounded-lg border border-slate-800 px-2 py-1.5 text-[10px] text-slate-500 hover:text-slate-300 hover:border-slate-700 transition-colors"
+                        type="button"
+                        onClick={() => { void loadTools(true); }}
+                        disabled={toolsLoading || Boolean(installing)}
+                        className="mt-1 flex w-full items-center justify-center gap-1 rounded-lg border border-slate-800 px-2 py-1.5 text-[10px] text-slate-500 transition-colors hover:border-slate-700 hover:text-slate-300 disabled:cursor-wait disabled:opacity-50"
                       >
                         <RefreshCw size={10} /> Refresh
                       </button>
@@ -1171,16 +1708,63 @@ function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete }: { ope
               </details>
             </div>
           </motion.div>
-        </>
-      )}
-    </AnimatePresence>
+        </div>
+      </ViewportModal>
+      <TypedConfirmationDialog
+        open={pendingToolInstall !== null}
+        title={`${pendingToolInstall?.status?.installed ? 'Update' : 'Install'} ${pendingToolInstall?.name || 'tool'}`}
+        description="This starts a bounded, auditable host job and may replace a server-wide command-line tool. Existing Portal sessions remain available while the job runs."
+        confirmationPhrase={pendingToolInstall ? toolInstallConfirmationPhrase(pendingToolInstall.id) : null}
+        confirmLabel={pendingToolInstall?.status?.installed ? 'Start update' : 'Start install'}
+        busyLabel={pendingToolInstall?.status?.installed ? 'Starting update…' : 'Starting install…'}
+        busy={Boolean(pendingToolInstall && installing === pendingToolInstall.id)}
+        onCancel={() => {
+          if (installAdmissionRef.current) return;
+          setToolInstallError(null);
+          setPendingToolInstall(null);
+        }}
+        onConfirm={(confirmation) => {
+          if (pendingToolInstall) void handleInstall(pendingToolInstall, confirmation);
+        }}
+        details={pendingToolInstall ? (
+          <>
+            <div className="rounded-xl border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-100">
+              Portal will run only the reviewed install recipe for <strong>{pendingToolInstall.name}</strong>. Progress and failures are retained under Agent Tools → Tasks.
+            </div>
+            {toolInstallError ? (
+              <div role="alert" className="rounded-xl border border-red-500/25 bg-red-500/10 px-3 py-2 text-xs leading-5 text-red-200">
+                {toolInstallError}
+              </div>
+            ) : null}
+          </>
+        ) : null}
+      />
+    </>
   );
 }
 
 /* ─── Fix #6: Tool Call as centered iMessage system notification pill ───── */
 
-function ToolCallBlock({ tool }: { tool: ToolCall }) {
+const ToolCallBlock = React.memo(function ToolCallBlock({ tool }: { tool: ToolCall }) {
+  const onAnswerQuestion = useAskQuestionAnswer();
+  const askPayload = useMemo(
+    () => (isAskQuestionTool(tool.name) ? parseAskQuestionPayload(tool.arguments) : null),
+    [tool.name, tool.arguments],
+  );
+  // Tool arguments can become valid partway through a stream. Keep every hook
+  // above the conditional return so that transition cannot change hook order.
   const [expanded, setExpanded] = useState(false);
+  if (askPayload && onAnswerQuestion) {
+    return (
+      <div className="px-4">
+        <AskQuestionCard
+          payload={askPayload}
+          answered={tool.result || undefined}
+          onSubmit={onAnswerQuestion}
+        />
+      </div>
+    );
+  }
   const duration = tool.endedAt ? ((tool.endedAt - tool.startedAt) / 1000).toFixed(1) : null;
   const hasDetails = !!(tool.result || tool.arguments);
   const summary = getToolSummary(tool);
@@ -1188,6 +1772,7 @@ function ToolCallBlock({ tool }: { tool: ToolCall }) {
 
   return (
     <motion.div
+      data-tool-call-block
       initial={{ opacity: 0, scale: 0.95 }}
       animate={{ opacity: 1, scale: 1 }}
       transition={{ duration: 0.2 }}
@@ -1241,55 +1826,50 @@ function ToolCallBlock({ tool }: { tool: ToolCall }) {
       </div>
     </motion.div>
   );
-}
+});
 
-/* ─── Tool Result Block (from history) ──────────────────────────────────── */
+const BoundedToolCallList = React.memo(function BoundedToolCallList({
+  tools,
+  messageKey,
+  className = '',
+  renderAfterFirst,
+}: {
+  tools: readonly ToolCall[];
+  messageKey: string;
+  className?: string;
+  renderAfterFirst?: React.ReactNode;
+}) {
+  const [revealedEarlier, setRevealedEarlier] = useState(0);
+  useEffect(() => setRevealedEarlier(0), [messageKey]);
+  const windowed = useMemo(
+    () => selectNewestWindow(tools, TOOL_WINDOW_SIZE, revealedEarlier),
+    [revealedEarlier, tools],
+  );
 
-function ToolResultBlock({ message }: { message: ChatMessage }) {
-  const [expanded, setExpanded] = useState(false);
-  const toolName = message.toolName || 'unknown';
-  const content = message.content || '';
-  const truncatedContent = content.length > 200 ? content.substring(0, 200) + '…' : content;
+  if (tools.length === 0) return null;
 
   return (
-    <motion.div
-      initial={{ opacity: 0, scale: 0.95 }}
-      animate={{ opacity: 1, scale: 1 }}
-      transition={{ duration: 0.2 }}
-      className="flex justify-center px-4 py-1"
-    >
-      <div className="flex flex-col items-center max-w-md w-full">
-        <button
-          onClick={() => content && setExpanded(!expanded)}
-          className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-emerald-500/[0.06] border border-emerald-500/[0.10] hover:bg-emerald-500/[0.10] transition-colors text-[11px] text-slate-400"
-        >
-          <CheckCircle2 size={11} className="text-emerald-400" />
-          <span className="text-slate-300">
-            Result: <span className="font-mono">{toolName}</span>
-          </span>
-          {content && (
-            <ChevronRight size={10} className={`text-slate-600 transition-transform ${expanded ? 'rotate-90' : ''}`} />
-          )}
-        </button>
-        <AnimatePresence>
-          {expanded && content && (
-            <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.15 }}
-              className="overflow-hidden w-full"
-            >
-              <div className="mt-1.5 px-3 py-2 rounded-xl bg-emerald-500/[0.04] border border-emerald-500/[0.06] text-[11px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap max-h-[200px] overflow-y-auto text-left">
-                {content}
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </div>
-    </motion.div>
+    <div className={className}>
+      {windowed.hiddenCount > 0 ? (
+        <div className="flex justify-center px-4 py-1">
+          <button
+            type="button"
+            onClick={() => setRevealedEarlier((current) => current + TOOL_WINDOW_SIZE)}
+            className="rounded-full border border-white/[0.08] bg-white/[0.03] px-3 py-1.5 text-[11px] text-slate-400 transition-colors hover:border-white/[0.14] hover:bg-white/[0.06] hover:text-slate-200"
+          >
+            Show earlier tools · {windowed.hiddenCount} hidden
+          </button>
+        </div>
+      ) : null}
+      {windowed.items.map((tool, index) => (
+        <React.Fragment key={`${messageKey}-${tool.id}`}>
+          <ToolCallBlock tool={tool} />
+          {index === 0 ? renderAfterFirst : null}
+        </React.Fragment>
+      ))}
+    </div>
   );
-}
+});
 
 /* ─── Composer Status Badge ─────────────────────────────────────────────── */
 
@@ -1727,6 +2307,7 @@ function AttachmentChip({
         </span>
       )}
       <button
+        aria-label={`Remove attachment ${attachment.name}`}
         onClick={onRemove}
         className="ml-0.5 text-slate-500 hover:text-slate-200 transition-colors"
       >
@@ -1804,25 +2385,35 @@ const UserBubble = React.memo(function UserBubble({ message, avatarUrl, username
 
 /* ─── Assistant Message Bubble ──────────────────────────────────────────── */
 
-const AssistantThinkingBubble = React.memo(function AssistantThinkingBubble({
+export const AssistantThinkingBubble = React.memo(function AssistantThinkingBubble({
   content,
+  subject,
   isStreaming,
 }: {
   content: string;
+  subject?: string;
   isStreaming: boolean;
 }) {
-  if (!content.trim()) return null;
+  if (!content.trim() && !subject) return null;
 
   return (
     <div className="mb-2 rounded-2xl rounded-bl-sm border border-violet-400/15 bg-violet-500/[0.08] px-4 py-2.5 shadow-lg shadow-black/10">
-      <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-violet-200/75">
+      <div className="mb-1.5 flex min-w-0 items-center gap-1.5 text-[10px] font-medium tracking-wide text-violet-200/75">
         <Sparkles size={11} className="text-violet-300/75" />
-        <span>thinking</span>
+        <span className="uppercase">thinking</span>
+        {subject ? (
+          <>
+            <span aria-hidden="true">·</span>
+            <span className="truncate normal-case" title={subject}>{subject}</span>
+          </>
+        ) : null}
         {isStreaming ? <span className="h-1 w-1 rounded-full bg-violet-300/70 animate-pulse" /> : null}
       </div>
-      <div className={isStreaming ? 'streaming-cursor text-slate-300/95' : 'text-slate-300/95'}>
-        <MarkdownRenderer content={content} isStreaming={isStreaming} />
-      </div>
+      {content.trim() ? (
+        <div className={isStreaming ? 'streaming-cursor text-slate-300/95' : 'text-slate-300/95'}>
+          <MarkdownRenderer content={content} isStreaming={isStreaming} />
+        </div>
+      ) : null}
     </div>
   );
 });
@@ -1834,6 +2425,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
   isLast,
   isStreaming,
   liveThinkingContent,
+  liveThinkingSubject,
   liveStatusText,
   onRetry,
 }: {
@@ -1843,6 +2435,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
   isLast: boolean;
   isStreaming: boolean;
   liveThinkingContent?: string;
+  liveThinkingSubject?: string;
   liveStatusText?: string | null;
   onRetry?: () => void;
 }) {
@@ -1855,8 +2448,11 @@ const AssistantBubble = React.memo(function AssistantBubble({
   const visibleThinkingContent = (typeof liveThinkingContent === 'string' && liveThinkingContent.trim())
     ? liveThinkingContent
     : (message.thinkingContent || '');
-  const hasThinkingContent = !!visibleThinkingContent.trim();
-  const liveStatusPlaceholder = isCurrentlyStreaming && !hasContent && !hasThinkingContent
+  const visibleThinkingSubject = (typeof liveThinkingSubject === 'string' && liveThinkingSubject.trim())
+    ? liveThinkingSubject.trim()
+    : (message.thinkingSubject || '');
+  const hasThinkingPresentation = Boolean(visibleThinkingContent.trim() || visibleThinkingSubject);
+  const liveStatusPlaceholder = isCurrentlyStreaming && !hasContent && !hasThinkingPresentation
     ? String(liveStatusText || '').trim()
     : '';
   const visibleMessageContent = hasContent ? message.content : liveStatusPlaceholder;
@@ -1876,21 +2472,25 @@ const AssistantBubble = React.memo(function AssistantBubble({
         )}
       </div>
       <div className="flex-1 min-w-0 max-w-[80%]">
-        {hasThinkingContent && (
-          <AssistantThinkingBubble content={visibleThinkingContent} isStreaming={isCurrentlyStreaming && !hasContent} />
+        {hasThinkingPresentation && (
+          <AssistantThinkingBubble
+            content={visibleThinkingContent}
+            subject={visibleThinkingSubject}
+            isStreaming={isCurrentlyStreaming && !hasContent}
+          />
         )}
 
         {/* Tool call pills — centered system notifications */}
         {toolCalls.length > 0 && (
-          <div className="mb-2 -ml-3 -mr-3">
-            {toolCalls.map((tool) => (
-              <ToolCallBlock key={tool.id} tool={tool} />
-            ))}
-          </div>
+          <BoundedToolCallList
+            tools={toolCalls}
+            messageKey={message.id}
+            className="mb-2 -ml-3 -mr-3"
+          />
         )}
 
         {/* Message content */}
-        {(hasVisibleMessageContent || (isCurrentlyStreaming && !hasThinkingContent)) && (
+        {(hasVisibleMessageContent || (isCurrentlyStreaming && !hasThinkingPresentation)) && (
           <div
             className={`rounded-2xl rounded-bl-sm px-4 py-2.5 transition-all duration-500 ${
               hasContent && message.content.startsWith('⚠️')
@@ -1966,6 +2566,181 @@ const AssistantBubble = React.memo(function AssistantBubble({
   );
 });
 
+/* ─── Long-run activity timeline ───────────────────────────────────────── */
+
+const TIMELINE_WINDOW_SIZE = 160;
+
+interface TimelineSegmentLike {
+  text: string;
+  subject?: string;
+  ts?: number;
+  order?: number;
+  kind?: 'text' | 'thinking';
+}
+
+type TimelineActivity =
+  | {
+      kind: 'segment';
+      segment: TimelineSegmentLike;
+      segmentIndex: number;
+      ts: number;
+      order: number | null;
+      fallbackOrder: number;
+    }
+  | {
+      kind: 'tool';
+      tool: ToolCall;
+      ts: number;
+      order: number | null;
+      fallbackOrder: number;
+    };
+
+export function compareActivityTimelineItems(
+  left: Pick<TimelineActivity, 'order' | 'ts' | 'fallbackOrder'>,
+  right: Pick<TimelineActivity, 'order' | 'ts' | 'fallbackOrder'>,
+): number {
+  // Durable replay order is authoritative when both records carry it.
+  // Provider timestamps can be skewed across tool and model processes.
+  if (left.order != null && right.order != null) {
+    return (left.order - right.order)
+      || (left.ts - right.ts)
+      || (left.fallbackOrder - right.fallbackOrder);
+  }
+  return (left.ts - right.ts) || (left.fallbackOrder - right.fallbackOrder);
+}
+
+export function isAssistantContentRepresentedByTimeline(
+  rawContent: string,
+  segments: readonly TimelineSegmentLike[],
+): boolean {
+  const content = String(rawContent || '').trim();
+  if (!content) return false;
+  const representedText = segments
+    .filter((segment) => segment.kind !== 'thinking')
+    .map((segment) => String(segment.text || '').trim())
+    .filter(Boolean);
+  if (representedText.length === 0) return false;
+  if (representedText.some((segment) => segment === content)) return true;
+  return !reconcileCumulativeFinalTail(representedText, content).trim();
+}
+
+const TimelineSegmentBubble = React.memo(function TimelineSegmentBubble({
+  segment,
+  segmentIndex,
+  timestamp,
+  messageId,
+  agent,
+  avatarUrl,
+}: {
+  segment: TimelineSegmentLike;
+  segmentIndex: number;
+  timestamp: number;
+  messageId: string;
+  agent: AgentIdentity;
+  avatarUrl?: string;
+}) {
+  const isThinking = segment.kind === 'thinking';
+  const message = useMemo<ChatMessage>(() => ({
+    id: `timeline-segment-${messageId}-${segmentIndex}`,
+    role: 'assistant',
+    content: isThinking ? '' : segment.text,
+    thinkingContent: isThinking ? segment.text : undefined,
+    thinkingSubject: isThinking ? segment.subject : undefined,
+    createdAt: new Date(timestamp),
+  }), [isThinking, messageId, segment.subject, segment.text, segmentIndex, timestamp]);
+
+  return (
+    <AssistantBubble
+      message={message}
+      agent={agent}
+      avatarUrl={avatarUrl}
+      isLast={false}
+      isStreaming={false}
+    />
+  );
+});
+
+const ActivityTimeline = React.memo(function ActivityTimeline({
+  messageId,
+  segments,
+  toolCalls,
+  fallbackTimestamp,
+  agent,
+  avatarUrl,
+}: {
+  messageId: string;
+  segments: readonly TimelineSegmentLike[];
+  toolCalls: readonly ToolCall[];
+  fallbackTimestamp: number;
+  agent: AgentIdentity;
+  avatarUrl?: string;
+}) {
+  const [revealedEarlier, setRevealedEarlier] = useState(0);
+  const timeline = useMemo<TimelineActivity[]>(() => {
+    const segmentItems: TimelineActivity[] = segments.map((segment, segmentIndex) => ({
+      kind: 'segment',
+      segment,
+      segmentIndex,
+      ts: typeof segment.ts === 'number' && Number.isFinite(segment.ts)
+        ? segment.ts
+        : fallbackTimestamp + segmentIndex,
+      order: typeof segment.order === 'number' && Number.isFinite(segment.order)
+        ? segment.order
+        : null,
+      fallbackOrder: segmentIndex,
+    }));
+    const toolItems: TimelineActivity[] = toolCalls.map((tool, toolIndex) => ({
+      kind: 'tool',
+      tool,
+      ts: typeof tool.startedAt === 'number' && Number.isFinite(tool.startedAt)
+        ? tool.startedAt
+        : fallbackTimestamp + segments.length + toolIndex,
+      order: typeof tool.order === 'number' && Number.isFinite(tool.order)
+        ? tool.order
+        : null,
+      fallbackOrder: segments.length + toolIndex,
+    }));
+
+    return [...segmentItems, ...toolItems]
+      .sort(compareActivityTimelineItems);
+  }, [fallbackTimestamp, segments, toolCalls]);
+  const windowed = useMemo(
+    () => selectNewestWindow(timeline, TIMELINE_WINDOW_SIZE, revealedEarlier),
+    [revealedEarlier, timeline],
+  );
+
+  return (
+    <>
+      {windowed.hiddenCount > 0 ? (
+        <div className="mx-auto flex max-w-3xl justify-center px-4 py-2">
+          <button
+            type="button"
+            onClick={() => setRevealedEarlier((current) => current + TIMELINE_WINDOW_SIZE)}
+            className="rounded-full border border-white/[0.08] bg-white/[0.03] px-3 py-1.5 text-[11px] text-slate-400 transition-colors hover:border-white/[0.14] hover:bg-white/[0.06] hover:text-slate-200"
+          >
+            Show earlier activity · {windowed.hiddenCount} hidden
+          </button>
+        </div>
+      ) : null}
+      {windowed.items.map((item) => (
+        item.kind === 'segment' ? (
+          <TimelineSegmentBubble
+            key={`timeline-segment-${messageId}-${item.segmentIndex}-${item.ts}`}
+            segment={item.segment}
+            segmentIndex={item.segmentIndex}
+            timestamp={item.ts}
+            messageId={messageId}
+            agent={agent}
+            avatarUrl={avatarUrl}
+          />
+        ) : (
+          <ToolCallBlock key={`timeline-tool-${messageId}-${item.tool.id}`} tool={item.tool} />
+        )
+      ))}
+    </>
+  );
+});
+
 /* ─── Main Component ────────────────────────────────────────────────────── */
 
 interface ChatInterfaceProps {
@@ -2009,101 +2784,6 @@ function normalizeSlashCategory(raw?: string | null): SlashCommand['category'] {
   return 'Debug';
 }
 
-const CATEGORY_ICONS: Record<string, string> = {
-  Session: '📋',
-  Model: '🧠',
-  Runtime: '⚙️',
-  Agents: '🤖',
-  Info: 'ℹ️',
-};
-const CATEGORY_ORDER = ['Session', 'Model', 'Runtime', 'Agents', 'Info'];
-
-function detectLeadingSlashToken(text: string, caret: number) {
-  const prefix = text.slice(0, caret);
-  const match = prefix.match(/^(\s*)(\/[^\n]*)$/);
-  if (!match) return null;
-  const leading = match[1] || '';
-  const token = match[2] || '';
-  const tokenStart = leading.length;
-  const tokenEnd = caret;
-  if (!token.startsWith('/')) return null;
-  const body = token.slice(1);
-  const parts = body.split(/\s+/);
-  const commandQuery = (parts[0] || '').toLowerCase();
-  const hasTrailingSpace = /\s$/.test(token);
-  const argumentIndex = hasTrailingSpace ? Math.max(parts.length - 1, 0) : Math.max(parts.length - 2, -1);
-  const argumentQuery = hasTrailingSpace ? '' : (parts.length > 1 ? parts[parts.length - 1] : '');
-  return {
-    tokenStart,
-    tokenEnd,
-    query: commandQuery,
-    raw: token,
-    commandQuery,
-    argumentIndex,
-    argumentQuery: argumentQuery.toLowerCase(),
-    hasArguments: parts.length > 1 || hasTrailingSpace,
-  };
-}
-
-function filterSlashCommands(commands: SlashCommandInfo[], query: string): SlashCommandInfo[] {
-  const q = query.trim().toLowerCase();
-  if (!q) return commands.slice(0, 32);
-
-  const starts: SlashCommandInfo[] = [];
-  const contains: SlashCommandInfo[] = [];
-  for (const cmd of commands) {
-    const base = cmd.command.startsWith('/') ? cmd.command.slice(1).toLowerCase() : cmd.command.toLowerCase();
-    const keywords = (cmd.keywords || []).map((k) => k.toLowerCase());
-    if (base.startsWith(q)) {
-      starts.push(cmd);
-      continue;
-    }
-    if (base.includes(q) || keywords.some((k) => k.includes(q)) || cmd.description.toLowerCase().includes(q)) {
-      contains.push(cmd);
-    }
-  }
-  return [...starts, ...contains].slice(0, 32);
-}
-
-function filterSlashArgumentValues(command: SlashCommandInfo | undefined, argumentIndex: number, query: string): SlashCommandInfo[] {
-  if (!command || argumentIndex < 0) return [];
-  const argument = command.arguments?.[argumentIndex];
-  const values = argument?.values || [];
-  const q = query.trim().toLowerCase();
-  return values
-    .filter((option) => !q || option.value.toLowerCase().includes(q) || (option.description || '').toLowerCase().includes(q))
-    .slice(0, 32)
-    .map((option) => ({
-      command: `${command.command} ${option.value}`,
-      description: option.description || `Use ${option.value} for ${argument?.name || 'argument'}`,
-      argsHint: command.argsHint,
-      example: command.example,
-      keywords: command.keywords,
-      category: command.category,
-      arguments: command.arguments,
-    }));
-}
-
-/** Group commands by category, preserving category order. */
-function groupByCategory(commands: SlashCommandInfo[]): { category: string; icon: string; items: SlashCommandInfo[] }[] {
-  const map = new Map<string, SlashCommandInfo[]>();
-  for (const cmd of commands) {
-    const cat = cmd.category || 'Other';
-    if (!map.has(cat)) map.set(cat, []);
-    map.get(cat)!.push(cmd);
-  }
-  const ordered = CATEGORY_ORDER.filter((c) => map.has(c));
-  // Append any categories not in the predefined order
-  for (const key of map.keys()) {
-    if (!ordered.includes(key)) ordered.push(key);
-  }
-  return ordered.map((cat) => ({
-    category: cat,
-    icon: CATEGORY_ICONS[cat] || '📦',
-    items: map.get(cat) || [],
-  }));
-}
-
 export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const chatState = useChatState();
   // Use context for persistent state (survives route navigation)
@@ -2117,9 +2797,16 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const setSelectedModel = chatState.setSelectedModel;
   const switchModel = chatState.switchModel;
   const refreshChat = chatState.refreshChat;
+  const historyError = chatState.historyError;
+  const hasOlderHistory = chatState.hasOlderHistory;
+  const isLoadingOlderHistory = chatState.isLoadingOlderHistory;
+  const olderHistoryError = chatState.olderHistoryError;
+  const loadOlderHistory = chatState.loadOlderHistory;
   const removeQueuedMessage = chatState.removeQueuedMessage;
   const wsConnected = chatState.wsConnected;
   const reconnectSocket = chatState.reconnectSocket;
+  const pendingUserQuestions = chatState.pendingUserQuestions;
+  const settlePendingUserQuestion = chatState.settlePendingUserQuestion;
   // Session controls
   const thinkingLevel = chatState.thinkingLevel;
   const sessionThinkingOptions = chatState.sessionThinkingOptions;
@@ -2132,23 +2819,61 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const setCompactionModelOverride = chatState.setCompactionModelOverride;
   const compactionModelLoading = chatState.compactionModelLoading;
   const compactionModelError = chatState.compactionModelError;
+  const sessionControlMutation = chatState.sessionControlMutation;
+  const isSessionControlMutationActive = chatState.isSessionControlMutationActive;
+  const sessionControlsError = chatState.sessionControlsError;
   const sessionControlsSupported = chatState.sessionControlsSupported;
   const ensureSessionControlsMetadataLoaded = chatState.ensureSessionControlsMetadataLoaded;
   const sessionTelemetry = chatState.sessionTelemetry;
   const sessionAvailability = chatState.sessionAvailability;
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [agentZeroRecoveryPending, setAgentZeroRecoveryPending] = useState(false);
   const [providerModels, setProviderModels] = useState<Record<string, string[]>>({ OPENCLAW: OPENCLAW_MODEL_FALLBACK });
   const [providerModelsLoading, setProviderModelsLoading] = useState<Record<string, boolean>>({});
+  // catalog-known models whose provider is not connected, per provider.
+  const [providerUnavailableModels, setProviderUnavailableModels] = useState<Record<string, string[]>>({});
+  const [providerModelsError, setProviderModelsError] = useState<Record<string, string | null>>({});
+  const [providerModelsValidated, setProviderModelsValidated] = useState<Record<string, boolean>>({});
+  const [modelSwitching, setModelSwitching] = useState(false);
+  const [modelSelectionError, setModelSelectionError] = useState<string | null>(null);
+  const [modelSelectionNotice, setModelSelectionNotice] = useState<string | null>(null);
+  const [newSessionPending, setNewSessionPending] = useState(false);
+  const modelSwitchInFlightRef = useRef(false);
+  const modelSwitchGenerationRef = useRef(0);
+  const newSessionLeaseRef = useRef<Readonly<{
+    generation: number;
+    provider: string;
+    agentId?: string;
+    originSession: string;
+  }> | null>(null);
+  const newSessionTargetRef = useRef<string | null>(null);
+  const newSessionGenerationRef = useRef(0);
+  const providerModelRequestGateRef = useRef<ReturnType<typeof createAgentChatProviderModelRequestGate> | null>(null);
+  if (!providerModelRequestGateRef.current) {
+    providerModelRequestGateRef.current = createAgentChatProviderModelRequestGate();
+  }
+  const providerRef = useRef(provider);
+  const sessionRef = useRef(session);
+  const agentIdRef = useRef(agentId);
+  providerRef.current = provider;
+  sessionRef.current = session;
+  agentIdRef.current = agentId;
+  const agentZeroAutoSelectionAttemptRef = useRef<string | null>(null);
   const [compactionAvailableModels, setCompactionAvailableModels] = useState<string[]>(OPENCLAW_MODEL_FALLBACK);
   const [compactionModelOptionsLoading, setCompactionModelOptionsLoading] = useState(false);
-  const [providerCatalog, setProviderCatalog] = useState<Record<string, {
-    usable?: boolean;
+  const [providerCatalog, setProviderCatalog] = useState<Record<string, Partial<AgentChatProviderCatalogEntry> & {
     capabilities?: ProviderCapabilities;
     slashCommands?: SlashCommandInfo[];
     slashCommandsLoaded?: boolean;
     slashCommandsLoading?: boolean;
   }>>({});
+  const [providerCatalogRevalidation, setProviderCatalogRevalidation] = useState<
+    AgentChatSelectedProviderRevalidationState | null
+  >(null);
+  const [providerCatalogRefreshNonce, setProviderCatalogRefreshNonce] = useState(0);
+  const providerCatalogGenerationRef = useRef(0);
+  const lastProviderCatalogRetryRef = useRef(0);
   const [deferGatewayMetadata, setDeferGatewayMetadata] = useState(true);
   const initialHistoryLoadStartedRef = useRef(false);
 
@@ -2160,34 +2885,134 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const { user } = useAuthStore();
   const isAdmin = isElevated(user);
-  const [heartbeatModel, setHeartbeatModel] = useState('');
-  const [heartbeatModelLoading, setHeartbeatModelLoading] = useState(false);
-  const [heartbeatModelError, setHeartbeatModelError] = useState<string | null>(null);
   const [compatibilityHotfixStatus, setCompatibilityHotfixStatus] = useState<CompatibilityHotfixStatus | null>(null);
   const [compatibilityHotfixLoading, setCompatibilityHotfixLoading] = useState(false);
   const [compatibilityHotfixApplying, setCompatibilityHotfixApplying] = useState(false);
   const [compatibilityHotfixMessage, setCompatibilityHotfixMessage] = useState<string | null>(null);
+  const [compatibilityHotfixConfirmationOpen, setCompatibilityHotfixConfirmationOpen] = useState(false);
   const [sessionControlsLoading, setSessionControlsLoading] = useState(false);
 
   useEffect(() => {
-    if (deferGatewayMetadata || provider === 'OPENCLAW') return;
+    const targetProvider = normalizeAgentChatProvider(provider);
+    const requestGeneration = ++providerCatalogGenerationRef.current;
+    setProviderCatalogRevalidation((current) => reduceAgentChatSelectedProviderRevalidation(
+      current,
+      {
+        type: 'begin',
+        provider: targetProvider,
+        generation: requestGeneration,
+        requestVersion: providerCatalogRefreshNonce,
+      },
+    ));
+    if (provider === 'OPENCLAW') {
+      return;
+    }
+    const controller = new AbortController();
     let cancelled = false;
-    client.get('/gateway/providers')
-      .then(({ data }) => {
+    const force = providerCatalogRefreshNonce > lastProviderCatalogRetryRef.current;
+    if (force) lastProviderCatalogRetryRef.current = providerCatalogRefreshNonce;
+    const applySnapshot = (
+      providers: AgentChatProviderCatalogEntry[],
+      metadata: AgentChatProviderCatalogSnapshotMetadata,
+    ) => {
+      if (cancelled) return;
+      setProviderCatalog((current) => {
+        const next = { ...current };
+        for (const entry of providers) {
+          const key = normalizeAgentChatProvider(entry?.name);
+          if (!key) continue;
+          next[key] = {
+            ...(current[key] || {}),
+            ...entry,
+            capabilities: {
+              ...(current[key]?.capabilities || {}),
+              ...(entry?.capabilities || {}),
+            },
+          };
+        }
+        return next;
+      });
+      setProviderCatalogRevalidation((current) => reduceAgentChatSelectedProviderRevalidation(
+        current,
+        {
+          type: 'snapshot',
+          provider: targetProvider,
+          generation: requestGeneration,
+          providers,
+          metadata,
+        },
+      ));
+    };
+    loadAgentChatProviderCatalog({
+      force,
+      signal: controller.signal,
+      onSnapshot: applySnapshot,
+    })
+      .then(() => {
         if (cancelled) return;
-        const catalog = Object.fromEntries(((data?.providers || []) as Array<any>).map((p) => [p.name, p]));
-        setProviderCatalog(catalog);
+        setProviderCatalogRevalidation((current) => reduceAgentChatSelectedProviderRevalidation(
+          current,
+          {
+            type: 'failure',
+            provider: targetProvider,
+            generation: requestGeneration,
+            error: `${targetProvider} availability was not returned by the provider catalog. Retry to check again.`,
+          },
+        ));
       })
-      .catch(() => {
-        if (!cancelled) setProviderCatalog({});
+      .catch((error) => {
+        if (!cancelled && !isAgentChatProviderCatalogAbortError(error)) {
+          setProviderCatalogRevalidation((current) => reduceAgentChatSelectedProviderRevalidation(
+            current,
+            {
+              type: 'failure',
+              provider: targetProvider,
+              generation: requestGeneration,
+              error: formatAgentChatProviderCatalogLoadError(error),
+            },
+          ));
+        }
       });
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [deferGatewayMetadata, provider]);
+  }, [provider, providerCatalogRefreshNonce]);
 
   const showHeartbeatModel = provider === 'OPENCLAW' && isAdmin && (!agentId || agentId === 'main');
   const showCompatibilityHotfix = provider === 'OPENCLAW' && isAdmin;
+  const canApplyCompatibilityHotfix = provider === 'OPENCLAW' && isOwner(user);
+  const {
+    heartbeatModel,
+    heartbeatModelLoading,
+    heartbeatModelMutating,
+    heartbeatModelError,
+    loadHeartbeatModel,
+    setHeartbeatModel: handleHeartbeatModelChange,
+    isHeartbeatModelMutationActive,
+  } = useAgentChatHeartbeatModel({
+    enabled: showHeartbeatModel,
+    sessionKey: session,
+  });
+
+  const sessionSettingNavigationBusy = sessionControlMutation !== null || heartbeatModelMutating;
+  const blockForChatContextMutation = useCallback((action: string): boolean => {
+    const sessionSettingActive = isSessionControlMutationActive() || isHeartbeatModelMutationActive();
+    if (!sessionSettingActive && !newSessionLeaseRef.current) return false;
+    setModelSelectionError(sessionSettingActive
+      ? `Wait for the current session setting to finish before ${action}.`
+      : `Wait for the new chat to finish starting before ${action}.`);
+    return true;
+  }, [isHeartbeatModelMutationActive, isSessionControlMutationActive]);
+
+  useEffect(() => {
+    const lease = newSessionLeaseRef.current;
+    const target = newSessionTargetRef.current;
+    if (!lease || !target || session !== target) return;
+    newSessionLeaseRef.current = null;
+    newSessionTargetRef.current = null;
+    setNewSessionPending(false);
+  }, [session]);
 
   const loadCompatibilityHotfixStatus = useCallback(async () => {
     if (!showCompatibilityHotfix) {
@@ -2208,24 +3033,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     }
   }, [showCompatibilityHotfix]);
 
-  const handleApplyCompatibilityHotfix = useCallback(async () => {
-    if (!showCompatibilityHotfix) return;
-    setCompatibilityHotfixApplying(true);
-    setCompatibilityHotfixMessage(null);
-    try {
-      const result = await gatewayAPI.applyCompatibilityHotfix();
-      setCompatibilityHotfixStatus(result.status);
-      setCompatibilityHotfixMessage(result.message || 'Compatibility hotfix applied.');
-    } catch (err: any) {
-      console.error('[ChatInterface] Failed to apply compatibility hotfix:', err);
-      const detail = err?.response?.data?.detail || err?.response?.data?.error || 'Failed to apply compatibility hotfix.';
-      setCompatibilityHotfixMessage(detail);
-    } finally {
-      setCompatibilityHotfixApplying(false);
-      void loadCompatibilityHotfixStatus();
-    }
-  }, [loadCompatibilityHotfixStatus, showCompatibilityHotfix]);
-
   useEffect(() => {
     if (!showCompatibilityHotfix) {
       setCompatibilityHotfixStatus(null);
@@ -2234,52 +3041,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       setCompatibilityHotfixMessage(null);
     }
   }, [showCompatibilityHotfix]);
-
-  const loadHeartbeatModel = useCallback(async () => {
-    if (!showHeartbeatModel) {
-      setHeartbeatModel('');
-      setHeartbeatModelError(null);
-      return;
-    }
-    setHeartbeatModelLoading(true);
-    setHeartbeatModelError(null);
-    try {
-      const data = await gatewayAPI.getConfigPath('agents.defaults.heartbeat.model');
-      const value = typeof data?.value === 'string' ? data.value.trim() : '';
-      setHeartbeatModel(value);
-    } catch (err) {
-      console.error('[ChatInterface] Failed to load heartbeat model:', err);
-      setHeartbeatModel('');
-      setHeartbeatModelError('Could not load the heartbeat model right now.');
-    } finally {
-      setHeartbeatModelLoading(false);
-    }
-  }, [showHeartbeatModel]);
-
-  const handleHeartbeatModelChange = useCallback(async (nextModel: string) => {
-    if (!showHeartbeatModel) return;
-    setHeartbeatModelLoading(true);
-    setHeartbeatModelError(null);
-    try {
-      const normalized = String(nextModel || '').trim();
-      const patchResult = await gatewayAPI.patchConfigPath('agents.defaults.heartbeat.model', normalized || null);
-      const patchedValue = typeof patchResult?.value === 'string' ? patchResult.value.trim() : '';
-      setHeartbeatModel(patchedValue);
-
-      try {
-        const fresh = await gatewayAPI.getConfigPath('agents.defaults.heartbeat.model');
-        const freshValue = typeof fresh?.value === 'string' ? fresh.value.trim() : '';
-        setHeartbeatModel(freshValue);
-      } catch (refreshErr) {
-        console.warn('[ChatInterface] Heartbeat model patched but refresh readback failed:', refreshErr);
-      }
-    } catch (err) {
-      console.error('[ChatInterface] Failed to patch heartbeat model:', err);
-      setHeartbeatModelError('Could not update the heartbeat model.');
-    } finally {
-      setHeartbeatModelLoading(false);
-    }
-  }, [showHeartbeatModel]);
 
   const loadProviderCommands = useCallback(async (targetProvider: string, options?: { force?: boolean }) => {
     const cached = !options?.force ? providerCommandsCache.get(targetProvider) : undefined;
@@ -2340,10 +3101,22 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     }
   }, []);
 
-  const ensureProviderModelsLoaded = useCallback(async (targetProvider: string) => {
-    const cachedModels = providerModelsCache.get(targetProvider);
+  const ensureProviderModelsLoaded = useCallback(async (rawProvider: string, options?: { force?: boolean }) => {
+    const targetProvider = normalizeAgentChatProvider(rawProvider);
+    if (!targetProvider) return [];
+    const requestGate = providerModelRequestGateRef.current!;
+    const requestGeneration = requestGate.begin(targetProvider);
+    const isCurrentRequest = () => requestGate.isCurrent(targetProvider, requestGeneration);
+    if (options?.force) invalidateAgentChatProviderModelsCache(targetProvider);
+    // Agent Zero's catalog is the authority for whether a persisted model may
+    // become active. Revalidate it on every provider entry instead of allowing
+    // a process-local cache from an earlier visit to reactivate a stale model.
+    const cachedModels = targetProvider === 'AGENT_ZERO'
+      ? null
+      : getAgentChatProviderModelsCache(targetProvider);
     if (cachedModels) {
       setProviderModelsLoading((prev) => ({ ...prev, [targetProvider]: false }));
+      setProviderModelsError((prev) => ({ ...prev, [targetProvider]: null }));
       setProviderModels((prev) => ({
         ...prev,
         [targetProvider]: cachedModels.models,
@@ -2363,49 +3136,99 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       return cachedModels.models;
     }
 
+    if (targetProvider === 'AGENT_ZERO') {
+      setProviderModelsValidated((prev) => ({ ...prev, [targetProvider]: false }));
+      setProviderModels((prev) => ({ ...prev, [targetProvider]: [] }));
+    }
     setProviderModelsLoading((prev) => ({ ...prev, [targetProvider]: true }));
+    setProviderModelsError((prev) => ({ ...prev, [targetProvider]: null }));
 
     try {
-      const { provider: providerName, models, capabilities } = await gatewayAPI.models(targetProvider);
-      const normalizedModels = Array.from(new Set((models || []).map((m) => canonicalizePortalModelId(m.id)).filter(Boolean)));
-      providerModelsCache.set(providerName, { models: normalizedModels, capabilities });
+      const { provider: providerName, models, capabilities, unavailableModelIds } = await gatewayAPI.models(targetProvider);
+      setProviderUnavailableModels((prev) => ({
+        ...prev,
+        [targetProvider]: Array.isArray(unavailableModelIds) ? unavailableModelIds : [],
+      }));
+      const responseProvider = normalizeAgentChatProvider(providerName) || targetProvider;
+      const normalizedModels = normalizeAgentChatModelCatalog(targetProvider, (models || []).map((model) => model.id));
+      if (!isCurrentRequest()) return [];
+      const cached = { models: normalizedModels, capabilities };
+      setAgentChatProviderModelsCache(targetProvider, cached);
+      if (responseProvider !== targetProvider) setAgentChatProviderModelsCache(responseProvider, cached);
       setProviderModels((prev) => ({
         ...prev,
-        [providerName]: normalizedModels,
+        [targetProvider]: normalizedModels,
+        ...(responseProvider !== targetProvider ? { [responseProvider]: normalizedModels } : {}),
       }));
+      if (targetProvider === 'AGENT_ZERO') {
+        setProviderModelsValidated((prev) => ({ ...prev, [targetProvider]: true }));
+      }
       if (capabilities) {
         setProviderCatalog((prev) => ({
           ...prev,
-          [providerName]: {
-            ...(prev[providerName] || {}),
+          [targetProvider]: {
+            ...(prev[targetProvider] || {}),
             capabilities: {
-              ...(prev[providerName]?.capabilities || {}),
+              ...(prev[targetProvider]?.capabilities || {}),
               ...capabilities,
             },
           },
         }));
       }
       return normalizedModels;
-    } catch (error) {
+    } catch (error: any) {
+      if (!isCurrentRequest()) return [];
+      const message = modelSelectionErrorMessage(
+        error,
+        `Could not load ${getAgent(targetProvider).name} models.`,
+      );
+      setProviderModelsError((prev) => ({ ...prev, [targetProvider]: message }));
+      if (targetProvider === 'AGENT_ZERO') {
+        setProviderModelsValidated((prev) => ({ ...prev, [targetProvider]: false }));
+        setProviderModels((prev) => ({ ...prev, [targetProvider]: [] }));
+      }
       if (targetProvider === 'OPENCLAW') {
         setProviderModels((prev) => ({ ...prev, OPENCLAW: OPENCLAW_MODEL_FALLBACK }));
         return OPENCLAW_MODEL_FALLBACK;
       }
       throw error;
     } finally {
-      setProviderModelsLoading((prev) => ({ ...prev, [targetProvider]: false }));
+      if (isCurrentRequest()) {
+        setProviderModelsLoading((prev) => ({ ...prev, [targetProvider]: false }));
+      }
     }
   }, []);
 
   const handleAiProviderSetupComplete = useCallback(() => {
-    providerModelsCache.clear();
+    invalidateAgentChatProviderModelsCache();
     providerCommandsCache.clear();
-    void ensureProviderModelsLoaded('OPENCLAW');
-    void ensureProviderModelsLoaded('GEMINI');
-  }, [ensureProviderModelsLoaded]);
+    agentZeroAutoSelectionAttemptRef.current = null;
+    for (const providerName of new Set(['OPENCLAW', 'GEMINI', provider])) {
+      void ensureProviderModelsLoaded(providerName, { force: true }).catch(() => undefined);
+    }
+  }, [ensureProviderModelsLoaded, provider]);
 
   useEffect(() => {
-    const cachedModels = providerModelsCache.get(provider);
+    if (deferGatewayMetadata) return;
+    void ensureProviderModelsLoaded(provider).catch(() => undefined);
+  }, [deferGatewayMetadata, ensureProviderModelsLoaded, provider]);
+
+  useEffect(() => {
+    modelSwitchGenerationRef.current += 1;
+    modelSwitchInFlightRef.current = false;
+    agentZeroAutoSelectionAttemptRef.current = null;
+    setModelSwitching(false);
+    setModelSelectionError(null);
+    setModelSelectionNotice(null);
+    if (provider === 'AGENT_ZERO') {
+      setProviderModelsValidated((prev) => ({ ...prev, AGENT_ZERO: false }));
+      setProviderModels((prev) => ({ ...prev, AGENT_ZERO: [] }));
+    }
+  }, [provider]);
+
+  useEffect(() => {
+    if (provider === 'AGENT_ZERO') return;
+    const cachedModels = getAgentChatProviderModelsCache(provider);
     if (!cachedModels) return;
     setProviderModels((prev) => ({
       ...prev,
@@ -2428,7 +3251,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   useEffect(() => {
     if (deferGatewayMetadata || !settingsOpen) return;
     let cancelled = false;
-    const cached = providerModelsCache.get('OPENCLAW');
+    const cached = getAgentChatProviderModelsCache('OPENCLAW');
     if (cached?.models?.length) {
       setCompactionAvailableModels(cached.models);
       return () => {
@@ -2441,7 +3264,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       .then(({ provider: providerName, models, capabilities }) => {
         if (cancelled) return;
         const normalizedModels = Array.from(new Set((models || []).map((m) => canonicalizePortalModelId(m.id)).filter(Boolean)));
-        providerModelsCache.set(providerName, { models: normalizedModels, capabilities });
+        setAgentChatProviderModelsCache(providerName, { models: normalizedModels, capabilities });
         setProviderModels((prev) => ({ ...prev, [providerName]: normalizedModels }));
         setCompactionAvailableModels(normalizedModels.length ? normalizedModels : OPENCLAW_MODEL_FALLBACK);
       })
@@ -2467,19 +3290,106 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         },
       }
     : {});
-  const availableModels = providerModels[provider] || [];
+  const availableModels = useMemo(
+    () => providerModels[provider] || [],
+    [provider, providerModels],
+  );
   const currentProviderModelsLoading = providerModelsLoading[provider] === true;
+  const currentProviderModelsError = providerModelsError[provider] || null;
+  const currentProviderModelsValidated = providerModelsValidated[provider] === true;
   const canSelectModel = providerMeta.capabilities?.supportsModelSelection === true;
   const supportsCustomModelInput = providerMeta.capabilities?.supportsCustomModelInput !== false;
   const modelCatalogKind = (providerMeta.capabilities?.modelCatalogKind === 'declared' || providerMeta.capabilities?.modelCatalogKind === 'none' || providerMeta.capabilities?.modelCatalogKind === 'dynamic')
     ? providerMeta.capabilities.modelCatalogKind
     : (availableModels.length > 0 ? 'dynamic' : 'none');
-  const sessionListProvider = provider === 'OPENCLAW' ? undefined : provider;
   const providerLabel = getAgent(provider).name;
+  const providerCatalogCandidate = providerCatalog[provider];
+  const currentProviderCatalogEntry = providerCatalogCandidate?.name && providerCatalogCandidate.displayName
+    ? providerCatalogCandidate as AgentChatProviderCatalogEntry
+    : undefined;
+  const providerCatalogLoading = isAgentChatSelectedProviderRevalidationPending(
+    provider,
+    providerCatalogRevalidation,
+    providerCatalogRefreshNonce,
+  );
+  const providerCatalogLoadError = providerCatalogRevalidation?.provider === normalizeAgentChatProvider(provider)
+    && providerCatalogRevalidation.requestVersion === providerCatalogRefreshNonce
+    ? providerCatalogRevalidation.loadError
+    : null;
+  const currentProviderAvailability = assessAgentChatProviderAvailability(
+    provider,
+    currentProviderCatalogEntry,
+    {
+      loading: providerCatalogLoading,
+      loadError: providerCatalogLoadError,
+    },
+  );
+  const agentZeroStoredModelCandidate = provider === 'AGENT_ZERO' && typeof window !== 'undefined'
+    ? String(localStorage.getItem('agentChats.lastModel.AGENT_ZERO') || '').trim()
+    : '';
+  const agentZeroCatalogSelection = provider === 'AGENT_ZERO'
+    ? resolveAgentZeroCatalogModel(selectedModel || agentZeroStoredModelCandidate, availableModels)
+    : '';
+  const agentZeroSelectedModelVerified = provider === 'AGENT_ZERO'
+    && currentProviderModelsValidated
+    && Boolean(selectedModel)
+    && availableModels.includes(selectedModel);
+  const agentZeroModelReady = provider !== 'AGENT_ZERO' || (
+    agentZeroSelectedModelVerified
+    && selectedModel === agentZeroCatalogSelection
+    && !currentProviderModelsLoading
+    && !currentProviderModelsError
+    && !modelSwitching
+  );
+  const agentZeroModelBlockedReason = provider !== 'AGENT_ZERO' || agentZeroModelReady
+    ? null
+    : currentProviderModelsError
+      ? 'Agent Zero’s connected model catalog could not be loaded. Retry it before sending.'
+      : currentProviderModelsLoading || modelSwitching
+        ? 'Agent Zero is loading and applying a connected model. Wait a moment before sending.'
+        : availableModels.length === 0
+          ? 'Connect an Agent Zero model account in AI Providers before sending.'
+          : 'Choose one of Agent Zero’s connected models before sending.';
+  const providerAvailabilityBlockedReason = currentProviderAvailability.canSend
+    ? null
+    : currentProviderAvailability.message;
+  const sendBlockedReason = providerAvailabilityBlockedReason || agentZeroModelBlockedReason;
+  const chatSendReady = currentProviderAvailability.canSend && agentZeroModelReady;
+  const agentZeroRecoveryError = provider === 'AGENT_ZERO'
+    ? historyError || currentProviderModelsError || modelSelectionError
+    : null;
+  const retryAgentZeroRecovery = useCallback(async () => {
+    if (agentZeroRecoveryPending) return;
+    setAgentZeroRecoveryPending(true);
+    setModelSelectionError(null);
+    // A failed automatic model apply records a dedupe key so ordinary renders
+    // do not hammer the session endpoint. An explicit Retry is new user intent:
+    // clear that key so a freshly verified catalog can apply Terra again.
+    agentZeroAutoSelectionAttemptRef.current = null;
+    try {
+      const attempts: Promise<unknown>[] = [
+        ensureProviderModelsLoaded('AGENT_ZERO', { force: true }),
+      ];
+      if (historyError) attempts.push(refreshChat());
+      await Promise.allSettled(attempts);
+    } finally {
+      setAgentZeroRecoveryPending(false);
+    }
+  }, [agentZeroRecoveryPending, ensureProviderModelsLoaded, historyError, refreshChat]);
+  const reportBlockedSend = useCallback(() => {
+    // Provider availability has its own persistent barrier and retry control.
+    // Model errors remain in the model-selection channel so the two readiness
+    // contracts never collapse into one ambiguous failure.
+    if (!providerAvailabilityBlockedReason && agentZeroModelBlockedReason) {
+      setModelSelectionError(agentZeroModelBlockedReason);
+    }
+  }, [agentZeroModelBlockedReason, providerAvailabilityBlockedReason]);
   const liveSteerEnabled = providerMeta.capabilities?.supportsInTurnSteering === true;
-  const runningComposerPlaceholder = liveSteerEnabled
-    ? 'OpenClaw is working, send a steering message for this turn…'
-    : 'Agent is working, queue a follow-up message…';
+  const runningComposerPlaceholder = pendingUserQuestions.length > 0
+    ? 'Answer the waiting question…'
+    : liveSteerEnabled
+      ? 'OpenClaw is working, send a steering message for this turn…'
+      : 'Agent is working, queue a follow-up message…';
   const providerCommandCount = providerMeta.slashCommands?.length || 0;
   const providerCommandStatus = providerMeta.slashCommandsLoaded
     ? `${providerCommandCount} provider command${providerCommandCount === 1 ? '' : 's'}`
@@ -2534,12 +3444,13 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     selectedIndex: 0,
     matches: [],
   });
+  const slashMenuId = React.useId();
 
   const uploadFileToServer = useCallback(async (file: File, attachId: string) => {
     const formData = new FormData();
     formData.append('file', file);
     try {
-      const resp = await fetch('/api/files/', {
+      const resp = await workspaceAuthorizedFetch('/api/files/', {
         method: 'POST',
         credentials: 'include',
         body: formData,
@@ -2701,14 +3612,93 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     dismissApproval: streamDismissApproval,
     compactionPhase,
     thinkingContent,
+    thinkingSubject,
     streamSegments,
+    activityTitles,
   } = useAgentRuntime({
     provider,
     session,
     model: selectedModel || undefined,
     agentId,
+    canSend: chatSendReady,
+    onSendBlocked: reportBlockedSend,
     onSessionResolved: handleSessionResolved,
   });
+
+  const [revealedEarlierMessages, setRevealedEarlierMessages] = useState(0);
+  const messageWindow = useMemo(
+    () => selectNewestWindow(messages, MESSAGE_WINDOW_SIZE, revealedEarlierMessages),
+    [messages, revealedEarlierMessages],
+  );
+  const visibleMessageStartIndex = messages.length - messageWindow.items.length;
+  const messageRevealAnchorRef = useRef<{
+    sessionKey: string;
+    scrollHeight: number;
+    scrollTop: number;
+  } | null>(null);
+  const messageWindowSessionKey = `${provider}:${session}`;
+
+  useEffect(() => {
+    messageRevealAnchorRef.current = null;
+    setRevealedEarlierMessages(0);
+  }, [messageWindowSessionKey]);
+
+  useLayoutEffect(() => {
+    const anchor = messageRevealAnchorRef.current;
+    if (!anchor) return;
+    if (isLoadingOlderHistory) return;
+    messageRevealAnchorRef.current = null;
+    if (anchor.sessionKey !== messageWindowSessionKey) return;
+    const container = scrollRef.current;
+    if (!container) return;
+    container.scrollTop = anchoredScrollTop(anchor, container.scrollHeight);
+  }, [isLoadingOlderHistory, messageWindow.items.length, messageWindowSessionKey, revealedEarlierMessages]);
+
+  const revealEarlierMessages = useCallback(() => {
+    const container = scrollRef.current;
+    if (container) {
+      messageRevealAnchorRef.current = {
+        sessionKey: messageWindowSessionKey,
+        scrollHeight: container.scrollHeight,
+        scrollTop: container.scrollTop,
+      };
+    }
+    setRevealedEarlierMessages((current) => current + MESSAGE_WINDOW_SIZE);
+  }, [messageWindowSessionKey]);
+
+  const loadEarlierMessages = useCallback(async () => {
+    if (isLoadingOlderHistory || isLoadingHistory) return;
+    if (messageWindow.hiddenCount > 0) {
+      revealEarlierMessages();
+      return;
+    }
+    if (!hasOlderHistory) return;
+
+    const container = scrollRef.current;
+    if (container) {
+      messageRevealAnchorRef.current = {
+        sessionKey: messageWindowSessionKey,
+        scrollHeight: container.scrollHeight,
+        scrollTop: container.scrollTop,
+      };
+    }
+    const added = await loadOlderHistory();
+    if (added > 0) {
+      // Keep every page the user deliberately loaded mounted. The server keeps
+      // initial state bounded; this grows only as the user asks for older rows.
+      setRevealedEarlierMessages((current) => current + added);
+    }
+  }, [hasOlderHistory, isLoadingHistory, isLoadingOlderHistory, loadOlderHistory, messageWindow.hiddenCount, messageWindowSessionKey, revealEarlierMessages]);
+
+  const handleChatScroll = useCallback(() => {
+    handleScroll();
+    const container = scrollRef.current;
+    if (!container || container.scrollTop > 72) return;
+    if (olderHistoryError || isLoadingOlderHistory || isLoadingHistory) return;
+    if (messageWindow.hiddenCount > 0 || hasOlderHistory) {
+      void loadEarlierMessages();
+    }
+  }, [handleScroll, hasOlderHistory, isLoadingHistory, isLoadingOlderHistory, loadEarlierMessages, messageWindow.hiddenCount, olderHistoryError]);
 
   useEffect(() => {
     initialHistoryLoadStartedRef.current = false;
@@ -2732,9 +3722,15 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     }
   }, [deferGatewayMetadata, isLoadingHistory, messages.length]);
 
-  const sendButtonTitle = isRunning
-    ? (liveSteerEnabled ? 'Interrupt and steer the running turn' : 'Queue follow-up after current turn')
-    : `Send message to ${providerLabel}`;
+  const sendButtonTitle = sendBlockedReason
+    || (isRunning
+      ? (liveSteerEnabled ? 'Interrupt and steer the running turn' : 'Queue follow-up after current turn')
+      : `Send message to ${providerLabel}`);
+  const sendButtonDescriptionId = providerAvailabilityBlockedReason
+    ? 'agent-chat-provider-availability'
+    : agentZeroModelBlockedReason
+      ? 'agent-zero-model-requirement'
+      : undefined;
 
   // Global exec approval listener (works even when no chat stream is active)
   const {
@@ -2758,7 +3754,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       return;
     }
     await globalResolveApproval(approvalId, decision);
-  }, [globalResolveApproval, globalPendingApprovals, streamPendingApprovals, streamResolveApproval]);
+  }, [globalResolveApproval, streamPendingApprovals, streamResolveApproval]);
 
   const dismissApproval = useCallback((approvalId?: string) => {
     if (!approvalId) {
@@ -2801,8 +3797,13 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     return undefined;
   }, [messages]);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
+  const localSlashCommandCoordinator = useMemo(createLocalSlashCommandCoordinator, []);
   const agent = getAgent(provider);
-  const providerSlashCommands = providerMeta.slashCommands || [];
+  const sendButtonClassName = `flex-shrink-0 p-2.5 sm:p-3 rounded-xl ${agent.sendBg} ${agent.sendHover} text-white transition-all duration-200 shadow-lg ${agent.sendShadow} hover:scale-105 active:scale-95 touch-target disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:scale-100 disabled:active:scale-100`;
+  const providerSlashCommands = useMemo(
+    () => providerMeta.slashCommands || [],
+    [providerMeta.slashCommands],
+  );
   const providerSlashSuggestions = useMemo<SlashCommand[]>(() => providerSlashCommands.map((command) => ({
     command: command.command,
     description: command.description,
@@ -2848,13 +3849,13 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     setSlashMatch({ isOpen: false, query: '', selectedIndex: 0, matches: [] });
   }, [provider]);
 
-  const buildNewSessionKey = useCallback(() => {
-    if (provider === 'OPENCLAW' && isOwner(user)) {
-      const targetAgentId = (agentId && agentId.trim()) ? agentId.trim() : 'main';
+  const buildNewSessionKey = useCallback((targetProvider: string, requestedAgentId?: string) => {
+    if (targetProvider === 'OPENCLAW' && isOwner(user)) {
+      const targetAgentId = (requestedAgentId && requestedAgentId.trim()) ? requestedAgentId.trim() : 'main';
       return `agent:${targetAgentId}:new-${Date.now()}`;
     }
     return `new-${Date.now()}`;
-  }, [agentId, provider, user]);
+  }, [user]);
 
   const refreshSlashAutocomplete = useCallback((value: string) => {
     const localMatches = matchSlashCommands(value);
@@ -2892,52 +3893,183 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     });
   }, []);
 
-  const startNewSession = useCallback(async () => {
-    const nextSession = buildNewSessionKey();
+  const startNewSession = useCallback(async (options?: { cancelRunning?: boolean }): Promise<boolean> => {
+    if (blockForChatContextMutation('starting a new chat')) return false;
+    if (newSessionLeaseRef.current) return false;
+    const snapshot = Object.freeze({
+      generation: ++newSessionGenerationRef.current,
+      provider: providerRef.current,
+      agentId: agentIdRef.current,
+      originSession: sessionRef.current,
+    });
+    newSessionLeaseRef.current = snapshot;
+    newSessionTargetRef.current = null;
+    setNewSessionPending(true);
+    setModelSelectionError(null);
+    const isCurrent = () => (
+      newSessionLeaseRef.current === snapshot
+      && providerRef.current === snapshot.provider
+      && agentIdRef.current === snapshot.agentId
+      && sessionRef.current === snapshot.originSession
+    );
+    const nextSession = buildNewSessionKey(snapshot.provider, snapshot.agentId);
     let resolvedSessionKey = nextSession;
+    let sessionCommitted = false;
+    try {
+      if (options?.cancelRunning) await chatState.cancelStream();
+      if (!isCurrent()) return false;
 
-    if (provider === 'OPENCLAW') {
-      try {
-        const created = await gatewayAPI.createSession(nextSession, provider);
-        const createdKey = typeof created?.key === 'string' ? created.key.trim() : '';
-        if (createdKey) resolvedSessionKey = createdKey;
-      } catch (err) {
-        console.warn('[ChatInterface] Failed to pre-create OpenClaw session:', err);
+      if (snapshot.provider === 'OPENCLAW') {
+        try {
+          const created = await gatewayAPI.createSession(nextSession, snapshot.provider);
+          if (!isCurrent()) return false;
+          const createdKey = typeof created?.key === 'string' ? created.key.trim() : '';
+          if (createdKey) resolvedSessionKey = createdKey;
+        } catch (err) {
+          console.warn('[ChatInterface] Failed to pre-create OpenClaw session:', err);
+          if (!isCurrent()) return false;
+        }
+      }
+
+      chatState.clearMessages();
+      resolvedSessionRef.current = null;
+      newSessionTargetRef.current = resolvedSessionKey;
+      chatState.setSession(resolvedSessionKey);
+      setPendingAttachments([]);
+      sessionCommitted = true;
+      return true;
+    } finally {
+      if (!sessionCommitted && newSessionLeaseRef.current === snapshot) {
+        newSessionLeaseRef.current = null;
+        newSessionTargetRef.current = null;
+        setNewSessionPending(false);
       }
     }
+  }, [blockForChatContextMutation, buildNewSessionKey, chatState]);
 
-    chatState.clearMessages();
-    resolvedSessionRef.current = null;
-    chatState.setSession(resolvedSessionKey);
-    setPendingAttachments([]);
-  }, [buildNewSessionKey, chatState, provider]);
+  // Model change handler — context handles localStorage persistence. Return a
+  // success bit so both the picker and `/model` command use the same rollback,
+  // launch-bound handoff, and visible error path without reporting a false
+  // success message.
+  const handleModelChange = useCallback(
+    async (model: string): Promise<boolean> => {
+      if (blockForChatContextMutation('changing models')) return false;
+      if (isAgentZeroDefaultModelAlias(provider, model)) {
+        setModelSelectionNotice(null);
+        setModelSelectionError('Agent Zero requires an exact model from a connected OAuth provider. Choose one of its available models instead of Default or reset.');
+        return false;
+      }
+      if (modelSwitchInFlightRef.current) return false;
+      const operationProvider = provider;
+      const operationSession = session;
+      const operationGeneration = modelSwitchGenerationRef.current + 1;
+      modelSwitchGenerationRef.current = operationGeneration;
+      const isCurrentHarness = () => (
+        modelSwitchGenerationRef.current === operationGeneration
+        && providerRef.current === operationProvider
+      );
+      const isCurrentSession = () => (
+        isCurrentHarness() && sessionRef.current === operationSession
+      );
+      const previousModel = selectedModel;
+      modelSwitchInFlightRef.current = true;
+      setModelSwitching(true);
+      setModelSelectionError(null);
+      setModelSelectionNotice(null);
+      try {
+        await switchModel(model);
+        if (!isCurrentSession()) return false;
+        return true;
+      } catch (err: any) {
+        console.error('Failed to switch model for current session:', err);
+        if (!isCurrentSession()) return false;
+        if (isAgentChatLaunchBoundModelError(err)) {
+          await startNewSession();
+          if (!isCurrentHarness()) return false;
+          const nextLabel = model ? modelDisplayName(model) : 'the provider default';
+          setModelSelectionNotice(`${providerLabel} applies model changes when a session starts. A clean new chat is ready with ${nextLabel}.`);
+          return true;
+        }
+        setSelectedModel(previousModel);
+        setModelSelectionError(modelSelectionErrorMessage(
+          err,
+          `Could not switch ${providerLabel} to that model.`,
+        ));
+        return false;
+      } finally {
+        if (modelSwitchGenerationRef.current === operationGeneration) {
+          modelSwitchInFlightRef.current = false;
+          setModelSwitching(false);
+        }
+      }
+    },
+    [blockForChatContextMutation, provider, providerLabel, selectedModel, session, setSelectedModel, startNewSession, switchModel],
+  );
 
-  const maybeExecuteSlashCommand = useCallback(async () => {
+  const handleNativeSetupModelSelected = useCallback(async (nativeProvider: 'GEMINI', model: string): Promise<boolean> => {
+    if (nativeProvider === 'GEMINI' && provider === 'GEMINI') {
+      return handleModelChange(model);
+    }
+    return true;
+  }, [handleModelChange, provider]);
+
+  // This intentionally returns a boolean synchronously. Submit events cannot
+  // be cancelled after awaiting history/model work: by then the composer has
+  // already sent the slash command to the provider.
+  const maybeExecuteSlashCommand = useCallback((event: LocalSlashCommandEvent) => {
     const textarea = composerInputRef.current;
     if (!textarea) return false;
-    const rawValue = textarea.value;
-    const command = findSlashCommand(rawValue);
-    if (!command || !command.executeLocal) return false;
 
-    const providerCommand = providerSlashCommands.find((entry) => {
-      const localCommand = command.command.toLowerCase();
-      const advertised = String(entry.command || '').trim().toLowerCase();
-      return advertised === localCommand || command.aliases?.includes(advertised);
+    return localSlashCommandCoordinator.claim({
+      rawValue: textarea.value,
+      provider,
+      providerSlashCommands,
+      event,
+      clearComposer: () => {
+        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+        if (nativeInputValueSetter) {
+          nativeInputValueSetter.call(textarea, '');
+        } else {
+          textarea.value = '';
+        }
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        setSlashMatch({ isOpen: false, query: '', selectedIndex: 0, matches: [] });
+        textarea.style.height = 'auto';
+      },
+      execute: async (parsed) => {
+        if (parsed.command.command === '/export') {
+          try {
+            const completeHistory = await chatState.getCompleteHistory();
+            downloadChatMarkdown(completeHistory);
+            chatState.setMessages((current) => [...current, {
+              id: `local-export-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              role: 'system',
+              content: `Exported the complete chat as markdown (${completeHistory.length} messages).`,
+              createdAt: new Date(),
+            }]);
+          } catch (err: any) {
+            chatState.setMessages((current) => [...current, {
+              id: `local-export-error-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              role: 'system',
+              content: `Couldn’t export the complete chat: ${String(err?.message || err || 'Unknown error')}`,
+              createdAt: new Date(),
+            }]);
+          }
+        } else {
+          await executeSlashCommand(parsed.command, parsed.args, chatState, {
+            onNewSession: async () => {
+              const started = await startNewSession();
+              if (!started) throw new Error('A new chat is already starting.');
+            },
+            onModelChange: handleModelChange,
+          });
+        }
+      },
+      onError: (err) => {
+        console.error('[ChatInterface] Failed to execute local slash command:', err);
+      },
     });
-    if (provider === 'OPENCLAW' && providerCommand) return false;
-
-    const parsed = parseSlashCommand(rawValue);
-    if (!parsed) return false;
-    await executeSlashCommand(parsed.command, parsed.args, chatState, {
-      onNewSession: startNewSession,
-    });
-    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-    nativeInputValueSetter?.call(textarea, '');
-    textarea.dispatchEvent(new Event('input', { bubbles: true }));
-    setSlashMatch({ isOpen: false, query: '', selectedIndex: 0, matches: [] });
-    textarea.style.height = 'auto';
-    return true;
-  }, [chatState, provider, providerSlashCommands, startNewSession]);
+  }, [chatState, handleModelChange, localSlashCommandCoordinator, provider, providerSlashCommands, startNewSession]);
 
   // Fix #3: Speech recognition
   const handleTranscript = useCallback((text: string) => {
@@ -2961,32 +4093,56 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     }
   }, [isListening, startListening, stopListening]);
 
-  // Model change handler — context handles localStorage persistence
-  const handleModelChange = useCallback(
-    async (model: string) => {
-      const previousModel = selectedModel;
-      try {
-        await switchModel(model);
-      } catch (err) {
-        console.error('Failed to switch model for current session:', err);
-        setSelectedModel(previousModel);
-      }
-    },
-    [selectedModel, setSelectedModel, switchModel],
-  );
+  useEffect(() => {
+    if (provider !== 'AGENT_ZERO') {
+      agentZeroAutoSelectionAttemptRef.current = null;
+      return;
+    }
+    if (currentProviderModelsLoading || currentProviderModelsError || modelSwitching) return;
+    if (!currentProviderModelsValidated) return;
+
+    const nextModel = resolveAgentZeroCatalogModel(
+      selectedModel || agentZeroStoredModelCandidate,
+      availableModels,
+    );
+    if (!nextModel || nextModel === selectedModel) {
+      agentZeroAutoSelectionAttemptRef.current = null;
+      return;
+    }
+
+    const attemptKey = `${session}\u0000${selectedModel}\u0000${availableModels.join('\u0000')}`;
+    if (agentZeroAutoSelectionAttemptRef.current === attemptKey) return;
+    agentZeroAutoSelectionAttemptRef.current = attemptKey;
+    void handleModelChange(nextModel);
+  }, [
+    availableModels,
+    agentZeroStoredModelCandidate,
+    currentProviderModelsError,
+    currentProviderModelsLoading,
+    currentProviderModelsValidated,
+    handleModelChange,
+    modelSwitching,
+    provider,
+    selectedModel,
+    session,
+  ]);
 
   const handleViewGatewaySession = useCallback(
     (sessionKey: string) => {
       if (!sessionKey) return;
+      if (blockForChatContextMutation('opening another session')) return;
+      if (modelSwitchInFlightRef.current) {
+        setModelSelectionError('Wait for the current model change to finish before opening another session.');
+        return;
+      }
       resolvedSessionRef.current = null;
       chatState.selectSession(sessionKey);
     },
-    [chatState],
+    [blockForChatContextMutation, chatState],
   );
 
   useEffect(() => {
     if (publicSettings?.agentAvatars) setAgentAvatars(publicSettings.agentAvatars);
-    if (publicSettings?.subAgentAvatars) setSubAgentAvatars(publicSettings.subAgentAvatars);
     if (publicSettings?.assistantName) setAssistantName(publicSettings.assistantName);
   }, [publicSettings]);
 
@@ -2996,11 +4152,18 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     async function loadClientSettings() {
       try {
         const { data } = await client.get('/settings/client');
-        if (!cancelled && data?.defaultOpenClawAgentId) {
-          setDefaultOpenClawAgentId(data.defaultOpenClawAgentId);
+        if (!cancelled) {
+          if (data?.defaultOpenClawAgentId) {
+            setDefaultOpenClawAgentId(data.defaultOpenClawAgentId);
+          }
+          if (data?.subAgentAvatars && typeof data.subAgentAvatars === 'object' && !Array.isArray(data.subAgentAvatars)) {
+            setSubAgentAvatars(data.subAgentAvatars);
+          }
         }
       } catch {
-        // Keep default main agent when authenticated settings are unavailable.
+        // Keep the main-agent and no-avatar fallbacks when authenticated settings
+        // are unavailable. The lazy /gateway/agents response can still supply an
+        // avatar for each verified selector entry.
       }
     }
 
@@ -3012,6 +4175,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
 
   const handleSelectAgent = useCallback(
     async (selection: AgentSelection) => {
+      if (blockForChatContextMutation('switching providers')) return;
+      if (modelSwitchInFlightRef.current) {
+        setModelSelectionError('Wait for the current model change to finish before switching providers.');
+        return;
+      }
       const providerChanged = selection.provider !== provider;
       const nextAgentId = normalizeOpenClawAgentSelection(selection.provider, selection.agentId);
       const currentAgentId = normalizeOpenClawAgentSelection(provider, agentId);
@@ -3028,94 +4196,20 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       setAgentId(nextAgentId);
       setSession(getInitialSessionForAgentSelection(selection.provider, nextAgentId));
     },
-    [provider, agentId, clearMessages, setProvider, setAgentId, setSession],
+    [blockForChatContextMutation, provider, agentId, clearMessages, setProvider, setAgentId, setSession],
   );
 
-  const handleNewChat = useCallback(async () => {
+  const handleNewChat = useCallback(() => {
+    if (blockForChatContextMutation('starting a new chat')) return;
     sounds.click();
-    if (isRunning) {
-      await chatState.cancelStream();
-    }
-    await startNewSession();
-  }, [isRunning, chatState, startNewSession]);
-
-  const handleSelectSession = useCallback(
-    (sessionId: string) => {
-      resolvedSessionRef.current = null;
-      // Use selectSession which resets stale stream state and force-loads history,
-      // bypassing the isStreamActive guard that would otherwise block history load.
-      chatState.selectSession(sessionId);
-    },
-    [chatState],
-  );
+    void startNewSession({ cancelRunning: isRunning });
+  }, [blockForChatContextMutation, isRunning, startNewSession]);
 
   // Build attachment text to prepend to message
-  const buildAttachmentText = useCallback(() => {
-    if (pendingAttachments.length === 0) return '';
-    const parts: string[] = [];
-    for (const att of pendingAttachments) {
-      const fileHref = att.fileId
-        ? `/files?file=${encodeURIComponent(att.fileId)}`
-        : att.serverPath
-          ? `/files?path=${encodeURIComponent(att.serverPath)}`
-          : '';
-      const portalUrl = fileHref ? `${window.location.origin}${fileHref}` : '';
-      const diskPathLine = att.serverPath ? `- server_path: ${att.serverPath}` : null;
-      const toolUrlLine = att.toolUrl ? `- tool_url: ${att.toolUrl}` : null;
-      const portalLine = portalUrl ? `- portal_url: ${portalUrl}` : null;
-
-      if (att.type === 'text' && att.textContent) {
-        parts.push([
-          `Attached text file: ${att.name}`,
-          diskPathLine,
-          portalLine,
-          'The file content is inlined below.',
-          `\`\`\`${att.name}\n${att.textContent}\n\`\`\``,
-        ].filter(Boolean).join('\n'));
-        continue;
-      }
-
-      if (att.uploadStatus === 'error') {
-        parts.push(`[File attached: ${att.name} (upload failed: ${att.uploadError || 'unknown error'})]`);
-        continue;
-      }
-
-      const typeHint = att.type === 'image'
-        ? [
-            'This is an image attachment.',
-            'IMPORTANT: prefer tool_url when present because the gateway host may differ from the portal host.',
-            att.toolUrl
-              ? `Use the image tool with image="${att.toolUrl}".`
-              : att.serverPath
-                ? `Use the image tool with image="${att.serverPath}".`
-                : 'Use the image tool on tool_url or server_path.',
-            'Do not say you cannot access the image unless the tool itself returns an error.',
-          ].join(' ')
-        : /\.pdf$/i.test(att.name)
-          ? [
-              'This is a PDF attachment.',
-              'IMPORTANT: prefer tool_url when present because the gateway host may differ from the portal host.',
-              att.toolUrl
-                ? `Use the pdf tool with pdf="${att.toolUrl}".`
-                : att.serverPath
-                  ? `Use the pdf tool with pdf="${att.serverPath}".`
-                  : 'Use the pdf tool on tool_url or server_path.',
-              'Do not say you cannot access the PDF unless the tool itself returns an error.',
-            ].join(' ')
-          : 'This file is attached on disk. Use tool_url or server_path to inspect it if needed.';
-
-      parts.push([
-        `Attached file: ${att.name}`,
-        `- kind: ${att.type}`,
-        `- size: ${att.size} bytes`,
-        diskPathLine,
-        toolUrlLine,
-        portalLine,
-        typeHint,
-      ].filter(Boolean).join('\n'));
-    }
-    return parts.join('\n\n') + '\n\n';
-  }, [pendingAttachments]);
+  const buildAttachmentText = useCallback(
+    () => buildPersistedChatAttachmentText(pendingAttachments),
+    [pendingAttachments],
+  );
 
   // Intercept send to prepend attachments
   const handleSendWithAttachments = useCallback((options?: { submit?: boolean }) => {
@@ -3140,7 +4234,25 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     return true;
   }, [pendingAttachments, buildAttachmentText]);
 
+  /**
+   * Submit a streamed ask-question card through the composer. If the run is
+   * paused, ChatStateProvider will only accept the text when exactly one
+   * broker-owned single-question prompt is waiting.
+   */
+  const submitAskQuestionAnswer = useCallback((answerText: string) => {
+    const trimmed = (answerText || '').trim();
+    if (!trimmed || !composerInputRef.current) return;
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype,
+      'value',
+    )?.set;
+    nativeInputValueSetter?.call(composerInputRef.current, trimmed);
+    composerInputRef.current.dispatchEvent(new Event('input', { bubbles: true }));
+    requestAnimationFrame(() => composerInputRef.current?.form?.requestSubmit());
+  }, []);
+
   return (
+    <AskQuestionAnswerProvider value={submitAskQuestionAnswer}>
     <AssistantRuntimeProvider runtime={runtime}>
       <div className="flex h-full overflow-hidden bg-[#0A0E27]">
         {/* ── Main Chat Area ───────────────────────────────────────── */}
@@ -3169,9 +4281,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               <AgentSelector
                 value={provider}
                 agentId={agentId}
+                disabled={modelSwitching || sessionSettingNavigationBusy || newSessionPending}
                 onChange={handleSelectAgent}
                 onViewSession={handleViewGatewaySession}
                 currentSessionKey={session}
+                activityTitles={activityTitles}
                 agentAvatars={agentAvatars}
                 subAgentAvatars={subAgentAvatars}
                 assistantName={assistantName}
@@ -3180,17 +4294,24 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
             </div>
 
             <div className="flex items-center gap-1 sm:gap-2 ml-auto">
-              {canSelectModel && (
+              {(canSelectModel || provider === 'AGENT_ZERO' || currentProviderModelsLoading || Boolean(currentProviderModelsError)) && (
                 <ModelPicker
-                  provider={provider}
-                  value={selectedModel}
+                  value={provider === 'AGENT_ZERO' && !agentZeroSelectedModelVerified ? '' : selectedModel}
                   onChange={handleModelChange}
                   models={availableModels}
-                  loading={currentProviderModelsLoading}
-                  supportsCustomModelInput={supportsCustomModelInput}
-                  modelCatalogKind={modelCatalogKind}
-                  disabled={isRunning}
-                  onOpen={() => { void ensureProviderModelsLoaded(provider); }}
+                  loading={currentProviderModelsLoading || modelSwitching}
+                  error={modelSelectionError || currentProviderModelsError}
+                  supportsCustomModelInput={provider === 'AGENT_ZERO' ? false : supportsCustomModelInput}
+                  modelCatalogKind={provider === 'AGENT_ZERO' ? 'dynamic' : modelCatalogKind}
+                  disabled={isRunning || modelSwitching || sessionSettingNavigationBusy || newSessionPending}
+                  allowDefaultModel={provider !== 'AGENT_ZERO'}
+                  required={provider === 'AGENT_ZERO'}
+                  emptyMessage="Connect an Agent Zero OAuth account in AI Providers to load selectable models."
+                  unavailableModelIds={providerUnavailableModels[provider] || []}
+                  onOpen={() => { void ensureProviderModelsLoaded(provider).catch(() => undefined); }}
+                  onRetry={currentProviderModelsError
+                    ? () => { void ensureProviderModelsLoaded(provider, { force: true }).catch(() => undefined); }
+                    : undefined}
                 />
               )}
               <SessionControls
@@ -3210,36 +4331,57 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 compatibilityHotfixApplying={compatibilityHotfixApplying}
                 compatibilityHotfixMessage={compatibilityHotfixMessage}
                 onRefreshCompatibilityHotfix={() => { void loadCompatibilityHotfixStatus(); }}
-                onApplyCompatibilityHotfix={() => { void handleApplyCompatibilityHotfix(); }}
-                onSetThinkingLevel={(level) => { void setThinkingLevel(level); }}
-                onSetReasoningVisibility={(level) => { void setReasoningVisibility(level); }}
-                onToggleFastMode={() => { void toggleFastMode(); }}
-                onSetCompactionModelOverride={(model) => { void setCompactionModelOverride(model); }}
-                onSetHeartbeatModel={(model) => { void handleHeartbeatModelChange(model); }}
+                onApplyCompatibilityHotfix={canApplyCompatibilityHotfix ? () => setCompatibilityHotfixConfirmationOpen(true) : undefined}
+                onSetThinkingLevel={(level) => {
+                  if (newSessionLeaseRef.current) return setModelSelectionError('Wait for the new chat to finish starting before changing session settings.');
+                  void setThinkingLevel(level);
+                }}
+                onSetReasoningVisibility={(level) => {
+                  if (newSessionLeaseRef.current) return setModelSelectionError('Wait for the new chat to finish starting before changing session settings.');
+                  void setReasoningVisibility(level);
+                }}
+                onToggleFastMode={() => {
+                  if (newSessionLeaseRef.current) return setModelSelectionError('Wait for the new chat to finish starting before changing session settings.');
+                  void toggleFastMode();
+                }}
+                onSetCompactionModelOverride={(model) => {
+                  if (newSessionLeaseRef.current) return setModelSelectionError('Wait for the new chat to finish starting before changing session settings.');
+                  void setCompactionModelOverride(model);
+                }}
+                onSetHeartbeatModel={(model) => {
+                  if (newSessionLeaseRef.current) return setModelSelectionError('Wait for the new chat to finish starting before changing session settings.');
+                  void handleHeartbeatModelChange(model);
+                }}
                 availableModels={availableModels}
                 compactionAvailableModels={compactionAvailableModels}
                 compactionModelLoading={compactionModelLoading}
                 compactionModelError={compactionModelError}
                 compactionModelOptionsLoading={compactionModelOptionsLoading}
+                sessionControlMutation={sessionControlMutation}
+                sessionControlsError={sessionControlsError}
                 sessionControlsSupported={sessionControlsSupported}
                 onPanelOpen={() => {
+                  if (newSessionLeaseRef.current) return;
                   setSessionControlsLoading(true);
                   void ensureSessionControlsMetadataLoaded({ force: true }).finally(() => setSessionControlsLoading(false));
                   void loadProviderCommands(provider);
-                  void ensureProviderModelsLoaded(provider);
+                  void ensureProviderModelsLoaded(provider).catch(() => undefined);
                   void loadHeartbeatModel();
                   void loadCompatibilityHotfixStatus();
                 }}
-                disabled={false}
+                disabled={newSessionPending || modelSwitching}
                 currentModel={selectedModel}
                 sessionKey={session}
               />
               <button
                 onClick={handleNewChat}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/[0.08] transition-colors"
-                title="New chat"
+                disabled={sessionSettingNavigationBusy || newSessionPending}
+                aria-busy={newSessionPending}
+                aria-label={newSessionPending ? 'Starting new chat' : 'New chat'}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/[0.08] transition-colors disabled:cursor-wait disabled:opacity-40"
+                title={newSessionPending ? 'Starting new chat…' : 'New chat'}
               >
-                <PenSquare size={16} />
+                {newSessionPending ? <Loader2 size={16} className="animate-spin" aria-hidden="true" /> : <PenSquare size={16} />}
               </button>
               {showConnectionLost && (
                 <button
@@ -3259,7 +4401,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                     setTimeout(() => setIsRefreshing(false), 600);
                   }
                 }}
-                disabled={isRefreshing}
+                disabled={isRefreshing || newSessionPending}
                 className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/[0.06] transition-colors disabled:opacity-50"
                 title="Refresh chat — reload history & reconnect stream"
               >
@@ -3274,6 +4416,28 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               </button>
             </div>
           </div>
+
+          <ProviderAvailabilityBarrier
+            assessment={currentProviderAvailability}
+            loading={providerCatalogLoading}
+            onRetry={() => setProviderCatalogRefreshNonce((nonce) => nonce + 1)}
+          />
+
+          {modelSelectionError && provider !== 'AGENT_ZERO' && (
+            <div className="flex items-center gap-2 border-b border-red-500/15 bg-red-500/[0.07] px-3 py-2 text-xs text-red-200" role="alert" aria-live="assertive">
+              <XCircle size={14} className="shrink-0" aria-hidden="true" />
+              <span className="min-w-0 flex-1">{modelSelectionError}</span>
+              <button type="button" onClick={() => setModelSelectionError(null)} className="min-h-[32px] rounded-lg px-2 text-red-100 hover:bg-red-500/10" aria-label="Dismiss model switch error">Dismiss</button>
+            </div>
+          )}
+
+          {modelSelectionNotice && (
+            <div className="flex items-center gap-2 border-b border-sky-500/15 bg-sky-500/[0.07] px-3 py-2 text-xs text-sky-100" role="status" aria-live="polite">
+              <CheckCircle2 size={14} className="shrink-0" aria-hidden="true" />
+              <span className="min-w-0 flex-1">{modelSelectionNotice}</span>
+              <button type="button" onClick={() => setModelSelectionNotice(null)} className="min-h-[32px] rounded-lg px-2 text-sky-100 hover:bg-sky-500/10" aria-label="Dismiss model switch notice">Dismiss</button>
+            </div>
+          )}
 
 
           {/* Fix #1: Direct message rendering (no counters) + Fix #2: Smart scroll */}
@@ -3304,12 +4468,36 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
             {/* Message list — rendered directly from messages state */}
             <div
               ref={scrollRef}
+              data-chat-scroll-container
               className="flex-1 overflow-y-auto"
-              onScroll={handleScroll}
+              onScroll={handleChatScroll}
             >
               {isLoadingHistory && messages.length === 0 ? (
                 /* Initial loading skeleton */
                 <LoadingSkeletonList />
+              ) : (historyError || agentZeroRecoveryError) && messages.length === 0 && !isSwitchingSession ? (
+                <div className="flex h-full items-center justify-center px-5 py-12">
+                  {provider === 'AGENT_ZERO' && agentZeroRecoveryError ? (
+                    <AgentZeroRecoveryCard
+                      message={agentZeroRecoveryError}
+                      retrying={agentZeroRecoveryPending}
+                      onRetry={() => { void retryAgentZeroRecovery(); }}
+                      onRepair={isOwner(user) ? () => setSettingsOpen(true) : undefined}
+                    />
+                  ) : (
+                    <div role="alert" className="w-full max-w-lg rounded-2xl border border-amber-400/20 bg-amber-500/[0.08] px-4 py-4 text-left">
+                      <div className="text-sm font-semibold text-amber-100">Chat history is unavailable</div>
+                      <div className="mt-1 text-xs leading-5 text-amber-100/80">{historyError}</div>
+                      <button
+                        type="button"
+                        onClick={() => { void refreshChat(); }}
+                        className="mt-3 inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-amber-300/25 bg-amber-400/10 px-3 text-xs font-medium text-amber-50 hover:bg-amber-400/20"
+                      >
+                        <RefreshCw size={13} /> Retry chat history
+                      </button>
+                    </div>
+                  )}
+                </div>
               ) : messages.length === 0 && !isSwitchingSession ? (
                 /* Empty state */
                 <div className="flex flex-col items-center justify-center h-full text-center px-8 py-16">
@@ -3371,12 +4559,66 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                       </div>
                     </div>
                   )}
+                  {provider === 'AGENT_ZERO' && agentZeroRecoveryError && (
+                    <div className="px-4 pt-4">
+                      <AgentZeroRecoveryCard
+                        message={agentZeroRecoveryError}
+                        retrying={agentZeroRecoveryPending}
+                        onRetry={() => { void retryAgentZeroRecovery(); }}
+                        onRepair={isOwner(user) ? () => setSettingsOpen(true) : undefined}
+                      />
+                    </div>
+                  )}
+                  {provider !== 'AGENT_ZERO' && historyError && (
+                    <div role="alert" className="mx-auto mt-4 flex w-[calc(100%-2rem)] max-w-xl items-center gap-3 rounded-xl border border-amber-400/20 bg-amber-500/[0.08] px-3 py-2 text-xs text-amber-100">
+                      <span className="min-w-0 flex-1">{historyError}</span>
+                      <button type="button" onClick={() => { void refreshChat(); }} className="min-h-[34px] rounded-lg border border-amber-300/20 px-2.5 font-medium">Retry</button>
+                    </div>
+                  )}
                   {/* Direct message rendering — no counters, fully reactive */}
                   <div className="py-2">
-                  {messages.map((msg, idx) => {
+                  <div className="mx-auto flex min-h-10 max-w-3xl items-center justify-center px-4 py-3" aria-live="polite">
+                    {olderHistoryError ? (
+                      <div className="flex flex-col items-center gap-2 text-center">
+                        <span className="text-[11px] text-rose-300">Couldn’t load earlier messages: {olderHistoryError}</span>
+                        <button
+                          type="button"
+                          onClick={() => void loadEarlierMessages()}
+                          className="rounded-full border border-rose-300/20 bg-rose-400/10 px-3 py-1.5 text-[11px] text-rose-200 transition-colors hover:bg-rose-400/15"
+                        >
+                          Try again
+                        </button>
+                      </div>
+                    ) : isLoadingOlderHistory ? (
+                      <span className="inline-flex items-center gap-2 text-[11px] text-slate-400">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        Loading earlier messages…
+                      </span>
+                    ) : messageWindow.hiddenCount > 0 ? (
+                      <button
+                        type="button"
+                        onClick={() => void loadEarlierMessages()}
+                        className="rounded-full border border-white/[0.08] bg-white/[0.03] px-3 py-1.5 text-[11px] text-slate-400 transition-colors hover:border-white/[0.14] hover:bg-white/[0.06] hover:text-slate-200"
+                      >
+                        Show earlier messages · {messageWindow.hiddenCount} hidden
+                      </button>
+                    ) : hasOlderHistory ? (
+                      <button
+                        type="button"
+                        onClick={() => void loadEarlierMessages()}
+                        className="rounded-full border border-white/[0.08] bg-white/[0.03] px-3 py-1.5 text-[11px] text-slate-400 transition-colors hover:border-white/[0.14] hover:bg-white/[0.06] hover:text-slate-200"
+                      >
+                        Load earlier messages
+                      </button>
+                    ) : (
+                      <span className="text-[10px] uppercase tracking-[0.18em] text-slate-600">Beginning of chat</span>
+                    )}
+                  </div>
+                  {messageWindow.items.map((msg, visibleIdx) => {
+                    const idx = visibleMessageStartIndex + visibleIdx;
                     const prevMsg = idx > 0 ? messages[idx - 1] : null;
                     const showDate =
-                      !prevMsg ||
+                      visibleIdx === 0 || !prevMsg ||
                       msg.createdAt.toDateString() !== prevMsg.createdAt.toDateString();
                     const isQueuedUserMessage = msg.role === 'user' && chatState.messageQueue.some((queued) => queued.id === msg.id);
 
@@ -3419,35 +4661,16 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                               );
                               
                               if (isLiveTimeline) {
-                                // Live streaming: use timestamps to interleave
-                                type TimelineItem =
-                                  | { kind: 'segment'; seg: typeof streamSegments[0]; segIdx: number; ts: number }
-                                  | { kind: 'tool'; tool: ToolCall; ts: number };
-                                const timeline: TimelineItem[] = [
-                                  ...streamSegments.map((seg, segIdx) => ({ kind: 'segment' as const, seg, segIdx, ts: seg.ts })),
-                                  ...toolCalls.map(tool => ({ kind: 'tool' as const, tool, ts: tool.startedAt })),
-                                ];
-                                timeline.sort((a, b) => a.ts - b.ts);
-
-                                return timeline.map((item) =>
-                                  item.kind === 'segment' ? (
-                                    <AssistantBubble
-                                      key={`stream-seg-${item.segIdx}-${item.ts}`}
-                                      message={{
-                                        id: `seg-${item.segIdx}`,
-                                        role: 'assistant' as const,
-                                        content: item.seg.kind === 'thinking' ? '' : item.seg.text,
-                                        thinkingContent: item.seg.kind === 'thinking' ? item.seg.text : undefined,
-                                        createdAt: new Date(item.ts),
-                                      }}
-                                      agent={agent}
-                                      avatarUrl={agentAvatars[agent.providerName]}
-                                      isLast={false}
-                                      isStreaming={false}
-                                    />
-                                  ) : (
-                                    <ToolCallBlock key={`timeline-tool-${item.tool.id}`} tool={item.tool} />
-                                  )
+                                return (
+                                  <ActivityTimeline
+                                    key={`live-activity-${msg.id}`}
+                                    messageId={msg.id}
+                                    segments={streamSegments}
+                                    toolCalls={toolCalls}
+                                    fallbackTimestamp={msg.createdAt.getTime()}
+                                    agent={agent}
+                                    avatarUrl={agentAvatars[agent.providerName]}
+                                  />
                                 );
                               } else {
                                 // History/finalized turn: prefer timestamped segments from the live stream,
@@ -3456,43 +4679,16 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                 const hasTimestampedSegments = segments.some((seg) => typeof seg.ts === 'number' && Number.isFinite(seg.ts));
 
                                 if (hasTimestampedSegments) {
-                                  type HistoryTimelineItem =
-                                    | { kind: 'segment'; seg: typeof segments[0]; segIdx: number; ts: number }
-                                    | { kind: 'tool'; tool: ToolCall; ts: number };
-                                  const timeline: HistoryTimelineItem[] = [
-                                    ...segments.map((seg, segIdx) => ({
-                                      kind: 'segment' as const,
-                                      seg,
-                                      segIdx,
-                                      ts: typeof seg.ts === 'number' && Number.isFinite(seg.ts) ? seg.ts : msg.createdAt.getTime() + segIdx,
-                                    })),
-                                    ...toolCalls.map((tool, toolIdx) => ({
-                                      kind: 'tool' as const,
-                                      tool,
-                                      ts: typeof tool.startedAt === 'number' && Number.isFinite(tool.startedAt) ? tool.startedAt : msg.createdAt.getTime() + toolIdx,
-                                    })),
-                                  ];
-                                  timeline.sort((a, b) => a.ts - b.ts);
-
-                                  return timeline.map((item) =>
-                                    item.kind === 'segment' ? (
-                                      <AssistantBubble
-                                        key={`hist-seg-${msg.id}-${item.segIdx}-${item.ts}`}
-                                        message={{
-                                          id: `hist-seg-${msg.id}-${item.segIdx}`,
-                                          role: 'assistant' as const,
-                                          content: item.seg.kind === 'thinking' ? '' : item.seg.text,
-                                          thinkingContent: item.seg.kind === 'thinking' ? item.seg.text : undefined,
-                                          createdAt: new Date(item.ts),
-                                        }}
-                                        agent={agent}
-                                        avatarUrl={agentAvatars[agent.providerName]}
-                                        isLast={false}
-                                        isStreaming={false}
-                                      />
-                                    ) : (
-                                      <ToolCallBlock key={`hist-tool-${item.tool.id}`} tool={item.tool} />
-                                    )
+                                  return (
+                                    <ActivityTimeline
+                                      key={`history-activity-${msg.id}`}
+                                      messageId={msg.id}
+                                      segments={segments}
+                                      toolCalls={toolCalls}
+                                      fallbackTimestamp={msg.createdAt.getTime()}
+                                      agent={agent}
+                                      avatarUrl={agentAvatars[agent.providerName]}
+                                    />
                                   );
                                 }
 
@@ -3508,6 +4704,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                           role: 'assistant' as const,
                                           content: seg.kind === 'thinking' ? '' : seg.text,
                                           thinkingContent: seg.kind === 'thinking' ? seg.text : undefined,
+                                          thinkingSubject: seg.kind === 'thinking' ? seg.subject : undefined,
                                           createdAt: msg.createdAt,
                                         }}
                                         agent={agent}
@@ -3516,27 +4713,27 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                         isStreaming={false}
                                       />
                                     ))}
-                                    {toolCalls.map((tool, toolIdx) => (
-                                      <React.Fragment key={`hist-tool-wrap-${tool.id}`}>
-                                        <ToolCallBlock key={`hist-tool-${tool.id}`} tool={tool} />
-                                        {toolIdx < toolCalls.length - 1 && betweenSegs.length > 0 && toolIdx === 0 && betweenSegs.map((seg, i) => (
-                                          <AssistantBubble
-                                            key={`hist-between-${msg.id}-${i}`}
-                                            message={{
-                                              id: `hist-between-${msg.id}-${i}`,
-                                              role: 'assistant' as const,
-                                              content: seg.kind === 'thinking' ? '' : seg.text,
-                                              thinkingContent: seg.kind === 'thinking' ? seg.text : undefined,
-                                              createdAt: msg.createdAt,
-                                            }}
-                                            agent={agent}
-                                            avatarUrl={agentAvatars[agent.providerName]}
-                                            isLast={false}
-                                            isStreaming={false}
-                                          />
-                                        ))}
-                                      </React.Fragment>
-                                    ))}
+                                    <BoundedToolCallList
+                                      tools={toolCalls}
+                                      messageKey={`history-${msg.id}`}
+                                      renderAfterFirst={toolCalls.length > 1 && betweenSegs.length > 0 ? betweenSegs.map((seg, i) => (
+                                        <AssistantBubble
+                                          key={`hist-between-${msg.id}-${i}`}
+                                          message={{
+                                            id: `hist-between-${msg.id}-${i}`,
+                                            role: 'assistant' as const,
+                                            content: seg.kind === 'thinking' ? '' : seg.text,
+                                            thinkingContent: seg.kind === 'thinking' ? seg.text : undefined,
+                                            thinkingSubject: seg.kind === 'thinking' ? seg.subject : undefined,
+                                            createdAt: msg.createdAt,
+                                          }}
+                                          agent={agent}
+                                          avatarUrl={agentAvatars[agent.providerName]}
+                                          isLast={false}
+                                          isStreaming={false}
+                                        />
+                                      )) : undefined}
+                                    />
                                     {/* Text after tool calls (main response) — rendered by the AssistantBubble below */}
                                   </>
                                 );
@@ -3556,43 +4753,56 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                 : msg;
                               const bubbleContent = bubbleMessage.content?.trim() || '';
                               const bubbleThinking = bubbleMessage.thinkingContent?.trim() || '';
-                              const lastRenderedTextSegment = [...renderedBeforeSegments]
-                                .reverse()
-                                .find((segment) => segment.kind !== 'thinking' && segment.text.trim());
+                              const bubbleThinkingSubject = bubbleMessage.thinkingSubject?.trim() || '';
                               const lastRenderedThinkingSegment = [...renderedBeforeSegments]
                                 .reverse()
-                                .find((segment) => segment.kind === 'thinking' && segment.text.trim());
-                              const bubbleContentDuplicatesTimeline = Boolean(bubbleContent)
-                                && lastRenderedTextSegment?.text.trim() === bubbleContent;
+                                .find((segment) => (
+                                  segment.kind === 'thinking'
+                                  && (segment.text.trim() || segment.subject)
+                                ));
+                              const bubbleContentDuplicatesTimeline = isAssistantContentRepresentedByTimeline(
+                                bubbleContent,
+                                renderedBeforeSegments,
+                              );
                               // A thought grows as cumulative snapshots. A mid-turn reload can leave a
                               // partially flushed copy in durable history while the live/resumed stream
                               // carries the grown version of the SAME thought — treat prefix matches in
                               // either direction as the same thought, not two bubbles.
                               const isSameGrowingThought = (a: string, b: string) => Boolean(a) && Boolean(b)
                                 && (a === b || a.startsWith(b) || b.startsWith(a));
-                              const bubbleThinkingDuplicatesTimeline = Boolean(bubbleThinking)
-                                && isSameGrowingThought(lastRenderedThinkingSegment?.text.trim() || '', bubbleThinking);
-                              const liveThinkingValue = idx === messages.length - 1 ? thinkingContent : undefined;
-                              const liveThinkingText = liveThinkingValue?.trim() || '';
-                              const liveThinkingAlreadyRendered = Boolean(liveThinkingText)
+                              const lastRenderedThinkingText = lastRenderedThinkingSegment?.text.trim() || '';
+                              const lastRenderedThinkingSubject = lastRenderedThinkingSegment?.subject?.trim() || '';
+                              const bubbleThinkingDuplicatesTimeline = Boolean(bubbleThinking || bubbleThinkingSubject)
                                 && Boolean(lastRenderedThinkingSegment)
-                                && (lastRenderedThinkingSegment!.text.trim() === liveThinkingText
-                                  || lastRenderedThinkingSegment!.text.trim().startsWith(liveThinkingText));
+                                && (!bubbleThinking || isSameGrowingThought(lastRenderedThinkingText, bubbleThinking))
+                                && (!bubbleThinkingSubject || lastRenderedThinkingSubject === bubbleThinkingSubject);
+                              const liveThinkingValue = idx === messages.length - 1 ? thinkingContent : undefined;
+                              const liveThinkingSubjectValue = idx === messages.length - 1 ? thinkingSubject : undefined;
+                              const liveThinkingText = liveThinkingValue?.trim() || '';
+                              const liveThinkingSubjectText = liveThinkingSubjectValue?.trim() || '';
+                              const liveThinkingAlreadyRendered = Boolean(liveThinkingText || liveThinkingSubjectText)
+                                && Boolean(lastRenderedThinkingSegment)
+                                && (!liveThinkingText || isSameGrowingThought(lastRenderedThinkingText, liveThinkingText))
+                                && (!liveThinkingSubjectText || lastRenderedThinkingSubject === liveThinkingSubjectText);
                               const effectiveBubbleMessage = (bubbleContentDuplicatesTimeline || bubbleThinkingDuplicatesTimeline)
                                 ? {
                                     ...bubbleMessage,
                                     content: bubbleContentDuplicatesTimeline ? '' : bubbleMessage.content,
                                     thinkingContent: bubbleThinkingDuplicatesTimeline ? undefined : bubbleMessage.thinkingContent,
+                                    thinkingSubject: bubbleThinkingDuplicatesTimeline ? undefined : bubbleMessage.thinkingSubject,
                                   }
                                 : bubbleMessage;
                               const effectiveLiveThinkingContent = liveThinkingAlreadyRendered ? undefined : liveThinkingValue;
+                              const effectiveLiveThinkingSubject = liveThinkingAlreadyRendered ? undefined : liveThinkingSubjectValue;
                               const effectiveLiveStatusText = idx === messages.length - 1 && isRunning
                                 ? String(statusText || '').trim()
                                 : '';
                               const hasVisibleBubble = Boolean(
                                 effectiveBubbleMessage.content?.trim()
                                 || effectiveBubbleMessage.thinkingContent?.trim()
+                                || effectiveBubbleMessage.thinkingSubject
                                 || effectiveLiveThinkingContent?.trim()
+                                || effectiveLiveThinkingSubject
                                 || effectiveLiveStatusText
                                 || (effectiveBubbleMessage.toolCalls || []).length > 0,
                               );
@@ -3607,6 +4817,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                   isLast={idx === messages.length - 1}
                                   isStreaming={isRunning}
                                   liveThinkingContent={effectiveLiveThinkingContent}
+                                  liveThinkingSubject={effectiveLiveThinkingSubject}
                                   liveStatusText={effectiveLiveStatusText}
                                   onRetry={
                                     idx === messages.length - 1 && lastUserMessage
@@ -3702,6 +4913,14 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 : 'border-white/[0.06] bg-[#0D1130]/30'
             } backdrop-blur-sm`}>
               <div className="px-2 sm:px-4 pt-2 pb-3 pb-safe max-w-3xl mx-auto">
+                {pendingUserQuestions.map((request) => (
+                  <AskUserQuestionCard
+                    key={request.id}
+                    request={request}
+                    onSettled={settlePendingUserQuestion}
+                  />
+                ))}
+
                 {/* Fix #4: Attachment chips row */}
                 {pendingAttachments.length > 0 && (
                   <div className="flex flex-wrap gap-2 mb-2">
@@ -3718,15 +4937,26 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 {/* Composer row: [paperclip] [textarea] [mic] [send] */}
                 <div className={`mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] ${isRunning ? 'text-violet-300/80' : 'text-slate-500'}`}>
                   <span className="inline-flex items-center gap-1"><kbd className="px-1 py-0.5 rounded bg-white/[0.05] text-[10px] font-mono text-slate-400">/</kbd> {providerCommandStatus}</span>
-                  <span>{canSelectModel ? 'Model switching available' : 'Fixed provider defaults'}</span>
+                  <span>{provider === 'AGENT_ZERO' ? 'Connected model required' : (canSelectModel ? 'Model switching available' : 'Fixed provider defaults')}</span>
                   <span>{modelCatalogKind === 'none' ? 'Manual model ids may be required' : `Model catalog: ${availableModels.length || 'live'}`}</span>
                   <span className="text-slate-600">Try <span className="font-mono text-slate-400">/help</span> or <span className="font-mono text-slate-400">/status</span></span>
+                  {provider !== 'OPENCLAW' && (
+                    <span className={currentProviderAvailability.canSend ? 'text-emerald-300/80' : 'font-medium text-amber-200'}>
+                      Provider availability: {currentProviderAvailability.status}
+                    </span>
+                  )}
+                  {currentProviderAvailability.canSend && agentZeroModelBlockedReason && (
+                    <span id="agent-zero-model-requirement" role="status" className="basis-full font-medium text-amber-200">
+                      {agentZeroModelBlockedReason}
+                    </span>
+                  )}
                 </div>
                 <ComposerPrimitive.Root className="relative flex items-end gap-1.5 sm:gap-2">
                   {/* Fix #4: Attachment button (hidden during streaming) */}
                   {!isRunning && (
                   <button
                     type="button"
+                    aria-label="Attach files"
                     onClick={() => fileInputRef.current?.click()}
                     className="flex-shrink-0 p-2 sm:p-2.5 rounded-xl text-slate-400 hover:text-slate-200 hover:bg-white/[0.06] transition-colors mb-0.5 touch-target"
                     title="Attach file"
@@ -3735,6 +4965,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   </button>
                   )}
                   <input
+                    aria-label="Choose files to attach"
                     ref={fileInputRef}
                     type="file"
                     multiple
@@ -3743,15 +4974,29 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                     onChange={(e) => handleFileSelect(e.target.files)}
                   />
                   <SlashCommandMenu
+                    id={slashMenuId}
+                    open={slashMatch.isOpen}
+                    anchorRef={composerInputRef}
                     commands={slashMatch.matches}
                     selectedIndex={slashMatch.selectedIndex}
+                    onNavigate={(selectedIndex) => {
+                      setSlashMatch((current) => ({ ...current, selectedIndex }));
+                    }}
                     onSelect={applySlashCommand}
+                    onDismiss={() => {
+                      setSlashMatch({ isOpen: false, query: '', selectedIndex: 0, matches: [] });
+                    }}
                   />
 
                   <ComposerPrimitive.Input
                     ref={composerInputRef}
                     autoFocus
                     placeholder={isRunning ? runningComposerPlaceholder : `Message ${agent.name}…`}
+                    aria-label={`Message ${agent.name}`}
+                    aria-haspopup="listbox"
+                    aria-expanded={slashMatch.isOpen}
+                    aria-controls={slashMatch.isOpen ? slashMenuId : undefined}
+                    aria-activedescendant={slashMatch.isOpen ? `${slashMenuId}-option-${slashMatch.selectedIndex}` : undefined}
                     className={`flex-1 resize-none rounded-2xl px-3 sm:px-4 py-2.5 sm:py-3 text-sm placeholder-slate-500 focus:outline-none transition-all duration-300 min-h-[44px] max-h-[200px] overflow-y-auto ${
                       isRunning
                         ? 'bg-violet-500/[0.04] border border-violet-500/15 text-white'
@@ -3778,10 +5023,14 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                     }}
                     onPaste={handlePasteAttachments}
                     onBlur={() => {
-                      // Dismiss autocomplete when focus leaves the composer.
-                      // (mouseDown on popup items calls preventDefault, keeping focus)
+                      // Desktop options keep composer focus; narrow-screen
+                      // sheets move focus into the portaled listbox. Dismiss
+                      // only when focus leaves both surfaces.
                       setTimeout(() => {
-                        if (composerInputRef.current !== document.activeElement) {
+                        const activeElement = document.activeElement;
+                        const focusInsideMenu = activeElement instanceof HTMLElement
+                          && Boolean(activeElement.closest('[data-slash-command-menu="true"]'));
+                        if (composerInputRef.current !== activeElement && !focusInsideMenu) {
                           setSlashMatch((prev) => prev.isOpen ? { isOpen: false, query: '', selectedIndex: 0, matches: [] } : prev);
                         }
                       }, 100);
@@ -3828,15 +5077,23 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                       // On mobile: Enter always inserts newline (submitMode="none" handles this)
                       // On desktop: Shift+Enter inserts newline, plain Enter submits
                       if (!isMobileDevice && e.key === 'Enter' && !e.shiftKey) {
+                        if (maybeExecuteSlashCommand(e)) {
+                          return;
+                        }
+                        if (!chatSendReady) {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          reportBlockedSend();
+                          return;
+                        }
                         // Let ComposerPrimitive handle the submit (via submitMode="enter")
                         // But if attachments exist, force the mutation first and then submit.
                         if (pendingAttachments.length > 0) {
                           e.preventDefault();
-                          if (handleSendWithAttachments({ submit: true })) {
-                            return;
-                          }
+                          e.stopPropagation();
+                          handleSendWithAttachments({ submit: true });
+                          return;
                         }
-                        // Slash commands are sent as messages to the agent (not executed locally)
                       }
                     }}
                   />
@@ -3845,6 +5102,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   {speechSupported && (
                     <button
                       type="button"
+                      aria-label={isListening ? 'Stop dictation' : 'Start dictation'}
                       onClick={handleMicToggle}
                       className={`flex-shrink-0 p-2 sm:p-2.5 rounded-xl transition-all duration-200 mb-0.5 touch-target ${
                         isListening
@@ -3858,29 +5116,48 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   )}
 
                   {/* Send button stays active during runs. OpenClaw uses live inject/steer; native CLIs queue the follow-up for the next turn. */}
-                  <ComposerPrimitive.Send asChild>
-                    <button
-                      onClick={async (e) => {
-                        if (pendingAttachments.length > 0 && handleSendWithAttachments({ submit: true })) {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          return;
-                        }
-                        if (await maybeExecuteSlashCommand()) {
-                          e.preventDefault();
-                          e.stopPropagation();
-                        }
-                      }}
-                      className={`flex-shrink-0 p-2.5 sm:p-3 rounded-xl ${agent.sendBg} ${agent.sendHover} text-white transition-all duration-200 shadow-lg ${agent.sendShadow} hover:scale-105 active:scale-95 touch-target`}
+                  {chatSendReady ? (
+                    <ComposerPrimitive.Send asChild>
+                      <button
+                        onClick={(e) => {
+                          if (maybeExecuteSlashCommand(e)) {
+                            return;
+                          }
+                          if (!chatSendReady) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            reportBlockedSend();
+                            return;
+                          }
+                          if (pendingAttachments.length > 0) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            handleSendWithAttachments({ submit: true });
+                            return;
+                          }
+                        }}
+                        aria-describedby={sendButtonDescriptionId}
+                        className={sendButtonClassName}
+                        title={sendButtonTitle}
+                      >
+                        <Send size={16} className="sm:w-4 sm:h-4 w-3.5 h-3.5" />
+                      </button>
+                    </ComposerPrimitive.Send>
+                  ) : (
+                    <BlockedAgentChatSendButton
                       title={sendButtonTitle}
+                      describedBy={sendButtonDescriptionId}
+                      className={sendButtonClassName}
                     >
                       <Send size={16} className="sm:w-4 sm:h-4 w-3.5 h-3.5" />
-                    </button>
-                  </ComposerPrimitive.Send>
+                    </BlockedAgentChatSendButton>
+                  )}
                   {/* Stop button — driven by our own isRunning, not assistant-ui runtime
                       (runtime.isRunning is always false to keep Send enabled for FYI queue) */}
-                  {isRunning && (
+                  {isRunning && supportsAgentChatStop(provider) && (
                     <button
+                      type="button"
+                      aria-label="Stop response"
                       onClick={() => chatState.cancelStream()}
                       className="flex-shrink-0 p-2.5 sm:p-3 rounded-xl bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-all duration-200 border border-red-500/20 hover:scale-105 active:scale-95 touch-target"
                     >
@@ -3911,7 +5188,18 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
           />
         )}
 
-        <AgentSettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} onAiProviderSetupComplete={handleAiProviderSetupComplete} />
+        <CompatibilityHotfixConfirmationDialog
+          open={compatibilityHotfixConfirmationOpen}
+          status={compatibilityHotfixStatus}
+          onClose={() => setCompatibilityHotfixConfirmationOpen(false)}
+          onBusyChange={setCompatibilityHotfixApplying}
+          onVerified={(verifiedStatus, message) => {
+            setCompatibilityHotfixStatus(verifiedStatus);
+            setCompatibilityHotfixMessage(message);
+          }}
+        />
+
+        <AgentSettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} onAiProviderSetupComplete={handleAiProviderSetupComplete} onNativeModelSelected={handleNativeSetupModelSelected} />
 
         {/* Exec Approval Modal — keyed per approval so isResolving/isClosing
             state can never leak from one queued approval into the next. */}
@@ -3926,5 +5214,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         )}
       </div>
     </AssistantRuntimeProvider>
+    </AskQuestionAnswerProvider>
   );
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { CheckCircle, XCircle, AlertCircle, Info, X, ChevronDown, ChevronUp, Copy, Check } from 'lucide-react';
 import ViewportOverlay from './ViewportOverlay';
 
@@ -32,6 +32,7 @@ export function Toast({ id, type, message, detail, hint, duration = 3000, onClos
   const Icon = icons[type];
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
+  const detailsId = useId();
 
   useEffect(() => {
     // Don't auto-close if expanded
@@ -50,7 +51,11 @@ export function Toast({ id, type, message, detail, hint, duration = 3000, onClos
   const hasExtra = !!(detail || hint);
 
   return (
-    <div className={`flex w-full flex-col rounded-lg border backdrop-blur-xl ${styles[type]} animate-slide-in`}>
+    <div
+      className={`flex w-full flex-col rounded-lg border backdrop-blur-xl ${styles[type]} animate-slide-in`}
+      role={type === 'error' || type === 'warning' ? 'alert' : 'status'}
+      aria-live={type === 'error' || type === 'warning' ? 'assertive' : 'polite'}
+    >
       {/* Main row */}
       <div className="flex items-start gap-2 px-4 py-3">
         <Icon size={18} className="mt-0.5 flex-shrink-0" />
@@ -66,6 +71,9 @@ export function Toast({ id, type, message, detail, hint, duration = 3000, onClos
               onClick={() => setExpanded(!expanded)}
               className="p-0.5 hover:opacity-70 transition-opacity"
               title={expanded ? 'Collapse' : 'Show details'}
+              aria-label={expanded ? 'Hide notification details' : 'Show notification details'}
+              aria-expanded={expanded}
+              aria-controls={detailsId}
             >
               {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
             </button>
@@ -73,6 +81,7 @@ export function Toast({ id, type, message, detail, hint, duration = 3000, onClos
           <button
             onClick={() => onClose(id)}
             className="p-0.5 hover:opacity-70 transition-opacity"
+            aria-label="Dismiss notification"
           >
             <X size={14} />
           </button>
@@ -81,7 +90,7 @@ export function Toast({ id, type, message, detail, hint, duration = 3000, onClos
 
       {/* Expanded detail */}
       {expanded && (detail || hint) && (
-        <div className="px-4 pb-3 border-t border-white/10 pt-2">
+        <div id={detailsId} className="px-4 pb-3 border-t border-white/10 pt-2">
           {hint && (
             <div className="text-xs mb-2 opacity-80">💡 <strong>Hint:</strong> {hint}</div>
           )}
@@ -94,6 +103,7 @@ export function Toast({ id, type, message, detail, hint, duration = 3000, onClos
                 onClick={copyDetail}
                 className="absolute top-1 right-1 p-1 rounded bg-black/50 hover:bg-black/70 transition-colors"
                 title="Copy error details"
+                aria-label={copied ? 'Notification details copied' : 'Copy notification details'}
               >
                 {copied ? <Check size={10} /> : <Copy size={10} />}
               </button>

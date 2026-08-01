@@ -49,7 +49,7 @@ export default function ComposerStatusBadge({
     dot: contextSummary?.dot || 'bg-slate-300',
     icon: null,
     label: contextSummary?.label || 'Status',
-    detail: null,
+    detail: contextSummary?.detail || null,
     bounce: false,
     showQueueMeta: false,
   };
@@ -113,7 +113,7 @@ export default function ComposerStatusBadge({
               {effectiveTone.detail}
             </span>
           ) : null}
-          {contextSummary ? (
+          {contextSummary && tone ? (
             <div className={`basis-full flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-[10px] ${contextSummary.text} opacity-90`}>
               <span className="inline-flex items-center gap-1.5 font-medium">
                 <span className={`h-1.5 w-1.5 rounded-full ${contextSummary.dot}`} />

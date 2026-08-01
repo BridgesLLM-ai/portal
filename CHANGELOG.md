@@ -2,6 +2,100 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.0] - 2026-08-01
+
+Portal 4.0 is a foundation release. It replaces several loosely connected feature paths with explicit ownership, isolation, recovery, and verification contracts across Agent Chat, Projects, providers, updates, backups, and the host workstation.
+
+### Upgrade notes
+
+- **Every user signs in again once.** The 4.0 identity migration invalidates existing session records because their stored hashes cannot be safely moved into the new authorization model. Accounts, roles, projects, files, apps, and managed data are retained, subject to the legacy Project safety boundary below.
+- **Long-lived 3.x Projects are preserved, not auto-promoted.** Their files, exactly associated Apps, and App running/stopped intent are retained. Startup enrolls each exact old Project root as legacy `NONE`, never as 4.0-current. A Project with preserved 3.x OpenClaw lineage remains visible, but Project Chat and destructive Project-level operations stay unavailable until that lineage can be reconciled safely.
+- **Use the Dashboard update path and take the backup preflight seriously.** The updater is operator-triggered; it does not install releases silently. It requires a fresh verified backup, displays signed release details, and rolls back a candidate that cannot pass migration and health checks.
+- **Project Chat now requires an attestable container host.** Compatible kernel, Docker, and AppArmor behavior is required for confined Project runtimes. Unsupported nested-container hosts can use `--skip-project-runtimes`; the Portal installs, but Project Chat remains explicitly disabled.
+- **Complete wipe has a stated boundary.** It verifies that each recorded managed path is gone. A copy moved elsewhere before uninstall is outside that record and can remain; review the host directly when it held sensitive data.
+- **Fresh setup enables limited operational telemetry by default.** The Owner can turn it off during setup or later in Settings, and existing installations keep their saved choice. The Portal reports shortly after startup and then about every 24 hours while it remains running. Turning it off stops that operational report only: the separate Owner-Dashboard version lookup and manual refresh remain available, and the installer separately reports limited install and update lifecycle milestones regardless of the Portal setting.
+- **Windows/WSL remains an experimental local preview.** The supported production targets are Ubuntu 22.04+ and Debian 12+ VPS hosts.
+- **Multi-user account retirement is not in 4.0.** Destructive user removal remains disabled until sessions, projects, files, apps, shares, and runtime state can be removed or reassigned as one provable transaction. That work is planned for 4.1.
+
+### Agent Chat and pending questions
+
+- **Answer agents from anywhere in the Portal.** A waiting Agent Chat or Project Chat question now opens as a persistent, expandable notification. The existing question card supports choices, free text, Send, and Skip without navigating away from the current page.
+- **Waiting questions have their own alert sound.** It respects the Portal sound and volume settings and degrades to a silent notification until the browser has allowed audio. Dismissing the notification means “not now”; it does not answer or skip the question.
+- **Native pending input is tied to the exact user, request, run, and conversation.** Cross-user and cross-run answers are rejected, duplicate delivery is idempotent, and accepted answers carry bounded receipts rather than being guessed from chat text.
+- **Active turns can be steered deliberately.** The composer stays available during supported active runs, targets the exact run, and distinguishes steering from a new message or explicit cancellation.
+- **Long-running conversations use bounded durable event history.** Reconnect replay, restart-aware cancellation, transcript windowing, stable stream handlers, and bounded tool/thought timelines keep multi-hour work usable without unbounded browser growth.
+- **Tool, approval, thought, maintenance, and completion events keep their shape across reloads.** Pre-tool text, paired tool results, compaction rails, visible reasoning, and finished assistant replies are preserved without replaying transient placeholders as conversation content.
+- **Provider and model changes are explicit.** Incompatible launch-bound changes start a clean provider session instead of pretending to mutate a running harness, and model application is verified rather than silently falling back.
+
+### Projects, Project Chat, and Apps
+
+- **Project Chat is a separate execution boundary from host-operator Agent Chat.** Server-owned actor and project identity, one writable project mount, non-root/read-only containers, dropped capabilities, pinned images, and synchronous policy/runtime attestation are required before fresh and resumed turns.
+- **Controlled public egress is Portal-owned.** Supported public web, Git, package, and asset traffic can leave a Project runtime while loopback, host, Docker peers, private ranges, metadata/link-local ranges, mixed DNS answers, rebinding, and public-to-private redirects are denied.
+- **Providers qualify against the complete Project contract.** A provider remains unavailable when filesystem, identity, network, runtime, or live-container evidence is absent or stale; there is no fallback to the host workspace.
+- **Project conversations have durable coordination.** Active-turn leases, provider switching, replay, abort/completion idempotency, transcript handoff cursors, exact pending-input ownership, and runtime cleanup survive ordinary reconnect and service-boundary races.
+- **3.x Project continuity is conservative and fail-closed.** Startup attests and enrolls each exact existing Project root as legacy `NONE`, restores only an App whose owner, name, managed deployment path, and directory identity prove the association, leaves every other App standalone, and preserves the recorded running/stopped intent. It does not infer a 4.0-current identity from an old path. Projects with preserved 3.x OpenClaw lineage keep their files and exact App relationship, while Project Chat, rename, delete, and other destructive Project-level operations remain unavailable until safe reconciliation succeeds. Interrupted lifecycle work for 4.0-current Projects still resumes from leases instead of guessing at cleanup.
+- **App deployment is transactional.** Source staging, dependency work, process promotion, proxying, and rollback preserve the last known-good deployment when a candidate cannot become healthy.
+- **Standalone app sources are now part of backup and restore.** Update overlays preserve their source trees, and startup reconciles the full-stack apps that were marked running before maintenance.
+- **Hosted-app and share boundaries are tighter.** Share tokens, passwords, expiry/use limits, active-content routing, API capabilities, bearer forwarding, request sizes, timeouts, and project-scoped activity are enforced by server-owned records.
+
+### Providers and models
+
+- **Provider setup now uses backend-owned capability and model catalogs.** Settings, Agent Chat, Project Chat, readiness checks, and removal controls read the same provider identities and exact model IDs.
+- **Agent Zero is a first-class optional provider path.** OAuth lifecycle, connected-model discovery, exact-model validation, remote application, rollback, and project bridge admission fail closed when no usable account model exists.
+- **Claude, Codex, Google, and xAI paths are separated by how they really authenticate.** Authenticated Claude CLI reuse is preferred with setup-token fallback; Codex account auth stays distinct from OpenAI API keys; Google IDs are canonical; xAI subscription OAuth, xAI API keys, and native Grok Build are not presented as interchangeable.
+- **Provider versions are checked against the tested release.** OpenClaw core and the Codex plugin retain exact parity and rollback; external CLIs and optional tools report drift and use explicit maintenance paths instead of changing during every Portal update.
+- **Credential removal is intentionally narrow.** Self-service transactional removal is limited to Portal-owned API-key rows whose ownership can be proven. Shared aliases, environment or secret references, OAuth/native-CLI credentials, local models, cloud chains, and unknown ownership require reviewed maintenance.
+- **Ollama can run locally or on an identity-bound Tailnet GPU.** Remote setup uses a stable Tailscale identity and native Serve route rather than an arbitrary URL, with inventory, model pulls, byte progress, cancellation, diagnostics, bounded test inference, exact-digest checks, and no silent fallback to local compute.
+
+### Setup, updates, backups, and recovery
+
+- **Fresh setup starts with a secure Owner.** Public plaintext setup is denied, domainless setup uses an explicit localhost tunnel, HTTPS handoff is verified, and bootstrap credentials are origin-bound, expiring, single-use, and replay-resistant.
+- **Optional readiness cards replace the old all-or-nothing wizard.** Domain/TLS, mail, providers, local models, Remote Desktop, and other capabilities can be completed with specific readiness evidence after the minimum secure launch path.
+- **Signed artifacts bind source lineage to exact contents.** Release metadata, per-file hashes, migrations, runtime helpers, managed skills, and post-deploy provenance are checked before an update can report success.
+- **Dashboard updates are serialized transactions.** Backup freshness, optional fresh-backup creation, maintenance ownership, database migration, OpenClaw/plugin compatibility, service startup, authenticated postflight, and rollback share one visible lifecycle.
+- **OpenClaw and plugin compatibility changes roll back atomically.** Failed package, hotfix, syntax, version-parity, gateway, or readiness checks restore the exact prior package and preserved state before the updater exits.
+- **ES-module validation now checks files in their real package context.** Piping an ES module through Node’s CommonJS stdin parser can reject both a valid candidate and its untouched backup; every install and rollback call site now validates the file path directly.
+- **Reverse-proxy ownership is conservative.** Managed Portal/app blocks can be updated, a single compatible operator-owned Portal block is preserved, and ambiguous hostname ownership fails closed instead of overwriting custom routes.
+- **Backups cover the managed recovery domains.** PostgreSQL, projects, standalone app sources, uploads, Portal state, mail state, OpenClaw state, manifests, and restore ordering are verified before a comprehensive backup authorizes maintenance.
+- **Keep-Data reinstall reconnects retained state.** Reinstall and restore paths use the configured database, preserve app/project sources, remove stale runtime files safely, and recover transactionally from interrupted overlays. For a preserved 3.x Project, that continuity does not bypass the legacy lineage boundary or auto-enable Project Chat and destructive Project-level operations.
+- **Telemetry is disclosed and controllable.** Fresh setup defaults limited Portal telemetry to enabled, shows that choice before completion, and lets the Owner turn it off there or later in Settings. The Portal reports shortly after startup and then about every 24 hours while it remains running. Its payload is limited to a random install ID, Portal/dependency versions, Portal user count, uptime, Node version, OS, and architecture; messages, prompts, project files, credentials, usernames, and email addresses are excluded. Turning it off stops that operational report only. The separate Owner-Dashboard version lookup and manual refresh send no operational telemetry payload but still create normal request metadata, and the installer independently reports install and update lifecycle milestones with the event type, Portal version, OS name/version, and the random install ID.
+
+### Workstation and interface
+
+- **Terminal now reflects the actual host.** Live capability discovery, reviewed actions, service-aware autocomplete, multiline-paste review, risk classification, reconnect, and bounded buffers replace a stale hard-coded command catalog.
+- **Remote Desktop has a verifiable service contract.** Xauthority, session ownership, loopback listeners, clipboard, audio, browser control, launcher versions, deploy provenance, keep-awake behavior, and the real desktop session are checked; a rate-limited watchdog repairs eligible drift.
+- **Files and uploads are bounded and recoverable.** Resumable parallel uploads, streaming downloads, archive limits, canonical paths, library/project transactions, chunk cleanup, previews, animated images, and protected active content share server-side containment.
+- **Mail handles content and account state more defensively.** Scoped attachments, malware scanning, remote-content blocking, bounded upstream responses, durable mailbox reconciliation, forwarding, unread counts, and primary-account rules fail visibly.
+- **Dashboard metrics are truthful.** Network throughput comes from an event-loop-safe collector and reports unavailable gaps rather than manufactured zeroes; expensive readiness and maintenance checks run independently with bounded refresh.
+- **Settings and Admin follow runtime ownership.** Typed settings replace broad writes, elevated mutations use current account state, maintenance actions serialize, recovery controls remain available during outages, and role visibility matches backend authorization.
+- **Light mode and accessibility are release-gated.** Editors, dialogs, previews, provider setup, chat, projects, maintenance, and administrative surfaces use one semantic palette with rendered component coverage and automated label/control checks.
+- **Tasks, Tools, Skills, and Automations use durable jobs.** Operator-only mutations, typed confirmations, restart-aware state, replayable completion/cancellation, canonical skill identity, and bounded output replace untracked background work.
+
+### Security
+
+- **Authorization changes invalidate every relevant access path.** Browser sessions, API requests, Socket.IO, raw WebSockets, history/cache reads, attachments, and file capabilities follow a durable authorization generation; removed access triggers a privacy curtain and client-state purge.
+- **Operator surfaces reload current role state.** Alerts, OpenClaw status, runtime inventory, Tools, Skills, jobs, host changes, and maintenance no longer trust a stale login-time role.
+- **Content and network handling are fail-closed where ambiguity crosses a security boundary.** Paths, symlinks, archives, uploads, thumbnails, proxy destinations, app content, attachments, and supported account/workspace mutations use canonical containment, bounded parsing, and recoverable ordering.
+- **Dependency audit disclosure:** the backend audit is clean. The frontend scanner reports `GHSA-qwww-vcr4-c8h2` against `react-router-dom@7.18.1`. That advisory affects React Server Components APIs; Portal is a React 18 Vite SPA and does not use RSC mode or the unstable RSC APIs. The tested routing version is retained for 4.0, and this release does not claim a zero-finding full dependency audit.
+
+### Validation
+
+- The complete backend regression run passed **276 suites / 3,426 tests**, with **1 additional suite intentionally skipped** (277 total). The complete frontend run passed **146 files / 1,151 tests** with no unhandled React errors.
+- Backend and frontend production builds, type checks, zero-warning lint, accessibility checks, bundle budgets, PostgreSQL 16 pristine migration deployment, packaging, inventory, data-safety, restore, compatibility, update-transaction, plugin/hotfix rollback, and privacy gates passed on the release candidate.
+- Upgrade validation covered both newly imported and long-lived 3.x Project/App shapes. It verified file and application continuity, exact Project↔App association, standalone App preservation, recorded process intent, idempotent replay, service health, and fail-closed behavior without treating an imported Project as proof of the legacy path.
+- The update rehearsal surfaced the ES-module validation defect before release. The rejected candidate left the existing Portal and project state healthy, and the corrected updater then completed successfully.
+- Release artifacts are built only from a clean commit and must pass exact inventory, public-origin, signature, content-hash, migration, privacy, and authenticated postflight checks before publication.
+
+### Known limitations and 4.1 roadmap
+
+- Browser audio can be silent until the tab receives a user interaction; the pending-question notification remains visible and answerable.
+- The collapsed-rail waiting count opens the correct Portal section, not an exact conversation. The expandable notification is the answer-in-place path; exact-conversation navigation and durable notification history remain roadmap work.
+- Project Chat is unavailable when the host cannot prove the required container isolation, and individual providers remain unavailable until they pass the complete qualification matrix.
+- A Project with preserved 3.x OpenClaw lineage remains visible with its files and any exact App association, but Project Chat and destructive Project-level operations remain unavailable until safe reconciliation succeeds.
+- Windows/WSL is experimental and does not replace the supported VPS deployment profiles.
+- Complete wipe cannot discover data copied or moved beyond its recorded managed paths. Positive residue proof is planned for 4.1.
+- Transactional multi-user account retirement is deferred to 4.1 rather than shipping a partial destructive flow.
+
 ## [3.26.1] - 2026-07-15
 
 ### Fixed
@@ -76,7 +170,7 @@ All notable changes to BridgesLLM Portal are documented here.
 - **OpenClaw agent session selection is more stable**: selected agents now persist concrete `agent:<agentId>:main` session keys, and stale `agent-chat-agentId=main` state self-heals instead of drifting back to the wrong session.
 
 ### Validation
-- Live test-box validation covered websocket auth probes, Project Agent Chat send/reload/history recovery, main Agent Chat rail/tool/thought streaming, and concurrent Project Chat + Agent Chat stress runs.
+- Live validation covered websocket auth probes, Project Agent Chat send/reload/history recovery, main Agent Chat rail/tool/thought streaming, and concurrent Project Chat + Agent Chat stress runs.
 
 ## [3.25.25] - 2026-06-21
 
@@ -93,7 +187,7 @@ All notable changes to BridgesLLM Portal are documented here.
 - **OpenClaw model IDs remain provider-qualified**: gateway catalog rows that report bare model IDs plus provider metadata are normalized back to `provider/model`, preserving Codex, Claude, Gemini CLI, and Antigravity routing clarity.
 
 ### Validation
-- Repaired the broken test-box OpenClaw bundle that failed ES-module parsing with duplicate Gemini helper definitions, restarted the gateway, and verified a Codex smoke turn completed through `codex/gpt-5.4-mini`.
+- Repaired an OpenClaw bundle that failed ES-module parsing with duplicate Gemini helper definitions, then verified a Codex smoke turn completed through `codex/gpt-5.4-mini`.
 
 ## [3.25.23] - 2026-06-21
 
@@ -174,7 +268,7 @@ All notable changes to BridgesLLM Portal are documented here.
 - **Background task discovery is cleaner**: maintenance jobs remain reachable from Admin Maintenance and job history, while the global sidebar avoids a Background Tasks destination that users do not need during normal portal work.
 
 ### Maintenance
-- **Release validation now covers the real maintenance and app-process failure modes**: tests and live test-box validation cover maintenance UI/action flows, Codex idle-timeout handling, status-history replay, and full-stack app start/stop/start behavior through the live Portal API.
+- **Release validation now covers the real maintenance and app-process failure modes**: automated and live checks cover maintenance UI/action flows, Codex idle-timeout handling, status-history replay, and full-stack app start/stop/start behavior through the Portal API.
 
 ## [3.25.15] — 2026-05-30
 
@@ -733,7 +827,7 @@ This is a major release covering a full week of intensive development. Dozens of
 - **README architecture** now uses a Mermaid diagram instead of misaligned ASCII boxes.
 - **README requirements** updated to match real minimums (3.5GB RAM, 35GB disk).
 - **Telemetry V2** — install lifecycle events, download tracking, heartbeat with dependency versions.
-- **Release process** — verified on external test box before production alignment.
+- **Release process** — validated on an isolated host before publication.
 - **GitHub export** rewritten to eliminate `.work/` duplication and add comprehensive exclusions for internal docs.
 
 ### Bug Fixes (selected)

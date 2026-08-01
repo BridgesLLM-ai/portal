@@ -166,20 +166,28 @@ describe('OpenClaw upgrade-state preparation', () => {
     expect(fs.readFileSync(externalIndex, 'utf8')).toBe(externalContents);
   });
 
-  test('quarantines the full production-shaped four-plugin conflict while preserving voice/auth config', () => {
-    const currentRecords = {
-      acpx: currentNpmRecord('acpx', '@openclaw/acpx'),
-      brave: currentNpmRecord('brave', '@openclaw/brave-plugin'),
-      discord: currentNpmRecord('discord', '@openclaw/discord'),
-      'voice-call': currentNpmRecord('voice-call', '@openclaw/voice-call'),
-    };
+  test('quarantines a synthetic four-plugin conflict while preserving unrelated config and auth', () => {
+    const pluginIds = ['alpha', 'bravo', 'charlie', 'delta'];
+    const currentRecords = Object.fromEntries(pluginIds.map((pluginId) => [
+      pluginId,
+      currentNpmRecord(pluginId, `@example/${pluginId}`),
+    ]));
     writePluginRegistry(currentRecords);
-    const legacyRecords = {
-      acpx: { source: 'npm', spec: '@openclaw/acpx', resolvedName: '@openclaw/acpx', resolvedVersion: '2026.5.5', resolvedSpec: '@openclaw/acpx@2026.5.5', version: '2026.5.5', integrity: 'sha512-old', shasum: 'a'.repeat(40), resolvedAt: 'old', installedAt: 'old' },
-      brave: { source: 'npm', spec: '@openclaw/brave-plugin', resolvedName: '@openclaw/brave-plugin', resolvedVersion: '2026.5.5', resolvedSpec: '@openclaw/brave-plugin@2026.5.5', version: '2026.5.5', integrity: 'sha512-old', shasum: 'b'.repeat(40), resolvedAt: 'old', installedAt: 'old' },
-      discord: { source: 'npm', spec: '@openclaw/discord', resolvedName: '@openclaw/discord', resolvedVersion: '2026.5.5', resolvedSpec: '@openclaw/discord@2026.5.5', version: '2026.5.5', integrity: 'sha512-old', shasum: 'c'.repeat(40), resolvedAt: 'old', installedAt: 'old' },
-      'voice-call': { source: 'npm', spec: '@openclaw/voice-call', resolvedName: '@openclaw/voice-call', resolvedVersion: '2026.5.5', resolvedSpec: '@openclaw/voice-call@2026.5.5', version: '2026.5.5', integrity: 'sha512-old', shasum: 'd'.repeat(40), resolvedAt: 'old', installedAt: 'old' },
-    };
+    const legacyRecords = Object.fromEntries(pluginIds.map((pluginId, index) => {
+      const packageName = `@example/${pluginId}`;
+      return [pluginId, {
+        source: 'npm',
+        spec: packageName,
+        resolvedName: packageName,
+        resolvedVersion: '2026.5.5',
+        resolvedSpec: `${packageName}@2026.5.5`,
+        version: '2026.5.5',
+        integrity: 'sha512-old',
+        shasum: String.fromCharCode(97 + index).repeat(40),
+        resolvedAt: 'old',
+        installedAt: 'old',
+      }];
+    }));
     const pluginDescriptor = (pluginId: string, installRecord: unknown) => ({
       pluginId,
       installRecord,
@@ -207,8 +215,8 @@ describe('OpenClaw upgrade-state preparation', () => {
     const legacyPath = writeLegacyPluginIndex(original);
     const openClawConfigPath = path.join(openClawHome, 'openclaw.json');
     const authPath = path.join(openClawHome, 'agents', 'main', 'agent', 'auth-profiles.json');
-    const voiceConfig = { plugins: { entries: { 'voice-call': { enabled: true, config: { provider: 'twilio' } } } } };
-    fs.writeFileSync(openClawConfigPath, JSON.stringify(voiceConfig));
+    const preservedConfig = { plugins: { entries: { unrelated: { enabled: true, config: { mode: 'synthetic' } } } } };
+    fs.writeFileSync(openClawConfigPath, JSON.stringify(preservedConfig));
     fs.mkdirSync(path.dirname(authPath), { recursive: true });
     fs.writeFileSync(authPath, '{"version":2,"profiles":{"openai:manual":{"provider":"openai"}}}');
     const configBefore = fs.readFileSync(openClawConfigPath);
@@ -218,7 +226,7 @@ describe('OpenClaw upgrade-state preparation', () => {
 
     expect(result.readyForGatewayStart).toBe(true);
     expect(result.legacyPluginIndexAction).toBe('quarantined-redundant');
-    expect(result.removedPluginRecordIds).toEqual(['acpx', 'brave', 'discord', 'voice-call']);
+    expect(result.removedPluginRecordIds).toEqual(pluginIds);
     expect(result.retainedPluginRecordIds).toEqual([]);
     expect(fs.existsSync(legacyPath)).toBe(false);
     expect(JSON.parse(fs.readFileSync(result.legacyPluginIndexBackupPath, 'utf8'))).toEqual(original);

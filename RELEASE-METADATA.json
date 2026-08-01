@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "version": "4.0.0",
+  "releasedAt": "2026-08-01",
+  "releaseClass": "feature",
+  "highlights": [
+    "Answer paused Agent Chat and Project Chat questions from persistent, expandable notifications anywhere in the Portal, with a distinct alert sound and no navigation.",
+    "Durable chat coordination keeps long turns, steering, tool history, pending input, and reconnect replay bounded and tied to the exact user, run, and conversation.",
+    "Project Chat runs in attested project-bound containers with controlled public egress; preserved 3.x Projects remain fail-closed until their lineage is reconciled safely.",
+    "Transactional App deployment, broader backups, Keep-Data reconnect, running-App restoration, and rollback protect working sources and recorded process intent across maintenance.",
+    "Signed Dashboard updates show verified release details, require backup preflight, bind source lineage to exact contents, and roll back candidates that fail migration or health checks."
+  ]
+}

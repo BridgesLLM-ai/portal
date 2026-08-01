@@ -3,9 +3,9 @@
  *
  * Problem: Every code path that launches something on the VNC desktop (projects,
  * agent browser, Chrome, xterm) had to reconstruct DISPLAY, XDG_RUNTIME_DIR,
- * PULSE_SERVER, SDL_AUDIODRIVER, DBUS vars, etc. Getting the quoting wrong in
- * `su -c` meant env vars were silently dropped, causing crashes (e.g. pygame
- * failing because ALSA couldn't find an audio device).
+ * PULSE_SERVER, SDL_AUDIODRIVER, DBUS vars, etc. Getting the privilege-drop
+ * boundary or quoting wrong meant env vars were silently dropped, causing
+ * crashes (e.g. pygame failing because ALSA couldn't find an audio device).
  *
  * Solution: One env file written at RD startup, one helper to launch commands.
  *
@@ -19,10 +19,10 @@
  *   desktopExec('python3 main.py', { cwd: '/home/bridgesrd/projects/foo', timeout: 30000 });
  *
  *   // To launch a GUI app detached (xterm, Chrome, etc.):
- *   desktopExecDetached('xterm -e "python3 main.py"');
+ *   desktopExecDetached('xterm -e "python3 main.py"', 'bridgesllm-example.service');
  */
 
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import fs from 'fs';
 
 export const RD_USER = 'bridgesrd';
@@ -31,6 +31,7 @@ export const DESKTOP_ENV_FILE = `/home/${RD_USER}/.bridges-rd-env`;
 const DISPLAY = ':1';
 const XDG_RUNTIME_DIR = '/tmp/bridges-rd-runtime';
 const PULSE_SOCKET = `unix:${XDG_RUNTIME_DIR}/pulse/native`;
+const XAUTHORITY = `/home/${RD_USER}/.Xauthority`;
 
 /**
  * The canonical set of environment variables needed to run GUI/audio apps
@@ -39,6 +40,7 @@ const PULSE_SOCKET = `unix:${XDG_RUNTIME_DIR}/pulse/native`;
 export function getDesktopEnvVars(): Record<string, string> {
   return {
     DISPLAY,
+    XAUTHORITY,
     XDG_RUNTIME_DIR,
     PULSE_SERVER: PULSE_SOCKET,
     SDL_AUDIODRIVER: 'pulseaudio',
@@ -65,12 +67,13 @@ export function writeDesktopEnvFile(): void {
   ].join('\n');
 
   fs.writeFileSync(DESKTOP_ENV_FILE, content, { mode: 0o640 });
+  fs.chmodSync(DESKTOP_ENV_FILE, 0o640);
 
   // Ensure bridgesrd can read it
   try {
     execSync(`chown ${RD_USER}:${RD_USER} ${shellQuote(DESKTOP_ENV_FILE)}`, { timeout: 3000 });
   } catch {
-    // Non-fatal — file is world-readable anyway
+    // Non-fatal here; the managed VNC launcher also repairs ownership.
   }
 }
 
@@ -100,12 +103,10 @@ export function desktopExec(
   const { cwd, timeout = 30000 } = opts;
   const cdPrefix = cwd ? `cd ${shellQuote(cwd)} && ` : '';
   const innerCmd = withDesktopEnv(`${cdPrefix}${cmd}`);
-  const fullCmd = `su - ${RD_USER} -c ${shellQuote(innerCmd)}`;
 
-  return execSync(fullCmd, {
+  return execFileSync('/usr/bin/setpriv', desktopPrivilegeDropArgs(innerCmd), {
     timeout,
     encoding: 'utf-8',
-    shell: '/bin/bash',
   });
 }
 
@@ -114,10 +115,75 @@ export function desktopExec(
  * Returns immediately; the process continues in the background.
  * Use for xterm, Chrome, etc.
  */
-export function desktopExecDetached(cmd: string): void {
-  const innerCmd = withDesktopEnv(cmd);
-  const fullCmd = `setsid su - ${RD_USER} -c ${shellQuote(innerCmd)} </dev/null >/dev/null 2>&1 &`;
-  execSync(fullCmd, { timeout: 5000, shell: '/bin/bash' });
+export function desktopExecDetached(cmd: string, unitName: string): void {
+  const runArgs = managedDesktopSystemdRunArgs(unitName, cmd);
+  try {
+    execFileSync('systemctl', ['stop', unitName], { timeout: 15_000, encoding: 'utf8' });
+  } catch {
+    // An absent/inactive transient unit is the normal first-launch state.
+  }
+  try {
+    execFileSync('systemctl', ['reset-failed', unitName], { timeout: 5000, encoding: 'utf8' });
+  } catch {
+    // --collect units may already be unloaded after stop.
+  }
+  execFileSync('systemd-run', runArgs, { timeout: 5000, encoding: 'utf8' });
+}
+
+function desktopPrivilegeDropArgs(innerCmd: string): string[] {
+  return [
+    `--reuid=${RD_USER}`,
+    `--regid=${RD_USER}`,
+    '--init-groups',
+    '--',
+    '/usr/bin/env',
+    '-i',
+    `HOME=/home/${RD_USER}`,
+    `USER=${RD_USER}`,
+    `LOGNAME=${RD_USER}`,
+    'SHELL=/bin/bash',
+    'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    `LANG=${process.env.LANG || 'C.UTF-8'}`,
+    '/bin/bash',
+    '-c',
+    innerCmd,
+  ];
+}
+
+/**
+ * Launch one Project runtime in a systemd service whose KillMode covers the
+ * complete cgroup. A child cannot escape by daemonizing or creating a new
+ * process session; lifecycle cleanup stops and reads back this exact unit.
+ */
+export function managedDesktopSystemdRunArgs(unitName: string, cmd: string): string[] {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\.service$/.test(unitName)) {
+    throw new Error('Managed Remote Desktop unit name is invalid');
+  }
+  return [
+    '--unit', unitName,
+    '--property=User=bridgesrd',
+    '--property=Group=bridgesrd',
+    '--property=KillMode=control-group',
+    '--property=TimeoutStopSec=15s',
+    '--property=WorkingDirectory=/home/bridgesrd',
+    '--setenv=HOME=/home/bridgesrd',
+    '--setenv=USER=bridgesrd',
+    '--setenv=LOGNAME=bridgesrd',
+    '--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    '--service-type=exec',
+    '--collect',
+    '--no-block',
+    '/bin/bash',
+    '-c',
+    withDesktopEnv(cmd),
+  ];
+}
+
+export function desktopExecManaged(unitName: string, cmd: string): void {
+  execFileSync('systemd-run', managedDesktopSystemdRunArgs(unitName, cmd), {
+    timeout: 5000,
+    encoding: 'utf8',
+  });
 }
 
 /** Shell-quote a string (single-quote wrapping with proper escaping). */

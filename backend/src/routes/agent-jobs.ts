@@ -8,14 +8,25 @@ import { isElevatedRole } from '../utils/authz';
 
 const router = Router();
 
-router.use(authenticateToken);
+// Agent Jobs are the same privileged host-operator surface as Agent Chat and
+// Terminal. Keep every route behind the elevated-role gate so a demoted or
+// ordinary user cannot resume, signal, or inspect a host process created under
+// the Portal service account.
+router.use(authenticateToken, requireAdmin, requireApproved);
 
 function canAccessAll(req: Request): boolean {
   return isElevatedRole(req.user?.role);
 }
 
+function errorStatus(error: unknown, fallback: number): number {
+  const statusCode = Number((error as { statusCode?: unknown })?.statusCode);
+  return Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 499
+    ? statusCode
+    : fallback;
+}
+
 // POST /api/agent-jobs
-router.post('/', requireApproved, requireAdmin, async (req: Request, res: Response): Promise<void> => {
+router.post('/', async (req: Request, res: Response): Promise<void> => {
   try {
     const { toolId, title, command, cwd, env } = req.body || {};
 
@@ -30,6 +41,7 @@ router.post('/', requireApproved, requireAdmin, async (req: Request, res: Respon
 
     const job = await startAgentJob({
       userId: req.user!.userId,
+      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
       toolId,
       title: typeof title === 'string' ? title : undefined,
       command,
@@ -40,7 +52,7 @@ router.post('/', requireApproved, requireAdmin, async (req: Request, res: Respon
     res.status(201).json(job);
   } catch (error: any) {
     console.error('[agent-jobs] start failed', error);
-    res.status(500).json({ error: error?.message || 'Failed to start job' });
+    res.status(errorStatus(error, 500)).json({ error: error?.message || 'Failed to start job' });
   }
 });
 
@@ -60,6 +72,7 @@ router.get('/', async (req: Request, res: Response): Promise<void> => {
         title: true,
         status: true,
         createdAt: true,
+        updatedAt: true,
         startedAt: true,
         finishedAt: true,
         exitCode: true,
@@ -73,6 +86,68 @@ router.get('/', async (req: Request, res: Response): Promise<void> => {
 });
 
 // GET /api/agent-jobs/:id
+router.get('/:id/status', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const job = await prisma.agentJob.findUnique({
+      where: { id: req.params.id },
+      select: {
+        id: true,
+        userId: true,
+        toolId: true,
+        title: true,
+        status: true,
+        createdAt: true,
+        updatedAt: true,
+        startedAt: true,
+        finishedAt: true,
+        exitCode: true,
+      },
+    });
+    if (!job) {
+      res.status(404).json({ error: 'Job not found' });
+      return;
+    }
+    if (!canAccessAll(req) && job.userId !== req.user!.userId) {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
+    res.json(job);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || 'Failed to fetch job status' });
+  }
+});
+
+// GET /api/agent-jobs/:id/transcript — bounded tail for task/status surfaces
+router.get('/:id/transcript', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const job = await prisma.agentJob.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, userId: true },
+    });
+    if (!job) {
+      res.status(404).json({ error: 'Job not found' });
+      return;
+    }
+    if (!canAccessAll(req) && job.userId !== req.user!.userId) {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
+    const requestedEntries = Number(req.query.entries || 200);
+    if (!Number.isSafeInteger(requestedEntries) || requestedEntries < 1 || requestedEntries > 500) {
+      res.status(400).json({ error: 'entries must be an integer from 1 to 500' });
+      return;
+    }
+    const transcript = await readTranscript(job.id, {
+      maxEntries: requestedEntries,
+      maxReadBytes: 512 * 1024,
+    });
+    res.json({ jobId: job.id, transcript });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || 'Failed to fetch job transcript' });
+  }
+});
+
+// GET /api/agent-jobs/:id (including the bounded transcript)
 router.get('/:id', async (req: Request, res: Response): Promise<void> => {
   try {
     const job = await prisma.agentJob.findUnique({ where: { id: req.params.id } });
@@ -115,7 +190,7 @@ router.post('/:id/input', async (req: Request, res: Response): Promise<void> => 
     await writeToAgentJob(req.params.id, job.userId, input);
     res.json({ success: true });
   } catch (error: any) {
-    res.status(400).json({ error: error?.message || 'Failed to send input' });
+    res.status(errorStatus(error, 400)).json({ error: error?.message || 'Failed to send input' });
   }
 });
 

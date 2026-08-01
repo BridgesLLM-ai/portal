@@ -1,12 +1,11 @@
 import { Router, Request, Response } from 'express';
-import { exec, spawn } from 'child_process';
-import fs from 'fs';
-import path from 'path';
-import type { Server as SocketIOServer } from 'socket.io';
+import { exec } from 'child_process';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
-import { prisma } from '../config/database';
+import { requireApproved } from '../middleware/requireApproved';
 import { getToolAdapter, isInstallCommandAllowed, TOOL_ADAPTERS } from '../config/toolAdapters';
+import { AgentJobRequestError, startAgentJob } from '../services/agentJobs';
+import { confirmationForToolInstall, isTypedConfirmationMatch } from '../utils/privilegedConfirmation';
 
 type DetectionStatus = {
   installed: boolean;
@@ -24,11 +23,8 @@ const DETECTION_TIMEOUT_MS = 3000;
 const DETECTION_CACHE_MS = 60_000;
 const detectionCache = new Map<string, DetectionCacheEntry>();
 
-const JOBS_DIR = path.join(process.env.PORTAL_ROOT || '/opt/bridgesllm/portal', '.data/jobs');
-fs.mkdirSync(JOBS_DIR, { recursive: true });
-
 const router = Router();
-router.use(authenticateToken);
+router.use(authenticateToken, requireApproved, requireAdmin);
 
 function parseVersion(output: string): string | null {
   const trimmed = output.trim();
@@ -36,6 +32,38 @@ function parseVersion(output: string): string | null {
   const semver = trimmed.match(/\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/);
   if (semver) return semver[0];
   return trimmed.split(/\r?\n/)[0]?.trim() || null;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function buildInstallCommand(steps: Array<{ label: string; command: string }>): string {
+  return [
+    'set -euo pipefail',
+    ...steps.flatMap((step) => [
+      `printf '%s\\n' ${shellQuote(`▶ ${step.label}`)}`,
+      step.command,
+    ]),
+  ].join('\n');
+}
+
+function buildSerializedInstallCommand(steps: Array<{ label: string; command: string }>): string {
+  return [
+    'flock',
+    '--nonblock',
+    '/run/bridgesllm-agent-mutation.lock',
+    // No `--` here: util-linux flock takes the command directly after the
+    // lock path and would try to execute a literal `--` (exit 69), which
+    // broke every UI-triggered tool install.
+    'timeout',
+    '--foreground',
+    '--kill-after=30s',
+    '30m',
+    '/bin/bash',
+    '-lc',
+    buildInstallCommand(steps),
+  ].map(shellQuote).join(' ');
 }
 
 function runDetect(command: string): Promise<DetectionStatus> {
@@ -54,13 +82,13 @@ function runDetect(command: string): Promise<DetectionStatus> {
   });
 }
 
-async function detectWithCache(toolId: string, detectCommand?: string): Promise<DetectionStatus> {
+async function detectWithCache(toolId: string, detectCommand?: string, force = false): Promise<DetectionStatus> {
   if (!detectCommand) {
     return { installed: true, version: null, missing: false, checkedAt: new Date().toISOString() };
   }
 
   const cached = detectionCache.get(toolId);
-  if (cached && cached.expiresAt > Date.now()) {
+  if (!force && cached && cached.expiresAt > Date.now()) {
     return cached.status;
   }
 
@@ -69,11 +97,12 @@ async function detectWithCache(toolId: string, detectCommand?: string): Promise<
   return status;
 }
 
-router.get('/', async (_req: Request, res: Response): Promise<void> => {
+router.get('/', async (req: Request, res: Response): Promise<void> => {
   try {
+    const force = req.query.refresh === '1';
     const tools = await Promise.all(
       TOOL_ADAPTERS.map(async (adapter) => {
-        const status = await detectWithCache(adapter.id, adapter.detect?.command);
+        const status = await detectWithCache(adapter.id, adapter.detect?.command, force);
         return {
           ...adapter,
           status,
@@ -87,7 +116,7 @@ router.get('/', async (_req: Request, res: Response): Promise<void> => {
   }
 });
 
-router.post('/:toolId/install', requireAdmin, async (req: Request, res: Response): Promise<void> => {
+router.post('/:toolId/install', async (req: Request, res: Response): Promise<void> => {
   const { toolId } = req.params;
   const adapter = getToolAdapter(toolId);
 
@@ -107,95 +136,36 @@ router.post('/:toolId/install', requireAdmin, async (req: Request, res: Response
     return;
   }
 
-  const transcriptPath = path.join(JOBS_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.jsonl`);
-  const job = await prisma.agentJob.create({
-    data: {
+  const confirmationPhrase = confirmationForToolInstall(adapter.id);
+  if (!isTypedConfirmationMatch(confirmationPhrase, req.body?.confirmation)) {
+    res.status(400).json({
+      error: `Type ${confirmationPhrase} to confirm this host-wide tool installation or update.`,
+      confirmationPhrase,
+    });
+    return;
+  }
+
+  try {
+    const job = await startAgentJob({
       userId: req.user!.userId,
-      toolId: '_install',
+      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
+      toolId: `_install:${adapter.id}`,
       title: `Install ${adapter.name}`,
-      status: 'running',
-      startedAt: new Date(),
-      transcriptPath,
-      metadata: {
-        targetToolId: adapter.id,
-        steps: adapter.install,
-      },
-    },
-  });
-
-  const io = req.app.get('io') as SocketIOServer | undefined;
-  const room = `tool-install-${adapter.id}`;
-
-  const append = async (entry: { type: 'input' | 'output' | 'system'; text: string; stream?: 'stdout' | 'stderr' }) => {
-    const row = {
-      ...entry,
-      timestamp: new Date().toISOString(),
-    };
-    fs.appendFileSync(transcriptPath, `${JSON.stringify(row)}\n`, 'utf-8');
-    io?.of('/ws/agent-jobs').to(room).emit('output', { toolId: adapter.id, entry: row, jobId: job.id });
-    io?.of('/ws/agent-jobs').to(`job:${job.id}`).emit('output', { jobId: job.id, entry: row });
-  };
-
-  const runStep = (step: { label: string; command: string }) => new Promise<void>((resolve, reject) => {
-    append({ type: 'system', text: `▶ ${step.label}` }).catch(() => {});
-    append({ type: 'input', text: `${step.command}\n` }).catch(() => {});
-
-    const child = spawn('/bin/bash', ['-lc', step.command], {
+      command: buildSerializedInstallCommand(adapter.install),
       cwd: process.cwd(),
-      env: { ...process.env },
-      stdio: 'pipe',
     });
+    detectionCache.delete(adapter.id);
 
-    child.stdout.on('data', (chunk) => {
-      append({ type: 'output', stream: 'stdout', text: chunk.toString('utf-8') }).catch(() => {});
+    res.status(202).json({
+      jobId: job.id,
+      room: `job:${job.id}`,
+      toolId: adapter.id,
+      message: `Install started for ${adapter.name}`,
     });
-
-    child.stderr.on('data', (chunk) => {
-      append({ type: 'output', stream: 'stderr', text: chunk.toString('utf-8') }).catch(() => {});
-    });
-
-    child.on('error', (error) => reject(error));
-    child.on('exit', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`Step failed with exit code ${code ?? -1}: ${step.label}`));
-    });
-  });
-
-  (async () => {
-    try {
-      for (const step of adapter.install) {
-        await runStep(step);
-      }
-
-      await append({ type: 'system', text: `✅ Install finished for ${adapter.name}` });
-      await prisma.agentJob.update({
-        where: { id: job.id },
-        data: {
-          status: 'completed',
-          finishedAt: new Date(),
-          exitCode: 0,
-        },
-      });
-      detectionCache.delete(adapter.id);
-    } catch (error: any) {
-      await append({ type: 'system', text: `❌ Install failed: ${error?.message || 'Unknown error'}` });
-      await prisma.agentJob.update({
-        where: { id: job.id },
-        data: {
-          status: 'error',
-          finishedAt: new Date(),
-          exitCode: 1,
-        },
-      });
-    }
-  })().catch(() => {});
-
-  res.status(202).json({
-    jobId: job.id,
-    room,
-    toolId: adapter.id,
-    message: `Install started for ${adapter.name}`,
-  });
+  } catch (error) {
+    const status = error instanceof AgentJobRequestError ? error.statusCode : 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'Failed to start tool installation' });
+  }
 });
 
 export default router;

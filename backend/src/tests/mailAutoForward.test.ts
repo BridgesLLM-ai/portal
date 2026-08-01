@@ -1,20 +1,23 @@
 import { buildAutoForwardSieveScript, syncAutoForwardRule } from '../services/mailService';
+import { PortalFeatureUnavailableError } from '../utils/portalFeatureCapabilities';
 
 function response(status: number, body: any, statusText = 'OK') {
-  return {
-    ok: status >= 200 && status < 300,
+  return new Response(typeof body === 'string' ? body : JSON.stringify(body), {
     status,
     statusText,
-    json: async () => body,
-    text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
-  } as Response;
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 describe('server-side mail auto-forwarding', () => {
   const originalFetch = global.fetch;
+  const originalOriginMode = process.env.ORIGIN_MODE;
+  const originalInstallProfile = process.env.INSTALL_PROFILE;
 
   beforeEach(() => {
     process.env.STALWART_URL = 'http://stalwart.test';
+    delete process.env.ORIGIN_MODE;
+    process.env.INSTALL_PROFILE = 'server';
   });
 
   afterEach(() => {
@@ -22,9 +25,26 @@ describe('server-side mail auto-forwarding', () => {
     jest.restoreAllMocks();
   });
 
+  afterAll(() => {
+    if (originalOriginMode === undefined) delete process.env.ORIGIN_MODE;
+    else process.env.ORIGIN_MODE = originalOriginMode;
+    if (originalInstallProfile === undefined) delete process.env.INSTALL_PROFILE;
+    else process.env.INSTALL_PROFILE = originalInstallProfile;
+  });
+
   it('builds a copy-forward Sieve script that leaves mail in the portal inbox', () => {
     expect(buildAutoForwardSieveScript('person@example.com')).toContain('require ["copy"];');
     expect(buildAutoForwardSieveScript('person@example.com')).toContain('redirect :copy "person@example.com";');
+  });
+
+  it('rejects unavailable mail before opening a JMAP session', async () => {
+    process.env.ORIGIN_MODE = 'tailnet';
+    const fetchMock = jest.fn();
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(syncAutoForwardRule('external@example.com', 'mailuser', 'mailpass'))
+      .rejects.toBeInstanceOf(PortalFeatureUnavailableError);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('creates and activates a portal-managed Sieve rule when forwarding is enabled', async () => {

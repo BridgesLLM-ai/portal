@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { AlertCircle, Loader2 } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { AlertCircle, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
@@ -11,21 +11,16 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
 
 export default function ProjectPdfViewer({ src }: { src: string }) {
   const [numPages, setNumPages] = useState(0);
+  const [pageNumber, setPageNumber] = useState(1);
   const [error, setError] = useState<string | null>(null);
-  const [pdfData, setPdfData] = useState<{ data: Uint8Array } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(800);
+  const pdfFile = useMemo(() => ({ url: src, withCredentials: true }), [src]);
 
   useEffect(() => {
-    let cancelled = false;
-    fetch(src, { credentials: 'include' })
-      .then(res => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.arrayBuffer();
-      })
-      .then(buf => { if (!cancelled) setPdfData({ data: new Uint8Array(buf) }); })
-      .catch(err => { if (!cancelled) setError(err.message || 'Failed to load PDF'); });
-    return () => { cancelled = true; };
+    setNumPages(0);
+    setPageNumber(1);
+    setError(null);
   }, [src]);
 
   useEffect(() => {
@@ -38,14 +33,6 @@ export default function ProjectPdfViewer({ src }: { src: string }) {
     return () => ro.disconnect();
   }, []);
 
-  if (!pdfData && !error) {
-    return (
-      <div className="flex-1 flex items-center justify-center">
-        <Loader2 size={24} className="animate-spin text-slate-500" />
-        <span className="ml-2 text-sm text-slate-500">Loading PDF…</span>
-      </div>
-    );
-  }
   if (error) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center gap-2">
@@ -56,10 +43,15 @@ export default function ProjectPdfViewer({ src }: { src: string }) {
   }
 
   return (
-    <div ref={containerRef} className="flex-1 overflow-auto bg-[#2a2a2a]">
+    <div ref={containerRef} className="flex-1 overflow-auto bg-theme-surface-strong" aria-label="PDF preview">
       <Document
-        file={pdfData}
-        onLoadSuccess={({ numPages: n }) => setNumPages(n)}
+        key={src}
+        file={pdfFile}
+        onLoadSuccess={({ numPages: n }) => {
+          setNumPages(n);
+          setPageNumber(1);
+          setError(null);
+        }}
         onLoadError={(err) => setError(err.message || 'Failed to render PDF')}
         loading={
           <div className="flex items-center justify-center py-12">
@@ -68,20 +60,38 @@ export default function ProjectPdfViewer({ src }: { src: string }) {
           </div>
         }
       >
-        {numPages > 0 && Array.from({ length: numPages }, (_, i) => (
-          <div key={i} className="flex justify-center py-2">
+        {numPages > 0 && (
+          <div className="flex justify-center py-2">
             <Page
-              pageNumber={i + 1}
+              pageNumber={pageNumber}
               width={Math.min(containerWidth - 32, 1200)}
               renderTextLayer={true}
               renderAnnotationLayer={true}
             />
           </div>
-        ))}
+        )}
       </Document>
       {numPages > 0 && (
-        <div className="sticky bottom-0 text-center py-2 bg-[#2a2a2a]/90 backdrop-blur-sm text-xs text-slate-500">
-          {numPages} page{numPages !== 1 ? 's' : ''}
+        <div className="sticky bottom-0 flex items-center justify-center gap-3 py-2 bg-theme-surface/95 backdrop-blur-sm text-xs text-theme-text">
+          <button
+            type="button"
+            aria-label="Previous PDF page"
+            disabled={pageNumber <= 1}
+            onClick={() => setPageNumber((current) => Math.max(1, current - 1))}
+            className="inline-flex size-8 items-center justify-center rounded bg-white/5 hover:bg-white/10 disabled:opacity-30"
+          >
+            <ChevronLeft size={15} />
+          </button>
+          <span>Page {pageNumber} of {numPages}</span>
+          <button
+            type="button"
+            aria-label="Next PDF page"
+            disabled={pageNumber >= numPages}
+            onClick={() => setPageNumber((current) => Math.min(numPages, current + 1))}
+            className="inline-flex size-8 items-center justify-center rounded bg-white/5 hover:bg-white/10 disabled:opacity-30"
+          >
+            <ChevronRight size={15} />
+          </button>
         </div>
       )}
     </div>

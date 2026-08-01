@@ -1,17 +1,22 @@
-import { useState, useEffect, useCallback, memo, lazy, Suspense } from 'react';
+import { useState, useEffect, useCallback, memo, lazy, Suspense, useRef } from 'react';
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
-import { usePublicSettings } from '../hooks/usePublicSettings';
+import { usePublicSettings, type PortalFeatureAvailability } from '../hooks/usePublicSettings';
 import { useIsMobile } from '../hooks/useIsMobile';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import { useAuthStore } from '../contexts/AuthContext';
 import FloatingUploadIndicator from './FloatingUploadIndicator';
 import OllamaControl from './OllamaControl';
 import ErrorPanel from './ErrorPanel';
 import ErrorBoundary from './ErrorBoundary';
+import PendingQuestionToasts from './PendingQuestionToasts';
 import { subscribeErrors, initGlobalErrorHandlers, type StoredError } from '../utils/errorHandler';
 import sounds from '../utils/sounds';
 import UserAvatar from './UserAvatar';
+import ViewportModal from './ViewportModal';
 import { canUseInteractivePortal, isElevated } from '../utils/authz';
+import { isRouteOperationOwned, useRouteOperationGuard } from '../contexts/RouteOperationContext';
+import { gatewayAPI } from '../api/endpoints';
+import type { GatewayPendingQuestion } from '../api/endpoints';
 import {
   LayoutDashboard, Terminal, Rocket, MessageCircle, Settings, Monitor, FolderOpen,
   LogOut, Menu, X, ChevronRight, Bug, Shield, Mail, Wrench
@@ -38,6 +43,9 @@ interface SidebarContentProps {
   onNavClick: () => void;
   onErrorPanelOpen: () => void;
   onLogout: () => void;
+  navigationBlocked: boolean;
+  mailAvailability?: PortalFeatureAvailability;
+  pendingQuestionCounts: Readonly<{ agent: number; project: number }>;
 }
 
 /**
@@ -52,6 +60,9 @@ const SidebarContent = memo(function SidebarContent({
   onNavClick,
   onErrorPanelOpen,
   onLogout,
+  navigationBlocked,
+  mailAvailability,
+  pendingQuestionCounts,
 }: SidebarContentProps) {
   return (
     <div className="flex flex-col h-full">
@@ -65,32 +76,104 @@ const SidebarContent = memo(function SidebarContent({
             className="min-w-0"
           >
             <h1 className="text-base font-bold text-theme-text leading-tight">{assistantName}</h1>
-            <p className="text-[11px] text-emerald-400/70 font-medium">Assistant</p>
+            <p className="text-[11px] accent-text opacity-70 font-medium">Assistant</p>
           </motion.div>
         )}
       </div>
 
       {/* Nav */}
-      <nav className="flex-1 py-4 px-2 space-y-1">
+      <nav aria-label="Primary navigation" className="flex-1 min-h-0 overflow-y-auto py-4 px-2 space-y-1">
         {navItems
           .filter(({ interactiveOnly, adminOnly }) => (!interactiveOnly || canUseInteractivePortal(user)) && (!adminOnly || isElevated(user)))
-          .map(({ to, icon: Icon, label }) => (
-          <NavLink
-            key={to}
-            to={to}
-            onClick={() => { sounds.click(); onNavClick(); }}
-            className={({ isActive }) =>
-              `flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 group
-              ${isActive
-                ? 'bg-emerald-500/10 text-emerald-400 shadow-lg shadow-emerald-500/5 border border-emerald-500/10'
-                : 'text-slate-400 hover:text-white hover:bg-white/[0.04] border border-transparent'
-              }`
-            }
-          >
-            <Icon size={20} className="flex-shrink-0" />
-            {!collapsed && <span>{label}</span>}
-          </NavLink>
-        ))}
+          .map(({ to, icon: Icon, label }) => {
+            const isMail = to === '/mail';
+            const mailState = !isMail || mailAvailability?.available === true
+              ? null
+              : mailAvailability?.available === false
+                ? 'unavailable'
+                : 'checking availability';
+            const mailBadge = mailState === 'unavailable' ? 'Unavailable' : 'Checking';
+            const linkLabel = mailState ? `${label} — ${mailState}` : (collapsed ? label : undefined);
+            const pendingCount = to === '/agent-chats'
+              ? pendingQuestionCounts.agent
+              : to === '/projects'
+                ? pendingQuestionCounts.project
+                : 0;
+
+            return (
+              <NavLink
+                key={to}
+                to={to}
+                aria-label={linkLabel}
+                aria-disabled={navigationBlocked || undefined}
+                title={mailState
+                  ? `${label} ${mailState}.${mailAvailability?.reason ? ` ${mailAvailability.reason}` : ''}`
+                  : undefined}
+                tabIndex={navigationBlocked ? -1 : undefined}
+                onClick={(event) => {
+                  if (navigationBlocked || isRouteOperationOwned()) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    return;
+                  }
+                  sounds.click();
+                  onNavClick();
+                }}
+                className={({ isActive }) =>
+                  `flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 group
+                  ${isActive
+                    ? 'accent-active border'
+                    : 'text-slate-400 hover:text-white hover:bg-white/[0.04] border border-transparent'
+                  } ${navigationBlocked ? 'pointer-events-none cursor-wait opacity-40' : ''}`
+                }
+              >
+                <span className="relative flex-shrink-0">
+                  <Icon size={20} aria-hidden="true" />
+                  {collapsed && mailState && (
+                    <span
+                      aria-hidden="true"
+                      className={`absolute -right-1 -top-1 h-2 w-2 rounded-full ring-2 ring-theme-surface ${
+                        mailState === 'unavailable' ? 'bg-amber-400' : 'bg-slate-400'
+                      }`}
+                    />
+                  )}
+                  {collapsed && pendingCount > 0 && (
+                    <span
+                      aria-hidden="true"
+                      className="absolute -right-2 -top-2 flex h-4 min-w-4 items-center justify-center rounded-full bg-violet-500 px-1 text-[9px] font-bold leading-none text-white ring-2 ring-theme-surface"
+                    >
+                      {pendingCount > 9 ? '9+' : pendingCount}
+                    </span>
+                  )}
+                </span>
+                {!collapsed && (
+                  <>
+                    <span>{label}</span>
+                    {mailState && (
+                      <span
+                        aria-hidden="true"
+                        className={`ml-auto rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide ${
+                          mailState === 'unavailable'
+                            ? 'border-amber-400/30 bg-amber-400/10 text-amber-300'
+                            : 'border-slate-500/30 bg-slate-500/10 text-slate-400'
+                        }`}
+                      >
+                        {mailBadge}
+                      </span>
+                    )}
+                    {pendingCount > 0 && (
+                      <span
+                        role="status"
+                        className="ml-auto rounded-full border border-violet-400/30 bg-violet-500/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-violet-200"
+                      >
+                        {pendingCount} waiting
+                      </span>
+                    )}
+                  </>
+                )}
+              </NavLink>
+            );
+          })}
       </nav>
 
       {/* Ollama + Error Panel + Settings + Logout */}
@@ -105,7 +188,13 @@ const SidebarContent = memo(function SidebarContent({
           </div>
         )}
         <button
-          onClick={() => { sounds.click(); onErrorPanelOpen(); }}
+          disabled={navigationBlocked}
+          onClick={() => {
+            if (isRouteOperationOwned()) return;
+            sounds.click();
+            onErrorPanelOpen();
+          }}
+          aria-label={collapsed ? `Open errors${errorCount > 0 ? ` (${errorCount} unread)` : ''}` : undefined}
           className="flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 text-slate-400 hover:text-white hover:bg-white/[0.04] border border-transparent w-full relative"
         >
           <Bug size={20} className="flex-shrink-0" />
@@ -119,13 +208,23 @@ const SidebarContent = memo(function SidebarContent({
         {isElevated(user) && (
           <NavLink
             to="/admin"
-            onClick={() => { sounds.click(); onNavClick(); }}
+            aria-disabled={navigationBlocked || undefined}
+            tabIndex={navigationBlocked ? -1 : undefined}
+            onClick={(event) => {
+              if (navigationBlocked || isRouteOperationOwned()) {
+                event.preventDefault();
+                event.stopPropagation();
+                return;
+              }
+              sounds.click();
+              onNavClick();
+            }}
             className={({ isActive }) =>
               `flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200
               ${isActive
-                ? 'bg-purple-500/10 text-purple-400 shadow-lg shadow-purple-500/5 border border-purple-500/10'
+                ? 'accent-active border'
                 : 'text-slate-400 hover:text-white hover:bg-white/[0.04] border border-transparent'
-              }`
+              } ${navigationBlocked ? 'pointer-events-none cursor-wait opacity-40' : ''}`
             }
           >
             <Shield size={20} className="flex-shrink-0" />
@@ -134,21 +233,37 @@ const SidebarContent = memo(function SidebarContent({
         )}
         <NavLink
           to="/settings"
-          onClick={() => { sounds.click(); onNavClick(); }}
+          aria-disabled={navigationBlocked || undefined}
+          tabIndex={navigationBlocked ? -1 : undefined}
+          onClick={(event) => {
+            if (navigationBlocked || isRouteOperationOwned()) {
+              event.preventDefault();
+              event.stopPropagation();
+              return;
+            }
+            sounds.click();
+            onNavClick();
+          }}
           className={({ isActive }) =>
             `flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200
             ${isActive
-              ? 'bg-emerald-500/10 text-emerald-400 shadow-lg shadow-emerald-500/5 border border-emerald-500/10'
+              ? 'accent-active border'
               : 'text-slate-400 hover:text-white hover:bg-white/[0.04] border border-transparent'
-            }`
+            } ${navigationBlocked ? 'pointer-events-none cursor-wait opacity-40' : ''}`
           }
         >
           <Settings size={20} className="flex-shrink-0" />
           {!collapsed && <span>Settings</span>}
         </NavLink>
         <button
-          onClick={() => { sounds.click(); onLogout(); }}
-          className="flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm text-slate-400 hover:text-red-400 hover:bg-red-500/10 w-full transition-all"
+          disabled={navigationBlocked}
+          onClick={() => {
+            if (isRouteOperationOwned()) return;
+            sounds.click();
+            onLogout();
+          }}
+          aria-label={collapsed ? 'Log out' : undefined}
+          className="flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm text-slate-400 hover:text-red-400 hover:bg-red-500/10 w-full transition-all disabled:cursor-wait disabled:opacity-40"
         >
           <LogOut size={20} />
           {!collapsed && <span>Logout</span>}
@@ -163,15 +278,22 @@ export default function Layout() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [errorPanelOpen, setErrorPanelOpen] = useState(false);
   const [errorCount, setErrorCount] = useState(0);
+  const [pendingQuestions, setPendingQuestions] = useState<GatewayPendingQuestion[]>([]);
   const publicSettings = usePublicSettings();
   const isMobile = useIsMobile();
   const assistantName = publicSettings?.assistantName || 'Assistant';
   const logoUrl = publicSettings?.logoUrl || '';
   const { logout, user } = useAuthStore();
+  const userId = user?.id || '';
+  const userRole = user?.role || '';
   const navigate = useNavigate();
   const location = useLocation();
   const isTerminalRoute = location.pathname === '/terminal';
+  const isErrorsRoute = location.pathname === '/errors';
   const showPersistentTerminal = isElevated(user);
+  const mobileNavRef = useRef<HTMLElement>(null);
+  const mobileMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const { active: routeOperationActive } = useRouteOperationGuard();
 
   useEffect(() => {
     initGlobalErrorHandlers();
@@ -179,19 +301,78 @@ export default function Layout() {
   }, []);
 
   useEffect(() => {
+    setPendingQuestions([]);
+    if (!canUseInteractivePortal({ role: userRole })) return undefined;
+    let cancelled = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const data = await gatewayAPI.pendingQuestions();
+        if (cancelled) return;
+        const now = Date.now();
+        setPendingQuestions((Array.isArray(data?.questions) ? data.questions : []).filter((entry) => (
+          entry?.state === 'pending' && entry.expiresAt > now
+        )));
+      } catch {
+        // A shell badge is advisory. Keep the last confirmed state and retry.
+      } finally {
+        inFlight = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 4_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [userId, userRole]);
+
+  const pendingQuestionCounts = pendingQuestions.reduce((counts, question) => {
+    if (question.surface === 'project-chat') counts.project += 1;
+    else if (question.surface === 'agent-chat') counts.agent += 1;
+    return counts;
+  }, { agent: 0, project: 0 });
+  const pendingQuestionTotal = pendingQuestionCounts.agent + pendingQuestionCounts.project;
+  const pendingQuestionTarget = pendingQuestionCounts.agent > 0 ? '/agent-chats' : '/projects';
+
+  // Drop a settled question immediately instead of waiting for the next poll,
+  // so the notification cannot linger over an answer that already landed.
+  const handlePendingQuestionSettled = useCallback((id: string) => {
+    setPendingQuestions((current) => current.filter((question) => question.id !== id));
+  }, []);
+
+  useEffect(() => {
     if (!isMobile) setMobileOpen(false);
   }, [isMobile]);
 
+  useEffect(() => {
+    if (isErrorsRoute) setErrorPanelOpen(true);
+  }, [isErrorsRoute]);
+
   const handleLogout = useCallback(async () => {
+    if (isRouteOperationOwned()) return;
     await logout();
+    if (isRouteOperationOwned()) return;
     navigate('/login');
   }, [logout, navigate]);
 
   const handleNavClick = useCallback(() => setMobileOpen(false), []);
   const handleErrorPanelOpen = useCallback(() => setErrorPanelOpen(true), []);
+  const handleErrorPanelClose = useCallback(() => {
+    setErrorPanelOpen(false);
+    if (isErrorsRoute) navigate('/dashboard', { replace: true });
+  }, [isErrorsRoute, navigate]);
 
   return (
     <div className="flex h-dvh overflow-hidden bg-theme-bg ambient-bg" style={{ height: '100dvh' }}>
+      <a
+        href="#portal-main-content"
+        className="accent-btn fixed left-3 top-3 z-[300] -translate-y-24 rounded-lg px-3 py-2 text-sm font-semibold shadow-lg transition-transform focus:translate-y-0"
+      >
+        Skip to main content
+      </a>
       {/* Desktop Sidebar */}
       {!isMobile && (
         <motion.aside
@@ -207,63 +388,86 @@ export default function Layout() {
             onNavClick={handleNavClick}
             onErrorPanelOpen={handleErrorPanelOpen}
             onLogout={handleLogout}
+            navigationBlocked={routeOperationActive}
+            mailAvailability={publicSettings?.mail}
+            pendingQuestionCounts={pendingQuestionCounts}
           />
           <button
+            disabled={routeOperationActive}
             onClick={() => setCollapsed(!collapsed)}
-            className="absolute -right-3 top-7 w-6 h-6 rounded-full bg-dark-surface border border-white/10 flex items-center justify-center hover:bg-emerald-500/20 transition-colors z-50 shadow-lg shadow-black/30"
+            aria-label={collapsed ? 'Expand navigation sidebar' : 'Collapse navigation sidebar'}
+            aria-expanded={!collapsed}
+            className="accent-hover absolute -right-3 top-7 w-6 h-6 rounded-full bg-dark-surface border border-white/10 flex items-center justify-center transition-colors z-50 shadow-lg shadow-black/30"
           >
             <ChevronRight size={12} className={`transition-transform ${collapsed ? '' : 'rotate-180'}`} />
           </button>
         </motion.aside>
       )}
 
-      {/* Mobile Overlay */}
-      <AnimatePresence>
-        {isMobile && mobileOpen && (
-          <>
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="fixed inset-0 bg-black/60 z-40 md:hidden"
-              onClick={() => setMobileOpen(false)}
-            />
-            <motion.aside
-              initial={{ x: -280 }}
-              animate={{ x: 0 }}
-              exit={{ x: -280 }}
-              transition={{ type: 'spring', damping: 25 }}
-              className="fixed left-0 top-0 bottom-0 w-[260px] bg-theme-surface border-r border-theme-border z-50 md:hidden"
-            >
-              <SidebarContent
-                collapsed={false}
-                assistantName={assistantName}
-                errorCount={errorCount}
-                user={user}
-                onNavClick={handleNavClick}
-                onErrorPanelOpen={handleErrorPanelOpen}
-                onLogout={handleLogout}
-              />
-            </motion.aside>
-          </>
-        )}
-      </AnimatePresence>
+      {/* Mobile navigation owns the visual viewport and participates in the
+          same deterministic modal stack as every other blocking surface. */}
+      <ViewportModal
+        open={isMobile && mobileOpen}
+        onDismiss={() => setMobileOpen(false)}
+        initialFocusRef={mobileNavRef}
+        className="bg-black/60 !items-stretch !justify-start md:hidden"
+      >
+        <motion.aside
+          ref={mobileNavRef}
+          id="portal-mobile-navigation"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Navigation menu"
+          tabIndex={-1}
+          initial={{ x: -280 }}
+          animate={{ x: 0 }}
+          transition={{ type: 'spring', damping: 25 }}
+          className="relative h-full w-[260px] max-w-full bg-theme-surface border-r border-theme-border shadow-2xl md:hidden"
+        >
+          <SidebarContent
+            collapsed={false}
+            assistantName={assistantName}
+            errorCount={errorCount}
+            user={user}
+            onNavClick={handleNavClick}
+            onErrorPanelOpen={handleErrorPanelOpen}
+            onLogout={handleLogout}
+            navigationBlocked={routeOperationActive}
+            mailAvailability={publicSettings?.mail}
+            pendingQuestionCounts={pendingQuestionCounts}
+          />
+        </motion.aside>
+      </ViewportModal>
 
       {/* Main */}
       <div className="flex-1 flex flex-col overflow-hidden">
         {/* Mobile Header */}
         {isMobile && (
           <div className="md:hidden flex items-center gap-3 px-4 py-3 border-b border-theme-border bg-theme-surface/80 backdrop-blur-xl relative z-40 flex-shrink-0" style={{ paddingTop: 'calc(max(0.75rem, env(safe-area-inset-top, 0px)) + 0.25rem)' }}>
-          <button onClick={() => setMobileOpen(true)} className="text-slate-400 hover:text-white">
+          <button ref={mobileMenuButtonRef} disabled={routeOperationActive} onClick={() => { if (!isRouteOperationOwned()) setMobileOpen(true); }} aria-label="Open navigation menu" aria-expanded={mobileOpen} aria-controls="portal-mobile-navigation" className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-slate-400 hover:text-white disabled:cursor-wait disabled:opacity-40">
             {mobileOpen ? <X size={22} /> : <Menu size={22} />}
           </button>
           {logoUrl ? <img src={logoUrl} alt="Portal logo" className="w-7 h-7 rounded object-cover" /> : null}
-          <span className="font-semibold">Bridges<span className="text-emerald-400">LLM</span></span>
+          <span className="font-semibold">Bridges<span className="accent-text">LLM</span></span>
+          {pendingQuestionTotal > 0 && (
+            <button
+              type="button"
+              aria-label={`${pendingQuestionTotal} agent ${pendingQuestionTotal === 1 ? 'question is' : 'questions are'} waiting`}
+              onClick={() => {
+                if (!routeOperationActive && !isRouteOperationOwned()) navigate(pendingQuestionTarget);
+              }}
+              disabled={routeOperationActive}
+              className="ml-auto inline-flex min-h-[36px] items-center gap-1.5 rounded-full border border-violet-400/30 bg-violet-500/15 px-2.5 text-xs font-medium text-violet-100 disabled:opacity-40"
+            >
+              <MessageCircle size={14} aria-hidden="true" />
+              {pendingQuestionTotal} waiting
+            </button>
+          )}
           </div>
         )}
 
         {/* Page Content */}
-        <main className="flex-1 overflow-hidden min-h-0 bg-theme-bg text-theme-text">
+        <main id="portal-main-content" tabIndex={-1} className="flex-1 overflow-hidden min-h-0 bg-theme-bg text-theme-text outline-none">
           <ErrorBoundary>
             {/* Only mount TerminalPage on the terminal route.
                 Keeping it hidden-but-live on every page spins up background Socket.IO
@@ -281,8 +485,15 @@ export default function Layout() {
       {/* Floating upload indicator */}
       <FloatingUploadIndicator />
 
+      {/* A paused run is answerable from anywhere in the Portal, not just from
+          the surface that asked. */}
+      <PendingQuestionToasts
+        questions={pendingQuestions}
+        onSettled={handlePendingQuestionSettled}
+      />
+
       {/* Error Panel */}
-      <ErrorPanel open={errorPanelOpen} onClose={() => setErrorPanelOpen(false)} />
+      <ErrorPanel open={errorPanelOpen} onClose={handleErrorPanelClose} />
     </div>
   );
 }

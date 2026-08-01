@@ -1,19 +1,22 @@
 import { AlertTriangle, CheckCircle2, ChevronRight, Clock } from 'lucide-react';
+import type { ReactNode } from 'react';
 import type { ProviderStatus } from './ProviderCard';
 
 interface QuickStartBannerProps {
   onChoose: (providerId: string) => void;
-  onNativeCliLogin?: (nativeProvider: 'claude-code' | 'codex' | 'gemini') => void;
+  onNativeCliLogin?: (nativeProvider: 'claude-code' | 'codex' | 'gemini' | 'grok') => void;
   statusMap?: Map<string, ProviderStatus>;
   compact?: boolean;
+  additionalCards?: ReactNode;
+  showBuiltInCards?: boolean;
 }
 
 const cards = [
   {
     id: 'openclaw',
     title: 'OpenClaw',
-    subtitle: 'All providers via OpenClaw',
-    description: 'Configure API keys and OAuth for providers through OpenClaw (Claude, Codex, Gemini, and more).',
+    subtitle: 'Supported providers via OpenClaw',
+    description: 'Configure the API-key and OAuth providers exposed by the installed OpenClaw runtime.',
     color: 'bg-emerald-500',
     isNativeCli: false,
   },
@@ -36,6 +39,15 @@ const cards = [
     nativeCliProvider: 'codex' as const,
   },
   {
+    id: 'native-grok',
+    title: 'Grok Build',
+    subtitle: 'Native xAI coding agent',
+    description: 'Sign in with a Grok subscription for a native full-server Agent Chat option. Server API keys remain supported separately.',
+    color: 'bg-orange-500',
+    isNativeCli: true,
+    nativeCliProvider: 'grok' as const,
+  },
+  {
     id: 'native-gemini',
     title: 'Antigravity',
     subtitle: 'Native CLI agent',
@@ -50,15 +62,9 @@ const cards = [
 const NATIVE_CLI_PROVIDER_MAP: Record<string, string> = {
   'native-claude-code': 'anthropic',
   'native-codex': 'openai-codex',
+  'native-grok': 'xai',
   'native-gemini': 'google-antigravity',
 };
-
-function getNativeCliStatus(statusMap: Map<string, ProviderStatus> | undefined, cardId: string): ProviderStatus['nativeCliAuthStatus'] | null {
-  const providerId = NATIVE_CLI_PROVIDER_MAP[cardId];
-  if (!statusMap || !providerId) return null;
-  const status = statusMap.get(providerId);
-  return status?.nativeCliAuthStatus || null;
-}
 
 function isConfigured(statusMap: Map<string, ProviderStatus> | undefined, id: string): boolean {
   if (!statusMap) return false;
@@ -73,8 +79,21 @@ function isConfigured(statusMap: Map<string, ProviderStatus> | undefined, id: st
 
 function getExpiryInfo(statusMap: Map<string, ProviderStatus> | undefined, id: string): { label: string; urgency: 'ok' | 'warning' | 'danger' | 'expired' } | null {
   if (!statusMap || id === 'openclaw') return null;
-  const providerId = NATIVE_CLI_PROVIDER_MAP[id] || id;
+  const nativeProviderId = NATIVE_CLI_PROVIDER_MAP[id];
+  const providerId = nativeProviderId || id;
   const status = statusMap.get(providerId);
+  // `expiresAt` belongs to the OpenClaw provider profile. A native CLI card
+  // represents a separate credential store, so showing that timestamp here can
+  // claim a healthy Grok/Codex CLI is expired. Use only the native auth probe.
+  if (nativeProviderId) {
+    if (status?.nativeCliAuthStatus === 'needs_login') {
+      return { label: 'Needs login', urgency: 'expired' };
+    }
+    if (status?.nativeCliAuthStatus === 'unknown') {
+      return { label: 'Check login', urgency: 'warning' };
+    }
+    return null;
+  }
   if (!status?.expiresAt) return null;
 
   const now = Date.now();
@@ -88,11 +107,18 @@ function getExpiryInfo(statusMap: Map<string, ProviderStatus> | undefined, id: s
   return { label: `Expires ${new Date(status.expiresAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`, urgency: 'ok' };
 }
 
-export default function QuickStartBanner({ onChoose, onNativeCliLogin, statusMap, compact = false }: QuickStartBannerProps) {
+export default function QuickStartBanner({
+  onChoose,
+  onNativeCliLogin,
+  statusMap,
+  compact = false,
+  additionalCards,
+  showBuiltInCards = true,
+}: QuickStartBannerProps) {
   if (compact) {
     return (
       <div className="space-y-1.5">
-        {cards.map((card) => {
+        {showBuiltInCards ? cards.map((card) => {
           const configured = isConfigured(statusMap, card.id);
           const expiry = getExpiryInfo(statusMap, card.id);
           return (
@@ -123,7 +149,8 @@ export default function QuickStartBanner({ onChoose, onNativeCliLogin, statusMap
               <ChevronRight className="h-4 w-4 shrink-0 text-slate-600 transition group-hover:text-slate-400" />
             </button>
           );
-        })}
+        }) : null}
+        {additionalCards}
       </div>
     );
   }
@@ -138,7 +165,7 @@ export default function QuickStartBanner({ onChoose, onNativeCliLogin, statusMap
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2">
-        {cards.map((card) => {
+        {showBuiltInCards ? cards.map((card) => {
           const configured = isConfigured(statusMap, card.id);
           const expiry = getExpiryInfo(statusMap, card.id);
           return (
@@ -184,7 +211,8 @@ export default function QuickStartBanner({ onChoose, onNativeCliLogin, statusMap
               </div>
             </button>
           );
-        })}
+        }) : null}
+        {additionalCards}
       </div>
     </div>
   );

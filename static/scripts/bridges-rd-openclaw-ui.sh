@@ -11,12 +11,20 @@ if [ "$(id -u)" = "0" ]; then
   exit 1
 fi
 
+if [ "$(id -un)" != "bridgesrd" ]; then
+  echo "ERROR: OpenClaw UI browser must run as the bridgesrd account" >&2
+  exit 1
+fi
+
+umask 077
+
 ENV_FILE="/home/bridgesrd/.bridges-rd-env"
 if [ -f "$ENV_FILE" ]; then
   # shellcheck disable=SC1090
   . "$ENV_FILE"
 else
   export DISPLAY="${DISPLAY:-:1}"
+  export XAUTHORITY="${XAUTHORITY:-/home/bridgesrd/.Xauthority}"
   export XDG_RUNTIME_DIR=/tmp/bridges-rd-runtime
   export PULSE_SERVER=unix:/tmp/bridges-rd-runtime/pulse/native
   export SDL_AUDIODRIVER=pulseaudio
@@ -66,7 +74,9 @@ NAV_EXTENSION_DIR="$PROFILE_DIR/nav-extension"
 URL_FILE="${OPENCLAW_DASHBOARD_URL_FILE:-$PROFILE_DIR/dashboard-url}"
 LAUNCH_HTML="${OPENCLAW_DASHBOARD_LAUNCH_HTML:-$PROFILE_DIR/launch.html}"
 mkdir -p "$PROFILE_DIR"
+chmod 700 "$PROFILE_DIR"
 write_nav_extension "$NAV_EXTENSION_DIR"
+chmod 700 "$NAV_EXTENSION_DIR"
 
 read_vnc_geometry() {
   local res
@@ -177,10 +187,8 @@ fi
   --name=OpenClawControlUI \
   --no-first-run \
   --no-default-browser-check \
-  --no-sandbox \
-  --disable-gpu-sandbox \
-  --disable-setuid-sandbox \
   --user-data-dir="$PROFILE_DIR" \
+  --enable-unsafe-extension-debugging \
   --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=${CDP_PORT} \
   "${CHROME_TARGET_ARGS[@]}" &
@@ -193,6 +201,57 @@ for i in $(seq 1 40); do
   fi
   sleep 0.3
 done
+
+# OpenClaw Controls: load the gateway's Chrome extension into this browser on
+# every launch. Branded Chrome ignores --load-extension, and a CDP-loaded
+# unpacked extension is session-scoped, so this reload is the persistence
+# mechanism; the pairing saved in this profile's extension storage survives
+# restarts and reconnects on its own. No pairing secret is read or printed
+# here — pairing stays a one-time action in the extension popup. Extension
+# load failures never block the Control UI itself.
+OPENCLAW_EXTENSION_DIR=""
+if command -v openclaw >/dev/null 2>&1; then
+  OPENCLAW_EXTENSION_DIR="$(openclaw browser extension path 2>/dev/null | tail -1 || true)"
+fi
+if [ -n "$OPENCLAW_EXTENSION_DIR" ] && [ -f "$OPENCLAW_EXTENSION_DIR/manifest.json" ] \
+  && curl -sf "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1; then
+  node - <<'OPENCLAW_EXT' "$CDP_PORT" "$OPENCLAW_EXTENSION_DIR" || true
+const http = require('http');
+const port = Number(process.argv[2]);
+const extensionPath = process.argv[3];
+function getJson(path) {
+  return new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port, path }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => body += d);
+      res.on('end', () => {
+        try { resolve(JSON.parse(body || '{}')); } catch (err) { reject(err); }
+      });
+    }).on('error', reject);
+  });
+}
+(async () => {
+  try {
+    const version = await getJson('/json/version');
+    if (!version.webSocketDebuggerUrl) process.exit(0);
+    const ws = new globalThis.WebSocket(version.webSocketDebuggerUrl);
+    const done = () => { try { ws.close(); } catch {} process.exit(0); };
+    setTimeout(done, 10000);
+    ws.addEventListener('open', () => {
+      ws.send(JSON.stringify({ id: 1, method: 'Extensions.loadUnpacked', params: { path: extensionPath } }));
+    });
+    ws.addEventListener('message', (event) => {
+      const message = JSON.parse(String(event.data));
+      if (message.id === 1) done();
+    });
+    ws.addEventListener('error', done);
+  } catch {
+    process.exit(0);
+  }
+})();
+OPENCLAW_EXT
+fi
 
 if curl -sf "http://127.0.0.1:${CDP_PORT}/json/list" >/dev/null 2>&1; then
   node - <<'NODE' "$CDP_PORT" "$NAV_EXTENSION_DIR/content.js"

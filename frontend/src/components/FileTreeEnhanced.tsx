@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { 
-  ChevronRight, ChevronDown, File, Folder, FolderOpen,
+  ChevronRight, ChevronDown, Folder, FolderOpen,
   Plus, Trash2, Edit3
 } from 'lucide-react';
 
@@ -62,7 +62,6 @@ function FileTreeNode({
   expandedFolders: Set<string>;
   setExpandedFolders: React.Dispatch<React.SetStateAction<Set<string>>>;
 }) {
-  const [hovering, setHovering] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState(node.name);
   const nodeRef = useRef<HTMLDivElement>(null);
@@ -132,13 +131,11 @@ function FileTreeNode({
       <motion.div
         ref={nodeRef}
         className={`flex items-center gap-2 px-2 py-1 rounded-lg cursor-pointer select-none transition-all group
-          ${isSelected ? 'bg-emerald-500/20 text-emerald-300' : ''}
-          ${isFocused && !isSelected ? 'ring-2 ring-emerald-500/40 bg-white/5' : ''}
+          ${isSelected ? 'accent-active' : ''}
+          ${isFocused && !isSelected ? 'ring-2 accent-ring bg-white/5' : ''}
           ${!isSelected && !isFocused ? 'hover:bg-white/5' : ''}
         `}
         style={{ paddingLeft: `${level * 16 + 8}px` }}
-        onMouseEnter={() => setHovering(true)}
-        onMouseLeave={() => setHovering(false)}
         onClick={handleClick}
         initial={false}
         whileHover={{ x: 2 }}
@@ -194,12 +191,15 @@ function FileTreeNode({
         {editing ? (
           <input
             value={editName}
+            aria-label={`Rename ${node.type} ${node.name}`}
             onChange={(e) => setEditName(e.target.value)}
             onBlur={handleRename}
             onKeyDown={(e) => {
+              e.stopPropagation();
               if (e.key === 'Enter') handleRename();
               if (e.key === 'Escape') setEditing(false);
             }}
+            onClick={(e) => e.stopPropagation()}
             className="bg-slate-800 text-white px-2 py-1 rounded text-sm flex-1 min-w-0"
             autoFocus
             onFocus={(e) => e.target.select()}
@@ -210,9 +210,9 @@ function FileTreeNode({
 
         {/* Actions */}
         <AnimatePresence>
-          {hovering && !editing && (
+          {!editing && (
             <motion.div 
-              className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
+              className="flex items-center gap-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity"
               initial={{ opacity: 0, scale: 0.8 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.8 }}
@@ -220,50 +220,54 @@ function FileTreeNode({
               {node.type === 'folder' && (
                 <>
                   <button
+                    type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       onFileCreate?.(node.path, 'file');
                     }}
-                    className="p-1 rounded hover:bg-white/10"
+                    className="size-7 inline-flex items-center justify-center rounded hover:bg-white/10 focus-visible:opacity-100"
                     title="New file (Ctrl+N)"
-                    aria-label="New file"
+                    aria-label={`Create file in ${node.name}`}
                   >
                     <Plus className="w-3 h-3" />
                   </button>
                   <button
+                    type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       onFileCreate?.(node.path, 'folder');
                     }}
-                    className="p-1 rounded hover:bg-white/10"
+                    className="size-7 inline-flex items-center justify-center rounded hover:bg-white/10 focus-visible:opacity-100"
                     title="New folder"
-                    aria-label="New folder"
+                    aria-label={`Create folder in ${node.name}`}
                   >
                     <Folder className="w-3 h-3" />
                   </button>
                 </>
               )}
               <button
+                type="button"
                 onClick={(e) => {
                   e.stopPropagation();
                   setEditing(true);
                 }}
-                className="p-1 rounded hover:bg-white/10"
+                className="size-7 inline-flex items-center justify-center rounded hover:bg-white/10 focus-visible:opacity-100"
                 title="Rename (F2)"
-                aria-label="Rename"
+                aria-label={`Rename ${node.type} ${node.name}`}
               >
                 <Edit3 className="w-3 h-3" />
               </button>
               <button
+                type="button"
                 onClick={(e) => {
                   e.stopPropagation();
                   if (confirm(`Delete ${node.name}?`)) {
                     onFileDelete?.(node);
                   }
                 }}
-                className="p-1 rounded hover:bg-red-500/20 text-red-400"
+                className="size-7 inline-flex items-center justify-center rounded hover:bg-red-500/20 text-red-400 focus-visible:opacity-100"
                 title="Delete (Del)"
-                aria-label="Delete"
+                aria-label={`Delete ${node.type} ${node.name}`}
               >
                 <Trash2 className="w-3 h-3" />
               </button>
@@ -281,6 +285,7 @@ function FileTreeNode({
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.2 }}
             className="overflow-hidden"
+            role="group"
           >
             {node.children.map(child => (
               <FileTreeNode

@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { 
-  ChevronRight, ChevronDown, File, Folder, FolderOpen,
-  Plus, GitBranch, Trash2, Edit3, Copy
+  ChevronRight, ChevronDown, Folder, FolderOpen,
+  Plus, Trash2, Edit3
 } from 'lucide-react';
 
 export interface FileNode {
@@ -43,7 +43,6 @@ function FileTreeNode({
   onFileRename?: (file: FileNode, newName: string) => void;
 }) {
   const [expanded, setExpanded] = useState(level < 2);
-  const [hovering, setHovering] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState(node.name);
 
@@ -96,14 +95,32 @@ function FileTreeNode({
     <>
       <motion.div
         className={`flex items-center gap-2 px-2 py-1 rounded-lg cursor-pointer select-none transition-colors group
-          ${isSelected ? 'bg-emerald-500/20 text-emerald-300' : 'hover:bg-white/5'}
+          ${isSelected ? 'accent-active' : 'hover:bg-white/5'}
         `}
         style={{ paddingLeft: `${level * 16 + 8}px` }}
-        onMouseEnter={() => setHovering(true)}
-        onMouseLeave={() => setHovering(false)}
         onClick={handleClick}
         initial={false}
         whileHover={{ x: 2 }}
+        role="treeitem"
+        tabIndex={editing ? -1 : 0}
+        aria-selected={isSelected}
+        aria-expanded={node.type === 'folder' ? expanded : undefined}
+        aria-label={`${node.type} ${node.name}`}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            handleClick();
+          } else if (event.key === 'ArrowRight' && node.type === 'folder' && !expanded) {
+            event.preventDefault();
+            setExpanded(true);
+          } else if (event.key === 'ArrowLeft' && node.type === 'folder' && expanded) {
+            event.preventDefault();
+            setExpanded(false);
+          } else if (event.key === 'F2') {
+            event.preventDefault();
+            setEditing(true);
+          }
+        }}
       >
         {/* Expansion indicator */}
         <div className="w-4 h-4 flex items-center justify-center">
@@ -127,12 +144,15 @@ function FileTreeNode({
         {editing ? (
           <input
             value={editName}
+            aria-label={`Rename ${node.type} ${node.name}`}
             onChange={(e) => setEditName(e.target.value)}
             onBlur={handleRename}
             onKeyDown={(e) => {
+              e.stopPropagation();
               if (e.key === 'Enter') handleRename();
               if (e.key === 'Escape') setEditing(false);
             }}
+            onClick={(e) => e.stopPropagation()}
             className="bg-slate-800 text-white px-2 py-1 rounded text-sm flex-1 min-w-0"
             autoFocus
             onFocus={(e) => e.target.select()}
@@ -143,9 +163,9 @@ function FileTreeNode({
 
         {/* Actions */}
         <AnimatePresence>
-          {hovering && !editing && (
+          {!editing && (
             <motion.div 
-              className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
+              className="flex items-center gap-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity"
               initial={{ opacity: 0, scale: 0.8 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.8 }}
@@ -153,44 +173,52 @@ function FileTreeNode({
               {node.type === 'folder' && (
                 <>
                   <button
+                    type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       onFileCreate?.(node.path, 'file');
                     }}
-                    className="p-1 rounded hover:bg-white/10"
+                    className="size-7 inline-flex items-center justify-center rounded hover:bg-white/10 focus-visible:opacity-100"
                     title="New file"
+                    aria-label={`Create file in ${node.name}`}
                   >
                     <Plus className="w-3 h-3" />
                   </button>
                   <button
+                    type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       onFileCreate?.(node.path, 'folder');
                     }}
-                    className="p-1 rounded hover:bg-white/10"
+                    className="size-7 inline-flex items-center justify-center rounded hover:bg-white/10 focus-visible:opacity-100"
                     title="New folder"
+                    aria-label={`Create folder in ${node.name}`}
                   >
                     <Folder className="w-3 h-3" />
                   </button>
                 </>
               )}
               <button
+                type="button"
                 onClick={(e) => {
                   e.stopPropagation();
                   setEditing(true);
                 }}
-                className="p-1 rounded hover:bg-white/10"
+                className="size-7 inline-flex items-center justify-center rounded hover:bg-white/10 focus-visible:opacity-100"
                 title="Rename"
+                aria-label={`Rename ${node.type} ${node.name}`}
               >
                 <Edit3 className="w-3 h-3" />
               </button>
               <button
+                type="button"
                 onClick={(e) => {
                   e.stopPropagation();
                   onFileDelete?.(node);
                 }}
-                className="p-1 rounded hover:bg-red-500/20 text-red-400"
+                className="size-7 inline-flex items-center justify-center rounded hover:bg-red-500/20 text-red-400 focus-visible:opacity-100"
                 title="Delete"
+                aria-label={`Delete ${node.type} ${node.name}`}
               >
                 <Trash2 className="w-3 h-3" />
               </button>
@@ -208,6 +236,7 @@ function FileTreeNode({
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.2 }}
             className="overflow-hidden"
+            role="group"
           >
             {node.children.map(child => (
               <FileTreeNode
@@ -238,7 +267,7 @@ export default function FileTree({
   className = '' 
 }: FileTreeProps) {
   return (
-    <div className={`space-y-1 ${className}`}>
+    <div className={`space-y-1 ${className}`} role="tree" aria-label="File tree">
       {files.map(file => (
         <FileTreeNode
           key={file.id}

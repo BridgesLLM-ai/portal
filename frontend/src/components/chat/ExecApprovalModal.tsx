@@ -6,11 +6,13 @@
  * 
  * Auto-expires based on the expiresAtMs from the approval request.
  */
-import { useEffect, useState, useCallback } from 'react';
-import { createPortal } from 'react-dom';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useEffect, useState, useCallback, useRef } from 'react';
+import { motion } from 'framer-motion';
 import { Shield, Terminal, Clock, CheckCircle2, XCircle, ShieldCheck, Loader2 } from 'lucide-react';
 import type { ExecApprovalRequest } from './useAgentRuntime';
+import ViewportModal from '../ViewportModal';
+
+type ExecApprovalDecision = 'allow-once' | 'deny' | 'allow-always';
 
 interface ExecApprovalModalProps {
   approval: ExecApprovalRequest;
@@ -22,17 +24,27 @@ interface ExecApprovalModalProps {
 export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismiss }: ExecApprovalModalProps) {
   const [timeLeft, setTimeLeft] = useState<number>(0);
   const [isClosing, setIsClosing] = useState(false);
-  const [isResolving, setIsResolving] = useState(false);
+  const [resolvingDecision, setResolvingDecision] = useState<ExecApprovalDecision | null>(null);
   const [resolveError, setResolveError] = useState<string | null>(null);
+  const denyButtonRef = useRef<HTMLButtonElement>(null);
+  const isResolving = resolvingDecision !== null;
 
   // Mount sites key this modal by approval id, but guard here too: stale
   // isResolving/isClosing carried into the next queued approval renders it
   // dead (buttons stuck spinning) or invisible while the agent waits on it.
   useEffect(() => {
     setIsClosing(false);
-    setIsResolving(false);
+    setResolvingDecision(null);
     setResolveError(null);
   }, [approval.id]);
+
+  const handleDismiss = useCallback(() => {
+    if (isClosing || isResolving) return;
+    setIsClosing(true);
+    setTimeout(() => {
+      onDismiss(approval.id);
+    }, 200);
+  }, [approval.id, isClosing, isResolving, onDismiss]);
 
   // Calculate and update time remaining
   useEffect(() => {
@@ -49,21 +61,14 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
     updateTimeLeft();
     const interval = setInterval(updateTimeLeft, 100);
     return () => clearInterval(interval);
-  }, [approval.expiresAtMs]);
+  }, [approval.expiresAtMs, handleDismiss]);
 
-  const handleDismiss = useCallback(() => {
-    setIsClosing(true);
-    setTimeout(() => {
-      onDismiss(approval.id);
-    }, 200);
-  }, [approval.id, onDismiss]);
-
-  const handleDecision = useCallback((decision: 'allow-once' | 'deny' | 'allow-always') => {
+  const handleDecision = useCallback((decision: ExecApprovalDecision) => {
     if (isResolving) return;
-    setIsResolving(true);
+    setResolvingDecision(decision);
     setResolveError(null);
     Promise.resolve(onResolve(approval.id, decision)).catch((err: any) => {
-      setIsResolving(false);
+      setResolvingDecision(null);
       const detail = err?.response?.data?.error || err?.message || '';
       setResolveError(detail && !/^Request failed/i.test(detail)
         ? `Couldn't submit decision (${detail}) — retry or deny.`
@@ -71,13 +76,7 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
     });
   }, [approval.id, onResolve, isResolving]);
 
-  const handleBackdropClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    event.stopPropagation();
-    if (!isResolving) handleDecision('deny');
-  }, [handleDecision, isResolving]);
-
-  const handleButtonClick = useCallback((decision: 'allow-once' | 'deny' | 'allow-always') => (
+  const handleButtonClick = useCallback((decision: ExecApprovalDecision) => (
     event: React.MouseEvent<HTMLButtonElement>,
   ) => {
     event.preventDefault();
@@ -101,41 +100,34 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
 
   // Calculate progress for the countdown ring
   const totalDuration = approval.expiresAtMs - approval.createdAtMs;
-  const progress = Math.max(0, Math.min(1, timeLeft / totalDuration));
+  const progress = totalDuration > 0
+    ? Math.max(0, Math.min(1, timeLeft / totalDuration))
+    : 0;
 
-  const modal = (
-    <AnimatePresence>
-      {!isClosing && (
-        <>
-          {/* Backdrop */}
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.2 }}
-            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50"
-            onClick={handleBackdropClick}
-          />
-
-          {/* Modal */}
-          <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 20 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 20 }}
-            transition={{ duration: 0.2, ease: 'easeOut' }}
-            className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none"
-          >
-            <div
-              className="pointer-events-auto w-full max-w-lg bg-[#0D1130]/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl shadow-black/50 overflow-hidden"
-              onClick={(event) => event.stopPropagation()}
-            >
+  return (
+    <ViewportModal
+      open={!isClosing}
+      onDismiss={() => handleDecision('deny')}
+      dismissible={!isResolving}
+      initialFocusRef={denyButtonRef}
+      className="bg-black/60 p-4 backdrop-blur-sm"
+    >
+      <motion.div
+        initial={{ opacity: 0, scale: 0.95, y: 20 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        transition={{ duration: 0.2, ease: 'easeOut' }}
+        className="max-h-[calc(100dvh-2rem)] w-full max-w-lg overflow-y-auto rounded-2xl border border-white/10 bg-[#0D1130]/95 shadow-2xl shadow-black/50 backdrop-blur-xl"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="exec-approval-title"
+      >
               {/* Header */}
               <div className="px-6 py-4 border-b border-white/10 flex items-center gap-3">
                 <div className="p-2 bg-amber-500/20 rounded-xl">
                   <Shield className="w-5 h-5 text-amber-400" />
                 </div>
                 <div className="flex-1">
-                  <h2 className="text-lg font-semibold text-white">Command Approval Required</h2>
+                  <h2 id="exec-approval-title" className="text-lg font-semibold text-white">Command Approval Required</h2>
                   <p className="text-sm text-white/60">
                     The agent wants to run a command{queueCount > 1 ? `, 1 of ${queueCount} pending` : ''}
                   </p>
@@ -256,16 +248,18 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
               )}
 
               {/* Action buttons */}
-              <div className="px-6 py-4 border-t border-white/10 flex items-center gap-3">
+              <div className="flex flex-col gap-3 border-t border-white/10 px-6 py-4 sm:flex-row sm:items-center">
                 {/* Deny button */}
                 <button
+                  ref={denyButtonRef}
                   type="button"
                   onClick={handleButtonClick('deny')}
                   disabled={isResolving}
+                  aria-busy={resolvingDecision === 'deny'}
                   className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-xl transition-colors font-medium disabled:opacity-50"
                 >
-                  {isResolving ? <Loader2 className="w-5 h-5 animate-spin" /> : <XCircle className="w-5 h-5" />}
-                  Deny
+                  {resolvingDecision === 'deny' ? <Loader2 className="w-5 h-5 animate-spin" /> : <XCircle className="w-5 h-5" />}
+                  {resolvingDecision === 'deny' ? 'Denying…' : 'Deny'}
                 </button>
 
                 {/* Always Allow button */}
@@ -273,10 +267,11 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
                   type="button"
                   onClick={handleButtonClick('allow-always')}
                   disabled={isResolving}
+                  aria-busy={resolvingDecision === 'allow-always'}
                   className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-violet-500/20 hover:bg-violet-500/30 text-violet-400 rounded-xl transition-colors font-medium disabled:opacity-50"
                 >
-                  {isResolving ? <Loader2 className="w-5 h-5 animate-spin" /> : <ShieldCheck className="w-5 h-5" />}
-                  Always Allow
+                  {resolvingDecision === 'allow-always' ? <Loader2 className="w-5 h-5 animate-spin" /> : <ShieldCheck className="w-5 h-5" />}
+                  {resolvingDecision === 'allow-always' ? 'Allowing…' : 'Always Allow'}
                 </button>
 
                 {/* Approve button */}
@@ -284,10 +279,11 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
                   type="button"
                   onClick={handleButtonClick('allow-once')}
                   disabled={isResolving}
+                  aria-busy={resolvingDecision === 'allow-once'}
                   className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 rounded-xl transition-colors font-medium disabled:opacity-50"
                 >
-                  {isResolving ? <Loader2 className="w-5 h-5 animate-spin" /> : <CheckCircle2 className="w-5 h-5" />}
-                  Approve
+                  {resolvingDecision === 'allow-once' ? <Loader2 className="w-5 h-5 animate-spin" /> : <CheckCircle2 className="w-5 h-5" />}
+                  {resolvingDecision === 'allow-once' ? 'Approving…' : 'Approve'}
                 </button>
               </div>
 
@@ -298,13 +294,7 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
                   Review carefully before approving.
                 </p>
               </div>
-            </div>
-          </motion.div>
-        </>
-      )}
-    </AnimatePresence>
+      </motion.div>
+    </ViewportModal>
   );
-
-  if (typeof document === 'undefined') return null;
-  return createPortal(modal, document.body);
 }

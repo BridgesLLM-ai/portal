@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "cases": [
+    {
+      "name": "ordinary metadata",
+      "accepted": true,
+      "highlights": ["Release fixture highlight."]
+    },
+    {
+      "name": "two hundred Unicode code points",
+      "accepted": true,
+      "repeatHighlight": { "value": "🚀", "count": 200 }
+    },
+    {
+      "name": "two hundred and one Unicode code points",
+      "accepted": false,
+      "repeatHighlight": { "value": "🚀", "count": 201 }
+    },
+    {
+      "name": "internal blank line",
+      "accepted": false,
+      "highlights": ["Release fixture highlight."],
+      "lineMutation": "internal-blank-after-schema"
+    },
+    {
+      "name": "leading blank line",
+      "accepted": false,
+      "highlights": ["Release fixture highlight."],
+      "lineMutation": "leading-blank"
+    },
+    {
+      "name": "second trailing blank line",
+      "accepted": false,
+      "highlights": ["Release fixture highlight."],
+      "lineMutation": "extra-trailing-blank"
+    },
+    {
+      "name": "duplicate highlights",
+      "accepted": false,
+      "highlights": ["Duplicate highlight.", "Duplicate highlight."]
+    }
+  ]
+}

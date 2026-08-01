@@ -1,21 +1,325 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
+import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
-import { execSync, exec, spawn } from 'child_process';
+import os from 'os';
+import { execFileSync, execSync } from 'child_process';
 import multer from 'multer';
 import bcrypt from 'bcrypt';
 import rateLimit from 'express-rate-limit';
+import { Prisma, type App, type ProjectChatTurn } from '@prisma/client';
 import { authenticateToken, browserAuthRedirect } from '../middleware/auth';
+import { projectPathSandbox } from '../middleware/pathSandbox';
 import { requireApproved } from '../middleware/requireApproved';
 import { prisma } from '../config/database';
 import { nanoid } from 'nanoid';
-import { gatewayRpcCall, patchSessionModel, getSessionInfo, listGatewayModels, deleteSession } from '../utils/openclawGatewayRpc';
-import { detectDeployType, allocatePort, startApp, stopApp, getAppStatus, getAppPort, listRunningApps } from '../services/app-process.service';
+import {
+  getSessionInfo,
+  listGatewayModels,
+} from '../utils/openclawGatewayRpc';
+import { steerActiveRun } from '../agents/providers/PersistentGatewayWs';
+import {
+  detectDeployType,
+  allocatePort,
+  startApp,
+  restartApp,
+  stopApp,
+  forgetAppRuntime,
+  getAppStatus,
+} from '../services/app-process.service';
 import { getWorkspaceOwnerId } from '../utils/workspaceScope';
-import extract from 'extract-zip';
-import { desktopExec, desktopExecDetached } from '../utils/desktopEnv';
-import { cleanupInvalidRuntimeOnlyModelProvidersFromOpenClawConfig, getDefaultModel, getProviderStatuses } from '../services/openclawConfigManager';
-import { canonicalizeProviderModelId, modelForOpenClawSessionPatch, normalizePortalModelId, resolvePortalModelFromCatalog } from '../utils/openclawCli';
+import { desktopExec, desktopExecManaged } from '../utils/desktopEnv';
+import {
+  createProjectLifecycleWorkspace,
+  copyDesktopRuntimeDeploymentTree,
+  copyFullstackDeploymentTree,
+  copyStaticDeploymentTree,
+  prepareProjectLifecycleWorkspace,
+  promoteProjectLifecycleArtifacts,
+  runProjectLifecycleCommand,
+  spawnProjectLifecycleCommand,
+  type ProjectDeploymentPromotion,
+} from '../services/project-lifecycle.service';
+import {
+  assertSafeProjectGitUrl,
+  runProjectGitCommand,
+} from '../services/project-git.service';
+import { getDefaultModel, getProviderStatusesAsync } from '../services/openclawConfigManager';
+import { canonicalizeProviderModelId, normalizePortalModelId } from '../utils/openclawCli';
+import { scanFile } from '../services/virusScan';
+import { PROJECT_ZIP_LIMITS, safeExtractZipToNewDirectory } from '../services/safeZipExtraction';
+import {
+  ContainedPathError,
+  ensureContainedDirectory,
+  resolveContainedPath,
+  writeContainedFileAtomic,
+} from '../services/containedPath';
+import { removeToolMirror, resolveFilePath } from './files';
+import { parseShareLinkOptions, shareLinkAvailability, validateSharePassword } from '../utils/shareAccessSecurity';
+import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
+import { portalFeatureUnavailableResponse } from '../utils/portalFeatureCapabilities';
+import {
+  PROJECT_DOCUMENT_MAX_BYTES,
+  PROJECT_METADATA_MAX_BYTES,
+  ProjectFilePolicyError,
+  ProjectRangeError,
+  parseProjectByteRange,
+  readProjectTextFile,
+  safeProjectDownloadName,
+  statProjectRegularFile,
+  writeProjectTextFile,
+} from '../services/projectSurfacePolicy';
+import type { AgentProviderName, ProjectSandboxExecutionContext } from '../agents/AgentProvider.interface';
+import {
+  deleteNativeSession,
+  listNativeProjectSessions,
+  loadNativeSession,
+  nativeSessionArtifactsPresent,
+  saveNativeSession,
+  updateNativeSessionModel,
+} from '../agents/providers/NativeSessionStore';
+import { executionContextsMatch } from '../agents/executionScope';
+import { canUseDesktopRuntimeDeployment } from '../utils/authz';
+import {
+  NATIVE_CLI_PROJECT_CONTAINER_ROOT,
+} from '../agents/providers/native/projectSandbox/NativeCliProjectEgressRuntime';
+import { presentProjectQualificationError } from '../services/projectQualificationErrorPresentation';
+import {
+  abortProjectNativeRun,
+  clearProjectNativeRun,
+  getProjectNativeRunSnapshot,
+  PROJECT_NATIVE_SETTLEMENT_FAILURE_MESSAGE,
+  quiesceProjectNativeRunForDestructiveReset,
+  startProjectNativeRun,
+  waitForProjectNativeRunSettlement,
+  type ProjectNativeRunEvent,
+} from '../services/projectNativeRunBroker';
+import { acquireWorkspaceAuthorizationMutationLease } from '../services/workspaceAuthorizationBarrier';
+import {
+  buildProjectChatMessagePresentation,
+  parseProjectChatMessagePresentation,
+  retainNewestProjectChatPresentationEvents,
+  shouldRepairProjectChatPresentation,
+} from '../services/projectChatPresentation';
+import {
+  OpenClawProjectModelVerificationError,
+  isOpenClawProjectEmbeddedModel,
+  listAvailableOpenClawProjectModels,
+  readVerifiedOpenClawSessionModel,
+  resolveAllowedOpenClawProjectModel,
+  verifyThenPersistOpenClawProjectModel,
+} from '../services/openclawProjectModel';
+import {
+  assertNoTransientProjectStateStaged,
+  isTransientProjectStatePath,
+  projectGitAddAllArgs,
+  runProjectCheckpointBoundary,
+  shelveTransientProjectState,
+} from '../services/projectCheckpoint';
+import {
+  ProjectSearchCapacityError,
+  runProjectWorkspaceSearch,
+} from '../services/projectSearch';
+import {
+  ProjectChatBindingReadError,
+  readExistingProjectChatBinding,
+} from '../services/projectChatBindingRead';
+import {
+  CodexProjectModelSelectionError,
+  codexCliModelId,
+  resolveAllowedCodexProjectModel,
+} from '../services/codexProjectModel';
+import {
+  ClaudeCodeProjectModelSelectionError,
+  claudeCodeCliModelId,
+  resolveAllowedClaudeCodeProjectModel,
+} from '../services/claudeCodeProjectModel';
+import {
+  AntigravityProjectModelSelectionError,
+  resolveAllowedAntigravityProjectModel,
+} from '../services/antigravityProjectModel';
+import {
+  OllamaProjectModelSelectionError,
+  parseOllamaProjectModelBinding,
+  resolveAllowedOllamaProjectModel,
+  type OllamaProjectModelSelection,
+} from '../services/ollamaProjectModel';
+import {
+  OllamaAuthorityBarrierBusyError,
+  withOllamaAuthorityRunLease,
+} from '../services/ollamaAuthorityBarrier';
+import {
+  AgentZeroProjectModelSelectionError,
+  agentZeroProjectModelBindingValue,
+  parseAgentZeroProjectModelBinding,
+  resolveAllowedAgentZeroProjectModel,
+} from '../services/agentZeroProjectModel';
+import type {
+  AgentZeroProjectModelSelection,
+} from '../agents/providers/agentZero/AgentZeroProjectModelBridgeCredential';
+import {
+  AgentZeroOAuthError,
+  getDefaultAgentZeroOAuthClient,
+} from '../agents/providers/agentZero/AgentZeroOAuthControl';
+import {
+  filterAgentZeroOAuthModelsForProjectQualification,
+} from '../agents/providers/agentZero/AgentZeroOAuthModelCatalog';
+import { normalizeAntigravityProjectModel } from '../agents/providers/native/projectSandbox/AntigravityProjectSandbox';
+import {
+  UnsupportedProjectChatProviderError,
+  buildProjectChatCapabilityResponse,
+  buildProjectChatProviderHandoff,
+  buildQualifiedProjectChatProviderCapability,
+  buildDiscoveryProjectSandboxExecutionContext,
+  buildUnqualifiedProjectSandboxExecutionContext,
+  ensureProjectChatProviderBinding,
+  getProjectChatProviderCapability,
+  listProjectChatBindings,
+  listProjectChatProviderCapabilities,
+  normalizeProjectChatProvider,
+  planProjectChatProviderSwitch,
+  resolveProjectChatQualificationMatrix,
+  serializeProjectSandboxContext,
+} from '../services/projectChatKernel';
+import {
+  abandonProjectIdentityRenameBeforeCleanup,
+  attestProjectRoot,
+  assertProjectIdentityNameAvailable,
+  beginProjectIdentityRename,
+  beginProjectIdentityDeletion,
+  cancelProjectIdentityRename,
+  createCurrentProjectIdentity,
+  ensureProjectIdentity,
+  finalizeCurrentProjectIdentityCreation,
+  isInternalProjectDirectoryName,
+  markProjectIdentityRenameCleanupStarted,
+  markProjectIdentityRenameRuntimeCleaned,
+  moveAttestedDirectoryNoReplace,
+  readProjectIdentityRenameDeployIdentity,
+  readCompletedProjectIdentityRename,
+  readProjectIdentity,
+  readProjectIdentityRenameJournal,
+  beginOrphanedProjectIdentityDeletion,
+  recoverInterruptedProjectIdentityRename,
+  projectLifecycleBlockedMessage,
+  renameProjectIdentity,
+  renewProjectIdentityRenameLease,
+  ProjectIdentityLifecycleError,
+  type AttestedDirectoryIdentity,
+  type AttestedProjectRoot,
+  type ProjectIdentityRecord,
+  type ProjectIdentityDatabase,
+} from '../services/projectIdentity';
+import {
+  ProjectRuntimeCleanupError,
+  cleanupProjectRuntime,
+  type ProjectRuntimeCleanupScope,
+  type ProjectRuntimeResource,
+} from '../services/projectRuntimeCleanup';
+import { createDefaultProjectRuntimeCleanupAdapters } from '../services/projectRuntimeCleanupAdapters';
+import { createProjectEgressCleanupAdapter } from '../services/projectEgressCleanupAdapter';
+import {
+  migrateLegacyProjectChatState,
+} from '../services/projectChatLegacyMigration';
+import {
+  PROJECT_QUALIFICATION_WINDOW_MS,
+  projectQualificationRateLimitKey,
+  projectQualificationRetryAt,
+  type ProjectQualificationRateLimitIdentity,
+} from '../services/projectQualificationRateLimit';
+import {
+  adoptLegacyProjectInPlace,
+  ProjectLegacyAdoptionError,
+} from '../services/projectLegacyAdoption';
+import {
+  assertNoLegacyOpenClawProjectCreationCollision,
+  assertNoLegacyOpenClawProjectEvidence,
+  assertLegacyOpenClawProjectMigrationInactive,
+  LegacyOpenClawProjectCreationCollisionError,
+  LegacyOpenClawProjectCreationScanCapacityError,
+  LegacyOpenClawProjectMigrationActiveError,
+  LegacyOpenClawProjectRetirementError,
+} from '../services/legacyOpenClawProjectRetirement';
+import { LEGACY_OPENCLAW_RETIREMENT_PENDING_MESSAGE } from '../services/legacyOpenClawRetirementPolicy';
+import { retireLegacyOpenClawProjectRuntime } from '../services/projectChatLegacyRuntimeCleanup';
+import {
+  deriveOpenClawProjectAgentId,
+  deriveOpenClawProjectSessionKey,
+  ensureOpenClawProjectSandbox,
+} from '../services/openclawProjectSandbox';
+import { buildProjectEgressConfig } from '../services/projectEgressCredentials';
+import {
+  QUALIFIABLE_PROJECT_PROVIDERS,
+  getProjectQualificationStatus,
+  qualifyProjectProvider,
+  removeProjectQualificationEvidenceForProject,
+  requireProjectQualification,
+  type QualifiableProjectProvider,
+} from '../services/projectQualificationRegistry';
+import {
+  ProjectChatProviderRuntimeUnavailableError,
+  getProjectChatProviderAdapter,
+  getProjectChatProviderRuntimeDescriptor,
+  isQualifiableProjectProvider,
+  projectChatProviderDisplayName,
+  rebindAgentZeroProjectSessionModel,
+} from '../services/projectChatProviderRegistry';
+import {
+  PortalProjectWorkloadError,
+  removePortalProjectWorkloadsForProject,
+} from '../services/projectWorkloadRuntime';
+import {
+  acquireProjectDeletionLock,
+  projectDeletionLockKey,
+} from '../services/projectDeletionLock';
+import {
+  buildProjectDesktopRuntimeIdentity,
+  ensureSecureProjectDesktopRuntimeRoot,
+  projectDesktopRuntimeAppState,
+  projectDesktopRuntimeCleanupDirectories,
+} from '../services/projectDesktopRuntime';
+import {
+  ProjectChatLeaseError,
+  PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX,
+  PROJECT_CHAT_DISPATCH_STAGE_ACCEPTED,
+  PROJECT_CHAT_DISPATCH_STAGE_UNCONFIRMED,
+  acquireProjectChatRuntimeAdmission,
+  appendProjectChatTurnEvent,
+  confirmProjectChatTurnAbort,
+  createProjectChatDispatchPersistenceGate,
+  ensureProjectChatState,
+  finishProjectChatRuntimeAdmission,
+  finishProjectChatTurn,
+  markProjectChatTurnProviderDispatchAccepted,
+  promoteProjectChatRuntimeAdmissionToTurn,
+  projectChatBindingNeedsHandoff,
+  projectChatTurnDispatchStage,
+  reconcileLegacyProjectChatTerminalHandoff,
+  readProjectChatCoordinationState,
+  readProjectChatTurnReplay,
+  isProjectChatRuntimeAdmissionTurn,
+  renewProjectChatTurnLease,
+  requestProjectChatTurnAbort,
+  withProjectChatRuntimeAdmission,
+  type ProjectChatPersistedProvider,
+  type ProjectChatAssistantProjection,
+} from '../services/projectChatTurnLease';
+import {
+  assertProjectChatDestructiveResetInactive,
+  commitProjectChatDestructiveReset,
+  markProjectChatDestructiveResetStarted,
+  ProjectChatDestructiveResetActiveError,
+  recoverExpiredProjectChatRuntimeAdmissionForDestructiveReset,
+  requireConfirmedProjectChatAbortForReset,
+} from '../services/projectChatDestructiveReset';
+import { readProjectChatProviderHandoffSuffix } from '../services/projectChatHandoff';
+import {
+  isProjectNativeSettlementFailure,
+  matchingProjectNativeSnapshot,
+  resolveProjectChatReplayLineCount,
+  visibleProjectChatActiveTurn,
+} from '../services/projectChatReplayPolicy';
+import { resolveAskUserQuestionRunOwner } from '../services/askUserQuestionSessionOwner';
 
 /** Shell-escape a filename for safe use in execSync commands */
 function shellEscape(s: string): string {
@@ -23,11 +327,752 @@ function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
+function processLookupReportedAbsent(error: unknown): boolean {
+  return !!error && typeof error === 'object' && (error as { status?: unknown }).status === 1;
+}
+
+function desktopRuntimeProcessIds(marker: string): number[] {
+  try {
+    execFileSync('id', ['-u', 'bridgesrd'], { timeout: 3_000, stdio: 'ignore' });
+  } catch (error) {
+    if (processLookupReportedAbsent(error)) return [];
+    throw error;
+  }
+  let output: string;
+  try {
+    output = execFileSync('pgrep', ['-u', 'bridgesrd'], {
+      timeout: 3_000,
+      encoding: 'utf8',
+    });
+  } catch (error) {
+    if (processLookupReportedAbsent(error)) return [];
+    throw error;
+  }
+  const ids = output.split(/\s+/).filter(Boolean);
+  if (ids.some((value) => !/^[1-9][0-9]*$/.test(value))) {
+    throw new Error('Remote Desktop process discovery returned an invalid process identity');
+  }
+  const shellPathToken = path.isAbsolute(marker) ? shellEscape(marker) : null;
+  return ids.flatMap((value) => {
+    const processId = Number(value);
+    let raw: Buffer;
+    try {
+      raw = fs.readFileSync(`/proc/${processId}/cmdline`);
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') return [];
+      throw error;
+    }
+    const args = raw.toString('utf8').split('\0').filter(Boolean);
+    const matches = shellPathToken
+      ? args.some((argument) => argument === marker || argument.includes(shellPathToken))
+      : args.includes(marker);
+    return matches ? [processId] : [];
+  });
+}
+
+function stopDesktopRuntimeProcess(marker: string): void {
+  const signal = (processIds: readonly number[], name: 'SIGTERM' | 'SIGKILL') => {
+    for (const processId of processIds) {
+      try {
+        process.kill(processId, name);
+      } catch (error: any) {
+        if (error?.code !== 'ESRCH') throw error;
+      }
+    }
+  };
+  signal(desktopRuntimeProcessIds(marker), 'SIGTERM');
+  if (isDesktopRuntimeProcessRunning(marker)) {
+    signal(desktopRuntimeProcessIds(marker), 'SIGKILL');
+  }
+  if (isDesktopRuntimeProcessRunning(marker)) {
+    throw new Error('Remote Desktop Project runtime remained after its exact process stop');
+  }
+}
+
+function isDesktopRuntimeProcessRunning(processMarker: string): boolean {
+  return desktopRuntimeProcessIds(processMarker).length > 0;
+}
+
+function desktopRuntimeUnitProperty(unitName: string, property: string): string {
+  return execFileSync('systemctl', [
+    'show',
+    unitName,
+    `--property=${property}`,
+    '--value',
+  ], {
+    encoding: 'utf8',
+    timeout: 5000,
+  }).trim();
+}
+
+function desktopRuntimeCgroupHasProcesses(controlGroup: string): boolean {
+  if (!controlGroup) return false;
+  if (!controlGroup.startsWith('/system.slice/') || controlGroup.includes('..')) {
+    throw new ProjectIdentityLifecycleError('Managed Remote Desktop cgroup identity is invalid');
+  }
+  const cgroupRoot = path.resolve('/sys/fs/cgroup', `.${controlGroup}`);
+  if (!cgroupRoot.startsWith('/sys/fs/cgroup/system.slice/')) {
+    throw new ProjectIdentityLifecycleError('Managed Remote Desktop cgroup escaped system.slice');
+  }
+  if (!managedPathExists(cgroupRoot)) return false;
+  const pending = [cgroupRoot];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    const processesPath = path.join(current, 'cgroup.procs');
+    if (managedPathExists(processesPath) && fs.readFileSync(processesPath, 'utf8').trim()) return true;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (entry.isDirectory()) pending.push(path.join(current, entry.name));
+    }
+  }
+  return false;
+}
+
+function stopManagedDesktopRuntimeUnit(unitName: string): void {
+  const loadState = desktopRuntimeUnitProperty(unitName, 'LoadState');
+  if (loadState === 'not-found') return;
+  execFileSync('systemctl', ['stop', unitName], { timeout: 20_000 });
+  const activeState = desktopRuntimeUnitProperty(unitName, 'ActiveState');
+  const controlGroup = desktopRuntimeUnitProperty(unitName, 'ControlGroup');
+  if (
+    !['inactive', 'failed'].includes(activeState)
+    || desktopRuntimeCgroupHasProcesses(controlGroup)
+  ) {
+    throw new ProjectIdentityLifecycleError(
+      'Managed Remote Desktop Project process tree remained after cgroup stop',
+    );
+  }
+  try {
+    execFileSync('systemctl', ['reset-failed', unitName], { timeout: 5000 });
+  } catch {
+    // A collected transient unit may disappear immediately after stop.
+  }
+}
+
+function isManagedDesktopRuntimeUnitRunning(unitName: string): boolean {
+  const loadState = desktopRuntimeUnitProperty(unitName, 'LoadState');
+  return loadState !== 'not-found'
+    && ['active', 'activating'].includes(desktopRuntimeUnitProperty(unitName, 'ActiveState'));
+}
+
+function managedPathExists(candidate: string): boolean {
+  try {
+    fs.lstatSync(candidate);
+    return true;
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function sameAttestedDirectoryIdentity(
+  expected: Pick<AttestedProjectRoot, 'rootDevice' | 'rootInode' | 'rootBirthtimeNs'>,
+  actual: Pick<AttestedProjectRoot, 'rootDevice' | 'rootInode' | 'rootBirthtimeNs'>,
+): boolean {
+  return expected.rootDevice === actual.rootDevice
+    && expected.rootInode === actual.rootInode
+    && expected.rootBirthtimeNs === actual.rootBirthtimeNs;
+}
+
+function lifecycleQuarantineRoot(parent: string): string {
+  const resolvedParent = path.resolve(parent);
+  const parentIdentity = attestProjectRoot(resolvedParent);
+  if (parentIdentity.canonicalRoot !== resolvedParent) {
+    throw new ProjectIdentityLifecycleError(
+      'Project lifecycle quarantine parent resolved through an unexpected path',
+    );
+  }
+  const currentUid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  let trustedAnchor = resolvedParent;
+  while (true) {
+    const entry = fs.lstatSync(trustedAnchor);
+    const identity = attestProjectRoot(trustedAnchor);
+    if (
+      identity.canonicalRoot === trustedAnchor
+      && identity.rootDevice === parentIdentity.rootDevice
+      && entry.uid === currentUid
+      && (entry.mode & 0o022) === 0
+    ) {
+      break;
+    }
+    const next = path.dirname(trustedAnchor);
+    if (next === trustedAnchor) {
+      throw new ProjectIdentityLifecycleError(
+        'No server-owned same-filesystem Project lifecycle quarantine anchor exists',
+      );
+    }
+    const nextIdentity = attestProjectRoot(next);
+    if (nextIdentity.rootDevice !== parentIdentity.rootDevice) {
+      throw new ProjectIdentityLifecycleError(
+        'Project lifecycle quarantine cannot cross a filesystem boundary',
+      );
+    }
+    trustedAnchor = next;
+  }
+  const quarantineRoot = path.join(trustedAnchor, '.bridgesllm-lifecycle-quarantine');
+  try {
+    fs.mkdirSync(quarantineRoot, { mode: 0o700 });
+  } catch (error: any) {
+    if (error?.code !== 'EEXIST') throw error;
+  }
+  const entry = fs.lstatSync(quarantineRoot);
+  if (
+    entry.isSymbolicLink()
+    || !entry.isDirectory()
+    || entry.uid !== currentUid
+    || (entry.mode & 0o077) !== 0
+  ) {
+    throw new ProjectIdentityLifecycleError('Project lifecycle quarantine root is not server-private');
+  }
+  if (attestProjectRoot(quarantineRoot).canonicalRoot !== quarantineRoot) {
+    throw new ProjectIdentityLifecycleError(
+      'Project lifecycle quarantine root resolved through an unexpected path',
+    );
+  }
+  return quarantineRoot;
+}
+
+async function removeDirectoryThroughAttestedQuarantine(input: {
+  sourceRoot: string;
+  quarantineKey: string;
+  expectedIdentity?: Pick<AttestedProjectRoot, 'rootDevice' | 'rootInode' | 'rootBirthtimeNs'>;
+  sourceMustBeAbsent?: boolean;
+}): Promise<boolean> {
+  const sourceRoot = path.resolve(input.sourceRoot);
+  const sourceParent = path.dirname(sourceRoot);
+  if (!managedPathExists(sourceParent)) {
+    if (input.expectedIdentity) {
+      throw new ProjectIdentityLifecycleError(
+        'Attested managed directory parent disappeared before lifecycle quarantine',
+      );
+    }
+    return false;
+  }
+  const quarantineRoot = lifecycleQuarantineRoot(sourceParent);
+  const quarantineName = crypto.createHash('sha256')
+    .update(`project-lifecycle\0${input.quarantineKey}\0${sourceRoot}`)
+    .digest('hex');
+  const quarantinedRoot = path.join(quarantineRoot, quarantineName);
+  const receiptPath = `${quarantinedRoot}.receipt`;
+  const readReceipt = (): AttestedDirectoryIdentity | null => {
+    if (!managedPathExists(receiptPath)) return null;
+    const entry = fs.lstatSync(receiptPath);
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : 0;
+    if (
+      entry.isSymbolicLink()
+      || !entry.isFile()
+      || entry.uid !== currentUid
+      || (entry.mode & 0o077) !== 0
+    ) {
+      throw new ProjectIdentityLifecycleError('Lifecycle quarantine receipt is not server-private');
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+    } catch {
+      throw new ProjectIdentityLifecycleError('Lifecycle quarantine receipt is malformed');
+    }
+    const record = parsed as Partial<AttestedDirectoryIdentity> & { version?: unknown };
+    if (
+      record.version !== 1
+      || typeof record.rootDevice !== 'string'
+      || typeof record.rootInode !== 'string'
+      || typeof record.rootBirthtimeNs !== 'string'
+    ) {
+      throw new ProjectIdentityLifecycleError('Lifecycle quarantine receipt is incomplete');
+    }
+    return Object.freeze({
+      canonicalRoot: quarantinedRoot,
+      rootDevice: record.rootDevice,
+      rootInode: record.rootInode,
+      rootBirthtimeNs: record.rootBirthtimeNs,
+    });
+  };
+  const persistReceipt = (identity: AttestedDirectoryIdentity): void => {
+    const existing = readReceipt();
+    if (existing) {
+      if (!sameAttestedDirectoryIdentity(existing, identity)) {
+        throw new ProjectIdentityLifecycleError(
+          'Lifecycle quarantine receipt conflicts with its attested directory',
+        );
+      }
+      return;
+    }
+    const temporaryPath = path.join(
+      quarantineRoot,
+      `.${quarantineName}.${process.pid}.${crypto.randomUUID()}.tmp`,
+    );
+    const descriptor = fs.openSync(temporaryPath, 'wx', 0o600);
+    try {
+      fs.writeFileSync(descriptor, JSON.stringify({
+        version: 1,
+        rootDevice: identity.rootDevice,
+        rootInode: identity.rootInode,
+        rootBirthtimeNs: identity.rootBirthtimeNs,
+      }));
+      fs.fsyncSync(descriptor);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    try {
+      fs.renameSync(temporaryPath, receiptPath);
+      const directoryDescriptor = fs.openSync(quarantineRoot, 'r');
+      try {
+        fs.fsyncSync(directoryDescriptor);
+      } finally {
+        fs.closeSync(directoryDescriptor);
+      }
+    } catch (error) {
+      try { fs.unlinkSync(temporaryPath); } catch {}
+      throw error;
+    }
+  };
+  const sourceExists = managedPathExists(sourceRoot);
+  const quarantineExists = managedPathExists(quarantinedRoot);
+  if (input.sourceMustBeAbsent && sourceExists) {
+    throw new ProjectIdentityLifecycleError(
+      'A managed directory appeared after lifecycle cleanup recorded its absence',
+    );
+  }
+  if (sourceExists && quarantineExists) {
+    throw new ProjectIdentityLifecycleError('Managed directory and its lifecycle quarantine both exist');
+  }
+  if (!sourceExists && !quarantineExists) {
+    if (!input.expectedIdentity) return false;
+    const receipt = readReceipt();
+    if (receipt && sameAttestedDirectoryIdentity(input.expectedIdentity, receipt)) return true;
+    throw new ProjectIdentityLifecycleError(
+      'Attested managed directory disappeared without a durable quarantine receipt',
+    );
+  }
+  const attested = sourceExists
+    ? moveAttestedDirectoryNoReplace({
+        sourceRoot,
+        targetRoot: quarantinedRoot,
+        expectedIdentity: input.expectedIdentity,
+      })
+    : attestProjectRoot(quarantinedRoot);
+  if (input.expectedIdentity && !sameAttestedDirectoryIdentity(input.expectedIdentity, attested)) {
+    throw new ProjectIdentityLifecycleError('Lifecycle quarantine no longer matches its attested directory');
+  }
+  persistReceipt(attested);
+  await fs.promises.rm(quarantinedRoot, { recursive: true, force: false });
+  if (managedPathExists(quarantinedRoot)) {
+    throw new ProjectIdentityLifecycleError('Lifecycle quarantine remained after recursive removal');
+  }
+  return true;
+}
+
 const router = Router();
+
+// Clear History and assistant reset still need the unresolved legacy retirement
+// primitives. Project rename/delete have a narrower safe lane for identities
+// born at the Portal 4 creation boundary and are admitted below by immutable ID.
+const PORTAL_4_DESTRUCTIVE_CHAT_RESET_ROUTES_ENABLED = false as const;
+const PROJECT_DESTRUCTIVE_RETIREMENT_PENDING_RESPONSE = Object.freeze({
+  error: LEGACY_OPENCLAW_RETIREMENT_PENDING_MESSAGE,
+  code: 'LEGACY_OPENCLAW_PROJECT_RETIREMENT_PENDING',
+  retryable: false,
+});
+
+function rejectDestructiveProjectChatResetRouteForRelease(res: Response): boolean {
+  if (PORTAL_4_DESTRUCTIVE_CHAT_RESET_ROUTES_ENABLED) return false;
+  res.status(409).json(PROJECT_DESTRUCTIVE_RETIREMENT_PENDING_RESPONSE);
+  return true;
+}
+const PROJECT_RUNTIME_CLEANUP_ADAPTERS = createDefaultProjectRuntimeCleanupAdapters();
+const PROJECT_EGRESS_CLEANUP_ADAPTER = createProjectEgressCleanupAdapter();
+const PROJECT_CHAT_LEASE_HOST = process.env.HOSTNAME || 'portal';
+const PROJECT_CHAT_LEASE_OWNER = `${PROJECT_CHAT_LEASE_HOST}:${process.pid}:${crypto.randomUUID()}`;
+const PROJECT_CHAT_LEASE_DURATION_MS = 5 * 60_000;
+const PROJECT_CHAT_LEASE_RENEW_INTERVAL_MS = 30_000;
+const PROJECT_CHAT_PRESENTATION_EVENT_LIMIT = 2_000;
+const PROJECT_CHAT_ROUTE_PROVIDERS = Object.freeze([
+  'OPENCLAW',
+  'CODEX',
+  'CLAUDE_CODE',
+  'AGENT_ZERO',
+  'GEMINI',
+  'OLLAMA',
+] as const);
+type ProjectChatRouteProvider = typeof PROJECT_CHAT_ROUTE_PROVIDERS[number];
+type NativeProjectChatRouteProvider = Exclude<ProjectChatRouteProvider, 'OPENCLAW'>;
+const PROJECT_CHAT_ROUTE_PROVIDER_SET = new Set<AgentProviderName>(PROJECT_CHAT_ROUTE_PROVIDERS);
+
+function projectChatRuntimeOperationId(base: string, ...identityParts: unknown[]): string {
+  const digest = crypto.createHash('sha256')
+    .update(JSON.stringify(identityParts))
+    .digest('hex')
+    .slice(0, 24);
+  return `${base}-${digest}`;
+}
+
+function projectChatLeaseOwnerIsInactive(leaseOwner: string): boolean {
+  const segments = String(leaseOwner || '').split(':');
+  if (segments.length < 3) return false;
+  const processId = Number(segments.at(-2));
+  const host = segments.slice(0, -2).join(':');
+  if (host !== PROJECT_CHAT_LEASE_HOST || !Number.isSafeInteger(processId) || processId < 2) return false;
+  if (processId === process.pid) return false;
+  try {
+    process.kill(processId, 0);
+    return false;
+  } catch (error: any) {
+    return error?.code === 'ESRCH';
+  }
+}
+
+function projectChatLeaseOwnerCanBeRecoveredByDestructiveReset(leaseOwner: string): boolean {
+  const segments = String(leaseOwner || '').split(':');
+  if (segments.length < 3) return false;
+  const host = segments.slice(0, -2).join(':');
+  // A different host is the backup/restore case. Reset does not claim that
+  // process is dead; it first terminates every attested provider session and
+  // only then retires the exact expired admission transactionally.
+  return host !== PROJECT_CHAT_LEASE_HOST || projectChatLeaseOwnerIsInactive(leaseOwner);
+}
+
+function isProjectChatRouteProvider(provider: AgentProviderName): provider is ProjectChatRouteProvider {
+  return PROJECT_CHAT_ROUTE_PROVIDER_SET.has(provider);
+}
+
+function isNativeProjectChatRouteProvider(
+  provider: AgentProviderName,
+): provider is NativeProjectChatRouteProvider {
+  return provider !== 'OPENCLAW' && isProjectChatRouteProvider(provider);
+}
+
+function requireProjectChatRouteProvider(provider: AgentProviderName): ProjectChatRouteProvider {
+  if (!isProjectChatRouteProvider(provider)) {
+    throw new UnsupportedProjectChatProviderError(
+      provider,
+      'No qualified central Project Chat route is enabled for this provider.',
+    );
+  }
+  return provider;
+}
+
 const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(process.env.HOME || '/root', '.openclaw');
 const MAIN_AGENT_DIR = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent');
 const MAIN_AUTH_PROFILES_PATH = path.join(MAIN_AGENT_DIR, 'auth-profiles.json');
 const MAIN_MODELS_PATH = path.join(MAIN_AGENT_DIR, 'models.json');
+
+export interface ProjectStorageOptions {
+  projectsDir?: string;
+  deployDir?: string;
+  zipsDir?: string;
+  uploadTempDir?: string;
+  portalRoot?: string;
+}
+
+export function resolveProjectStoragePaths(options: ProjectStorageOptions = {}) {
+  const portalRoot = path.resolve(options.portalRoot || process.env.PORTAL_DATA_ROOT || process.env.PORTAL_ROOT || '/portal');
+  return {
+    projectsDir: path.resolve(options.projectsDir || process.env.PORTAL_PROJECTS_ROOT || path.join(portalRoot, 'projects')),
+    deployDir: path.resolve(options.deployDir || process.env.APPS_ROOT || '/var/www/bridgesllm-apps'),
+    zipsDir: path.resolve(options.zipsDir || process.env.PORTAL_PROJECT_ZIPS_ROOT || path.join(portalRoot, 'project-zips')),
+    uploadTempDir: path.resolve(options.uploadTempDir || process.env.PORTAL_UPLOAD_TEMP_ROOT || path.join(portalRoot, 'upload-temp')),
+  };
+}
+
+const projectStoragePaths = resolveProjectStoragePaths();
+export const PROJECTS_DIR = projectStoragePaths.projectsDir;
+export const DEPLOY_DIR = projectStoragePaths.deployDir;
+export const ZIPS_DIR = projectStoragePaths.zipsDir;
+export const UPLOAD_TEMP_DIR = projectStoragePaths.uploadTempDir;
+
+const PROJECT_CREATION_STAGING_DIRECTORY = '.bridgesllm-project-creation-staging';
+
+function ensureProjectCreationStagingRoot(projectsDir = PROJECTS_DIR): string {
+  const projectsRoot = attestProjectRoot(projectsDir);
+  if (projectsRoot.canonicalRoot !== path.resolve(projectsDir)) {
+    throw new ProjectIdentityLifecycleError('Project creation staging parent is not canonical');
+  }
+  const stagingRoot = path.join(projectsRoot.canonicalRoot, PROJECT_CREATION_STAGING_DIRECTORY);
+  ensureRuntimeDirectory(stagingRoot, { mode: 0o700, enforceMode: true });
+  const entry = fs.lstatSync(stagingRoot);
+  const currentUid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  if (
+    entry.isSymbolicLink()
+    || !entry.isDirectory()
+    || entry.uid !== currentUid
+    || (entry.mode & 0o077) !== 0
+    || attestProjectRoot(stagingRoot).canonicalRoot !== stagingRoot
+  ) {
+    throw new ProjectIdentityLifecycleError('Project creation staging root is not server-private');
+  }
+  return stagingRoot;
+}
+
+function createProjectCreationStagingDirectory(): string {
+  const stagingRoot = ensureProjectCreationStagingRoot();
+  const staged = fs.mkdtempSync(path.join(stagingRoot, 'create-'));
+  fs.chmodSync(staged, 0o700);
+  const identity = attestProjectRoot(staged);
+  if (path.dirname(identity.canonicalRoot) !== stagingRoot) {
+    throw new ProjectIdentityLifecycleError('Project creation staging directory escaped its root');
+  }
+  return identity.canonicalRoot;
+}
+
+async function removeAttestedProjectCreationDirectory(
+  directory: string,
+  expected: Pick<AttestedProjectRoot, 'rootDevice' | 'rootInode' | 'rootBirthtimeNs'>,
+): Promise<void> {
+  const current = attestProjectRoot(directory);
+  if (!sameAttestedDirectoryIdentity(expected, current)) {
+    throw new ProjectIdentityLifecycleError('Project creation directory changed before cleanup');
+  }
+  await fs.promises.rm(directory, { recursive: true, force: false });
+  if (managedPathExists(directory)) {
+    throw new ProjectIdentityLifecycleError('Project creation directory remained after cleanup');
+  }
+}
+
+export async function discardFailedCurrentProjectCreation(input: {
+  projectIdentityId?: string;
+  directory?: string;
+  expectedDirectoryIdentity?: Pick<AttestedProjectRoot, 'rootDevice' | 'rootInode' | 'rootBirthtimeNs'>;
+}, options: {
+  removeWorkloads?: (projectIdentityId: string) => Promise<unknown>;
+  database?: Pick<typeof prisma, 'projectIdentity'>;
+} = {}): Promise<'discarded' | 'published'> {
+  const removeWorkloads = options.removeWorkloads || removePortalProjectWorkloadsForProject;
+  const database = options.database || prisma;
+  if (!input.projectIdentityId) {
+    if (!input.directory) return 'discarded';
+    if (!input.expectedDirectoryIdentity) {
+      throw new ProjectIdentityLifecycleError('Failed Project creation has no directory attestation');
+    }
+    await removeAttestedProjectCreationDirectory(input.directory, input.expectedDirectoryIdentity);
+    return 'discarded';
+  }
+  const identity = await database.projectIdentity.findUnique({
+    where: { id: input.projectIdentityId },
+  });
+  if (!identity) {
+    // Portal versions that still cascaded ProjectIdentity from User could
+    // erase the database claim while this request was constructing the hidden
+    // root. The request still holds the inode attestation captured before any
+    // content was written, so it may remove exactly that root. Never infer or
+    // recursively sweep some other unclaimed directory.
+    if (!input.directory || !input.expectedDirectoryIdentity) {
+      throw new ProjectIdentityLifecycleError('Failed Project creation identity disappeared before reconciliation');
+    }
+    await removeAttestedProjectCreationDirectory(input.directory, input.expectedDirectoryIdentity);
+    return 'discarded';
+  }
+  if (identity.lifecycleStatus === 'ACTIVE') {
+    if (
+      identity.legacyOpenClawMigrationStatus !== 'CURRENT'
+      || !input.directory
+      || !managedPathExists(input.directory)
+      || !sameAttestedDirectoryIdentity(identity, attestProjectRoot(input.directory))
+    ) {
+      throw new ProjectIdentityLifecycleError('Published Project creation could not be reconciled safely');
+    }
+    return 'published';
+  }
+  if (
+    identity.lifecycleStatus !== 'CREATING'
+    || identity.legacyOpenClawMigrationStatus !== 'CURRENT'
+  ) {
+    throw new ProjectIdentityLifecycleError('Failed Project creation is not cleanup-eligible');
+  }
+  const claimed = await database.projectIdentity.updateMany({
+    where: {
+      id: identity.id,
+      lifecycleStatus: 'CREATING',
+      legacyOpenClawMigrationStatus: 'CURRENT',
+      canonicalRoot: identity.canonicalRoot,
+      rootDevice: identity.rootDevice,
+      rootInode: identity.rootInode,
+      rootBirthtimeNs: identity.rootBirthtimeNs,
+    },
+    data: { lifecycleStatus: 'CREATION_CLEANUP' },
+  });
+  if (claimed.count !== 1) {
+    throw new ProjectIdentityLifecycleError('Failed Project creation changed before cleanup admission');
+  }
+  await removeWorkloads(identity.id);
+  if (input.directory) {
+    await removeAttestedProjectCreationDirectory(input.directory, identity);
+  }
+  const deleted = await database.projectIdentity.deleteMany({
+    where: {
+      id: identity.id,
+      lifecycleStatus: 'CREATION_CLEANUP',
+      legacyOpenClawMigrationStatus: 'CURRENT',
+    },
+  });
+  if (deleted.count !== 1) {
+    throw new ProjectIdentityLifecycleError('Failed Project creation cleanup claim changed before discard');
+  }
+  return 'discarded';
+}
+
+async function reconcileFailedCurrentProjectCreation(input: {
+  projectIdentityId?: string;
+  directory?: string;
+  expectedDirectoryIdentity?: Pick<AttestedProjectRoot, 'rootDevice' | 'rootInode' | 'rootBirthtimeNs'>;
+}, cleanupFailureLabel: string): Promise<'discarded' | 'published' | 'failed'> {
+  try {
+    return await discardFailedCurrentProjectCreation(input);
+  } catch (cleanupError) {
+    console.error(cleanupFailureLabel, cleanupError);
+    return 'failed';
+  }
+}
+
+export function initializeProjectStorage(options: ProjectStorageOptions = {}): ReturnType<typeof resolveProjectStoragePaths> {
+  const paths = Object.keys(options).length > 0 ? resolveProjectStoragePaths(options) : projectStoragePaths;
+  ensureRuntimeDirectory(paths.projectsDir, { mode: 0o755 });
+  ensureProjectCreationStagingRoot(paths.projectsDir);
+  ensureRuntimeDirectory(paths.deployDir, { mode: 0o755 });
+  ensureRuntimeDirectory(paths.zipsDir, { mode: 0o700, enforceMode: true });
+  ensureRuntimeDirectory(paths.uploadTempDir, { mode: 0o700, enforceMode: true });
+  return paths;
+}
+
+/**
+ * Converge only server-owned CREATING identities after a process restart.
+ * A staging inode was never published and is discarded; a matching final
+ * inode proves the no-replace move completed after construction and can be
+ * finalized. Ambiguous or replaced paths stop startup rather than guessing.
+ */
+export async function recoverInterruptedCurrentProjectCreations(options: {
+  projectsDir?: string;
+  database?: Pick<typeof prisma, 'projectIdentity'>;
+  removeWorkloads?: (projectIdentityId: string) => Promise<unknown>;
+  collisionProof?: typeof assertNoLegacyOpenClawProjectCreationCollision;
+  finalizeCreation?: typeof finalizeCurrentProjectIdentityCreation;
+} = {}): Promise<{
+  finalized: number;
+  discarded: number;
+  orphanStagingDirectories: number;
+  preservedOrphanStagingDirectories: number;
+}> {
+  const projectsDir = path.resolve(options.projectsDir || PROJECTS_DIR);
+  const database = options.database || prisma;
+  const removeWorkloads = options.removeWorkloads || removePortalProjectWorkloadsForProject;
+  const collisionProof = options.collisionProof || assertNoLegacyOpenClawProjectCreationCollision;
+  const finalizeCreation = options.finalizeCreation || finalizeCurrentProjectIdentityCreation;
+  const stagingRoot = ensureProjectCreationStagingRoot(projectsDir);
+  const creations = await database.projectIdentity.findMany({
+    where: { lifecycleStatus: { in: ['CREATING', 'CREATION_CLEANUP'] } },
+    orderBy: { createdAt: 'asc' },
+  });
+  const claimedStagingRoots = new Set<string>();
+  let finalized = 0;
+  let discarded = 0;
+  for (const creation of creations) {
+    if (creation.legacyOpenClawMigrationStatus !== 'CURRENT') {
+      throw new ProjectIdentityLifecycleError('Interrupted Project creation lost CURRENT provenance');
+    }
+    const stagedRoot = path.resolve(creation.canonicalRoot);
+    if (path.dirname(stagedRoot) !== stagingRoot) {
+      throw new ProjectIdentityLifecycleError('Interrupted Project creation escaped the staging root');
+    }
+    claimedStagingRoots.add(stagedRoot);
+    if (
+      !/^[a-zA-Z0-9_-]+$/.test(creation.workspaceOwnerId)
+      || !creation.projectName
+      || path.basename(creation.projectName) !== creation.projectName
+      || creation.projectName.includes('\\')
+    ) {
+      throw new ProjectIdentityLifecycleError('Interrupted Project creation has an invalid final name');
+    }
+    const finalRoot = path.join(projectsDir, creation.workspaceOwnerId, creation.projectName);
+    const stagedExists = managedPathExists(stagedRoot);
+    const finalExists = managedPathExists(finalRoot);
+    if (stagedExists && finalExists) {
+      throw new ProjectIdentityLifecycleError('Interrupted Project creation has both staged and final roots');
+    }
+    await removeWorkloads(creation.id);
+    if (creation.lifecycleStatus === 'CREATION_CLEANUP') {
+      const cleanupRoot = finalExists ? finalRoot : stagedExists ? stagedRoot : null;
+      if (cleanupRoot) {
+        const cleanupIdentity = attestProjectRoot(cleanupRoot);
+        if (!sameAttestedDirectoryIdentity(creation, cleanupIdentity)) {
+          throw new ProjectIdentityLifecycleError('Interrupted Project cleanup root changed before recovery');
+        }
+        await removeAttestedProjectCreationDirectory(cleanupRoot, creation);
+      }
+      const deleted = await database.projectIdentity.deleteMany({
+        where: {
+          id: creation.id,
+          lifecycleStatus: 'CREATION_CLEANUP',
+          legacyOpenClawMigrationStatus: 'CURRENT',
+        },
+      });
+      if (deleted.count !== 1) {
+        throw new ProjectIdentityLifecycleError('Interrupted Project cleanup claim changed before recovery');
+      }
+      discarded += 1;
+      continue;
+    }
+    if (finalExists) {
+      const finalIdentity = attestProjectRoot(finalRoot);
+      if (!sameAttestedDirectoryIdentity(creation, finalIdentity)) {
+        throw new ProjectIdentityLifecycleError('Interrupted Project final root changed before recovery');
+      }
+      // The pre-move scan may be arbitrarily old after downtime. Re-prove
+      // scoped legacy absence before making the recovered project ACTIVE.
+      await collisionProof({
+        workspaceOwnerId: creation.workspaceOwnerId,
+        projectName: creation.projectName,
+        projectRoot: finalRoot,
+      });
+      await finalizeCreation({
+        projectIdentityId: creation.id,
+        projectRoot: finalRoot,
+      });
+      finalized += 1;
+      continue;
+    }
+    if (stagedExists) {
+      await removeAttestedProjectCreationDirectory(stagedRoot, creation);
+    }
+    const deleted = await database.projectIdentity.deleteMany({
+      where: {
+        id: creation.id,
+        lifecycleStatus: 'CREATING',
+        legacyOpenClawMigrationStatus: 'CURRENT',
+      },
+    });
+    if (deleted.count !== 1) {
+      throw new ProjectIdentityLifecycleError('Interrupted Project creation changed before discard');
+    }
+    discarded += 1;
+  }
+
+  let orphanStagingDirectories = 0;
+  let preservedOrphanStagingDirectories = 0;
+  for (const entry of fs.readdirSync(stagingRoot, { withFileTypes: true })) {
+    const candidate = path.join(stagingRoot, entry.name);
+    if (claimedStagingRoots.has(candidate)) continue;
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new ProjectIdentityLifecycleError('Unknown entry exists in Project creation staging');
+    }
+    // Empty roots are the ordinary pre-insert crash window. Older Portal
+    // versions could also lose a claim through User cascade while content was
+    // being written. Preserve those nonempty roots rather than guessing their
+    // ownership, but do not let ambiguous residue boot-loop the Portal.
+    try {
+      fs.rmdirSync(candidate);
+      orphanStagingDirectories += 1;
+    } catch (error: any) {
+      if (error?.code !== 'ENOTEMPTY' && error?.code !== 'EEXIST') throw error;
+      preservedOrphanStagingDirectories += 1;
+      console.warn('[Project Creation] Preserving nonempty unclaimed staging directory:', entry.name);
+    }
+  }
+  return {
+    finalized,
+    discarded,
+    orphanStagingDirectories,
+    preservedOrphanStagingDirectories,
+  };
+}
 
 function syncProjectAgentRuntimeFiles(agentId: string) {
   try {
@@ -45,17 +1090,22 @@ function syncProjectAgentRuntimeFiles(agentId: string) {
 }
 
 // Multer for ZIP uploads
-const ZIPS_DIR = '/portal/project-zips';
-fs.mkdirSync(ZIPS_DIR, { recursive: true });
 const zipStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, ZIPS_DIR),
-  filename: (_req, file, cb) => cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname)}`),
+  destination: (_req, _file, cb) => {
+    try {
+      initializeProjectStorage();
+      cb(null, ZIPS_DIR);
+    } catch (error: any) {
+      cb(error, ZIPS_DIR);
+    }
+  },
+  filename: (_req, _file, cb) => cb(null, `${nanoid(24)}.zip`),
 });
 const zipUpload = multer({
   storage: zipStorage,
   limits: { fileSize: 200 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    if (file.mimetype === 'application/zip' || file.mimetype === 'application/x-zip-compressed' || file.originalname.endsWith('.zip')) {
+    if (file.mimetype === 'application/zip' || file.mimetype === 'application/x-zip-compressed' || file.originalname.toLowerCase().endsWith('.zip')) {
       cb(null, true);
     } else {
       cb(new Error('Only ZIP files are allowed'));
@@ -63,147 +1113,198 @@ const zipUpload = multer({
   },
 });
 // Multer for general file uploads to projects (any file type)
-const UPLOAD_TEMP_DIR = '/portal/upload-temp';
-fs.mkdirSync(UPLOAD_TEMP_DIR, { recursive: true });
 const fileUploadStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, UPLOAD_TEMP_DIR),
-  filename: (_req, file, cb) => cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}-${file.originalname}`),
+  destination: (_req, _file, cb) => {
+    try {
+      initializeProjectStorage();
+      cb(null, UPLOAD_TEMP_DIR);
+    } catch (error: any) {
+      cb(error, UPLOAD_TEMP_DIR);
+    }
+  },
+  filename: (_req, file, cb) => {
+    const safeName = path.posix.basename(file.originalname.replace(/\\/g, '/')).replace(/[\u0000-\u001f\u007f]/g, '_').slice(0, 180) || 'file';
+    cb(null, `${nanoid(24)}-${safeName}`);
+  },
 });
 const fileUpload = multer({
   storage: fileUploadStorage,
   limits: { fileSize: 100 * 1024 * 1024 }, // 100MB per file
 });
 
-const PROJECTS_DIR = path.join(process.env.PORTAL_ROOT || '/portal', 'projects');
-const DEPLOY_DIR = process.env.APPS_ROOT || '/var/www/bridgesllm-apps';
-const PROJECT_IDENTITY_FILENAME = '.portal-project.json';
 const PROJECT_EDIT_MAX_BYTES = 10 * 1024 * 1024;
 const PROJECT_RAW_MAX_BYTES = 100 * 1024 * 1024;
-const PROJECT_AGENT_GIT_NAME = process.env.PORTAL_PROJECT_AGENT_GIT_NAME || 'Assistant AI';
-const PROJECT_AGENT_GIT_EMAIL = process.env.PORTAL_PROJECT_AGENT_GIT_EMAIL || process.env.GIT_AUTHOR_EMAIL || 'admin@localhost';
-fs.mkdirSync(PROJECTS_DIR, { recursive: true });
-fs.mkdirSync(DEPLOY_DIR, { recursive: true });
-
 type ProjectIdentityMeta = {
-  version: 1;
+  version: 2;
+  projectInstanceId: string;
+  workspaceOwnerId: string;
   stableSlug: string;
   createdAt: string;
 };
+
+type ProjectIdentityProof = {
+  id: string;
+  generation: number;
+};
+
+const PROJECT_MOVE_REQUIRED_CODE = 'PROJECT_MOVE_REQUIRED';
+const PROJECT_DESTRUCTIVE_MOVE_REQUIRED_MESSAGE =
+  'Move this older project into a new Portal project before renaming or deleting it.';
+const PROJECT_CHAT_MOVE_REQUIRED_MESSAGE =
+  'Portal will preserve this project, its links, and its files. Older agent history must be reconciled before Project Chat can be prepared; if that evidence is still present, nothing is changed.';
+
+class ProjectMoveRequiredError extends Error {
+  readonly code = PROJECT_MOVE_REQUIRED_CODE;
+
+  constructor(message = PROJECT_DESTRUCTIVE_MOVE_REQUIRED_MESSAGE) {
+    super(message);
+    this.name = 'ProjectMoveRequiredError';
+  }
+}
+
+function serializeProjectIdentityProof(identity: { id: string; generation: number }): ProjectIdentityProof {
+  if (!identity.id || !Number.isSafeInteger(identity.generation) || identity.generation < 1) {
+    throw new Error('Project identity proof is invalid');
+  }
+  return { id: identity.id, generation: identity.generation };
+}
+
+function projectDestructiveActionCapability(identity: ProjectIdentityRecord) {
+  const allowed = identity.legacyOpenClawMigrationStatus === 'CURRENT';
+  return {
+    allowed,
+    reason: allowed ? null : PROJECT_DESTRUCTIVE_MOVE_REQUIRED_MESSAGE,
+  };
+}
+
+function requireCurrentProjectDestructiveIdentity(identity: ProjectIdentityRecord | null): ProjectIdentityRecord {
+  if (!identity || identity.legacyOpenClawMigrationStatus !== 'CURRENT') {
+    throw new ProjectMoveRequiredError();
+  }
+  return identity;
+}
+
+function sendProjectRenameNotAdmitted(
+  res: Response,
+  statusCode: number,
+  attemptId: string | null,
+  code: string,
+  error: string,
+): void {
+  console.error('[ProjectLifecycle]', JSON.stringify({
+    route: 'project-rename',
+    code,
+    status: statusCode,
+    detail: error,
+    ...(attemptId ? { attemptId } : {}),
+  }));
+  res.status(statusCode).json({
+    error,
+    code,
+    status: 'not_admitted',
+    admitted: false,
+    ...(attemptId ? { attemptId } : {}),
+  });
+}
 
 function normalizeProjectSlug(value: string): string {
   const normalized = value.toLowerCase().replace(/[^a-z0-9_-]/g, '_').replace(/^_+|_+$/g, '');
   return normalized || 'project';
 }
 
-function createProjectStableSlug(projectName: string): string {
-  const base = normalizeProjectSlug(projectName).slice(0, 32) || 'project';
-  return `${base}-${nanoid(8).toLowerCase()}`;
+function getProjectAgentId(actorUserId: string, projectInstanceId: string) {
+  const digest = crypto.createHash('sha256').update(`agent\0${actorUserId}\0${projectInstanceId}`).digest('hex');
+  return `portal-project-${digest.slice(0, 40)}`;
 }
 
-function getProjectIdentityPath(projectDir: string) {
-  return path.join(projectDir, PROJECT_IDENTITY_FILENAME);
+function getProjectSessionId(actorUserId: string, projectInstanceId: string) {
+  const digest = crypto.createHash('sha256').update(`session\0${actorUserId}\0${projectInstanceId}`).digest('hex');
+  return `portal-project-${digest}`;
 }
 
-function readProjectIdentity(projectDir: string): ProjectIdentityMeta | null {
-  try {
-    const identityPath = getProjectIdentityPath(projectDir);
-    if (!fs.existsSync(identityPath)) return null;
-    const parsed = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
-    if (!parsed || typeof parsed !== 'object' || typeof parsed.stableSlug !== 'string' || !parsed.stableSlug.trim()) {
-      return null;
-    }
-    return {
-      version: 1,
-      stableSlug: normalizeProjectSlug(parsed.stableSlug).slice(0, 48),
-      createdAt: typeof parsed.createdAt === 'string' && parsed.createdAt ? parsed.createdAt : new Date().toISOString(),
-    };
-  } catch {
-    return null;
+interface ProjectGitPorcelainEntry {
+  status: string;
+  path: string;
+}
+
+function parseProjectGitPorcelain(output: string): ProjectGitPorcelainEntry[] {
+  const records = output.split('\0');
+  const entries: ProjectGitPorcelainEntry[] = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    if (!record || record.length < 4) continue;
+    const status = record.slice(0, 2);
+    const filePath = record.slice(3);
+    if (!filePath) continue;
+    entries.push({ status, path: filePath });
+    if (status.includes('R') || status.includes('C')) index += 1;
   }
+  return entries;
 }
 
-function writeProjectIdentity(projectDir: string, stableSlug: string): ProjectIdentityMeta {
-  const normalizedStableSlug = normalizeProjectSlug(stableSlug).slice(0, 48) || createProjectStableSlug(path.basename(projectDir));
-  const existing = readProjectIdentity(projectDir);
-  const meta: ProjectIdentityMeta = {
-    version: 1,
-    stableSlug: normalizedStableSlug,
-    createdAt: existing?.createdAt || new Date().toISOString(),
-  };
-  fs.writeFileSync(getProjectIdentityPath(projectDir), JSON.stringify(meta, null, 2), 'utf-8');
-  return meta;
+interface ProjectWorkloadScope {
+  actorId: string;
+  projectId: string;
 }
 
-function getProjectAgentId(userId: string, stableSlug: string) {
-  return `portal-${userId.slice(0, 8)}-${stableSlug}`.slice(0, 64);
+async function listDirtyProjectPaths(projectDir: string, scope: ProjectWorkloadScope, signal?: AbortSignal) {
+  const statusOutput = await runProjectGitCommand({
+    ...scope,
+    workspace: projectDir,
+    args: ['status', '--porcelain=v1', '-z', '-uall'],
+    timeoutMs: 30_000,
+    maxOutputBytes: 2 * 1024 * 1024,
+    signal,
+  });
+  return parseProjectGitPorcelain(statusOutput).map((entry) => entry.path);
 }
 
-function getProjectSessionId(userId: string, stableSlug: string) {
-  return `portal-${userId}-${stableSlug}`;
-}
-
-const TRANSIENT_PROJECT_STATE_FILES = new Set([
-  '.agent-session.json',
-  '.assistant-session.json',
-  '.marcus-session.json',
-  '.agent-history.json',
-  '.assistant-history.json',
-  '.marcus-history.json',
-  '.agent-memory.md',
-  '.assistant-memory.md',
-  '.marcus-memory.md',
-  '.marcus-pending-commit',
-]);
-
-function projectHasLocalAssistantState(projectDir: string): boolean {
-  return Array.from(TRANSIENT_PROJECT_STATE_FILES).some((marker) => fs.existsSync(path.join(projectDir, marker)));
-}
-
-function normalizeGitPorcelainPath(rawPath: string): string {
-  const trimmed = rawPath.trim();
-  const renameIndex = trimmed.indexOf('->');
-  if (renameIndex >= 0) return trimmed.slice(renameIndex + 2).trim();
-  return trimmed;
-}
-
-function listDirtyProjectPaths(projectDir: string, opts: { cwd: string; timeout: number; encoding: 'utf-8' }) {
-  const statusOutput = execSync('git status --porcelain -uall', { ...opts, maxBuffer: 2 * 1024 * 1024 });
-  return statusOutput
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => normalizeGitPorcelainPath(line.substring(3)))
-    .filter(Boolean);
-}
-
-async function withTransientProjectStateShelved<T>(projectDir: string, fn: () => Promise<T>, opts?: { timeout?: number }): Promise<T> {
-  const execOpts = { cwd: projectDir, timeout: opts?.timeout || 30000, encoding: 'utf-8' as const };
-  const dirtyPaths = listDirtyProjectPaths(projectDir, execOpts);
-  const blockingPaths = Array.from(new Set(dirtyPaths.filter((filePath) => !TRANSIENT_PROJECT_STATE_FILES.has(path.basename(filePath)))));
+async function withTransientProjectStateShelved<T>(
+  projectDir: string,
+  scope: ProjectWorkloadScope,
+  fn: () => Promise<T>,
+  opts?: { timeout?: number; signal?: AbortSignal },
+): Promise<T> {
+  const git = (args: string[]) => runProjectGitCommand({
+    ...scope,
+    workspace: projectDir,
+    args,
+    timeoutMs: opts?.timeout || 30_000,
+    signal: opts?.signal,
+  });
+  const cleanupGit = (args: string[]) => runProjectGitCommand({
+    ...scope,
+    workspace: projectDir,
+    args,
+    timeoutMs: opts?.timeout || 30_000,
+    nameHint: 'project-git-cleanup',
+  });
+  const dirtyPaths = await listDirtyProjectPaths(projectDir, scope, opts?.signal);
+  const blockingPaths = Array.from(new Set(dirtyPaths.filter((filePath) => !isTransientProjectStatePath(filePath))));
   if (blockingPaths.length > 0) {
     const preview = blockingPaths.slice(0, 6).join(', ');
     const suffix = blockingPaths.length > 6 ? ` (+${blockingPaths.length - 6} more)` : '';
     throw new Error(`Working tree has uncommitted changes: ${preview}${suffix}`);
   }
 
-  const transientPaths = Array.from(new Set(dirtyPaths.filter((filePath) => TRANSIENT_PROJECT_STATE_FILES.has(path.basename(filePath)))));
+  const transientPaths = Array.from(new Set(dirtyPaths.filter(isTransientProjectStatePath)));
   let stashed = false;
   const stashMessage = 'portal-transient-project-state';
 
   if (transientPaths.length > 0) {
-    const escapedPaths = transientPaths.map(shellEscape).join(' ');
-    execSync(`git stash push -u -m ${shellEscape(stashMessage)} -- ${escapedPaths}`, execOpts);
+    await git(['stash', 'push', '-u', '-m', stashMessage, '--', ...transientPaths]);
     stashed = true;
   }
 
   try {
     return await fn();
   } catch (error) {
-    try { execSync('git revert --abort', execOpts); } catch {}
+    try { await cleanupGit(['revert', '--abort']); } catch {}
     throw error;
   } finally {
     if (stashed) {
       try {
-        execSync('git stash pop --index', execOpts);
+        await cleanupGit(['stash', 'pop', '--index']);
       } catch (restoreError) {
         console.warn(`[projects] Failed to restore transient project state for ${projectDir}:`, restoreError);
       }
@@ -211,38 +1312,28 @@ async function withTransientProjectStateShelved<T>(projectDir: string, fn: () =>
   }
 }
 
-async function projectHasLegacyAssistantState(userId: string, stableSlug: string): Promise<boolean> {
-  const legacyAgentId = getProjectAgentId(userId, stableSlug);
-  if (knownAgentIds.has(legacyAgentId)) return true;
-  if (fs.existsSync(path.join(OPENCLAW_HOME, 'agents', legacyAgentId))) return true;
-  try {
-    const row = await prisma.projectChatSession.findUnique({ where: { sessionKey: getProjectSessionId(userId, stableSlug) } });
-    return !!row;
-  } catch {
-    return false;
-  }
-}
-
 async function ensureProjectAssistantIdentity(
   projectDir: string,
-  userId: string,
+  actorUserId: string,
   projectName: string,
-  options?: { preferLegacySlug?: boolean }
+  options?: { workspaceOwnerId?: string }
 ): Promise<ProjectIdentityMeta & { legacySlug: string; agentId: string; sessionId: string; sessionKey: string }> {
+  const workspaceOwnerId = options?.workspaceOwnerId || actorUserId;
   const legacySlug = normalizeProjectSlug(projectName);
-  let meta = readProjectIdentity(projectDir);
-
-  if (!meta) {
-    let stableSlug = '';
-    if ((options?.preferLegacySlug ?? true) && projectHasLocalAssistantState(projectDir) && await projectHasLegacyAssistantState(userId, legacySlug)) {
-      stableSlug = legacySlug;
-    }
-    if (!stableSlug) stableSlug = createProjectStableSlug(projectName);
-    meta = writeProjectIdentity(projectDir, stableSlug);
-  }
-
-  const agentId = getProjectAgentId(userId, meta.stableSlug);
-  const sessionId = getProjectSessionId(userId, meta.stableSlug);
+  const identity = await ensureProjectIdentity({ workspaceOwnerId, projectName, projectRoot: projectDir });
+  const stableSlug = `p-${crypto.createHash('sha256')
+    .update(`slug\0${actorUserId}\0${identity.id}`)
+    .digest('hex')
+    .slice(0, 32)}`;
+  const meta: ProjectIdentityMeta = {
+    version: 2,
+    projectInstanceId: identity.id,
+    workspaceOwnerId,
+    stableSlug,
+    createdAt: identity.createdAt.toISOString(),
+  };
+  const agentId = getProjectAgentId(actorUserId, stableSlug);
+  const sessionId = getProjectSessionId(actorUserId, stableSlug);
   return {
     ...meta,
     legacySlug,
@@ -252,65 +1343,1320 @@ async function ensureProjectAssistantIdentity(
   };
 }
 
-async function updateProjectAgentBindIfPresent(userId: string, stableSlug: string, projectDirName: string) {
-  const agentId = getProjectAgentId(userId, stableSlug);
-  const expectedWorkspace = `/root/.openclaw/sandboxes/${agentId}-workspace`;
-  const expectedBind = `${PROJECTS_DIR}/${userId}/${projectDirName}:/workspace/project:rw`;
-  const expectedWorkdir = '/workspace';
-  const expectedWorkspaceAccess = 'rw';
-  cleanupInvalidRuntimeOnlyModelProvidersFromOpenClawConfig();
-  const configResult = await gatewayRpcCall('config.get', {});
-  if (!configResult.ok) return;
+async function listProjectLifecycleActorIds(input: {
+  projectIdentityId: string;
+  workspaceOwnerId: string;
+  authenticatedActorId: string;
+}): Promise<readonly string[]> {
+  const [bindings, sessions, messages, states, turns] = await Promise.all([
+    prisma.projectChatProviderBinding.findMany({
+      where: { projectId: input.projectIdentityId },
+      select: { userId: true },
+    }),
+    prisma.projectChatSession.findMany({
+      where: { projectId: input.projectIdentityId },
+      select: { userId: true },
+    }),
+    prisma.projectChatMessage.findMany({
+      where: { projectId: input.projectIdentityId },
+      select: { userId: true },
+    }),
+    prisma.projectChatState.findMany({
+      where: { projectIdentityId: input.projectIdentityId },
+      select: { actorUserId: true },
+    }),
+    prisma.projectChatTurn.findMany({
+      where: { projectIdentityId: input.projectIdentityId },
+      select: { actorUserId: true },
+    }),
+  ]);
+  return Object.freeze(Array.from(new Set([
+    input.authenticatedActorId,
+    input.workspaceOwnerId,
+    ...bindings.map((entry) => entry.userId),
+    ...sessions.map((entry) => entry.userId),
+    ...messages.map((entry) => entry.userId),
+    ...states.map((entry) => entry.actorUserId),
+    ...turns.map((entry) => entry.actorUserId),
+  ])));
+}
 
-  const config = configResult.data?.config || configResult.data?.parsed || {};
-  const agents: any[] = config?.agents?.list || [];
-  const index = agents.findIndex((agent: any) => agent?.id === agentId);
-  if (index === -1) return;
+function projectAppAssociationWhere(input: {
+  workspaceOwnerId: string;
+  projectIdentityId: string;
+  projectName: string;
+  deployPath: string;
+}): Prisma.AppWhereInput {
+  const desktopRuntimePaths = projectDesktopRuntimeCleanupDirectories({
+    projectId: input.projectIdentityId,
+    projectName: input.projectName,
+  });
+  return {
+    userId: input.workspaceOwnerId,
+    OR: [
+      { projectIdentityId: input.projectIdentityId },
+      {
+        projectIdentityId: null,
+        name: input.projectName,
+        OR: [
+          { zipPath: input.deployPath },
+          { deployType: 'runtime', zipPath: { in: desktopRuntimePaths } },
+        ],
+      },
+    ],
+  };
+}
 
-  const currentWorkspace = agents[index]?.workspace;
-  const currentWorkdir = agents[index]?.sandbox?.docker?.workdir;
-  const currentWorkspaceAccess = agents[index]?.sandbox?.workspaceAccess;
-  const currentBinds = agents[index]?.sandbox?.docker?.binds;
-  const currentAllowReserved = agents[index]?.sandbox?.docker?.dangerouslyAllowReservedContainerTargets;
+async function findProjectAppForIdentity(input: {
+  workspaceOwnerId: string;
+  projectIdentityId: string;
+  projectName: string;
+  deployPath: string;
+}): Promise<App | null> {
+  const apps = await prisma.app.findMany({
+    where: projectAppAssociationWhere(input),
+    take: 2,
+  });
+  if (apps.length > 1) {
+    throw new ProjectIdentityLifecycleError(
+      'More than one App claims the same immutable Project identity',
+    );
+  }
+  return apps[0] || null;
+}
+
+async function stopProjectDesktopRuntimesForLifecycle(input: {
+  workspaceOwnerId: string;
+  projectIdentityId: string;
+  projectName: string;
+}): Promise<{
+  runtimeDir: string;
+  identity: AttestedDirectoryIdentity | null;
+}> {
+  ensureSecureProjectDesktopRuntimeRoot();
+  const desktopIdentity = buildProjectDesktopRuntimeIdentity(
+    input.projectIdentityId,
+    input.projectName,
+  );
+  // This marker is immutable across rename. Stop it even if a failed deploy
+  // created the process/directory before its App row committed.
+  const currentRuntimeIdentity = managedPathExists(desktopIdentity.runtimeDir)
+    ? attestProjectRoot(desktopIdentity.runtimeDir)
+    : null;
+  stopManagedDesktopRuntimeUnit(desktopIdentity.systemdUnit);
+  stopDesktopRuntimeProcess(desktopIdentity.processMarker);
+  if (currentRuntimeIdentity) {
+    const current = attestProjectRoot(desktopIdentity.runtimeDir);
+    if (!sameAttestedDirectoryIdentity(currentRuntimeIdentity, current)) {
+      throw new ProjectIdentityLifecycleError(
+        'Remote Desktop Project runtime directory changed while its process stopped',
+      );
+    }
+  } else if (managedPathExists(desktopIdentity.runtimeDir)) {
+    throw new ProjectIdentityLifecycleError(
+      'A Remote Desktop Project runtime directory appeared while its process stopped',
+    );
+  }
+  const runtimeApps = await prisma.app.findMany({
+    where: {
+      AND: [
+        projectAppAssociationWhere({
+          ...input,
+          deployPath: path.join(DEPLOY_DIR, `${input.workspaceOwnerId}-${input.projectName}`),
+        }),
+        { deployType: 'runtime' },
+      ],
+    },
+    select: { id: true, zipPath: true },
+    take: 2,
+  });
+  if (runtimeApps.length > 1) {
+    throw new ProjectIdentityLifecycleError(
+      'More than one Remote Desktop App claims the same immutable Project identity',
+    );
+  }
+  const sameProjectAppIds = runtimeApps.map((entry) => entry.id);
+  const legacyDirectories = new Set(
+    projectDesktopRuntimeCleanupDirectories({
+      projectId: input.projectIdentityId,
+      projectName: input.projectName,
+    }).filter((candidate) => candidate !== desktopIdentity.runtimeDir),
+  );
+  for (const runtimeApp of runtimeApps) {
+    for (const candidate of projectDesktopRuntimeCleanupDirectories({
+      projectId: input.projectIdentityId,
+      projectName: input.projectName,
+      recordedRuntimeDir: runtimeApp.zipPath,
+    })) {
+      if (candidate !== desktopIdentity.runtimeDir) legacyDirectories.add(candidate);
+    }
+  }
+  const recordedUnmanagedRuntime = runtimeApps.some((runtimeApp) => (
+    legacyDirectories.has(path.resolve(runtimeApp.zipPath))
+  ));
   if (
-    currentWorkspace === expectedWorkspace
-    && currentWorkdir === expectedWorkdir
-    && currentWorkspaceAccess === expectedWorkspaceAccess
-    && Array.isArray(currentBinds)
-    && currentBinds.length === 1
-    && currentBinds[0] === expectedBind
-    && currentAllowReserved === true
-  ) return;
+    recordedUnmanagedRuntime
+    || Array.from(legacyDirectories).some((runtimeDirectory) => managedPathExists(runtimeDirectory))
+  ) {
+    throw new ProjectIdentityLifecycleError(
+      'A legacy Remote Desktop runtime cannot be proven stopped without a managed cgroup; lifecycle cleanup remains pending',
+    );
+  }
+  for (const runtimeDirectory of legacyDirectories) {
+    const sharedLegacyReferences = await prisma.app.count({
+      where: {
+        ...(sameProjectAppIds.length > 0 ? { id: { notIn: sameProjectAppIds } } : {}),
+        deployType: 'runtime',
+        zipPath: runtimeDirectory,
+      },
+    });
+    if (sharedLegacyReferences > 0) continue;
+    const initialIdentity = managedPathExists(runtimeDirectory)
+      ? attestProjectRoot(runtimeDirectory)
+      : null;
+    stopDesktopRuntimeProcess(runtimeDirectory);
+    await removeDirectoryThroughAttestedQuarantine({
+      sourceRoot: runtimeDirectory,
+      quarantineKey: `desktop-legacy:${input.projectIdentityId}`,
+      expectedIdentity: initialIdentity || undefined,
+      sourceMustBeAbsent: !initialIdentity,
+    });
+  }
+  return Object.freeze({
+    runtimeDir: desktopIdentity.runtimeDir,
+    identity: currentRuntimeIdentity,
+  });
+}
 
-  const updatedAgent = {
-    ...agents[index],
-    workspace: expectedWorkspace,
-    sandbox: {
-      ...agents[index]?.sandbox,
-      workspaceAccess: expectedWorkspaceAccess,
-      docker: {
-        ...agents[index]?.sandbox?.docker,
-        workdir: expectedWorkdir,
-        dangerouslyAllowExternalBindSources: true,
-        dangerouslyAllowReservedContainerTargets: true,
-        binds: [expectedBind],
+async function retargetProjectAppsForRename(
+  transaction: Prisma.TransactionClient,
+  input: {
+    workspaceOwnerId: string;
+    projectIdentityId: string;
+    oldProjectName: string;
+    newProjectName: string;
+    oldDeployPath: string;
+    newDeployPath: string;
+  },
+): Promise<void> {
+  if (await transaction.app.count({
+    where: { userId: input.workspaceOwnerId, name: input.newProjectName },
+  }) > 0) {
+    throw new ProjectIdentityLifecycleError('Rename target already has an App identity');
+  }
+  const desktopRuntimeDir = buildProjectDesktopRuntimeIdentity(
+    input.projectIdentityId,
+    input.newProjectName,
+  ).runtimeDir;
+  const projectApps = await transaction.app.findMany({
+    where: projectAppAssociationWhere({
+      workspaceOwnerId: input.workspaceOwnerId,
+      projectIdentityId: input.projectIdentityId,
+      projectName: input.oldProjectName,
+      deployPath: input.oldDeployPath,
+    }),
+    take: 2,
+  });
+  if (projectApps.length > 1) {
+    throw new ProjectIdentityLifecycleError(
+      'More than one App claims the same immutable Project identity',
+    );
+  }
+  const projectApp = projectApps[0];
+  if (projectApp) {
+    await transaction.app.update({
+      where: { id: projectApp.id },
+      data: {
+        projectIdentityId: input.projectIdentityId,
+        name: input.newProjectName,
+        processStatus: 'stopped',
+        ...(projectApp.deployType === 'runtime'
+          ? { zipPath: desktopRuntimeDir }
+          : projectApp.zipPath === input.oldDeployPath
+            ? { zipPath: input.newDeployPath }
+            : {}),
+      },
+    });
+  }
+  if (await transaction.app.count({
+    where: {
+      projectIdentityId: input.projectIdentityId,
+      name: { not: input.newProjectName },
+    },
+  }) > 0) {
+    throw new ProjectIdentityLifecycleError('A Project App row remained under the old rename identity');
+  }
+}
+
+function convergeInterruptedProjectDeployment(input: {
+  mode: 'cancel' | 'complete' | 'continue';
+  identity: ProjectIdentityRecord;
+  oldDeployPath: string;
+  newDeployPath: string;
+}): 'absent' | 'old' | 'new' {
+  const expected = readProjectIdentityRenameDeployIdentity(input.identity);
+  const oldExists = managedPathExists(input.oldDeployPath);
+  const newExists = managedPathExists(input.newDeployPath);
+  if (!expected) {
+    if (oldExists || newExists) {
+      throw new ProjectIdentityLifecycleError(
+        'A deployment directory appeared after Project rename started',
+      );
+    }
+    return 'absent';
+  }
+  if (oldExists === newExists) {
+    throw new ProjectIdentityLifecycleError(
+      'Interrupted Project rename has ambiguous deployment directories',
+    );
+  }
+  const actual = attestProjectRoot(oldExists ? input.oldDeployPath : input.newDeployPath);
+  if (!sameAttestedDirectoryIdentity(expected, actual)) {
+    throw new ProjectIdentityLifecycleError(
+      'Interrupted Project rename deployment no longer matches its durable identity',
+    );
+  }
+  if (input.mode === 'complete') {
+    if (oldExists) {
+      throw new ProjectIdentityLifecycleError(
+        'Interrupted Project rename moved its root before its deployment directory',
+      );
+    }
+    return 'new';
+  }
+  if (input.mode === 'continue') {
+    return oldExists ? 'old' : 'new';
+  }
+  if (newExists) {
+    moveAttestedDirectoryNoReplace({
+      sourceRoot: input.newDeployPath,
+      targetRoot: input.oldDeployPath,
+      expectedIdentity: expected,
+    });
+  }
+  return 'old';
+}
+
+async function completeInterruptedProjectRenameWithApps(input: {
+  workspaceOwnerId: string;
+  projectIdentityId: string;
+  oldProjectName: string;
+  newProjectName: string;
+  newProjectRoot: string;
+  oldDeployPath: string;
+  newDeployPath: string;
+}) {
+  return prisma.$transaction(async (transaction) => {
+    const recovered = await recoverInterruptedProjectIdentityRename({
+      workspaceOwnerId: input.workspaceOwnerId,
+      projectName: input.newProjectName,
+      projectRoot: input.newProjectRoot,
+    }, transaction as unknown as ProjectIdentityDatabase);
+    if (!recovered || recovered.id !== input.projectIdentityId) return null;
+    await retargetProjectAppsForRename(transaction, input);
+    return recovered;
+  });
+}
+
+async function retireLegacyOpenClawRuntimesForProject(input: {
+  actorUserIds: readonly string[];
+  projectIdentityId: string;
+  legacyProjectName: string;
+  legacyProjectOwnerId: string;
+  targetCanonicalRoot: string;
+  preserveTranscriptFiles?: boolean;
+}): Promise<void> {
+  // CURRENT identities are issued only by the Portal 4 create/clone/upload
+  // boundary and by contract never adopt name-keyed 3.x OpenClaw state, so
+  // there is nothing legacy to retire for them. The global retirement service
+  // stays behind the sticky migration gate for every other lineage; routing a
+  // CURRENT project through it would let unrelated preserved 3.x evidence veto
+  // this project's own rename/delete forever.
+  const identity = await prisma.projectIdentity.findUnique({
+    where: { id: input.projectIdentityId },
+    select: { legacyOpenClawMigrationStatus: true },
+  });
+  if (identity?.legacyOpenClawMigrationStatus === 'CURRENT') {
+    await assertLegacyOpenClawProjectMigrationInactive(input.projectIdentityId);
+    return;
+  }
+  for (const actorUserId of input.actorUserIds) {
+    const stableSlug = `p-${crypto.createHash('sha256')
+      .update(`slug\0${actorUserId}\0${input.projectIdentityId}`)
+      .digest('hex')
+      .slice(0, 32)}`;
+    const legacyAgentId = getProjectAgentId(actorUserId, stableSlug);
+    const legacySessionId = getProjectSessionId(actorUserId, stableSlug);
+    try {
+      await retireLegacyOpenClawProjectRuntime({
+        actorUserId,
+        targetProjectIds: actorUserId === input.legacyProjectOwnerId
+          ? [input.projectIdentityId, input.legacyProjectName]
+          : [input.projectIdentityId],
+        targetCanonicalRoot: input.targetCanonicalRoot,
+        exactServerOwnedSessionKeys: [
+          `agent:${legacyAgentId}:${legacySessionId}`,
+          `agent:portal:${legacySessionId}`,
+        ],
+        adapterOwnedSessionKeys: [deriveOpenClawProjectSessionKey({
+          userId: actorUserId,
+          projectId: input.projectIdentityId,
+        })],
+        preserveTranscriptFiles: input.preserveTranscriptFiles,
+        retireRootAttestedConfigOnlyAgents: true,
+      });
+    } catch (error) {
+      const cleanupError = new ProjectRuntimeCleanupError(
+        'CLEANUP_FAILED',
+        'Legacy OpenClaw Project runtime cleanup could not be verified',
+        'OPENCLAW',
+      );
+      (cleanupError as Error & { cause?: unknown }).cause = error;
+      throw cleanupError;
+    }
+  }
+}
+
+interface ProjectRenameConvergenceResult {
+  projectName: string;
+  projectDir: string;
+  recovered: boolean;
+  renamedTo?: string;
+}
+
+/**
+ * Destructive chat resets without a proven CURRENT identity need both release
+ * gates. Rename/delete pass their immutable CURRENT identity into convergence
+ * and use the scoped branch below instead.
+ */
+async function assertLegacyOpenClawProjectDestructiveMutationSafe(): Promise<void> {
+  await assertLegacyOpenClawProjectMigrationInactive();
+  await assertNoLegacyOpenClawProjectEvidence();
+}
+
+/**
+ * Destructive operations must not silently cancel a partially cleaned rename.
+ * An expired old-root journal is claimed, fully cleaned again, and cancelled;
+ * an expired target-root journal is completed only after callback/app/legacy
+ * absence is reasserted. A caller holding the current name lock never crosses
+ * over and mutates a differently named target without owning its lock.
+ */
+async function convergeInterruptedProjectRenameForDestructiveOperation(input: {
+  actorUserId: string;
+  workspaceOwnerId: string;
+  projectName: string;
+  currentProjectIdentityId?: string;
+}): Promise<ProjectRenameConvergenceResult> {
+  const assertMutationSafe = async (projectIdentityId = input.currentProjectIdentityId) => {
+    if (input.currentProjectIdentityId) {
+      if (projectIdentityId !== input.currentProjectIdentityId) {
+        throw new ProjectIdentityLifecycleError(
+          'Interrupted Project rename belongs to a different immutable identity',
+        );
+      }
+      await assertLegacyOpenClawProjectMigrationInactive(input.currentProjectIdentityId);
+      return;
+    }
+    await assertLegacyOpenClawProjectDestructiveMutationSafe();
+  };
+  await assertMutationSafe();
+  const journal = await readProjectIdentityRenameJournal({
+    workspaceOwnerId: input.workspaceOwnerId,
+    projectName: input.projectName,
+  });
+  const currentProjectDir = getProjectPath(input.workspaceOwnerId, input.projectName);
+  if (!journal) {
+    return { projectName: input.projectName, projectDir: currentProjectDir, recovered: false };
+  }
+  await assertMutationSafe(journal.id);
+  await assertProjectChatDestructiveResetInactive(journal.id);
+  await assertLegacyOpenClawProjectMigrationInactive(journal.id);
+  if (!(journal.renameLeaseExpiresAt instanceof Date)
+    || journal.renameLeaseExpiresAt.getTime() > Date.now()) {
+    throw new ProjectIdentityLifecycleError('Project rename is still in progress');
+  }
+  const targetName = String(journal.renameTargetName || '');
+  const targetDir = getProjectPath(input.workspaceOwnerId, targetName);
+  const oldDir = path.resolve(journal.canonicalRoot);
+  const oldExists = fs.existsSync(oldDir);
+  const targetExists = fs.existsSync(targetDir);
+  if (oldExists === targetExists) {
+    throw new ProjectIdentityLifecycleError(
+      'Interrupted Project rename has ambiguous filesystem state and cannot be changed safely',
+    );
+  }
+  if (targetExists && input.projectName !== targetName) {
+    return {
+      projectName: input.projectName,
+      projectDir: currentProjectDir,
+      recovered: false,
+      renamedTo: targetName,
+    };
+  }
+
+  if (targetExists) {
+    if (!(journal.renameRuntimeCleanedAt instanceof Date)) {
+      throw new ProjectIdentityLifecycleError(
+        'Interrupted Project rename moved its root before runtime cleanup was durably recorded',
+      );
+    }
+    const actorUserIds = await listProjectLifecycleActorIds({
+      projectIdentityId: journal.id,
+      workspaceOwnerId: input.workspaceOwnerId,
+      authenticatedActorId: input.actorUserId,
+    });
+    await assertMutationSafe(journal.id);
+    for (const actorUserId of actorUserIds) {
+      if (actorUserId === input.workspaceOwnerId) {
+        await migrateLegacyProjectChatState({
+          actorUserId,
+          legacyProjectId: journal.projectName,
+          immutableProjectId: journal.id,
+        });
+      }
+      await quiesceProjectChatBrokerCallbacksForDestructiveReset({
+        actorUserId,
+        projectIdentityId: journal.id,
+      });
+    }
+    await retireLegacyOpenClawRuntimesForProject({
+      actorUserIds,
+      projectIdentityId: journal.id,
+      legacyProjectName: journal.projectName,
+      legacyProjectOwnerId: input.workspaceOwnerId,
+      targetCanonicalRoot: journal.canonicalRoot,
+      preserveTranscriptFiles: true,
+    });
+    await removePortalProjectWorkloadsForProject(journal.id);
+    await stopApp(`${input.workspaceOwnerId}-${journal.projectName}`);
+    await stopProjectDesktopRuntimesForLifecycle({
+      workspaceOwnerId: input.workspaceOwnerId,
+      projectIdentityId: journal.id,
+      projectName: journal.projectName,
+    });
+    const oldDeployPath = path.join(DEPLOY_DIR, `${input.workspaceOwnerId}-${journal.projectName}`);
+    const newDeployPath = path.join(DEPLOY_DIR, `${input.workspaceOwnerId}-${targetName}`);
+    convergeInterruptedProjectDeployment({
+      mode: 'complete',
+      identity: journal,
+      oldDeployPath,
+      newDeployPath,
+    });
+    const recovered = await completeInterruptedProjectRenameWithApps({
+      workspaceOwnerId: input.workspaceOwnerId,
+      projectIdentityId: journal.id,
+      oldProjectName: journal.projectName,
+      newProjectName: targetName,
+      newProjectRoot: targetDir,
+      oldDeployPath,
+      newDeployPath,
+    });
+    if (!recovered || recovered.projectName !== targetName) {
+      throw new ProjectIdentityLifecycleError('Interrupted Project rename target could not be verified');
+    }
+    return { projectName: targetName, projectDir: targetDir, recovered: true };
+  }
+
+  await assertMutationSafe(journal.id);
+  const grant = await beginProjectIdentityRename({
+    workspaceOwnerId: input.workspaceOwnerId,
+    oldProjectName: journal.projectName,
+    newProjectName: targetName,
+    oldProjectRoot: oldDir,
+    newProjectRoot: targetDir,
+    deployRootIdentity: readProjectIdentityRenameDeployIdentity(journal),
+  });
+  let timer: NodeJS.Timeout | null = null;
+  let renewal: Promise<void> = Promise.resolve();
+  let renewalFailure: unknown = null;
+  const queueRenewal = () => {
+    if (renewalFailure) return;
+    renewal = renewal.then(async () => {
+      await renewProjectIdentityRenameLease({
+        projectIdentityId: grant.identity.id,
+        leaseToken: grant.leaseToken,
+      });
+    }).catch((error) => { renewalFailure = error; });
+  };
+  timer = setInterval(queueRenewal, 30_000);
+  timer.unref?.();
+  try {
+    await markProjectIdentityRenameCleanupStarted({
+      projectIdentityId: grant.identity.id,
+      leaseToken: grant.leaseToken,
+    });
+    await assertMutationSafe(journal.id);
+    const actorUserIds = await listProjectLifecycleActorIds({
+      projectIdentityId: journal.id,
+      workspaceOwnerId: input.workspaceOwnerId,
+      authenticatedActorId: input.actorUserId,
+    });
+    for (const actorUserId of actorUserIds) {
+      if (actorUserId === input.workspaceOwnerId) {
+        await migrateLegacyProjectChatState({
+          actorUserId,
+          legacyProjectId: journal.projectName,
+          immutableProjectId: journal.id,
+        });
+      }
+      await quiesceProjectChatBrokerCallbacksForDestructiveReset({
+        actorUserId,
+        projectIdentityId: journal.id,
+      });
+    }
+    await cleanupProjectRuntime({
+      authenticatedActorId: input.actorUserId,
+      workspaceOwnerId: input.workspaceOwnerId,
+      projectIdentity: grant.identity,
+      lifecycleReason: 'rename',
+    }, {
+      adapters: PROJECT_RUNTIME_CLEANUP_ADAPTERS,
+      egressAdapter: PROJECT_EGRESS_CLEANUP_ADAPTER,
+    });
+    await retireLegacyOpenClawRuntimesForProject({
+      actorUserIds,
+      projectIdentityId: journal.id,
+      legacyProjectName: journal.projectName,
+      legacyProjectOwnerId: input.workspaceOwnerId,
+      targetCanonicalRoot: journal.canonicalRoot,
+      preserveTranscriptFiles: true,
+    });
+    await removePortalProjectWorkloadsForProject(journal.id);
+    await stopApp(`${input.workspaceOwnerId}-${journal.projectName}`);
+    await stopProjectDesktopRuntimesForLifecycle({
+      workspaceOwnerId: input.workspaceOwnerId,
+      projectIdentityId: journal.id,
+      projectName: journal.projectName,
+    });
+    clearInterval(timer);
+    timer = null;
+    await renewal;
+    if (renewalFailure) throw renewalFailure;
+    await renewProjectIdentityRenameLease({
+      projectIdentityId: grant.identity.id,
+      leaseToken: grant.leaseToken,
+    });
+    await prisma.$transaction(async (transaction) => {
+      const projectRows = {
+        OR: [
+          { projectId: journal.id },
+          { userId: input.workspaceOwnerId, projectId: journal.projectName },
+        ],
+      };
+      await transaction.projectChatProviderBinding.deleteMany({ where: projectRows });
+      await transaction.projectChatSession.deleteMany({ where: projectRows });
+      const activeState = await transaction.projectChatState.findFirst({
+        where: { projectIdentityId: journal.id, activeTurnId: { not: null } },
+        select: { id: true },
+      });
+      if (activeState) {
+        throw new ProjectIdentityLifecycleError(
+          'Interrupted Project rename still has an active Project Chat turn',
+        );
+      }
+      await transaction.projectChatState.updateMany({
+        where: { projectIdentityId: journal.id, activeTurnId: null },
+        data: { version: { increment: 1 } },
+      });
+      await markProjectIdentityRenameRuntimeCleaned({
+        projectIdentityId: journal.id,
+        leaseToken: grant.leaseToken,
+      }, transaction as unknown as ProjectIdentityDatabase);
+    });
+    for (const provider of QUALIFIABLE_PROJECT_PROVIDERS) {
+      removeProjectQualificationEvidenceForProject(provider, journal.id);
+    }
+    convergeInterruptedProjectDeployment({
+      mode: 'cancel',
+      identity: journal,
+      oldDeployPath: path.join(DEPLOY_DIR, `${input.workspaceOwnerId}-${journal.projectName}`),
+      newDeployPath: path.join(DEPLOY_DIR, `${input.workspaceOwnerId}-${targetName}`),
+    });
+    await prisma.$transaction(async (transaction) => {
+      await cancelProjectIdentityRename({
+        projectIdentityId: journal.id,
+        leaseToken: grant.leaseToken,
+        oldProjectRoot: oldDir,
+      }, transaction as unknown as ProjectIdentityDatabase);
+      await transaction.app.updateMany({
+        where: projectAppAssociationWhere({
+          workspaceOwnerId: input.workspaceOwnerId,
+          projectIdentityId: journal.id,
+          projectName: journal.projectName,
+          deployPath: path.join(
+            DEPLOY_DIR,
+            `${input.workspaceOwnerId}-${journal.projectName}`,
+          ),
+        }),
+        data: { processStatus: 'stopped' },
+      });
+    });
+    return { projectName: journal.projectName, projectDir: oldDir, recovered: true };
+  } finally {
+    if (timer) clearInterval(timer);
+    await renewal.catch(() => undefined);
+  }
+}
+
+/** one structured line per project lifecycle decision that is not a 2xx. */
+function logProjectLifecycleDecision(input: {
+  route: string;
+  code: string;
+  status: number;
+  workspaceOwnerId?: string;
+  projectName?: string;
+  projectIdentityId?: string | null;
+  detail?: string;
+}): void {
+  console.error('[ProjectLifecycle]', JSON.stringify(input));
+}
+
+const lifecycleResidueRecoveryState = new Map<string, { at: number; running: boolean }>();
+const LIFECYCLE_RESIDUE_RECOVERY_COOLDOWN_MS = 20_000;
+
+/**
+ * expired RENAMING/DELETING journals resolve themselves shortly after
+ * the next touching request instead of waiting for operator surgery. Runs
+ * detached from the triggering request; the deletion-lock keys serialize it
+ * against real rename/delete traffic and a per-owner cooldown bounds load.
+ * A journal whose lease is still live is never touched.
+ */
+async function recoverProjectLifecycleResidueForOwner(input: {
+  actorUserId: string;
+  workspaceOwnerId: string;
+}): Promise<void> {
+  const residues = await prisma.projectIdentity.findMany({
+    where: {
+      workspaceOwnerId: input.workspaceOwnerId,
+      lifecycleStatus: { in: ['RENAMING', 'DELETING'] },
+    },
+  });
+  for (const identity of residues) {
+    try {
+      if (identity.lifecycleStatus === 'RENAMING') {
+        const expiry = identity.renameLeaseExpiresAt;
+        if (expiry instanceof Date && expiry.getTime() > Date.now()) continue;
+        const releases: Array<() => void> = [];
+        try {
+          const lockNames = Array.from(new Set([
+            identity.projectName,
+            ...(identity.renameTargetName ? [identity.renameTargetName] : []),
+          ]));
+          for (const key of lockNames
+            .map((name) => projectDeletionLockKey(input.workspaceOwnerId, name))
+            .sort()) {
+            releases.push(await acquireProjectDeletionLock(key));
+          }
+          const converged = await convergeInterruptedProjectRenameForDestructiveOperation({
+            actorUserId: input.actorUserId,
+            workspaceOwnerId: input.workspaceOwnerId,
+            projectName: identity.projectName,
+            currentProjectIdentityId: identity.id,
+          });
+          logProjectLifecycleDecision({
+            route: 'lifecycle-residue-recovery',
+            code: converged.recovered
+              ? 'PROJECT_RENAME_RESIDUE_RECOVERED'
+              : 'PROJECT_RENAME_RESIDUE_UNCHANGED',
+            status: 200,
+            workspaceOwnerId: input.workspaceOwnerId,
+            projectName: identity.projectName,
+            projectIdentityId: identity.id,
+            detail: converged.renamedTo
+              ? `completed as ${converged.renamedTo}`
+              : `active as ${converged.projectName}`,
+          });
+        } finally {
+          for (const release of releases.reverse()) release();
+        }
+      } else {
+        // DELETING is durable, already-admitted intent; finishing it is the
+        // only terminal state that does not resurrect a half-deleted project.
+        const release = await acquireProjectDeletionLock(
+          projectDeletionLockKey(input.workspaceOwnerId, identity.projectName),
+        );
+        try {
+          const current = await prisma.projectIdentity.findUnique({ where: { id: identity.id } });
+          if (!current || current.lifecycleStatus !== 'DELETING') continue;
+          await completeAdmittedProjectDeletion({
+            actorUserId: input.actorUserId,
+            ownerId: input.workspaceOwnerId,
+            projectName: current.projectName,
+            projectDir: getProjectPath(input.workspaceOwnerId, current.projectName),
+            projectIdentity: current as unknown as ProjectIdentityRecord,
+          });
+          logProjectLifecycleDecision({
+            route: 'lifecycle-residue-recovery',
+            code: 'PROJECT_DELETE_RESIDUE_COMPLETED',
+            status: 200,
+            workspaceOwnerId: input.workspaceOwnerId,
+            projectName: current.projectName,
+            projectIdentityId: current.id,
+          });
+        } finally {
+          release();
+        }
+      }
+    } catch (error) {
+      logProjectLifecycleDecision({
+        route: 'lifecycle-residue-recovery',
+        code: 'PROJECT_LIFECYCLE_RESIDUE_RECOVERY_FAILED',
+        status: 500,
+        workspaceOwnerId: input.workspaceOwnerId,
+        projectName: identity.projectName,
+        projectIdentityId: identity.id,
+        detail: String((error as Error)?.message || error).slice(0, 300),
+      });
+    }
+  }
+}
+
+function scheduleProjectLifecycleResidueRecovery(input: {
+  actorUserId: string;
+  workspaceOwnerId: string;
+}): void {
+  const entry = lifecycleResidueRecoveryState.get(input.workspaceOwnerId);
+  const now = Date.now();
+  if (entry && (entry.running || now - entry.at < LIFECYCLE_RESIDUE_RECOVERY_COOLDOWN_MS)) return;
+  let releaseAuthorizationLease: () => void;
+  try {
+    // Acquire before detaching. Otherwise the GET response can release its
+    // admission, an ownership/sandbox change can commit, and this old-scope
+    // recovery can still rename or delete workspace state afterward.
+    releaseAuthorizationLease = acquireWorkspaceAuthorizationMutationLease(input.actorUserId);
+  } catch {
+    return;
+  }
+  lifecycleResidueRecoveryState.set(input.workspaceOwnerId, { at: now, running: true });
+  try {
+    setImmediate(() => {
+      recoverProjectLifecycleResidueForOwner(input)
+        .catch(() => undefined)
+        .finally(() => {
+          lifecycleResidueRecoveryState.set(input.workspaceOwnerId, { at: Date.now(), running: false });
+          releaseAuthorizationLease();
+        });
+    });
+  } catch {
+    lifecycleResidueRecoveryState.set(input.workspaceOwnerId, { at: Date.now(), running: false });
+    releaseAuthorizationLease();
+  }
+}
+
+async function ensureOpenClawProjectChatBinding(input: {
+  actorUserId: string;
+  workspaceOwnerId: string;
+  projectName: string;
+  projectDir: string;
+  executionContext: ProjectSandboxExecutionContext;
+  model?: string | null;
+}) {
+  await assertLegacyOpenClawProjectMigrationInactive(input.executionContext.projectId);
+  const qualificationGrant = requireProjectQualification('OPENCLAW', {
+    context: input.executionContext,
+    egress: buildProjectEgressConfig({
+      context: input.executionContext,
+      provider: 'OPENCLAW',
+    }),
+  });
+  const agentId = deriveOpenClawProjectAgentId(input.executionContext);
+  const sessionKey = deriveOpenClawProjectSessionKey(input.executionContext);
+  const identity = {
+    version: 2 as const,
+    projectInstanceId: input.executionContext.projectId,
+    workspaceOwnerId: input.workspaceOwnerId,
+    stableSlug: `p-${input.executionContext.projectId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)}`,
+    createdAt: new Date().toISOString(),
+    legacySlug: normalizeProjectSlug(input.projectName),
+    agentId,
+    // Portal database rows use the full immutable session key. It is globally
+    // unique; the provider-specific suffix alone is deliberately not.
+    sessionId: sessionKey,
+    sessionKey,
+  };
+  const portalTranscriptCursor = await prisma.projectChatMessage.count({
+    where: { userId: input.actorUserId, projectId: input.executionContext.projectId },
+  });
+  const binding = await ensureProjectChatProviderBinding({
+      userId: input.actorUserId,
+      projectId: input.executionContext.projectId,
+      provider: 'OPENCLAW',
+      executionContext: input.executionContext,
+      sessionKey: identity.sessionKey,
+      legacySessionKey: null,
+      externalSessionId: identity.sessionKey,
+      model: input.model,
+      qualificationGrant,
+    });
+  return {
+    identity,
+    needsBootstrap: projectChatBindingNeedsHandoff(binding, portalTranscriptCursor),
+    handoffCursor: binding.handoffCursor,
+    handoffVersion: binding.handoffVersion,
+    binding,
+  };
+}
+
+async function ensureOpenClawProjectAgentCatalogScope(
+  executionContext: ProjectSandboxExecutionContext,
+) {
+  const agentId = deriveOpenClawProjectAgentId(executionContext);
+  const sessionKey = deriveOpenClawProjectSessionKey(executionContext);
+  // Keep the copied credential/model files in place both before container
+  // convergence and after the exact agent is registered in OpenClaw config.
+  syncProjectAgentRuntimeFiles(agentId);
+  const sandbox = await ensureOpenClawProjectSandbox({
+    context: executionContext,
+    agentId,
+    sessionKey,
+    egress: buildProjectEgressConfig({
+      context: executionContext,
+      provider: 'OPENCLAW',
+    }),
+  });
+  syncProjectAgentRuntimeFiles(agentId);
+  return { agentId, sessionKey, sandbox };
+}
+
+async function ensureOpenClawProjectRuntime(input: Parameters<typeof ensureOpenClawProjectChatBinding>[0]) {
+  const resolved = await ensureOpenClawProjectChatBinding(input);
+  const { sandbox } = await ensureOpenClawProjectAgentCatalogScope(input.executionContext);
+  return { ...resolved, sandbox };
+}
+
+async function verifyAndPersistOpenClawProjectModel(input: {
+  actorUserId: string;
+  projectId: string;
+  portalSessionKey: string;
+  providerSessionKey: string;
+  desiredModel: string;
+}) {
+  // External runtime mutation happens before either Portal model column is
+  // touched. If patching or readback fails, the last verified binding remains
+  // intact and the surrounding admission/switch operation fails closed.
+  const result = await verifyThenPersistOpenClawProjectModel({
+    sessionKey: input.providerSessionKey,
+    desiredModel: input.desiredModel,
+    persistVerifiedModel: async (verifiedModel) => {
+      const now = new Date();
+      const [binding] = await prisma.$transaction([
+        prisma.projectChatProviderBinding.update({
+          where: {
+            userId_projectId_provider: {
+              userId: input.actorUserId,
+              projectId: input.projectId,
+              provider: 'OPENCLAW',
+            },
+          },
+          data: {
+            model: verifiedModel,
+            status: 'active',
+            lastActivity: now,
+          },
+        }),
+        prisma.projectChatSession.updateMany({
+          where: {
+            userId: input.actorUserId,
+            projectId: input.projectId,
+            sessionKey: input.portalSessionKey,
+          },
+          data: {
+            model: verifiedModel,
+            status: 'active',
+            lastActivity: now,
+          },
+        }),
+      ]);
+      return binding;
+    },
+    failProviderClosed: async () => {
+      const now = new Date();
+      await prisma.$transaction([
+        prisma.projectChatProviderBinding.updateMany({
+          where: {
+            userId: input.actorUserId,
+            projectId: input.projectId,
+            provider: 'OPENCLAW',
+          },
+          data: {
+            status: 'error',
+            lastActivity: now,
+          },
+        }),
+        prisma.projectChatSession.updateMany({
+          where: {
+            userId: input.actorUserId,
+            projectId: input.projectId,
+            sessionKey: input.portalSessionKey,
+          },
+          data: {
+            status: 'error',
+            lastActivity: now,
+          },
+        }),
+      ]);
+    },
+  });
+  return {
+    binding: result.persisted,
+    verified: result.verified,
+  };
+}
+
+async function ensureNativeProjectChatBinding(input: {
+  actorUserId: string;
+  workspaceOwnerId: string;
+  projectName: string;
+  projectDir: string;
+  provider: NativeProjectChatRouteProvider;
+  executionContext: ProjectSandboxExecutionContext;
+  model?: string | null;
+}) {
+  if (input.provider === 'OLLAMA') {
+    return withOllamaAuthorityRunLease(
+      () => ensureNativeProjectChatBindingWithAuthorityLease(input),
+    );
+  }
+  return ensureNativeProjectChatBindingWithAuthorityLease(input);
+}
+
+async function ensureNativeProjectChatBindingWithAuthorityLease(input: {
+  actorUserId: string;
+  workspaceOwnerId: string;
+  projectName: string;
+  projectDir: string;
+  provider: NativeProjectChatRouteProvider;
+  executionContext: ProjectSandboxExecutionContext;
+  model?: string | null;
+}) {
+  const descriptor = getProjectChatProviderRuntimeDescriptor(input.provider);
+  const existingBinding = await prisma.projectChatProviderBinding.findUnique({
+    where: {
+      userId_projectId_provider: {
+        userId: input.actorUserId,
+        projectId: input.executionContext.projectId,
+        provider: input.provider,
       },
     },
-    tools: {
-      ...agents[index]?.tools,
-      allow: ['group:runtime', 'web_search', 'web_fetch', 'image'],
-      deny: ['browser', 'canvas', 'nodes', 'message', 'tts', 'cron', 'gateway', 'group:fs'],
-      elevated: { enabled: false },
-      exec: { security: 'full' },
-    },
+  });
+  const qualificationInput = {
+    context: input.executionContext,
+    egress: buildProjectEgressConfig({
+      context: input.executionContext,
+      provider: input.provider,
+    }),
   };
-  const updatedList = [...agents];
-  updatedList[index] = updatedAgent;
+  let qualificationGrant = requireProjectQualification(input.provider, qualificationInput);
+  let agentZeroModelSelection: AgentZeroProjectModelSelection | undefined;
+  if (input.provider === 'AGENT_ZERO') {
+    const evidencedSelection: AgentZeroProjectModelSelection = {
+      providerId: String(qualificationGrant.modelProviderId || '') as AgentZeroProjectModelSelection['providerId'],
+      model: String(qualificationGrant.modelId || ''),
+    };
+    const requestedBinding = String(input.model || '').trim();
+    const requestedSelection = requestedBinding
+      ? parseAgentZeroProjectModelBinding(requestedBinding)
+      : evidencedSelection;
+    agentZeroModelSelection = await resolveAllowedAgentZeroProjectModel(requestedSelection);
+    if (agentZeroModelSelection.providerId !== evidencedSelection.providerId
+      || agentZeroModelSelection.model !== evidencedSelection.model) {
+      throw new AgentZeroProjectModelSelectionError(
+        'The connected Agent Zero OAuth model no longer matches this project qualification. Qualify the selected model again.',
+      );
+    }
+    qualificationGrant = requireProjectQualification('AGENT_ZERO', {
+      ...qualificationInput,
+      agentZeroModelSelection,
+    });
+  }
+  let ollamaModelSelection: OllamaProjectModelSelection | undefined;
+  if (input.provider === 'OLLAMA') {
+    const evidencedModel = String(qualificationGrant.modelId || '').trim();
+    const requestedModel = String(input.model || '').trim() || evidencedModel;
+    if (!requestedModel || !qualificationGrant.modelDigest) {
+      throw new OllamaProjectModelSelectionError(
+        'Ollama Project qualification did not retain an exact model digest.',
+      );
+    }
+    ollamaModelSelection = await resolveAllowedOllamaProjectModel(
+      [evidencedModel],
+      requestedModel,
+    );
+    if (
+      ollamaModelSelection.model !== evidencedModel
+      || ollamaModelSelection.digest !== qualificationGrant.modelDigest
+      || ollamaModelSelection.backendKind !== qualificationGrant.ollamaBackendKind
+      || ollamaModelSelection.backendFingerprint !== qualificationGrant.ollamaBackendFingerprint
+      || ollamaModelSelection.backendGeneration !== qualificationGrant.ollamaBackendGeneration
+    ) {
+      throw new OllamaProjectModelSelectionError(
+        'The Ollama backend or installed model no longer matches this project qualification. Qualify the selected model again.',
+      );
+    }
+  }
+  const identity = await ensureProjectAssistantIdentity(input.projectDir, input.actorUserId, input.projectName, {
+    workspaceOwnerId: input.workspaceOwnerId,
+  });
+  const portalTranscriptCursor = await prisma.projectChatMessage.count({
+    where: { userId: input.actorUserId, projectId: input.executionContext.projectId },
+  });
+  const modelCandidates = [input.model, existingBinding?.model];
+  const selectedModel = input.provider === 'CODEX'
+    ? await resolveAllowedCodexProjectModel(modelCandidates, input.model)
+    : input.provider === 'CLAUDE_CODE'
+      ? await resolveAllowedClaudeCodeProjectModel(modelCandidates, input.model)
+      : input.provider === 'GEMINI'
+        ? await resolveAllowedAntigravityProjectModel(modelCandidates, input.model)
+        : input.provider === 'AGENT_ZERO'
+          ? agentZeroProjectModelBindingValue(agentZeroModelSelection!)
+          : ollamaModelSelection!.model;
+  if (input.provider === 'AGENT_ZERO'
+    && existingBinding?.sessionKey
+    && existingBinding.externalSessionId
+    && existingBinding.sessionKey !== existingBinding.externalSessionId) {
+    throw new ProjectChatBindingReadError(
+      'The existing Agent Zero Project binding contains conflicting remote context identities.',
+    );
+  }
+  const persistedProviderSessionId = String(
+    existingBinding?.sessionKey || existingBinding?.externalSessionId || '',
+  ).trim();
+  const loadedNativeSession = persistedProviderSessionId
+    ? loadNativeSession(input.provider, persistedProviderSessionId)
+    : null;
+  let nativeSession = loadedNativeSession;
+  if (
+    !nativeSession
+    || nativeSession.userId !== input.actorUserId
+    || !nativeSession.executionContext
+    || !executionContextsMatch(nativeSession.executionContext, input.executionContext)
+  ) {
+    nativeSession = null;
+  }
+  if (input.provider === 'OLLAMA' && nativeSession) {
+    const metadataHasBackendIdentity = (
+      nativeSession.metadata?.ollamaBackendKind !== undefined
+      || nativeSession.metadata?.ollamaBackendFingerprint !== undefined
+      || nativeSession.metadata?.ollamaBackendGeneration !== undefined
+    );
+    const sessionBackendKind = metadataHasBackendIdentity
+      ? nativeSession.metadata?.ollamaBackendKind
+      : 'LOCAL';
+    const sessionBackendFingerprint = metadataHasBackendIdentity
+      ? nativeSession.metadata?.ollamaBackendFingerprint
+      : 'local-ollama-v1:127.0.0.1:11434';
+    const sessionBackendGeneration = metadataHasBackendIdentity
+      ? nativeSession.metadata?.ollamaBackendGeneration
+      : null;
+    if (
+      nativeSession.model !== ollamaModelSelection!.model
+      || nativeSession.metadata?.ollamaModelDigest !== ollamaModelSelection!.digest
+      || nativeSession.metadata?.ollamaToolQualified !== true
+      || nativeSession.metadata?.ollamaRuntimeQuarantined === true
+      || sessionBackendKind !== ollamaModelSelection!.backendKind
+      || sessionBackendFingerprint !== ollamaModelSelection!.backendFingerprint
+      || sessionBackendGeneration !== ollamaModelSelection!.backendGeneration
+    ) {
+      throw new ProjectChatBindingReadError(
+        'The existing Ollama Project session no longer matches the qualified backend and model. Clear it before creating a replacement.',
+      );
+    }
+  }
+  if (input.provider === 'AGENT_ZERO' && nativeSession) {
+    if (nativeSession.metadata?.agentZeroRuntimeQuarantined === true
+      || String(nativeSession.metadata?.agentZeroActiveRunId || '').trim()) {
+      throw new ProjectChatBindingReadError(
+        'The existing Agent Zero Project context is active or quarantined and cannot change models.',
+      );
+    }
+    if (nativeSession.model !== agentZeroModelSelection!.model
+      || nativeSession.metadata?.agentZeroOAuthProviderId !== agentZeroModelSelection!.providerId
+      || nativeSession.metadata?.agentZeroModel !== agentZeroModelSelection!.model) {
+      await rebindAgentZeroProjectSessionModel({
+        sessionId: nativeSession.sessionId,
+        selection: agentZeroModelSelection!,
+      });
+      nativeSession = loadNativeSession('AGENT_ZERO', nativeSession.sessionId);
+      if (!nativeSession
+        || nativeSession.model !== agentZeroModelSelection!.model
+        || nativeSession.metadata?.agentZeroOAuthProviderId !== agentZeroModelSelection!.providerId
+        || nativeSession.metadata?.agentZeroModel !== agentZeroModelSelection!.model
+        || nativeSession.metadata?.agentZeroRuntimeQuarantined === true) {
+        throw new ProjectChatBindingReadError(
+          'Agent Zero did not persist the exact newly qualified OAuth model binding.',
+        );
+      }
+    }
+  }
+  if (input.provider === 'AGENT_ZERO' && persistedProviderSessionId && !loadedNativeSession) {
+    throw new ProjectChatBindingReadError(
+      'The existing Agent Zero Project context is missing locally, so its remote cleanup cannot be verified.',
+    );
+  }
+  if (input.provider === 'AGENT_ZERO' && loadedNativeSession && !nativeSession
+    && loadNativeSession('AGENT_ZERO', loadedNativeSession.sessionId)) {
+    // If the loaded record failed actor/context validation, it is not safe to
+    // mutate through this request. A deliberate cleanup path must resolve
+    // ownership first.
+    throw new ProjectChatBindingReadError(
+      'The existing Agent Zero Project context does not match this actor and project.',
+    );
+  }
+  if (input.provider === 'OLLAMA' && loadedNativeSession && !nativeSession
+    && loadNativeSession('OLLAMA', loadedNativeSession.sessionId)) {
+    throw new ProjectChatBindingReadError(
+      'The existing Ollama Project context does not match this actor and project. Clear it before creating a replacement.',
+    );
+  }
+  const replacingNativeSession = Boolean(
+    existingBinding
+    && !nativeSession
+    && (
+      existingBinding.sessionKey
+      || existingBinding.externalSessionId
+      || existingBinding.handoffCursor > 0
+    )
+  );
 
-  await gatewayRpcCall('config.patch', {
-    raw: JSON.stringify({ agents: { list: updatedList } }),
-    baseHash: configResult.data?.hash || '',
-  }, 15000);
+  const cliModel = input.provider === 'CODEX'
+    ? codexCliModelId(selectedModel)
+    : input.provider === 'CLAUDE_CODE'
+      ? claudeCodeCliModelId(selectedModel)
+      : input.provider === 'GEMINI'
+        ? normalizeAntigravityProjectModel(selectedModel) || undefined
+        : input.provider === 'AGENT_ZERO'
+          ? agentZeroModelSelection!.model
+          : selectedModel;
+  let sessionKey = nativeSession?.sessionId || '';
+  let createdNativeSession = false;
+  if (!sessionKey) {
+    prepareProjectLifecycleWorkspace(input.projectDir);
+    sessionKey = await getProjectChatProviderAdapter(input.provider).startSession(input.actorUserId, {
+      executionContext: input.executionContext,
+      ...(cliModel ? { model: cliModel } : {}),
+      metadata: {
+        cwd: input.executionContext.canonicalRoot,
+        title: `${input.projectName} · ${descriptor.displayName}`,
+        projectId: input.executionContext.projectId,
+        projectName: input.projectName,
+        workspaceOwnerId: input.workspaceOwnerId,
+        projectRuntime: descriptor.runtime,
+        ...(agentZeroModelSelection
+          ? { agentZeroOAuthProviderId: agentZeroModelSelection.providerId }
+          : {}),
+        ...(ollamaModelSelection
+          ? {
+              ollamaBackendKind: ollamaModelSelection.backendKind,
+              ollamaBackendFingerprint: ollamaModelSelection.backendFingerprint,
+              ollamaBackendGeneration: ollamaModelSelection.backendGeneration,
+            }
+          : {}),
+      },
+    });
+    createdNativeSession = true;
+    if (input.provider === 'OLLAMA') {
+      const createdSession = loadNativeSession('OLLAMA', sessionKey);
+      if (
+        !createdSession
+        || createdSession.metadata?.ollamaModelDigest !== ollamaModelSelection!.digest
+        || createdSession.metadata?.ollamaToolQualified !== true
+        || createdSession.metadata?.ollamaBackendKind !== ollamaModelSelection!.backendKind
+        || createdSession.metadata?.ollamaBackendFingerprint !== ollamaModelSelection!.backendFingerprint
+        || createdSession.metadata?.ollamaBackendGeneration !== ollamaModelSelection!.backendGeneration
+      ) {
+        deleteNativeSession('OLLAMA', sessionKey);
+        throw new OllamaProjectModelSelectionError(
+          'Ollama changed while the Project session was being admitted. Qualify the model again.',
+        );
+      }
+    }
+  } else if (input.provider !== 'OLLAMA'
+    && input.provider !== 'AGENT_ZERO'
+    && cliModel
+    && nativeSession?.model !== cliModel) {
+    updateNativeSessionModel(input.provider, sessionKey, cliModel);
+  }
+
+  let binding;
+  try {
+    binding = await ensureProjectChatProviderBinding({
+      userId: input.actorUserId,
+      projectId: input.executionContext.projectId,
+      provider: input.provider,
+      executionContext: input.executionContext,
+      sessionKey,
+      legacySessionKey: identity.sessionId,
+      externalSessionId: sessionKey,
+      model: selectedModel,
+      ...(agentZeroModelSelection ? { agentZeroModelSelection } : {}),
+      ...(ollamaModelSelection ? { ollamaModelSelection } : {}),
+      qualificationGrant,
+      resetHandoff: replacingNativeSession,
+    });
+  } catch (error) {
+    if (createdNativeSession) {
+      if (input.provider === 'AGENT_ZERO') {
+        try {
+          // Agent Zero owns a remote context as well as the local session
+          // record. A binding CAS failure must prove that remote context was
+          // deleted; deleting only the Portal record would orphan an
+          // independently runnable project context.
+          await getProjectChatProviderAdapter('AGENT_ZERO').terminateSession(sessionKey);
+        } catch (cleanupError) {
+          const cleanupFailure = new Error(
+            'Agent Zero Project binding failed and remote context cleanup could not be verified; the project remains quarantined.',
+          );
+          (cleanupFailure as Error & { cause?: unknown }).cause = cleanupError;
+          throw cleanupFailure;
+        }
+      } else {
+        deleteNativeSession(input.provider, sessionKey);
+      }
+    } else if (nativeSession) {
+      // Binding persistence and the native invocation model are one logical
+      // operation. Restore the preexisting file exactly if the database CAS
+      // fails so a later read cannot observe split configuration.
+      saveNativeSession(nativeSession);
+    }
+    throw error;
+  }
+  return {
+    identity,
+    binding,
+    sessionKey,
+    agentId: `${input.provider.toLowerCase().replace('_', '-')}-project`,
+    created: createdNativeSession,
+    needsBootstrap: projectChatBindingNeedsHandoff(binding, portalTranscriptCursor),
+    handoffCursor: binding.handoffCursor,
+    handoffVersion: binding.handoffVersion,
+    configuredModel: selectedModel,
+  };
+}
+
+async function ensureSelectedProjectChatBinding(input: {
+  actorUserId: string;
+  workspaceOwnerId: string;
+  projectName: string;
+  projectDir: string;
+  provider: AgentProviderName;
+  executionContext: ProjectSandboxExecutionContext;
+  model?: string | null;
+}) {
+  let resolved;
+  if (input.provider === 'OPENCLAW') {
+    const openClaw = await ensureOpenClawProjectChatBinding(input);
+    resolved = {
+      ...openClaw,
+      sessionKey: openClaw.binding.sessionKey || openClaw.identity.sessionKey,
+      agentId: openClaw.identity.agentId,
+      created: false,
+    };
+  } else if (isNativeProjectChatRouteProvider(input.provider)) {
+    resolved = await ensureNativeProjectChatBinding({ ...input, provider: input.provider });
+  } else {
+    throw new UnsupportedProjectChatProviderError(input.provider, 'No Project Sandbox broker is implemented for this provider.');
+  }
+  return resolved;
 }
 
 function isTextPreviewableFile(filePath: string): boolean {
@@ -331,50 +2677,470 @@ function isTextPreviewableFile(filePath: string): boolean {
   return false;
 }
 
+function listProjectRootRegularFiles(projectDir: string): string[] {
+  return fs.readdirSync(projectDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name)
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function readProjectPackageJson(projectDir: string): Record<string, any> | null {
+  const raw = readProjectTextFile(projectDir, 'package.json', {
+    optional: true,
+    maxBytes: PROJECT_METADATA_MAX_BYTES,
+  });
+  if (raw === null) return null;
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ProjectFilePolicyError('NOT_REGULAR', 'package.json must contain a JSON object');
+  }
+  return parsed;
+}
+
 function getUserProjectDir(userId: string) {
-  const dir = path.join(PROJECTS_DIR, userId);
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
+  if (!/^[a-zA-Z0-9_-]+$/.test(userId)) throw new Error('Invalid project owner');
+  const directory = ensureContainedDirectory(PROJECTS_DIR, userId);
+  fs.chmodSync(directory, 0o700);
+  return directory;
 }
 
 function getProjectPath(userId: string, projectName: string) {
   const userDir = getUserProjectDir(userId);
-  const projectDir = path.join(userDir, projectName);
-  const resolved = path.resolve(projectDir);
-  if (!resolved.startsWith(path.resolve(userDir))) throw new Error('Path traversal');
-  return resolved;
+  if (!projectName || path.basename(projectName) !== projectName || projectName.includes('\\')) {
+    throw new Error('Invalid project name');
+  }
+  return resolveContainedPath(userDir, projectName, { mustExist: false });
 }
 
-function ensureProjectGitIdentity(projectDir: string) {
-  const opts = { cwd: projectDir, timeout: 10000, encoding: 'utf-8' as const };
-  try {
-    execSync('git rev-parse --git-dir', opts);
-  } catch {
+function getExistingProjectPathReadOnly(userId: string, projectName: string) {
+  if (!/^[a-zA-Z0-9_-]+$/.test(userId)) throw new Error('Invalid project owner');
+  if (!projectName || path.basename(projectName) !== projectName || projectName.includes('\\')) {
+    throw new Error('Invalid project name');
+  }
+  return resolveContainedPath(PROJECTS_DIR, `${userId}/${projectName}`, {
+    mustExist: true,
+    kind: 'directory',
+  });
+}
+
+/**
+ * Project Chat is always scoped to the authenticated actor's own project tree.
+ *
+ * The broader Projects surface may intentionally map a SUB_ADMIN into the
+ * Owner workspace for host-operator compatibility. That mapping is never a
+ * valid sandbox principal: passing it into a provider would let one user's
+ * agent mount another user's project. Keep this resolver separate from
+ * getScopedOwnerId() so every Project Chat entry point fails closed.
+ */
+function resolveActorProjectChatWorkspace(req: Request, projectName: string) {
+  const actorUserId = req.user?.userId;
+  if (!actorUserId) throw new Error('Authenticated Project Chat actor is required');
+  return {
+    actorUserId,
+    workspaceOwnerId: actorUserId,
+    projectDir: getProjectPath(actorUserId, projectName),
+  };
+}
+
+function sendProjectFileMutationError(res: Response, error: unknown, fallback: string): void {
+  const message = error instanceof Error ? error.message : fallback;
+  if (error instanceof ProjectFilePolicyError || error instanceof ContainedPathError) {
+    const status = error instanceof ProjectFilePolicyError && error.code === 'TOO_LARGE'
+      || /exceeds the configured limit/i.test(message)
+      ? 413
+      : /already exists/i.test(message)
+        ? 409
+        : 400;
+    res.status(status).json({ error: message });
     return;
   }
+  res.status(500).json({ error: fallback });
+}
 
-  try {
-    const currentName = execSync('git config --local --get user.name || true', opts).trim();
-    if (!currentName) {
-      execSync(`git config --local user.name ${shellEscape(PROJECT_AGENT_GIT_NAME)}`, opts);
-    }
-  } catch {}
+async function resolveProjectChatOperationContext(
+  actorUserId: string,
+  workspaceOwnerId: string,
+  projectName: string,
+  projectDir: string,
+  requestedProvider: unknown,
+  options: { requireQualification?: boolean; readOnly?: boolean } = {},
+): Promise<{
+  provider: ProjectChatRouteProvider;
+  executionContext: ProjectSandboxExecutionContext;
+}> {
+  const provider = requireProjectChatRouteProvider(normalizeProjectChatProvider(requestedProvider));
+  const projectIdentity = options.readOnly
+    ? await readProjectIdentity({
+        workspaceOwnerId,
+        projectName,
+        projectRoot: projectDir,
+      })
+    : await ensureProjectIdentity({
+    workspaceOwnerId,
+    projectName,
+    projectRoot: projectDir,
+  });
+  if (!projectIdentity) throw new ProjectChatUninitializedError();
+  if (!options.readOnly) {
+    // All providers share one visible transcript. Native turns must not race a
+    // pending OpenClaw import or they can appear ahead of unimported history.
+    // Unrelated projects remain available because the gate is identity-scoped.
+    await assertLegacyOpenClawProjectMigrationInactive(projectIdentity.id);
+    await migrateLegacyProjectChatState({
+      actorUserId,
+      legacyProjectId: projectName,
+      immutableProjectId: projectIdentity.id,
+    });
+  }
+  const unqualifiedContextInput = {
+        actorUserId,
+        workspaceOwnerId,
+        projectName,
+        projectIdentity,
+        projectDir,
+        projectsRoot: PROJECTS_DIR,
+      };
+  const executionContext = buildUnqualifiedProjectSandboxExecutionContext(
+    provider,
+    unqualifiedContextInput,
+  );
+  if (options.requireQualification !== false) {
+    requireProjectQualification(provider, {
+      context: executionContext,
+      egress: buildProjectEgressConfig({ context: executionContext, provider }),
+    });
+  }
+  return { provider, executionContext };
+}
 
+class ProjectChatUninitializedError extends Error {
+  readonly code = 'PROJECT_CHAT_UNINITIALIZED';
+  constructor() {
+    super('Project Chat has not been initialized for this project.');
+    this.name = 'ProjectChatUninitializedError';
+  }
+}
+
+function sendProjectChatProviderError(
+  res: Response,
+  error: unknown,
+  extra: Record<string, unknown> = {},
+): boolean {
+  if (error instanceof OllamaAuthorityBarrierBusyError) {
+    res.status(error.statusCode).json({
+      error: error.message,
+      code: error.code,
+      provider: 'OLLAMA',
+      ...extra,
+    });
+    return true;
+  }
+  if (error instanceof LegacyOpenClawProjectMigrationActiveError) {
+    res.status(409).json({
+      error: error.message,
+      code: error.code,
+      retryable: error.retryable,
+      ...extra,
+    });
+    return true;
+  }
+  if (sendProjectChatQualificationError(res, error, null, extra)) return true;
+  // An optional provider runtime that is not installed is an ordinary,
+  // actionable state, not a failed sandbox attestation. Reporting it as the
+  // latter sent people hunting a security problem that was not there.
+  if (error instanceof ProjectChatProviderRuntimeUnavailableError) {
+    res.status(409).json({
+      error: error.message,
+      code: 'PROJECT_PROVIDER_RUNTIME_UNAVAILABLE',
+      provider: error.provider,
+      ...extra,
+    });
+    return true;
+  }
+  if (error instanceof ProjectChatUninitializedError) {
+    res.status(409).json({ error: error.message, code: error.code, ...extra });
+    return true;
+  }
+  if (error instanceof ProjectChatBindingReadError) {
+    res.status(409).json({
+      error: 'The existing Project provider session could not be verified. Start a new provider session before sending another turn.',
+      code: error.code,
+      ...extra,
+    });
+    return true;
+  }
+  if (error instanceof CodexProjectModelSelectionError) {
+    res.status(409).json({
+      error: error.message,
+      code: error.code,
+      provider: 'CODEX',
+      ...extra,
+    });
+    return true;
+  }
+  if (error instanceof ClaudeCodeProjectModelSelectionError) {
+    res.status(409).json({
+      error: error.message,
+      code: error.code,
+      provider: 'CLAUDE_CODE',
+      ...extra,
+    });
+    return true;
+  }
+  if (error instanceof AntigravityProjectModelSelectionError) {
+    res.status(409).json({
+      error: error.message,
+      code: error.code,
+      provider: 'GEMINI',
+      ...extra,
+    });
+    return true;
+  }
+  if (error instanceof AgentZeroProjectModelSelectionError) {
+    res.status(409).json({
+      error: error.message,
+      code: error.code,
+      provider: 'AGENT_ZERO',
+      ...extra,
+    });
+    return true;
+  }
+  if (error instanceof OllamaProjectModelSelectionError) {
+    res.status(409).json({
+      error: error.message,
+      code: error.code,
+      provider: 'OLLAMA',
+      ...extra,
+    });
+    return true;
+  }
+  if (error instanceof OpenClawProjectModelVerificationError) {
+    const rejected = error.code === 'MODEL_INVALID'
+      || error.code === 'MODEL_UNAVAILABLE'
+      || error.code === 'MODEL_PATCH_REJECTED'
+      || (error.code === 'MODEL_READBACK_MISMATCH' && error.rollbackStatus === 'CONFIRMED');
+    console.error(`[OpenClaw Project Model] ${error.code}:`, error.causeDetail || error.message);
+    res.status(rejected ? 409 : 503).json({
+      error: error.message,
+      code: rejected ? 'PROJECT_MODEL_SWITCH_REJECTED' : 'PROJECT_MODEL_VERIFICATION_FAILED',
+      provider: 'OPENCLAW',
+      previousModelRestored: error.rollbackStatus === 'CONFIRMED',
+      ...extra,
+    });
+    return true;
+  }
+  if (!(error instanceof UnsupportedProjectChatProviderError)) return false;
+  res.status(409).json({
+    error: error.message,
+    code: 'PROJECT_PROVIDER_UNSUPPORTED',
+    provider: error.provider,
+    ...extra,
+  });
+  return true;
+}
+
+function sendProjectChatQualificationError(
+  res: Response,
+  error: unknown,
+  provider: QualifiableProjectProvider | null = null,
+  extra: Record<string, unknown> = {},
+): boolean {
+  const presented = presentProjectQualificationError(error, provider);
+  if (!presented) return false;
+  res.status(presented.status).json({ ...presented.body, provider, ...extra });
+  return true;
+}
+
+function toPersistedProjectChatProvider(provider: AgentProviderName): ProjectChatPersistedProvider {
+  return provider === 'GROK' ? 'GROK_BUILD' : provider;
+}
+
+function fromPersistedProjectChatProvider(provider: ProjectChatPersistedProvider): AgentProviderName {
+  return provider === 'GROK_BUILD' ? 'GROK' : provider;
+}
+
+function projectChatClientModel(
+  provider: AgentProviderName,
+  bindingModel: string | null | undefined,
+  nativeModel?: string | null,
+): string | null {
+  const persisted = String(bindingModel || '').trim();
+  if (provider === 'OLLAMA') {
+    if (persisted) return parseOllamaProjectModelBinding(persisted).model;
+    const runtimeModel = String(nativeModel || '').trim();
+    return runtimeModel || null;
+  }
+  return persisted || String(nativeModel || '').trim() || null;
+}
+
+function sendProjectChatCoordinationError(
+  res: Response,
+  error: unknown,
+  extra: Record<string, unknown> = {},
+): boolean {
+  if (!(error instanceof ProjectChatLeaseError)) return false;
+  res.status(error.httpStatus).json({
+    error: error.message,
+    code: `PROJECT_CHAT_${error.code}`,
+    ...extra,
+  });
+  return true;
+}
+
+async function requireSelectedProjectChatState(input: {
+  actorUserId: string;
+  projectIdentityId: string;
+  provider: AgentProviderName;
+  expectedVersion: unknown;
+}) {
+  const expectedVersion = Number(input.expectedVersion);
+  if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) {
+    throw new ProjectChatLeaseError(
+      'INVALID_INPUT',
+      'A current Project Chat state version is required',
+      400,
+    );
+  }
+  await ensureProjectChatState({
+    actorUserId: input.actorUserId,
+    projectIdentityId: input.projectIdentityId,
+    initialProvider: toPersistedProjectChatProvider(input.provider),
+  });
+  const coordination = await readProjectChatCoordinationState({
+    actorUserId: input.actorUserId,
+    projectIdentityId: input.projectIdentityId,
+  });
+  if (!coordination.state) {
+    throw new ProjectChatLeaseError('STATE_NOT_FOUND', 'Project Chat state was not found', 404);
+  }
+  if (coordination.state.version !== expectedVersion) {
+    throw new ProjectChatLeaseError(
+      'VERSION_CONFLICT',
+      'Project Chat state changed; refresh before continuing',
+    );
+  }
+  if (coordination.state.selectedProvider !== toPersistedProjectChatProvider(input.provider)) {
+    throw new ProjectChatLeaseError(
+      'PROVIDER_MISMATCH',
+      'The requested provider is not the server-selected Project Chat provider',
+    );
+  }
+  return coordination;
+}
+
+async function findProjectChatRequestReplay(input: {
+  actorUserId: string;
+  projectIdentityId: string;
+  provider: AgentProviderName;
+  messageId: string | null;
+  message: string;
+}) {
+  if (!input.messageId) return null;
+  const persistedMessage = await prisma.projectChatMessage.findFirst({
+    where: {
+      userId: input.actorUserId,
+      projectId: input.projectIdentityId,
+      messageId: input.messageId,
+    },
+    select: { id: true, role: true, content: true, provider: true },
+  });
+  if (!persistedMessage) return null;
+  if (
+    persistedMessage.role !== 'user'
+    || persistedMessage.content !== input.message
+    || persistedMessage.provider !== input.provider
+  ) {
+    throw new ProjectChatLeaseError(
+      'REQUEST_REPLAY',
+      'Project Chat message identity was already used for different content',
+    );
+  }
+  const turn = await prisma.projectChatTurn.findUnique({
+    where: {
+      actorUserId_projectIdentityId_requestId: {
+        actorUserId: input.actorUserId,
+        projectIdentityId: input.projectIdentityId,
+        requestId: persistedMessage.id,
+      },
+    },
+  });
+  if (!turn) return null;
+  if (turn.provider !== toPersistedProjectChatProvider(input.provider)) {
+    throw new ProjectChatLeaseError('PROVIDER_MISMATCH', 'Durable Project Chat replay belongs to another provider');
+  }
+  const coordination = await readProjectChatCoordinationState({
+    actorUserId: input.actorUserId,
+    projectIdentityId: input.projectIdentityId,
+  });
+  if (!coordination.state || coordination.state.selectedProvider !== turn.provider) {
+    throw new ProjectChatLeaseError('STATE_CORRUPT', 'Durable Project Chat replay is detached from provider state', 500);
+  }
+  return { turn, state: coordination.state };
+}
+
+function startProjectChatLeaseHeartbeat(input: {
+  actorUserId: string;
+  projectIdentityId: string;
+  turnId: string;
+  leaseToken: string;
+  providerSessionId?: () => string | null;
+  onLeaseLost: (error: unknown) => Promise<void> | void;
+}) {
+  let stopped = false;
+  let renewing = false;
+  let lossReported = false;
+  const timer = setInterval(() => {
+    if (stopped || renewing || lossReported) return;
+    renewing = true;
+    void renewProjectChatTurnLease({
+      actorUserId: input.actorUserId,
+      projectIdentityId: input.projectIdentityId,
+      turnId: input.turnId,
+      leaseToken: input.leaseToken,
+      leaseDurationMs: PROJECT_CHAT_LEASE_DURATION_MS,
+      providerSessionId: input.providerSessionId?.() || null,
+    }).catch((error) => {
+      lossReported = true;
+      clearInterval(timer);
+      void Promise.resolve(input.onLeaseLost(error)).catch((callbackError) => {
+        console.error('[Project Chat] Lease-loss callback failed:', callbackError);
+      });
+    }).finally(() => {
+      renewing = false;
+    });
+  }, PROJECT_CHAT_LEASE_RENEW_INTERVAL_MS);
+  timer.unref?.();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
+function resolveExistingProjectEntry(projectDir: string, requestedPath: unknown, kind: 'file' | 'directory' | 'any' = 'any') {
+  return resolveContainedPath(projectDir, requestedPath, { mustExist: true, kind });
+}
+
+function resolveProjectTarget(projectDir: string, requestedPath: unknown) {
+  return resolveContainedPath(projectDir, requestedPath, { mustExist: false });
+}
+
+function readProjectGitHead(projectDir: string): string {
   try {
-    const currentEmail = execSync('git config --local --get user.email || true', opts).trim();
-    if (!currentEmail) {
-      execSync(`git config --local user.email ${shellEscape(PROJECT_AGENT_GIT_EMAIL)}`, opts);
-    }
+    const dotGit = path.join(projectDir, '.git');
+    const headPath = path.join(dotGit, 'HEAD');
+    const gitEntry = fs.lstatSync(dotGit);
+    if (gitEntry.isSymbolicLink() || !gitEntry.isDirectory()) return '';
+    const headEntry = fs.lstatSync(headPath);
+    if (headEntry.isSymbolicLink() || !headEntry.isFile() || headEntry.size > 4096) return '';
+    const head = fs.readFileSync(headPath, 'utf8').trim();
+    if (/^ref: refs\/heads\/[a-zA-Z0-9_./-]+$/.test(head)) return head.slice('ref: refs/heads/'.length);
+    if (/^[a-f0-9]{40,64}$/i.test(head)) return head.slice(0, 12);
   } catch {}
+  return '';
 }
 
 async function getScopedOwnerId(req: Request): Promise<string> {
   return getWorkspaceOwnerId(req.user!);
-}
-
-async function withScopedOwner<T>(req: Request, fn: (ownerId: string) => Promise<T>): Promise<T> {
-  const ownerId = await getScopedOwnerId(req);
-  return fn(ownerId);
 }
 
 async function getAssistantName(): Promise<string> {
@@ -454,11 +3220,13 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`,
   'node-api': {
     files: {
       'index.js': `const http = require('http');
+const host = process.env.HOST || '127.0.0.1';
+const port = Number.parseInt(process.env.PORT || '3000', 10);
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ message: 'Hello from Node.js API!', timestamp: new Date().toISOString() }));
 });
-server.listen(3000, () => console.log('Server running on port 3000'));`,
+server.listen(port, host, () => console.log(\`Server running at http://\${host}:\${port}\`));`,
       'package.json': JSON.stringify({ name: 'node-api', version: '1.0.0', main: 'index.js', scripts: { start: 'node index.js' } }, null, 2),
       'README.md': '# Node.js API\n\nRun with `npm start`\n',
     },
@@ -508,25 +3276,73 @@ router.get('/', authenticateToken, requireApproved, async (req: Request, res: Re
     const ownerId = await getScopedOwnerId(req);
     const userDir = getUserProjectDir(ownerId);
     const entries = fs.readdirSync(userDir, { withFileTypes: true });
-    const projects = entries
-      .filter(e => e.isDirectory())
-      .map(e => {
+    let lifecycleResidueSeen = false;
+    const projects = await Promise.all(entries
+      // Dot-prefixed entries are the Portal's internal lifecycle namespace
+      // (quarantine staging), never projects; listing one here once adopted
+      // it as a permanent ghost project.
+      .filter(e => e.isDirectory() && !isInternalProjectDirectoryName(e.name))
+      .map(async e => {
         const pDir = path.join(userDir, e.name);
+        const storedIdentity = await prisma.projectIdentity.findUnique({
+          where: {
+            workspaceOwnerId_projectName: {
+              workspaceOwnerId: ownerId,
+              projectName: e.name,
+            },
+          },
+        });
+        // A no-replace move can make the final directory visible for the few
+        // milliseconds before its CREATING->ACTIVE CAS. Never fail the whole
+        // project list or expose that partially published lifecycle row.
+        if (storedIdentity && storedIdentity.lifecycleStatus === 'CREATING') return null;
+        if (storedIdentity && storedIdentity.lifecycleStatus !== 'ACTIVE') {
+          // A wedged rename/delete must not make the project vanish from the
+          // list. Surface it with its controls disabled and one honest
+          // sentence; recovery runs detached from this request.
+          lifecycleResidueSeen = true;
+          const residueStat = fs.statSync(pDir);
+          return {
+            name: e.name,
+            hasGit: fs.existsSync(path.join(pDir, '.git')),
+            currentBranch: '',
+            deployedUrl: '',
+            deployment: null,
+            createdAt: residueStat.birthtime.toISOString(),
+            updatedAt: residueStat.mtime.toISOString(),
+            identity: serializeProjectIdentityProof(storedIdentity),
+            destructiveActions: {
+              allowed: false,
+              reason: projectLifecycleBlockedMessage(storedIdentity),
+            },
+          };
+        }
         const stat = fs.statSync(pDir);
+        const identity = await ensureProjectIdentity({
+          workspaceOwnerId: ownerId,
+          projectName: e.name,
+          projectRoot: pDir,
+        });
         const hasGit = fs.existsSync(path.join(pDir, '.git'));
         let currentBranch = '';
         let deployedUrl = '';
         
         if (hasGit) {
-          try {
-            currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: pDir, timeout: 5000, encoding: 'utf-8' }).trim();
-          } catch {}
+          currentBranch = readProjectGitHead(pDir);
         }
         
-        // Check if deployed
+        // Resolve deployment through the immutable Project association. A
+        // leftover directory without a matching App row is residue, not a
+        // supported deployment.
         const deployId = `${ownerId}-${e.name}`;
         const deployPath = path.join(DEPLOY_DIR, deployId);
-        if (fs.existsSync(deployPath)) {
+        const app = await findProjectAppForIdentity({
+          workspaceOwnerId: ownerId,
+          projectIdentityId: identity.id,
+          projectName: e.name,
+          deployPath,
+        });
+        if (app?.isActive && app.deployType !== 'runtime' && fs.existsSync(deployPath)) {
           deployedUrl = `/hosted/${deployId}/`;
         }
         
@@ -535,86 +3351,358 @@ router.get('/', authenticateToken, requireApproved, async (req: Request, res: Re
           hasGit,
           currentBranch,
           deployedUrl,
+          deployment: app ? {
+            appId: app.id,
+            deployType: app.deployType,
+            processStatus: app.processStatus,
+            port: app.port,
+            isActive: app.isActive,
+          } : null,
           createdAt: stat.birthtime.toISOString(),
           updatedAt: stat.mtime.toISOString(),
+          identity: serializeProjectIdentityProof(identity),
+          destructiveActions: projectDestructiveActionCapability(identity),
         };
+      }));
+    if (lifecycleResidueSeen) {
+      scheduleProjectLifecycleResidueRecovery({
+        actorUserId: req.user!.userId,
+        workspaceOwnerId: ownerId,
       });
-    res.json({ projects });
+    }
+    res.json({ projects: projects.filter((project) => project !== null) });
   } catch (error) {
     console.error('List projects error:', error);
     res.status(500).json({ error: 'Failed to list projects', detail: (error as any)?.message });
   }
 });
 
+const projectSearchLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 60,
+  message: { error: 'Too many Project searches. Refine the query and try again shortly.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// GET /api/projects/search - bounded project and nested-file search
+router.get('/search', authenticateToken, requireApproved, projectSearchLimiter, async (req: Request, res: Response) => {
+  const abortController = new AbortController();
+  const abortIfDisconnected = () => {
+    if (!res.writableEnded) abortController.abort();
+  };
+  res.once('close', abortIfDisconnected);
+  try {
+    const query = String(req.query.q || '').trim();
+    if (!query) {
+      res.status(400).json({ error: 'q required' });
+      return;
+    }
+    if (query.length > 200 || /[\u0000-\u001f\u007f]/.test(query)) {
+      res.status(400).json({ error: 'Project search query is invalid or too long' });
+      return;
+    }
+
+    const requestedLimit = Number(req.query.limit || 24);
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit <= 0) {
+      res.status(400).json({ error: 'Project search limit is invalid' });
+      return;
+    }
+
+    // Match the Files and Projects workspace contract: ordinary users and
+    // sandboxed operators stay in their own actor workspace; an explicitly
+    // shared elevated workspace resolves through getWorkspaceOwnerId.
+    const ownerId = await getScopedOwnerId(req);
+    const userDir = getUserProjectDir(ownerId);
+    const response = await runProjectWorkspaceSearch(userDir, {
+      query,
+      limit: Math.min(requestedLimit, 50),
+      signal: abortController.signal,
+    });
+    res.json(response);
+  } catch (error) {
+    if ((error as Error)?.name === 'AbortError' && abortController.signal.aborted) return;
+    if (error instanceof ProjectSearchCapacityError) {
+      res.setHeader('Retry-After', '1');
+      res.status(503).json({ error: 'Project search is busy. Try again shortly.' });
+      return;
+    }
+    console.error('Project search error:', error);
+    res.status(500).json({ error: 'Failed to search projects' });
+  } finally {
+    res.off('close', abortIfDisconnected);
+  }
+});
+
 // POST /api/projects - create from template
 router.post('/', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  let createdProjectDir: string | undefined;
+  let createdProjectRootIdentity: AttestedProjectRoot | undefined;
+  let createdProjectIdentityId: string | undefined;
+  let creationSuccessResponse:
+    | { name: string; template: string; identity: ProjectIdentityProof }
+    | undefined;
+  let releaseProjectNameLock: (() => void) | null = null;
   try {
     const ownerId = await getScopedOwnerId(req);
     const { name, template = 'static-html' } = req.body;
-    if (!name) { res.status(400).json({ error: 'name required' }); return; }
+    if (typeof name !== 'string' || !name.trim()) { res.status(400).json({ error: 'name required' }); return; }
+    if (typeof template !== 'string' || !Object.prototype.hasOwnProperty.call(TEMPLATES, template)) {
+      res.status(400).json({ error: 'Unknown project template' });
+      return;
+    }
 
-    const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120) || 'project';
     const projectDir = getProjectPath(ownerId, safeName);
+
+    releaseProjectNameLock = await acquireProjectDeletionLock(
+      projectDeletionLockKey(ownerId, safeName),
+    );
+    await assertProjectIdentityNameAvailable({ workspaceOwnerId: ownerId, projectName: safeName });
 
     if (fs.existsSync(projectDir)) {
       res.status(409).json({ error: 'Project already exists' });
       return;
     }
 
-    fs.mkdirSync(projectDir, { recursive: true });
-    writeProjectIdentity(projectDir, createProjectStableSlug(safeName));
+    const stagingDir = createProjectCreationStagingDirectory();
+    createdProjectDir = stagingDir;
+    createdProjectRootIdentity = attestProjectRoot(stagingDir);
+    await assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId: ownerId,
+      projectName: safeName,
+      projectRoot: stagingDir,
+    });
+    const projectIdentity = await createCurrentProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: safeName,
+      projectRoot: stagingDir,
+    });
+    createdProjectIdentityId = projectIdentity.id;
+    const gitScope = { actorId: req.user!.userId, projectId: projectIdentity.id };
 
-    const tmpl = TEMPLATES[template] || TEMPLATES['static-html'];
+    const tmpl = TEMPLATES[template];
     for (const [fname, content] of Object.entries(tmpl.files)) {
-      const filePath = path.join(projectDir, fname);
+      const filePath = path.join(stagingDir, fname);
       fs.mkdirSync(path.dirname(filePath), { recursive: true });
       fs.writeFileSync(filePath, content);
     }
 
     // Init git
     try {
-      execSync('git init && git add -A && git commit -m "Initial commit"', { cwd: projectDir, timeout: 10000 });
+      await runProjectGitCommand({ ...gitScope, workspace: stagingDir, args: ['init'], timeoutMs: 10_000 });
+      await runProjectGitCommand({ ...gitScope, workspace: stagingDir, args: ['add', '-A'], timeoutMs: 10_000 });
+      await runProjectGitCommand({ ...gitScope, workspace: stagingDir, args: ['commit', '-m', 'Initial commit'], timeoutMs: 10_000 });
     } catch {}
 
-    await prisma.activityLog.create({
-      data: { userId: ownerId, action: 'PROJECT_CREATE', resource: 'project', severity: 'INFO' },
+    await assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId: ownerId,
+      projectName: safeName,
+      projectRoot: stagingDir,
+    });
+    moveAttestedDirectoryNoReplace({
+      sourceRoot: stagingDir,
+      targetRoot: projectDir,
+      expectedIdentity: projectIdentity,
+    });
+    createdProjectDir = projectDir;
+    creationSuccessResponse = {
+      name: safeName,
+      template,
+      identity: serializeProjectIdentityProof(projectIdentity),
+    };
+    await finalizeCurrentProjectIdentityCreation({
+      projectIdentityId: projectIdentity.id,
+      projectRoot: projectDir,
     });
 
-    res.status(201).json({ name: safeName, template });
+    await prisma.activityLog.create({
+      data: {
+        userId: ownerId,
+        action: 'PROJECT_CREATE',
+        resource: 'project',
+        resourceId: projectIdentity.id,
+        severity: 'INFO',
+        metadata: { projectName: safeName, template },
+      },
+    }).catch((error) => {
+      console.warn('[Project Create] Failed to record activity:', error);
+    });
+
+    res.status(201).json(creationSuccessResponse);
+    createdProjectDir = undefined;
+    createdProjectRootIdentity = undefined;
+    createdProjectIdentityId = undefined;
   } catch (error) {
+    const reconciliation = await reconcileFailedCurrentProjectCreation({
+      projectIdentityId: createdProjectIdentityId,
+      directory: createdProjectDir,
+      expectedDirectoryIdentity: createdProjectRootIdentity,
+    }, '[Project Create] Staging cleanup failed:');
+    if (reconciliation === 'published') {
+      console.warn('[Project Create] Publication committed before a later operation failed:', error);
+      if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+        res.status(201).json(creationSuccessResponse!);
+      }
+      return;
+    }
     console.error('Create project error:', error);
+    if (error instanceof LegacyOpenClawProjectCreationCollisionError) {
+      res.status(409).json({ error: error.message, code: error.code, retryable: false });
+      return;
+    }
+    if (error instanceof LegacyOpenClawProjectCreationScanCapacityError) {
+      res.status(503).json({ error: error.message, code: error.code, retryable: true });
+      return;
+    }
+    if (error instanceof ProjectIdentityLifecycleError || (error as any)?.code === 'P2002') {
+      res.status(409).json({ error: 'Project name is already owned or reserved' });
+      return;
+    }
     res.status(500).json({ error: 'Failed to create project', detail: (error as any)?.message });
+  } finally {
+    releaseProjectNameLock?.();
   }
 });
 
 // POST /api/projects/clone - clone git repo
 router.post('/clone', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  const abortController = new AbortController();
+  let createdProjectDir: string | undefined;
+  let createdProjectRootIdentity: AttestedProjectRoot | undefined;
+  let createdProjectIdentityId: string | undefined;
+  let creationSuccessResponse:
+    | { name: string; clonedFrom: string; identity: ProjectIdentityProof }
+    | undefined;
+  let releaseProjectNameLock: (() => void) | null = null;
+  const abort = () => abortController.abort();
+  req.once('aborted', abort);
+  const close = () => { if (!res.writableEnded) abort(); };
+  res.once('close', close);
   try {
     const ownerId = await getScopedOwnerId(req);
     const { url, name } = req.body;
-    if (!url) { res.status(400).json({ error: 'url required' }); return; }
+    if (typeof url !== 'string' || !url.trim()) { res.status(400).json({ error: 'url required' }); return; }
 
-    const safeName = (name || url.split('/').pop()?.replace('.git', '') || 'repo').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const safeName = String(name || url.split('/').pop()?.replace('.git', '') || 'repo')
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .slice(0, 120) || 'repo';
     const projectDir = getProjectPath(ownerId, safeName);
+
+    releaseProjectNameLock = await acquireProjectDeletionLock(
+      projectDeletionLockKey(ownerId, safeName),
+    );
+    await assertProjectIdentityNameAvailable({ workspaceOwnerId: ownerId, projectName: safeName });
 
     if (fs.existsSync(projectDir)) {
       res.status(409).json({ error: 'Project already exists' });
       return;
     }
 
-    // Validate URL format to prevent command injection
-    if (!/^https?:\/\/[^\s"'`$()]+$/.test(url) && !/^git@[^\s"'`$()]+$/.test(url)) {
-      res.status(400).json({ error: 'Invalid repository URL format' });
+    let safeUrl = '';
+    try {
+      safeUrl = assertSafeProjectGitUrl(url);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
       return;
     }
 
-    execSync(`git clone --depth 1 ${shellEscape(url)} ${shellEscape(projectDir)}`, { timeout: 120000 });
-    writeProjectIdentity(projectDir, createProjectStableSlug(safeName));
+    const stagingDir = createProjectCreationStagingDirectory();
+    createdProjectDir = stagingDir;
+    createdProjectRootIdentity = attestProjectRoot(stagingDir);
+    await assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId: ownerId,
+      projectName: safeName,
+      projectRoot: stagingDir,
+    });
+    const projectIdentity = await createCurrentProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: safeName,
+      projectRoot: stagingDir,
+    });
+    createdProjectIdentityId = projectIdentity.id;
+    await runProjectGitCommand({
+      actorId: req.user!.userId,
+      projectId: projectIdentity.id,
+      workspace: stagingDir,
+      args: ['clone', '--depth', '1', safeUrl, '.'],
+      timeoutMs: 120_000,
+      network: true,
+      signal: abortController.signal,
+    });
 
-    res.status(201).json({ name: safeName, clonedFrom: url });
+    await assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId: ownerId,
+      projectName: safeName,
+      projectRoot: stagingDir,
+    });
+    moveAttestedDirectoryNoReplace({
+      sourceRoot: stagingDir,
+      targetRoot: projectDir,
+      expectedIdentity: projectIdentity,
+    });
+    createdProjectDir = projectDir;
+    creationSuccessResponse = {
+      name: safeName,
+      clonedFrom: safeUrl,
+      identity: serializeProjectIdentityProof(projectIdentity),
+    };
+    await finalizeCurrentProjectIdentityCreation({
+      projectIdentityId: projectIdentity.id,
+      projectRoot: projectDir,
+    });
+
+    await prisma.activityLog.create({
+      data: {
+        userId: ownerId,
+        action: 'PROJECT_CLONE',
+        resource: 'project',
+        resourceId: projectIdentity.id,
+        severity: 'INFO',
+        metadata: { projectName: safeName, clonedFrom: safeUrl },
+      },
+    }).catch((error) => {
+      console.warn('[Project Clone] Failed to record activity:', error);
+    });
+
+    res.status(201).json(creationSuccessResponse);
+    createdProjectDir = undefined;
+    createdProjectRootIdentity = undefined;
+    createdProjectIdentityId = undefined;
   } catch (error: any) {
+    const reconciliation = await reconcileFailedCurrentProjectCreation({
+      projectIdentityId: createdProjectIdentityId,
+      directory: createdProjectDir,
+      expectedDirectoryIdentity: createdProjectRootIdentity,
+    }, '[Project Clone] Staging cleanup failed:');
+    if (reconciliation === 'published') {
+      console.warn('[Project Clone] Publication committed before a later operation failed:', error);
+      if (
+        !res.headersSent
+        && !res.writableEnded
+        && !res.destroyed
+        && !abortController.signal.aborted
+      ) {
+        res.status(201).json(creationSuccessResponse!);
+      }
+      return;
+    }
     console.error('Clone error:', error);
-    res.status(500).json({ error: 'Failed to clone repository', detail: error.message });
+    if (!res.headersSent && !abortController.signal.aborted) {
+      if (error instanceof LegacyOpenClawProjectCreationCollisionError) {
+        res.status(409).json({ error: error.message, code: error.code, retryable: false });
+      } else if (error instanceof LegacyOpenClawProjectCreationScanCapacityError) {
+        res.status(503).json({ error: error.message, code: error.code, retryable: true });
+      } else if (error instanceof ProjectIdentityLifecycleError || error?.code === 'P2002') {
+        res.status(409).json({ error: 'Project name is already owned or reserved' });
+      } else {
+        res.status(500).json({ error: 'Failed to clone repository', detail: error.message });
+      }
+    }
+  } finally {
+    releaseProjectNameLock?.();
+    req.off('aborted', abort);
+    res.off('close', close);
   }
 });
 
@@ -623,18 +3711,27 @@ router.post('/clone', authenticateToken, requireApproved, async (req: Request, r
 router.get('/models/available', authenticateToken, requireApproved, async (_req: Request, res: Response) => {
   try {
     const result = await listGatewayModels();
-    const providerStatus = new Map(getProviderStatuses().map((p) => [p.id, p]));
+    const providerStatus = new Map((await getProviderStatusesAsync()).map((p) => [p.id, p]));
     const defaultModel = getDefaultModel();
 
     if (result.ok && result.models) {
-      const models = result.models.map((m: any) => ({
-        id: m.id ? (m.provider ? `${m.provider}/${m.id}` : m.id) : m.model,
-        name: m.name || m.id || m.model,
-        provider: m.provider,
-        reasoning: m.reasoning || false,
-        contextWindow: m.contextWindow,
-        cost: m.cost,
-      }));
+      const models = result.models.flatMap((m: any) => {
+        if (m?.available === false || m?.missing === true) return [];
+        const rawModel = String(m?.key || m?.id || m?.model || '').trim();
+        const provider = String(m?.provider || '').trim();
+        const id = rawModel.includes('/')
+          ? normalizePortalModelId(rawModel)
+          : canonicalizeProviderModelId(provider, rawModel);
+        if (!id) return [];
+        return [{
+          id,
+          name: m.name || rawModel,
+          provider: provider || id.split('/')[0] || '',
+          reasoning: m.reasoning || false,
+          contextWindow: m.contextWindow,
+          cost: m.cost,
+        }];
+      });
 
       models.sort((a, b) => {
         const aStatus = a.provider ? providerStatus.get(a.provider) : undefined;
@@ -648,51 +3745,67 @@ router.get('/models/available', authenticateToken, requireApproved, async (_req:
         return 0;
       });
 
-      res.json({ models });
+      res.json({ models, verified: true });
     } else {
-      res.json({ 
-        models: [
-          { id: 'openai/gpt-5.6-sol', name: 'GPT-5.6 Sol', provider: 'openai-codex' },
-          { id: 'openai/gpt-5.5', name: 'GPT-5.5', provider: 'openai-codex' },
-          { id: 'anthropic/claude-fable-5', name: 'Claude Fable 5', provider: 'anthropic' },
-          { id: 'anthropic/claude-opus-4-8', name: 'Claude Opus 4.8', provider: 'anthropic' },
-          { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6', provider: 'anthropic' },
-          { id: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', provider: 'anthropic' },
-        ],
-        fallback: true,
+      res.status(503).json({
+        error: 'The live OpenClaw model catalog is unavailable.',
+        code: 'PROJECT_MODEL_CATALOG_UNAVAILABLE',
+        models: [],
+        verified: false,
       });
     }
-  } catch (error: any) {
-    res.status(500).json({ error: 'Failed to list models' });
+  } catch (error) {
+    console.error('[Project Models] Live catalog failed:', error);
+    res.status(503).json({
+      error: 'The live OpenClaw model catalog is unavailable.',
+      code: 'PROJECT_MODEL_CATALOG_UNAVAILABLE',
+      models: [],
+      verified: false,
+    });
   }
 });
 
 // GET /api/projects/:name/tree - file tree with git status
-router.get('/:name/tree', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+router.get('/:name/tree', authenticateToken, requireApproved, projectPathSandbox, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: req.params.name,
+      projectRoot: projectDir,
+    });
     const subPath = (req.query.path as string) || '';
-    const targetDir = path.join(projectDir, subPath);
-    const resolved = path.resolve(targetDir);
-    if (!resolved.startsWith(path.resolve(projectDir))) { res.status(403).json({ error: 'Forbidden' }); return; }
-
-    if (!fs.existsSync(resolved)) { res.status(404).json({ error: 'Path not found' }); return; }
+    let resolved: string;
+    try {
+      resolved = subPath
+        ? resolveExistingProjectEntry(projectDir, subPath, 'directory')
+        : fs.realpathSync(projectDir);
+    } catch {
+      res.status(404).json({ error: 'Path not found' });
+      return;
+    }
 
     // Get git status for all files
-    let gitStatusMap: Record<string, string> = {};
+    const gitStatusMap: Record<string, string> = {};
     const hasGit = fs.existsSync(path.join(projectDir, '.git'));
     if (hasGit) {
       try {
-        const statusOutput = execSync('git status --porcelain -uall', { cwd: projectDir, timeout: 5000, encoding: 'utf-8' });
-        for (const line of statusOutput.split('\n').filter(Boolean)) {
-          const status = line.substring(0, 2).trim();
-          const filePath = line.substring(3).trim();
+        const statusOutput = await runProjectGitCommand({
+          actorId: req.user!.userId,
+          projectId: projectIdentity.id,
+          workspace: projectDir,
+          args: ['status', '--porcelain=v1', '-z', '-uall'],
+          timeoutMs: 5000,
+        });
+        for (const entry of parseProjectGitPorcelain(statusOutput)) {
+          const status = entry.status.trim();
+          const filePath = entry.path;
+          if (isTransientProjectStatePath(filePath)) continue;
           // Map git status codes
           let statusLabel = 'modified';
-          if (status === '??' || status === 'A') statusLabel = 'untracked';
+          if (status === '??') statusLabel = 'untracked';
           else if (status === 'M' || status === 'MM') statusLabel = 'modified';
           else if (status === 'D') statusLabel = 'deleted';
           else if (status === 'R') statusLabel = 'renamed';
@@ -704,6 +3817,7 @@ router.get('/:name/tree', authenticateToken, requireApproved, async (req: Reques
 
     const entries = fs.readdirSync(resolved, { withFileTypes: true });
     const tree = entries
+      .filter(e => !e.isSymbolicLink())
       .filter(e => !e.name.startsWith('.') || e.name === '.gitignore' || e.name === '.agent-memory.md')
       .map(e => {
         const entryPath = subPath ? `${subPath}/${e.name}` : e.name;
@@ -721,7 +3835,7 @@ router.get('/:name/tree', authenticateToken, requireApproved, async (req: Reques
           name: e.name,
           type: e.isDirectory() ? 'directory' as const : 'file' as const,
           path: entryPath,
-          size: e.isFile() ? fs.statSync(path.join(resolved, e.name)).size : undefined,
+          size: e.isFile() ? fs.lstatSync(path.join(resolved, e.name)).size : undefined,
           gitStatus,
         };
       })
@@ -730,7 +3844,11 @@ router.get('/:name/tree', authenticateToken, requireApproved, async (req: Reques
         return a.name.localeCompare(b.name);
       });
 
-    res.json({ tree, currentPath: subPath });
+    res.json({
+      tree,
+      currentPath: subPath,
+      identity: serializeProjectIdentityProof(projectIdentity),
+    });
   } catch (error) {
     console.error('Tree error:', error);
     res.status(500).json({ error: 'Failed to get file tree' });
@@ -739,7 +3857,13 @@ router.get('/:name/tree', authenticateToken, requireApproved, async (req: Reques
 
 // GET /api/projects/:name/raw - serve raw file with correct MIME type (for media preview)
 // Cookies are sent automatically by browsers so <img>/<audio>/<video> elements work fine
-router.get('/:name/raw', browserAuthRedirect, requireApproved, async (req: Request, res: Response) => {
+router.get('/:name/raw', browserAuthRedirect, requireApproved, projectPathSandbox, async (req: Request, res: Response) => {
+  let rawFd: number | undefined;
+  const closeRawFile = () => {
+    if (rawFd === undefined) return;
+    try { fs.closeSync(rawFd); } catch {}
+    rawFd = undefined;
+  };
   try {
     const ownerId = await getScopedOwnerId(req);
     const userId = ownerId;
@@ -747,17 +3871,29 @@ router.get('/:name/raw', browserAuthRedirect, requireApproved, async (req: Reque
     const filePath = req.query.path as string;
     if (!filePath) { res.status(400).json({ error: 'path required' }); return; }
 
-    const fullPath = path.join(projectDir, filePath);
-    const resolved = path.resolve(fullPath);
-    if (!resolved.startsWith(path.resolve(projectDir))) { res.status(403).json({ error: 'Forbidden' }); return; }
-
-    if (!fs.existsSync(resolved) || fs.statSync(resolved).isDirectory()) {
+    let resolved: string;
+    try {
+      resolved = resolveExistingProjectEntry(projectDir, filePath, 'file');
+    } catch {
       res.status(404).json({ error: 'File not found' });
       return;
     }
 
-    const stat = fs.statSync(resolved);
+    const expectedStat = fs.lstatSync(resolved);
+    try {
+      rawFd = fs.openSync(resolved, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    } catch {
+      res.status(404).json({ error: 'File not found' });
+      return;
+    }
+    const stat = fs.fstatSync(rawFd);
+    if (!stat.isFile() || stat.dev !== expectedStat.dev || stat.ino !== expectedStat.ino) {
+      closeRawFile();
+      res.status(404).json({ error: 'File changed while it was being opened' });
+      return;
+    }
     if (stat.size > PROJECT_RAW_MAX_BYTES) {
+      closeRawFile();
       res.status(413).json({ error: 'File too large (max 100MB)' });
       return;
     }
@@ -786,48 +3922,84 @@ router.get('/:name/raw', browserAuthRedirect, requireApproved, async (req: Reque
     const mode = String(req.query.mode || '').toLowerCase();
     const forceText = mode === 'text';
     if (forceText && !isTextPreviewableFile(filePath)) {
+      closeRawFile();
       res.status(400).json({ error: 'This file cannot be previewed as text' });
       return;
     }
 
-    const mime = forceText ? 'text/plain; charset=utf-8' : (mimeMap[ext] || 'application/octet-stream');
-    res.setHeader('Content-Type', mime);
-    res.setHeader('Content-Length', stat.size);
-    res.setHeader('Cache-Control', 'private, max-age=300');
-    if (forceText) res.setHeader('X-Content-Type-Options', 'nosniff');
+    const activeContent = ['.html', '.htm', '.svg', '.xml'].includes(ext);
+    const mime = forceText
+      ? 'text/plain; charset=utf-8'
+      : activeContent
+        ? 'application/octet-stream'
+        : (mimeMap[ext] || 'application/octet-stream');
+    let range: ReturnType<typeof parseProjectByteRange> = null;
+    try {
+      range = parseProjectByteRange(req.headers.range, stat.size);
+    } catch (error) {
+      if (error instanceof ProjectRangeError) {
+        closeRawFile();
+        res.setHeader('Content-Range', `bytes */${stat.size}`);
+        res.status(416).end();
+        return;
+      }
+      throw error;
+    }
 
-    const stream = fs.createReadStream(resolved);
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Content-Length', range ? range.end - range.start + 1 : stat.size);
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
+    if (activeContent && !forceText) {
+      res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filePath).replace(/[\r\n"\\]/g, '_')}"`);
+    }
+
+    if (range) {
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${stat.size}`);
+    }
+    const stream = fs.createReadStream(resolved, {
+      ...(range || {}),
+      fd: rawFd,
+      autoClose: true,
+    });
+    rawFd = undefined; // The stream owns the descriptor from this point onward.
+    stream.once('error', (streamError) => {
+      console.error('Raw file stream error:', streamError);
+      if (!res.headersSent) res.status(500).json({ error: 'Failed to serve file' });
+      else res.destroy(streamError);
+    });
     stream.pipe(res);
   } catch (error) {
+    closeRawFile();
     console.error('Raw file error:', error);
-    res.status(500).json({ error: 'Failed to serve file' });
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to serve file' });
+    else res.destroy(error instanceof Error ? error : undefined);
   }
 });
 
 // GET /api/projects/:name/file - read file content
-router.get('/:name/file', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+router.get('/:name/file', authenticateToken, requireApproved, projectPathSandbox, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
     const filePath = req.query.path as string;
     if (!filePath) { res.status(400).json({ error: 'path required' }); return; }
 
-    const fullPath = path.join(projectDir, filePath);
-    const resolved = path.resolve(fullPath);
-    if (!resolved.startsWith(path.resolve(projectDir))) { res.status(403).json({ error: 'Forbidden' }); return; }
-
-    if (!fs.existsSync(resolved) || fs.statSync(resolved).isDirectory()) {
-      res.status(404).json({ error: 'File not found' });
+    let content: string;
+    try {
+      content = readProjectTextFile(projectDir, filePath, { maxBytes: PROJECT_EDIT_MAX_BYTES }) || '';
+    } catch (error: any) {
+      if (error instanceof ProjectFilePolicyError && error.code === 'TOO_LARGE') {
+        res.status(413).json({ error: 'File too large to edit (max 10MB)' });
+      } else {
+        res.status(404).json({ error: 'File not found' });
+      }
       return;
     }
 
-    const stat = fs.statSync(resolved);
-    if (stat.size > PROJECT_EDIT_MAX_BYTES) {
-      res.status(413).json({ error: 'File too large to edit (max 10MB)' });
-      return;
-    }
-
-    const content = fs.readFileSync(resolved, 'utf-8');
     const ext = path.extname(filePath).toLowerCase();
     const langMap: Record<string, string> = {
       '.js': 'javascript', '.jsx': 'javascript', '.ts': 'typescript', '.tsx': 'typescript',
@@ -839,7 +4011,7 @@ router.get('/:name/file', authenticateToken, requireApproved, async (req: Reques
       '.toml': 'toml', '.ini': 'ini', '.env': 'shell', '.dockerfile': 'dockerfile',
     };
 
-    res.json({ content, language: langMap[ext] || 'plaintext', path: filePath, size: stat.size });
+    res.json({ content, language: langMap[ext] || 'plaintext', path: filePath, size: Buffer.byteLength(content, 'utf8') });
   } catch (error) {
     console.error('Read file error:', error);
     res.status(500).json({ error: 'Failed to read file' });
@@ -847,214 +4019,226 @@ router.get('/:name/file', authenticateToken, requireApproved, async (req: Reques
 });
 
 // PUT /api/projects/:name/file - write file content
-router.put('/:name/file', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+router.put('/:name/file', authenticateToken, requireApproved, projectPathSandbox, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
     const { path: filePath, content } = req.body;
-    if (!filePath || content === undefined) { res.status(400).json({ error: 'path and content required' }); return; }
+    if (!filePath || typeof content !== 'string') { res.status(400).json({ error: 'path and string content required' }); return; }
 
-    const fullPath = path.join(projectDir, filePath);
-    const resolved = path.resolve(fullPath);
-    if (!resolved.startsWith(path.resolve(projectDir))) { res.status(403).json({ error: 'Forbidden' }); return; }
-
-    fs.mkdirSync(path.dirname(resolved), { recursive: true });
-    fs.writeFileSync(resolved, content, 'utf-8');
+    writeContainedFileAtomic(projectDir, filePath, content, { maxBytes: PROJECT_EDIT_MAX_BYTES });
 
     res.json({ message: 'File saved', path: filePath });
   } catch (error) {
     console.error('Write file error:', error);
-    res.status(500).json({ error: 'Failed to write file' });
+    sendProjectFileMutationError(res, error, 'Failed to write file');
   }
 });
 
 // POST /api/projects/:name/file - create new file
-router.post('/:name/file', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+router.post('/:name/file', authenticateToken, requireApproved, projectPathSandbox, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
     const { path: filePath, content = '' } = req.body;
-    if (!filePath) { res.status(400).json({ error: 'path required' }); return; }
+    if (!filePath || typeof content !== 'string') { res.status(400).json({ error: 'path and string content required' }); return; }
 
-    const fullPath = path.join(projectDir, filePath);
-    const resolved = path.resolve(fullPath);
-    if (!resolved.startsWith(path.resolve(projectDir))) { res.status(403).json({ error: 'Forbidden' }); return; }
-
-    if (fs.existsSync(resolved)) { res.status(409).json({ error: 'File already exists' }); return; }
-
-    fs.mkdirSync(path.dirname(resolved), { recursive: true });
-    fs.writeFileSync(resolved, content, 'utf-8');
+    try {
+      writeContainedFileAtomic(projectDir, filePath, content, { exclusive: true, maxBytes: PROJECT_EDIT_MAX_BYTES });
+    } catch (error: any) {
+      if (/already exists/i.test(error?.message || '')) {
+        res.status(409).json({ error: 'File already exists' });
+        return;
+      }
+      throw error;
+    }
     res.status(201).json({ message: 'File created', path: filePath });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to create file' });
+    sendProjectFileMutationError(res, error, 'Failed to create file');
   }
 });
 
 // DELETE /api/projects/:name/file
-router.delete('/:name/file', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+router.delete('/:name/file', authenticateToken, requireApproved, projectPathSandbox, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
     const filePath = req.query.path as string;
     if (!filePath) { res.status(400).json({ error: 'path required' }); return; }
 
-    const fullPath = path.join(projectDir, filePath);
-    const resolved = path.resolve(fullPath);
-    if (!resolved.startsWith(path.resolve(projectDir))) { res.status(403).json({ error: 'Forbidden' }); return; }
+    let resolved: string;
+    try {
+      resolved = resolveExistingProjectEntry(projectDir, filePath, 'any');
+    } catch {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
 
-    if (!fs.existsSync(resolved)) { res.status(404).json({ error: 'Not found' }); return; }
-
-    const stat = fs.statSync(resolved);
+    const stat = fs.lstatSync(resolved);
     if (stat.isDirectory()) {
       fs.rmSync(resolved, { recursive: true, force: true });
     } else {
       fs.unlinkSync(resolved);
     }
     res.json({ message: 'Deleted' });
-  } catch (error) {
+  } catch {
     res.status(500).json({ error: 'Failed to delete' });
   }
 });
 
-// POST /api/projects/:name/git - git operations (enhanced)
+function isSafeProjectGitRef(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 255
+    && !value.startsWith('-')
+    && !value.includes('..')
+    && !value.includes('@{')
+    && !value.endsWith('.')
+    && !value.endsWith('/')
+    && !value.includes('//')
+    && /^[a-zA-Z0-9_./-]+$/.test(value);
+}
+
+function resolveSafeProjectGitFile(projectDir: string, file: unknown): string | null {
+  if (typeof file !== 'string' || !file || path.isAbsolute(file) || file.includes('\0')) return null;
+  const root = path.resolve(projectDir);
+  const resolved = path.resolve(root, file);
+  if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) return null;
+  return resolved;
+}
+
+// POST /api/projects/:name/git - isolated Git operations
 router.post('/:name/git', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  const abortController = new AbortController();
+  const abort = () => abortController.abort();
+  req.once('aborted', abort);
+  const close = () => { if (!res.writableEnded) abort(); };
+  res.once('close', close);
+
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: req.params.name,
+      projectRoot: projectDir,
+    });
+    const gitScope = { actorId: req.user!.userId, projectId: projectIdentity.id };
 
-    const { action, message, branch, file, remote } = req.body;
-
+    const { action, message, branch, file } = req.body;
+    const git = (args: string[], options?: { timeoutMs?: number; network?: boolean; maxOutputBytes?: number }) => runProjectGitCommand({
+      ...gitScope,
+      workspace: projectDir,
+      args,
+      timeoutMs: options?.timeoutMs || 30_000,
+      network: options?.network,
+      maxOutputBytes: options?.maxOutputBytes,
+      signal: abortController.signal,
+      nameHint: `${ownerId}:${req.params.name}:${action}`,
+    });
+    const commandError = (error: any, fallback: string) => (
+      error?.stdout?.toString().trim()
+      || error?.stderr?.toString().trim()
+      || error?.message
+      || fallback
+    );
     let output = '';
-    const opts = { cwd: projectDir, timeout: 30000, encoding: 'utf-8' as const };
 
     switch (action) {
       case 'status': {
-        const raw = execSync('git status --porcelain -uall', opts);
-        let branch = 'main';
-        try { branch = execSync('git rev-parse --abbrev-ref HEAD', opts).trim(); } catch { /* no commits yet */ }
-        let ahead = 0, behind = 0;
+        const raw = await git(['status', '--porcelain=v1', '-z', '-uall']);
+        let currentBranch = 'main';
+        try { currentBranch = (await git(['rev-parse', '--abbrev-ref', 'HEAD'])).trim(); } catch { /* no commits yet */ }
+        let ahead = 0;
+        let behind = 0;
         try {
-          const ab = execSync('git rev-list --left-right --count HEAD...@{upstream}', opts).trim();
-          const parts = ab.split(/\s+/);
-          ahead = parseInt(parts[0]) || 0;
-          behind = parseInt(parts[1]) || 0;
+          const counts = (await git(['rev-list', '--left-right', '--count', 'HEAD...@{upstream}'])).trim().split(/\s+/);
+          ahead = parseInt(counts[0], 10) || 0;
+          behind = parseInt(counts[1], 10) || 0;
         } catch {}
-        
-        const files = raw.split('\n').filter(Boolean).map(line => {
-          const xy = line.substring(0, 2);
-          const fp = line.substring(3).trim();
-          let status = 'modified';
-          if (xy === '??') status = 'untracked';
-          else if (xy.includes('A')) status = 'added';
-          else if (xy.includes('D')) status = 'deleted';
-          else if (xy.includes('R')) status = 'renamed';
-          else if (xy.includes('M')) status = 'modified';
-          return { path: fp, status, raw: xy };
-        });
-        
-        res.json({ branch, ahead, behind, files, clean: files.length === 0 });
+        const files = parseProjectGitPorcelain(raw)
+          .filter((entry) => !isTransientProjectStatePath(entry.path))
+          .map((entry) => {
+            const xy = entry.status;
+            let status = 'modified';
+            if (xy === '??') status = 'untracked';
+            else if (xy.includes('A')) status = 'added';
+            else if (xy.includes('D')) status = 'deleted';
+            else if (xy.includes('R')) status = 'renamed';
+            return { path: entry.path, status, raw: xy };
+          });
+        res.json({ branch: currentBranch, ahead, behind, files, clean: files.length === 0 });
         return;
       }
-      
+
       case 'log': {
-        const limit = req.body.limit || 50;
+        const limit = Math.max(1, Math.min(Number.parseInt(String(req.body.limit || 50), 10) || 50, 100));
         const branchFilter = req.body.branch;
-        const branchArg = branchFilter ? branchFilter : '--all';
-        const raw = execSync(
-          `git log ${branchArg} --format='{"hash":"%H","short":"%h","author":"%an","email":"%ae","date":"%aI","relativeDate":"%ar","message":"%s","refs":"%D","parent":"%P"}' -${limit}`,
-          opts
-        );
-        const commits = raw.split('\n').filter(Boolean).map(line => {
+        if (branchFilter && !isSafeProjectGitRef(branchFilter)) { res.status(400).json({ error: 'Valid branch name required' }); return; }
+        const raw = await git([
+          'log',
+          branchFilter || '--all',
+          '--format={"hash":"%H","short":"%h","author":"%an","email":"%ae","date":"%aI","relativeDate":"%ar","message":"%s","refs":"%D","parent":"%P"}',
+          `-${limit}`,
+        ]);
+        const commits = raw.split('\n').filter(Boolean).map((line) => {
           try { return JSON.parse(line); } catch { return null; }
         }).filter(Boolean);
         res.json({ commits });
         return;
       }
-      
+
       case 'log-enhanced': {
-        const limit = req.body.limit || 30;
+        const limit = Math.max(1, Math.min(Number.parseInt(String(req.body.limit || 30), 10) || 30, 100));
         const branchFilter = req.body.branch;
-        const branchArg = branchFilter ? branchFilter : '--all';
-        // Get log with stats
-        const raw = execSync(
-          `git log ${branchArg} --format="COMMIT_START%n%H|%h|%an|%ae|%aI|%ar|%s|%D|%P" --stat -${limit}`,
-          { ...opts, maxBuffer: 5 * 1024 * 1024 }
-        );
+        if (branchFilter && !isSafeProjectGitRef(branchFilter)) { res.status(400).json({ error: 'Valid branch name required' }); return; }
+        const raw = await git([
+          'log', branchFilter || '--all',
+          '--format=COMMIT_START%n%H|%h|%an|%ae|%aI|%ar|%s|%D|%P',
+          '--stat', '--no-ext-diff', '--no-textconv', `-${limit}`,
+        ], { maxOutputBytes: 5 * 1024 * 1024 });
         const blocks = raw.split('COMMIT_START\n').filter(Boolean);
-        const enhancedCommits = blocks.map(block => {
+        const enhancedCommits = blocks.map((block) => {
           const lines = block.trim().split('\n');
-          const headerLine = lines[0];
-          const parts = headerLine.split('|');
+          const parts = lines[0].split('|');
           if (parts.length < 7) return null;
           const [hash, short, author, email, date, relativeDate, ...rest] = parts;
-          // message and refs may contain | so rejoin carefully
           const remaining = rest.join('|');
-          const refsMatch = remaining.match(/^(.*)\|([^|]*)\|([a-f0-9 ]*)$/);
-          let message = remaining, refs = '', parent = '';
-          if (refsMatch) {
-            message = refsMatch[1];
-            refs = refsMatch[2];
-            parent = refsMatch[3];
-          } else {
-            // Simpler split from the end
-            const lastPipe = remaining.lastIndexOf('|');
-            if (lastPipe > 0) {
-              parent = remaining.slice(lastPipe + 1);
-              const secondLast = remaining.lastIndexOf('|', lastPipe - 1);
-              if (secondLast > 0) {
-                refs = remaining.slice(secondLast + 1, lastPipe);
-                message = remaining.slice(0, secondLast);
-              } else {
-                message = remaining.slice(0, lastPipe);
-              }
-            }
-          }
-          
-          // Parse --stat lines
-          const statLines = lines.slice(1);
+          const lastPipe = remaining.lastIndexOf('|');
+          const secondLast = lastPipe > 0 ? remaining.lastIndexOf('|', lastPipe - 1) : -1;
+          const commitMessage = secondLast > 0 ? remaining.slice(0, secondLast) : remaining;
+          const refs = secondLast > 0 ? remaining.slice(secondLast + 1, lastPipe) : '';
+          const parent = lastPipe > 0 ? remaining.slice(lastPipe + 1) : '';
           const files: Array<{ path: string; additions: number; deletions: number }> = [];
-          let totalInsertions = 0, totalDeletions = 0;
-          
-          for (const sl of statLines) {
-            // Match file stat lines like: " file.txt | 5 ++--"
-            const fileMatch = sl.match(/^\s+(.+?)\s+\|\s+(\d+)\s*([+-]*)\s*$/);
+          let totalInsertions = 0;
+          let totalDeletions = 0;
+          for (const statLine of lines.slice(1)) {
+            const fileMatch = statLine.match(/^\s+(.+?)\s+\|\s+(\d+)\s*([+-]*)\s*$/);
             if (fileMatch) {
-              const filePath = fileMatch[1].trim();
-              const plusCount = (fileMatch[3].match(/\+/g) || []).length;
-              const minusCount = (fileMatch[3].match(/-/g) || []).length;
-              const total = parseInt(fileMatch[2]);
-              const totalPM = plusCount + minusCount;
-              let additions = 0, deletions = 0;
-              if (totalPM > 0) {
-                additions = Math.round(total * plusCount / totalPM);
-                deletions = total - additions;
-              } else {
-                additions = total;
-              }
-              files.push({ path: filePath, additions, deletions });
+              const plus = (fileMatch[3].match(/\+/g) || []).length;
+              const minus = (fileMatch[3].match(/-/g) || []).length;
+              const total = parseInt(fileMatch[2], 10);
+              const changes = plus + minus;
+              const additions = changes ? Math.round(total * plus / changes) : total;
+              files.push({ path: fileMatch[1].trim(), additions, deletions: total - additions });
             }
-            // Match binary file lines: " file.png | Bin 0 -> 1234 bytes"
-            const binMatch = sl.match(/^\s+(.+?)\s+\|\s+Bin/);
-            if (binMatch) {
-              files.push({ path: binMatch[1].trim(), additions: 0, deletions: 0 });
-            }
-            // Match summary line: " 3 files changed, 47 insertions(+), 12 deletions(-)"
-            const summaryMatch = sl.match(/(\d+) insertion/);
-            const delMatch = sl.match(/(\d+) deletion/);
-            if (summaryMatch) totalInsertions = parseInt(summaryMatch[1]);
-            if (delMatch) totalDeletions = parseInt(delMatch[1]);
+            const binary = statLine.match(/^\s+(.+?)\s+\|\s+Bin/);
+            if (binary) files.push({ path: binary[1].trim(), additions: 0, deletions: 0 });
+            const insertions = statLine.match(/(\d+) insertion/);
+            const deletions = statLine.match(/(\d+) deletion/);
+            if (insertions) totalInsertions = parseInt(insertions[1], 10);
+            if (deletions) totalDeletions = parseInt(deletions[1], 10);
           }
-          
           return {
             hash, short, author, email, date, relativeDate,
-            message: message.trim(),
-            refs: refs.trim(),
-            parentHash: parent.trim(),
+            message: commitMessage.trim(), refs: refs.trim(), parentHash: parent.trim(),
             stats: {
               filesChanged: files.length,
-              insertions: totalInsertions || files.reduce((s, f) => s + f.additions, 0),
-              deletions: totalDeletions || files.reduce((s, f) => s + f.deletions, 0),
+              insertions: totalInsertions || files.reduce((sum, entry) => sum + entry.additions, 0),
+              deletions: totalDeletions || files.reduce((sum, entry) => sum + entry.deletions, 0),
               files,
             },
           };
@@ -1062,214 +4246,215 @@ router.post('/:name/git', authenticateToken, requireApproved, async (req: Reques
         res.json({ commits: enhancedCommits });
         return;
       }
-      
+
       case 'revert': {
         const hash = req.body.hash;
-        if (!hash || !/^[a-f0-9]{7,40}$/.test(hash)) {
-          res.status(400).json({ error: 'Valid commit hash required' });
-          return;
-        }
+        if (!hash || !/^[a-f0-9]{7,40}$/.test(hash)) { res.status(400).json({ error: 'Valid commit hash required' }); return; }
         try {
-          const revertResult = await withTransientProjectStateShelved(projectDir, async () => {
-            execSync(`git cat-file -t ${hash}`, opts);
-            const commitMsg = execSync(`git log -1 --format="%s" ${hash}`, opts).trim();
-            const output = execSync(`git revert ${hash} --no-edit`, opts).toString().trim();
-            const newHash = execSync('git rev-parse HEAD', opts).trim();
-            return { output, commitMsg, newHash };
-          }, { timeout: 30000 });
-          
-          const app = await prisma.app.findFirst({ where: { userId: ownerId, name: req.params.name } });
+          const revertResult = await withTransientProjectStateShelved(projectDir, gitScope, async () => {
+            await git(['cat-file', '-t', hash]);
+            const commitMsg = (await git(['log', '-1', '--format=%s', hash])).trim();
+            const revertOutput = (await git(['revert', hash, '--no-edit'])).trim();
+            const newHash = (await git(['rev-parse', 'HEAD'])).trim();
+            return { output: revertOutput, commitMsg, newHash };
+          }, { timeout: 30_000, signal: abortController.signal });
           await prisma.activityLog.create({
             data: {
               userId: ownerId,
               action: 'PROJECT_GIT_REVERT',
               resource: 'project',
-              resourceId: app?.id,
+              resourceId: projectIdentity.id,
               severity: 'INFO',
               metadata: { projectName: req.params.name, revertedHash: hash, revertedMessage: revertResult.commitMsg, newHash: revertResult.newHash },
             },
+          }).catch((activityError) => {
+            console.warn('[Project Git] Failed to record revert activity:', activityError);
           });
-          
           res.json({ output: revertResult.output, newHash: revertResult.newHash, revertedMessage: revertResult.commitMsg });
-        } catch (e: any) {
-          const errorOutput = e.stdout?.toString() || e.stderr?.toString() || e.message;
-          if (errorOutput.includes('CONFLICT') || errorOutput.includes('conflict')) {
-            try { execSync('git revert --abort', opts); } catch {}
-            res.status(409).json({ error: 'Revert failed due to conflicts. The revert has been aborted.', details: errorOutput });
-          } else if (errorOutput.includes('Working tree has uncommitted changes:')) {
-            res.status(409).json({ error: 'Revert blocked by uncommitted project changes.', details: errorOutput, hint: 'Commit, discard, or move the listed files before reverting. Portal session scratch files are ignored automatically now.' });
+        } catch (error: any) {
+          const details = commandError(error, 'Revert failed');
+          if (details.toLowerCase().includes('conflict')) {
+            try { await git(['revert', '--abort']); } catch {}
+            res.status(409).json({ error: 'Revert failed due to conflicts. The revert has been aborted.', details });
+          } else if (details.includes('Working tree has uncommitted changes:')) {
+            res.status(409).json({ error: 'Revert blocked by uncommitted project changes.', details, hint: 'Commit, discard, or move the listed files before reverting. Portal session scratch files are ignored automatically now.' });
           } else {
-            res.status(500).json({ error: 'Revert failed', details: errorOutput });
+            res.status(500).json({ error: 'Revert failed', details });
           }
         }
         return;
       }
-      
+
       case 'diff': {
         if (file) {
-          output = execSync(`git diff -- ${shellEscape(file)}`, opts);
+          const resolvedFile = resolveSafeProjectGitFile(projectDir, file);
+          if (!resolvedFile) { res.status(400).json({ error: 'Valid project file required' }); return; }
+          output = await git(['diff', '--no-ext-diff', '--no-textconv', '--', file]);
+          if (!output.trim()) output = await git(['diff', '--cached', '--no-ext-diff', '--no-textconv', '--', file]);
           if (!output.trim()) {
-            output = execSync(`git diff --cached -- ${shellEscape(file)}`, opts);
-          }
-          if (!output.trim()) {
-            // Untracked file - show full content as addition
             try {
-              const content = fs.readFileSync(path.join(projectDir, file), 'utf-8');
-              output = `--- /dev/null\n+++ b/${file}\n` + content.split('\n').map(l => `+${l}`).join('\n');
+              const entry = fs.lstatSync(resolvedFile);
+              if (!entry.isSymbolicLink() && entry.isFile() && entry.size <= 1024 * 1024) {
+                const content = fs.readFileSync(resolvedFile, 'utf8');
+                output = `--- /dev/null\n+++ b/${file}\n${content.split('\n').map((line) => `+${line}`).join('\n')}`;
+              }
             } catch {}
           }
         } else {
-          output = execSync('git diff', opts);
-          const cached = execSync('git diff --cached', opts);
-          if (cached.trim()) output += '\n' + cached;
+          output = await git(['diff', '--no-ext-diff', '--no-textconv']);
+          const cached = await git(['diff', '--cached', '--no-ext-diff', '--no-textconv']);
+          if (cached.trim()) output += `\n${cached}`;
         }
-        break;
-      }
-      
-      case 'diff-commit': {
-        const hash = req.body.hash;
-        if (!hash || !/^[a-f0-9]{7,40}$/.test(hash)) { res.status(400).json({ error: 'Valid commit hash required' }); return; }
-        output = execSync(`git show ${shellEscape(hash)} --format="" --stat`, opts);
-        const fullDiff = execSync(`git show ${shellEscape(hash)} --format=""`, opts);
-        res.json({ output: output.trim(), diff: fullDiff.trim() });
-        return;
-      }
-      
-      case 'add':
-        output = execSync('git add -A', opts);
-        break;
-        
-      case 'commit': {
-        execSync('git add -A', opts);
-        output = execSync(`git commit -m ${shellEscape(message || 'Update')}`, opts);
-        const commitHash = execSync('git rev-parse --short HEAD', opts).trim();
-        const commitBranch = execSync('git rev-parse --abbrev-ref HEAD', opts).trim();
-        // Get lines added/removed stats
-        let linesAdded = 0, linesRemoved = 0, commitFilesChanged = 0;
-        try {
-          const statOutput = execSync('git diff HEAD~1 --shortstat', { ...opts, timeout: 5000 }).trim();
-          const filesMatch = statOutput.match(/(\d+) file/);
-          const addMatch = statOutput.match(/(\d+) insertion/);
-          const delMatch = statOutput.match(/(\d+) deletion/);
-          commitFilesChanged = filesMatch ? parseInt(filesMatch[1]) : 0;
-          linesAdded = addMatch ? parseInt(addMatch[1]) : 0;
-          linesRemoved = delMatch ? parseInt(delMatch[1]) : 0;
-        } catch {}
-        const app = await prisma.app.findFirst({ where: { userId: ownerId, name: req.params.name } });
-        await prisma.activityLog.create({
-          data: { userId: ownerId, action: 'PROJECT_GIT_COMMIT', resource: 'project', resourceId: app?.id, severity: 'INFO', metadata: { projectName: req.params.name, message: message || 'Update', hash: commitHash, branch: commitBranch, filesChanged: commitFilesChanged, linesAdded, linesRemoved } },
-        });
-        break;
-      }
-      
-      case 'branches': {
-        const local = execSync('git branch', opts).split('\n').filter(Boolean).map(b => ({
-          name: b.replace('* ', '').trim(),
-          current: b.startsWith('*'),
-          remote: false,
-        }));
-        let remote: any[] = [];
-        try {
-          remote = execSync('git branch -r', opts).split('\n').filter(Boolean)
-            .filter(b => !b.includes('HEAD'))
-            .map(b => ({
-              name: b.trim(),
-              current: false,
-              remote: true,
-            }));
-        } catch {}
-        res.json({ branches: [...local, ...remote] });
-        return;
-      }
-      
-      case 'checkout':
-        if (!branch || !/^[a-zA-Z0-9_./-]+$/.test(branch)) { res.status(400).json({ error: 'Valid branch name required' }); return; }
-        output = execSync(`git checkout ${shellEscape(branch)}`, opts);
-        { const app = await prisma.app.findFirst({ where: { userId: ownerId, name: req.params.name } });
-        await prisma.activityLog.create({
-          data: { userId: ownerId, action: 'PROJECT_GIT_CHECKOUT', resource: 'project', resourceId: app?.id, severity: 'INFO', metadata: { projectName: req.params.name, branch } },
-        }); }
-        break;
-        
-      case 'checkout-new':
-        if (!branch || !/^[a-zA-Z0-9_./-]+$/.test(branch)) { res.status(400).json({ error: 'Valid branch name required' }); return; }
-        output = execSync(`git checkout -b ${shellEscape(branch)}`, opts);
-        { const app = await prisma.app.findFirst({ where: { userId: ownerId, name: req.params.name } });
-        await prisma.activityLog.create({
-          data: { userId: ownerId, action: 'PROJECT_GIT_BRANCH_CREATE', resource: 'project', resourceId: app?.id, severity: 'INFO', metadata: { projectName: req.params.name, branch } },
-        }); }
-        break;
-        
-      case 'pull':
-        try {
-          output = execSync('git pull', opts);
-        } catch (e: any) {
-          output = e.stdout?.toString() || e.stderr?.toString() || 'No remote configured';
-        }
-        { const app = await prisma.app.findFirst({ where: { userId: ownerId, name: req.params.name } });
-        const pullBranch = (() => { try { return execSync('git rev-parse --abbrev-ref HEAD', opts).trim(); } catch { return 'unknown'; } })();
-        await prisma.activityLog.create({
-          data: { userId: ownerId, action: 'PROJECT_GIT_PULL', resource: 'project', resourceId: app?.id, severity: 'INFO', metadata: { projectName: req.params.name, branch: pullBranch } },
-        }); }
-        break;
-        
-      case 'push':
-        try {
-          output = execSync('git push', opts);
-        } catch (e: any) {
-          // Try setting upstream
-          try {
-            const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', opts).trim();
-            output = execSync(`git push -u origin ${shellEscape(currentBranch)}`, opts);
-          } catch (e2: any) {
-            output = e2.stdout?.toString() || e2.stderr?.toString() || 'Push failed - no remote configured';
-          }
-        }
-        { const app = await prisma.app.findFirst({ where: { userId: ownerId, name: req.params.name } });
-        const pushBranch = (() => { try { return execSync('git rev-parse --abbrev-ref HEAD', opts).trim(); } catch { return 'unknown'; } })();
-        await prisma.activityLog.create({
-          data: { userId: ownerId, action: 'PROJECT_GIT_PUSH', resource: 'project', resourceId: app?.id, severity: 'INFO', metadata: { projectName: req.params.name, branch: pushBranch } },
-        }); }
-        break;
-        
-      case 'remote': {
-        try {
-          output = execSync('git remote -v', opts);
-        } catch {
-          output = 'No remotes configured';
-        }
-        break;
-      }
-      
-      case 'remote-add': {
-        const url = req.body.url;
-        const remoteName = req.body.remote || 'origin';
-        if (!url) { res.status(400).json({ error: 'url required' }); return; }
-        if (!/^[a-zA-Z0-9_-]+$/.test(remoteName)) { res.status(400).json({ error: 'Invalid remote name' }); return; }
-        if (!/^https?:\/\/[^\s"'`$()]+$/.test(url) && !/^git@[^\s"'`$()]+$/.test(url)) { res.status(400).json({ error: 'Invalid URL format' }); return; }
-        try {
-          execSync(`git remote remove ${shellEscape(remoteName)}`, opts);
-        } catch {}
-        output = execSync(`git remote add ${shellEscape(remoteName)} ${shellEscape(url)}`, opts);
-        output = `Remote '${remoteName}' added: ${url}`;
-        break;
-      }
-      
-      case 'stash':
-        output = execSync('git stash', opts);
-        break;
-        
-      case 'stash-pop':
-        output = execSync('git stash pop', opts);
-        break;
-        
-      case 'reset-file': {
-        if (!file) { res.status(400).json({ error: 'file required' }); return; }
-        output = execSync(`git checkout -- ${shellEscape(file)}`, opts);
-        output = `Reset: ${file}`;
         break;
       }
 
+      case 'diff-commit': {
+        const hash = req.body.hash;
+        if (!hash || !/^[a-f0-9]{7,40}$/.test(hash)) { res.status(400).json({ error: 'Valid commit hash required' }); return; }
+        output = await git(['show', hash, '--format=', '--stat', '--no-ext-diff', '--no-textconv']);
+        const fullDiff = await git(['show', hash, '--format=', '--no-ext-diff', '--no-textconv']);
+        res.json({ output: output.trim(), diff: fullDiff.trim() });
+        return;
+      }
+
+      case 'add':
+        output = await git(projectGitAddAllArgs());
+        break;
+
+      case 'commit': {
+        await git(projectGitAddAllArgs());
+        const commitMessage = typeof message === 'string' && message.trim() ? message.trim().slice(0, 4096) : 'Update';
+        output = await git(['commit', '-m', commitMessage]);
+        const commitHash = (await git(['rev-parse', '--short', 'HEAD'])).trim();
+        const commitBranch = (await git(['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+        let linesAdded = 0;
+        let linesRemoved = 0;
+        let commitFilesChanged = 0;
+        try {
+          const statOutput = (await git(['diff', 'HEAD~1', '--shortstat', '--no-ext-diff', '--no-textconv'], { timeoutMs: 5000 })).trim();
+          commitFilesChanged = parseInt(statOutput.match(/(\d+) file/)?.[1] || '0', 10);
+          linesAdded = parseInt(statOutput.match(/(\d+) insertion/)?.[1] || '0', 10);
+          linesRemoved = parseInt(statOutput.match(/(\d+) deletion/)?.[1] || '0', 10);
+        } catch {}
+        await prisma.activityLog.create({
+          data: { userId: ownerId, action: 'PROJECT_GIT_COMMIT', resource: 'project', resourceId: projectIdentity.id, severity: 'INFO', metadata: { projectName: req.params.name, message: commitMessage, hash: commitHash, branch: commitBranch, filesChanged: commitFilesChanged, linesAdded, linesRemoved } },
+        }).catch((activityError) => {
+          console.warn('[Project Git] Failed to record commit activity:', activityError);
+        });
+        break;
+      }
+
+      case 'branches': {
+        const local = (await git(['branch'])).split('\n').filter(Boolean).map((entry) => ({
+          name: entry.replace('* ', '').trim(), current: entry.startsWith('*'), remote: false,
+        }));
+        let remoteBranches: Array<{ name: string; current: boolean; remote: boolean }> = [];
+        try {
+          remoteBranches = (await git(['branch', '-r'])).split('\n').filter(Boolean)
+            .filter((entry) => !entry.includes('HEAD'))
+            .map((entry) => ({ name: entry.trim(), current: false, remote: true }));
+        } catch {}
+        res.json({ branches: [...local, ...remoteBranches] });
+        return;
+      }
+
+      case 'checkout':
+      case 'checkout-new': {
+        if (!isSafeProjectGitRef(branch)) { res.status(400).json({ error: 'Valid branch name required' }); return; }
+        output = action === 'checkout'
+          ? await git(['checkout', branch])
+          : await git(['checkout', '-b', branch]);
+        await prisma.activityLog.create({
+          data: {
+            userId: ownerId,
+            action: action === 'checkout' ? 'PROJECT_GIT_CHECKOUT' : 'PROJECT_GIT_BRANCH_CREATE',
+            resource: 'project', resourceId: projectIdentity.id, severity: 'INFO', metadata: { projectName: req.params.name, branch },
+          },
+        }).catch((activityError) => {
+          console.warn('[Project Git] Failed to record branch activity:', activityError);
+        });
+        break;
+      }
+
+      case 'pull': {
+        try {
+          output = await git(['pull', '--ff-only'], { timeoutMs: 120_000, network: true });
+        } catch (error: any) {
+          if (abortController.signal.aborted) throw error;
+          res.status(409).json({
+            error: 'Git pull failed',
+            details: commandError(error, 'No remote is configured or the remote rejected the pull'),
+          });
+          return;
+        }
+        let pullBranch = 'unknown';
+        try { pullBranch = (await git(['rev-parse', '--abbrev-ref', 'HEAD'])).trim(); } catch {}
+        await prisma.activityLog.create({
+          data: { userId: ownerId, action: 'PROJECT_GIT_PULL', resource: 'project', resourceId: projectIdentity.id, severity: 'INFO', metadata: { projectName: req.params.name, branch: pullBranch } },
+        }).catch((activityError) => {
+          console.warn('[Project Git] Failed to record pull activity:', activityError);
+        });
+        break;
+      }
+
+      case 'push': {
+        try {
+          output = await git(['push'], { timeoutMs: 120_000, network: true });
+        } catch (error: any) {
+          if (abortController.signal.aborted) throw error;
+          try {
+            const currentBranch = (await git(['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+            if (!isSafeProjectGitRef(currentBranch)) throw new Error('Unsafe current branch');
+            output = await git(['push', '-u', 'origin', currentBranch], { timeoutMs: 120_000, network: true });
+          } catch (fallbackError: any) {
+            res.status(409).json({
+              error: 'Git push failed',
+              details: commandError(fallbackError, commandError(error, 'No remote is configured or the remote rejected the push')),
+            });
+            return;
+          }
+        }
+        let pushBranch = 'unknown';
+        try { pushBranch = (await git(['rev-parse', '--abbrev-ref', 'HEAD'])).trim(); } catch {}
+        await prisma.activityLog.create({
+          data: { userId: ownerId, action: 'PROJECT_GIT_PUSH', resource: 'project', resourceId: projectIdentity.id, severity: 'INFO', metadata: { projectName: req.params.name, branch: pushBranch } },
+        }).catch((activityError) => {
+          console.warn('[Project Git] Failed to record push activity:', activityError);
+        });
+        break;
+      }
+
+      case 'remote':
+        try { output = await git(['remote', '-v']); } catch { output = 'No remotes configured'; }
+        break;
+
+      case 'remote-add': {
+        const remoteName = req.body.remote || 'origin';
+        if (typeof remoteName !== 'string' || !/^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/.test(remoteName)) {
+          res.status(400).json({ error: 'Invalid remote name' });
+          return;
+        }
+        let safeUrl = '';
+        try { safeUrl = assertSafeProjectGitUrl(req.body.url); }
+        catch (error: any) { res.status(400).json({ error: error.message }); return; }
+        try { await git(['remote', 'remove', remoteName]); } catch {}
+        await git(['remote', 'add', remoteName, safeUrl]);
+        output = `Remote '${remoteName}' added: ${safeUrl}`;
+        break;
+      }
+
+      case 'stash':
+        output = await git(['stash']);
+        break;
+      case 'stash-pop':
+        output = await git(['stash', 'pop']);
+        break;
+      case 'reset-file': {
+        if (!resolveSafeProjectGitFile(projectDir, file)) { res.status(400).json({ error: 'Valid project file required' }); return; }
+        output = await git(['checkout', '--', file]);
+        output = `Reset: ${file}`;
+        break;
+      }
       default:
         res.status(400).json({ error: 'Unknown git action' });
         return;
@@ -1277,12 +4462,22 @@ router.post('/:name/git', authenticateToken, requireApproved, async (req: Reques
 
     res.json({ output: output.toString().trim() });
   } catch (error: any) {
-    res.json({ output: error.stdout?.toString() || error.stderr?.toString() || error.message });
+    if (!res.headersSent && !abortController.signal.aborted) {
+      res.status(500).json({ output: error?.stdout?.toString() || error?.stderr?.toString() || error.message });
+    }
+  } finally {
+    req.off('aborted', abort);
+    res.off('close', close);
   }
 });
 
 // POST /api/projects/upload-zip - upload ZIP as project
 router.post('/upload-zip', authenticateToken, requireApproved, zipUpload.single('file'), async (req: Request, res: Response) => {
+  let promotedProjectDir: string | undefined;
+  let promotedProjectRootIdentity: AttestedProjectRoot | undefined;
+  let createdProjectIdentityId: string | undefined;
+  let creationSuccessResponse: { name: string; detectedType: string; suggestedCommand: string } | undefined;
+  let releaseProjectNameLock: (() => void) | null = null;
   try {
     const ownerId = await getScopedOwnerId(req);
     if (!req.file) {
@@ -1290,42 +4485,58 @@ router.post('/upload-zip', authenticateToken, requireApproved, zipUpload.single(
       return;
     }
 
-    const name = (req.body.name || path.basename(req.file.originalname, '.zip')).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const name = (req.body.name || path.basename(req.file.originalname, '.zip')).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120) || 'project';
     const projectDir = getProjectPath(ownerId, name);
 
+    const scanResult = await scanFile(req.file.path);
+    if (!scanResult.clean) {
+      res.status(scanResult.scannerAvailable ? 400 : 503).json({
+        error: scanResult.scannerAvailable
+          ? `ZIP rejected: malware detected (${scanResult.threat})`
+          : 'Project ZIP upload is temporarily unavailable because malware scanning could not complete',
+      });
+      return;
+    }
+
+    releaseProjectNameLock = await acquireProjectDeletionLock(
+      projectDeletionLockKey(ownerId, name),
+    );
+    await assertProjectIdentityNameAvailable({ workspaceOwnerId: ownerId, projectName: name });
     if (fs.existsSync(projectDir)) {
-      // Clean up uploaded file
-      fs.unlinkSync(req.file.path);
       res.status(409).json({ error: 'Project already exists' });
       return;
     }
 
-    fs.mkdirSync(projectDir, { recursive: true });
-    writeProjectIdentity(projectDir, createProjectStableSlug(name));
-
-    // Extract ZIP (pure JS — no system unzip dependency)
-    await extract(req.file.path, { dir: path.resolve(projectDir) });
-
-    // If there's a single subdirectory, move its contents up
-    const entries = fs.readdirSync(projectDir);
-    if (entries.length === 1 && fs.statSync(path.join(projectDir, entries[0])).isDirectory()) {
-      const subDir = path.join(projectDir, entries[0]);
-      const subEntries = fs.readdirSync(subDir);
-      for (const entry of subEntries) {
-        fs.renameSync(path.join(subDir, entry), path.join(projectDir, entry));
-      }
-      fs.rmdirSync(subDir);
-    }
+    const stagingDir = createProjectCreationStagingDirectory();
+    promotedProjectDir = stagingDir;
+    promotedProjectRootIdentity = attestProjectRoot(stagingDir);
+    await assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId: ownerId,
+      projectName: name,
+      projectRoot: stagingDir,
+    });
+    const projectIdentity = await createCurrentProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: name,
+      projectRoot: stagingDir,
+    });
+    createdProjectIdentityId = projectIdentity.id;
+    await safeExtractZipToNewDirectory(req.file.path, stagingDir, {
+      limits: PROJECT_ZIP_LIMITS,
+      collapseSingleRoot: true,
+      existingEmptyDirectory: true,
+    });
+    const gitScope = { actorId: req.user!.userId, projectId: projectIdentity.id };
 
     // Auto-detect project type
     let detectedType = 'unknown';
     let suggestedCommand = '';
-    const files = fs.readdirSync(projectDir);
+    const files = listProjectRootRegularFiles(stagingDir);
     if (files.includes('package.json')) {
       detectedType = 'node';
       try {
-        const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
-        suggestedCommand = pkg.scripts?.start ? 'npm start' : pkg.scripts?.dev ? 'npm run dev' : 'node index.js';
+        const pkg = readProjectPackageJson(stagingDir);
+        suggestedCommand = pkg?.scripts?.start ? 'npm start' : pkg?.scripts?.dev ? 'npm run dev' : 'node index.js';
       } catch { suggestedCommand = 'npm start'; }
     } else if (files.includes('requirements.txt')) {
       detectedType = 'python';
@@ -1342,25 +4553,83 @@ router.post('/upload-zip', authenticateToken, requireApproved, zipUpload.single(
 
     // Init git
     try {
-      execSync('git init && git add -A && git commit -m "Initial commit from ZIP upload"', { cwd: projectDir, timeout: 10000 });
+      await runProjectGitCommand({ ...gitScope, workspace: stagingDir, args: ['init'], timeoutMs: 10_000 });
+      await runProjectGitCommand({ ...gitScope, workspace: stagingDir, args: ['add', '-A'], timeoutMs: 10_000 });
+      await runProjectGitCommand({ ...gitScope, workspace: stagingDir, args: ['commit', '-m', 'Initial commit from ZIP upload'], timeoutMs: 10_000 });
     } catch {}
 
-    // Clean up zip file
-    try { fs.unlinkSync(req.file.path); } catch {}
-
-    await prisma.activityLog.create({
-      data: { userId: ownerId, action: 'PROJECT_UPLOAD_ZIP', resource: 'project', severity: 'INFO' },
+    await assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId: ownerId,
+      projectName: name,
+      projectRoot: stagingDir,
+    });
+    moveAttestedDirectoryNoReplace({
+      sourceRoot: stagingDir,
+      targetRoot: projectDir,
+      expectedIdentity: projectIdentity,
+    });
+    promotedProjectDir = projectDir;
+    creationSuccessResponse = { name, detectedType, suggestedCommand };
+    await finalizeCurrentProjectIdentityCreation({
+      projectIdentityId: projectIdentity.id,
+      projectRoot: projectDir,
     });
 
-    res.status(201).json({ name, detectedType, suggestedCommand });
+    await prisma.activityLog.create({
+      data: {
+        userId: ownerId,
+        action: 'PROJECT_UPLOAD_ZIP',
+        resource: 'project',
+        resourceId: projectIdentity.id,
+        severity: 'INFO',
+        metadata: { projectName: name },
+      },
+    }).catch((error) => {
+      console.warn('[Project ZIP Upload] Failed to record activity:', error);
+    });
+
+    res.status(201).json(creationSuccessResponse);
+    promotedProjectDir = undefined;
+    promotedProjectRootIdentity = undefined;
+    createdProjectIdentityId = undefined;
   } catch (error: any) {
+    const reconciliation = await reconcileFailedCurrentProjectCreation({
+      projectIdentityId: createdProjectIdentityId,
+      directory: promotedProjectDir,
+      expectedDirectoryIdentity: promotedProjectRootIdentity,
+    }, '[Project ZIP Upload] Staging cleanup failed:');
+    if (reconciliation === 'published') {
+      console.warn('[Project ZIP Upload] Publication committed before a later operation failed:', error);
+      if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+        res.status(201).json(creationSuccessResponse!);
+      }
+      return;
+    }
     console.error('ZIP upload error:', error);
-    res.status(500).json({ error: 'Failed to upload ZIP: ' + (error.message || 'unknown error') });
+    if (error instanceof LegacyOpenClawProjectCreationCollisionError) {
+      res.status(409).json({ error: error.message, code: error.code, retryable: false });
+    } else if (error instanceof LegacyOpenClawProjectCreationScanCapacityError) {
+      res.status(503).json({ error: error.message, code: error.code, retryable: true });
+    } else if (error instanceof ProjectIdentityLifecycleError || error?.code === 'P2002') {
+      res.status(409).json({ error: 'Project name is already owned or reserved' });
+    } else {
+      res.status(500).json({ error: 'Failed to upload ZIP: ' + (error.message || 'unknown error') });
+    }
+  } finally {
+    releaseProjectNameLock?.();
+    if (req.file?.path) {
+      try { fs.unlinkSync(req.file.path); } catch {}
+    }
   }
 });
 
 // POST /api/projects/create-from-upload - create project from a chunked-uploaded file
 router.post('/create-from-upload', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  let promotedProjectDir: string | undefined;
+  let promotedProjectRootIdentity: AttestedProjectRoot | undefined;
+  let createdProjectIdentityId: string | undefined;
+  let creationSuccessResponse: { name: string; detectedType: string; suggestedCommand: string } | undefined;
+  let releaseProjectNameLock: (() => void) | null = null;
   try {
     const ownerId = await getScopedOwnerId(req);
     const { name, filePath: uploadedFilePath } = req.body;
@@ -1369,52 +4638,66 @@ router.post('/create-from-upload', authenticateToken, requireApproved, async (re
       return;
     }
 
-    const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120) || 'project';
     const projectDir = getProjectPath(ownerId, safeName);
 
+    const uploadedName = path.basename(String(uploadedFilePath));
+    const fileRecord = await prisma.file.findFirst({ where: { userId: ownerId, path: uploadedName } });
+    const fullPath = fileRecord ? resolveFilePath(ownerId, fileRecord.path) : null;
+    if (!fileRecord || !fullPath) {
+      res.status(404).json({ error: 'Uploaded file not found' });
+      return;
+    }
+
+    const scanResult = await scanFile(fullPath);
+    if (!scanResult.clean) {
+      res.status(scanResult.scannerAvailable ? 400 : 503).json({
+        error: scanResult.scannerAvailable
+          ? `ZIP rejected: malware detected (${scanResult.threat})`
+          : 'Project ZIP import is temporarily unavailable because malware scanning could not complete',
+      });
+      return;
+    }
+
+    releaseProjectNameLock = await acquireProjectDeletionLock(
+      projectDeletionLockKey(ownerId, safeName),
+    );
+    await assertProjectIdentityNameAvailable({ workspaceOwnerId: ownerId, projectName: safeName });
     if (fs.existsSync(projectDir)) {
       res.status(409).json({ error: 'Project already exists' });
       return;
     }
 
-    // Resolve the uploaded file (it's in the user's upload dir)
-    const { getUserUploadDir } = require('./files');
-    const userDir = getUserUploadDir(ownerId);
-    const fullPath = path.join(userDir, path.basename(uploadedFilePath));
-
-    console.log('[create-from-upload]', { uploadedFilePath, userDir, fullPath, exists: fs.existsSync(fullPath) });
-
-    if (!fs.existsSync(fullPath)) {
-      res.status(404).json({ error: `Uploaded file not found at ${fullPath}` });
-      return;
-    }
-
-    fs.mkdirSync(projectDir, { recursive: true });
-    writeProjectIdentity(projectDir, createProjectStableSlug(safeName));
-
-    // Extract ZIP (pure JS — no system unzip dependency)
-    await extract(fullPath, { dir: path.resolve(projectDir) });
-
-    // If there's a single subdirectory, move its contents up
-    const entries = fs.readdirSync(projectDir);
-    if (entries.length === 1 && fs.statSync(path.join(projectDir, entries[0])).isDirectory()) {
-      const subDir = path.join(projectDir, entries[0]);
-      const subEntries = fs.readdirSync(subDir);
-      for (const entry of subEntries) {
-        fs.renameSync(path.join(subDir, entry), path.join(projectDir, entry));
-      }
-      fs.rmdirSync(subDir);
-    }
+    const stagingDir = createProjectCreationStagingDirectory();
+    promotedProjectDir = stagingDir;
+    promotedProjectRootIdentity = attestProjectRoot(stagingDir);
+    await assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId: ownerId,
+      projectName: safeName,
+      projectRoot: stagingDir,
+    });
+    const projectIdentity = await createCurrentProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: safeName,
+      projectRoot: stagingDir,
+    });
+    createdProjectIdentityId = projectIdentity.id;
+    await safeExtractZipToNewDirectory(fullPath, stagingDir, {
+      limits: PROJECT_ZIP_LIMITS,
+      collapseSingleRoot: true,
+      existingEmptyDirectory: true,
+    });
+    const gitScope = { actorId: req.user!.userId, projectId: projectIdentity.id };
 
     // Auto-detect project type
     let detectedType = 'unknown';
     let suggestedCommand = '';
-    const files = fs.readdirSync(projectDir);
+    const files = listProjectRootRegularFiles(stagingDir);
     if (files.includes('package.json')) {
       detectedType = 'node';
       try {
-        const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
-        suggestedCommand = pkg.scripts?.start ? 'npm start' : pkg.scripts?.dev ? 'npm run dev' : 'node index.js';
+        const pkg = readProjectPackageJson(stagingDir);
+        suggestedCommand = pkg?.scripts?.start ? 'npm start' : pkg?.scripts?.dev ? 'npm run dev' : 'node index.js';
       } catch { suggestedCommand = 'npm start'; }
     } else if (files.includes('requirements.txt')) {
       detectedType = 'python';
@@ -1431,25 +4714,224 @@ router.post('/create-from-upload', authenticateToken, requireApproved, async (re
 
     // Init git
     try {
-      execSync('git init && git add -A && git commit -m "Initial commit from ZIP upload"', { cwd: projectDir, timeout: 10000 });
+      await runProjectGitCommand({ ...gitScope, workspace: stagingDir, args: ['init'], timeoutMs: 10_000 });
+      await runProjectGitCommand({ ...gitScope, workspace: stagingDir, args: ['add', '-A'], timeoutMs: 10_000 });
+      await runProjectGitCommand({ ...gitScope, workspace: stagingDir, args: ['commit', '-m', 'Initial commit from ZIP upload'], timeoutMs: 10_000 });
     } catch {}
 
-    // Clean up uploaded file
-    try { fs.unlinkSync(fullPath); } catch {}
-
-    await prisma.activityLog.create({
-      data: { userId: ownerId, action: 'PROJECT_UPLOAD_ZIP', resource: 'project', severity: 'INFO' },
+    await assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId: ownerId,
+      projectName: safeName,
+      projectRoot: stagingDir,
+    });
+    moveAttestedDirectoryNoReplace({
+      sourceRoot: stagingDir,
+      targetRoot: projectDir,
+      expectedIdentity: projectIdentity,
+    });
+    promotedProjectDir = projectDir;
+    creationSuccessResponse = { name: safeName, detectedType, suggestedCommand };
+    await finalizeCurrentProjectIdentityCreation({
+      projectIdentityId: projectIdentity.id,
+      projectRoot: projectDir,
     });
 
-    res.status(201).json({ name: safeName, detectedType, suggestedCommand });
+    // Consume the source upload only after the project is complete. If the DB
+    // mutation fails, restore the source so Files never points at a missing path.
+    const quarantine = path.join(path.dirname(fullPath), `.portal-import-${fileRecord.id}-${nanoid(8)}.part`);
+    try {
+      fs.renameSync(fullPath, quarantine);
+      try {
+        await prisma.file.delete({ where: { id: fileRecord.id } });
+      } catch (error) {
+        fs.renameSync(quarantine, fullPath);
+        throw error;
+      }
+      removeToolMirror(ownerId, fileRecord.path);
+      try { fs.unlinkSync(quarantine); } catch {}
+    } catch (error) {
+      console.warn('[create-from-upload] Project created, but source upload cleanup was rolled back:', error);
+    }
+
+    await prisma.activityLog.create({
+      data: {
+        userId: ownerId,
+        action: 'PROJECT_UPLOAD_ZIP',
+        resource: 'project',
+        resourceId: projectIdentity.id,
+        severity: 'INFO',
+        metadata: { projectName: safeName },
+      },
+    }).catch(() => {});
+
+    res.status(201).json(creationSuccessResponse);
+    promotedProjectDir = undefined;
+    promotedProjectRootIdentity = undefined;
+    createdProjectIdentityId = undefined;
   } catch (error: any) {
+    const reconciliation = await reconcileFailedCurrentProjectCreation({
+      projectIdentityId: createdProjectIdentityId,
+      directory: promotedProjectDir,
+      expectedDirectoryIdentity: promotedProjectRootIdentity,
+    }, '[Create From Upload] Staging cleanup failed:');
+    if (reconciliation === 'published') {
+      console.warn('[Create From Upload] Publication committed before a later operation failed:', error);
+      if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+        res.status(201).json(creationSuccessResponse!);
+      }
+      return;
+    }
     console.error('Create from upload error:', error);
-    res.status(500).json({ error: 'Failed to create project: ' + (error.message || 'unknown error') });
+    if (error instanceof LegacyOpenClawProjectCreationCollisionError) {
+      res.status(409).json({ error: error.message, code: error.code, retryable: false });
+    } else if (error instanceof LegacyOpenClawProjectCreationScanCapacityError) {
+      res.status(503).json({ error: error.message, code: error.code, retryable: true });
+    } else if (error instanceof ProjectIdentityLifecycleError || error?.code === 'P2002') {
+      res.status(409).json({ error: 'Project name is already owned or reserved' });
+    } else {
+      res.status(500).json({ error: 'Failed to create project: ' + (error.message || 'unknown error') });
+    }
+  } finally {
+    releaseProjectNameLock?.();
   }
 });
 
+// POST /api/projects/:name/assistant/attachments - materialize one Project Chat
+// attachment inside the exact attested project workspace. This endpoint never
+// returns a host path or a signed Portal file URL: Project providers receive
+// only the project-relative path visible through their sandbox mount.
+router.post(
+  '/:name/assistant/attachments',
+  authenticateToken,
+  requireApproved,
+  projectPathSandbox,
+  fileUpload.single('file'),
+  async (req: Request, res: Response) => {
+    const uploadedFile = req.file as Express.Multer.File | undefined;
+    let attachmentDir: string | null = null;
+    let materializedPath: string | null = null;
+    let attachmentCommitted = false;
+    try {
+      if (!uploadedFile) {
+        res.status(400).json({ error: 'No file provided' });
+        return;
+      }
+      const { actorUserId, workspaceOwnerId, projectDir } = resolveActorProjectChatWorkspace(
+        req,
+        req.params.name,
+      );
+      if (!fs.existsSync(projectDir)) {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+      const { provider, executionContext } = await resolveProjectChatOperationContext(
+        actorUserId,
+        workspaceOwnerId,
+        req.params.name,
+        projectDir,
+        req.body?.provider,
+      );
+      if (!getProjectChatProviderCapability(provider).supportsAttachments) {
+        throw new UnsupportedProjectChatProviderError(
+          provider,
+          'This Project provider does not expose a server-verified attachment path.',
+        );
+      }
+      const coordination = await requireSelectedProjectChatState({
+        actorUserId,
+        projectIdentityId: executionContext.projectId,
+        provider,
+        expectedVersion: req.body?.stateVersion,
+      });
+      if (coordination.activeTurn) {
+        throw new ProjectChatLeaseError(
+          'TURN_ACTIVE',
+          'Project attachments cannot change while a Project Chat turn is active',
+        );
+      }
+
+      const safeOriginalName = path.posix.basename(uploadedFile.originalname.replace(/\\/g, '/'))
+        .replace(/[\u0000-\u001f\u007f]/g, '_')
+        .slice(0, 180);
+      if (!safeOriginalName || safeOriginalName === '.' || safeOriginalName === '..') {
+        res.status(400).json({ error: 'Invalid filename' });
+        return;
+      }
+      const scanResult = await scanFile(uploadedFile.path);
+      if (!scanResult.clean) {
+        res.status(scanResult.scannerAvailable ? 422 : 503).json({
+          error: scanResult.scannerAvailable
+            ? 'Project attachment was rejected by malware scanning'
+            : 'Project attachment is temporarily unavailable because malware scanning could not complete',
+        });
+        return;
+      }
+
+      const attachmentSubdirectory = path.posix.join('.portal', 'attachments', crypto.randomUUID());
+      attachmentDir = ensureContainedDirectory(projectDir, attachmentSubdirectory);
+      const destination = resolveContainedPath(attachmentDir, safeOriginalName, { mustExist: false });
+      fs.copyFileSync(uploadedFile.path, destination, fs.constants.COPYFILE_EXCL);
+      materializedPath = destination;
+      fs.unlinkSync(uploadedFile.path);
+      const confirmedCoordination = await requireSelectedProjectChatState({
+        actorUserId,
+        projectIdentityId: executionContext.projectId,
+        provider,
+        expectedVersion: coordination.state!.version,
+      });
+      if (confirmedCoordination.activeTurn) {
+        throw new ProjectChatLeaseError(
+          'TURN_ACTIVE',
+          'Project attachments cannot change while a Project Chat turn is active',
+        );
+      }
+      const projectPath = path.relative(projectDir, destination).split(path.sep).join('/');
+      await prisma.activityLog.create({
+        data: {
+          userId: actorUserId,
+          action: 'PROJECT_CHAT_ATTACHMENT_UPLOAD',
+          resource: 'project',
+          resourceId: executionContext.projectId,
+          severity: 'INFO',
+          metadata: {
+            projectName: req.params.name,
+            projectPath,
+            fileName: safeOriginalName,
+            fileSize: uploadedFile.size,
+            provider,
+          },
+        },
+      });
+      attachmentCommitted = true;
+      attachmentDir = null;
+      res.status(201).json({
+        name: safeOriginalName,
+        size: uploadedFile.size,
+        projectPath,
+        provider,
+        stateVersion: confirmedCoordination.state!.version,
+      });
+    } catch (error: any) {
+      if (sendProjectChatProviderError(res, error)) return;
+      if (sendProjectChatCoordinationError(res, error)) return;
+      console.error('[Project Chat Attachment] Error:', error?.message || error);
+      res.status(500).json({ error: 'Failed to attach file to Project Chat' });
+    } finally {
+      if (uploadedFile) {
+        try { fs.unlinkSync(uploadedFile.path); } catch {}
+      }
+      if (!attachmentCommitted && materializedPath) {
+        try { fs.unlinkSync(materializedPath); } catch {}
+      }
+      if (attachmentDir) {
+        try { fs.rmdirSync(attachmentDir); } catch {}
+      }
+    }
+  },
+);
+
 // POST /api/projects/:name/upload - upload files to existing project
-router.post('/:name/upload', authenticateToken, requireApproved, fileUpload.array('files', 50), async (req: Request, res: Response) => {
+router.post('/:name/upload', authenticateToken, requireApproved, projectPathSandbox, fileUpload.array('files', 50), async (req: Request, res: Response) => {
   const uploadedFiles = req.files as Express.Multer.File[];
   try {
     const ownerId = await getScopedOwnerId(req);
@@ -1461,44 +4943,55 @@ router.post('/:name/upload', authenticateToken, requireApproved, fileUpload.arra
       res.status(404).json({ error: 'Project not found' });
       return;
     }
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: req.params.name,
+      projectRoot: projectDir,
+    });
 
     if (!uploadedFiles || uploadedFiles.length === 0) {
       res.status(400).json({ error: 'No files provided' });
       return;
     }
+    const aggregateSize = uploadedFiles.reduce((sum, file) => sum + file.size, 0);
+    if (!Number.isSafeInteger(aggregateSize) || aggregateSize > 500 * 1024 * 1024) {
+      uploadedFiles.forEach(file => { try { fs.unlinkSync(file.path); } catch {} });
+      res.status(413).json({ error: 'Combined upload exceeds 500MB' });
+      return;
+    }
 
     // Target subdirectory within the project (default to root)
     const targetSubPath = (req.query.path as string) || '';
-    const targetDir = path.join(projectDir, targetSubPath);
-    const resolvedTarget = path.resolve(targetDir);
-    if (!resolvedTarget.startsWith(path.resolve(projectDir))) {
+    let resolvedTarget: string;
+    try {
+      resolvedTarget = targetSubPath
+        ? ensureContainedDirectory(projectDir, targetSubPath)
+        : fs.realpathSync(projectDir);
+    } catch {
       uploadedFiles.forEach(f => { try { fs.unlinkSync(f.path); } catch {} });
       res.status(403).json({ error: 'Path traversal detected' });
       return;
     }
-
-    // Ensure target directory exists
-    fs.mkdirSync(resolvedTarget, { recursive: true });
 
     const results: Array<{ name: string; path: string; size: number }> = [];
     const errors: Array<{ name: string; error: string }> = [];
 
     for (const file of uploadedFiles) {
       try {
-        const destPath = path.join(resolvedTarget, file.originalname);
-        const resolvedDest = path.resolve(destPath);
-        // Verify no path traversal in filename
-        if (!resolvedDest.startsWith(path.resolve(projectDir))) {
-          errors.push({ name: file.originalname, error: 'Invalid filename' });
-          continue;
+        const safeOriginalName = path.posix.basename(file.originalname.replace(/\\/g, '/')).replace(/[\u0000-\u001f\u007f]/g, '_');
+        if (!safeOriginalName || safeOriginalName === '.' || safeOriginalName === '..') {
+          throw new Error('Invalid filename');
         }
-        // Create parent dirs if needed (for filenames with subdirectory structure)
-        fs.mkdirSync(path.dirname(resolvedDest), { recursive: true });
-        // Move from temp to project
-        fs.copyFileSync(file.path, resolvedDest);
+        const scanResult = await scanFile(file.path);
+        if (!scanResult.clean) {
+          throw new Error(scanResult.scannerAvailable
+            ? `Malware detected (${scanResult.threat})`
+            : 'Malware scanning unavailable');
+        }
+        const resolvedDest = resolveContainedPath(resolvedTarget, safeOriginalName, { mustExist: false });
+        fs.copyFileSync(file.path, resolvedDest, fs.constants.COPYFILE_EXCL);
         fs.unlinkSync(file.path);
-        const relativePath = targetSubPath ? `${targetSubPath}/${file.originalname}` : file.originalname;
-        results.push({ name: file.originalname, path: relativePath, size: file.size });
+        results.push({ name: safeOriginalName, path: path.relative(projectDir, resolvedDest).split(path.sep).join('/'), size: file.size });
       } catch (err: any) {
         errors.push({ name: file.originalname, error: err.message || 'Failed to copy' });
         // Clean up temp file
@@ -1506,14 +4999,18 @@ router.post('/:name/upload', authenticateToken, requireApproved, fileUpload.arra
       }
     }
 
+    if (results.length === 0 && errors.length > 0 && errors.every(item => item.error === 'Malware scanning unavailable')) {
+      res.status(503).json({ error: 'Project upload is temporarily unavailable because malware scanning could not complete' });
+      return;
+    }
+
     // Log activity
-    const app = await prisma.app.findFirst({ where: { userId, name: req.params.name } });
     await prisma.activityLog.create({
       data: {
         userId,
         action: 'PROJECT_FILE_UPLOAD',
         resource: 'project',
-        resourceId: app?.id,
+        resourceId: projectIdentity.id,
         severity: 'INFO',
         metadata: {
           projectName: req.params.name,
@@ -1523,6 +5020,8 @@ router.post('/:name/upload', authenticateToken, requireApproved, fileUpload.arra
           fileNames: results.map(f => f.name),
         },
       },
+    }).catch((error) => {
+      console.warn('[Project Upload] Failed to record activity:', error);
     });
 
     res.json({
@@ -1542,7 +5041,15 @@ router.post('/:name/upload', authenticateToken, requireApproved, fileUpload.arra
 router.get('/:name/activity', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
-    const limit = parseInt(req.query.limit as string) || 20;
+    const projectDir = getProjectPath(ownerId, req.params.name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: req.params.name,
+      projectRoot: projectDir,
+    });
+    const parsedLimit = Number.parseInt(String(req.query.limit || '20'), 10);
+    const limit = Math.max(1, Math.min(Number.isFinite(parsedLimit) ? parsedLimit : 20, 100));
     // Get app record for this project
     const app = await prisma.app.findFirst({
       where: { userId: ownerId, name: req.params.name },
@@ -1551,114 +5058,1215 @@ router.get('/:name/activity', authenticateToken, requireApproved, async (req: Re
     const logs = await prisma.activityLog.findMany({
       where: {
         userId: ownerId,
-        OR: [
-          { resourceId: app?.id || 'none' },
-          { action: { in: ['PROJECT_CREATE', 'PROJECT_DEPLOY', 'PROJECT_UPLOAD_ZIP', 'PROJECT_FILE_UPLOAD'] } },
-        ],
+        resource: 'project',
+        resourceId: { in: [projectIdentity.id, ...(app?.id ? [app.id] : [])] },
       },
       orderBy: { createdAt: 'desc' },
       take: limit,
     });
 
     res.json({ logs });
-  } catch (error) {
+  } catch {
     res.status(500).json({ error: 'Failed to get activity' });
   }
 });
 
+/**
+ * Everything after deletion admission (DELETING committed) through durable row
+ * removal. Idempotent by construction — quarantine receipts, absence markers,
+ * and guarded deletes let a crashed deletion resume here, both from a client
+ * retry of the DELETE route and from automatic lifecycle-residue recovery.
+ */
+async function completeAdmittedProjectDeletion(input: {
+  actorUserId: string;
+  ownerId: string;
+  projectName: string;
+  projectDir: string;
+  projectIdentity: ProjectIdentityRecord;
+  actorIdsBeforeBarrier?: readonly string[];
+}): Promise<Record<string, unknown>> {
+  const { actorUserId, ownerId, projectName, projectDir, projectIdentity } = input;
+  // Re-read after DELETING closes admission so an actor that admitted in the
+  // narrow discovery/barrier interval cannot retain an in-process callback.
+  const actorIds = Array.from(new Set([
+    ...(input.actorIdsBeforeBarrier || [actorUserId, ownerId]),
+    ...await listProjectLifecycleActorIds({
+      projectIdentityId: projectIdentity.id,
+      workspaceOwnerId: ownerId,
+      authenticatedActorId: actorUserId,
+    }),
+  ]));
+  for (const actorId of actorIds) {
+    if (actorId === ownerId) {
+      await migrateLegacyProjectChatState({
+        actorUserId: actorId,
+        legacyProjectId: projectName,
+        immutableProjectId: projectIdentity.id,
+      });
+    }
+    await quiesceProjectChatBrokerCallbacksForDestructiveReset({
+      actorUserId: actorId,
+      projectIdentityId: projectIdentity.id,
+    });
+  }
+
+  const deployId = `${ownerId}-${projectName}`;
+  const deployPath = path.join(DEPLOY_DIR, deployId);
+  const initialDeployAttestation = managedPathExists(deployPath)
+    ? attestProjectRoot(deployPath)
+    : null;
+  await stopApp(deployId);
+  const removedProjectWorkloads = await removePortalProjectWorkloadsForProject(projectIdentity.id);
+
+  const cleanup = await cleanupProjectRuntime({
+    authenticatedActorId: actorUserId,
+    workspaceOwnerId: ownerId,
+    projectIdentity,
+  }, {
+    adapters: PROJECT_RUNTIME_CLEANUP_ADAPTERS,
+    egressAdapter: PROJECT_EGRESS_CLEANUP_ADAPTER,
+  });
+  await retireLegacyOpenClawRuntimesForProject({
+    actorUserIds: actorIds,
+    projectIdentityId: projectIdentity.id,
+    legacyProjectName: projectName,
+    legacyProjectOwnerId: ownerId,
+    targetCanonicalRoot: projectIdentity.canonicalRoot,
+  });
+  const removedQualificationEvidenceByProvider = Object.fromEntries(
+    QUALIFIABLE_PROJECT_PROVIDERS.map((provider) => [
+      provider,
+      removeProjectQualificationEvidenceForProject(provider, projectIdentity.id),
+    ]),
+  );
+  const removedQualificationEvidence = Object.values(removedQualificationEvidenceByProvider)
+    .reduce((total, count) => total + count, 0);
+
+  const desktopRuntime = await stopProjectDesktopRuntimesForLifecycle({
+    workspaceOwnerId: ownerId,
+    projectIdentityId: projectIdentity.id,
+    projectName,
+  });
+  await removeDirectoryThroughAttestedQuarantine({
+    sourceRoot: desktopRuntime.runtimeDir,
+    quarantineKey: `desktop-current:${projectIdentity.id}`,
+    expectedIdentity: desktopRuntime.identity || undefined,
+    sourceMustBeAbsent: !desktopRuntime.identity,
+  });
+
+  if (!initialDeployAttestation && managedPathExists(deployPath)) {
+    throw new ProjectIdentityLifecycleError(
+      'A deployment directory appeared after Project deletion started',
+    );
+  }
+  await removeDirectoryThroughAttestedQuarantine({
+    sourceRoot: deployPath,
+    quarantineKey: `deploy:${projectIdentity.id}`,
+    expectedIdentity: initialDeployAttestation || undefined,
+    sourceMustBeAbsent: !initialDeployAttestation,
+  });
+  await removeDirectoryThroughAttestedQuarantine({
+    sourceRoot: projectDir,
+    quarantineKey: `project:${projectIdentity.id}`,
+    expectedIdentity: projectIdentity,
+  });
+
+  await prisma.$transaction(async (transaction) => {
+    const legacyOrImmutable = {
+      OR: [
+        { projectId: projectIdentity.id },
+        { userId: ownerId, projectId: projectName },
+      ],
+    };
+    await transaction.projectChatMessage.deleteMany({ where: legacyOrImmutable });
+    await transaction.projectChatProviderBinding.deleteMany({ where: legacyOrImmutable });
+    await transaction.projectChatSession.deleteMany({ where: legacyOrImmutable });
+    await transaction.app.deleteMany({
+      where: projectAppAssociationWhere({
+        workspaceOwnerId: ownerId,
+        projectIdentityId: projectIdentity.id,
+        projectName,
+        deployPath,
+      }),
+    });
+    const deleted = await transaction.projectIdentity.deleteMany({
+      where: { id: projectIdentity.id, lifecycleStatus: 'DELETING' },
+    });
+    if (deleted.count !== 1) throw new Error('Project identity deletion barrier changed before commit');
+  });
+
+  const runtimeCleanup = {
+    ...cleanup,
+    removedProjectWorkloads,
+    removedQualificationEvidence,
+    removedQualificationEvidenceByProvider,
+  };
+  await prisma.activityLog.create({
+    data: {
+      userId: actorUserId,
+      action: 'PROJECT_DELETE',
+      resource: 'project',
+      resourceId: projectIdentity.id,
+      severity: 'INFO',
+      metadata: {
+        projectName,
+        projectIdentityId: projectIdentity.id,
+        runtimeCleanup,
+      },
+    },
+  }).catch((activityError) => {
+    console.warn('[Project Delete] Failed to record activity:', activityError);
+  });
+  return runtimeCleanup;
+}
+
 // DELETE /api/projects/:name - delete project
 router.delete('/:name', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  let releaseDeletionLock: (() => void) | null = null;
   try {
     const ownerId = await getScopedOwnerId(req);
-    const projectDir = getProjectPath(ownerId, req.params.name);
-    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-
-    fs.rmSync(projectDir, { recursive: true, force: true });
-    
-    // Also remove deployment if exists
-    const deployId = `${ownerId}-${req.params.name}`;
-    const deployPath = path.join(DEPLOY_DIR, deployId);
-    if (fs.existsSync(deployPath)) {
-      fs.rmSync(deployPath, { recursive: true, force: true });
-    }
-    
-    // Log activity
-    await prisma.activityLog.create({
-      data: {
-        userId: ownerId,
-        action: 'PROJECT_DELETE',
-        resource: 'project',
-        severity: 'INFO',
-        metadata: { projectName: req.params.name },
-      },
+    const requestedIdentity = requireCurrentProjectDestructiveIdentity(
+      await prisma.projectIdentity.findUnique({
+        where: {
+          workspaceOwnerId_projectName: {
+            workspaceOwnerId: ownerId,
+            projectName: req.params.name,
+          },
+        },
+      }),
+    );
+    await assertLegacyOpenClawProjectMigrationInactive(requestedIdentity.id);
+    releaseDeletionLock = await acquireProjectDeletionLock(
+      projectDeletionLockKey(ownerId, req.params.name),
+    );
+    const actorUserId = req.user!.userId;
+    const currentRequestedIdentity = await prisma.projectIdentity.findUnique({
+      where: { id: requestedIdentity.id },
     });
-    
-    res.json({ message: 'Project deleted' });
+    if (!currentRequestedIdentity) {
+      res.json({ message: 'Project deleted', alreadyAbsent: true });
+      return;
+    }
+    requireCurrentProjectDestructiveIdentity(
+      currentRequestedIdentity as unknown as ProjectIdentityRecord,
+    );
+    if (currentRequestedIdentity.lifecycleStatus === 'DELETING') {
+      const runtimeCleanup = await completeAdmittedProjectDeletion({
+        actorUserId,
+        ownerId,
+        projectName: currentRequestedIdentity.projectName,
+        projectDir: getProjectPath(ownerId, currentRequestedIdentity.projectName),
+        projectIdentity: currentRequestedIdentity as unknown as ProjectIdentityRecord,
+      });
+      res.json({ message: 'Project deleted', runtimeCleanup, resumed: true });
+      return;
+    }
+    const renameConvergence = await convergeInterruptedProjectRenameForDestructiveOperation({
+      actorUserId,
+      workspaceOwnerId: ownerId,
+      projectName: req.params.name,
+      currentProjectIdentityId: requestedIdentity.id,
+    });
+    if (renameConvergence.renamedTo) {
+      res.status(409).json({
+        error: 'This Project finished renaming. Retry deletion using its current name.',
+        code: 'PROJECT_RENAMED',
+        newName: renameConvergence.renamedTo,
+        retryable: true,
+      });
+      return;
+    }
+    const projectName = renameConvergence.projectName;
+    const projectDir = renameConvergence.projectDir;
+    const projectExists = fs.existsSync(projectDir);
+    await assertLegacyOpenClawProjectMigrationInactive(requestedIdentity.id);
+    const identityBeforeBarrier = projectExists
+      ? await ensureProjectIdentity({
+        workspaceOwnerId: ownerId,
+        projectName,
+        projectRoot: projectDir,
+      })
+      : await prisma.projectIdentity.findUnique({
+        where: {
+          workspaceOwnerId_projectName: {
+            workspaceOwnerId: ownerId,
+            projectName,
+          },
+        },
+      });
+    if (identityBeforeBarrier) {
+      requireCurrentProjectDestructiveIdentity(identityBeforeBarrier);
+      if (identityBeforeBarrier.id !== requestedIdentity.id) {
+        throw new ProjectIdentityLifecycleError('Project identity changed before deletion admission');
+      }
+      await assertProjectChatDestructiveResetInactive(identityBeforeBarrier.id);
+      await assertLegacyOpenClawProjectMigrationInactive(identityBeforeBarrier.id);
+    }
+    const actorIdsBeforeBarrier = identityBeforeBarrier
+      ? await listProjectLifecycleActorIds({
+        projectIdentityId: identityBeforeBarrier.id,
+        workspaceOwnerId: ownerId,
+        authenticatedActorId: actorUserId,
+      })
+      : Object.freeze([actorUserId, ownerId]);
+    await assertLegacyOpenClawProjectMigrationInactive(requestedIdentity.id);
+    const projectIdentity = projectExists
+      ? await beginProjectIdentityDeletion({
+        workspaceOwnerId: ownerId,
+        projectName,
+        projectRoot: projectDir,
+      })
+      : await beginOrphanedProjectIdentityDeletion({ workspaceOwnerId: ownerId, projectName });
+    // Deletion is idempotent: a repeat request (or a double-click that raced
+    // the first) for an already-removed project is a success, not an error.
+    if (!projectIdentity && !projectExists) {
+      res.json({ message: 'Project deleted', alreadyAbsent: true });
+      return;
+    }
+    if (!projectIdentity) { res.status(404).json({ error: 'Project not found' }); return; }
+    await assertLegacyOpenClawProjectMigrationInactive(projectIdentity.id);
+
+    const runtimeCleanup = await completeAdmittedProjectDeletion({
+      actorUserId,
+      ownerId,
+      projectName,
+      projectDir,
+      projectIdentity,
+      actorIdsBeforeBarrier,
+    });
+
+    res.json({ message: 'Project deleted', runtimeCleanup });
   } catch (error) {
+    logProjectLifecycleDecision({
+      route: 'project-delete',
+      code: String((error as any)?.code || (error as any)?.name || 'UNKNOWN'),
+      status: 0,
+      projectName: req.params.name,
+      detail: String((error as any)?.message || error).slice(0, 300),
+    });
+    if (error instanceof ProjectMoveRequiredError) {
+      res.status(409).json({
+        error: error.message,
+        code: error.code,
+        retryable: false,
+      });
+      return;
+    }
+    if (error instanceof ProjectChatDestructiveResetActiveError) {
+      res.status(409).json({
+        error: error.message,
+        code: error.code,
+        retryable: true,
+      });
+      return;
+    }
+    if (error instanceof LegacyOpenClawProjectMigrationActiveError) {
+      res.status(409).json({
+        error: error.message,
+        code: error.code,
+        retryable: error.retryable,
+      });
+      return;
+    }
+    if (error instanceof PortalProjectWorkloadError) {
+      res.status(503).json({
+        error: 'Project deletion is paused until Portal-owned Git, build, and app runtimes are proven clean.',
+        code: error.code,
+        retryable: true,
+      });
+      return;
+    }
+    if (error instanceof ProjectRuntimeCleanupError) {
+      // TURN_STILL_ACTIVE clears itself when the held lease lapses, so calling
+      // it non-retryable was wrong: the delete was reported as a dead end and
+      // then completed on its own moments later, which is what made deleting a
+      // project feel broken. Rename already treated this class as retryable.
+      const retryable = [
+        'ENUMERATION_FAILED',
+        'CLEANUP_FAILED',
+        'TURN_ABORT_FAILED',
+        'TURN_STILL_ACTIVE',
+      ].includes(error.code);
+      const stillRunning = error.code === 'TURN_STILL_ACTIVE';
+      if (stillRunning && error.retryAfterMs) {
+        res.setHeader('Retry-After', String(Math.ceil(error.retryAfterMs / 1000)));
+      }
+      res.status(retryable ? 503 : 409).json({
+        error: stillRunning
+          ? 'This Project is still finishing a chat turn. Deletion will be accepted as soon as it settles.'
+          : 'Project deletion is paused until its isolated runtime can be proven clean.',
+        code: error.code,
+        provider: error.provider,
+        retryable,
+        ...(stillRunning && error.retryAfterMs ? { retryAfterMs: error.retryAfterMs } : {}),
+      });
+      return;
+    }
+    if (error instanceof ProjectIdentityLifecycleError) {
+      res.status(409).json({
+        error: error.message,
+        code: error.code,
+        retryable: true,
+      });
+      return;
+    }
     res.status(500).json({ error: 'Failed to delete project' });
+  } finally {
+    releaseDeletionLock?.();
   }
 });
 
 // PATCH /api/projects/:name/rename - rename a project
+// `attemptId` correlates this response with one browser-owned admission. This
+// route does not claim durable server-side replay/idempotency; an uncertain
+// caller must reconcile list/tree identity and must not resubmit the PATCH.
 router.patch('/:name/rename', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  const releaseLocks: Array<() => void> = [];
+  let renameGrant: Awaited<ReturnType<typeof beginProjectIdentityRename>> | null = null;
+  let renameLeaseTimer: NodeJS.Timeout | null = null;
+  let renameLeaseRenewal: Promise<void> = Promise.resolve();
+  let renameLeaseFailure: unknown = null;
+  let runtimeCleanupCommitted = false;
+  let projectPathMoved = false;
+  let deployPathMoved = false;
+  let identityCommitted = false;
+  let attemptId: string | null = null;
+  let requestedProjectIdentityId = '';
+  let requestedProjectGeneration = 0;
+  let ownerId = '';
+  let targetProjectName = '';
+  let oldDir = '';
+  let newDir = '';
+  let oldDeployPath = '';
+  let newDeployPath = '';
+  let oldDeployId = '';
+  let oldDeployAttestation: AttestedDirectoryIdentity | null = null;
+  let restartFullstackApp = false;
+  let app: Awaited<ReturnType<typeof prisma.app.findFirst>> | null = null;
+
+  const queueLeaseRenewal = () => {
+    if (!renameGrant || renameLeaseFailure) return;
+    renameLeaseRenewal = renameLeaseRenewal.then(async () => {
+      if (!renameGrant) return;
+      await renewProjectIdentityRenameLease({
+        projectIdentityId: renameGrant.identity.id,
+        leaseToken: renameGrant.leaseToken,
+      });
+    }).catch((error) => {
+      renameLeaseFailure = error;
+    });
+  };
+
+  const stopLeaseHeartbeat = async (refreshBeforeMove = false) => {
+    if (renameLeaseTimer) clearInterval(renameLeaseTimer);
+    renameLeaseTimer = null;
+    await renameLeaseRenewal;
+    if (renameLeaseFailure) throw renameLeaseFailure;
+    if (refreshBeforeMove && renameGrant) {
+      await renewProjectIdentityRenameLease({
+        projectIdentityId: renameGrant.identity.id,
+        leaseToken: renameGrant.leaseToken,
+      });
+    }
+  };
+
   try {
-    const ownerId = await getScopedOwnerId(req);
-    const { newName } = req.body;
-    if (!newName || typeof newName !== 'string') { res.status(400).json({ error: 'newName is required' }); return; }
+    const { newName, attemptId: rawAttemptId, projectIdentityId, projectGeneration } = req.body;
+    attemptId = typeof rawAttemptId === 'string' && /^[a-zA-Z0-9_-]{16,128}$/.test(rawAttemptId)
+      ? rawAttemptId
+      : null;
+    if (!attemptId) {
+      sendProjectRenameNotAdmitted(res, 400, null, 'PROJECT_RENAME_ATTEMPT_REQUIRED', 'A valid rename attempt ID is required');
+      return;
+    }
+    if (!newName || typeof newName !== 'string') {
+      sendProjectRenameNotAdmitted(res, 400, attemptId, 'PROJECT_RENAME_NAME_REQUIRED', 'newName is required');
+      return;
+    }
+    if (
+      typeof projectIdentityId !== 'string'
+      || !projectIdentityId
+      || !Number.isSafeInteger(projectGeneration)
+      || projectGeneration < 1
+    ) {
+      sendProjectRenameNotAdmitted(
+        res,
+        400,
+        attemptId,
+        'PROJECT_RENAME_IDENTITY_REQUIRED',
+        'An immutable project identity proof is required',
+      );
+      return;
+    }
+    requestedProjectIdentityId = projectIdentityId;
+    requestedProjectGeneration = projectGeneration;
 
-    const sanitized = newName.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
-    if (!sanitized || sanitized === '.' || sanitized === '..') { res.status(400).json({ error: 'Invalid project name' }); return; }
-
-    const oldDir = getProjectPath(ownerId, req.params.name);
-    if (!fs.existsSync(oldDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-
-    const identity = await ensureProjectAssistantIdentity(oldDir, ownerId, req.params.name);
-
-    const newDir = getProjectPath(ownerId, sanitized);
-    if (fs.existsSync(newDir)) { res.status(409).json({ error: 'A project with that name already exists' }); return; }
-
-    fs.renameSync(oldDir, newDir);
-
-    // Update App DB record if one exists
-    const app = await prisma.app.findFirst({ where: { userId: ownerId, name: req.params.name } });
-    if (app) {
-      await prisma.app.update({ where: { id: app.id }, data: { name: sanitized } });
+    const sanitized = newName.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 120);
+    if (!sanitized || sanitized === '.' || sanitized === '..' || sanitized !== newName) {
+      sendProjectRenameNotAdmitted(res, 400, attemptId, 'PROJECT_RENAME_NAME_INVALID', 'Invalid project name');
+      return;
+    }
+    if (sanitized === req.params.name) {
+      sendProjectRenameNotAdmitted(
+        res,
+        409,
+        attemptId,
+        'PROJECT_RENAME_NAME_UNCHANGED',
+        'The rename target must differ from the current project name',
+      );
+      return;
     }
 
-    await prisma.projectChatSession.updateMany({
-      where: { userId: ownerId, projectId: req.params.name },
-      data: { projectId: sanitized },
+    ownerId = await getScopedOwnerId(req);
+    targetProjectName = sanitized;
+    const requestedIdentity = await prisma.projectIdentity.findUnique({
+      where: { id: requestedProjectIdentityId },
     });
-    await prisma.projectChatMessage.updateMany({
-      where: { userId: ownerId, projectId: req.params.name },
-      data: { projectId: sanitized },
-    });
+    if (
+      !requestedIdentity
+      || requestedIdentity.workspaceOwnerId !== ownerId
+    ) {
+      sendProjectRenameNotAdmitted(
+        res,
+        409,
+        attemptId,
+        'PROJECT_RENAME_IDENTITY_CHANGED',
+        'The project identity changed before rename admission',
+      );
+      return;
+    }
+    requireCurrentProjectDestructiveIdentity(requestedIdentity);
+    const requestedIdentityMatchesSource = (
+      ['ACTIVE', 'RENAMING'].includes(requestedIdentity.lifecycleStatus || 'ACTIVE')
+      && requestedIdentity.projectName === req.params.name
+      && requestedIdentity.generation === requestedProjectGeneration
+    );
+    const requestedIdentityMatchesCompletedRename = (
+      requestedProjectGeneration < Number.MAX_SAFE_INTEGER
+      && (requestedIdentity.lifecycleStatus || 'ACTIVE') === 'ACTIVE'
+      && requestedIdentity.projectName === sanitized
+      && requestedIdentity.generation === requestedProjectGeneration + 1
+      && requestedIdentity.lastRenameSourceName === req.params.name
+      && requestedIdentity.lastRenameCompletedAt instanceof Date
+    );
+    if (!requestedIdentityMatchesSource && !requestedIdentityMatchesCompletedRename) {
+      sendProjectRenameNotAdmitted(
+        res,
+        409,
+        attemptId,
+        'PROJECT_RENAME_IDENTITY_CHANGED',
+        'The project identity changed before rename admission',
+      );
+      return;
+    }
+    await assertLegacyOpenClawProjectMigrationInactive(requestedIdentity.id);
 
-    // Rename deployment dir if it exists
-    const oldDeployId = `${ownerId}-${req.params.name}`;
+    oldDir = getProjectPath(ownerId, req.params.name);
+    newDir = getProjectPath(ownerId, sanitized);
+    oldDeployId = `${ownerId}-${req.params.name}`;
     const newDeployId = `${ownerId}-${sanitized}`;
-    const oldDeployPath = path.join(DEPLOY_DIR, oldDeployId);
-    const newDeployPath = path.join(DEPLOY_DIR, newDeployId);
-    if (fs.existsSync(oldDeployPath)) {
-      fs.renameSync(oldDeployPath, newDeployPath);
+    oldDeployPath = path.join(DEPLOY_DIR, oldDeployId);
+    newDeployPath = path.join(DEPLOY_DIR, newDeployId);
+
+    for (const lockKey of Array.from(new Set([
+      projectDeletionLockKey(ownerId, req.params.name),
+      projectDeletionLockKey(ownerId, sanitized),
+    ])).sort()) {
+      releaseLocks.push(await acquireProjectDeletionLock(lockKey));
     }
 
-    await updateProjectAgentBindIfPresent(ownerId, identity.stableSlug, sanitized);
+    if (!managedPathExists(oldDir)) {
+      if (!managedPathExists(newDir)) {
+        sendProjectRenameNotAdmitted(
+          res,
+          404,
+          attemptId,
+          'PROJECT_RENAME_SOURCE_NOT_FOUND',
+          'Project not found',
+        );
+        return;
+      }
+      const interrupted = await readProjectIdentityRenameJournal({
+        workspaceOwnerId: ownerId,
+        projectName: sanitized,
+      });
+      if (
+        interrupted
+        && (
+          interrupted.projectName !== req.params.name
+          || interrupted.renameTargetName !== sanitized
+        )
+      ) {
+        res.status(409).json({
+          error: 'Rename target is participating in a different Project rename.',
+        });
+        return;
+      }
+      if (interrupted && (
+        interrupted.id !== requestedProjectIdentityId
+        || interrupted.generation !== requestedProjectGeneration
+      )) {
+        res.status(409).json({
+          error: 'Interrupted Project rename belongs to a different immutable identity.',
+          code: 'PROJECT_RENAME_IDENTITY_CHANGED',
+          retryable: true,
+        });
+        return;
+      }
+      if (!interrupted) {
+        const completed = await readCompletedProjectIdentityRename({
+          workspaceOwnerId: ownerId,
+          oldProjectName: req.params.name,
+          newProjectName: sanitized,
+          newProjectRoot: newDir,
+        });
+        if (!completed) {
+          res.status(409).json({ error: 'Rename target belongs to a different Project.' });
+          return;
+        }
+        if (
+          completed.id !== requestedProjectIdentityId
+          || completed.generation !== requestedProjectGeneration + 1
+        ) {
+          res.status(409).json({
+            error: 'Completed Project rename does not match the submitted immutable identity proof.',
+            code: 'PROJECT_RENAME_IDENTITY_CHANGED',
+            retryable: true,
+          });
+          return;
+        }
+        res.json({
+          name: sanitized,
+          attemptId,
+          status: 'committed',
+          alreadyRenamed: true,
+          identity: serializeProjectIdentityProof(completed),
+        });
+        return;
+      }
+      await assertLegacyOpenClawProjectMigrationInactive(interrupted.id);
+      await assertProjectChatDestructiveResetInactive(interrupted.id);
+      await assertLegacyOpenClawProjectMigrationInactive(requestedProjectIdentityId);
+      await stopProjectDesktopRuntimesForLifecycle({
+        workspaceOwnerId: ownerId,
+        projectIdentityId: interrupted.id,
+        projectName: req.params.name,
+      });
+      convergeInterruptedProjectDeployment({
+        mode: 'complete',
+        identity: interrupted,
+        oldDeployPath,
+        newDeployPath,
+      });
+      const recovered = await completeInterruptedProjectRenameWithApps({
+        workspaceOwnerId: ownerId,
+        projectIdentityId: interrupted.id,
+        oldProjectName: req.params.name,
+        newProjectName: sanitized,
+        newProjectRoot: newDir,
+        oldDeployPath,
+        newDeployPath,
+      });
+      if (
+        !recovered
+        || recovered.projectName !== sanitized
+        || recovered.id !== requestedProjectIdentityId
+        || recovered.generation !== requestedProjectGeneration + 1
+      ) {
+        res.status(409).json({ error: 'Project rename recovery could not verify the target.' });
+        return;
+      }
+      res.json({
+        name: sanitized,
+        attemptId,
+        status: 'committed',
+        identity: serializeProjectIdentityProof(recovered),
+        recovered: true,
+        warning: 'The interrupted rename was recovered with its app runtime stopped. Start it again when ready.',
+      });
+      return;
+    }
+    const pendingRename = await readProjectIdentityRenameJournal({
+      workspaceOwnerId: ownerId,
+      projectName: req.params.name,
+    });
+    if (managedPathExists(newDir)) {
+      if (!pendingRename) {
+        sendProjectRenameNotAdmitted(
+          res,
+          409,
+          attemptId,
+          'PROJECT_RENAME_TARGET_EXISTS',
+          'A project with that name already exists',
+        );
+      } else {
+        res.status(409).json({
+          error: 'Interrupted Project rename has ambiguous source and target roots.',
+          code: 'PROJECT_RENAME_CONFLICT',
+          retryable: true,
+        });
+      }
+      return;
+    }
+    if (await prisma.app.count({ where: { userId: ownerId, name: sanitized } }) > 0) {
+      res.status(409).json({ error: 'An app with the new project name already exists' });
+      return;
+    }
+    if (pendingRename) {
+      await assertProjectChatDestructiveResetInactive(pendingRename.id);
+      await assertLegacyOpenClawProjectMigrationInactive(pendingRename.id);
+    } else {
+      await assertLegacyOpenClawProjectMigrationInactive(requestedProjectIdentityId);
+      const renameMigrationIdentity = await ensureProjectIdentity({
+        workspaceOwnerId: ownerId,
+        projectName: req.params.name,
+        projectRoot: oldDir,
+      });
+      await assertProjectChatDestructiveResetInactive(renameMigrationIdentity.id);
+      await assertLegacyOpenClawProjectMigrationInactive(renameMigrationIdentity.id);
+    }
+    if (
+      pendingRename
+      && (
+        pendingRename.projectName !== req.params.name
+        || pendingRename.renameTargetName !== sanitized
+      )
+    ) {
+      res.status(409).json({ error: 'A different Project rename is already pending.' });
+      return;
+    }
+    if (pendingRename) {
+      oldDeployAttestation = readProjectIdentityRenameDeployIdentity(pendingRename);
+      await assertLegacyOpenClawProjectMigrationInactive(requestedProjectIdentityId);
+      const deployLocation = convergeInterruptedProjectDeployment({
+        mode: 'continue',
+        identity: pendingRename,
+        oldDeployPath,
+        newDeployPath,
+      });
+      deployPathMoved = deployLocation === 'new';
+    } else {
+      oldDeployAttestation = managedPathExists(oldDeployPath)
+        ? attestProjectRoot(oldDeployPath)
+        : null;
+      if (managedPathExists(newDeployPath)) {
+        sendProjectRenameNotAdmitted(
+          res,
+          409,
+          attemptId,
+          'PROJECT_RENAME_DEPLOYMENT_TARGET_EXISTS',
+          'A deployment with the new project name already exists',
+        );
+        return;
+      }
+    }
+
+    const identityBeforeRenameBarrier = await prisma.projectIdentity.findUnique({
+      where: {
+        workspaceOwnerId_projectName: {
+          workspaceOwnerId: ownerId,
+          projectName: req.params.name,
+        },
+      },
+    });
+    if (
+      !identityBeforeRenameBarrier
+      || identityBeforeRenameBarrier.id !== requestedProjectIdentityId
+      || identityBeforeRenameBarrier.generation !== requestedProjectGeneration
+    ) {
+      if (!pendingRename) {
+        sendProjectRenameNotAdmitted(
+          res,
+          409,
+          attemptId,
+          'PROJECT_RENAME_IDENTITY_CHANGED',
+          'The project identity changed before rename admission',
+        );
+      } else {
+        res.status(409).json({
+          error: 'Pending Project rename does not match the submitted immutable identity proof.',
+          code: 'PROJECT_RENAME_IDENTITY_CHANGED',
+          retryable: true,
+        });
+      }
+      return;
+    }
+    const actorsBeforeRenameBarrier = identityBeforeRenameBarrier
+      ? await listProjectLifecycleActorIds({
+        projectIdentityId: identityBeforeRenameBarrier.id,
+        workspaceOwnerId: ownerId,
+        authenticatedActorId: req.user!.userId,
+      })
+      : Object.freeze([req.user!.userId, ownerId]);
+
+    await assertLegacyOpenClawProjectMigrationInactive(requestedProjectIdentityId);
+    renameGrant = await beginProjectIdentityRename({
+      workspaceOwnerId: ownerId,
+      oldProjectName: req.params.name,
+      newProjectName: sanitized,
+      oldProjectRoot: oldDir,
+      newProjectRoot: newDir,
+      deployRootIdentity: oldDeployAttestation,
+    });
+    const projectIdentity = renameGrant.identity;
+
+    // Rename is not an implicit "cancel chat" action. The durable identity
+    // barrier closes new admission first, then this read detects a turn that
+    // was already admitted. A barrier created by this request has made no
+    // provider/filesystem mutation yet, so it can be rolled back exactly and
+    // the Project remains usable. The durable cleanup-start marker—not process
+    // memory or lease age—distinguishes that case from a genuinely partial
+    // attempt that must remain RENAMING for explicit recovery.
+    const [activeDurableTurn, activeDurableState] = await Promise.all([
+      prisma.projectChatTurn.findFirst({
+        where: {
+          projectIdentityId: projectIdentity.id,
+          status: { in: ['RUNNING', 'ABORTING'] },
+        },
+        select: { id: true },
+      }),
+      prisma.projectChatState.findFirst({
+        where: { projectIdentityId: projectIdentity.id, activeTurnId: { not: null } },
+        select: { id: true },
+      }),
+    ]);
+    if ((activeDurableTurn || activeDurableState) && !renameGrant.resumed) {
+      const cleanupMayHaveStarted = renameGrant.identity.renameCleanupStartedAt instanceof Date
+        || renameGrant.identity.renameRuntimeCleanedAt instanceof Date;
+      if (!cleanupMayHaveStarted) {
+        await abandonProjectIdentityRenameBeforeCleanup({
+          projectIdentityId: projectIdentity.id,
+          leaseToken: renameGrant.leaseToken,
+          oldProjectRoot: oldDir,
+        });
+        renameGrant = null;
+      }
+      res.status(409).json({
+        error: cleanupMayHaveStarted
+          ? 'Project rename recovery is paused until the active Project Chat turn finishes.'
+          : 'Finish or stop the active Project Chat turn before renaming this Project.',
+        code: 'PROJECT_RENAME_TURN_ACTIVE',
+        retryable: true,
+      });
+      return;
+    }
+
+    // A resumed lease owns an expired journal from a process that can no longer
+    // finish its callback. Keep RENAMING closed and let deletion-grade cleanup
+    // abort/re-attest that stale durable turn under the new lease. Reopening
+    // ACTIVE here would strand a cleanup-started journal forever.
+
+    renameLeaseTimer = setInterval(queueLeaseRenewal, 30_000);
+    renameLeaseTimer.unref?.();
+
+    const projectApps = await prisma.app.findMany({
+      where: projectAppAssociationWhere({
+        workspaceOwnerId: ownerId,
+        projectIdentityId: projectIdentity.id,
+        projectName: req.params.name,
+        deployPath: oldDeployPath,
+      }),
+      take: 2,
+    });
+    if (projectApps.length > 1) {
+      throw new ProjectIdentityLifecycleError(
+        'More than one App claims the same immutable Project identity',
+      );
+    }
+    app = projectApps[0] || null;
+    restartFullstackApp = app?.deployType === 'fullstack'
+      && app.processStatus !== 'stopped'
+      && app.processStatus !== 'error'
+      && Boolean(app.port);
+
+    const renameActorIds = Array.from(new Set([
+      ...actorsBeforeRenameBarrier,
+      ...await listProjectLifecycleActorIds({
+        projectIdentityId: projectIdentity.id,
+        workspaceOwnerId: ownerId,
+        authenticatedActorId: req.user!.userId,
+      }),
+    ]));
+    await assertLegacyOpenClawProjectMigrationInactive(requestedProjectIdentityId);
+    await markProjectIdentityRenameCleanupStarted({
+      projectIdentityId: projectIdentity.id,
+      leaseToken: renameGrant.leaseToken,
+    });
+    await assertLegacyOpenClawProjectMigrationInactive(requestedProjectIdentityId);
+    for (const actorUserId of renameActorIds) {
+      if (actorUserId === ownerId) {
+        await migrateLegacyProjectChatState({
+          actorUserId,
+          legacyProjectId: req.params.name,
+          immutableProjectId: projectIdentity.id,
+        });
+      }
+      await quiesceProjectChatBrokerCallbacksForDestructiveReset({
+        actorUserId,
+        projectIdentityId: projectIdentity.id,
+      });
+    }
+
+    // RENAMING is a durable project-wide admission barrier. With that row
+    // closed, the deletion-grade cleanup adapters can abort any admitted turn
+    // and retire every UUID/root-attested provider resource without consulting
+    // current OAuth or model readiness. The Portal transcript remains in DB.
+    await cleanupProjectRuntime({
+      authenticatedActorId: req.user!.userId,
+      workspaceOwnerId: ownerId,
+      projectIdentity: renameGrant.identity,
+      lifecycleReason: 'rename',
+    }, {
+      adapters: PROJECT_RUNTIME_CLEANUP_ADAPTERS,
+      egressAdapter: PROJECT_EGRESS_CLEANUP_ADAPTER,
+    });
+
+    await retireLegacyOpenClawRuntimesForProject({
+      actorUserIds: renameActorIds,
+      projectIdentityId: projectIdentity.id,
+      legacyProjectName: req.params.name,
+      legacyProjectOwnerId: ownerId,
+      targetCanonicalRoot: projectIdentity.canonicalRoot,
+      preserveTranscriptFiles: true,
+    });
+
+    // Portal app/build/git workloads are outside provider adapters but can
+    // still retain the old root or deployment identity. Prove them stopped
+    // before the durable cleanup marker, so crash recovery never reopens a
+    // half-renamed project with a live old-path app.
+    await removePortalProjectWorkloadsForProject(projectIdentity.id);
+    if (app?.deployType === 'fullstack') await stopApp(oldDeployId);
+    await stopProjectDesktopRuntimesForLifecycle({
+      workspaceOwnerId: ownerId,
+      projectIdentityId: projectIdentity.id,
+      projectName: req.params.name,
+    });
+
+    // Reset provider bindings before moving the inode. This transaction is the
+    // crash-recovery marker: once present, no old-root session identity remains
+    // and a later qualified provider can rehydrate from the preserved shared
+    // transcript with a freshly computed root/policy fingerprint.
+    await prisma.$transaction(async (transaction) => {
+      const projectRows = {
+        OR: [
+          { projectId: projectIdentity.id },
+          { userId: ownerId, projectId: req.params.name },
+        ],
+      };
+      await transaction.projectChatProviderBinding.deleteMany({
+        where: projectRows,
+      });
+      await transaction.projectChatSession.deleteMany({
+        where: projectRows,
+      });
+      const activeState = await transaction.projectChatState.findFirst({
+        where: { projectIdentityId: projectIdentity.id, activeTurnId: { not: null } },
+        select: { id: true },
+      });
+      if (activeState) {
+        throw new ProjectIdentityLifecycleError(
+          'Project rename still has an active Project Chat turn after runtime cleanup',
+        );
+      }
+      await transaction.projectChatState.updateMany({
+        where: { projectIdentityId: projectIdentity.id, activeTurnId: null },
+        data: { version: { increment: 1 } },
+      });
+      await markProjectIdentityRenameRuntimeCleaned({
+        projectIdentityId: projectIdentity.id,
+        leaseToken: renameGrant!.leaseToken,
+      }, transaction as unknown as ProjectIdentityDatabase);
+    });
+    runtimeCleanupCommitted = true;
+
+    for (const provider of QUALIFIABLE_PROJECT_PROVIDERS) {
+      removeProjectQualificationEvidenceForProject(provider, projectIdentity.id);
+    }
+
+    await stopLeaseHeartbeat(true);
+
+    // Rename deployment state and retarget the durable App row atomically from
+    // the Portal's perspective. The workload identity itself remains the
+    // immutable ProjectIdentity UUID + App UUID, never the mutable name.
+    if (!deployPathMoved && oldDeployAttestation) {
+      moveAttestedDirectoryNoReplace({
+        sourceRoot: oldDeployPath,
+        targetRoot: newDeployPath,
+        expectedIdentity: oldDeployAttestation,
+      });
+      deployPathMoved = true;
+    } else if (!deployPathMoved && managedPathExists(oldDeployPath)) {
+      throw new ProjectIdentityLifecycleError(
+        'A deployment directory appeared after Project rename started',
+      );
+    }
+    moveAttestedDirectoryNoReplace({
+      sourceRoot: oldDir,
+      targetRoot: newDir,
+      expectedIdentity: projectIdentity,
+    });
+    projectPathMoved = true;
+    convergeInterruptedProjectDeployment({
+      mode: 'complete',
+      identity: projectIdentity,
+      oldDeployPath,
+      newDeployPath,
+    });
+
+    const renamedIdentity = await prisma.$transaction(async (transaction) => {
+      const committedIdentity = await renameProjectIdentity({
+        workspaceOwnerId: ownerId,
+        oldProjectName: req.params.name,
+        newProjectName: sanitized,
+        newProjectRoot: newDir,
+        leaseToken: renameGrant!.leaseToken,
+      }, transaction as unknown as ProjectIdentityDatabase);
+      await retargetProjectAppsForRename(transaction, {
+        workspaceOwnerId: ownerId,
+        projectIdentityId: projectIdentity.id,
+        oldProjectName: req.params.name,
+        newProjectName: sanitized,
+        oldDeployPath,
+        newDeployPath,
+      });
+      return committedIdentity;
+    });
+    if (app) {
+      app = {
+        ...app,
+        name: sanitized,
+        processStatus: 'stopped',
+        zipPath: app.deployType === 'runtime'
+          ? buildProjectDesktopRuntimeIdentity(projectIdentity.id, sanitized).runtimeDir
+          : app.zipPath === oldDeployPath ? newDeployPath : app.zipPath,
+      };
+    }
+    identityCommitted = true;
+
+    let runtimeWarning: string | null = null;
+    if (app) {
+      if (restartFullstackApp && app.port) {
+        try {
+          await startApp(app.id, newDeployId, newDeployPath, app.port, {
+            actorId: ownerId,
+            projectId: projectIdentity.id,
+          });
+        } catch {
+          await prisma.app.update({ where: { id: app.id }, data: { processStatus: 'error' } });
+          runtimeWarning = 'The project was renamed, but its app runtime needs to be started again.';
+        }
+      }
+    }
 
     await prisma.activityLog.create({
       data: {
         userId: ownerId,
         action: 'PROJECT_RENAME',
         resource: 'project',
-        resourceId: app?.id,
+        resourceId: projectIdentity.id,
         severity: 'INFO',
         metadata: { oldName: req.params.name, newName: sanitized },
       },
+    }).catch((activityError) => {
+      console.warn('[Project Rename] Failed to record activity:', activityError);
     });
 
-    res.json({ name: sanitized });
-  } catch (error) {
+    if (
+      renamedIdentity.id !== requestedProjectIdentityId
+      || renamedIdentity.generation !== requestedProjectGeneration + 1
+    ) {
+      throw new ProjectIdentityLifecycleError(
+        'Project rename committed without the expected immutable identity generation',
+      );
+    }
+    res.json({
+      name: sanitized,
+      attemptId,
+      status: 'committed',
+      identity: serializeProjectIdentityProof(renamedIdentity),
+      ...(runtimeWarning ? { warning: runtimeWarning } : {}),
+    });
+  } catch (error: any) {
+    if (error instanceof ProjectMoveRequiredError) {
+      sendProjectRenameNotAdmitted(res, 409, attemptId, error.code, error.message);
+      return;
+    }
+    logProjectLifecycleDecision({
+      route: 'project-rename',
+      code: String(error?.code || error?.name || 'UNKNOWN'),
+      status: 0,
+      workspaceOwnerId: ownerId || undefined,
+      projectName: req.params.name,
+      projectIdentityId: requestedProjectIdentityId || null,
+      detail: String(error?.message || error).slice(0, 300),
+    });
+    if (renameLeaseTimer) clearInterval(renameLeaseTimer);
+    renameLeaseTimer = null;
+    await renameLeaseRenewal.catch(() => undefined);
+
+    let rollbackAuthorized = false;
+    if (!identityCommitted && renameGrant && runtimeCleanupCommitted) {
+      try {
+        const currentIdentity = await prisma.projectIdentity.findUnique({
+          where: { id: renameGrant.identity.id },
+        });
+        if (
+          currentIdentity?.lifecycleStatus === 'ACTIVE'
+          && currentIdentity.projectName === targetProjectName
+          && currentIdentity.lastRenameSourceName === req.params.name
+        ) {
+          const completed = await readCompletedProjectIdentityRename({
+            workspaceOwnerId: ownerId,
+            oldProjectName: req.params.name,
+            newProjectName: targetProjectName,
+            newProjectRoot: newDir,
+          });
+          if (
+            !completed
+            || completed.id !== renameGrant.identity.id
+            || completed.id !== requestedProjectIdentityId
+            || completed.generation !== requestedProjectGeneration + 1
+          ) {
+            throw new ProjectIdentityLifecycleError(
+              'Project rename commit receipt could not be verified',
+            );
+          }
+          convergeInterruptedProjectDeployment({
+            mode: 'complete',
+            identity: renameGrant.identity,
+            oldDeployPath,
+            newDeployPath,
+          });
+          identityCommitted = true;
+          res.json({
+            name: targetProjectName,
+            attemptId,
+            status: 'committed',
+            identity: serializeProjectIdentityProof(completed),
+            recovered: true,
+            warning: 'The rename committed, but its original response was interrupted.',
+          });
+          return;
+        }
+        rollbackAuthorized = currentIdentity?.lifecycleStatus === 'RENAMING'
+          && currentIdentity.renameLeaseTokenHash === renameGrant.identity.renameLeaseTokenHash;
+      } catch (commitProbeError) {
+        console.error('[Project Rename] Commit outcome could not be verified:', commitProbeError);
+      }
+    }
+
+    if (!identityCommitted && renameGrant && runtimeCleanupCommitted && rollbackAuthorized) {
+      let filesystemRolledBack = true;
+      try {
+        if (projectPathMoved) {
+          if (!managedPathExists(newDir) || managedPathExists(oldDir)) {
+            throw new ProjectIdentityLifecycleError(
+              'Project root changed before rename rollback',
+            );
+          }
+          moveAttestedDirectoryNoReplace({
+            sourceRoot: newDir,
+            targetRoot: oldDir,
+            expectedIdentity: renameGrant.identity,
+          });
+          projectPathMoved = false;
+        }
+        convergeInterruptedProjectDeployment({
+          mode: 'cancel',
+          identity: renameGrant.identity,
+          oldDeployPath,
+          newDeployPath,
+        });
+        deployPathMoved = false;
+      } catch (rollbackError) {
+        filesystemRolledBack = false;
+        console.error('[Project Rename] Filesystem rollback failed:', rollbackError);
+      }
+      if (
+        filesystemRolledBack
+        && !projectPathMoved
+        && !deployPathMoved
+        && managedPathExists(oldDir)
+        && !managedPathExists(newDir)
+      ) {
+        try {
+          await prisma.$transaction(async (transaction) => {
+            await cancelProjectIdentityRename({
+              projectIdentityId: renameGrant!.identity.id,
+              leaseToken: renameGrant!.leaseToken,
+              oldProjectRoot: oldDir,
+            }, transaction as unknown as ProjectIdentityDatabase);
+            await transaction.app.updateMany({
+              where: projectAppAssociationWhere({
+                workspaceOwnerId: ownerId,
+                projectIdentityId: renameGrant!.identity.id,
+                projectName: req.params.name,
+                deployPath: oldDeployPath,
+              }),
+              data: { processStatus: 'stopped' },
+            });
+          });
+          if (restartFullstackApp && app?.port) {
+            await startApp(app.id, oldDeployId, oldDeployPath, app.port, {
+              actorId: app.userId,
+              projectId: renameGrant.identity.id,
+            });
+          }
+        } catch (rollbackError) {
+          console.error('[Project Rename] Durable rollback failed:', rollbackError);
+        }
+      }
+    }
+
+    if (error instanceof ProjectChatDestructiveResetActiveError) {
+      res.status(409).json({
+        error: error.message,
+        code: error.code,
+        retryable: true,
+      });
+      return;
+    }
+    if (error instanceof LegacyOpenClawProjectMigrationActiveError) {
+      res.status(409).json({
+        error: error.message,
+        code: error.code,
+        retryable: error.retryable,
+      });
+      return;
+    }
+    if (error instanceof ProjectRuntimeCleanupError) {
+      res.status(503).json({
+        error: 'Project rename is paused until every Project Chat runtime is proven stopped.',
+        code: error.code,
+        provider: error.provider,
+        retryable: true,
+      });
+      return;
+    }
+    if (error instanceof PortalProjectWorkloadError) {
+      res.status(503).json({
+        error: 'Project rename is paused until Portal-owned app, build, and Git workloads are proven stopped.',
+        code: error.code,
+        retryable: true,
+      });
+      return;
+    }
+    if (error instanceof ProjectIdentityLifecycleError || error?.code === 'P2002') {
+      res.status(409).json({
+        error: error instanceof ProjectIdentityLifecycleError
+          ? error.message
+          : 'A Project rename already reserved that name.',
+        code: 'PROJECT_RENAME_CONFLICT',
+        retryable: true,
+      });
+      return;
+    }
+    console.error('[Project Rename] Error:', error);
     res.status(500).json({ error: 'Failed to rename project' });
+  } finally {
+    if (renameLeaseTimer) clearInterval(renameLeaseTimer);
+    await renameLeaseRenewal.catch(() => undefined);
+    for (const release of releaseLocks.reverse()) release();
   }
 });
 
@@ -1668,37 +6276,48 @@ router.post('/:name/check', authenticateToken, requireApproved, async (req: Requ
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: req.params.name,
+      projectRoot: projectDir,
+    });
 
-    const files = fs.readdirSync(projectDir);
     let language = 'unknown';
-    let checkCommand = '';
+    let checkCommand: { command: string; args: string[] } | null = null;
     let output = '';
     const errors: string[] = [];
+
+    const files = listProjectRootRegularFiles(projectDir);
 
     // Detect project type and set check command
     if (files.includes('main.py') || files.includes('requirements.txt')) {
       language = 'python';
       // Find all .py files and check them
-      const pyFiles = files.filter(f => f.endsWith('.py'));
+      const pyFiles = files.filter(f => f.endsWith('.py')).slice(0, PROJECT_DEPENDENCY_SCAN_MAX_FILES);
       if (pyFiles.length > 0) {
-        checkCommand = `python3 -m py_compile ${pyFiles.map(shellEscape).join(' ')} 2>&1`;
+        checkCommand = { command: 'python3', args: ['-m', 'py_compile', ...pyFiles] };
       }
     } else if (files.includes('main.cpp') || (files.includes('Makefile') && !files.includes('package.json'))) {
       language = 'cpp';
-      const cppFiles = files.filter(f => f.endsWith('.cpp') || f.endsWith('.c'));
+      const cppFiles = files.filter(f => f.endsWith('.cpp') || f.endsWith('.c')).slice(0, PROJECT_DEPENDENCY_SCAN_MAX_FILES);
       if (cppFiles.length > 0) {
-        checkCommand = `g++ -fsyntax-only -Wall ${cppFiles.map(shellEscape).join(' ')} 2>&1`;
+        checkCommand = { command: 'g++', args: ['-fsyntax-only', '-Wall', ...cppFiles] };
       }
     } else if (files.includes('package.json')) {
       language = 'node';
       // Find main JS file
       let mainFile = 'index.js';
       try {
-        const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
-        if (pkg.main) mainFile = pkg.main;
+        const pkg = readProjectPackageJson(projectDir);
+        if (typeof pkg?.main === 'string'
+          && pkg.main.length <= 240
+          && path.posix.basename(pkg.main) === pkg.main
+          && !pkg.main.includes('\\')) {
+          mainFile = pkg.main;
+        }
       } catch {}
       if (files.includes(mainFile)) {
-        checkCommand = `node --check ${shellEscape(mainFile)} 2>&1`;
+        checkCommand = { command: 'node', args: ['--check', mainFile] };
       }
     } else if (files.includes('index.html')) {
       language = 'html';
@@ -1712,12 +6331,16 @@ router.post('/:name/check', authenticateToken, requireApproved, async (req: Requ
       return;
     }
 
+    const checkWorkspace = createProjectLifecycleWorkspace(projectDir);
     try {
-      output = execSync(checkCommand, { 
-        cwd: projectDir, 
-        timeout: 15000, 
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe']
+      output = await runProjectLifecycleCommand({
+        actorId: req.user!.userId,
+        projectId: projectIdentity.id,
+        workspace: checkWorkspace.path,
+        command: checkCommand.command,
+        args: checkCommand.args,
+        timeoutMs: 30_000,
+        nameHint: `${ownerId}:${req.params.name}:syntax-check`,
       });
       // If we get here without error, syntax check passed
       res.json({ ok: true, language, output: output || 'No syntax errors found.', errors: [] });
@@ -1738,6 +6361,8 @@ router.post('/:name/check', authenticateToken, requireApproved, async (req: Requ
       }
       
       res.json({ ok: false, language, output: errorOutput, errors });
+    } finally {
+      checkWorkspace.cleanup();
     }
   } catch (error: any) {
     console.error('Check error:', error);
@@ -1880,8 +6505,12 @@ interface DependencyCheckResult {
   command?: string;
 }
 
+const PROJECT_DEPENDENCY_SCAN_MAX_FILES = 200;
+const PROJECT_DEPENDENCY_SCAN_MAX_FILE_BYTES = 256 * 1024;
+const PROJECT_DEPENDENCY_MAX_PACKAGES = 256;
+
 async function detectDependencies(projectDir: string): Promise<DependencyCheckResult> {
-  const files = fs.readdirSync(projectDir);
+  const files = listProjectRootRegularFiles(projectDir);
   
   // Check for Python project
   if (files.some(f => f.endsWith('.py')) || files.includes('requirements.txt')) {
@@ -1905,23 +6534,31 @@ async function detectPythonDeps(projectDir: string, files: string[]): Promise<De
   const requiredPackages = new Set<string>();
   
   // Check requirements.txt first
-  const reqFile = path.join(projectDir, 'requirements.txt');
-  if (fs.existsSync(reqFile)) {
-    const content = fs.readFileSync(reqFile, 'utf-8');
+  const requirements = readProjectTextFile(projectDir, 'requirements.txt', {
+    optional: true,
+    maxBytes: PROJECT_METADATA_MAX_BYTES,
+  });
+  if (requirements !== null) {
+    const content = requirements;
     for (const line of content.split('\n')) {
       const trimmed = line.trim();
       if (trimmed && !trimmed.startsWith('#') && !trimmed.startsWith('-')) {
         // Extract package name (before ==, >=, <=, ~=, etc.)
         const pkgName = trimmed.split(/[=<>~!]/)[0].trim().toLowerCase();
-        if (pkgName) requiredPackages.add(pkgName);
+        if (pkgName && pkgName.length <= 200) requiredPackages.add(pkgName);
+        if (requiredPackages.size > PROJECT_DEPENDENCY_MAX_PACKAGES) {
+          throw new ProjectFilePolicyError('TOO_LARGE', 'requirements.txt declares too many packages');
+        }
       }
     }
   } else {
     // Scan Python files for imports
-    for (const file of files) {
+    for (const file of files.filter((name) => name.endsWith('.py')).slice(0, PROJECT_DEPENDENCY_SCAN_MAX_FILES)) {
       if (!file.endsWith('.py')) continue;
       try {
-        const content = fs.readFileSync(path.join(projectDir, file), 'utf-8');
+        const content = readProjectTextFile(projectDir, file, {
+          maxBytes: PROJECT_DEPENDENCY_SCAN_MAX_FILE_BYTES,
+        }) || '';
         // Match: import X, from X import Y
         const importRegex = /^(?:import|from)\s+([a-zA-Z_][a-zA-Z0-9_]*)/gm;
         let match;
@@ -1931,10 +6568,14 @@ async function detectPythonDeps(projectDir: string, files: string[]): Promise<De
             // Map to pip package name
             const pipPkg = COMMON_PIP_MAPPINGS[module] || module.toLowerCase();
             requiredPackages.add(pipPkg);
+            if (requiredPackages.size > PROJECT_DEPENDENCY_MAX_PACKAGES) {
+              throw new ProjectFilePolicyError('TOO_LARGE', 'Project imports too many dependency candidates');
+            }
           }
         }
-      } catch (e) {
-        // Ignore read errors
+      } catch (error) {
+        if (error instanceof ProjectFilePolicyError) throw error;
+        // Ignore transient read errors; containment/policy errors fail closed.
       }
     }
   }
@@ -1943,20 +6584,12 @@ async function detectPythonDeps(projectDir: string, files: string[]): Promise<De
     return { needsInstall: false, language: 'python', packages: [] };
   }
   
-  // Check which packages are already installed (check venv first, then system)
+  // Never execute a project-owned .venv/bin/pip to inspect dependencies: that
+  // path is user-controlled and can itself be a malicious script. The route's
+  // dependency hash marker is the trusted installation cache; without a valid
+  // marker, reinstall all declared packages inside the project container.
   const installedPackages: string[] = [];
-  const missingPackages: string[] = [];
-  const venvPip = path.join(projectDir, '.venv', 'bin', 'pip');
-  const pipCmd = fs.existsSync(venvPip) ? venvPip : 'pip3';
-  
-  for (const pkg of requiredPackages) {
-    try {
-      execSync(`${shellEscape(pipCmd)} show ${shellEscape(pkg)} 2>/dev/null`, { encoding: 'utf-8' });
-      installedPackages.push(pkg);
-    } catch {
-      missingPackages.push(pkg);
-    }
-  }
+  const missingPackages = Array.from(requiredPackages);
   
   return {
     needsInstall: missingPackages.length > 0,
@@ -1978,10 +6611,14 @@ function detectCppDeps(projectDir: string, files: string[]): DependencyCheckResu
   }
   
   // Scan C++ files for includes
-  for (const file of files) {
+  for (const file of files
+    .filter((name) => /\.(?:cpp|c|h|hpp)$/.test(name))
+    .slice(0, PROJECT_DEPENDENCY_SCAN_MAX_FILES)) {
     if (!file.endsWith('.cpp') && !file.endsWith('.c') && !file.endsWith('.h') && !file.endsWith('.hpp')) continue;
     try {
-      const content = fs.readFileSync(path.join(projectDir, file), 'utf-8');
+      const content = readProjectTextFile(projectDir, file, {
+        maxBytes: PROJECT_DEPENDENCY_SCAN_MAX_FILE_BYTES,
+      }) || '';
       // Match: #include <...> or #include "..."
       const includeRegex = /#include\s*[<"]([^>"]+)[>"]/g;
       let match;
@@ -1999,8 +6636,9 @@ function detectCppDeps(projectDir: string, files: string[]): DependencyCheckResu
           }
         }
       }
-    } catch (e) {
-      // Ignore read errors
+    } catch (error) {
+      if (error instanceof ProjectFilePolicyError) throw error;
+      // Ignore transient read errors; containment/policy errors fail closed.
     }
   }
   
@@ -2013,21 +6651,27 @@ function detectCppDeps(projectDir: string, files: string[]): DependencyCheckResu
     needsInstall: true,
     language: 'cpp',
     packages,
-    command: `sudo apt-get install -y ${packages.join(' ')}`,
+    command: 'System package installation is disabled in the project sandbox',
   };
 }
 
 function detectNodeDeps(projectDir: string): DependencyCheckResult {
-  const pkgJsonPath = path.join(projectDir, 'package.json');
-  if (!fs.existsSync(pkgJsonPath)) {
+  if (readProjectTextFile(projectDir, 'package.json', {
+    optional: true,
+    maxBytes: PROJECT_METADATA_MAX_BYTES,
+  }) === null) {
     return { needsInstall: false, language: 'node', packages: [] };
   }
   
   const nodeModulesPath = path.join(projectDir, 'node_modules');
-  const lockPath = path.join(projectDir, 'package-lock.json');
   
   // Check if node_modules exists
-  if (!fs.existsSync(nodeModulesPath)) {
+  let nodeModulesIsDirectory = false;
+  try {
+    const nodeModulesEntry = fs.lstatSync(nodeModulesPath);
+    nodeModulesIsDirectory = !nodeModulesEntry.isSymbolicLink() && nodeModulesEntry.isDirectory();
+  } catch {}
+  if (!nodeModulesIsDirectory) {
     return {
       needsInstall: true,
       language: 'node',
@@ -2037,9 +6681,11 @@ function detectNodeDeps(projectDir: string): DependencyCheckResult {
   }
   
   // Check if package-lock.json is newer than node_modules
-  if (fs.existsSync(lockPath)) {
-    const lockStat = fs.statSync(lockPath);
-    const nmStat = fs.statSync(nodeModulesPath);
+  const lockStat = statProjectRegularFile(projectDir, 'package-lock.json', {
+    optional: true,
+  });
+  if (lockStat !== null) {
+    const nmStat = fs.lstatSync(nodeModulesPath);
     if (lockStat.mtimeMs > nmStat.mtimeMs) {
       return {
         needsInstall: true,
@@ -2056,17 +6702,17 @@ function detectNodeDeps(projectDir: string): DependencyCheckResult {
 // Hash dependencies for caching
 function hashDependencies(packages: string[]): string {
   const sorted = [...packages].sort().join(',');
-  const crypto = require('crypto');
-  return crypto.createHash('md5').update(sorted).digest('hex');
+  return crypto.createHash('sha256').update(sorted).digest('hex');
 }
 
 // Check if dependencies are already installed (cached)
 function checkDepsCache(projectDir: string, packages: string[]): boolean {
-  const markerPath = path.join(projectDir, '.deps-installed');
-  if (!fs.existsSync(markerPath)) return false;
-  
   try {
-    const cached = fs.readFileSync(markerPath, 'utf-8').trim();
+    const cached = readProjectTextFile(projectDir, '.deps-installed', {
+      optional: true,
+      maxBytes: 256,
+    })?.trim();
+    if (!cached) return false;
     const currentHash = hashDependencies(packages);
     return cached === currentHash;
   } catch {
@@ -2076,9 +6722,8 @@ function checkDepsCache(projectDir: string, packages: string[]): boolean {
 
 // Write deps cache marker
 function writeDepsCache(projectDir: string, packages: string[]): void {
-  const markerPath = path.join(projectDir, '.deps-installed');
   const hash = hashDependencies(packages);
-  fs.writeFileSync(markerPath, hash, 'utf-8');
+  writeProjectTextFile(projectDir, '.deps-installed', hash, 256);
 }
 
 // GET /api/projects/:name/check-deps - check dependencies without installing
@@ -2090,7 +6735,7 @@ router.get('/:name/check-deps', authenticateToken, requireApproved, async (req: 
       res.status(404).json({ error: 'Project not found' });
       return;
     }
-    
+
     const result = await detectDependencies(projectDir);
     
     // Check cache
@@ -2110,6 +6755,9 @@ router.get('/:name/check-deps', authenticateToken, requireApproved, async (req: 
 
 // POST /api/projects/:name/install-deps - install dependencies with SSE streaming
 router.post('/:name/install-deps', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  let lifecycleWorkspace: ReturnType<typeof createProjectLifecycleWorkspace> | null = null;
+  let lifecycleProcess: Awaited<ReturnType<typeof spawnProjectLifecycleCommand>> | null = null;
+  let responseFinished = false;
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
@@ -2117,6 +6765,12 @@ router.post('/:name/install-deps', authenticateToken, requireApproved, async (re
       res.status(404).json({ error: 'Project not found' });
       return;
     }
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: req.params.name,
+      projectRoot: projectDir,
+    });
+    const lifecycleScope = { actorId: req.user!.userId, projectId: projectIdentity.id };
     
     const result = await detectDependencies(projectDir);
     
@@ -2130,10 +6784,21 @@ router.post('/:name/install-deps', authenticateToken, requireApproved, async (re
       res.json({ success: true, message: 'Dependencies already installed (cached)', packages: result.packages, cached: true });
       return;
     }
-    
+
+    if (result.language === 'cpp') {
+      res.status(422).json({
+        error: 'System package installation is disabled for project sandboxes',
+        detail: 'Project requests cannot run apt or sudo on the Portal host. Use dependencies already included in the project runtime image.',
+        packages: result.packages,
+      });
+      return;
+    }
+
+    lifecycleWorkspace = createProjectLifecycleWorkspace(projectDir);
+
     // Set up SSE
     res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Cache-Control', 'private, no-store, no-transform, max-age=0');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     
@@ -2147,46 +6812,43 @@ router.post('/:name/install-deps', authenticateToken, requireApproved, async (re
       command: result.command,
     });
     
-    // Run installation
-    let installProcess: ReturnType<typeof spawn>;
+    // Run installation in a disposable, non-root project container. Only
+    // dependency artifacts are promoted back after a successful exit.
+    const sandboxDir = lifecycleWorkspace.path;
     
     if (result.language === 'python') {
-      // Install Python packages in a virtual environment
-      const venvDir = path.join(projectDir, '.venv');
-      if (!fs.existsSync(venvDir)) {
-        // Create venv first
-        sendEvent('log', { text: 'Creating virtual environment...', type: 'stdout' });
-        try {
-          execSync(`python3 -m venv ${shellEscape(venvDir)}`, { timeout: 30000 });
-        } catch (venvErr: any) {
-          // python3-venv may not be installed
-          sendEvent('log', { text: 'Installing python3-venv...', type: 'stdout' });
-          execSync('sudo apt-get install -y python3-venv', { timeout: 60000, env: { ...process.env, DEBIAN_FRONTEND: 'noninteractive' } });
-          execSync(`python3 -m venv ${shellEscape(venvDir)}`, { timeout: 30000 });
-        }
-      }
-      const pipPath = path.join(venvDir, 'bin', 'pip');
-      installProcess = spawn(pipPath, ['install', ...result.packages], {
-        cwd: projectDir,
-        env: { ...process.env },
+      sendEvent('log', { text: 'Creating isolated virtual environment...', type: 'stdout' });
+      await runProjectLifecycleCommand({
+        ...lifecycleScope,
+        workspace: sandboxDir,
+        command: 'python3',
+        args: ['-m', 'venv', '.venv'],
+        timeoutMs: 60_000,
+        nameHint: `${ownerId}:${req.params.name}:venv`,
       });
-    } else if (result.language === 'cpp') {
-      // Install apt packages (requires sudo)
-      installProcess = spawn('sudo', ['apt-get', 'install', '-y', ...result.packages], {
-        cwd: projectDir,
-        env: { ...process.env, DEBIAN_FRONTEND: 'noninteractive' },
+      lifecycleProcess = await spawnProjectLifecycleCommand({
+        ...lifecycleScope,
+        workspace: sandboxDir,
+        command: '/workspace/project/.venv/bin/pip',
+        args: ['install', ...result.packages],
+        nameHint: `${ownerId}:${req.params.name}:pip`,
+        network: true,
       });
     } else if (result.language === 'node') {
-      // Run npm install
-      installProcess = spawn('npm', ['install'], {
-        cwd: projectDir,
-        env: { ...process.env },
+      lifecycleProcess = await spawnProjectLifecycleCommand({
+        ...lifecycleScope,
+        workspace: sandboxDir,
+        command: 'npm',
+        args: ['install', '--no-audit', '--no-fund'],
+        nameHint: `${ownerId}:${req.params.name}:npm-install`,
+        network: true,
       });
     } else {
       sendEvent('error', { message: 'Unknown language' });
       res.end();
       return;
     }
+    const installProcess = lifecycleProcess.process;
     
     let outputBuffer = '';
     const totalPackages = result.packages.length;
@@ -2219,15 +6881,34 @@ router.post('/:name/install-deps', authenticateToken, requireApproved, async (re
       sendEvent('log', { text: text.trim(), type: 'stderr' });
     });
     
-    installProcess.on('close', (code) => {
+    installProcess.on('close', async (code) => {
+      if (responseFinished) return;
+      responseFinished = true;
+      try {
+        await lifecycleProcess?.cleanup;
+      } catch (cleanupError: any) {
+        sendEvent('error', { success: false, message: `Sandbox cleanup failed: ${cleanupError.message}` });
+        lifecycleWorkspace?.cleanup();
+        lifecycleWorkspace = null;
+        res.end();
+        return;
+      }
       if (code === 0) {
-        // Write cache marker
-        writeDepsCache(projectDir, result.packages);
-        sendEvent('complete', { 
-          success: true, 
-          message: 'Dependencies installed successfully',
-          packages: result.packages,
-        });
+        try {
+          promoteProjectLifecycleArtifacts(
+            sandboxDir,
+            projectDir,
+            result.language === 'python' ? ['.venv'] : ['node_modules', 'package-lock.json'],
+          );
+          writeDepsCache(projectDir, result.packages);
+          sendEvent('complete', {
+            success: true,
+            message: 'Dependencies installed successfully',
+            packages: result.packages,
+          });
+        } catch (error: any) {
+          sendEvent('error', { success: false, message: `Failed to promote dependency artifacts: ${error.message}` });
+        }
       } else {
         sendEvent('error', { 
           success: false, 
@@ -2235,25 +6916,40 @@ router.post('/:name/install-deps', authenticateToken, requireApproved, async (re
           output: outputBuffer,
         });
       }
+      lifecycleWorkspace?.cleanup();
+      lifecycleWorkspace = null;
       res.end();
     });
     
-    installProcess.on('error', (err) => {
+    installProcess.on('error', async (err) => {
+      if (responseFinished) return;
+      responseFinished = true;
+      await lifecycleProcess?.cleanup.catch(() => undefined);
       sendEvent('error', { 
         success: false, 
         message: err.message,
       });
+      lifecycleWorkspace?.cleanup();
+      lifecycleWorkspace = null;
       res.end();
     });
     
     // Handle client disconnect
-    req.on('close', () => {
-      if (installProcess && !installProcess.killed) {
-        installProcess.kill('SIGTERM');
-      }
+    res.on('close', () => {
+      if (responseFinished) return;
+      responseFinished = true;
+      lifecycleProcess?.cancel();
+      void (lifecycleProcess?.cleanup || Promise.resolve()).finally(() => {
+        lifecycleWorkspace?.cleanup();
+        lifecycleWorkspace = null;
+      });
     });
     
   } catch (error: any) {
+    lifecycleProcess?.cancel();
+    await lifecycleProcess?.cleanup.catch(() => undefined);
+    lifecycleWorkspace?.cleanup();
+    lifecycleWorkspace = null;
     console.error('Install deps error:', error);
     if (!res.headersSent) {
       res.status(500).json({ error: 'Failed to install dependencies', detail: error.message });
@@ -2266,101 +6962,190 @@ router.post('/:name/install-deps', authenticateToken, requireApproved, async (re
 
 // POST /api/projects/:name/deploy - deploy with build support (static + fullstack + runtime)
 router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  let fullstackPromotion: ProjectDeploymentPromotion | null = null;
+  let previousFullstackApp: App | null = null;
+  let fullstackAppRecordMutated = false;
+  let fullstackAppIdForRecovery: string | null = null;
+  let fullstackStartAttempted = false;
+  let deployIdForRecovery: string | null = null;
+  let deployPathForRecovery: string | null = null;
+  let lifecycleScopeForRecovery: { actorId: string; projectId: string } | null = null;
   try {
     const ownerId = await getScopedOwnerId(req);
-    const projectDir = getProjectPath(ownerId, req.params.name);
-    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    let projectDir: string;
+    try {
+      projectDir = getExistingProjectPathReadOnly(ownerId, req.params.name);
+    } catch (error: any) {
+      if (error instanceof ContainedPathError || error?.code === 'ENOENT') {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+      throw error;
+    }
+
+    // Remote Desktop runtimes stay available in private/local profiles because
+    // they never serve untrusted content through the Portal origin. Hosted
+    // static/full-stack deployment fails before identity, DB, build, or copy
+    // mutation when the required isolated app-content origin is unavailable.
+    const deployType = detectDeployType(projectDir);
+    if (deployType !== 'runtime') {
+      const unavailable = portalFeatureUnavailableResponse('appHosting');
+      if (unavailable) {
+        res.status(409).json(unavailable);
+        return;
+      }
+    }
+
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: req.params.name,
+      projectRoot: projectDir,
+    });
+    const lifecycleScope = { actorId: req.user!.userId, projectId: projectIdentity.id };
+    const appRuntimeIdentity = { actorId: ownerId, projectId: projectIdentity.id };
 
     const appName = req.params.name;
     const deployId = `${ownerId}-${appName}`;
     const deployPath = path.join(DEPLOY_DIR, deployId);
+    deployIdForRecovery = deployId;
+    deployPathForRecovery = deployPath;
+    lifecycleScopeForRecovery = appRuntimeIdentity;
+    const existingProjectApp = await findProjectAppForIdentity({
+      workspaceOwnerId: ownerId,
+      projectIdentityId: projectIdentity.id,
+      projectName: appName,
+      deployPath,
+    });
+    if (!existingProjectApp && await prisma.app.count({
+      where: { userId: ownerId, name: appName },
+    }) > 0) {
+      res.status(409).json({
+        error: 'A standalone App already uses this Project name and cannot be adopted implicitly.',
+      });
+      return;
+    }
     
-    // Detect deploy type
-    const deployType = detectDeployType(projectDir);
+    if (deployType === 'runtime' && !canUseDesktopRuntimeDeployment(
+      req.user?.role,
+      req.user?.accountStatus,
+      undefined,
+    )) {
+      res.status(403).json({
+        error: 'Remote Desktop runtime deployment requires an Owner or Sub-Admin because it executes project code in the shared host desktop session.',
+      });
+      return;
+    }
     let buildOutput = '';
     let sourceDir = projectDir;
     
     // For static apps: build if needed, copy dist
     if (deployType === 'static') {
-      const hasPackageJson = fs.existsSync(path.join(projectDir, 'package.json'));
-      if (hasPackageJson) {
-        try {
-          const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
-          if (pkg.scripts?.build) {
-            buildOutput += execSync('npm install --production=false 2>&1', { cwd: projectDir, timeout: 120000, encoding: 'utf-8' });
-            buildOutput += '\n' + execSync('npm run build 2>&1', { cwd: projectDir, timeout: 120000, encoding: 'utf-8' });
-            
+      const packageJson = readProjectPackageJson(projectDir);
+      let buildWorkspace: ReturnType<typeof createProjectLifecycleWorkspace> | null = null;
+      try {
+        if (packageJson?.scripts?.build) {
+            buildWorkspace = createProjectLifecycleWorkspace(projectDir);
+            buildOutput += await runProjectLifecycleCommand({
+              ...lifecycleScope,
+              workspace: buildWorkspace.path,
+              command: 'npm',
+              args: ['install', '--include=dev', '--no-audit', '--no-fund'],
+              timeoutMs: 180_000,
+              nameHint: `${deployId}:static-install`,
+              network: true,
+            });
+            buildOutput += '\n' + await runProjectLifecycleCommand({
+              ...lifecycleScope,
+              workspace: buildWorkspace.path,
+              command: 'npm',
+              args: ['run', 'build'],
+              timeoutMs: 180_000,
+              nameHint: `${deployId}:static-build`,
+              network: false,
+            });
+
             const buildDirs = ['dist', 'build', 'out', 'public', '.next/static'];
+            sourceDir = '';
             for (const dir of buildDirs) {
-              const buildDir = path.join(projectDir, dir);
+              const buildDir = path.join(buildWorkspace.path, dir);
               if (fs.existsSync(buildDir) && fs.existsSync(path.join(buildDir, 'index.html'))) {
                 sourceDir = buildDir;
                 break;
               }
             }
-          }
-        } catch (e: any) {
-          buildOutput += '\nBuild warning: ' + (e.message || 'unknown error');
+            if (!sourceDir) throw new Error('Build completed without a supported index.html output directory');
         }
-      }
 
-      // Copy to deploy directory
-      if (fs.existsSync(deployPath)) fs.rmSync(deployPath, { recursive: true, force: true });
-      execSync(`cp -r ${shellEscape(sourceDir)} ${shellEscape(deployPath)}`, { timeout: 30000 });
+        // Copy only inert build output (or a no-build static project) to the hosted directory.
+        copyStaticDeploymentTree(sourceDir, deployPath);
+      } finally {
+        buildWorkspace?.cleanup();
+      }
       
-      const nmPath = path.join(deployPath, 'node_modules');
-      const gitPath = path.join(deployPath, '.git');
-      if (fs.existsSync(nmPath)) fs.rmSync(nmPath, { recursive: true, force: true });
-      if (fs.existsSync(gitPath)) fs.rmSync(gitPath, { recursive: true, force: true });
     }
     
     // For fullstack apps: copy everything, assign port, start process
     if (deployType === 'fullstack') {
-      if (fs.existsSync(deployPath)) fs.rmSync(deployPath, { recursive: true, force: true });
-      execSync(`rsync -a --exclude=node_modules --exclude=.git ${shellEscape(projectDir + '/')} ${shellEscape(deployPath + '/')}`, { timeout: 60000 });
-      
-      const gitPath = path.join(deployPath, '.git');
-      if (fs.existsSync(gitPath)) fs.rmSync(gitPath, { recursive: true, force: true });
+      previousFullstackApp = existingProjectApp;
+      fullstackPromotion = copyFullstackDeploymentTree(projectDir, deployPath);
     }
     
     // For runtime apps: copy to bridgesrd user's projects directory and launch in xterm
     if (deployType === 'runtime') {
-      const safeAppName = appName.replace(/[^a-zA-Z0-9_-]/g, '_');
-      const runtimeDir = `/home/bridgesrd/projects/${safeAppName}`;
-      const files = fs.readdirSync(projectDir);
+      const desktopIdentity = buildProjectDesktopRuntimeIdentity(projectIdentity.id, appName);
+      const runtimeDir = desktopIdentity.runtimeDir;
+      const files = listProjectRootRegularFiles(projectDir);
+
+      // Stop the exact immutable runtime before replacing its files. This
+      // cannot collide with a same-named project in another workspace.
+      stopManagedDesktopRuntimeUnit(desktopIdentity.systemdUnit);
+      stopDesktopRuntimeProcess(desktopIdentity.processMarker);
+
+      // Runtime children are bridgesrd-owned, but the parent remains
+      // server-owned so a desktop process cannot rename sibling Projects.
+      ensureSecureProjectDesktopRuntimeRoot();
+      if (managedPathExists(runtimeDir)) {
+        const entry = fs.lstatSync(runtimeDir);
+        const identity = attestProjectRoot(runtimeDir);
+        if (entry.isSymbolicLink() || !entry.isDirectory() || identity.canonicalRoot !== runtimeDir) {
+          throw new ProjectIdentityLifecycleError(
+            'Remote Desktop Project runtime path is not a real managed directory',
+          );
+        }
+      } else {
+        fs.mkdirSync(runtimeDir, { mode: 0o755 });
+      }
       
-      // Create runtime directory
-      execSync(`mkdir -p ${shellEscape(runtimeDir)}`, { timeout: 5000 });
-      execSync(`chown bridgesrd:bridgesrd /home/bridgesrd/projects`, { timeout: 5000 });
-      
-      // Copy project files
-      execSync(`rsync -a --exclude=node_modules --exclude=.git ${shellEscape(projectDir + '/')} ${shellEscape(runtimeDir + '/')}`, { timeout: 60000 });
+      // Replace the complete runtime source tree. The shared deployment-tree
+      // policy excludes container-built .venv/node_modules artifacts, rejects
+      // included symlinks, and prevents deleted source files from surviving a
+      // redeploy as stale host-executed code.
+      copyDesktopRuntimeDeploymentTree(projectDir, runtimeDir);
       execSync(`chown -R bridgesrd:bridgesrd ${shellEscape(runtimeDir)}`, { timeout: 5000 });
       
       // Determine project type and run command
       let runCommand = '';
       let installCommand = '';
+      let runtimePreparationError: string | null = null;
       
       if (files.includes('main.py') || files.includes('requirements.txt')) {
         // Python project — always use venv (PEP 668 on Ubuntu 24.04 blocks system pip)
         const runtimeVenv = path.join(runtimeDir, '.venv');
         const runtimeVenvPython = path.join(runtimeVenv, 'bin', 'python');
-        const runtimeVenvPip = path.join(runtimeVenv, 'bin', 'pip');
-        // Create venv in runtime dir if missing (owned by bridgesrd)
-        if (!fs.existsSync(runtimeVenvPython)) {
-          try {
-            desktopExec(`python3 -m venv ${shellEscape(runtimeVenv)}`, { timeout: 30000 });
-          } catch (e: any) {
-            buildOutput += `\nWarning: failed to create venv: ${e.message}`;
-          }
+        // The lifecycle sandbox and host may use different Python versions.
+        // Build a fresh host venv after the clean tree promotion; a promoted
+        // container venv is not relocatable and must never be trusted here.
+        try {
+          desktopExec(`python3 -m venv ${shellEscape(runtimeVenv)}`, { timeout: 30000 });
+        } catch (e: any) {
+          runtimePreparationError = `Failed to create the Remote Desktop Python environment: ${e.message}`;
+          buildOutput += `\n${runtimePreparationError}`;
         }
-        const usePython = fs.existsSync(runtimeVenvPython) ? runtimeVenvPython : 'python3';
-        const usePip = fs.existsSync(runtimeVenvPip) ? runtimeVenvPip : 'pip3';
         if (files.includes('requirements.txt')) {
-          installCommand = `${shellEscape(usePip)} install -r requirements.txt 2>&1`;
+          installCommand = `${shellEscape(runtimeVenvPython)} -m pip install -r requirements.txt 2>&1`;
         }
         const mainFile = files.includes('main.py') ? 'main.py' : files.find(f => f.endsWith('.py')) || 'main.py';
-        runCommand = `${shellEscape(usePython)} ${shellEscape(mainFile)}`;
+        runCommand = `${shellEscape(runtimeVenvPython)} ${shellEscape(mainFile)}`;
         buildOutput += '\nDetected: Python project';
       } else if (files.includes('main.cpp') || files.includes('Makefile')) {
         // C++ project
@@ -2374,54 +7159,81 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
       } else if (files.includes('package.json')) {
         // Node CLI project
         installCommand = `npm install 2>&1`;
-        const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
-        const mainFile = pkg.main || 'index.js';
+        const pkg = readProjectPackageJson(projectDir);
+        const requestedMain = typeof pkg?.main === 'string' ? pkg.main : 'index.js';
+        const mainFile = requestedMain.length <= 240
+          && path.posix.basename(requestedMain) === requestedMain
+          && !requestedMain.includes('\\')
+          && files.includes(requestedMain)
+          ? requestedMain
+          : 'index.js';
         runCommand = `node ${shellEscape(mainFile)}`;
         buildOutput += '\nDetected: Node.js CLI project';
       }
       
+      if (!runCommand) {
+        await fs.promises.rm(runtimeDir, { recursive: true, force: true });
+        res.status(422).json({
+          error: 'No supported Python, C++, or Node runtime entry point was found.',
+          deployType: 'runtime',
+        });
+        return;
+      }
+
+      let runtimeError: string | null = runtimePreparationError;
+
       // Run install/build as bridgesrd user
-      if (installCommand) {
+      if (installCommand && !runtimeError) {
         try {
           desktopExec(installCommand, { cwd: runtimeDir, timeout: 120000 });
           buildOutput += '\nDependencies installed';
         } catch (e: any) {
-          buildOutput += `\nInstall warning: ${e.message}`;
+          runtimeError = `Dependency installation or compilation failed: ${e.message}`;
+          buildOutput += `\n${runtimeError}`;
         }
       }
-      
-      // Kill any existing xterm for this project
-      try {
-        execSync(`pkill -f ${shellEscape('xterm -title ' + shellEscape(safeAppName))} 2>/dev/null || true`, { timeout: 3000 });
-        // Brief pause for cleanup
-        await new Promise(r => setTimeout(r, 500));
-      } catch {}
-      
+
       // Launch in xterm on the VNC desktop (fully detached via setsid so execSync returns immediately)
-      if (runCommand) {
+      if (!runtimeError) {
         try {
-          const xtermCmd = `xterm -title ${shellEscape(safeAppName)} -fa Monospace -fs 12 -e "bash -c ${shellEscape(`cd ${shellEscape(runtimeDir)} && ${runCommand}; echo; echo Press Enter to close...; read`)}"`;
-          desktopExecDetached(xtermCmd);
-          buildOutput += `\nRunning on Remote Desktop`;
+          const terminalCommand = `cd ${shellEscape(runtimeDir)} && ${runCommand}; status=$?; echo; echo "Process exited with status $status"; echo "Press Enter to close..."; read`;
+          const xtermCmd = [
+            'xterm',
+            '-name', shellEscape(desktopIdentity.processMarker),
+            '-title', shellEscape(desktopIdentity.windowTitle),
+            '-fa', 'Monospace',
+            '-fs', '12',
+            '-e', 'bash', '-lc', shellEscape(terminalCommand),
+          ].join(' ');
+          desktopExecManaged(desktopIdentity.systemdUnit, xtermCmd);
+          await new Promise(resolve => setTimeout(resolve, 750));
+          if (
+            !isManagedDesktopRuntimeUnitRunning(desktopIdentity.systemdUnit)
+            || !isDesktopRuntimeProcessRunning(desktopIdentity.processMarker)
+          ) {
+            throw new Error('Remote Desktop terminal did not remain running');
+          }
+          buildOutput += '\nRunning on Remote Desktop';
         } catch (e: any) {
-          buildOutput += `\nFailed to launch xterm: ${e.message}`;
+          runtimeError = `Failed to launch Remote Desktop terminal: ${e.message}`;
+          buildOutput += `\n${runtimeError}`;
         }
       }
       
       // Create or update App record for runtime
-      let app = await prisma.app.findFirst({
-        where: { userId: ownerId, name: appName },
-      });
+      const runtimeAppState = projectDesktopRuntimeAppState(runtimeError);
+      let app = existingProjectApp;
 
       if (app) {
         app = await prisma.app.update({
           where: { id: app.id },
           data: { 
+            projectIdentityId: projectIdentity.id,
             zipPath: runtimeDir, 
-            isActive: true, 
+            isActive: runtimeAppState.isActive,
             deployType: 'runtime',
             port: null,
-            processStatus: 'running',
+            processStatus: runtimeAppState.processStatus,
             updatedAt: new Date(),
           },
         });
@@ -2429,25 +7241,49 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
         app = await prisma.app.create({
           data: {
             userId: ownerId,
+            projectIdentityId: projectIdentity.id,
             name: appName,
             description: `Runtime project ${appName}`,
             zipPath: runtimeDir,
-            isActive: true,
+            isActive: runtimeAppState.isActive,
             deployType: 'runtime',
             port: null,
-            processStatus: 'running',
+            processStatus: runtimeAppState.processStatus,
           },
         });
       }
 
       await prisma.activityLog.create({
-        data: { userId: ownerId, action: 'PROJECT_DEPLOY', resource: 'project', resourceId: app.id, severity: 'INFO', metadata: { deployType: 'runtime' } },
+        data: {
+          userId: ownerId,
+          action: 'PROJECT_DEPLOY',
+          resource: 'project',
+          resourceId: projectIdentity.id,
+          severity: runtimeError ? 'ERROR' : 'INFO',
+          metadata: {
+            projectName: appName,
+            deployType: 'runtime',
+            appId: app.id,
+            status: runtimeError ? 'error' : 'running',
+          },
+        },
       });
 
-      res.json({ 
-        message: 'Running on Remote Desktop', 
-        appId: app.id, 
-        name: appName, 
+      if (runtimeError) {
+        res.status(500).json({
+          error: runtimeError,
+          appId: app.id,
+          name: appName,
+          deployType: 'runtime',
+          buildOutput: buildOutput || undefined,
+        });
+        return;
+      }
+
+      res.json({
+        message: 'Running on Remote Desktop',
+        appId: app.id,
+        name: appName,
         deployType: 'runtime',
         buildOutput: buildOutput || undefined,
       });
@@ -2455,9 +7291,9 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
     }
 
     // Create or update App record (for static/fullstack)
-    let app = await prisma.app.findFirst({
-      where: { userId: ownerId, name: appName },
-    });
+    let app = deployType === 'fullstack'
+      ? previousFullstackApp
+      : existingProjectApp;
 
     let port: number | null = null;
     if (deployType === 'fullstack') {
@@ -2469,6 +7305,7 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
       app = await prisma.app.update({
         where: { id: app.id },
         data: { 
+          projectIdentityId: projectIdentity.id,
           zipPath: deployPath, 
           isActive: true, 
           deployType,
@@ -2477,10 +7314,13 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
           updatedAt: new Date(),
         },
       });
+      fullstackAppRecordMutated = deployType === 'fullstack';
+      if (deployType === 'fullstack') fullstackAppIdForRecovery = app.id;
     } else {
       app = await prisma.app.create({
         data: {
           userId: ownerId,
+          projectIdentityId: projectIdentity.id,
           name: appName,
           description: `Deployed from project ${appName}`,
           zipPath: deployPath,
@@ -2490,24 +7330,29 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
           processStatus: deployType === 'fullstack' ? 'starting' : 'stopped',
         },
       });
+      fullstackAppRecordMutated = deployType === 'fullstack';
+      if (deployType === 'fullstack') fullstackAppIdForRecovery = app.id;
     }
 
     // Start the process for fullstack apps
     if (deployType === 'fullstack' && port) {
       try {
-        // Force-kill any stale process on the port
-        try { require("child_process").execSync(`kill $(lsof -ti:${port} -sTCP:LISTEN) 2>/dev/null || true`); } catch {}
-        await new Promise(r => setTimeout(r, 1000));
-        await startApp(app.id, deployId, deployPath, port);
+        fullstackStartAttempted = true;
+        await startApp(app.id, deployId, deployPath, port, appRuntimeIdentity);
         buildOutput += `\nFullstack app started on internal port ${port}`;
+        fullstackPromotion?.finalize();
+        fullstackPromotion = null;
       } catch (e: any) {
         buildOutput += `\nProcess start failed: ${e.message}`;
         await prisma.app.update({ where: { id: app.id }, data: { processStatus: 'error' } });
+        throw new Error(`Fullstack app failed to start: ${e.message}`);
       }
     }
 
     await prisma.activityLog.create({
-      data: { userId: ownerId, action: 'PROJECT_DEPLOY', resource: 'project', resourceId: app.id, severity: 'INFO' },
+      data: { userId: ownerId, action: 'PROJECT_DEPLOY', resource: 'project', resourceId: projectIdentity.id, severity: 'INFO', metadata: { projectName: appName, deployType, appId: app.id } },
+    }).catch((activityError) => {
+      console.warn('[Project Deploy] Failed to record activity:', activityError);
     });
 
     const hostedUrl = `/hosted/${deployId}/`;
@@ -2521,31 +7366,279 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
       buildOutput: buildOutput || undefined,
     });
   } catch (error: any) {
+    let recoveryError: Error | null = null;
+    if (fullstackPromotion && deployIdForRecovery && deployPathForRecovery && lifecycleScopeForRecovery) {
+      if (fullstackStartAttempted) {
+        try {
+          await stopApp(deployIdForRecovery);
+        } catch (stopError: any) {
+          recoveryError = new Error(`Failed to stop the replacement app: ${stopError.message}`);
+        }
+      }
+
+      let deploymentRestored = false;
+      try {
+        fullstackPromotion.rollback();
+        deploymentRestored = true;
+      } catch (rollbackError: any) {
+        recoveryError = new Error([
+          recoveryError?.message,
+          `Failed to restore the prior deployment: ${rollbackError.message}`,
+        ].filter(Boolean).join('; '));
+      }
+
+      if (deploymentRestored && fullstackAppRecordMutated) {
+        try {
+          if (previousFullstackApp) {
+            await prisma.app.update({
+              where: { id: previousFullstackApp.id },
+              data: {
+                zipPath: previousFullstackApp.zipPath,
+                isActive: previousFullstackApp.isActive,
+                deployType: previousFullstackApp.deployType,
+                port: previousFullstackApp.port,
+                processStatus: previousFullstackApp.processStatus,
+                updatedAt: previousFullstackApp.updatedAt,
+              },
+            });
+          } else if (fullstackAppIdForRecovery) {
+            await prisma.app.deleteMany({ where: { id: fullstackAppIdForRecovery } });
+          }
+        } catch (databaseError: any) {
+          recoveryError = new Error([
+            recoveryError?.message,
+            `Failed to restore the prior app record: ${databaseError.message}`,
+          ].filter(Boolean).join('; '));
+        }
+      }
+
+      const shouldRestartPriorApp = deploymentRestored
+        && fullstackStartAttempted
+        && previousFullstackApp?.deployType === 'fullstack'
+        && previousFullstackApp.isActive
+        && previousFullstackApp.port !== null
+        && ['running', 'starting'].includes(previousFullstackApp.processStatus);
+      if (shouldRestartPriorApp && previousFullstackApp?.port) {
+        try {
+          await startApp(
+            previousFullstackApp.id,
+            deployIdForRecovery,
+            deployPathForRecovery,
+            previousFullstackApp.port,
+            lifecycleScopeForRecovery,
+          );
+        } catch (restartError: any) {
+          recoveryError = new Error([
+            recoveryError?.message,
+            `Failed to restart the prior app: ${restartError.message}`,
+          ].filter(Boolean).join('; '));
+        }
+      }
+    }
     console.error('Deploy error:', error);
-    res.status(500).json({ error: 'Failed to deploy', details: error.message });
+    if (recoveryError) console.error('Deploy recovery error:', recoveryError);
+    res.status(500).json({
+      error: 'Failed to deploy',
+      details: error.message,
+      ...(recoveryError ? { recoveryError: recoveryError.message } : {}),
+    });
   }
 });
 
-// POST /api/projects/:name/app-process — manage fullstack app process (start/stop/status/logs)
+// DELETE /api/projects/:name/deploy — remove only the Project deployment.
+// Source, Git history, Project Chat, and immutable Project identity remain.
+router.delete('/:name/deploy', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const ownerId = await getScopedOwnerId(req);
+    const appName = req.params.name;
+    let projectDir: string;
+    try {
+      projectDir = getExistingProjectPathReadOnly(ownerId, appName);
+    } catch (error: any) {
+      if (error instanceof ContainedPathError || error?.code === 'ENOENT') {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+      throw error;
+    }
+
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: appName,
+      projectRoot: projectDir,
+    });
+    const deployId = `${ownerId}-${appName}`;
+    const deployPath = path.join(DEPLOY_DIR, deployId);
+    const app = await findProjectAppForIdentity({
+      workspaceOwnerId: ownerId,
+      projectIdentityId: projectIdentity.id,
+      projectName: appName,
+      deployPath,
+    });
+    const deployIdentity = managedPathExists(deployPath)
+      ? attestProjectRoot(deployPath)
+      : null;
+
+    if (!app && !deployIdentity) {
+      res.status(404).json({ error: 'Project deployment not found' });
+      return;
+    }
+
+    if (app?.deployType === 'fullstack') {
+      await forgetAppRuntime(app.id, deployId, {
+        actorId: ownerId,
+        projectId: projectIdentity.id,
+      });
+    } else {
+      await stopApp(deployId);
+    }
+
+    let runtimeDirectoryRemoved = false;
+    if (app?.deployType === 'runtime') {
+      const desktopRuntime = await stopProjectDesktopRuntimesForLifecycle({
+        workspaceOwnerId: ownerId,
+        projectIdentityId: projectIdentity.id,
+        projectName: appName,
+      });
+      await removeDirectoryThroughAttestedQuarantine({
+        sourceRoot: desktopRuntime.runtimeDir,
+        quarantineKey: `undeploy-desktop:${projectIdentity.id}`,
+        expectedIdentity: desktopRuntime.identity || undefined,
+        sourceMustBeAbsent: !desktopRuntime.identity,
+      });
+      runtimeDirectoryRemoved = Boolean(desktopRuntime.identity);
+    }
+
+    await removeDirectoryThroughAttestedQuarantine({
+      sourceRoot: deployPath,
+      quarantineKey: `undeploy-hosted:${projectIdentity.id}`,
+      expectedIdentity: deployIdentity || undefined,
+      sourceMustBeAbsent: !deployIdentity,
+    });
+
+    if (app) {
+      const deleted = await prisma.app.deleteMany({
+        where: {
+          id: app.id,
+          projectIdentityId: projectIdentity.id,
+          userId: ownerId,
+        },
+      });
+      if (deleted.count !== 1) {
+        throw new ProjectIdentityLifecycleError(
+          'Project deployment identity changed before undeploy committed',
+        );
+      }
+    }
+
+    await prisma.activityLog.create({
+      data: {
+        userId: req.user!.userId,
+        action: 'PROJECT_UNDEPLOY',
+        resource: 'project',
+        resourceId: projectIdentity.id,
+        severity: 'INFO',
+        metadata: {
+          projectName: appName,
+          projectIdentityId: projectIdentity.id,
+          appId: app?.id || null,
+          deployType: app?.deployType || null,
+          removedHostedDirectory: Boolean(deployIdentity),
+          removedRuntimeDirectory: runtimeDirectoryRemoved,
+        },
+      },
+    }).catch((activityError) => {
+      console.warn('[Project Undeploy] Failed to record activity:', activityError);
+    });
+
+    res.json({
+      message: 'Project deployment removed',
+      projectName: appName,
+      projectIdentityId: projectIdentity.id,
+      appId: app?.id || null,
+      deployType: app?.deployType || null,
+      sourcePreserved: true,
+    });
+  } catch (error: any) {
+    console.error('Project undeploy error:', error);
+    res.status(error instanceof ProjectIdentityLifecycleError ? 409 : 500).json({
+      error: error instanceof ProjectIdentityLifecycleError
+        ? error.message
+        : 'Failed to remove Project deployment',
+      ...(error instanceof ProjectIdentityLifecycleError ? {} : { details: error.message }),
+    });
+  }
+});
+
+// POST /api/projects/:name/app-process — manage fullstack app process (start/stop/restart/status/logs)
 router.post('/:name/app-process', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const appName = req.params.name;
+    const projectDir = getProjectPath(ownerId, appName);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: appName,
+      projectRoot: projectDir,
+    });
     const deployId = `${ownerId}-${appName}`;
-    const { action } = req.body; // 'start' | 'stop' | 'status' | 'logs'
+    const { action } = req.body;
+    const supportedActions = ['start', 'stop', 'restart', 'status', 'logs'] as const;
+    if (!supportedActions.includes(action)) {
+      res.status(400).json({
+        error: 'Invalid action. Use: start, stop, restart, status, logs',
+      });
+      return;
+    }
     
-    const app = await prisma.app.findFirst({
-      where: { userId: ownerId, name: appName, deployType: 'fullstack' },
+    const app = await findProjectAppForIdentity({
+      workspaceOwnerId: ownerId,
+      projectIdentityId: projectIdentity.id,
+      projectName: appName,
+      deployPath: path.join(DEPLOY_DIR, deployId),
     });
     
     if (!app) {
-      res.status(404).json({ error: 'Fullstack app not found' });
+      res.status(404).json({ error: 'Project deployment not found' });
+      return;
+    }
+
+    if (app.deployType !== 'fullstack') {
+      if (action === 'status') {
+        res.json({
+          status: app.deployType === 'runtime' ? app.processStatus : 'deployed',
+          deployType: app.deployType,
+          supportedActions: [],
+          logs: [],
+          restartCount: 0,
+          limitation: app.deployType === 'runtime'
+            ? 'Remote Desktop Project runtimes are launched as desktop sessions and do not support web process controls.'
+            : 'Static deployments have no application process to control.',
+        });
+        return;
+      }
+      res.status(409).json({
+        code: 'PROJECT_PROCESS_CONTROL_UNSUPPORTED',
+        error: app.deployType === 'runtime'
+          ? 'Remote Desktop Project runtimes do not support start, stop, restart, or log controls.'
+          : 'Static Project deployments do not have a controllable application process.',
+        deployType: app.deployType,
+        supportedActions: [],
+      });
       return;
     }
     
     if (action === 'stop') {
       await stopApp(deployId);
-      res.json({ message: 'Stopped', status: 'stopped' });
+      res.json({
+        message: 'Stopped',
+        status: 'stopped',
+        deployType: 'fullstack',
+        supportedActions,
+        logs: [],
+        restartCount: 0,
+      });
       return;
     }
     
@@ -2555,21 +7648,61 @@ router.post('/:name/app-process', authenticateToken, requireApproved, async (req
         return;
       }
       try {
-        await startApp(app.id, deployId, app.zipPath, app.port);
-        res.json({ message: 'Starting', status: 'starting', port: app.port });
+        await startApp(app.id, deployId, app.zipPath, app.port, {
+          actorId: ownerId,
+          projectId: projectIdentity.id,
+        });
+        res.json({
+          ...(getAppStatus(deployId) || { logs: [], restartCount: 0 }),
+          message: 'Running',
+          status: 'running',
+          port: app.port,
+          deployType: 'fullstack',
+          supportedActions,
+        });
       } catch (e: any) {
         res.status(500).json({ error: 'Failed to start', details: e.message });
+      }
+      return;
+    }
+
+    if (action === 'restart') {
+      if (!app.port || !app.zipPath) {
+        res.status(400).json({ error: 'App not properly configured (missing port or path)' });
+        return;
+      }
+      try {
+        await restartApp(app.id, deployId, app.zipPath, app.port, {
+          actorId: ownerId,
+          projectId: projectIdentity.id,
+        });
+        res.json({
+          ...(getAppStatus(deployId) || { logs: [], restartCount: 0 }),
+          message: 'Restarted',
+          status: 'running',
+          port: app.port,
+          deployType: 'fullstack',
+          supportedActions,
+        });
+      } catch (e: any) {
+        res.status(500).json({ error: 'Failed to restart', details: e.message });
       }
       return;
     }
     
     if (action === 'status' || action === 'logs') {
       const status = getAppStatus(deployId);
-      res.json(status || { status: 'stopped', logs: [], restartCount: 0 });
+      res.json({
+        ...(status || {
+          status: app.processStatus === 'starting' ? 'starting' : 'stopped',
+          logs: [],
+          restartCount: 0,
+        }),
+        deployType: 'fullstack',
+        supportedActions,
+      });
       return;
     }
-    
-    res.status(400).json({ error: 'Invalid action. Use: start, stop, status, logs' });
   } catch (error: any) {
     console.error('App process error:', error);
     res.status(500).json({ error: error.message });
@@ -2581,59 +7714,108 @@ router.post('/:name/doc-update', authenticateToken, requireApproved, async (req:
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: req.params.name,
+      projectRoot: projectDir,
+    });
+    const gitScope = { actorId: req.user!.userId, projectId: projectIdentity.id };
 
     const { type, description, details } = req.body;
-    // type: 'fix' | 'feature' | 'deployment' | 'note'
+    const allowedTypes = new Set(['fix', 'feature', 'deployment', 'note']);
+    if (!allowedTypes.has(type)) {
+      res.status(400).json({ error: 'type must be fix, feature, deployment, or note' });
+      return;
+    }
+    if (typeof description !== 'string' || !description.trim() || description.length > 2000) {
+      res.status(400).json({ error: 'description must be between 1 and 2000 characters' });
+      return;
+    }
+    if (details !== undefined && (typeof details !== 'string' || details.length > 20_000)) {
+      res.status(400).json({ error: 'details must be a string of at most 20000 characters' });
+      return;
+    }
     
     const timestamp = new Date().toISOString().split('T')[0];
-    const entry = `\n## ${type === 'fix' ? '🔧 Fix' : type === 'feature' ? '✨ Feature' : type === 'deployment' ? '🚀 Deployment' : '📝 Note'} - ${timestamp}\n\n${description}\n${details ? `\n${details}\n` : ''}`;
+    const entry = `\n## ${type === 'fix' ? '🔧 Fix' : type === 'feature' ? '✨ Feature' : type === 'deployment' ? '🚀 Deployment' : '📝 Note'} - ${timestamp}\n\n${description.trim()}\n${details?.trim() ? `\n${details.trim()}\n` : ''}`;
     
     // Update NOTES.md
-    const notesPath = path.join(projectDir, 'NOTES.md');
-    let notesContent = '';
-    if (fs.existsSync(notesPath)) {
-      notesContent = fs.readFileSync(notesPath, 'utf-8');
-    } else {
-      notesContent = `# ${req.params.name} - Development Notes\n`;
-    }
+    let notesContent = readProjectTextFile(projectDir, 'NOTES.md', {
+      optional: true,
+      maxBytes: PROJECT_DOCUMENT_MAX_BYTES,
+    }) || `# ${req.params.name} - Development Notes\n`;
     notesContent += entry;
-    fs.writeFileSync(notesPath, notesContent, 'utf-8');
-    
+
     // Update README.md changelog section if exists
-    const readmePath = path.join(projectDir, 'README.md');
-    if (fs.existsSync(readmePath)) {
-      let readmeContent = fs.readFileSync(readmePath, 'utf-8');
+    let readmeContent = readProjectTextFile(projectDir, 'README.md', {
+      optional: true,
+      maxBytes: PROJECT_DOCUMENT_MAX_BYTES,
+    });
+    if (readmeContent !== null) {
       const changelogHeader = '## Changelog';
       if (!readmeContent.includes(changelogHeader)) {
         readmeContent += `\n\n${changelogHeader}\n`;
       }
-      const changelogLine = `\n- **${timestamp}** - ${type}: ${description}`;
+      const changelogLine = `\n- **${timestamp}** - ${type}: ${description.trim()}`;
       readmeContent = readmeContent.replace(changelogHeader, changelogHeader + changelogLine);
-      fs.writeFileSync(readmePath, readmeContent, 'utf-8');
+    }
+
+    for (const [fileName, content] of [
+      ['NOTES.md', notesContent],
+      ...(readmeContent === null ? [] : [['README.md', readmeContent]]),
+    ] as Array<[string, string]>) {
+      if (Buffer.byteLength(content, 'utf8') > PROJECT_DOCUMENT_MAX_BYTES) {
+        throw new ProjectFilePolicyError(
+          'TOO_LARGE',
+          `${fileName} would exceed the ${PROJECT_DOCUMENT_MAX_BYTES}-byte document limit`,
+        );
+      }
+    }
+
+    // All final sizes and both existing files are preflighted before writing.
+    // Each replacement is atomic and rejects repository-controlled links.
+    writeProjectTextFile(projectDir, 'NOTES.md', notesContent, PROJECT_DOCUMENT_MAX_BYTES);
+    if (readmeContent !== null) {
+      writeProjectTextFile(projectDir, 'README.md', readmeContent, PROJECT_DOCUMENT_MAX_BYTES);
     }
     
     // Auto-commit the doc changes
     const hasGit = fs.existsSync(path.join(projectDir, '.git'));
     if (hasGit) {
       try {
-        execSync('git add NOTES.md README.md', { cwd: projectDir, timeout: 5000 });
-        execSync(`git commit -m ${shellEscape(`docs: ${type} - ${(description || '').substring(0, 50)}`)}`, { cwd: projectDir, timeout: 5000 });
+        await runProjectGitCommand({ ...gitScope, workspace: projectDir, args: ['add', '--', 'NOTES.md', 'README.md'], timeoutMs: 5000 });
+        await runProjectGitCommand({
+          ...gitScope,
+          workspace: projectDir,
+          args: ['commit', '-m', `docs: ${type} - ${(description || '').substring(0, 50)}`],
+          timeoutMs: 5000,
+        });
       } catch {}
     }
     
     res.json({ message: 'Documentation updated' });
   } catch (error) {
     console.error('Doc update error:', error);
-    res.status(500).json({ error: 'Failed to update documentation' });
+    sendProjectFileMutationError(res, error, 'Failed to update documentation');
   }
 });
 
 // POST /api/projects/:name/share - create share link for project
 router.post('/:name/share', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
+    const unavailable = portalFeatureUnavailableResponse('appHosting');
+    if (unavailable) {
+      res.status(409).json(unavailable);
+      return;
+    }
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: req.params.name,
+      projectRoot: projectDir,
+    });
 
     // Ensure deployed
     const deployId = `${ownerId}-${req.params.name}`;
@@ -2644,31 +7826,57 @@ router.post('/:name/share', authenticateToken, requireApproved, async (req: Requ
     }
 
     // Find or create App record
-    let app = await prisma.app.findFirst({
-      where: { userId: ownerId, name: req.params.name },
+    let app = await findProjectAppForIdentity({
+      workspaceOwnerId: ownerId,
+      projectIdentityId: projectIdentity.id,
+      projectName: req.params.name,
+      deployPath,
     });
+    if (!app && await prisma.app.count({
+      where: { userId: ownerId, name: req.params.name },
+    }) > 0) {
+      res.status(409).json({
+        error: 'A standalone App already uses this Project name and cannot be shared implicitly.',
+      });
+      return;
+    }
 
     if (!app) {
       app = await prisma.app.create({
         data: {
           userId: ownerId,
+          projectIdentityId: projectIdentity.id,
           name: req.params.name,
           description: `Project ${req.params.name}`,
           zipPath: deployPath,
           isActive: true,
         },
       });
+    } else if (app.projectIdentityId !== projectIdentity.id) {
+      app = await prisma.app.update({
+        where: { id: app.id },
+        data: { projectIdentityId: projectIdentity.id },
+      });
     }
 
     const token = nanoid(21);
     const isPublic = req.body.isPublic !== false; // default true
     const password = req.body.password;
+    let shareOptions;
+    try {
+      shareOptions = parseShareLinkOptions(req.body || {});
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
 
     // Validate password if password-protected
     let passwordHash: string | null = null;
     if (!isPublic && password) {
-      if (password.length < 8) {
-        res.status(400).json({ error: 'Password must be at least 8 characters' });
+      try {
+        validateSharePassword(password);
+      } catch (error: any) {
+        res.status(400).json({ error: error.message });
         return;
       }
       passwordHash = await bcrypt.hash(password, 12);
@@ -2682,8 +7890,8 @@ router.post('/:name/share', authenticateToken, requireApproved, async (req: Requ
         appId: app.id,
         userId: ownerId,
         token,
-        expiresAt: req.body.expiresAt ? new Date(req.body.expiresAt) : null,
-        maxUses: req.body.maxUses || null,
+        expiresAt: shareOptions.expiresAt,
+        maxUses: shareOptions.maxUses,
         isPublic,
         passwordHash,
       },
@@ -2713,9 +7921,9 @@ router.get('/:name/shares', authenticateToken, requireApproved, async (req: Requ
     });
 
     // Strip passwordHash from response
-    const shares = (app?.shareLinks || []).map(({ passwordHash, ...rest }) => rest);
+    const shares = (app?.shareLinks || []).map(({ passwordHash: _passwordHash, ...rest }) => rest);
     res.json({ shares });
-  } catch (error) {
+  } catch {
     res.status(500).json({ error: 'Failed to list shares' });
   }
 });
@@ -2736,8 +7944,16 @@ async function findOwnedShareLink(ownerId: string, projectName: string, linkId: 
 // PATCH /api/projects/:name/share/:linkId - update share link (public ↔ secure, active toggle)
 router.patch('/:name/share/:linkId', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    const ownerId = await getScopedOwnerId(req);
     const { isPublic, password, isActive } = req.body;
+    const cleanupOnly = isActive === false && isPublic === undefined && password === undefined;
+    if (!cleanupOnly) {
+      const unavailable = portalFeatureUnavailableResponse('appHosting');
+      if (unavailable) {
+        res.status(409).json(unavailable);
+        return;
+      }
+    }
+    const ownerId = await getScopedOwnerId(req);
     const updateData: any = {};
 
     if (typeof isActive === 'boolean') {
@@ -2748,8 +7964,10 @@ router.patch('/:name/share/:linkId', authenticateToken, requireApproved, async (
       updateData.isPublic = true;
       updateData.passwordHash = null;
     } else if (isPublic === false) {
-      if (!password || password.length < 8) {
-        res.status(400).json({ error: 'Password must be at least 8 characters' });
+      try {
+        validateSharePassword(password);
+      } catch (error: any) {
+        res.status(400).json({ error: error.message });
         return;
       }
       updateData.isPublic = false;
@@ -2769,7 +7987,7 @@ router.patch('/:name/share/:linkId', authenticateToken, requireApproved, async (
 
     const { passwordHash: _, ...safeLink } = link;
     res.json({ shareLink: safeLink });
-  } catch (error) {
+  } catch {
     res.status(500).json({ error: 'Failed to update share link' });
   }
 });
@@ -2797,7 +8015,7 @@ router.delete('/:name/share/:linkId', authenticateToken, requireApproved, async 
       });
       res.json({ message: 'Share link revoked' });
     }
-  } catch (error) {
+  } catch {
     res.status(500).json({ error: 'Failed to delete share link' });
   }
 });
@@ -2805,9 +8023,23 @@ router.delete('/:name/share/:linkId', authenticateToken, requireApproved, async 
 // POST /api/projects/:name/share/:linkId/email - send share link via email
 router.post('/:name/share/:linkId/email', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
+    const hostingUnavailable = portalFeatureUnavailableResponse('appHosting');
+    if (hostingUnavailable) {
+      res.status(409).json(hostingUnavailable);
+      return;
+    }
+    const mailUnavailable = portalFeatureUnavailableResponse('mail');
+    if (mailUnavailable) {
+      res.status(409).json(mailUnavailable);
+      return;
+    }
     const ownerId = await getScopedOwnerId(req);
-    const { recipientEmail, password } = req.body;
-    if (!recipientEmail || typeof recipientEmail !== 'string') {
+    const { recipientEmail } = req.body;
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'password')) {
+      res.status(400).json({ error: 'Share passwords are never accepted by email endpoints; send them through a separate channel' });
+      return;
+    }
+    if (!recipientEmail || typeof recipientEmail !== 'string' || recipientEmail.length > 320) {
       res.status(400).json({ error: 'recipientEmail is required' }); return;
     }
     // Basic email format check
@@ -2816,8 +8048,13 @@ router.post('/:name/share/:linkId/email', authenticateToken, requireApproved, as
     }
 
     const link = await findOwnedShareLink(ownerId, req.params.name, req.params.linkId);
-    if (!link || !link.isActive) {
-      res.status(404).json({ error: 'Share link not found or inactive' }); return;
+    if (!link) {
+      res.status(404).json({ error: 'Share link not found' }); return;
+    }
+    const availability = shareLinkAvailability(link);
+    if (availability !== 'active') {
+      res.status(409).json({ error: `Share link is ${availability}. Create a new active link before emailing it.` });
+      return;
     }
 
     const siteUrl = process.env.PORTAL_URL || 'https://localhost';
@@ -2841,7 +8078,6 @@ router.post('/:name/share/:linkId/email', authenticateToken, requireApproved, as
         appName: req.params.name,
         shareUrl,
         isPasswordProtected: !link.isPublic,
-        password: typeof password === 'string' && password.length > 0 ? password : undefined,
       },
       mailCreds,
     );
@@ -2854,224 +8090,2259 @@ router.post('/:name/share/:linkId/email', authenticateToken, requireApproved, as
 });
 
 // POST /api/projects/:name/rename-file - rename/move file
-router.post('/:name/rename-file', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+router.post('/:name/rename-file', authenticateToken, requireApproved, projectPathSandbox, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
     const { oldPath, newPath } = req.body;
     if (!oldPath || !newPath) { res.status(400).json({ error: 'oldPath and newPath required' }); return; }
 
-    const resolvedOld = path.resolve(path.join(projectDir, oldPath));
-    const resolvedNew = path.resolve(path.join(projectDir, newPath));
-    if (!resolvedOld.startsWith(path.resolve(projectDir)) || !resolvedNew.startsWith(path.resolve(projectDir))) {
-      res.status(403).json({ error: 'Forbidden' }); return;
+    let resolvedOld: string;
+    let resolvedNew: string;
+    try {
+      resolvedOld = resolveExistingProjectEntry(projectDir, oldPath, 'any');
+      resolvedNew = resolveProjectTarget(projectDir, newPath);
+    } catch {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
+    if (fs.existsSync(resolvedNew)) { res.status(409).json({ error: 'Destination already exists' }); return; }
+
+    const oldEntry = fs.lstatSync(resolvedOld);
+    if (oldEntry.isDirectory() && resolvedNew.startsWith(`${resolvedOld}${path.sep}`)) {
+      res.status(400).json({ error: 'A folder cannot be moved inside itself' });
+      return;
     }
 
-    if (!fs.existsSync(resolvedOld)) { res.status(404).json({ error: 'Source not found' }); return; }
-    
-    fs.mkdirSync(path.dirname(resolvedNew), { recursive: true });
+    try {
+      const newParent = path.posix.dirname(String(newPath).replace(/\\/g, '/'));
+      if (newParent !== '.') ensureContainedDirectory(projectDir, newParent);
+      resolvedNew = resolveProjectTarget(projectDir, newPath);
+    } catch {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
+
     fs.renameSync(resolvedOld, resolvedNew);
     res.json({ message: 'Renamed' });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to rename' });
+    sendProjectFileMutationError(res, error, 'Failed to rename');
   }
 });
 
-// --- OpenClaw TUI Chat Persistence Routes ---
+// --- Provider-neutral Project Chat kernel ---
+
+// POST /api/projects/:name/chat/migrate-legacy - adopt a legacy project in place
+router.post('/:name/chat/migrate-legacy', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    const {
+      workspaceOwnerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
+    if (!fs.existsSync(projectDir)) {
+      res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId,
+      projectName: name,
+      projectRoot: projectDir,
+    });
+    // A parked file snapshot cannot prove that name/path-keyed OpenClaw 3.x
+    // agents, sessions, or transcripts stopped targeting this old inode. Do
+    // not let the explicit adoption button mint CURRENT provenance while that
+    // evidence gate is active; the original Project and evidence stay intact.
+    await assertLegacyOpenClawProjectMigrationInactive(projectIdentity.id);
+    // The durable lease is the normal startup fence. Repeat the bounded
+    // read-only evidence inventory here as defense in depth so a missing or
+    // manually disturbed lease can never turn preserved 3.x state into a
+    // CURRENT collision.
+    await assertNoLegacyOpenClawProjectEvidence();
+    const result = await adoptLegacyProjectInPlace({
+      projectIdentity,
+      projectRoot: projectDir,
+    });
+    console.info('[ProjectLegacyAdoption]', JSON.stringify({
+      projectIdentityId: result.projectIdentityId,
+      generation: result.generation,
+      alreadyCurrent: result.alreadyCurrent,
+      fileCount: result.manifest.fileCount,
+      totalBytes: result.manifest.totalBytes,
+      manifestSha256: result.manifest.sha256,
+    }));
+    res.json({
+      migrated: true,
+      projectId: result.projectIdentityId,
+      generation: result.generation,
+      alreadyCurrent: result.alreadyCurrent,
+      integrity: {
+        fileCount: result.manifest.fileCount,
+        totalBytes: result.manifest.totalBytes,
+        manifestSha256: result.manifest.sha256,
+      },
+    });
+  } catch (error: any) {
+    const adoptionError = error instanceof ProjectLegacyAdoptionError ? error : null;
+    const legacyGateError = error instanceof LegacyOpenClawProjectMigrationActiveError ? error : null;
+    const legacyEvidenceError = error instanceof LegacyOpenClawProjectRetirementError ? error : null;
+    const status = adoptionError?.code === 'MIGRATION_BUSY' || legacyGateError?.retryable ? 409 : 503;
+    const message = adoptionError?.message
+      || legacyGateError?.message
+      || (legacyEvidenceError ? LEGACY_OPENCLAW_RETIREMENT_PENDING_MESSAGE : null)
+      || 'Portal could not finish preparing this project. Its original files remain unchanged.';
+    const code = adoptionError?.code
+      || legacyGateError?.code
+      || (legacyEvidenceError ? 'LEGACY_OPENCLAW_PROJECT_RETIREMENT_PENDING' : 'MIGRATION_FAILED');
+    const retryable = adoptionError?.retryable ?? legacyGateError?.retryable ?? !legacyEvidenceError;
+    console.error('[ProjectLegacyAdoption]', JSON.stringify({
+      route: 'project-legacy-adoption',
+      projectName: req.params.name,
+      code,
+      retryable,
+      detail: message,
+    }));
+    res.status(status).json({
+      error: message,
+      code,
+      retryable,
+    });
+  }
+});
+
+// GET /api/projects/:name/chat/providers - Project-safe provider capabilities
+router.get('/:name/chat/providers', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    const {
+      actorUserId: actorId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+
+    const projectIdentity = await ensureProjectIdentity({
+      workspaceOwnerId: ownerId,
+      projectName: name,
+      projectRoot: projectDir,
+    });
+    if (projectIdentity.legacyOpenClawMigrationStatus !== 'CURRENT') {
+      res.json({
+        migration: {
+          required: true,
+          projectId: projectIdentity.id,
+          title: 'Prepare this project for Project Chat',
+          message: PROJECT_CHAT_MOVE_REQUIRED_MESSAGE,
+        },
+      });
+      return;
+    }
+    // Provider discovery creates coordination state below. Fence legacy
+    // identities before qualification reads or name-keyed state migration so
+    // preserved 3.x evidence cannot be made visible by merely opening Chat.
+    await assertLegacyOpenClawProjectMigrationInactive(projectIdentity.id);
+    const contextInput = {
+      actorUserId: actorId,
+      workspaceOwnerId: ownerId,
+      projectName: name,
+      projectIdentity,
+      projectDir,
+      projectsRoot: PROJECTS_DIR,
+    };
+    const qualifications = resolveProjectChatQualificationMatrix(
+      PROJECT_CHAT_ROUTE_PROVIDERS,
+      (provider) => {
+        const context = buildUnqualifiedProjectSandboxExecutionContext(provider, contextInput);
+        return getProjectQualificationStatus(provider, {
+          context,
+          egress: buildProjectEgressConfig({ context, provider }),
+        });
+      },
+    );
+    await migrateLegacyProjectChatState({
+      actorUserId: actorId,
+      legacyProjectId: name,
+      immutableProjectId: projectIdentity.id,
+    });
+    const bindings = await listProjectChatBindings(actorId, projectIdentity.id);
+    // Qualification attests the sandbox and embedded execution provider.
+    // Within that provider, the server-persisted binding is the authoritative
+    // metadata patch; browser-local preferences are never trusted.
+    const qualifiedModels = Object.fromEntries(
+      PROJECT_CHAT_ROUTE_PROVIDERS.map((provider) => {
+        if (!qualifications[provider].selectable) return [provider, null];
+        const context = buildUnqualifiedProjectSandboxExecutionContext(provider, contextInput);
+        const grant = requireProjectQualification(provider, {
+          context,
+          egress: buildProjectEgressConfig({ context, provider }),
+        });
+        if (provider !== 'OPENCLAW') return [provider, grant.modelId];
+        const bindingModel = normalizePortalModelId(
+          bindings.find((binding) => binding.provider === 'OPENCLAW')?.model || '',
+        );
+        const bindingProvider = bindingModel.split('/')[0] || '';
+        return [
+          provider,
+          bindingModel
+            && isOpenClawProjectEmbeddedModel(bindingModel)
+            && bindingProvider === grant.executionProviderId
+            ? bindingModel
+            : grant.modelId,
+        ];
+      }),
+    );
+    const providers = listProjectChatProviderCapabilities().map((capability) => (
+      isProjectChatRouteProvider(capability.provider)
+        ? qualifications[capability.provider].selectable
+          ? buildQualifiedProjectChatProviderCapability(
+              capability.provider,
+              qualifications[capability.provider].reason,
+            )
+          : { ...capability, reason: qualifications[capability.provider].reason }
+        : capability
+    ));
+    const portalSession = await prisma.projectChatSession.findFirst({
+      where: { userId: actorId, projectId: projectIdentity.id },
+      orderBy: { lastActivity: 'desc' },
+    });
+    const initialProviderCandidate = normalizeProjectChatProvider(
+      portalSession?.activeProvider
+      || [...bindings]
+        .filter((binding) => isProjectChatRouteProvider(binding.provider as AgentProviderName))
+        .sort((a, b) => b.lastActivity.getTime() - a.lastActivity.getTime())[0]?.provider
+      || 'OPENCLAW',
+    );
+    const initialProvider = isProjectChatRouteProvider(initialProviderCandidate)
+      ? initialProviderCandidate
+      : 'OPENCLAW';
+    await ensureProjectChatState({
+      actorUserId: actorId,
+      projectIdentityId: projectIdentity.id,
+      initialProvider: toPersistedProjectChatProvider(initialProvider),
+    });
+    const coordination = await readProjectChatCoordinationState({
+      actorUserId: actorId,
+      projectIdentityId: projectIdentity.id,
+    });
+    if (!coordination.state) throw new Error('Project Chat coordination state is unavailable');
+    const activeProvider = requireProjectChatRouteProvider(fromPersistedProjectChatProvider(
+      coordination.state.selectedProvider as ProjectChatPersistedProvider,
+    ));
+    // A selected provider whose runtime is not installed must not brick
+    // discovery, or the picker that is the only way off it is unreachable.
+    const discovery = buildDiscoveryProjectSandboxExecutionContext(
+      activeProvider,
+      PROJECT_CHAT_ROUTE_PROVIDERS,
+      contextInput,
+    );
+    const executionContext = discovery.context;
+    const runtimeUnavailable = discovery.unavailable;
+    const activeUserTurn = visibleProjectChatActiveTurn(coordination.activeTurn);
+    res.json({
+      ...buildProjectChatCapabilityResponse({
+      activeProvider,
+      bindings,
+      executionContext,
+      providers,
+      }),
+      qualifications,
+      qualifiedModels,
+      // Tells the client the selected provider cannot run here and which
+      // provider vouched for the project identity instead, so the panel can
+      // say so plainly rather than presenting a lane that will fail on send.
+      activeProviderRuntime: {
+        provider: activeProvider,
+        available: !runtimeUnavailable,
+        reason: runtimeUnavailable?.message || null,
+        identityProvider: discovery.provider,
+      },
+      coordination: {
+        stateVersion: coordination.state.version,
+        selectedProvider: activeProvider,
+        transcriptCursor: coordination.state.transcriptCursor,
+        activeTurn: activeUserTurn ? {
+          id: activeUserTurn.id,
+          provider: fromPersistedProjectChatProvider(
+            activeUserTurn.provider as ProjectChatPersistedProvider,
+          ),
+          status: activeUserTurn.status,
+          requestId: activeUserTurn.requestId,
+          leaseExpiresAt: activeUserTurn.leaseExpiresAt.toISOString(),
+        } : null,
+        runtimeTransitionActive: Boolean(coordination.activeTurn && !activeUserTurn),
+      },
+    });
+  } catch (error: any) {
+    if (sendProjectChatProviderError(res, error)) return;
+    if (sendProjectChatCoordinationError(res, error)) return;
+    console.error('[Project Chat Providers] Error:', error?.message || error);
+    res.status(403).json({ error: 'Project sandbox could not be verified' });
+  }
+});
+
+const projectOpenClawModelCatalogLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => crypto.createHash('sha256').update([
+    req.user?.userId || 'unauthenticated',
+    String(req.params.name || ''),
+  ].join('\0')).digest('hex'),
+  message: {
+    error: 'Too many OpenClaw Project model catalog requests. Try again later.',
+    code: 'PROJECT_MODEL_CATALOG_RATE_LIMITED',
+  },
+});
+
+// GET /api/projects/:name/chat/models - Models available to this exact Project agent
+router.get(
+  '/:name/chat/models',
+  authenticateToken,
+  requireApproved,
+  projectOpenClawModelCatalogLimiter,
+  async (req: Request, res: Response) => {
+  try {
+    const provider = requireProjectChatRouteProvider(
+      normalizeProjectChatProvider(req.query.provider || 'OPENCLAW'),
+    );
+    if (provider !== 'OPENCLAW') {
+      res.status(400).json({
+        error: 'This Project-scoped model catalog is available only for OpenClaw.',
+        code: 'PROJECT_MODEL_PROVIDER_UNSUPPORTED',
+      });
+      return;
+    }
+    const { name } = req.params;
+    const {
+      actorUserId,
+      workspaceOwnerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
+    if (!fs.existsSync(projectDir)) {
+      res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+    const { executionContext } = await resolveProjectChatOperationContext(
+      actorUserId,
+      workspaceOwnerId,
+      name,
+      projectDir,
+      provider,
+      { readOnly: true },
+    );
+    const models = await listAvailableOpenClawProjectModels(
+      deriveOpenClawProjectAgentId(executionContext),
+    );
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+    res.vary('Authorization');
+    res.vary('Cookie');
+    res.json({
+      provider,
+      models: models.map((id) => ({
+        id,
+        alias: null,
+        displayName: id.split('/').slice(1).join('/') || id,
+        provider: id.split('/')[0] || 'openclaw',
+        source: 'dynamic',
+      })),
+    });
+  } catch (error) {
+    if (sendProjectChatProviderError(res, error)) return;
+    console.error(
+      '[Project Chat Models] Error:',
+      error instanceof Error ? error.message : error,
+    );
+    res.status(503).json({
+      error: 'The dedicated OpenClaw Project agent model catalog is unavailable.',
+      code: 'MODEL_CATALOG_UNAVAILABLE',
+    });
+  }
+  },
+);
+
+const PROJECT_QUALIFICATION_RATE_LIMIT_IDENTITY = Symbol(
+  'projectQualificationRateLimitIdentity',
+);
+
+type ProjectQualificationRateLimitRequest = Request & {
+  [PROJECT_QUALIFICATION_RATE_LIMIT_IDENTITY]?: Readonly<ProjectQualificationRateLimitIdentity>;
+  rateLimit?: { resetTime?: Date };
+};
+
+function requireProjectQualificationRateLimitIdentity(
+  req: Request,
+): Readonly<ProjectQualificationRateLimitIdentity> {
+  const admitted = (req as ProjectQualificationRateLimitRequest)[
+    PROJECT_QUALIFICATION_RATE_LIMIT_IDENTITY
+  ];
+  if (!admitted || admitted.actorUserId !== req.user?.userId) {
+    throw new Error('Project qualification immutable identity admission is unavailable');
+  }
+  return admitted;
+}
+
+/**
+ * Resolve and attest the existing Project identity before the limiter. This is
+ * deliberately read-only: qualification must not create an identity merely to
+ * obtain a rate-limit key, and a rename cannot create a fresh attempt budget.
+ */
+async function admitProjectQualificationRateLimitIdentity(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const projectName = String(req.params.name || '');
+    const actorUserId = req.user?.userId;
+    if (!actorUserId) {
+      res.status(401).json({ error: 'Authentication is required' });
+      return;
+    }
+    const workspaceOwnerId = actorUserId;
+    const projectDir = getExistingProjectPathReadOnly(workspaceOwnerId, projectName);
+    const projectIdentity = await readProjectIdentity({
+      workspaceOwnerId,
+      projectName,
+      projectRoot: projectDir,
+    });
+    if (!projectIdentity) {
+      res.status(409).json({
+        error: 'Project identity has not been initialized. Refresh Project Chat before preparing a provider.',
+        code: 'PROJECT_QUALIFICATION_IDENTITY_UNAVAILABLE',
+        retryable: true,
+      });
+      return;
+    }
+    (req as ProjectQualificationRateLimitRequest)[
+      PROJECT_QUALIFICATION_RATE_LIMIT_IDENTITY
+    ] = Object.freeze({
+      actorUserId,
+      workspaceOwnerId,
+      projectIdentityId: projectIdentity.id,
+    });
+    next();
+  } catch (error) {
+    if (error instanceof ContainedPathError && error.message === 'Path does not exist') {
+      res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+    const policyFailure = error instanceof ContainedPathError
+      || error instanceof ProjectIdentityLifecycleError;
+    console.error(
+      '[Project Provider Qualification] Immutable identity admission failed:',
+      error instanceof Error ? error.message : error,
+    );
+    res.status(policyFailure ? 409 : 503).json({
+      error: policyFailure
+        ? 'Project identity could not be safely verified for provider preparation.'
+        : 'Project identity verification is temporarily unavailable.',
+      code: 'PROJECT_QUALIFICATION_IDENTITY_UNAVAILABLE',
+      retryable: !policyFailure,
+    });
+  }
+}
+
+function projectQualificationLimiter(provider: ProjectChatRouteProvider) {
+  return rateLimit({
+    windowMs: PROJECT_QUALIFICATION_WINDOW_MS,
+    max: 3,
+    standardHeaders: true,
+    legacyHeaders: false,
+    // Each provider gets an independent budget for the authenticated actor
+    // and project. A normal first-time setup can therefore qualify every
+    // enabled provider without one provider consuming another provider's gate.
+    keyGenerator: (req) => projectQualificationRateLimitKey({
+      provider,
+      identity: requireProjectQualificationRateLimitIdentity(req),
+    }),
+    handler: (req, res) => {
+      res.status(429).json({
+        error: 'Too many Project provider qualification attempts. Try again after the preparation window resets.',
+        code: 'PROJECT_QUALIFICATION_RATE_LIMITED',
+        retryable: true,
+        retryAt: projectQualificationRetryAt(
+          (req as ProjectQualificationRateLimitRequest).rateLimit?.resetTime,
+        ),
+      });
+    },
+  });
+}
+
+const projectAgentZeroModelCatalogLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => crypto.createHash('sha256').update([
+    req.user?.userId || 'unauthenticated',
+    String(req.params.name || ''),
+  ].join('\0')).digest('hex'),
+  message: {
+    error: 'Too many Agent Zero model catalog requests. Try again later.',
+    code: 'AGENT_ZERO_MODEL_CATALOG_RATE_LIMITED',
+  },
+});
+
+// Project members must be able to make an explicit model choice before
+// qualification, but the owner-only Agent Runtime OAuth surface also exposes
+// account labels. Return only the connected, bounded model identifiers needed
+// by this actor's own Project Chat UI.
+router.get(
+  '/:name/chat/providers/agent-zero/models',
+  authenticateToken,
+  requireApproved,
+  projectAgentZeroModelCatalogLimiter,
+  async (req: Request, res: Response) => {
+    try {
+      const { projectDir } = resolveActorProjectChatWorkspace(req, req.params.name);
+      if (!fs.existsSync(projectDir)) {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+      const catalog = await getDefaultAgentZeroOAuthClient().modelCatalog();
+      res.json({
+        available: true,
+        checkedAt: catalog.checkedAt,
+        providers: catalog.providers
+          .filter((provider) => provider.connectionState === 'connected')
+          .flatMap((provider) => {
+            const models = filterAgentZeroOAuthModelsForProjectQualification(
+              provider.providerId,
+              provider.models,
+            ).map((model) => ({
+              id: model.id,
+              displayName: model.displayName,
+            }));
+            return models.length > 0
+              ? [{
+                  providerId: provider.providerId,
+                  displayName: provider.displayName,
+                  connectionState: 'connected' as const,
+                  models,
+                }]
+              : [];
+          }),
+      });
+    } catch (error) {
+      if (error instanceof AgentZeroOAuthError) {
+        const status = error.code === 'AUTHENTICATION'
+          ? 409
+          : error.code === 'INVALID_REQUEST'
+            ? 400
+            : error.code === 'UPSTREAM_REJECTED'
+              ? 502
+              : 503;
+        res.status(status).json({
+          error: error.message,
+          code: `AGENT_ZERO_MODEL_CATALOG_${error.code}`,
+        });
+        return;
+      }
+      console.error('[Agent Zero Project Model Catalog] Error:', error);
+      res.status(503).json({
+        error: 'Agent Zero OAuth models could not be verified.',
+        code: 'AGENT_ZERO_MODEL_CATALOG_UNAVAILABLE',
+      });
+    }
+  },
+);
+
+// These are the only routes permitted to construct unqualified provider
+// contexts. Evidence is written only after the provider-specific runtime and
+// egress attestation, complete positive/negative probe matrix, and a real
+// authenticated model challenge all succeed.
+function qualifyProjectChatProviderRoute(provider: ProjectChatRouteProvider) {
+  return async (req: Request, res: Response) => {
+    try {
+      const { name } = req.params;
+      const rateLimitIdentity = requireProjectQualificationRateLimitIdentity(req);
+      const actorUserId = req.user!.userId;
+      const workspaceOwnerId = actorUserId;
+      const projectDir = getExistingProjectPathReadOnly(workspaceOwnerId, name);
+      const projectIdentity = await readProjectIdentity({
+        workspaceOwnerId,
+        projectName: name,
+        projectRoot: projectDir,
+      });
+      if (
+        !projectIdentity
+        || rateLimitIdentity.actorUserId !== actorUserId
+        || rateLimitIdentity.workspaceOwnerId !== workspaceOwnerId
+        || rateLimitIdentity.projectIdentityId !== projectIdentity.id
+      ) {
+        throw new ProjectIdentityLifecycleError(
+          'Project identity changed after qualification rate-limit admission',
+        );
+      }
+      // Every provider shares one transcript and may bridge name-keyed 3.x
+      // state. Gate all qualification lanes before that migration, not just
+      // the OpenClaw lane that owns the preserved Gateway history.
+      await assertLegacyOpenClawProjectMigrationInactive(projectIdentity.id);
+      await migrateLegacyProjectChatState({
+        actorUserId,
+        legacyProjectId: name,
+        immutableProjectId: projectIdentity.id,
+      });
+      await ensureProjectChatState({
+        actorUserId,
+        projectIdentityId: projectIdentity.id,
+        initialProvider: 'OPENCLAW',
+      });
+      const coordination = await readProjectChatCoordinationState({
+        actorUserId,
+        projectIdentityId: projectIdentity.id,
+      });
+      if (!coordination.state) throw new Error('Project Chat coordination state is unavailable');
+      const contextInput = {
+        actorUserId,
+        workspaceOwnerId,
+        projectName: name,
+        projectIdentity,
+        projectDir,
+        projectsRoot: PROJECTS_DIR,
+      };
+      const executionContext = buildUnqualifiedProjectSandboxExecutionContext(provider, contextInput);
+      const descriptor = getProjectChatProviderRuntimeDescriptor(provider);
+      const admitted = await withProjectChatRuntimeAdmission({
+        actorUserId,
+        actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
+        projectIdentityId: projectIdentity.id,
+        // Qualification does not switch the selected provider. The admission
+        // only reserves the actor/project mutation slot while target runtime
+        // evidence is being replaced.
+        provider: coordination.state.selectedProvider as ProjectChatPersistedProvider,
+        runtime: descriptor.runtime,
+        operation: projectChatRuntimeOperationId(
+          `qualify-${provider.toLowerCase()}`,
+          req.body?.model || null,
+          req.body?.modelSelection || null,
+        ),
+        leaseOwner: PROJECT_CHAT_LEASE_OWNER,
+        expectedVersion: coordination.state.version,
+        leaseDurationMs: PROJECT_CHAT_LEASE_DURATION_MS,
+      }, async () => {
+        await repairTerminalProjectChatPresentations({
+          actorUserId,
+          projectIdentityId: projectIdentity.id,
+          limit: 100,
+        });
+        prepareProjectLifecycleWorkspace(projectDir);
+        if (provider === 'OPENCLAW') {
+          // A genuinely new Project agent is absent from OpenClaw config.
+          // Register and converge that exact identity before asking the pinned
+          // CLI for its agent-scoped auth/model status.
+          await ensureOpenClawProjectAgentCatalogScope(executionContext);
+        }
+        const ollamaModelSelection = provider === 'OLLAMA'
+          ? await resolveAllowedOllamaProjectModel(
+              [],
+              typeof req.body?.model === 'string' ? req.body.model : null,
+            )
+          : undefined;
+        const agentZeroModelSelection = provider === 'AGENT_ZERO'
+          ? await resolveAllowedAgentZeroProjectModel(
+              typeof req.body?.model === 'string'
+                ? parseAgentZeroProjectModelBinding(req.body.model)
+                : req.body?.modelSelection,
+            )
+          : undefined;
+        let openClawModel: string | undefined;
+        if (provider === 'OPENCLAW') {
+          const requestedModel = normalizePortalModelId(
+            typeof req.body?.model === 'string' ? req.body.model : '',
+          );
+          const existingBinding = await prisma.projectChatProviderBinding.findUnique({
+            where: {
+              userId_projectId_provider: {
+                userId: actorUserId,
+                projectId: executionContext.projectId,
+                provider: 'OPENCLAW',
+              },
+            },
+          });
+          openClawModel = (await resolveAllowedOpenClawProjectModel(
+            deriveOpenClawProjectAgentId(executionContext),
+            [
+            requestedModel,
+            existingBinding?.model || '',
+            getDefaultModel() || '',
+            ],
+            requestedModel,
+          )).model;
+        }
+        return qualifyProjectProvider(provider, {
+          context: executionContext,
+          egress: buildProjectEgressConfig({ context: executionContext, provider }),
+          sender: {
+            label: req.user!.email,
+            userId: actorUserId,
+            role: req.user!.role,
+          },
+          ...(openClawModel ? { openClawModel } : {}),
+          ...(agentZeroModelSelection ? { agentZeroModelSelection } : {}),
+          ...(ollamaModelSelection ? { ollamaModelSelection } : {}),
+        });
+      });
+      res.json({
+        provider,
+        qualification: admitted.result,
+        stateVersion: admitted.state.version,
+        executionContext: serializeProjectSandboxContext(executionContext),
+      });
+    } catch (error) {
+      if (sendProjectChatQualificationError(res, error, provider)) return;
+      if (sendProjectChatProviderError(res, error)) return;
+      if (sendProjectChatCoordinationError(res, error)) return;
+      console.error(`[${provider} Project Qualification] Failed:`, error instanceof Error ? error.message : error);
+      res.status(503).json({
+        error: 'Project provider qualification did not complete. The provider remains unavailable.',
+        code: 'PROJECT_QUALIFICATION_FAILED',
+        provider,
+      });
+    }
+  };
+}
+
+router.post(
+  '/:name/chat/providers/openclaw/qualify',
+  authenticateToken,
+  requireApproved,
+  admitProjectQualificationRateLimitIdentity,
+  projectQualificationLimiter('OPENCLAW'),
+  qualifyProjectChatProviderRoute('OPENCLAW'),
+);
+
+router.post(
+  '/:name/chat/providers/codex/qualify',
+  authenticateToken,
+  requireApproved,
+  admitProjectQualificationRateLimitIdentity,
+  projectQualificationLimiter('CODEX'),
+  qualifyProjectChatProviderRoute('CODEX'),
+);
+
+router.post(
+  '/:name/chat/providers/claude-code/qualify',
+  authenticateToken,
+  requireApproved,
+  admitProjectQualificationRateLimitIdentity,
+  projectQualificationLimiter('CLAUDE_CODE'),
+  qualifyProjectChatProviderRoute('CLAUDE_CODE'),
+);
+
+router.post(
+  '/:name/chat/providers/antigravity/qualify',
+  authenticateToken,
+  requireApproved,
+  admitProjectQualificationRateLimitIdentity,
+  projectQualificationLimiter('GEMINI'),
+  qualifyProjectChatProviderRoute('GEMINI'),
+);
+
+router.post(
+  '/:name/chat/providers/agent-zero/qualify',
+  authenticateToken,
+  requireApproved,
+  admitProjectQualificationRateLimitIdentity,
+  projectQualificationLimiter('AGENT_ZERO'),
+  qualifyProjectChatProviderRoute('AGENT_ZERO'),
+);
+
+router.post(
+  '/:name/chat/providers/ollama/qualify',
+  authenticateToken,
+  requireApproved,
+  admitProjectQualificationRateLimitIdentity,
+  projectQualificationLimiter('OLLAMA'),
+  qualifyProjectChatProviderRoute('OLLAMA'),
+);
+
+// POST /api/projects/:name/chat/provider - Select/resume one provider binding
+router.post('/:name/chat/provider', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    const {
+      actorUserId: actorId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      actorId,
+      ownerId,
+      name,
+      projectDir,
+      req.body?.provider,
+    );
+    const currentBindings = await listProjectChatBindings(actorId, executionContext.projectId);
+    const portalSession = await prisma.projectChatSession.findFirst({
+      where: { userId: actorId, projectId: executionContext.projectId },
+      orderBy: { lastActivity: 'desc' },
+    });
+    const initialProvider = normalizeProjectChatProvider(portalSession?.activeProvider || 'OPENCLAW');
+    await ensureProjectChatState({
+      actorUserId: actorId,
+      projectIdentityId: executionContext.projectId,
+      initialProvider: toPersistedProjectChatProvider(initialProvider),
+    });
+    const coordination = await readProjectChatCoordinationState({
+      actorUserId: actorId,
+      projectIdentityId: executionContext.projectId,
+    });
+    if (!coordination.state) throw new Error('Project Chat coordination state is unavailable');
+    const currentProvider = fromPersistedProjectChatProvider(
+      coordination.state.selectedProvider as ProjectChatPersistedProvider,
+    );
+    const switchPlan = planProjectChatProviderSwitch({
+      activeProvider: currentProvider,
+      requestedProvider: provider,
+      boundProviders: currentBindings.map((entry) => entry.provider),
+      qualifiedCapability: buildQualifiedProjectChatProviderCapability(
+        provider,
+        requireProjectQualification(provider, {
+          context: executionContext,
+          egress: buildProjectEgressConfig({ context: executionContext, provider }),
+        }).reason,
+      ),
+    });
+    const bindingInput = {
+      actorUserId: actorId,
+      workspaceOwnerId: ownerId,
+      projectName: name,
+      projectDir,
+      provider,
+      executionContext,
+      model: typeof req.body?.model === 'string' ? normalizePortalModelId(req.body.model) : null,
+    };
+    const existingRequestedBinding = currentBindings.find((entry) => entry.provider === provider) || null;
+    const admitted = await withProjectChatRuntimeAdmission({
+      actorUserId: actorId,
+      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
+      projectIdentityId: executionContext.projectId,
+      provider: coordination.state.selectedProvider as ProjectChatPersistedProvider,
+      runtime: getProjectChatProviderRuntimeDescriptor(provider).runtime,
+      operation: projectChatRuntimeOperationId('switch-provider', provider, bindingInput.model),
+      leaseOwner: PROJECT_CHAT_LEASE_OWNER,
+      expectedVersion: req.body?.stateVersion,
+      leaseDurationMs: PROJECT_CHAT_LEASE_DURATION_MS,
+      requestedProviderAfterSuccess: toPersistedProjectChatProvider(provider),
+    }, async () => {
+      await repairTerminalProjectChatPresentations({
+        actorUserId: actorId,
+        projectIdentityId: executionContext.projectId,
+        limit: 100,
+      });
+      let selectedBinding: Awaited<ReturnType<typeof ensureSelectedProjectChatBinding>>;
+      if (provider === 'OPENCLAW') {
+        prepareProjectLifecycleWorkspace(projectDir);
+        const catalogScope = await ensureOpenClawProjectAgentCatalogScope(executionContext);
+        const openClawModelResolution = await resolveAllowedOpenClawProjectModel(
+          catalogScope.agentId,
+          [
+            bindingInput.model || '',
+            existingRequestedBinding?.model || '',
+            getDefaultModel() || '',
+          ],
+          bindingInput.model || '',
+        );
+        const resolved = await ensureOpenClawProjectRuntime({
+          ...bindingInput,
+          model: existingRequestedBinding?.model || null,
+        });
+        const modelVerification = await verifyAndPersistOpenClawProjectModel({
+          actorUserId: actorId,
+          projectId: executionContext.projectId,
+          portalSessionKey: resolved.identity.sessionId,
+          providerSessionKey: resolved.identity.sessionKey,
+          desiredModel: openClawModelResolution.model,
+        });
+        selectedBinding = {
+          ...resolved,
+          binding: modelVerification.binding,
+          sessionKey: resolved.identity.sessionKey,
+          agentId: resolved.identity.agentId,
+          created: false,
+        };
+      } else {
+        selectedBinding = await ensureSelectedProjectChatBinding(bindingInput);
+      }
+      const { identity, binding } = selectedBinding;
+      await prisma.projectChatSession.upsert({
+        where: { sessionKey: identity.sessionId },
+        update: {
+          activeProvider: provider,
+          runtime: binding.runtime,
+          model: binding.model,
+          status: 'active',
+          lastActivity: new Date(),
+        },
+        create: {
+          userId: actorId,
+          projectId: executionContext.projectId,
+          sessionKey: identity.sessionId,
+          activeProvider: provider,
+          runtime: binding.runtime,
+          model: binding.model,
+          status: 'active',
+        },
+      });
+      return selectedBinding;
+    });
+    const { binding, sessionKey, agentId } = admitted.result;
+
+    res.json({
+      provider,
+      runtime: binding.runtime,
+      sessionKey,
+      agentId,
+      externalSessionId: binding.externalSessionId || sessionKey,
+      model: projectChatClientModel(provider, binding.model),
+      modelValidated: true,
+      modelVerified: provider === 'OPENCLAW' ? true : undefined,
+      modelConfigured: isNativeProjectChatRouteProvider(provider) ? true : undefined,
+      modelWarning: null,
+      resumed: switchPlan.action === 'resume',
+      preservePortalTranscript: switchPlan.preservePortalTranscript,
+      stateVersion: admitted.state.version,
+      executionContext: serializeProjectSandboxContext(executionContext),
+    });
+  } catch (error: any) {
+    if (sendProjectChatProviderError(res, error)) return;
+    if (sendProjectChatCoordinationError(res, error)) return;
+    console.error('[Project Chat Provider Switch] Error:', error?.message || error);
+    res.status(403).json({ error: 'Project sandbox could not be verified' });
+  }
+});
+
+// --- Portal-owned Project Chat transcript routes ---
+
+function toPresentationTerminalStatus(status: ProjectChatTurn['status']) {
+  return status === 'COMPLETED'
+    ? 'completed' as const
+    : status === 'ABORTED'
+      ? 'aborted' as const
+      : status === 'EXPIRED'
+        ? 'expired' as const
+        : 'error' as const;
+}
+
+async function readDurableProjectPresentationEvents(turn: ProjectChatTurn): Promise<{
+  events: ProjectNativeRunEvent[];
+  truncated: boolean;
+}> {
+  const newestFirst = await prisma.projectChatTurnEvent.findMany({
+    where: { turnId: turn.id },
+    // Keep the terminal edge when a very long turn exceeds the bounded
+    // projection window. Final tool results and status are more important to
+    // restart repair than the oldest streaming deltas.
+    orderBy: { seq: 'desc' },
+    take: PROJECT_CHAT_PRESENTATION_EVENT_LIMIT + 1,
+  });
+  const retained = retainNewestProjectChatPresentationEvents(
+    newestFirst,
+    PROJECT_CHAT_PRESENTATION_EVENT_LIMIT,
+  );
+  return {
+    truncated: retained.truncated,
+    events: retained.events.map((event) => {
+    const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
+      ? event.payload as Record<string, unknown>
+      : {};
+    return {
+      ...payload,
+      seq: event.seq,
+      ts: event.createdAt.getTime(),
+      runId: turn.id,
+    } as unknown as ProjectNativeRunEvent;
+    }),
+  };
+}
+
+function terminalProjectTurnContent(
+  turn: ProjectChatTurn,
+  events: readonly ProjectNativeRunEvent[],
+  preferredContent?: string | null,
+  presentation?: ReturnType<typeof buildProjectChatMessagePresentation>,
+): string {
+  const preferred = String(preferredContent || '').trim();
+  if (preferred) return preferred;
+  const terminal = [...events].reverse().find((event) => (
+    (event.type === 'done' || event.type === 'error')
+    && typeof event.content === 'string'
+    && event.content.trim()
+  ));
+  if (terminal?.content) return String(terminal.content);
+  // Presentation projection understands provider snapshot/replace semantics.
+  // Reuse it rather than concatenating raw deltas, which can duplicate an
+  // answer when history repairs after a Portal restart.
+  const text = (presentation?.segments || [])
+    .filter((segment) => segment.kind === 'text')
+    .sort((a, b) => a.order - b.order || a.ts - b.ts)
+    .map((segment) => segment.text)
+    .join('\n\n');
+  if (text.trim()) return text;
+  if (turn.errorMessage) return turn.errorMessage;
+  if (turn.status === 'ABORTED') return 'Turn cancelled.';
+  if (turn.status === 'EXPIRED') return 'Turn interrupted when the Portal lease expired.';
+  return '';
+}
+
+/**
+ * Materialize a terminal assistant record from the durable replay log. This is
+ * intentionally idempotent. Restart repair runs only from a mutating provider
+ * admission; history/status/poll routes remain strict read-only projections.
+ */
+async function materializeTerminalProjectChatAssistant(input: {
+  turn: ProjectChatTurn;
+  preferredContent?: string | null;
+  sessionKey?: string | null;
+  terminalStatus?: 'COMPLETED' | 'ERROR' | 'ABORTED' | 'EXPIRED';
+  expectedHandoffVersion?: number;
+}): Promise<boolean> {
+  const terminalStatus = input.terminalStatus || input.turn.status;
+  if (!['COMPLETED', 'ERROR', 'ABORTED', 'EXPIRED'].includes(terminalStatus)) return false;
+  if (isProjectChatRuntimeAdmissionTurn(input.turn)) return false;
+  const durableReplay = await readDurableProjectPresentationEvents(input.turn);
+  const presentation = buildProjectChatMessagePresentation(durableReplay.events, {
+    terminalStatus: toPresentationTerminalStatus(terminalStatus as ProjectChatTurn['status']),
+    sourceTruncated: durableReplay.truncated,
+  });
+  const terminalTurn = terminalStatus === input.turn.status
+    ? input.turn
+    : { ...input.turn, status: terminalStatus as ProjectChatTurn['status'] };
+  const content = terminalProjectTurnContent(
+    terminalTurn,
+    durableReplay.events,
+    input.preferredContent,
+    presentation,
+  );
+  const deterministicMessageId = `project-turn:${input.turn.id}`;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    try {
+      return await prisma.$transaction(async (transaction) => {
+        const [currentTurn, binding, existingSession] = await Promise.all([
+          transaction.projectChatTurn.findUnique({ where: { id: input.turn.id } }),
+          transaction.projectChatProviderBinding.findUnique({
+            where: {
+              userId_projectId_provider: {
+                userId: input.turn.actorUserId,
+                projectId: input.turn.projectIdentityId,
+                provider: input.turn.provider,
+              },
+            },
+            select: { status: true, handoffVersion: true },
+          }),
+          input.sessionKey
+            ? Promise.resolve(null)
+            : transaction.projectChatSession.findFirst({
+                where: { userId: input.turn.actorUserId, projectId: input.turn.projectIdentityId },
+                orderBy: { lastActivity: 'desc' },
+                select: { sessionKey: true },
+              }),
+        ]);
+        // The durable turn row is the reset tombstone. A successful reset
+        // deletes every prior turn and increments every provider generation in
+        // the same Serializable transaction. Replayed settlement and repair
+        // must therefore prove that both the turn and captured generation are
+        // still current before they may publish an assistant row.
+        if (
+          !currentTurn
+          || currentTurn.actorUserId !== input.turn.actorUserId
+          || currentTurn.projectIdentityId !== input.turn.projectIdentityId
+          || currentTurn.provider !== input.turn.provider
+          || binding?.status === 'reset'
+          || (
+            input.expectedHandoffVersion != null
+            && binding?.handoffVersion !== input.expectedHandoffVersion
+          )
+        ) return false;
+
+        const sessionKey = String(
+          input.sessionKey
+          || existingSession?.sessionKey
+          || input.turn.providerSessionId
+          || `project-turn:${input.turn.id}`,
+        );
+        const legacyProjection = await transaction.projectChatMessage.findFirst({
+          where: {
+            userId: input.turn.actorUserId,
+            projectId: input.turn.projectIdentityId,
+            role: 'assistant',
+            messageId: deterministicMessageId,
+            turnId: null,
+          },
+          select: { id: true },
+        });
+        if (legacyProjection) {
+          await transaction.projectChatMessage.update({
+            where: { id: legacyProjection.id },
+            data: {
+              turnId: input.turn.id,
+              content,
+              presentation: presentation ? presentation as unknown as Prisma.InputJsonValue : Prisma.JsonNull,
+              model: input.turn.model,
+              providerSessionId: input.turn.providerSessionId,
+            },
+          });
+          return true;
+        }
+        await transaction.projectChatMessage.upsert({
+          where: { turnId: input.turn.id },
+          update: {
+            content,
+            presentation: presentation ? presentation as unknown as Prisma.InputJsonValue : Prisma.JsonNull,
+            model: input.turn.model,
+            providerSessionId: input.turn.providerSessionId,
+          },
+          create: {
+            projectId: input.turn.projectIdentityId,
+            userId: input.turn.actorUserId,
+            sessionKey,
+            role: 'assistant',
+            content,
+            messageId: deterministicMessageId,
+            turnId: input.turn.id,
+            presentation: presentation ? presentation as unknown as Prisma.InputJsonValue : undefined,
+            provider: input.turn.provider,
+            runtime: input.turn.runtime,
+            model: input.turn.model,
+            providerSessionId: input.turn.providerSessionId,
+          },
+        });
+        return true;
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    } catch (error) {
+      if (
+        !(error instanceof Prisma.PrismaClientKnownRequestError)
+        || error.code !== 'P2034'
+        || attempt === 4
+      ) throw error;
+    }
+  }
+  return false;
+}
+
+async function markProjectTurnPresentationMaterialized(turn: ProjectChatTurn): Promise<void> {
+  const metadata = turn.resultMetadata && typeof turn.resultMetadata === 'object' && !Array.isArray(turn.resultMetadata)
+    ? turn.resultMetadata as Record<string, unknown>
+    : {};
+  await prisma.projectChatTurn.update({
+    where: { id: turn.id },
+    data: {
+      resultMetadata: {
+        ...metadata,
+        presentationMaterialized: true,
+      } as Prisma.InputJsonValue,
+    },
+  });
+}
+
+async function repairTerminalProjectChatPresentations(input: {
+  actorUserId: string;
+  projectIdentityId: string;
+  limit: number;
+}): Promise<void> {
+  const turns = await prisma.projectChatTurn.findMany({
+    where: {
+      actorUserId: input.actorUserId,
+      projectIdentityId: input.projectIdentityId,
+      status: { in: ['COMPLETED', 'ERROR', 'ABORTED', 'EXPIRED'] },
+      NOT: { requestId: { startsWith: PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX } },
+    },
+    orderBy: { createdAt: 'desc' },
+    take: input.limit,
+  });
+  if (turns.length === 0) return;
+  const existing = await prisma.projectChatMessage.findMany({
+    where: { turnId: { in: turns.map((turn) => turn.id) } },
+    select: { turnId: true, content: true, sessionKey: true, presentation: true },
+  });
+  const materialized = new Map(
+    existing
+      .filter((message): message is typeof message & { turnId: string } => Boolean(message.turnId))
+      .map((message) => [message.turnId, message]),
+  );
+  for (const turn of turns.reverse()) {
+    const message = materialized.get(turn.id);
+    const presentation = parseProjectChatMessagePresentation(message?.presentation);
+    if (shouldRepairProjectChatPresentation({
+      resultMetadata: turn.resultMetadata,
+      presentation,
+    })) {
+      const repaired = await materializeTerminalProjectChatAssistant({
+        turn,
+        preferredContent: message?.content,
+        sessionKey: message?.sessionKey,
+      });
+      if (repaired) await markProjectTurnPresentationMaterialized(turn);
+    }
+  }
+}
+
+async function settleProjectChatTurnWithPresentation(input: {
+  turn: ProjectChatTurn;
+  leaseToken: string;
+  providerStatus: 'completed' | 'error' | 'aborted';
+  providerSessionId: string;
+  providerError?: string | null;
+  providerDispatchObserved?: boolean;
+  durableEventFailure?: unknown;
+  durableEventCount: number;
+  sessionKey: string;
+  preferredContent?: string | null;
+  handoff: {
+    expectedCursor: number;
+    expectedHandoffVersion: number;
+  };
+}): Promise<void> {
+  const requestedStatus = input.durableEventFailure
+    ? 'ERROR' as const
+    : input.providerStatus === 'completed'
+      ? 'COMPLETED' as const
+      : input.providerStatus === 'aborted'
+      ? 'ABORTED' as const
+      : 'ERROR' as const;
+  let assistantProjection: ProjectChatAssistantProjection;
+  let projectionPreparationFailed = false;
+  try {
+    const durableReplay = await readDurableProjectPresentationEvents(input.turn);
+    const presentation = buildProjectChatMessagePresentation(durableReplay.events, {
+      terminalStatus: toPresentationTerminalStatus(requestedStatus),
+      sourceTruncated: durableReplay.truncated,
+    });
+    assistantProjection = {
+      sessionKey: input.sessionKey,
+      messageId: `project-turn:${input.turn.id}`,
+      content: terminalProjectTurnContent(
+        { ...input.turn, status: requestedStatus },
+        durableReplay.events,
+        input.preferredContent,
+        presentation,
+      ),
+      presentation: presentation as unknown as Prisma.InputJsonValue,
+    };
+  } catch (error) {
+    projectionPreparationFailed = true;
+    console.error('[Project Chat] Terminal projection preparation failed:', error);
+    assistantProjection = {
+      sessionKey: input.sessionKey,
+      messageId: `project-turn:${input.turn.id}`,
+      content: PROJECT_NATIVE_SETTLEMENT_FAILURE_MESSAGE,
+    };
+  }
+
+  const settlementStatus = input.durableEventFailure || projectionPreparationFailed ? 'ERROR' : requestedStatus;
+  const settlementError = input.durableEventFailure
+    ? 'Project Chat replay persistence failed before the provider turn completed.'
+    : projectionPreparationFailed
+      ? 'Project Chat terminal presentation could not be materialized; history recovery will retry.'
+      : input.providerError || null;
+  let durableSettlementStatus: string = settlementStatus;
+  try {
+    const settled = await finishProjectChatTurn({
+      actorUserId: input.turn.actorUserId,
+      projectIdentityId: input.turn.projectIdentityId,
+      turnId: input.turn.id,
+      leaseToken: input.leaseToken,
+      status: settlementStatus,
+      providerSessionId: input.providerSessionId,
+      assistantProjection,
+      resultMetadata: {
+        durableEventCount: input.durableEventCount,
+        providerStatus: input.providerStatus,
+        presentationMaterialized: true,
+        ...(input.providerDispatchObserved ? {
+          providerDispatchStage: PROJECT_CHAT_DISPATCH_STAGE_ACCEPTED,
+          providerDispatchAcceptedAt: new Date().toISOString(),
+        } : {}),
+      },
+      errorCode: input.durableEventFailure
+        ? 'REPLAY_PERSISTENCE_FAILED'
+        : projectionPreparationFailed
+          ? 'PRESENTATION_PERSISTENCE_FAILED'
+          : input.providerStatus === 'error'
+            ? 'PROVIDER_ERROR'
+            : null,
+      errorMessage: settlementError,
+      handoff: {
+        provider: input.turn.provider as ProjectChatPersistedProvider,
+        expectedHandoffVersion: input.handoff.expectedHandoffVersion,
+        expectedCursor: input.handoff.expectedCursor,
+      },
+    });
+    durableSettlementStatus = settled.status;
+  } catch (error) {
+    console.error('[Project Chat] Durable settlement failed; attempting terminal reconciliation:', error);
+    try {
+      const reconciled = await finishProjectChatTurn({
+        actorUserId: input.turn.actorUserId,
+        projectIdentityId: input.turn.projectIdentityId,
+        turnId: input.turn.id,
+        leaseToken: input.leaseToken,
+        status: 'ERROR',
+        providerSessionId: input.providerSessionId,
+        assistantProjection: {
+          sessionKey: input.sessionKey,
+          messageId: `project-turn:${input.turn.id}`,
+          content: PROJECT_NATIVE_SETTLEMENT_FAILURE_MESSAGE,
+        },
+        handoff: {
+          provider: input.turn.provider as ProjectChatPersistedProvider,
+          expectedHandoffVersion: input.handoff.expectedHandoffVersion,
+          expectedCursor: input.handoff.expectedCursor,
+        },
+        resultMetadata: {
+          durableEventCount: input.durableEventCount,
+          providerStatus: input.providerStatus,
+          presentationMaterialized: true,
+          settlementReconciled: true,
+          ...(input.providerDispatchObserved ? {
+            providerDispatchStage: PROJECT_CHAT_DISPATCH_STAGE_ACCEPTED,
+            providerDispatchAcceptedAt: new Date().toISOString(),
+          } : {}),
+        },
+        errorCode: 'SETTLEMENT_PERSISTENCE_FAILED',
+        errorMessage: PROJECT_NATIVE_SETTLEMENT_FAILURE_MESSAGE,
+      });
+      durableSettlementStatus = reconciled.status;
+    } catch (reconciliationError) {
+      console.error('[Project Chat] Terminal settlement reconciliation failed:', reconciliationError);
+      throw new Error(PROJECT_NATIVE_SETTLEMENT_FAILURE_MESSAGE);
+    }
+  }
+
+  if (input.providerStatus === 'completed' && durableSettlementStatus !== 'COMPLETED') {
+    throw new Error(PROJECT_NATIVE_SETTLEMENT_FAILURE_MESSAGE);
+  }
+}
 
 // GET /api/projects/:name/chat/history - Load persisted chat messages for this project+user
 router.get('/:name/chat/history', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
-    const userId = ownerId;
-    const projectDir = getProjectPath(userId, name);
+    const {
+      actorUserId: userId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-    const { sessionId: sessionKey } = await ensureProjectAssistantIdentity(projectDir, userId, name);
-    
-    const messages = await prisma.projectChatMessage.findMany({
-      where: { userId, sessionKey },
-      orderBy: { timestamp: 'asc' },
-      take: 500, // Limit to last 500 messages
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      userId,
+      ownerId,
+      name,
+      projectDir,
+      req.query.provider,
+      { requireQualification: false, readOnly: true },
+    );
+    // Preview-era UUID rows can still contain unmatched Portal 3.x SQL residue.
+    // Do not expose any transcript until the authoritative Gateway import has
+    // either quarantined that ambiguity or proven the identity unaffected.
+    await assertLegacyOpenClawProjectMigrationInactive(executionContext.projectId);
+    const bindingRead = await readExistingProjectChatBinding({
+      actorUserId: userId,
+      provider,
+      executionContext,
     });
-    
+    const { binding } = bindingRead;
+
+    const requestedLimit = req.query.limit == null ? 100 : Number(req.query.limit);
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) {
+      res.status(400).json({ error: 'Project Chat history limit must be between 1 and 100' });
+      return;
+    }
+    const beforeId = String(req.query.before || '').trim() || null;
+    if (beforeId) {
+      const cursor = await prisma.projectChatMessage.findFirst({
+        where: { id: beforeId, userId, projectId: executionContext.projectId },
+        select: { id: true },
+      });
+      if (!cursor) { res.status(400).json({ error: 'Project Chat history cursor is invalid' }); return; }
+    }
+
+    const historyPage = await prisma.projectChatMessage.findMany({
+      where: { userId, projectId: executionContext.projectId },
+      orderBy: [{ timestamp: 'desc' }, { sourceSortKey: 'desc' }, { id: 'desc' }],
+      take: requestedLimit + 1,
+      ...(beforeId ? { cursor: { id: beforeId }, skip: 1 } : {}),
+    });
+    const hasMore = historyPage.length > requestedLimit;
+    const messages = historyPage.slice(0, requestedLimit).reverse();
+
     // Get session status
-    const session = await prisma.projectChatSession.findUnique({
-      where: { sessionKey },
-    });
-    
-    res.json({ 
-      messages: messages.map(m => ({
-        id: m.id,
-        role: m.role,
-        content: m.content,
-        timestamp: m.timestamp.toISOString(),
-        messageId: m.messageId,
-      })),
+    const session = bindingRead.portalSession;
+
+    res.json({
+      messages: messages.map((m) => {
+        const presentation = parseProjectChatMessagePresentation(m.presentation);
+        return {
+          id: m.id,
+          role: m.role,
+          content: m.content,
+          timestamp: m.timestamp.toISOString(),
+          messageId: m.messageId,
+          provider: m.provider,
+          runtime: m.runtime,
+          model: projectChatClientModel(
+            normalizeProjectChatProvider(m.provider || provider),
+            m.model,
+          ),
+          providerSessionId: m.providerSessionId,
+          turnId: m.turnId,
+          ...(presentation?.thinkingContent ? { thinkingContent: presentation.thinkingContent } : {}),
+          ...(presentation?.toolCalls ? { toolCalls: presentation.toolCalls } : {}),
+          ...(presentation?.segments ? { segments: presentation.segments } : {}),
+          ...(presentation?.truncated ? { presentationTruncated: true } : {}),
+        };
+      }),
+      pagination: {
+        hasMore,
+        nextCursor: hasMore ? messages[0]?.id || null : null,
+        limit: requestedLimit,
+      },
       session: session ? {
         status: session.status,
-        model: session.model,
+        model: projectChatClientModel(provider, session.model),
+        activeProvider: session.activeProvider,
+        runtime: session.runtime,
         lastActivity: session.lastActivity.toISOString(),
+      } : binding ? {
+        status: binding.status,
+        model: projectChatClientModel(provider, binding.model),
+        activeProvider: provider,
+        runtime: binding.runtime,
+        lastActivity: binding.lastActivity.toISOString(),
+      } : {
+        status: 'uninitialized',
+        model: null,
+        activeProvider: provider,
+        runtime: null,
+        lastActivity: null,
+      },
+      activeBinding: binding ? {
+        provider,
+        runtime: binding.runtime,
+        sessionKey: binding.sessionKey,
+        externalSessionId: binding.externalSessionId,
+        model: projectChatClientModel(provider, binding.model),
       } : null,
+      executionContext: serializeProjectSandboxContext(executionContext),
     });
   } catch (error: any) {
+    if (sendProjectChatProviderError(res, error)) return;
     console.error('[Chat History] Error:', error.message);
     res.status(500).json({ error: 'Failed to load chat history' });
   }
 });
 
-// POST /api/projects/:name/chat/message - Save a chat message
-router.post('/:name/chat/message', authenticateToken, requireApproved, async (req: Request, res: Response) => {
-  try {
-    const ownerId = await getScopedOwnerId(req);
-    const { name } = req.params;
-    const userId = ownerId;
-    const projectDir = getProjectPath(userId, name);
-    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-    const { sessionId: sessionKey } = await ensureProjectAssistantIdentity(projectDir, userId, name);
-    const { role, content, messageId } = req.body;
-    
-    if (!role || !content) {
-      res.status(400).json({ error: 'role and content required' });
-      return;
-    }
-    
-    const message = await prisma.projectChatMessage.create({
-      data: {
-        projectId: name,
-        userId,
-        sessionKey,
-        role,
-        content,
-        messageId: messageId || null,
-      },
-    });
-    
-    // Upsert session record
-    await prisma.projectChatSession.upsert({
-      where: { sessionKey },
-      update: { 
-        status: 'active',
-        lastActivity: new Date(),
-      },
-      create: {
-        userId,
-        projectId: name,
-        sessionKey,
-        status: 'active',
-      },
-    });
-    
-    res.json({ id: message.id, timestamp: message.timestamp.toISOString() });
-  } catch (error: any) {
-    console.error('[Chat Message] Error:', error.message);
-    res.status(500).json({ error: 'Failed to save message' });
-  }
+// These browser-written transcript endpoints predate durable Project turns.
+// They bypassed the state-version CAS and provider runtime admission, so they
+// are fixed tombstones rather than compatibility write paths. User messages
+// are persisted only by /assistant/send when admission is promoted atomically.
+router.post('/:name/chat/message', authenticateToken, requireApproved, (_req: Request, res: Response) => {
+  res.status(410).json({
+    error: 'Direct Project Chat transcript writes are retired. Send through /assistant/send.',
+    code: 'PROJECT_CHAT_DIRECT_TRANSCRIPT_WRITE_RETIRED',
+  });
 });
 
-// POST /api/projects/:name/chat/messages - Batch save multiple messages
-router.post('/:name/chat/messages', authenticateToken, requireApproved, async (req: Request, res: Response) => {
-  try {
-    const ownerId = await getScopedOwnerId(req);
-    const { name } = req.params;
-    const userId = ownerId;
-    const projectDir = getProjectPath(userId, name);
-    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-    const { sessionId: sessionKey } = await ensureProjectAssistantIdentity(projectDir, userId, name);
-    const { messages } = req.body;
-    
-    if (!Array.isArray(messages) || messages.length === 0) {
-      res.status(400).json({ error: 'messages array required' });
-      return;
-    }
-    
-    const created = await prisma.projectChatMessage.createMany({
-      data: messages.map((m: any) => ({
-        projectId: name,
-        userId,
-        sessionKey,
-        role: m.role,
-        content: m.content,
-        messageId: m.messageId || null,
-        timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
-      })),
-    });
-    
-    res.json({ count: created.count });
-  } catch (error: any) {
-    console.error('[Chat Messages Batch] Error:', error.message);
-    res.status(500).json({ error: 'Failed to save messages' });
-  }
+router.post('/:name/chat/messages', authenticateToken, requireApproved, (_req: Request, res: Response) => {
+  res.status(410).json({
+    error: 'Direct Project Chat transcript writes are retired. Send through /assistant/send.',
+    code: 'PROJECT_CHAT_DIRECT_TRANSCRIPT_WRITE_RETIRED',
+  });
 });
+
+function projectChatResetNotQuiescent(message: string): ProjectChatLeaseError {
+  return new ProjectChatLeaseError('TURN_ACTIVE', message, 409);
+}
+
+async function quiesceProjectChatBrokerCallbacksForDestructiveReset(input: {
+  actorUserId: string;
+  projectIdentityId: string;
+}): Promise<void> {
+  for (const provider of QUALIFIABLE_PROJECT_PROVIDERS) {
+    const result = await quiesceProjectNativeRunForDestructiveReset({
+      userId: input.actorUserId,
+      projectId: input.projectIdentityId,
+      provider,
+    });
+    if (!result.quiescent) {
+      throw projectChatResetNotQuiescent(
+        `The ${projectChatProviderDisplayName(provider)} Project callback boundary is still active; no data was cleared.`,
+      );
+    }
+  }
+}
+
+const PROJECT_CHAT_RESET_ACTORLESS_RESOURCE_KINDS = new Set([
+  'AGENT_ZERO_NETWORK',
+  'AGENT_ZERO_FIREWALL',
+  'AGENT_ZERO_CREDENTIAL',
+]);
+
+function assertProjectRuntimeCleanupResourcesForReset(input: {
+  provider: ProjectChatRouteProvider;
+  actorUserId: string;
+  projectIdentityId: string;
+  resources: readonly ProjectRuntimeResource[];
+}): void {
+  for (const resource of input.resources) {
+    const exactProjectGlobal = resource.actorUserId === null
+      && PROJECT_CHAT_RESET_ACTORLESS_RESOURCE_KINDS.has(resource.kind);
+    if (
+      resource.provider !== input.provider
+      || resource.projectIdentityId !== input.projectIdentityId
+      || (resource.actorUserId !== input.actorUserId && !exactProjectGlobal)
+    ) {
+      throw projectChatResetNotQuiescent(
+        `${projectChatProviderDisplayName(input.provider)} cleanup crossed the authenticated Project boundary.`,
+      );
+    }
+  }
+}
+
+async function cleanupProjectRuntimeAdapterMatrixForDestructiveReset(input: {
+  actorUserId: string;
+  cleanupScope: ProjectRuntimeCleanupScope;
+  providers: readonly ProjectChatRouteProvider[];
+  snapshots?: ReadonlyMap<ProjectChatRouteProvider, readonly ProjectRuntimeResource[]>;
+}): Promise<ReadonlyMap<ProjectChatRouteProvider, readonly ProjectRuntimeResource[]>> {
+  const snapshots = new Map<ProjectChatRouteProvider, readonly ProjectRuntimeResource[]>();
+  const enumerated = input.snapshots
+    ? input.providers.map((provider) => ({
+      provider,
+      resources: input.snapshots!.get(provider) || [],
+    }))
+    : await Promise.all(input.providers.map(async (provider) => ({
+      provider,
+      resources: await PROJECT_RUNTIME_CLEANUP_ADAPTERS[provider].enumerate(input.cleanupScope),
+    })));
+  // Attest every provider snapshot before the first external mutation. A
+  // malformed later provider can therefore never leave an earlier provider
+  // partially deleted under a cleanup scope that was not fully proven.
+  for (const entry of enumerated) {
+    assertProjectRuntimeCleanupResourcesForReset({
+      provider: entry.provider,
+      actorUserId: input.actorUserId,
+      projectIdentityId: input.cleanupScope.projectIdentity.id,
+      resources: entry.resources,
+    });
+    snapshots.set(entry.provider, entry.resources);
+  }
+  for (const provider of input.providers) {
+    const adapter = PROJECT_RUNTIME_CLEANUP_ADAPTERS[provider];
+    await adapter.cleanup(input.cleanupScope, snapshots.get(provider) || []);
+    const remaining = await adapter.verifyClean(input.cleanupScope);
+    if (remaining.length !== 0) {
+      throw projectChatResetNotQuiescent(
+        `${projectChatProviderDisplayName(provider)} runtime cleanup could not be verified.`,
+      );
+    }
+  }
+  return snapshots;
+}
+
+async function convergeProjectChatTurnForDestructiveReset(input: {
+  actorUserId: string;
+  projectIdentityId: string;
+  executionContext: ProjectSandboxExecutionContext;
+  coordination: Awaited<ReturnType<typeof requireSelectedProjectChatState>>;
+}) {
+  const activeTurn = input.coordination.activeTurn;
+  if (!activeTurn) return input.coordination.state!;
+  if (isProjectChatRuntimeAdmissionTurn(activeTurn)) {
+    if (
+      activeTurn.leaseExpiresAt.getTime() > Date.now()
+      || !projectChatLeaseOwnerCanBeRecoveredByDestructiveReset(activeTurn.leaseOwner)
+    ) {
+      throw projectChatResetNotQuiescent(
+        'Another Project Chat runtime operation is still active; retry reset after it finishes.',
+      );
+    }
+    const legacyIdentity = await ensureProjectAssistantIdentity(
+      input.executionContext.canonicalRoot,
+      input.actorUserId,
+      input.executionContext.projectName,
+      { workspaceOwnerId: input.executionContext.workspaceOwnerId },
+    );
+    await terminateProjectChatBindingsForDestructiveReset({
+      actorUserId: input.actorUserId,
+      projectIdentityId: input.projectIdentityId,
+      legacyProjectId: input.executionContext.projectName,
+      executionContext: input.executionContext,
+      exactServerOwnedOpenClawSessionKeys: [
+        legacyIdentity.sessionKey,
+        `agent:portal:${legacyIdentity.sessionId}`,
+      ],
+    });
+    await recoverExpiredProjectChatRuntimeAdmissionForDestructiveReset({
+      actorUserId: input.actorUserId,
+      projectIdentityId: input.projectIdentityId,
+      turnId: activeTurn.id,
+      expectedVersion: input.coordination.state!.version,
+    });
+    const recovered = await readProjectChatCoordinationState({
+      actorUserId: input.actorUserId,
+      projectIdentityId: input.projectIdentityId,
+      recoverStale: false,
+    });
+    if (!recovered.state || recovered.activeTurn) {
+      throw projectChatResetNotQuiescent(
+        'Expired Project Chat runtime admission did not converge after provider termination.',
+      );
+    }
+    return recovered.state;
+  }
+  const provider = fromPersistedProjectChatProvider(activeTurn.provider as ProjectChatPersistedProvider);
+  if (!isQualifiableProjectProvider(provider)) {
+    throw projectChatResetNotQuiescent('The active Project provider cannot prove a safe abort path.');
+  }
+  const binding = await prisma.projectChatProviderBinding.findUnique({
+    where: {
+      userId_projectId_provider: {
+        userId: input.actorUserId,
+        projectId: input.projectIdentityId,
+        provider: activeTurn.provider,
+      },
+    },
+  });
+  const boundSessions = new Set(
+    [binding?.sessionKey, binding?.externalSessionId]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean),
+  );
+  if (
+    !binding
+    || binding.runtime !== activeTurn.runtime
+    || !activeTurn.providerSessionId
+    || !boundSessions.has(activeTurn.providerSessionId)
+  ) {
+    throw projectChatResetNotQuiescent(
+      'The active Project turn does not match an attested provider session; reset was not attempted.',
+    );
+  }
+  const activeProviderSessionId = activeTurn.providerSessionId;
+
+  await requestProjectChatTurnAbort({
+    actorUserId: input.actorUserId,
+    projectIdentityId: input.projectIdentityId,
+    turnId: activeTurn.id,
+    expectedProvider: activeTurn.provider as ProjectChatPersistedProvider,
+  });
+
+  const rawSnapshot = getProjectNativeRunSnapshot({
+    userId: input.actorUserId,
+    projectId: input.projectIdentityId,
+    provider,
+  });
+  const snapshot = matchingProjectNativeSnapshot(activeTurn, rawSnapshot);
+  if (rawSnapshot?.active && !snapshot) {
+    throw projectChatResetNotQuiescent(
+      'The process-local Project callback belongs to a different durable turn; no data was cleared.',
+    );
+  }
+  await requireConfirmedProjectChatAbortForReset({
+    hasExactBrokerRun: Boolean(snapshot?.runId),
+    abortBroker: () => abortProjectNativeRun({
+      userId: input.actorUserId,
+      projectId: input.projectIdentityId,
+      provider,
+    }),
+    waitForBrokerSettlement: () => snapshot?.runId
+      ? waitForProjectNativeRunSettlement({
+        userId: input.actorUserId,
+        projectId: input.projectIdentityId,
+        provider,
+        runId: snapshot.runId,
+      })
+      : Promise.resolve(false),
+    abortProvider: async () => {
+      if (!snapshot?.runId) {
+        // After a process crash no process-local callback can prove whether a
+        // provider request is still alive (including legacy turns without a
+        // dispatch-stage marker). Destructive reset already intends to retire
+        // this exact attested binding, so terminating that session is the only
+        // truthful absence proof that can release the quarantine. Every
+        // provider goes through its immutable-label cleanup adapter: deleting
+        // a session record alone cannot stop a Gateway/CLI process after a
+        // backend restart.
+        const legacyIdentity = await ensureProjectAssistantIdentity(
+          input.executionContext.canonicalRoot,
+          input.actorUserId,
+          input.executionContext.projectName,
+          { workspaceOwnerId: input.executionContext.workspaceOwnerId },
+        );
+        await terminateProjectChatBindingsForDestructiveReset({
+          actorUserId: input.actorUserId,
+          projectIdentityId: input.projectIdentityId,
+          legacyProjectId: input.executionContext.projectName,
+          executionContext: input.executionContext,
+          exactServerOwnedOpenClawSessionKeys: [
+            legacyIdentity.sessionKey,
+            `agent:portal:${legacyIdentity.sessionId}`,
+          ],
+        });
+        return true;
+      }
+      return await getProjectChatProviderAdapter(provider).abortActiveRun?.(
+        activeProviderSessionId,
+        activeTurn.id,
+      ) === true;
+    },
+    isTurnStillActive: async () => Boolean((await readProjectChatCoordinationState({
+      actorUserId: input.actorUserId,
+      projectIdentityId: input.projectIdentityId,
+      recoverStale: false,
+    })).activeTurn),
+  });
+
+  await confirmProjectChatTurnAbort({
+    actorUserId: input.actorUserId,
+    projectIdentityId: input.projectIdentityId,
+    turnId: activeTurn.id,
+    expectedProvider: activeTurn.provider as ProjectChatPersistedProvider,
+    providerSessionId: activeProviderSessionId,
+  });
+  const quiescent = await readProjectChatCoordinationState({
+    actorUserId: input.actorUserId,
+    projectIdentityId: input.projectIdentityId,
+    recoverStale: false,
+  });
+  if (!quiescent.state || quiescent.activeTurn) {
+    throw projectChatResetNotQuiescent(
+      'Project Chat cancellation did not release its durable turn; no data was cleared.',
+    );
+  }
+  return quiescent.state;
+}
+
+async function terminateProjectChatBindingsForDestructiveReset(input: {
+  actorUserId: string;
+  projectIdentityId: string;
+  legacyProjectId: string;
+  executionContext: ProjectSandboxExecutionContext;
+  exactServerOwnedOpenClawSessionKeys: readonly string[];
+}) {
+  const projectIds = Array.from(new Set([
+    input.projectIdentityId,
+    input.legacyProjectId,
+  ]));
+  const bindings = await prisma.projectChatProviderBinding.findMany({
+    where: { userId: input.actorUserId, projectId: { in: projectIds } },
+  });
+  const sessions = await prisma.projectChatSession.findMany({
+    where: { userId: input.actorUserId, projectId: { in: projectIds } },
+  });
+  const projectIdentity = await prisma.projectIdentity.findUnique({
+    where: { id: input.projectIdentityId },
+  });
+  if (
+    !projectIdentity
+    || projectIdentity.lifecycleStatus !== 'ACTIVE'
+    || projectIdentity.workspaceOwnerId !== input.executionContext.workspaceOwnerId
+    || projectIdentity.projectName !== input.executionContext.projectName
+    || projectIdentity.canonicalRoot !== input.executionContext.canonicalRoot
+    || projectIdentity.rootDevice !== input.executionContext.rootDevice
+    || projectIdentity.rootInode !== input.executionContext.rootInode
+    || projectIdentity.rootBirthtimeNs !== input.executionContext.rootBirthtimeNs
+  ) {
+    throw projectChatResetNotQuiescent(
+      'The immutable Project identity changed before provider cleanup; no data was cleared.',
+    );
+  }
+  const openClawSessionKey = deriveOpenClawProjectSessionKey(input.executionContext);
+  const nativeQuery = {
+    projectIdentityId: input.executionContext.projectId,
+    canonicalRoot: input.executionContext.canonicalRoot,
+    rootDevice: input.executionContext.rootDevice,
+    rootInode: input.executionContext.rootInode,
+    rootBirthtimeNs: input.executionContext.rootBirthtimeNs,
+  };
+  const nativeSessions = new Map<NativeProjectChatRouteProvider, ReturnType<typeof listNativeProjectSessions>>();
+  // Enumerate and attest every allowed identity before the first external
+  // mutation. A corrupt binding must never be able to point reset at another
+  // actor/project's provider session.
+  for (const provider of PROJECT_CHAT_ROUTE_PROVIDERS) {
+    if (provider === 'OPENCLAW') continue;
+    const sessions = listNativeProjectSessions(provider, nativeQuery);
+    if (sessions.some((session) => session.userId !== input.actorUserId)) {
+      throw projectChatResetNotQuiescent(
+        `The ${projectChatProviderDisplayName(provider)} Project session actor does not match reset ownership.`,
+      );
+    }
+    nativeSessions.set(provider, sessions);
+  }
+  const cleanupScope: ProjectRuntimeCleanupScope = Object.freeze({
+    authenticatedActorId: input.actorUserId,
+    workspaceOwnerId: input.executionContext.workspaceOwnerId,
+    projectIdentity: Object.freeze(projectIdentity),
+    knownActorIds: Object.freeze([input.actorUserId]),
+    bindings: Object.freeze(bindings.map((binding) => ({
+      id: binding.id,
+      userId: binding.userId,
+      projectId: binding.projectId,
+      provider: binding.provider,
+      runtime: binding.runtime,
+      sessionKey: binding.sessionKey,
+      externalSessionId: binding.externalSessionId,
+      status: binding.status,
+    }))),
+    sessions: Object.freeze(sessions.map((session) => ({
+      id: session.id,
+      userId: session.userId,
+      projectId: session.projectId,
+      sessionKey: session.sessionKey,
+      activeProvider: session.activeProvider,
+      runtime: session.runtime,
+      status: session.status,
+    }))),
+    activeTurns: Object.freeze([]),
+  });
+  // Enumerate the full provider matrix before the first mutation. Session-file
+  // deletion is not a stop proof after a backend restart; these adapters also
+  // attest and remove Gateway runs, persistent CLI containers, credentials,
+  // and provider singleton reservations.
+  const cleanupSnapshots = new Map<ProjectChatRouteProvider, readonly ProjectRuntimeResource[]>();
+  const enumerated = await Promise.all(PROJECT_CHAT_ROUTE_PROVIDERS.map(async (provider) => ({
+    provider,
+    resources: await PROJECT_RUNTIME_CLEANUP_ADAPTERS[provider].enumerate(cleanupScope),
+  })));
+  for (const entry of enumerated) {
+    assertProjectRuntimeCleanupResourcesForReset({
+      provider: entry.provider,
+      actorUserId: input.actorUserId,
+      projectIdentityId: input.projectIdentityId,
+      resources: entry.resources,
+    });
+    cleanupSnapshots.set(entry.provider, entry.resources);
+  }
+
+  for (const session of sessions) {
+    const provider = fromPersistedProjectChatProvider(session.activeProvider as ProjectChatPersistedProvider);
+    if (!isQualifiableProjectProvider(provider) || !isProjectChatRouteProvider(provider)) {
+      throw projectChatResetNotQuiescent(
+        `The ${session.activeProvider} legacy Project session has no qualified termination path.`,
+      );
+    }
+    if (session.runtime !== getProjectChatProviderRuntimeDescriptor(provider).runtime) {
+      throw projectChatResetNotQuiescent(
+        `The ${projectChatProviderDisplayName(provider)} legacy Project session runtime does not match reset ownership.`,
+      );
+    }
+  }
+
+  for (const binding of bindings) {
+    const provider = fromPersistedProjectChatProvider(binding.provider as ProjectChatPersistedProvider);
+    if (!isQualifiableProjectProvider(provider) || !isProjectChatRouteProvider(provider)) {
+      throw projectChatResetNotQuiescent(
+        `The ${binding.provider} Project binding has no qualified termination path.`,
+      );
+    }
+    if (binding.runtime !== getProjectChatProviderRuntimeDescriptor(provider).runtime) {
+      throw projectChatResetNotQuiescent(
+        `The ${projectChatProviderDisplayName(provider)} Project binding runtime does not match reset ownership.`,
+      );
+    }
+    const sessionIds = Array.from(new Set(
+      [binding.sessionKey, binding.externalSessionId]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    ));
+    if (provider === 'OPENCLAW') continue;
+    const allowedSessionIds = new Set(
+      (nativeSessions.get(provider) || []).map((session) => session.sessionId),
+    );
+    const unattestedSessionIds = sessionIds.filter((sessionId) => !allowedSessionIds.has(sessionId));
+    const safelyAbsentNativeIds = unattestedSessionIds
+      .filter((sessionId) => !nativeSessionArtifactsPresent(provider, sessionId));
+    const safelyAbsent = new Set(safelyAbsentNativeIds);
+    if (unattestedSessionIds.some((sessionId) => !safelyAbsent.has(sessionId))) {
+      throw projectChatResetNotQuiescent(
+        `The ${projectChatProviderDisplayName(provider)} Project binding session does not match immutable reset ownership.`,
+      );
+    }
+  }
+  try {
+    await retireLegacyOpenClawProjectRuntime({
+      actorUserId: input.actorUserId,
+      targetProjectIds: projectIds,
+      targetCanonicalRoot: input.executionContext.canonicalRoot,
+      exactServerOwnedSessionKeys: Array.from(new Set([
+        openClawSessionKey,
+        ...input.exactServerOwnedOpenClawSessionKeys,
+      ])),
+      adapterOwnedSessionKeys: [openClawSessionKey],
+    });
+  } catch {
+    throw projectChatResetNotQuiescent(
+      'Legacy OpenClaw Project runtime cleanup could not be safely verified.',
+    );
+  }
+  await cleanupProjectRuntimeAdapterMatrixForDestructiveReset({
+    actorUserId: input.actorUserId,
+    cleanupScope,
+    providers: PROJECT_CHAT_ROUTE_PROVIDERS,
+    snapshots: cleanupSnapshots,
+  });
+  for (const provider of nativeSessions.keys()) {
+    for (const session of nativeSessions.get(provider) || []) {
+      if (nativeSessionArtifactsPresent(provider, session.sessionId)) {
+        throw projectChatResetNotQuiescent(
+          `The ${projectChatProviderDisplayName(provider)} Project session artifacts remain after runtime cleanup.`,
+        );
+      }
+    }
+    if (listNativeProjectSessions(provider, nativeQuery).length !== 0) {
+      throw projectChatResetNotQuiescent(
+        `The ${projectChatProviderDisplayName(provider)} Project session cleanup could not be verified.`,
+      );
+    }
+  }
+  return { bindings, sessions };
+}
+
+async function performProjectChatDestructiveReset(input: {
+  actorUserId: string;
+  actorAuthorizationVersion: number;
+  workspaceOwnerId: string;
+  projectName: string;
+  projectDir: string;
+  provider: AgentProviderName;
+  executionContext: ProjectSandboxExecutionContext;
+  expectedVersion: unknown;
+}) {
+  // Clear retires exact OpenClaw registrations even when a native provider is
+  // currently selected, so every provider path must honor the import gate.
+  await assertLegacyOpenClawProjectDestructiveMutationSafe();
+  await assertLegacyOpenClawProjectMigrationInactive(input.executionContext.projectId);
+  const coordination = await requireSelectedProjectChatState({
+    actorUserId: input.actorUserId,
+    projectIdentityId: input.executionContext.projectId,
+    provider: input.provider,
+    expectedVersion: input.expectedVersion,
+  });
+  await convergeProjectChatTurnForDestructiveReset({
+    actorUserId: input.actorUserId,
+    projectIdentityId: input.executionContext.projectId,
+    executionContext: input.executionContext,
+    coordination,
+  });
+  // Durable recovery can detach or expire a turn before its provider promise
+  // finishes onComplete/onError/onSettled. Quiesce every exact in-memory run,
+  // not merely the turn still named by ProjectChatState.activeTurnId.
+  await quiesceProjectChatBrokerCallbacksForDestructiveReset({
+    actorUserId: input.actorUserId,
+    projectIdentityId: input.executionContext.projectId,
+  });
+  const quiescentCoordination = await readProjectChatCoordinationState({
+    actorUserId: input.actorUserId,
+    projectIdentityId: input.executionContext.projectId,
+    recoverStale: false,
+  });
+  if (!quiescentCoordination.state || quiescentCoordination.activeTurn) {
+    throw projectChatResetNotQuiescent(
+      'Project Chat callbacks did not converge to an idle durable state; no data was cleared.',
+    );
+  }
+  const quiescentState = quiescentCoordination.state;
+  if (!isQualifiableProjectProvider(input.provider)) {
+    throw new UnsupportedProjectChatProviderError(
+      input.provider,
+      'This Project provider has no qualified destructive reset path.',
+    );
+  }
+  const descriptor = getProjectChatProviderRuntimeDescriptor(input.provider);
+  const completed = await withProjectChatRuntimeAdmission({
+    actorUserId: input.actorUserId,
+    actorAuthorizationVersion: input.actorAuthorizationVersion,
+    projectIdentityId: input.executionContext.projectId,
+    provider: toPersistedProjectChatProvider(input.provider),
+    runtime: descriptor.runtime,
+    operation: projectChatRuntimeOperationId('destructive-reset', input.provider),
+    leaseOwner: PROJECT_CHAT_LEASE_OWNER,
+    expectedVersion: quiescentState.version,
+  }, async (admission) => {
+    await assertLegacyOpenClawProjectDestructiveMutationSafe();
+    const identity = await ensureProjectAssistantIdentity(
+      input.projectDir,
+      input.actorUserId,
+      input.projectName,
+      { workspaceOwnerId: input.workspaceOwnerId },
+    );
+    await markProjectChatDestructiveResetStarted({
+      actorUserId: input.actorUserId,
+      projectIdentityId: input.executionContext.projectId,
+      legacyProjectId: input.projectName,
+      admission,
+    });
+    await assertLegacyOpenClawProjectDestructiveMutationSafe();
+    const terminated = await terminateProjectChatBindingsForDestructiveReset({
+      actorUserId: input.actorUserId,
+      projectIdentityId: input.executionContext.projectId,
+      legacyProjectId: input.projectName,
+      executionContext: input.executionContext,
+      exactServerOwnedOpenClawSessionKeys: [
+        identity.sessionKey,
+        `agent:portal:${identity.sessionId}`,
+      ],
+    });
+    await assertLegacyOpenClawProjectDestructiveMutationSafe();
+    // This legacy history file is a write-only, database-derived projection.
+    // Empty it atomically before the authoritative DB commit so a crash after
+    // commit cannot retain transcript plaintext. It is never used to decide
+    // provider/session state, so a failed commit leaves the live database and
+    // non-transcript session projection authoritative.
+    writeProjectTextFile(
+      input.projectDir,
+      '.agent-history.json',
+      JSON.stringify({ messages: [], model: '' }),
+      PROJECT_METADATA_MAX_BYTES,
+    );
+    const reset = await commitProjectChatDestructiveReset({
+      actorUserId: input.actorUserId,
+      projectIdentityId: input.executionContext.projectId,
+      legacyProjectId: input.projectName,
+      admission,
+    });
+    // Unlike the history projection, this compatibility file describes
+    // session status. Change it only after the database reset commits so a
+    // failed transaction cannot falsely advertise an uninitialized session.
+    // A post-commit write failure is safely retryable because DB bindings and
+    // transcript state remain the sole authority.
+    writeProjectTextFile(input.projectDir, '.agent-session.json', JSON.stringify({
+      initialized: false,
+      stableSlug: identity.stableSlug,
+    }, null, 2), PROJECT_METADATA_MAX_BYTES);
+    for (const binding of terminated.bindings) {
+      const boundProvider = fromPersistedProjectChatProvider(binding.provider as ProjectChatPersistedProvider);
+      if (isQualifiableProjectProvider(boundProvider)) {
+        clearProjectNativeRun({
+          userId: input.actorUserId,
+          projectId: input.executionContext.projectId,
+          provider: boundProvider,
+        });
+      }
+    }
+    return reset;
+  });
+  return {
+    ...completed.result,
+    stateVersion: completed.state.version,
+    runtime: descriptor.runtime,
+  };
+}
 
 // DELETE /api/projects/:name/chat/history - Clear chat history for this project
 router.delete('/:name/chat/history', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  let releaseProjectNameLock: (() => void) | null = null;
   try {
-    const ownerId = await getScopedOwnerId(req);
+    if (rejectDestructiveProjectChatResetRouteForRelease(res)) return;
     const { name } = req.params;
-    const userId = ownerId;
-    const projectDir = getProjectPath(userId, name);
+    const {
+      actorUserId: userId,
+      workspaceOwnerId: ownerId,
+      projectDir: requestedProjectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
+    await assertLegacyOpenClawProjectDestructiveMutationSafe();
+    releaseProjectNameLock = await acquireProjectDeletionLock(
+      projectDeletionLockKey(ownerId, name),
+    );
+    const renameConvergence = await convergeInterruptedProjectRenameForDestructiveOperation({
+      actorUserId: userId,
+      workspaceOwnerId: ownerId,
+      projectName: name,
+    });
+    if (renameConvergence.renamedTo) {
+      res.status(409).json({
+        error: 'This Project finished renaming. Reopen Project Chat using its current name.',
+        code: 'PROJECT_RENAMED',
+        newName: renameConvergence.renamedTo,
+        retryable: true,
+      });
+      return;
+    }
+    const projectName = renameConvergence.projectName;
+    const projectDir = renameConvergence.projectDir || requestedProjectDir;
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-    const { sessionId: sessionKey } = await ensureProjectAssistantIdentity(projectDir, userId, name);
-    
-    await prisma.projectChatMessage.deleteMany({
-      where: { userId, sessionKey },
+    await assertLegacyOpenClawProjectDestructiveMutationSafe();
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      userId,
+      ownerId,
+      projectName,
+      projectDir,
+      req.query.provider || req.body?.provider,
+      { requireQualification: false, readOnly: true },
+    );
+    if (!getProjectChatProviderCapability(provider).supportsReset) {
+      throw new UnsupportedProjectChatProviderError(
+        provider,
+        'This Project provider does not expose a server-verified reset path.',
+      );
+    }
+    const reset = await performProjectChatDestructiveReset({
+      actorUserId: userId,
+      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
+      workspaceOwnerId: ownerId,
+      projectName,
+      projectDir,
+      provider,
+      executionContext,
+      expectedVersion: req.query.stateVersion ?? req.body?.stateVersion,
     });
-    
-    // Reset session
-    await prisma.projectChatSession.upsert({
-      where: { sessionKey },
-      update: { status: 'expired', lastActivity: new Date() },
-      create: { userId, projectId: name, sessionKey, status: 'expired' },
+    res.json({
+      success: true,
+      provider,
+      ...reset,
+      executionContext: serializeProjectSandboxContext(executionContext),
     });
-    
-    res.json({ success: true });
   } catch (error: any) {
+    if (sendProjectChatProviderError(res, error)) return;
+    if (sendProjectChatCoordinationError(res, error)) return;
+    if (error instanceof ProjectIdentityLifecycleError) {
+      res.status(409).json({
+        error: error.message,
+        code: error.code,
+        retryable: true,
+      });
+      return;
+    }
     res.status(500).json({ error: 'Failed to clear history' });
+  } finally {
+    releaseProjectNameLock?.();
   }
 });
 
 // GET /api/projects/:name/chat/session-status - Check if gateway session is still active
 router.get('/:name/chat/session-status', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
-    const userId = ownerId;
-    const projectDir = getProjectPath(userId, name);
+    const {
+      actorUserId: userId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-    const { agentId: projectAgentId, sessionId } = await ensureProjectAssistantIdentity(projectDir, userId, name);
-    // Try project-specific agent first, then legacy
-    let sessionKey = `agent:${projectAgentId}:${sessionId}`;
-    let result = await getSessionInfo(sessionKey);
-    if (!result.ok) {
-      sessionKey = `agent:portal:${sessionId}`;
-      result = await getSessionInfo(sessionKey);
-    }
-    
-    const dbSession = await prisma.projectChatSession.findUnique({
-      where: { sessionKey: sessionId },
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      userId,
+      ownerId,
+      name,
+      projectDir,
+      req.query.provider,
+      { requireQualification: false, readOnly: true },
+    );
+    const existing = await readExistingProjectChatBinding({
+      actorUserId: userId,
+      provider,
+      executionContext,
     });
-    
-    const gatewayActive = result.ok && !!result.data;
-    
-    // Update DB session status based on gateway
-    if (dbSession) {
-      const newStatus = gatewayActive ? 'active' : 'expired';
-      if (dbSession.status !== newStatus) {
-        await prisma.projectChatSession.update({
-          where: { sessionKey: sessionId },
-          data: { status: newStatus },
-        });
-      }
+    if (!existing.binding) {
+      res.json({
+        active: false,
+        running: false,
+        runStatus: 'idle',
+        model: null,
+        modelValidated: false,
+        modelVerified: false,
+        configuredModel: null,
+        dbStatus: 'uninitialized',
+        sessionKey: null,
+        provider,
+        runtime: null,
+        executionContext: serializeProjectSandboxContext(executionContext),
+      });
+      return;
     }
-    
+    if (isNativeProjectChatRouteProvider(provider)) {
+      const coordination = await readProjectChatCoordinationState({
+        actorUserId: userId,
+        projectIdentityId: executionContext.projectId,
+      });
+      const snapshot = getProjectNativeRunSnapshot({
+        userId,
+        projectId: executionContext.projectId,
+        provider,
+      });
+      res.json({
+        active: Boolean(existing.nativeSession),
+        running: Boolean(snapshot?.active),
+        runStatus: snapshot?.status || 'idle',
+        // Native Project adapters have no idle-session model readback contract.
+        // Keep configured state separate instead of presenting it as active.
+        model: null,
+        modelValidated: Boolean(existing.binding.model || existing.nativeSession?.model),
+        modelVerified: false,
+        configuredModel: projectChatClientModel(
+          provider,
+          existing.binding.model,
+          existing.nativeSession?.model,
+        ),
+        dbStatus: existing.portalSession?.status || existing.binding.status,
+        sessionKey: existing.providerSessionKey,
+        provider,
+        runtime: existing.binding.runtime,
+        stateVersion: coordination.state?.version ?? null,
+        executionContext: serializeProjectSandboxContext(executionContext),
+      });
+      return;
+    }
+    const binding = existing.binding;
+    const sessionKey = existing.providerSessionKey;
+    if (!sessionKey) {
+      throw new ProjectChatBindingReadError('The OpenClaw Project binding has no existing session.');
+    }
+    const result = await getSessionInfo(sessionKey);
+    const dbSession = existing.portalSession;
+
+    if (!result.ok) {
+      if (/session not found/i.test(String(result.error || ''))) {
+        res.json({
+          active: false,
+          model: null,
+          modelVerified: false,
+          dbStatus: dbSession ? 'expired' : 'none',
+          provider,
+          runtime: binding.runtime,
+          executionContext: serializeProjectSandboxContext(executionContext),
+        });
+        return;
+      }
+      throw new OpenClawProjectModelVerificationError(
+        'SESSION_INSPECTION_FAILED',
+        'OpenClaw could not verify the active Project session.',
+        String(result.error || ''),
+      );
+    }
+    if (!result.data || result.data.stale) {
+      throw new OpenClawProjectModelVerificationError(
+        result.data?.stale ? 'SESSION_INSPECTION_STALE' : 'SESSION_INSPECTION_FAILED',
+        'OpenClaw could not verify the active Project session.',
+        String(result.data?.staleReason || 'Session metadata was unavailable'),
+      );
+    }
+    const activeModel = readVerifiedOpenClawSessionModel(result.data);
+    if (!activeModel) {
+      throw new OpenClawProjectModelVerificationError(
+        'MODEL_READBACK_FAILED',
+        'OpenClaw did not report an active Project model.',
+      );
+    }
+
     res.json({
-      active: gatewayActive,
-      model: result.data ? `${result.data.modelProvider || 'anthropic'}/${result.data.model || 'claude-sonnet-4-6'}` : null,
+      active: true,
+      model: activeModel,
+      modelVerified: true,
       dbStatus: dbSession?.status || 'none',
+      provider,
+      runtime: binding.runtime,
+      executionContext: serializeProjectSandboxContext(executionContext),
     });
   } catch (error: any) {
-    res.json({ active: false, error: error.message });
+    if (sendProjectChatProviderError(res, error)) return;
+    console.error('[Project Chat Session Status] Failed:', error?.message || error);
+    res.status(503).json({ active: false, error: 'Project provider session status is temporarily unavailable.' });
   }
 });
 
@@ -3098,76 +10369,14 @@ function detectProjectType(projectDir: string): string {
   return 'Unknown';
 }
 
-// --- Assistant model mapping (frontend ID → Anthropic API model ID) ---
-const MARCUS_MODEL_MAP: Record<string, string> = {
-  'anthropic/claude-haiku-4-5': 'claude-haiku-4-5',
-  'anthropic/claude-sonnet-4-6': 'claude-sonnet-4-6',
-  'anthropic/claude-sonnet-4-5': 'claude-sonnet-4-6',  // upgrade 4.5 → 4.6
-  'anthropic/claude-opus-4-8': 'claude-opus-4-8',
-  'anthropic/claude-opus-4-6': 'claude-opus-4-8',
-  // Legacy aliases
-  'anthropic/claude-3-5-haiku-20241022': 'claude-haiku-4-5',
-  'anthropic/claude-opus-4-5-20251101': 'claude-opus-4-8',
-  'anthropic/claude-opus-4-5': 'claude-opus-4-8',
-};
-
-function resolveAnthropicModel(frontendModel: string): string {
-  // If it's already a bare Anthropic model ID, use it
-  if (!frontendModel.startsWith('anthropic/')) return frontendModel;
-  return MARCUS_MODEL_MAP[frontendModel] || 'claude-sonnet-4-6';
-}
-
-// Execute an assistant tool call within the project sandbox
-async function executeAssistantTool(toolName: string, input: any, projectDir: string): Promise<string> {
-  const resolvePath = (p: string) => {
-    const resolved = path.resolve(projectDir, p);
-    if (!resolved.startsWith(path.resolve(projectDir))) throw new Error('Path traversal blocked');
-    return resolved;
-  };
-
-  try {
-    switch (toolName) {
-      case 'read': {
-        const filePath = resolvePath(input.path);
-        if (!fs.existsSync(filePath)) return `Error: File not found: ${input.path}`;
-        const stat = fs.statSync(filePath);
-        if (stat.size > 512 * 1024) return `Error: File too large (${(stat.size / 1024).toFixed(0)}KB). Max 512KB.`;
-        return fs.readFileSync(filePath, 'utf-8');
-      }
-      case 'write': {
-        const filePath = resolvePath(input.path);
-        fs.mkdirSync(path.dirname(filePath), { recursive: true });
-        fs.writeFileSync(filePath, input.content, 'utf-8');
-        return `Written ${input.content.length} bytes to ${input.path}`;
-      }
-      case 'edit': {
-        const filePath = resolvePath(input.path);
-        if (!fs.existsSync(filePath)) return `Error: File not found: ${input.path}`;
-        const content = fs.readFileSync(filePath, 'utf-8');
-        if (!content.includes(input.old_string)) return `Error: old_string not found in ${input.path}`;
-        const newContent = content.replace(input.old_string, input.new_string);
-        fs.writeFileSync(filePath, newContent, 'utf-8');
-        return `Edited ${input.path}`;
-      }
-      case 'exec': {
-        const cmd = `cd ${JSON.stringify(projectDir)} && ${input.command}`;
-        const result = execSync(cmd, { timeout: 30000, maxBuffer: 1024 * 1024, encoding: 'utf-8' });
-        return result.slice(0, 10000);
-      }
-      default:
-        return `Unknown tool: ${toolName}`;
-    }
-  } catch (err: any) {
-    return `Error: ${err.message}`;
-  }
-}
-
 // Auto-commit helper: commits any changes in project dir after assistant edits files
 function getModelDisplayName(model: string): string {
   const names: Record<string, string> = {
+    'anthropic/claude-fable-5': 'Claude Fable 5',
+    'anthropic/claude-opus-5': 'Claude Opus 5',
     'anthropic/claude-opus-4-8': 'Claude Opus 4.8',
-    'anthropic/claude-opus-4-6': 'Claude Opus 4.8',
-    'anthropic/claude-opus-4-5-20251101': 'Claude Opus 4.8',
+    'anthropic/claude-opus-4-6': 'Claude Opus 4.6',
+    'anthropic/claude-opus-4-5-20251101': 'Claude Opus 4.5',
     'anthropic/claude-sonnet-4-6': 'Claude Sonnet 4.6',
     'anthropic/claude-sonnet-4-5': 'Claude Sonnet 4.5',
     'anthropic/claude-haiku-4-1': 'Claude Haiku 4.1',
@@ -3178,8 +10387,15 @@ function getModelDisplayName(model: string): string {
     'ollama/qwen3:1.7b': 'Qwen3 1.7B',
     'ollama/qwen3:4b': 'Qwen3 4B',
     'ollama/qwen3:8b': 'Qwen3 8B',
+    'ollama/qwen3.5:0.8b': 'Qwen 3.5 0.8B',
+    'ollama/qwen3.5:2b': 'Qwen 3.5 2B',
+    'ollama/qwen3.5:4b': 'Qwen 3.5 4B',
+    'ollama/qwen3.5:9b': 'Qwen 3.5 9B',
+    'ollama/qwen3.6:27b': 'Qwen 3.6 27B',
+    'ollama/qwen3.6:35b': 'Qwen 3.6 35B',
     'ollama/gemma4:e2b': 'Gemma 4 E2B',
     'ollama/gemma4:e4b': 'Gemma 4 E4B',
+    'ollama/gemma4:12b': 'Gemma 4 12B',
     'openai/gpt-5.6-sol': 'GPT-5.6 Sol',
     'openai/gpt-5.6-terra': 'GPT-5.6 Terra',
     'openai/gpt-5.6-luna': 'GPT-5.6 Luna',
@@ -3198,64 +10414,63 @@ function getModelDisplayName(model: string): string {
   return names[model] || model.replace(/^(anthropic|ollama|codex|openai-codex|openai)\//, '');
 }
 
-async function autoCommitProjectChanges(projectDir: string, userId: string, projectName: string, summary?: string, model?: string) {
-  const opts = { cwd: projectDir, timeout: 15000, encoding: 'utf-8' as const };
+async function autoCommitProjectChanges(
+  projectDir: string,
+  actorId: string,
+  projectId: string,
+  workspaceOwnerId: string,
+  projectName: string,
+  summary?: string,
+  model?: string,
+) {
   let transientShelved = false;
-  const transientStashMessage = 'portal-transient-project-state';
+  const git = (args: string[], timeoutMs = 15_000) => runProjectGitCommand({
+    actorId,
+    projectId,
+    workspace: projectDir,
+    args,
+    timeoutMs,
+    nameHint: `${actorId}:${projectName}:auto-commit`,
+  });
 
   try {
     // Ensure git repo exists
-    try { execSync('git rev-parse --git-dir', opts); } catch {
-      execSync('git init', opts);
-      execSync(`git config user.email ${shellEscape(process.env.GIT_AUTHOR_EMAIL || 'admin@localhost')}`, opts);
-      execSync('git config user.name "Assistant AI"', opts);
+    try { await git(['rev-parse', '--git-dir']); } catch {
+      await git(['init']);
     }
 
-    const initialStatus = execSync('git status --porcelain -uall', opts).trim();
+    const initialStatus = await git(['status', '--porcelain=v1', '-z', '-uall']);
     if (!initialStatus) return null;
 
     const initialPaths = Array.from(new Set(
-      initialStatus
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => normalizeGitPorcelainPath(line.substring(3)))
-        .filter(Boolean)
+      parseProjectGitPorcelain(initialStatus).map((entry) => entry.path).filter(Boolean),
     ));
-    const transientPaths = initialPaths.filter((filePath) => TRANSIENT_PROJECT_STATE_FILES.has(path.basename(filePath)));
+    const transientPaths = initialPaths.filter(isTransientProjectStatePath);
 
-    if (transientPaths.length > 0) {
-      try {
-        const escapedPaths = transientPaths.map(shellEscape).join(' ');
-        execSync(`git stash push -u -m ${shellEscape(transientStashMessage)} -- ${escapedPaths}`, opts);
-        transientShelved = true;
-      } catch (stashError: any) {
-        console.warn('[Agent] Failed to shelve transient project state before auto-commit:', stashError?.message || stashError);
-      }
-    }
+    transientShelved = await shelveTransientProjectState(git, transientPaths);
 
-    const status = execSync('git status --porcelain -uall', opts).trim();
+    const status = await git(['status', '--porcelain=v1', '-z', '-uall']);
     if (!status) return null;
 
     const changedFiles = Array.from(new Set(
-      status
-        .split('\n')
+      parseProjectGitPorcelain(status)
+        .map((entry) => entry.path)
         .filter(Boolean)
-        .map((line) => normalizeGitPorcelainPath(line.substring(3)))
-        .filter(Boolean)
-        .filter((filePath) => !TRANSIENT_PROJECT_STATE_FILES.has(path.basename(filePath)))
+        .filter((filePath) => !isTransientProjectStatePath(filePath))
     ));
     if (!changedFiles.length) return null;
 
-    execSync('git add .', opts);
+    await git(projectGitAddAllArgs());
 
-    const stagedNames = execSync('git diff --cached --name-only', { ...opts, timeout: 5000 }).trim();
-    const stagedFiles = stagedNames.split('\n').map((line) => line.trim()).filter(Boolean);
+    const stagedNames = await git(['diff', '--cached', '--name-only', '-z', '--no-ext-diff', '--no-textconv'], 5000);
+    const stagedFiles = stagedNames.split('\0').filter(Boolean);
+    assertNoTransientProjectStateStaged(stagedFiles);
     if (!stagedFiles.length) return null;
 
     let commitMsg = summary ? `Assistant: ${summary}` : '';
     if (!summary) {
       try {
-        const diff = execSync('git diff --cached --stat', { ...opts, timeout: 5000 }).trim();
+        const diff = (await git(['diff', '--cached', '--stat', '--no-ext-diff', '--no-textconv'], 5000)).trim();
         const diffLines = diff.split('\n').filter(Boolean);
         const fileChanges: { file: string; added: number; removed: number }[] = [];
         for (const line of diffLines) {
@@ -3290,17 +10505,17 @@ async function autoCommitProjectChanges(projectDir: string, userId: string, proj
     }
 
     const authorName = model ? `Assistant AI (${getModelDisplayName(model)})` : 'Assistant AI';
-    const authorEmail = process.env.GIT_AUTHOR_EMAIL || 'admin@localhost';
-    const authorArg = `--author=${shellEscape(`${authorName} <${authorEmail}>`)}`;
+    const authorEmail = (process.env.GIT_AUTHOR_EMAIL || 'admin@localhost').replace(/[\r\n<>]/g, '').slice(0, 254);
+    const author = `${authorName.replace(/[\r\n<>]/g, '').slice(0, 200)} <${authorEmail}>`;
 
-    execSync(`git commit ${authorArg} -m ${shellEscape(commitMsg)}`, opts);
-    const hash = execSync('git rev-parse --short HEAD', opts).trim();
-    const branch = execSync('git rev-parse --abbrev-ref HEAD', opts).trim();
+    await git(['commit', `--author=${author}`, '-m', commitMsg.slice(0, 4096)]);
+    const hash = (await git(['rev-parse', '--short', 'HEAD'])).trim();
+    const branch = (await git(['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
 
     let linesAdded = 0;
     let linesRemoved = 0;
     try {
-      const statLine = execSync('git diff HEAD~1 --shortstat', { ...opts, timeout: 5000 }).trim();
+      const statLine = (await git(['diff', 'HEAD~1', '--shortstat', '--no-ext-diff', '--no-textconv'], 5000)).trim();
       const addM = statLine.match(/(\d+) insertion/);
       const delM = statLine.match(/(\d+) deletion/);
       linesAdded = addM ? parseInt(addM[1]) : 0;
@@ -3310,10 +10525,10 @@ async function autoCommitProjectChanges(projectDir: string, userId: string, proj
     console.log(`[Agent] Auto-commit ${hash}: ${commitMsg}`);
 
     try {
-      const app = await prisma.app.findFirst({ where: { userId, name: projectName } });
+      const app = await prisma.app.findFirst({ where: { userId: workspaceOwnerId, name: projectName } });
       await prisma.activityLog.create({
         data: {
-          userId,
+          userId: actorId,
           action: 'PROJECT_GIT_COMMIT',
           resource: 'project',
           resourceId: app?.id,
@@ -3326,16 +10541,114 @@ async function autoCommitProjectChanges(projectDir: string, userId: string, proj
     return { hash, message: commitMsg, filesChanged: stagedFiles.length };
   } catch (err: any) {
     console.error('[Agent] Auto-commit error:', err.message);
-    return null;
+    throw err;
   } finally {
     if (transientShelved) {
       try {
-        execSync('git stash pop --index', opts);
+        await git(['stash', 'pop', '--index']);
       } catch (restoreError) {
         console.warn('[Agent] Failed to restore transient project state after auto-commit:', restoreError);
       }
     }
   }
+}
+
+async function autoCommitProjectChangesWithRetry(
+  ...input: Parameters<typeof autoCommitProjectChanges>
+): Promise<{ commit: Awaited<ReturnType<typeof autoCommitProjectChanges>>; attempts: number }> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      return {
+        commit: await autoCommitProjectChanges(...input),
+        attempts: attempt,
+      };
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('Project checkpoint failed');
+}
+
+async function persistProjectCheckpointNotice(input: {
+  actorUserId: string;
+  projectId: string;
+  sessionKey: string;
+  turnId: string;
+  provider: string;
+  runtime: string;
+  model?: string | null;
+  content: string;
+}): Promise<void> {
+  const messageId = `project-checkpoint:${input.turnId}`;
+  await prisma.projectChatMessage.upsert({
+    where: {
+      userId_projectId_messageId: {
+        userId: input.actorUserId,
+        projectId: input.projectId,
+        messageId,
+      },
+    },
+    update: {
+      content: input.content,
+      model: input.model || null,
+    },
+    create: {
+      projectId: input.projectId,
+      userId: input.actorUserId,
+      sessionKey: input.sessionKey,
+      role: 'system',
+      content: input.content,
+      messageId,
+      provider: input.provider,
+      runtime: input.runtime,
+      model: input.model || null,
+    },
+  });
+}
+
+async function checkpointProjectAfterProviderTurn(input: {
+  projectDir: string;
+  actorUserId: string;
+  projectId: string;
+  workspaceOwnerId: string;
+  projectName: string;
+  sessionKey: string;
+  turnId: string;
+  provider: string;
+  runtime: string;
+  model?: string | null;
+}): Promise<void> {
+  await runProjectCheckpointBoundary({
+    createCheckpoint: () => autoCommitProjectChangesWithRetry(
+      input.projectDir,
+      input.actorUserId,
+      input.projectId,
+      input.workspaceOwnerId,
+      input.projectName,
+      undefined,
+      input.model || undefined,
+    ),
+    persistNotice: (content) => persistProjectCheckpointNotice({
+      actorUserId: input.actorUserId,
+      projectId: input.projectId,
+      sessionKey: input.sessionKey,
+      turnId: input.turnId,
+      provider: input.provider,
+      runtime: input.runtime,
+      model: input.model,
+      content,
+    }),
+    successNotice: (checkpoint) => (
+      `${checkpoint.attempts > 1 ? 'Checkpoint retry succeeded. ' : ''}`
+      + `Committed ${checkpoint.commit!.hash}: ${checkpoint.commit!.message}`
+    ),
+    failureNotice: 'Project checkpoint failed after one automatic retry. Your file changes remain in the project; retry from the Project Git controls.',
+    logError: (message, error) => console.error(`[Project Chat] ${message}:`, error),
+  });
 }
 
 // ========================================
@@ -3349,476 +10662,402 @@ interface SessionMeta {
   stableSlug?: string;
 }
 
-/**
- * Phase 2: Ensure a dedicated OpenClaw agent exists for this project.
- * Creates agent on-demand via config.patch if it doesn't exist yet.
- * Each project gets its own Docker sandbox with only that project's files mounted.
- */
-// Cache of known agent IDs to avoid repeated config.get calls
-const knownAgentIds = new Set<string>();
-
-async function ensureProjectAgent(
-  userId: string,
-  stableSlug: string,
-  projectDirName: string,
-): Promise<{ agentId: string; created: boolean }> {
-  const agentId = getProjectAgentId(userId, stableSlug);
-
-  const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-  cleanupInvalidRuntimeOnlyModelProvidersFromOpenClawConfig();
-
-  // Fast path: already known from this process lifetime
-  if (knownAgentIds.has(agentId)) {
-    updateProjectAgentBindIfPresent(userId, stableSlug, projectDirName).catch((err) => {
-      console.warn('[ensureProjectAgent] Background bind refresh failed:', err?.message || err);
-    });
-    syncProjectAgentRuntimeFiles(agentId);
-    return { agentId, created: false };
-  }
-
-  // Fast path after backend restart: OpenClaw persists materialized agents on
-  // disk, but config.get can temporarily time out while the gateway is busy.
-  // If the agent directory already exists, do not block project chat startup on
-  // a config round-trip; refresh the bind best-effort in the background.
-  if (fs.existsSync(path.join(OPENCLAW_HOME, 'agents', agentId))) {
-    knownAgentIds.add(agentId);
-    updateProjectAgentBindIfPresent(userId, stableSlug, projectDirName).catch((err) => {
-      console.warn('[ensureProjectAgent] Background bind refresh failed:', err?.message || err);
-    });
-    syncProjectAgentRuntimeFiles(agentId);
-    return { agentId, created: false };
-  }
-
-  console.log(`[ensureProjectAgent] Ensuring agent: ${agentId} for project dir: ${projectDirName}`);
-
-  // Create a minimal project-specific AGENTS.md for the sandbox workspace
-  const agentWorkspaceDir = `/root/.openclaw/sandboxes/${agentId}-workspace`;
-  if (!fs.existsSync(agentWorkspaceDir)) {
-    fs.mkdirSync(agentWorkspaceDir, { recursive: true });
-  }
-  const projectAgentsMd = `# AGENTS.md — Project Agent
-
-You are a coding assistant sandboxed to a specific project.
-
-## The real project files are at: /workspace/project/
-
-**ALWAYS start by exploring /workspace/project/ to understand the project.**
-
-Do NOT modify files in /workspace unless you explicitly need scratch space.
-Do NOT look at unrelated files outside /workspace/project/.
-Your default shell starts in /workspace, so for project work you must \`cd /workspace/project\` first or set exec workdir to \`/workspace/project\`.
-Git commits in this repo should use the preconfigured local assistant identity.
-
-## On first interaction:
-1. Run \`pwd\` and \`ls -la /workspace/project\` to confirm the project structure
-2. Read key files with shell commands from /workspace/project (README, package.json, index.html, etc.)
-3. Read \`.agent-memory.md\` in /workspace/project for past context
-4. Then respond to the user's request
-
-## Tools available:
-- exec — shell commands (git, npm, node, ls, grep, cat, sed, python, etc.)
-- web_search, web_fetch — internet research
-- image — analyze images
-
-## Important:
-- File edits inside the project must happen through shell commands while working in /workspace/project
-- Never write project files into /workspace root by accident
-- Update \`/workspace/project/.agent-memory.md\` with important findings when useful
-`;
-  fs.writeFileSync(path.join(agentWorkspaceDir, 'AGENTS.md'), projectAgentsMd, 'utf-8');
-
-  const newAgent = {
-    id: agentId,
-    workspace: agentWorkspaceDir,
-    sandbox: {
-      mode: "all",
-      workspaceAccess: "rw",
-      scope: "session",
-      docker: {
-        image: "openclaw-sandbox:bookworm-slim",
-        workdir: "/workspace",
-        network: "bridge",
-        dangerouslyAllowExternalBindSources: true,
-        dangerouslyAllowReservedContainerTargets: true,
-        binds: [
-          `${PROJECTS_DIR}/${userId}/${projectDirName}:/workspace/project:rw`
-        ]
-      }
-    },
-    tools: {
-      allow: ["group:runtime", "web_search", "web_fetch", "image"],
-      deny: ["browser", "canvas", "nodes", "message", "tts", "cron", "gateway", "group:fs"],
-      elevated: { enabled: false },
-      exec: { security: "full" }
-    }
-  };
-
-  let lastError = 'gateway unavailable';
-
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const configResult = await gatewayRpcCall('config.get', {}, 10000);
-    if (!configResult.ok) {
-      lastError = `config.get failed: ${configResult.error}`;
-      console.warn(`[ensureProjectAgent] ${lastError} (attempt ${attempt + 1}/8)`);
-      await wait(2000);
-      continue;
-    }
-
-    const config = configResult.data?.config || configResult.data?.parsed || {};
-    const agents: any[] = config?.agents?.list || [];
-
-    if (agents.some((a: any) => a.id === agentId)) {
-      knownAgentIds.add(agentId);
-      await updateProjectAgentBindIfPresent(userId, stableSlug, projectDirName);
-      syncProjectAgentRuntimeFiles(agentId);
-      return { agentId, created: false };
-    }
-
-    const updatedList = [...agents, newAgent];
-    const baseHash = configResult.data?.hash || '';
-    const patchResult = await gatewayRpcCall('config.patch', {
-      raw: JSON.stringify({ agents: { list: updatedList } }),
-      baseHash,
-    }, 15000);
-
-    if (!patchResult.ok) {
-      lastError = `config.patch failed: ${patchResult.error}`;
-      console.warn(`[ensureProjectAgent] ${lastError} (attempt ${attempt + 1}/8)`);
-      await wait(3000);
-      continue;
-    }
-
-    console.log(`[ensureProjectAgent] Agent ${agentId} created successfully. Waiting for gateway reload...`);
-    for (let i = 0; i < 15; i++) {
-      await wait(2000);
-      try {
-        const check = await gatewayRpcCall('sessions.list', { agentId }, 5000);
-        if (check.ok) {
-          console.log(`[ensureProjectAgent] Gateway ready after ${(i + 1) * 2}s`);
-          break;
-        }
-      } catch {}
-    }
-
-    knownAgentIds.add(agentId);
-    syncProjectAgentRuntimeFiles(agentId);
-    return { agentId, created: true };
-  }
-
-  throw new Error(`[ensureProjectAgent] Failed to ensure dedicated project agent ${agentId}: ${lastError}`);
-}
-
-/**
- * Get or create a portal assistant session.
- * No rotation — OpenClaw's native compaction handles context management.
- * Only re-initializes if: (1) never initialized, or (2) gateway lost the session (restart).
- */
-async function getOrCreateSession(
-  projectDir: string,
-  userId: string,
-  projectName: string,
-): Promise<{ sessionKey: string; agentId: string; needsInit: boolean; stableSlug: string; sessionId: string }> {
-  const identity = await ensureProjectAssistantIdentity(projectDir, userId, projectName);
-  ensureProjectGitIdentity(projectDir);
-
-  // Phase 2: Get or create a dedicated agent for this project
-  const projectDirName = path.basename(projectDir);
-  const { agentId } = await ensureProjectAgent(userId, identity.stableSlug, projectDirName);
-  const sessionId = identity.sessionId;
-  const sessionKey = `agent:${agentId}:${sessionId}`;
-  
-  // Auto-migrate legacy .assistant-* files to .agent-*
-  migrateAssistantFiles(projectDir);
-  
-  // Check local state
-  const sessionStatePath = path.join(projectDir, '.agent-session.json');
-  let localInitialized = false;
-  try {
-    if (fs.existsSync(sessionStatePath)) {
-      const meta = JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8'));
-      localInitialized = meta.initialized === true;
-    }
-  } catch {}
-  
-  // Avoid blocking project chat startup on gateway metadata RPCs. A locally
-  // initialized project can be resumed/materialized by OpenClaw on the next
-  // send, and sessions.list can time out on busy gateways.
-  let gatewayHasSession = localInitialized;
-  if (!localInitialized) {
-    try {
-      const result = await getSessionInfo(sessionKey);
-      gatewayHasSession = result.ok && !!result.data;
-    } catch {}
-  }
-  
-  const needsInit = !localInitialized || !gatewayHasSession;
-  
-  return { sessionKey, agentId, needsInit, stableSlug: identity.stableSlug, sessionId };
-}
-
-
 // --- Legacy backward-compat: .assistant-* / .marcus-* → .agent-* ---
 // Auto-migrate known legacy internal files on first access.
-function normalizeGatewayModelIds(models: any[] | undefined): string[] {
-  const ids = new Set<string>();
-  for (const model of Array.isArray(models) ? models : []) {
-    const direct = typeof model === 'string' ? model : String(model?.id || model?.name || '').trim();
-    const provider = typeof model?.provider === 'string' ? model.provider.trim() : '';
-    const nestedModel = typeof model?.model === 'string' ? model.model.trim() : '';
-    const normalizedDirect = normalizePortalModelId(direct);
-    if (normalizedDirect) ids.add(normalizedDirect);
-    const canonical = canonicalizeProviderModelId(provider, nestedModel || direct);
-    if (canonical) ids.add(canonical);
-  }
-  return Array.from(ids);
-}
 
-async function resolveAllowedProjectModel(candidates: string[], requestedForWarning = ''): Promise<{ model: string; warning?: string }> {
-  const normalizedCandidates = candidates.map((candidate) => normalizePortalModelId(candidate)).filter(Boolean);
-  const requestedModel = normalizePortalModelId(requestedForWarning);
-  const hardFallback = 'openai/gpt-5.5';
-  const fallbackCandidates = [...normalizedCandidates, hardFallback];
-
-  let availableModels: string[] = [];
-  try {
-    const listed = await listGatewayModels();
-    if (listed.ok) availableModels = normalizeGatewayModelIds(listed.models);
-  } catch {}
-
-  if (!availableModels.length) {
-    return { model: fallbackCandidates[0] || hardFallback };
-  }
-
-  for (const candidate of fallbackCandidates) {
-    const resolved = resolvePortalModelFromCatalog(candidate, availableModels);
-    if (resolved) {
-      return {
-        model: resolved,
-        warning: requestedModel && requestedModel !== resolved
-          ? `Requested model ${requestedModel} is not available in the current OpenClaw catalog; using ${resolved}.`
-          : undefined,
-      };
-    }
-  }
-
-  const fallback = availableModels[0] || hardFallback;
-  return {
-    model: fallback,
-    warning: requestedModel && requestedModel !== fallback
-      ? `Requested model ${requestedModel} is not available in the current OpenClaw catalog; using ${fallback}.`
-      : undefined,
-  };
-}
-
-function migrateAssistantFiles(projectDir: string) {
-  const migrations = [
-    ['.assistant-memory.md', '.agent-memory.md'],
-    ['.assistant-session.json', '.agent-session.json'],
-    ['.assistant-history.json', '.agent-history.json'],
-    ['.marcus-memory.md', '.agent-memory.md'],
-    ['.marcus-session.json', '.agent-session.json'],
-    ['.marcus-history.json', '.agent-history.json'],
-  ];
-  for (const [oldName, newName] of migrations) {
-    const oldPath = path.join(projectDir, oldName);
-    const newPath = path.join(projectDir, newName);
-    try {
-      if (fs.existsSync(oldPath) && !fs.existsSync(newPath)) {
-        fs.renameSync(oldPath, newPath);
-      }
-    } catch {}
-  }
-}
 router.use(authenticateToken, requireApproved);
+
+// GET /api/projects/:name/assistant/resume-session - Read-only active-turn handshake.
+//
+// A browser refresh during a tool call must not compete for the single active
+// turn slot by running ensure-session again. This route authenticates the
+// exact durable turn and its existing provider binding without mutating the
+// runtime, model, binding, or coordination version.
+router.get('/:name/assistant/resume-session', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    const requestedTurnId = String(req.query.turnId || '').trim();
+    if (!requestedTurnId || requestedTurnId.length > 512 || requestedTurnId.includes('\u0000')) {
+      res.status(400).json({ error: 'A valid active Project turn ID is required.' });
+      return;
+    }
+    const {
+      actorUserId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      actorUserId,
+      ownerId,
+      name,
+      projectDir,
+      req.query.provider,
+      { requireQualification: false, readOnly: true },
+    );
+    const coordination = await readProjectChatCoordinationState({
+      actorUserId,
+      projectIdentityId: executionContext.projectId,
+    });
+    if (!coordination.state) {
+      throw new ProjectChatLeaseError('STATE_NOT_FOUND', 'Project Chat state was not found', 404);
+    }
+    const activeTurn = visibleProjectChatActiveTurn(coordination.activeTurn);
+    if (!activeTurn || activeTurn.id !== requestedTurnId) {
+      throw new ProjectChatLeaseError('TURN_NOT_ACTIVE', 'The requested Project Chat turn is no longer active');
+    }
+    if (activeTurn.provider !== toPersistedProjectChatProvider(provider)) {
+      throw new ProjectChatLeaseError('PROVIDER_MISMATCH', 'The active Project Chat turn belongs to another provider');
+    }
+
+    const bindingRead = await readExistingProjectChatBinding({
+      actorUserId,
+      provider,
+      executionContext,
+      requireActive: true,
+      requireProviderSession: true,
+    });
+    const binding = bindingRead.binding;
+    const sessionKey = String(activeTurn.providerSessionId || '').trim();
+    const bindingSessions = new Set(
+      [binding?.sessionKey, binding?.externalSessionId].map((value) => String(value || '').trim()).filter(Boolean),
+    );
+    if (
+      !binding
+      || binding.status !== 'active'
+      || binding.runtime !== activeTurn.runtime
+      || binding.sandboxRoot !== executionContext.canonicalRoot
+      || binding.policyFingerprint !== executionContext.policyFingerprint
+      || !sessionKey
+      || !bindingSessions.has(sessionKey)
+    ) {
+      throw new ProjectChatLeaseError(
+        'STATE_CORRUPT',
+        'The active Project Chat turn no longer matches its verified provider binding',
+        503,
+      );
+    }
+    const boundModel = normalizePortalModelId(activeTurn.model || binding.model || '');
+    if (!boundModel || (binding.model && normalizePortalModelId(binding.model) !== boundModel)) {
+      throw new ProjectChatLeaseError(
+        'STATE_CORRUPT',
+        'The active Project model is not validated against its provider binding',
+        503,
+      );
+    }
+
+    res.json({
+      resumed: true,
+      turnId: activeTurn.id,
+      sessionKey,
+      agentId: `${provider.toLowerCase().replace('_', '-')}-project`,
+      provider,
+      runtime: activeTurn.runtime,
+      model: projectChatClientModel(provider, boundModel),
+      modelValidated: true,
+      ...(provider === 'OPENCLAW' ? { modelVerified: true } : {}),
+      ...(isNativeProjectChatRouteProvider(provider) ? { modelConfigured: true } : {}),
+      stateVersion: coordination.state.version,
+      executionContext: serializeProjectSandboxContext(executionContext),
+    });
+  } catch (error: any) {
+    if (sendProjectChatProviderError(res, error)) return;
+    if (sendProjectChatCoordinationError(res, error)) return;
+    console.error('[resume-session] Error:', error?.message || error);
+    res.status(500).json({ error: 'Failed to resume active Project turn' });
+  }
+});
 
 // POST /api/projects/:name/assistant/ensure-session - Create/verify agent + session, return keys for WS chat
 router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
-    const projectDir = getProjectPath(ownerId, name);
+    const {
+      actorUserId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
 
-    const userId = ownerId;
-
-    // Get or create session (reuses existing functions)
-    const { sessionKey, agentId, needsInit, stableSlug } = await getOrCreateSession(
-      projectDir, userId, name
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      actorUserId,
+      ownerId,
+      name,
+      projectDir,
+      req.body?.provider,
     );
+    const coordination = await requireSelectedProjectChatState({
+      actorUserId,
+      projectIdentityId: executionContext.projectId,
+      provider,
+      expectedVersion: req.body?.stateVersion,
+    });
 
-    // Determine which model should back this session. If the caller explicitly
-    // requested a model, honor it. Otherwise preserve the existing session model
-    // when one already exists, and only fall back to the configured gateway
-    // default for brand-new / unset sessions.
-    const requestedModel = normalizePortalModelId(req.body?.model || '');
-    const sessionStatePath = path.join(projectDir, '.agent-session.json');
-    let storedSessionModel = '';
-    try {
-      if (fs.existsSync(sessionStatePath)) {
-        const meta = JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8'));
-        storedSessionModel = normalizePortalModelId(meta.model || '');
-      }
-    } catch {}
-    let currentSessionModel = '';
-    let currentSessionInfo: any = null;
-    try {
-      const sessionInfo = await getSessionInfo(sessionKey);
-      if (sessionInfo.ok) {
-        currentSessionInfo = sessionInfo.data;
-        const rawModel = String(sessionInfo.data?.model || '');
-        const provider = String(
-          sessionInfo.data?.modelProvider
-          || sessionInfo.data?.currentModel?.provider
-          || sessionInfo.data?.agentRuntime?.id
-          || ''
-        );
-        currentSessionModel = canonicalizeProviderModelId(provider, rawModel) || normalizePortalModelId(rawModel);
-        if (!sessionInfo.data?.reasoningLevel) {
-          await gatewayRpcCall('sessions.patch', { key: sessionKey, reasoningLevel: 'on' });
+    const admitted = await withProjectChatRuntimeAdmission({
+      actorUserId,
+      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
+      projectIdentityId: executionContext.projectId,
+      provider: toPersistedProjectChatProvider(provider),
+      runtime: getProjectChatProviderRuntimeDescriptor(provider).runtime,
+      operation: projectChatRuntimeOperationId('ensure-session', provider, req.body?.model || null),
+      leaseOwner: PROJECT_CHAT_LEASE_OWNER,
+      expectedVersion: coordination.state!.version,
+      leaseDurationMs: PROJECT_CHAT_LEASE_DURATION_MS,
+    }, async () => {
+      await repairTerminalProjectChatPresentations({
+        actorUserId,
+        projectIdentityId: executionContext.projectId,
+        limit: 100,
+      });
+      if (isNativeProjectChatRouteProvider(provider)) {
+        const requestedModel = normalizePortalModelId(req.body?.model || '');
+        const resolved = await ensureNativeProjectChatBinding({
+          actorUserId,
+          workspaceOwnerId: ownerId,
+          projectName: name,
+          projectDir,
+          provider,
+          executionContext,
+          model: requestedModel || null,
+        });
+        const memoryPath = path.join(projectDir, '.agent-memory.md');
+        if (!fs.existsSync(memoryPath)) {
+          fs.writeFileSync(memoryPath, `# Project Memory — ${name}\n\n## Overview\n(Describe what this project does)\n`, 'utf-8');
         }
+        const sessionStatePath = path.join(projectDir, '.agent-session.json');
+        const previous = fs.existsSync(sessionStatePath)
+          ? JSON.parse(fs.readFileSync(sessionStatePath, 'utf8'))
+          : {};
+        fs.writeFileSync(sessionStatePath, JSON.stringify({
+          ...previous,
+          initialized: true,
+          model: resolved.configuredModel,
+          modelConfigured: true,
+          lastActivity: new Date().toISOString(),
+          stableSlug: resolved.identity.stableSlug,
+        }, null, 2), 'utf8');
+        return {
+          sessionKey: resolved.sessionKey,
+          agentId: resolved.agentId,
+          model: resolved.configuredModel,
+          modelValidated: true,
+          modelConfigured: true,
+          modelWarning: null,
+          initialized: true,
+          provider,
+          runtime: resolved.binding.runtime,
+          bindingId: resolved.binding.id,
+          executionContext: serializeProjectSandboxContext(executionContext),
+        };
       }
-    } catch {}
 
-    const modelResolution = await resolveAllowedProjectModel([
-      requestedModel,
-      currentSessionModel,
-      storedSessionModel,
-      getDefaultModel() || '',
-    ], requestedModel);
-    const selectedModel = modelResolution.model;
+      const requestedModel = normalizePortalModelId(req.body?.model || '');
+      const existingBinding = await prisma.projectChatProviderBinding.findUnique({
+        where: {
+          userId_projectId_provider: {
+            userId: actorUserId,
+            projectId: executionContext.projectId,
+            provider: 'OPENCLAW',
+          },
+        },
+      });
 
-    // Patch the session model before any init traffic only when the caller asked
-    // for a specific model. Do not silently reset an existing session back to
-    // the gateway default on reload.
-    if (requestedModel && selectedModel && currentSessionModel !== selectedModel) {
-      try {
-        const runtimeModel = modelForOpenClawSessionPatch(currentSessionInfo, selectedModel);
-        await patchSessionModel(sessionKey, runtimeModel);
-      } catch {}
-    }
+      // Ownership preparation never follows project-created symlinks. The same
+      // numeric identity is used by lifecycle, Git, and every Project provider.
+      prepareProjectLifecycleWorkspace(projectDir);
+      const catalogScope = await ensureOpenClawProjectAgentCatalogScope(executionContext);
+      const modelResolution = await resolveAllowedOpenClawProjectModel(
+        catalogScope.agentId,
+        [
+          requestedModel,
+          existingBinding?.model || '',
+          getDefaultModel() || '',
+        ],
+        requestedModel,
+      );
+      const selectedModel = modelResolution.model;
+      const resolved = await ensureOpenClawProjectRuntime({
+        actorUserId,
+        workspaceOwnerId: ownerId,
+        projectName: name,
+        projectDir,
+        executionContext,
+        // Do not write the requested model into the binding until the gateway
+        // has both accepted it and reported it back as the live session model.
+        model: existingBinding?.model || null,
+      });
+      const { identity } = resolved;
+      const sessionKey = identity.sessionKey;
+      const modelVerification = await verifyAndPersistOpenClawProjectModel({
+        actorUserId,
+        projectId: executionContext.projectId,
+        portalSessionKey: identity.sessionId,
+        providerSessionKey: sessionKey,
+        desiredModel: selectedModel,
+      });
+      const binding = modelVerification.binding;
+      const verifiedModel = modelVerification.verified.model;
 
-    // If session needs init, prepare local project state only. Do not send a
-    // background /v1/chat/completions init turn here: that legacy endpoint can
-    // leave project chat stuck in an active "Thinking…" run before the user
-    // sends anything. The dedicated project agent gets its sandbox guidance from
-    // its workspace AGENTS.md; the first real user send carries the task.
-    if (needsInit) {
+      const sessionStatePath = path.join(projectDir, '.agent-session.json');
       const memoryPath = path.join(projectDir, '.agent-memory.md');
       if (!fs.existsSync(memoryPath)) {
         fs.writeFileSync(memoryPath, `# Project Memory — ${name}\n\n## Overview\n(Describe what this project does)\n`, 'utf-8');
       }
+      const previous = fs.existsSync(sessionStatePath)
+        ? JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8'))
+        : {};
+      fs.writeFileSync(sessionStatePath, JSON.stringify({
+        ...previous,
+        initialized: true,
+        model: verifiedModel,
+        lastActivity: new Date().toISOString(),
+        stableSlug: identity.stableSlug,
+      }, null, 2), 'utf-8');
 
-      fs.writeFileSync(sessionStatePath, JSON.stringify({ initialized: true, model: selectedModel, lastActivity: new Date().toISOString(), stableSlug }, null, 2), 'utf-8');
-    }
-
-    if (!needsInit && requestedModel) {
-      try {
-        const previous = fs.existsSync(sessionStatePath) ? JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8')) : {};
-        fs.writeFileSync(sessionStatePath, JSON.stringify({ ...previous, initialized: true, model: selectedModel, lastActivity: new Date().toISOString(), stableSlug }, null, 2), 'utf-8');
-      } catch {}
-    }
-
-    res.json({
-      sessionKey,
-      agentId,
-      model: selectedModel,
-      modelWarning: modelResolution.warning || null,
-      initialized: true,
+      return {
+        sessionKey,
+        agentId: identity.agentId,
+        model: verifiedModel,
+        modelValidated: true,
+        modelVerified: true,
+        modelWarning: modelResolution.warning || null,
+        initialized: true,
+        provider,
+        runtime: binding.runtime,
+        bindingId: binding.id,
+        executionContext: serializeProjectSandboxContext(executionContext),
+      };
     });
+    res.json({ ...admitted.result, stateVersion: admitted.state.version });
   } catch (error: any) {
+    if (sendProjectChatProviderError(res, error)) return;
+    if (sendProjectChatCoordinationError(res, error)) return;
     console.error('[ensure-session] Error:', error.message);
-    res.status(500).json({ error: 'Failed to ensure session', detail: error.message });
+    res.status(500).json({ error: 'Failed to ensure Project provider session' });
   }
 });
 
-// GET /api/projects/:name/assistant/history - Load chat history
-router.get('/:name/assistant/history', authenticateToken, async (req: Request, res: Response) => {
-  try {
-    const ownerId = await getScopedOwnerId(req);
-    const projectDir = getProjectPath(ownerId, req.params.name);
-    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-
-    const historyPath = path.join(projectDir, '.agent-history.json');
-    if (!fs.existsSync(historyPath)) {
-      res.json({ messages: [], model: '' });
-      return;
-    }
-
-    const data = JSON.parse(fs.readFileSync(historyPath, 'utf-8'));
-    res.json(data);
-  } catch (error) {
-    res.json({ messages: [], model: '' });
-  }
+// Legacy client-written transcript storage is intentionally retired. Project
+// Chat history now lives in ProjectChatMessage, where assistant/tool/system
+// provenance can only be written by the server-owned provider runner.
+router.get('/:name/assistant/history', authenticateToken, (_req: Request, res: Response) => {
+  res.status(410).json({
+    error: 'Legacy Project Chat history is retired. Use /chat/history.',
+    code: 'PROJECT_CHAT_LEGACY_HISTORY_RETIRED',
+  });
 });
 
-// POST /api/projects/:name/assistant/history - Save chat history
-router.post('/:name/assistant/history', authenticateToken, async (req: Request, res: Response) => {
-  try {
-    const ownerId = await getScopedOwnerId(req);
-    const projectDir = getProjectPath(ownerId, req.params.name);
-    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-
-    const { messages, model } = req.body;
-    const historyPath = path.join(projectDir, '.agent-history.json');
-    fs.writeFileSync(historyPath, JSON.stringify({ messages: messages || [], model: model || '' }, null, 2), 'utf-8');
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to save history' });
-  }
+router.post('/:name/assistant/history', authenticateToken, (_req: Request, res: Response) => {
+  res.status(410).json({
+    error: 'Client-written Project Chat transcripts are not accepted. Send through /assistant/send.',
+    code: 'PROJECT_CHAT_LEGACY_HISTORY_RETIRED',
+  });
 });
 
 // GET /api/projects/:name/assistant/active-model - Get the ACTUAL active model for this project's session
 router.get('/:name/assistant/active-model', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
-    const userId = ownerId;
-    const projectDir = getProjectPath(userId, name);
+    const {
+      actorUserId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-    const { agentId: projectAgentId, sessionId } = await ensureProjectAssistantIdentity(projectDir, userId, name);
-    // Try project-specific agent first, then legacy
-    let sessionKey = `agent:${projectAgentId}:${sessionId}`;
-    let result = await getSessionInfo(sessionKey);
-    if (!result.ok) {
-      sessionKey = `agent:portal:${sessionId}`;
-      result = await getSessionInfo(sessionKey);
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      actorUserId,
+      ownerId,
+      name,
+      projectDir,
+      req.query.provider,
+      { requireQualification: false, readOnly: true },
+    );
+    const existing = await readExistingProjectChatBinding({
+      actorUserId,
+      provider,
+      executionContext,
+    });
+    if (!existing.binding) {
+      res.json({
+        activeModel: null,
+        modelProvider: null,
+        model: null,
+        configuredModel: null,
+        verified: false,
+        isOverridden: false,
+        sessionKey: null,
+        provider,
+        runtime: null,
+        executionContext: serializeProjectSandboxContext(executionContext),
+      });
+      return;
     }
-    
-    const configuredDefault = getDefaultModel() || 'openai/gpt-5.5';
-    const [defaultProvider, ...defaultModelParts] = configuredDefault.split('/');
-    const defaultModel = defaultModelParts.join('/') || 'gpt-5.5';
-
-    if (result.ok && result.data) {
+    if (isNativeProjectChatRouteProvider(provider)) {
+      const configuredModel = projectChatClientModel(
+        provider,
+        existing.binding.model,
+        existing.nativeSession?.model,
+      ) || '';
+      res.json({
+        // The persisted native invocation choice is not a live provider readback.
+        // Do not label it as the active model until that adapter exposes an
+        // authoritative challenge/readback contract.
+        activeModel: null,
+        modelProvider: null,
+        model: null,
+        configuredModel,
+        verified: false,
+        isOverridden: false,
+        sessionKey: existing.providerSessionKey,
+        provider,
+        runtime: existing.binding.runtime,
+        executionContext: serializeProjectSandboxContext(executionContext),
+      });
+      return;
+    }
+    const binding = existing.binding;
+    const sessionKey = existing.providerSessionKey;
+    if (!sessionKey) {
+      throw new ProjectChatBindingReadError('The OpenClaw Project binding has no existing session.');
+    }
+    const result = await getSessionInfo(sessionKey);
+    if (result.ok && result.data && !result.data.stale) {
       const session = result.data;
-      // sessions.list returns the resolved model (already merged with override)
-      const provider = session.modelProvider || defaultProvider || 'openai';
-      const model = session.model || defaultModel;
-      const activeModel = `${provider}/${model}`;
-      const isDefault = activeModel === configuredDefault;
+      const activeModel = readVerifiedOpenClawSessionModel(session);
+      if (!activeModel) {
+        throw new OpenClawProjectModelVerificationError(
+          'MODEL_READBACK_FAILED',
+          'OpenClaw did not report an active Project model.',
+        );
+      }
+      const [modelProvider, ...modelParts] = activeModel.split('/');
+      const model = modelParts.join('/');
+      const configuredDefault = normalizePortalModelId(getDefaultModel() || '');
       
       res.json({ 
         activeModel,
-        modelProvider: provider,
+        modelProvider,
         model,
-        isOverridden: !isDefault,
+        verified: true,
+        isOverridden: Boolean(configuredDefault && activeModel !== configuredDefault),
         sessionKey,
+        provider,
+        runtime: binding.runtime,
+        executionContext: serializeProjectSandboxContext(executionContext),
       });
     } else {
-      // Session might not exist yet - return configured gateway default
-      res.json({ 
-        activeModel: configuredDefault,
-        modelProvider: defaultProvider || 'openai',
-        model: defaultModel,
-        isOverridden: false,
-        sessionKey,
-        note: 'Session not yet created - showing configured default model',
-      });
+      throw new OpenClawProjectModelVerificationError(
+        result.data?.stale ? 'SESSION_INSPECTION_STALE' : 'SESSION_INSPECTION_FAILED',
+        'OpenClaw could not verify the active Project model.',
+        String(result.data?.staleReason || result.error || ''),
+      );
     }
   } catch (error: any) {
+    if (sendProjectChatProviderError(res, error)) return;
     console.error('[Agent] Active model check error:', error.message);
-    res.json({ 
-      activeModel: 'unknown',
-      error: error.message,
+    res.status(503).json({
+      error: 'Project model verification failed.',
+      code: 'PROJECT_MODEL_VERIFICATION_FAILED',
     });
   }
 });
@@ -3826,722 +11065,1836 @@ router.get('/:name/assistant/active-model', authenticateToken, async (req: Reque
 // GET /api/projects/:name/assistant/memory - Load project memory
 router.get('/:name/assistant/memory', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const ownerId = await getScopedOwnerId(req);
-    const projectDir = getProjectPath(ownerId, req.params.name);
+    const {
+      actorUserId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, req.params.name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const { executionContext } = await resolveProjectChatOperationContext(
+      actorUserId,
+      ownerId,
+      req.params.name,
+      projectDir,
+      req.query.provider,
+    );
 
     const memoryPath = path.join(projectDir, '.agent-memory.md');
     const content = fs.existsSync(memoryPath) ? fs.readFileSync(memoryPath, 'utf-8') : '';
-    res.json({ content });
+    res.json({ content, executionContext: serializeProjectSandboxContext(executionContext) });
   } catch (error) {
+    if (sendProjectChatProviderError(res, error)) return;
     res.status(500).json({ error: 'Failed to load memory' });
   }
 });
 
 // POST /api/projects/:name/assistant/reset - Reset assistant session (for clear chat)
 router.post('/:name/assistant/reset', authenticateToken, async (req: Request, res: Response) => {
+  let releaseProjectNameLock: (() => void) | null = null;
   try {
-    const ownerId = await getScopedOwnerId(req);
-    const projectDir = getProjectPath(ownerId, req.params.name);
+    if (rejectDestructiveProjectChatResetRouteForRelease(res)) return;
+    const requestedProjectName = req.params.name;
+    const {
+      actorUserId,
+      workspaceOwnerId: ownerId,
+      projectDir: requestedProjectDir,
+    } = resolveActorProjectChatWorkspace(req, requestedProjectName);
+    await assertLegacyOpenClawProjectDestructiveMutationSafe();
+    releaseProjectNameLock = await acquireProjectDeletionLock(
+      projectDeletionLockKey(ownerId, requestedProjectName),
+    );
+    const renameConvergence = await convergeInterruptedProjectRenameForDestructiveOperation({
+      actorUserId,
+      workspaceOwnerId: ownerId,
+      projectName: requestedProjectName,
+    });
+    if (renameConvergence.renamedTo) {
+      res.status(409).json({
+        error: 'This Project finished renaming. Reopen Project Chat using its current name.',
+        code: 'PROJECT_RENAMED',
+        newName: renameConvergence.renamedTo,
+        retryable: true,
+      });
+      return;
+    }
+    const projectName = renameConvergence.projectName;
+    const projectDir = renameConvergence.projectDir || requestedProjectDir;
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-
-    // Delete the gateway session (both project-specific and legacy)
-    const userId = ownerId;
-    const identity = await ensureProjectAssistantIdentity(projectDir, userId, req.params.name);
-    const sessionId = identity.sessionId;
-    const projectAgentId = identity.agentId;
-    
-    // Delete project-specific agent session
-    try {
-      await deleteSession(`agent:${projectAgentId}:${sessionId}`);
-      console.log(`[Agent Reset] Deleted project session: agent:${projectAgentId}:${sessionId}`);
-    } catch {}
-    
-    // Delete legacy portal agent session
-    try {
-      await deleteSession(`agent:portal:${sessionId}`);
-      console.log(`[Agent Reset] Deleted legacy session: agent:portal:${sessionId}`);
-    } catch {}
-    
-    // Also clean up any legacy versioned sessions
-    for (let v = 1; v <= 10; v++) {
-      try {
-        await deleteSession(`agent:portal:${sessionId}-v${v}`);
-      } catch {}
+    await assertLegacyOpenClawProjectDestructiveMutationSafe();
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      actorUserId,
+      ownerId,
+      projectName,
+      projectDir,
+      req.body?.provider,
+      { requireQualification: false, readOnly: true },
+    );
+    if (!getProjectChatProviderCapability(provider).supportsReset) {
+      throw new UnsupportedProjectChatProviderError(
+        provider,
+        'This Project provider does not expose a server-verified reset path.',
+      );
     }
-    
-    // Reset session state
-    const sessionStatePath = path.join(projectDir, '.agent-session.json');
-    fs.writeFileSync(sessionStatePath, JSON.stringify({ initialized: false, stableSlug: identity.stableSlug }, null, 2), 'utf-8');
-    
-    // Clear history file
-    const historyPath = path.join(projectDir, '.agent-history.json');
-    if (fs.existsSync(historyPath)) {
-      fs.writeFileSync(historyPath, JSON.stringify({ messages: [], model: '' }), 'utf-8');
-    }
-
-    res.json({ success: true });
+    const reset = await performProjectChatDestructiveReset({
+      actorUserId,
+      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
+      workspaceOwnerId: ownerId,
+      projectName,
+      projectDir,
+      provider,
+      executionContext,
+      expectedVersion: req.body?.stateVersion,
+    });
+    res.json({
+      success: true,
+      provider,
+      ...reset,
+      executionContext: serializeProjectSandboxContext(executionContext),
+    });
   } catch (error) {
+    if (sendProjectChatProviderError(res, error)) return;
+    if (sendProjectChatCoordinationError(res, error)) return;
+    if (error instanceof ProjectIdentityLifecycleError) {
+      res.status(409).json({
+        error: error.message,
+        code: error.code,
+        retryable: true,
+      });
+      return;
+    }
     console.error('[Agent Reset] Error:', error);
     res.status(500).json({ error: 'Failed to reset session' });
+  } finally {
+    releaseProjectNameLock?.();
   }
 });
 
-// POST /api/projects/:name/assistant/auto-commit - Commit project changes after a completed WS agent run
-router.post('/:name/assistant/auto-commit', authenticateToken, async (req: Request, res: Response) => {
+// The browser used to own a second completion commit, racing the provider
+// runner and producing .git/index.lock failures. Keep the legacy URL explicit
+// but permanently retired so cached 4.0 preview bundles cannot revive it.
+router.post('/:name/assistant/auto-commit', authenticateToken, (_req: Request, res: Response) => {
+  res.status(410).json({
+    error: 'Project checkpoints are created once by the server after the provider turn completes.',
+    code: 'PROJECT_CHECKPOINT_SERVER_OWNED',
+  });
+});
+
+// Project memory is provider-owned runtime state. The browser write endpoint
+// had no state-version CAS, size bound, or atomic provider admission, and no
+// current UI consumes it. Keep a fixed tombstone so cached preview bundles
+// cannot race an active provider by writing .agent-memory.md directly.
+router.post('/:name/assistant/memory', authenticateToken, (_req: Request, res: Response) => {
+  res.status(410).json({
+    error: 'Direct Project memory writes are retired. Ask the active Project provider to update memory.',
+    code: 'PROJECT_MEMORY_PROVIDER_OWNED',
+  });
+});
+
+// Reconciles a browser-owned stable message ID without returning transcript
+// content or searching outside the authenticated actor/project/provider tuple.
+router.post('/:name/assistant/message-status', authenticateToken, async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
   try {
-    const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
-    const projectDir = getProjectPath(ownerId, name);
+    const { actorUserId, workspaceOwnerId, projectDir } = resolveActorProjectChatWorkspace(req, name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-
-    const summary = typeof req.body?.summary === 'string' && req.body.summary.trim()
-      ? req.body.summary.trim()
-      : undefined;
-    const selectedModel = typeof req.body?.model === 'string' && req.body.model.trim()
-      ? normalizePortalModelId(req.body.model.trim())
-      : undefined;
-
-    const commit = await autoCommitProjectChanges(projectDir, ownerId, name, summary, selectedModel);
-    res.json({ success: true, committed: !!commit, commit });
-  } catch (error) {
-    console.error('[Agent Auto-Commit] Error:', error);
-    res.status(500).json({ error: 'Failed to auto-commit project changes' });
-  }
-});
-
-// POST /api/projects/:name/assistant/memory - Save project memory
-router.post('/:name/assistant/memory', authenticateToken, async (req: Request, res: Response) => {
-  try {
-    const ownerId = await getScopedOwnerId(req);
-    const projectDir = getProjectPath(ownerId, req.params.name);
-    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-
-    const { content } = req.body;
-    const memoryPath = path.join(projectDir, '.agent-memory.md');
-    fs.writeFileSync(memoryPath, content || '', 'utf-8');
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to save memory' });
+    const messageId = String(req.body?.messageId || '').trim();
+    const messageFingerprint = String(req.body?.messageFingerprint || '').trim().toLowerCase();
+    if (!messageId || messageId.length > 512 || !/^[a-f0-9]{64}$/.test(messageFingerprint)) {
+      res.status(400).json({
+        error: 'A stable message ID and SHA-256 payload fingerprint are required.',
+        code: 'PROJECT_CHAT_MESSAGE_STATUS_INPUT_INVALID',
+      });
+      return;
+    }
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      actorUserId,
+      workspaceOwnerId,
+      name,
+      projectDir,
+      req.body?.provider,
+      { requireQualification: false, readOnly: true },
+    );
+    const persistedMessage = await prisma.projectChatMessage.findFirst({
+      where: { userId: actorUserId, projectId: executionContext.projectId, messageId },
+      select: { id: true, role: true, content: true, provider: true },
+    });
+    const coordination = await readProjectChatCoordinationState({
+      actorUserId,
+      projectIdentityId: executionContext.projectId,
+      recoverStale: false,
+    });
+    if (!persistedMessage) {
+      res.json({
+        found: false,
+        status: 'absent',
+        provider,
+        messageId,
+        projectId: executionContext.projectId,
+        stateVersion: coordination.state?.version ?? null,
+      });
+      return;
+    }
+    const actualFingerprint = crypto.createHash('sha256').update(persistedMessage.content, 'utf8').digest();
+    const expectedFingerprint = Buffer.from(messageFingerprint, 'hex');
+    if (
+      persistedMessage.role !== 'user'
+      || persistedMessage.provider !== provider
+      || expectedFingerprint.length !== actualFingerprint.length
+      || !crypto.timingSafeEqual(actualFingerprint, expectedFingerprint)
+    ) {
+      throw new ProjectChatLeaseError(
+        'REQUEST_REPLAY',
+        'Project Chat message identity was already used for different content',
+      );
+    }
+    const turn = await prisma.projectChatTurn.findUnique({
+      where: {
+        actorUserId_projectIdentityId_requestId: {
+          actorUserId,
+          projectIdentityId: executionContext.projectId,
+          requestId: persistedMessage.id,
+        },
+      },
+    });
+    if (!turn || turn.provider !== toPersistedProjectChatProvider(provider)) {
+      throw new ProjectChatLeaseError(
+        'STATE_CORRUPT',
+        'Project Chat message admission is incomplete; clear Project Chat before retrying',
+        409,
+      );
+    }
+    const terminal = ['COMPLETED', 'ERROR', 'ABORTED', 'EXPIRED'].includes(turn.status);
+    const dispatchStage = projectChatTurnDispatchStage(turn);
+    const recoveryRequired = dispatchStage === PROJECT_CHAT_DISPATCH_STAGE_UNCONFIRMED
+      || (!terminal && dispatchStage === null);
+    res.json({
+      found: true,
+      status: terminal ? 'terminal' : dispatchStage === PROJECT_CHAT_DISPATCH_STAGE_ACCEPTED ? 'active' : 'admitted',
+      turnStatus: turn.status.toLowerCase(),
+      dispatchStatus: dispatchStage === PROJECT_CHAT_DISPATCH_STAGE_ACCEPTED
+        ? 'accepted'
+        : dispatchStage === PROJECT_CHAT_DISPATCH_STAGE_UNCONFIRMED
+          ? 'unconfirmed'
+          : 'unknown',
+      recoveryRequired,
+      provider,
+      messageId,
+      turnId: turn.id,
+      projectId: executionContext.projectId,
+      stateVersion: coordination.state?.version ?? null,
+    });
+  } catch (error: any) {
+    if (sendProjectChatProviderError(res, error)) return;
+    if (sendProjectChatCoordinationError(res, error)) return;
+    console.error('[Project Chat Message Status] Error:', error?.message || error);
+    res.status(500).json({ error: 'Failed to reconcile Project Chat message status' });
   }
 });
 
 // Rate limiter for assistant poll endpoint (prevent aggressive polling)
 const assistantPollLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 300, // Max 300 requests per minute (allows 3-4 tabs + normal usage with headroom)
-  message: 'Too many polling requests. Please slow down.',
+  max: 360, // Four foreground tabs at the supported 750ms cadence, plus wake-up headroom.
+  // A completed turn, another project, or another authenticated actor must
+  // not consume the active turn's replay budget. The broad /api limiter still
+  // caps aggregate traffic, so rotating turn IDs cannot bypass the host guard.
+  keyGenerator: (req) => {
+    let provider = 'INVALID';
+    try {
+      const normalized = normalizeProjectChatProvider(req.query.provider);
+      provider = isProjectChatRouteProvider(normalized) ? normalized : 'INVALID';
+    } catch {
+      // Invalid provider identities share one bounded bucket.
+    }
+    const requestedTurnId = String(req.query.turnId || '').trim();
+    const turnId = requestedTurnId && requestedTurnId.length <= 512 && !requestedTurnId.includes('\u0000')
+      ? requestedTurnId
+      : 'NO_VALID_TURN';
+    return crypto.createHash('sha256').update([
+      req.user?.userId || 'unauthenticated',
+      String(req.params.name || ''),
+      provider,
+      turnId,
+    ].join('\0')).digest('hex');
+  },
+  message: {
+    error: 'Too many Project replay polling requests. Please slow down.',
+    code: 'PROJECT_REPLAY_RATE_LIMITED',
+  },
   standardHeaders: true,
   legacyHeaders: false,
 });
-
-function extractGatewayHistoryText(content: any): string {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((block) => {
-        if (typeof block === 'string') return block;
-        if (typeof block?.text === 'string') return block.text;
-        if (typeof block?.content === 'string') return block.content;
-        return '';
-      })
-      .filter(Boolean)
-      .join('\n');
-  }
-  if (typeof content?.text === 'string') return content.text;
-  return '';
-}
-
-function cleanProjectAssistantUserText(text: string): string {
-  const contextEnd = text.indexOf('[END CONTEXT]\n\n');
-  let displayText = contextEnd >= 0 ? text.substring(contextEnd + 15) : text;
-  const metadataEnd = displayText.indexOf('```\n\n');
-  if (/^Sender \(untrusted metadata\):/i.test(displayText) && metadataEnd >= 0) {
-    displayText = displayText.substring(metadataEnd + 5);
-  }
-  displayText = displayText.replace(/^\[[^\]]+\]\s*/, '');
-  const modelNote = displayText.match(/^\[Note: Model switched to [^\]]+\]\n\n/);
-  return (modelNote ? displayText.substring(modelNote[0].length) : displayText).trim();
-}
-
-const GEMINI_CLI_TMP_DIR = path.join(process.env.HOME || '/root', '.gemini', 'tmp');
-const GEMINI_CLI_PROVIDER = 'google-gemini-cli';
-
-function extractProjectGeminiCliSessionId(session: any): string {
-  const bindingSessionId = typeof session?.cliSessionBindings?.[GEMINI_CLI_PROVIDER]?.sessionId === 'string'
-    ? session.cliSessionBindings[GEMINI_CLI_PROVIDER].sessionId.trim()
-    : '';
-  if (bindingSessionId) return bindingSessionId;
-  const legacySessionId = typeof session?.cliSessionIds?.[GEMINI_CLI_PROVIDER] === 'string'
-    ? session.cliSessionIds[GEMINI_CLI_PROVIDER].trim()
-    : '';
-  return legacySessionId;
-}
-
-function readProjectGatewaySessionRegistryEntry(sessionKey: string): any | null {
-  const parts = sessionKey.split(':');
-  const agentId = parts[0] === 'agent' ? parts[1] : '';
-  if (!agentId) return null;
-  const sessionsFile = path.join(process.env.HOME || '/root', '.openclaw', 'agents', agentId, 'sessions', 'sessions.json');
-  try {
-    const sessions = JSON.parse(fs.readFileSync(sessionsFile, 'utf-8'));
-    return sessions?.[sessionKey] || null;
-  } catch {
-    return null;
-  }
-}
-
-function findProjectGeminiTranscript(sessionId: string): string | null {
-  if (!sessionId || !fs.existsSync(GEMINI_CLI_TMP_DIR)) return null;
-  const stack: Array<{ dir: string; depth: number }> = [{ dir: GEMINI_CLI_TMP_DIR, depth: 0 }];
-  while (stack.length > 0) {
-    const current = stack.pop()!;
-    if (current.depth > 6) continue;
-    let entries: fs.Dirent[] = [];
-    try { entries = fs.readdirSync(current.dir, { withFileTypes: true }); } catch { continue; }
-    for (const entry of entries) {
-      const fullPath = path.join(current.dir, entry.name);
-      if (entry.isDirectory()) {
-        stack.push({ dir: fullPath, depth: current.depth + 1 });
-        continue;
-      }
-      if (!entry.isFile() || (!entry.name.endsWith('.json') && !entry.name.endsWith('.jsonl'))) continue;
-      if (!fullPath.includes(`${path.sep}chats${path.sep}`)) continue;
-      try {
-        const firstLine = fs.readFileSync(fullPath, 'utf-8').split(/\r?\n/, 1)[0];
-        const header = JSON.parse(firstLine || '{}');
-        if (header?.sessionId === sessionId) return fullPath;
-      } catch {}
-    }
-  }
-  return null;
-}
-
-function readProjectGeminiTranscriptMessages(sessionId: string, limit = 200): any[] {
-  const transcriptPath = findProjectGeminiTranscript(sessionId);
-  if (!transcriptPath) return [];
-  try {
-    const lines = fs.readFileSync(transcriptPath, 'utf-8').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    const messages: any[] = [];
-    for (const line of lines) {
-      let entry: any;
-      try { entry = JSON.parse(line); } catch { continue; }
-      const type = typeof entry?.type === 'string' ? entry.type.trim().toLowerCase() : '';
-      if (type === 'user') {
-        const content = cleanProjectAssistantUserText(extractGatewayHistoryText(entry.content));
-        if (content) {
-          messages.push({
-            id: typeof entry.id === 'string' ? entry.id : `gemini-user-${messages.length}`,
-            role: 'user',
-            content,
-            timestamp: entry.timestamp,
-            provenance: 'gemini-cli-import',
-          });
-        }
-        continue;
-      }
-      if (type !== 'gemini' && type !== 'model') continue;
-      const content = extractGatewayHistoryText(entry.content).trim();
-      if (!content) continue;
-      messages.push({
-        id: typeof entry.id === 'string' ? entry.id : `gemini-assistant-${messages.length}`,
-        role: 'assistant',
-        content,
-        timestamp: entry.timestamp,
-        model: typeof entry.model === 'string' ? entry.model : undefined,
-        provenance: 'gemini-cli-import',
-      });
-    }
-    return messages.slice(-Math.max(1, limit));
-  } catch {
-    return [];
-  }
-}
-
-async function buildGatewayHistoryPollResponse(sessionKey: string, afterLine: number) {
-  const history = await gatewayRpcCall('chat.history', { sessionKey, limit: 200, maxChars: 200000 }, 8000);
-  if (!history.ok) return null;
-
-  let status = '';
-  let lastActivity = '';
-  let sessionInfoData: any = null;
-  try {
-    const info = await getSessionInfo(sessionKey);
-    if (info.ok && info.data) {
-      sessionInfoData = info.data;
-      status = String(info.data.status || '');
-      const lastActivityMs = Number(info.data.endedAt || info.data.updatedAt || info.data.lastActivityAt || 0);
-      if (lastActivityMs > 0) lastActivity = new Date(lastActivityMs).toISOString();
-    }
-  } catch {}
-
-  let rawMessages = Array.isArray(history.data?.messages) ? history.data.messages : [];
-  if (rawMessages.length === 0) {
-    const registryEntry = readProjectGatewaySessionRegistryEntry(sessionKey);
-    const cliSessionId = extractProjectGeminiCliSessionId(sessionInfoData) || extractProjectGeminiCliSessionId(registryEntry);
-    if (cliSessionId) rawMessages = readProjectGeminiTranscriptMessages(cliSessionId, 200);
-  }
-
-  const normalizedMessages = rawMessages
-    .map((entry: any, index: number) => {
-      const role = typeof entry?.role === 'string' ? entry.role : '';
-      if (role !== 'user' && role !== 'assistant') return null;
-
-      const rawText = extractGatewayHistoryText(entry?.content);
-      const content = role === 'user' ? cleanProjectAssistantUserText(rawText) : rawText.trim();
-      const toolCalls = Array.isArray(entry?.toolCalls)
-        ? entry.toolCalls.map((tool: any) => typeof tool?.name === 'string' ? tool.name : '').filter(Boolean)
-        : [];
-      if (!content && toolCalls.length === 0) return null;
-
-      return {
-        id: typeof entry?.id === 'string' ? entry.id : `history-${index}`,
-        role,
-        content: content || (toolCalls.length ? `🔧 Using ${toolCalls.join(', ')}...` : ''),
-        timestamp: typeof entry?.timestamp === 'string' ? entry.timestamp : new Date().toISOString(),
-        lineIndex: index,
-        ...(toolCalls.length > 0 ? { toolCalls } : {}),
-      };
-    })
-    .filter(Boolean) as Array<{ id: string; role: string; content: string; timestamp: string; lineIndex: number; toolCalls?: string[] }>;
-
-  const latestMessageTs = [...normalizedMessages].reverse().find((message) => message.timestamp)?.timestamp || '';
-  const lastActivityTs = lastActivity || latestMessageTs;
-  const lastActivityMs = lastActivityTs ? Date.parse(lastActivityTs) : NaN;
-  const idleMs = Number.isFinite(lastActivityMs) ? Math.round(Date.now() - lastActivityMs) : null;
-  const hasAssistant = normalizedMessages.some((message) => message.role === 'assistant' && message.content.trim());
-  const isProcessing = /processing|running|active|queued|pending/i.test(status) || (!hasAssistant && normalizedMessages.some((message) => message.role === 'user'));
-  const complete = /done|idle|complete|completed|error|failed|aborted/i.test(status) || (hasAssistant && !isProcessing);
-
-  const activeToolCall = isProcessing
-    ? [...normalizedMessages].reverse().flatMap((message) => message.toolCalls || [])[0] || null
-    : null;
-
-  return {
-    messages: normalizedMessages.filter((message) => message.lineIndex >= afterLine),
-    lineCount: normalizedMessages.length,
-    sessionActive: normalizedMessages.length > 0,
-    complete,
-    isProcessing: !complete && isProcessing,
-    activeToolCall,
-    recentTools: [],
-    lastActivity: lastActivityTs || null,
-    idleMs,
-  };
-}
 
 // GET /api/projects/:name/assistant/poll - Poll for new messages from gateway session JSONL
 // This replaces SSE streaming for long-running sessions (Cloudflare-compatible)
 router.get('/:name/assistant/poll', authenticateToken, assistantPollLimiter, async (req: Request, res: Response) => {
   try {
-    const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
-    const userId = ownerId;
+    const {
+      actorUserId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
     const afterLine = parseInt(req.query.after as string) || 0;
-    const projectDir = getProjectPath(userId, name);
-    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-    const { agentId: projectAgentId, sessionId } = await ensureProjectAssistantIdentity(projectDir, userId, name);
-    
-    // Phase 2: Derive agent ID and session key for this project
-    // Try project-specific agent first, then fall back to generic portal
-    const sessionKeyProject = `agent:${projectAgentId}:${sessionId}`;
-    const sessionKeyLegacy = `agent:portal:${sessionId}`;
-
-    // Find the JSONL session file — search project-specific agent dir first, then legacy dirs
-    const agentDirs = [projectAgentId, 'portal', 'portal-opus', 'portal-sonnet', 'portal-haiku'];
-    let jsonlPath: string | null = null;
-    let foundSessionId: string | null = null;
-    let activeSessionKey = sessionKeyProject; // track which session key matched
-
-    for (const agentDir of agentDirs) {
-      const sessionsFile = path.join(process.env.HOME || '/root', `.openclaw/agents/${agentDir}/sessions/sessions.json`);
-      if (!fs.existsSync(sessionsFile)) continue;
-      try {
-        const sessionsData = JSON.parse(fs.readFileSync(sessionsFile, 'utf-8'));
-        // Try project-specific key first, then legacy key
-        const keysToTry = agentDir === projectAgentId ? [sessionKeyProject] : [sessionKeyLegacy];
-        for (const tryKey of keysToTry) {
-          const entry = sessionsData[tryKey];
-          if (entry?.sessionId) {
-            const candidate = path.join(path.dirname(sessionsFile), `${entry.sessionId}.jsonl`);
-            if (fs.existsSync(candidate)) {
-              jsonlPath = candidate;
-              foundSessionId = entry.sessionId;
-              activeSessionKey = tryKey;
-              break;
-            }
-          }
-        }
-        if (jsonlPath) break;
-      } catch {}
+    const requestedTurnId = String(req.query.turnId || '').trim() || null;
+    if (requestedTurnId && (requestedTurnId.length > 512 || requestedTurnId.includes('\u0000'))) {
+      res.status(400).json({ error: 'Invalid Project Chat turn ID' });
+      return;
     }
-
-    const sessionKey = activeSessionKey;
-
-    if (!jsonlPath) {
-      const historyPoll = await buildGatewayHistoryPollResponse(sessionKey, afterLine).catch((error) => {
-        console.warn('[Agent Poll] Gateway history fallback failed:', error?.message || error);
-        return null;
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      actorUserId,
+      ownerId,
+      name,
+      projectDir,
+      req.query.provider,
+      { requireQualification: false, readOnly: true },
+    );
+    if (isProjectChatRouteProvider(provider)) {
+      const coordination = await readProjectChatCoordinationState({
+        actorUserId,
+        projectIdentityId: executionContext.projectId,
       });
-      if (historyPoll) {
-        res.json(historyPoll);
-        return;
+      if (!coordination.state) {
+        throw new ProjectChatLeaseError('STATE_NOT_FOUND', 'Project Chat state was not found', 404);
       }
-      res.json({ messages: [], lineCount: 0, sessionActive: false, complete: false });
+      const activeUserTurn = visibleProjectChatActiveTurn(coordination.activeTurn);
+      const activeProviderTurn = activeUserTurn?.provider === toPersistedProjectChatProvider(provider)
+        ? activeUserTurn
+        : null;
+      const latestTurn = await prisma.projectChatTurn.findFirst({
+        where: {
+          actorUserId,
+          projectIdentityId: executionContext.projectId,
+          provider,
+          ...(requestedTurnId ? { id: requestedTurnId } : {}),
+          NOT: { requestId: { startsWith: PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX } },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+      const selectedTurn = requestedTurnId
+        ? latestTurn
+        : activeProviderTurn || latestTurn;
+      if (requestedTurnId && !selectedTurn) {
+        throw new ProjectChatLeaseError('TURN_NOT_FOUND', 'Project Chat turn was not found', 404);
+      }
+      const selectedTurnActive = Boolean(
+        activeProviderTurn
+        && selectedTurn
+        && activeProviderTurn.id === selectedTurn.id,
+      );
+      const bindingRead = await readExistingProjectChatBinding({
+        actorUserId,
+        provider,
+        executionContext,
+        // Terminal replay is durable and remains readable after a provider
+        // session is cleaned up. An active run, however, must still be bound
+        // to the exact native session before its cursor can be exposed.
+        requireActive: selectedTurnActive,
+        requireProviderSession: selectedTurnActive,
+      });
+      if (selectedTurn) {
+        const binding = bindingRead.binding;
+        const providerSessionId = String(selectedTurn.providerSessionId || '').trim();
+        const boundSessions = new Set(
+          [binding?.sessionKey, binding?.externalSessionId]
+            .map((value) => String(value || '').trim())
+            .filter(Boolean),
+        );
+        if (
+          !binding
+          || binding.runtime !== selectedTurn.runtime
+          || !providerSessionId
+          || !boundSessions.has(providerSessionId)
+        ) {
+          throw new ProjectChatBindingReadError(
+            'The selected durable Project turn no longer matches its provider binding.',
+          );
+        }
+      }
+      const durableReplay = selectedTurn
+        ? await readProjectChatTurnReplay({
+            actorUserId,
+            projectIdentityId: executionContext.projectId,
+            turnId: selectedTurn.id,
+            afterSeq: afterLine,
+            limit: 1_000,
+          })
+        : null;
+      const durableEvents: ProjectNativeRunEvent[] = (durableReplay?.events || []).map((event) => {
+        const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
+          ? event.payload as Record<string, unknown>
+          : {};
+        return {
+          ...payload,
+          seq: event.seq,
+          ts: event.createdAt.getTime(),
+          runId: selectedTurn?.id,
+        } as unknown as ProjectNativeRunEvent;
+      });
+      const snapshot = matchingProjectNativeSnapshot(selectedTurn, getProjectNativeRunSnapshot({
+        userId: actorUserId,
+        projectId: executionContext.projectId,
+        provider,
+        afterSeq: afterLine,
+      }));
+      const brokerSettlementFailure = isProjectNativeSettlementFailure(snapshot);
+      const baseReplayEvents = durableEvents.length > 0 ? durableEvents : snapshot?.events || [];
+      const brokerSettlementTerminal = brokerSettlementFailure
+        ? snapshot?.events.find((event) => (
+            event.type === 'error'
+            && event.content === PROJECT_NATIVE_SETTLEMENT_FAILURE_MESSAGE
+          ))
+        : undefined;
+      const replayEvents = brokerSettlementTerminal
+        && !baseReplayEvents.some((event) => event.seq === brokerSettlementTerminal.seq)
+        && brokerSettlementTerminal.seq === (baseReplayEvents.at(-1)?.seq ?? afterLine) + 1
+        ? [...baseReplayEvents, brokerSettlementTerminal]
+        : baseReplayEvents;
+      const activeToolCall = replayEvents
+        .filter((event) => event.type === 'tool_start' || event.type === 'tool_update')
+        .map((event) => event.toolName)
+        .filter((toolName): toolName is string => typeof toolName === 'string' && toolName.length > 0)
+        .at(-1) || null;
+      const latestAssistant = snapshot?.text || !selectedTurn
+        ? null
+        : await prisma.projectChatMessage.findFirst({
+            where: {
+              userId: actorUserId,
+              projectId: executionContext.projectId,
+              provider,
+              role: 'assistant',
+              turnId: selectedTurn.id,
+            },
+            select: { content: true },
+          });
+      const terminal = brokerSettlementFailure || (selectedTurn
+        ? ['COMPLETED', 'ERROR', 'ABORTED', 'EXPIRED'].includes(selectedTurn.status)
+        : false);
+      const replayLineCount = resolveProjectChatReplayLineCount({
+        durableLastEventSeq: selectedTurn?.lastEventSeq,
+        snapshotLastSeq: snapshot?.lastSeq,
+        replayEvents,
+      });
+      const replayActive = selectedTurnActive && !brokerSettlementFailure;
+      res.json({
+        messages: [],
+        events: replayEvents,
+        lineCount: replayLineCount,
+        active: replayActive,
+        sessionActive: replayActive,
+        complete: terminal || snapshot?.complete || false,
+        isProcessing: replayActive,
+        activeToolCall,
+        recentTools: [],
+        lastActivity: snapshot ? new Date(snapshot.updatedAt).toISOString() : null,
+        idleMs: snapshot ? Math.max(0, Date.now() - snapshot.updatedAt) : null,
+        text: snapshot?.text || latestAssistant?.content || '',
+        status: brokerSettlementFailure
+          ? 'error'
+          : selectedTurn?.status.toLowerCase() || snapshot?.status || 'idle',
+        error: brokerSettlementFailure
+          ? PROJECT_NATIVE_SETTLEMENT_FAILURE_MESSAGE
+          : selectedTurn?.errorMessage || snapshot?.error || null,
+        runId: selectedTurn?.id || null,
+        sessionKey: snapshot?.sessionId || bindingRead.providerSessionKey,
+        provider,
+        runtime: bindingRead.binding?.runtime || null,
+        stateVersion: coordination.state.version,
+        executionContext: serializeProjectSandboxContext(executionContext),
+      });
+      return;
+    }
+    throw new UnsupportedProjectChatProviderError(
+      provider,
+      'No qualified durable Project Chat poll transport is available.',
+    );
+  } catch (error: any) {
+    if (sendProjectChatProviderError(res, error)) return;
+    if (sendProjectChatCoordinationError(res, error)) return;
+    console.error('[Agent Poll] Error:', error.message);
+    res.status(503).json({ messages: [], lineCount: 0, sessionActive: false, complete: false, error: 'Project replay is temporarily unavailable.' });
+  }
+});
+
+// POST /api/projects/:name/assistant/abort - Stop a provider-owned Project Sandbox run
+router.post('/:name/assistant/abort', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    const {
+      actorUserId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      actorUserId,
+      ownerId,
+      name,
+      projectDir,
+      req.body?.provider,
+      { requireQualification: false, readOnly: true },
+    );
+    const coordination = await requireSelectedProjectChatState({
+      actorUserId,
+      projectIdentityId: executionContext.projectId,
+      provider,
+      expectedVersion: req.body?.stateVersion,
+    });
+    if (!getProjectChatProviderCapability(provider).supportsAbort) {
+      res.status(409).json({ error: 'This provider does not have a qualified Project Sandbox abort path.' });
+      return;
+    }
+    const activeUserTurn = visibleProjectChatActiveTurn(coordination.activeTurn);
+    const runtime = activeUserTurn?.runtime
+      || getProjectChatProviderRuntimeDescriptor(provider).runtime;
+    if (!activeUserTurn) {
+      res.json({
+        aborted: false,
+        provider,
+        runtime,
+        stateVersion: coordination.state!.version,
+        executionContext: serializeProjectSandboxContext(executionContext),
+      });
+      return;
+    }
+    const bindingRead = await readExistingProjectChatBinding({
+      actorUserId,
+      provider,
+      executionContext,
+      requireActive: true,
+      requireProviderSession: true,
+    });
+    const boundSessions = new Set(
+      [bindingRead.binding?.sessionKey, bindingRead.binding?.externalSessionId]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    );
+    if (
+      !bindingRead.binding
+      || bindingRead.binding.runtime !== activeUserTurn.runtime
+      || !activeUserTurn.providerSessionId
+      || !boundSessions.has(activeUserTurn.providerSessionId)
+    ) {
+      throw new ProjectChatBindingReadError('The active Project turn does not match its provider binding.');
+    }
+    // Capture the exact process-local run before changing durable state. A
+    // stale broker entry for another turn is not provider-stop evidence and
+    // must never be cleared as a side effect of this abort.
+    const rawSnapshot = getProjectNativeRunSnapshot({
+      userId: actorUserId,
+      projectId: executionContext.projectId,
+      provider,
+    });
+    const exactSnapshot = matchingProjectNativeSnapshot(activeUserTurn, rawSnapshot);
+    if (rawSnapshot?.active && !exactSnapshot) {
+      throw new ProjectChatLeaseError(
+        'STATE_CORRUPT',
+        'The process-local Project run does not match the durable active turn; cancellation remains quarantined',
+        409,
+      );
+    }
+    await requestProjectChatTurnAbort({
+      actorUserId,
+      projectIdentityId: executionContext.projectId,
+      turnId: activeUserTurn.id,
+      expectedProvider: toPersistedProjectChatProvider(provider),
+    });
+    await requireConfirmedProjectChatAbortForReset({
+      hasExactBrokerRun: Boolean(exactSnapshot?.runId),
+      abortBroker: () => exactSnapshot?.active
+        ? abortProjectNativeRun({
+            userId: actorUserId,
+            projectId: executionContext.projectId,
+            provider,
+          })
+        : Promise.resolve(false),
+      waitForBrokerSettlement: () => exactSnapshot?.runId
+        ? waitForProjectNativeRunSettlement({
+            userId: actorUserId,
+            projectId: executionContext.projectId,
+            provider,
+            runId: exactSnapshot.runId,
+          })
+        : Promise.resolve(false),
+      abortProvider: async () => (
+        exactSnapshot?.complete && !exactSnapshot.active
+          ? true
+          : await getProjectChatProviderAdapter(provider).abortActiveRun?.(
+              activeUserTurn.providerSessionId!,
+              activeUserTurn.id,
+            ) === true
+      ),
+      isTurnStillActive: async () => Boolean((await readProjectChatCoordinationState({
+        actorUserId,
+        projectIdentityId: executionContext.projectId,
+        recoverStale: false,
+      })).activeTurn),
+    });
+    const confirmedTurn = await confirmProjectChatTurnAbort({
+      actorUserId,
+      projectIdentityId: executionContext.projectId,
+      turnId: activeUserTurn.id,
+      expectedProvider: toPersistedProjectChatProvider(provider),
+      providerSessionId: activeUserTurn.providerSessionId,
+    });
+    if (exactSnapshot) {
+      clearProjectNativeRun({ userId: actorUserId, projectId: executionContext.projectId, provider });
+    }
+    const confirmedState = await readProjectChatCoordinationState({
+      actorUserId,
+      projectIdentityId: executionContext.projectId,
+      recoverStale: false,
+    });
+    res.json({
+      aborted: confirmedTurn.status === 'ABORTED',
+      provider,
+      runtime,
+      turnId: confirmedTurn.id,
+      stateVersion: confirmedState.state?.version ?? coordination.state!.version,
+      executionContext: serializeProjectSandboxContext(executionContext),
+    });
+  } catch (error: any) {
+    if (sendProjectChatProviderError(res, error)) return;
+    if (sendProjectChatCoordinationError(res, error)) return;
+    console.error('[Project Chat Abort] Failed:', error?.message || error);
+    res.status(500).json({ error: 'Failed to abort project turn' });
+  }
+});
+
+const PROJECT_ACTIVE_INPUT_MAX_TEXT = 4_096;
+const PROJECT_ACTIVE_INPUT_MAX_REQUEST_ID = 128;
+
+function projectActiveInputField(
+  value: unknown,
+  label: 'request ID' | 'turn ID',
+  maxLength: number,
+): string {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text || text.length > maxLength || /[\u0000-\u001F\u007F]/.test(text)) {
+    throw new ProjectChatLeaseError('INVALID_INPUT', `A valid ${label} is required`, 400);
+  }
+  return text;
+}
+
+function projectActiveInputText(value: unknown): string {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (
+    !text
+    || text.length > PROJECT_ACTIVE_INPUT_MAX_TEXT
+    || /[\u0000\u000B\u000C\u000E-\u001F\u007F]/.test(text)
+  ) {
+    throw new ProjectChatLeaseError(
+      'INVALID_INPUT',
+      `An answer of at most ${PROJECT_ACTIVE_INPUT_MAX_TEXT} characters is required`,
+      400,
+    );
+  }
+  return text;
+}
+
+function projectActiveInputMessageMatches(
+  message: {
+    role: string;
+    content: string;
+    provider: string;
+    runtime: string;
+    sessionKey: string;
+    providerSessionId: string | null;
+    turnId: string | null;
+  },
+  expected: { content: string; runtime: string; sessionKey: string },
+): boolean {
+  return message.role === 'user'
+    && message.content === expected.content
+    && message.provider === 'OPENCLAW'
+    && message.runtime === expected.runtime
+    && message.sessionKey === expected.sessionKey
+    && message.providerSessionId === expected.sessionKey
+    && message.turnId === null;
+}
+
+// Deliberately steer the exact same live Project turn. Native Codex
+// request_user_input prompts are answered through the owner-scoped broker
+// routes instead. This never calls /assistant/send: that path rejects an
+// active turn and can race into a second turn after settlement.
+router.post('/:name/assistant/answer-input', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    const {
+      actorUserId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
+    if (!fs.existsSync(projectDir)) {
+      res.status(404).json({ error: 'Project not found' });
       return;
     }
 
-    // Read JSONL and extract user/assistant messages
-    // JSONL FORMAT (from actual OpenClaw analysis 2026-02-17):
-    //   type:"message" role:"assistant" stopReason:"toolUse"  → agent wants to call a tool (NOT done)
-    //   type:"message" role:"toolResult"                       → tool response
-    //   type:"message" role:"assistant" stopReason:"stop"      → agent finished this turn (DONE)
-    //   type:"message" role:"user"                             → new user message (new turn)
-    //   type:"compaction"                                      → context compaction
-    //   type:"result"                                          → explicit turn result (rare)
-    // NOTE: There are NO type:"tool_call" or type:"tool_result" entries.
-    //       Tools appear as content blocks (tool_use) inside assistant messages
-    //       and as separate role:"toolResult" messages.
-
-    const allLines = fs.readFileSync(jsonlPath, 'utf-8').split('\n').filter(l => l.trim());
-    const messages: Array<{ id: string; role: string; content: string; timestamp: string; lineIndex: number; toolCalls?: string[] }> = [];
-    let lastActivityTs = '';
-    const recentTools: Array<{ name: string; timestamp: string; active: boolean }> = [];
-
-    // Track the last entry's state to determine completion.
-    // Only the LAST relevant entry matters — not any historical one.
-    let lastEntryState: 'idle' | 'user_waiting' | 'tool_running' | 'agent_done' = 'idle';
-    let currentToolName = '';
-
-    // CRITICAL: Read ALL lines for state determination, but only emit messages from afterLine.
-    // Without this, incremental polls (afterLine=N where N=lineCount) see zero lines
-    // and return idle state even when the agent is between API calls.
-    for (let i = 0; i < allLines.length; i++) {
-      // Skip message extraction for already-seen lines, but still track state
-      const emitMessages = i >= afterLine;
-      try {
-        const entry = JSON.parse(allLines[i]);
-        if (entry.timestamp) lastActivityTs = entry.timestamp;
-
-        if (entry.type === 'message' && entry.message) {
-          const role = entry.message.role;
-          const stopReason = entry.message.stopReason || entry.message.stop_reason || '';
-
-          if (role === 'user') {
-            // New user message → new turn begins
-            lastEntryState = 'user_waiting';
-            recentTools.length = 0; // Clear tool history for new turn
-
-            let text = '';
-            if (typeof entry.message.content === 'string') {
-              text = entry.message.content;
-            } else if (Array.isArray(entry.message.content)) {
-              for (const block of entry.message.content) {
-                if (block.type === 'text') text += (text ? '\n' : '') + block.text;
-              }
-            }
-            if (text && emitMessages) {
-              // Strip portal context injection — show only the user's actual message
-              const contextEnd = text.indexOf('[END CONTEXT]\n\n');
-              const displayText = contextEnd >= 0 ? text.substring(contextEnd + 15) : text;
-              // Also strip model-switch notes
-              const modelNote = displayText.match(/^\[Note: Model switched to [^\]]+\]\n\n/);
-              const cleanText = modelNote ? displayText.substring(modelNote[0].length) : displayText;
-              if (cleanText.trim()) {
-                messages.push({
-                  id: entry.id, role, content: cleanText,
-                  timestamp: entry.timestamp, lineIndex: i,
-                });
-              }
-            }
-          } else if (role === 'assistant') {
-            // Extract text, thinking, and tool_use/toolCall blocks from content
-            let text = '';
-            const toolCalls: string[] = [];
-            if (typeof entry.message.content === 'string') {
-              text = entry.message.content;
-            } else if (Array.isArray(entry.message.content)) {
-              for (const block of entry.message.content) {
-                if (block.type === 'text') text += (text ? '\n' : '') + block.text;
-                if (block.type === 'tool_use' || block.type === 'toolCall') {
-                  const toolName = block.name || 'tool';
-                  toolCalls.push(toolName);
-                  currentToolName = toolName;
-                  recentTools.push({ name: toolName, timestamp: entry.timestamp || lastActivityTs, active: true });
-                }
-              }
-            }
-
-            // Emit assistant message if it has text content
-            if (text && emitMessages) {
-              messages.push({
-                id: entry.id, role, content: text,
-                timestamp: entry.timestamp, lineIndex: i,
-                ...(toolCalls.length > 0 ? { toolCalls } : {}),
-              });
-            }
-            // Also emit tool-only messages (no text, just tool calls) so UI shows activity
-            if (!text && toolCalls.length > 0 && emitMessages) {
-              messages.push({
-                id: entry.id, role, content: `🔧 Using ${toolCalls.join(', ')}...`,
-                timestamp: entry.timestamp, lineIndex: i,
-                toolCalls,
-              });
-            }
-
-            // Determine state from stopReason
-            if (stopReason === 'stop' || stopReason === 'end_turn') {
-              lastEntryState = 'agent_done';
-            } else if (stopReason === 'toolUse' || stopReason === 'tool_use') {
-              lastEntryState = 'tool_running';
-            }
-          } else if (role === 'toolResult') {
-            // Tool finished — mark it complete, but agent is still working
-            const tool = [...recentTools].reverse().find(t => t.active);
-            if (tool) tool.active = false;
-            currentToolName = '';
-            lastEntryState = 'tool_running'; // Keep as processing until next assistant msg
-          }
-        }
-
-        // Explicit result entry (rare but handle it)
-        if (entry.type === 'result') {
-          lastEntryState = 'agent_done';
-        }
-      } catch {}
+    const requestId = projectActiveInputField(
+      req.body?.requestId,
+      'request ID',
+      PROJECT_ACTIVE_INPUT_MAX_REQUEST_ID,
+    );
+    const requestedTurnId = projectActiveInputField(req.body?.turnId, 'turn ID', 512);
+    const message = projectActiveInputText(req.body?.message);
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      actorUserId,
+      ownerId,
+      name,
+      projectDir,
+      req.body?.provider,
+      { requireQualification: false, readOnly: true },
+    );
+    if (provider !== 'OPENCLAW') {
+      throw new ProjectChatLeaseError(
+        'PROVIDER_MISMATCH',
+        'Only the active OpenClaw Project turn accepts live user input',
+      );
     }
 
-    // sessionActive: derived from JSONL presence (no WS RPC needed — avoids 1/sec flood)
-    const sessionActive = allLines.length > 0;
+    const durableMessageId = `active-input:${requestedTurnId}:${requestId}`;
+    const replayMessage = await prisma.projectChatMessage.findFirst({
+      where: {
+        userId: actorUserId,
+        projectId: executionContext.projectId,
+        messageId: durableMessageId,
+      },
+      select: {
+        id: true,
+        role: true,
+        content: true,
+        provider: true,
+        runtime: true,
+        sessionKey: true,
+        providerSessionId: true,
+        turnId: true,
+      },
+    });
+    if (replayMessage) {
+      const replayTurn = await prisma.projectChatTurn.findFirst({
+        where: {
+          id: requestedTurnId,
+          actorUserId,
+          projectIdentityId: executionContext.projectId,
+          provider: 'OPENCLAW',
+        },
+        select: { id: true, runtime: true, providerSessionId: true },
+      });
+      if (
+        !replayTurn?.providerSessionId
+        || !projectActiveInputMessageMatches(replayMessage, {
+          content: message,
+          runtime: replayTurn.runtime,
+          sessionKey: replayTurn.providerSessionId,
+        })
+      ) {
+        throw new ProjectChatLeaseError(
+          'REQUEST_REPLAY',
+          'Project live-input identity was already used for different content',
+        );
+      }
+      const replayState = await readProjectChatCoordinationState({
+        actorUserId,
+        projectIdentityId: executionContext.projectId,
+        recoverStale: false,
+      });
+      res.json({
+        accepted: true,
+        idempotentReplay: true,
+        requestId,
+        messageId: replayMessage.id,
+        turnId: replayTurn.id,
+        sessionKey: replayTurn.providerSessionId,
+        provider,
+        stateVersion: replayState.state?.version ?? null,
+      });
+      return;
+    }
 
-    const lastActivity = lastActivityTs ? new Date(lastActivityTs) : null;
-    const idleMs = lastActivity ? Date.now() - lastActivity.getTime() : Infinity;
+    const coordination = await requireSelectedProjectChatState({
+      actorUserId,
+      projectIdentityId: executionContext.projectId,
+      provider,
+      expectedVersion: req.body?.stateVersion,
+    });
+    const activeTurn = visibleProjectChatActiveTurn(coordination.activeTurn);
+    if (
+      !activeTurn
+      || activeTurn.id !== requestedTurnId
+      || activeTurn.status !== 'RUNNING'
+      || activeTurn.provider !== 'OPENCLAW'
+      || !activeTurn.providerSessionId
+    ) {
+      throw new ProjectChatLeaseError(
+        'TURN_NOT_FOUND',
+        'That OpenClaw Project turn is no longer accepting input',
+        409,
+      );
+    }
 
-    // Completion is simple: the last entry state says "agent_done"
-    const sessionComplete = lastEntryState === 'agent_done';
+    const snapshot = matchingProjectNativeSnapshot(activeTurn, getProjectNativeRunSnapshot({
+      userId: actorUserId,
+      projectId: executionContext.projectId,
+      provider,
+    }));
+    if (!snapshot?.active || snapshot.complete || snapshot.sessionId !== activeTurn.providerSessionId) {
+      throw new ProjectChatLeaseError(
+        'TURN_NOT_FOUND',
+        'The exact OpenClaw Project run is no longer accepting input',
+        409,
+      );
+    }
 
-    // Processing: anything that's not done and not idle
-    const isProcessing = !sessionComplete && lastEntryState !== 'idle';
+    const authority = await resolveAskUserQuestionRunOwner({
+      sessionKey: activeTurn.providerSessionId,
+      runId: `portal-${activeTurn.id}`,
+      toolCallId: requestId,
+    });
+    if (
+      authority.ownerUserId !== actorUserId
+      || authority.surface !== 'project-chat'
+      || authority.authorityId !== activeTurn.id
+      || authority.projectIdentityId !== executionContext.projectId
+    ) {
+      res.status(404).json({ error: 'Active Project input request not found' });
+      return;
+    }
 
-    // Active tool: only if state is tool_running and we have a current tool
-    const activeToolCall = (lastEntryState === 'tool_running' && currentToolName) ? currentToolName :
-      recentTools.find(t => t.active)?.name || null;
+    const expectedMessage = {
+      content: message,
+      runtime: activeTurn.runtime,
+      sessionKey: activeTurn.providerSessionId,
+    };
+    const existing = await prisma.projectChatMessage.findFirst({
+      where: {
+        userId: actorUserId,
+        projectId: executionContext.projectId,
+        messageId: durableMessageId,
+      },
+      select: {
+        id: true,
+        role: true,
+        content: true,
+        provider: true,
+        runtime: true,
+        sessionKey: true,
+        providerSessionId: true,
+        turnId: true,
+      },
+    });
+    if (existing) {
+      if (!projectActiveInputMessageMatches(existing, expectedMessage)) {
+        throw new ProjectChatLeaseError(
+          'REQUEST_REPLAY',
+          'Project live-input identity was already used for different content',
+        );
+      }
+      res.json({
+        accepted: true,
+        idempotentReplay: true,
+        requestId,
+        messageId: existing.id,
+        turnId: activeTurn.id,
+        sessionKey: activeTurn.providerSessionId,
+        provider,
+        stateVersion: coordination.state!.version,
+      });
+      return;
+    }
 
+    const accepted = await steerActiveRun(
+      activeTurn.providerSessionId,
+      `portal-${activeTurn.id}`,
+      requestId,
+      message,
+    );
+    if (accepted?.accepted !== true) {
+      throw new ProjectChatLeaseError(
+        'TURN_NOT_FOUND',
+        'The OpenClaw Project run stopped accepting input before delivery',
+        409,
+      );
+    }
+
+    const persisted = await prisma.projectChatMessage.upsert({
+      where: {
+        userId_projectId_messageId: {
+          userId: actorUserId,
+          projectId: executionContext.projectId,
+          messageId: durableMessageId,
+        },
+      },
+      update: {},
+      create: {
+        projectId: executionContext.projectId,
+        userId: actorUserId,
+        sessionKey: activeTurn.providerSessionId,
+        role: 'user',
+        content: message,
+        messageId: durableMessageId,
+        provider: 'OPENCLAW',
+        runtime: activeTurn.runtime,
+        model: activeTurn.model,
+        providerSessionId: activeTurn.providerSessionId,
+      },
+      select: {
+        id: true,
+        role: true,
+        content: true,
+        provider: true,
+        runtime: true,
+        sessionKey: true,
+        providerSessionId: true,
+        turnId: true,
+      },
+    });
+    if (!projectActiveInputMessageMatches(persisted, expectedMessage)) {
+      throw new ProjectChatLeaseError(
+        'REQUEST_REPLAY',
+        'Project live-input identity was already used for different content',
+      );
+    }
+    const current = await readProjectChatCoordinationState({
+      actorUserId,
+      projectIdentityId: executionContext.projectId,
+      recoverStale: false,
+    });
     res.json({
-      messages,
-      lineCount: allLines.length,
-      sessionActive,
-      complete: sessionComplete,
-      isProcessing,
-      activeToolCall: activeToolCall || null,
-      recentTools: recentTools.slice(-50),
-      lastActivity: lastActivityTs || null,
-      idleMs: Math.round(idleMs),
+      accepted: true,
+      idempotentReplay: accepted.idempotentReplay === true,
+      requestId,
+      messageId: persisted.id,
+      turnId: activeTurn.id,
+      sessionKey: activeTurn.providerSessionId,
+      provider,
+      stateVersion: current.state?.version ?? coordination.state!.version,
     });
   } catch (error: any) {
-    console.error('[Agent Poll] Error:', error.message);
-    res.json({ messages: [], lineCount: 0, sessionActive: false, complete: false, error: error.message });
+    if (sendProjectChatProviderError(res, error)) return;
+    if (sendProjectChatCoordinationError(res, error)) return;
+    const statusCode = Number(error?.statusCode);
+    if (Number.isInteger(statusCode) && statusCode >= 400 && statusCode < 600) {
+      res.status(statusCode === 403 ? 404 : statusCode).json({
+        error: statusCode === 403
+          ? 'Active Project input request not found'
+          : String(error?.message || 'Project input was rejected'),
+        code: String(error?.code || 'PROJECT_ACTIVE_INPUT_REJECTED'),
+      });
+      return;
+    }
+    console.error('[Project Chat Active Input] Failed:', error?.message || error);
+    res.status(503).json({
+      error: 'Project input could not be delivered to the active OpenClaw turn',
+      code: 'PROJECT_ACTIVE_INPUT_UNAVAILABLE',
+    });
   }
 });
 
 // POST /api/projects/:name/assistant/send - Fire-and-forget message send (non-streaming)
 // Returns immediately after dispatching to gateway. Frontend polls for response.
 router.post('/:name/assistant/send', authenticateToken, async (req: Request, res: Response) => {
+  let runtimeAdmission: Awaited<ReturnType<typeof acquireProjectChatRuntimeAdmission>> | null = null;
+  let runtimeAdmissionPromoted = false;
+  let runtimeAdmissionFinalizedAfterFailure = false;
+  let stopRuntimeAdmissionHeartbeat: (() => void) | null = null;
   try {
-    const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
+    const {
+      actorUserId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, name);
     const { message, model } = req.body;
-    if (!message) { res.status(400).json({ error: 'message required' }); return; }
-
-    const projectDir = getProjectPath(ownerId, name);
-    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-
-    const requestedModel = normalizePortalModelId(model || '');
-    const modelResolution = await resolveAllowedProjectModel([
-      requestedModel,
-      getDefaultModel() || '',
-    ], requestedModel);
-    const selectedModel = modelResolution.model;
-    
-    // Get or create session (Phase 2: per-project agent isolation)
-    const { sessionKey, agentId, needsInit, stableSlug } = await getOrCreateSession(
-      projectDir, ownerId, name
-    );
-
-    // Check if model changed from last message
-    const sessionStatePath = path.join(projectDir, '.agent-session.json');
-    let previousModel = '';
-    try {
-      if (fs.existsSync(sessionStatePath)) {
-        const meta = JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8'));
-        previousModel = normalizePortalModelId(meta.model || '');
-      }
-    } catch {}
-    const modelChanged = !previousModel || previousModel !== selectedModel;
-
-    // Patch model only when it actually changed or the caller explicitly asked
-    // for a concrete model on an uninitialized/stale session. Re-patching on
-    // every send turns normal chat into a transport timeout lottery.
-    if (selectedModel && modelChanged) {
-      try {
-        let currentSessionInfo: any = null;
-        try {
-          const sessionInfo = await getSessionInfo(sessionKey);
-          if (sessionInfo.ok) currentSessionInfo = sessionInfo.data;
-        } catch {}
-        const runtimeModel = modelForOpenClawSessionPatch(currentSessionInfo, selectedModel);
-        await patchSessionModel(sessionKey, runtimeModel || selectedModel);
-      } catch {}
+    const messageId = typeof req.body?.messageId === 'string' && req.body.messageId.trim()
+      ? req.body.messageId.trim()
+      : null;
+    if (!message) {
+      res.status(400).json({
+        error: 'message required',
+        admissionOutcome: 'not_admitted',
+        admissionStatus: 'never_admitted',
+        recoveryRequired: false,
+      });
+      return;
     }
-    
-    // Phase 2: dedicated project agents work in /workspace/project/, legacy portal fallback uses /home/user/projects/{name}/
-    const isDedicatedProjectAgent = agentId !== 'portal';
-    const sandboxProjectDir = isDedicatedProjectAgent ? `/workspace/project/` : `/home/user/projects/${name}/`;
-    let fullMessage = message;
-    const assistantName = await getAssistantName();
+    if (!messageId) {
+      res.status(400).json({
+        error: 'A stable Project Chat message ID is required for exactly-once delivery.',
+        code: 'PROJECT_CHAT_MESSAGE_ID_REQUIRED',
+        admissionOutcome: 'not_admitted',
+        admissionStatus: 'never_admitted',
+        recoveryRequired: false,
+      });
+      return;
+    }
 
-    if (needsInit) {
-      // Initialize project memory if missing
-      const memoryPath = path.join(projectDir, '.agent-memory.md');
-      if (!fs.existsSync(memoryPath)) {
-        fs.writeFileSync(memoryPath, `# Project Memory — ${name}\n\n## Overview\n(Describe what this project does)\n`, 'utf-8');
+    if (!fs.existsSync(projectDir)) {
+      res.status(404).json({
+        error: 'Project not found',
+        admissionOutcome: 'not_admitted',
+        admissionStatus: 'never_admitted',
+        recoveryRequired: false,
+      });
+      return;
+    }
+    const { provider, executionContext } = await resolveProjectChatOperationContext(
+      actorUserId,
+      ownerId,
+      name,
+      projectDir,
+      req.body?.provider,
+    );
+    const replay = await findProjectChatRequestReplay({
+      actorUserId: req.user!.userId,
+      projectIdentityId: executionContext.projectId,
+      provider,
+      messageId,
+      message,
+    });
+    if (replay) {
+      const complete = ['COMPLETED', 'ERROR', 'ABORTED', 'EXPIRED'].includes(replay.turn.status);
+      const dispatchStage = projectChatTurnDispatchStage(replay.turn);
+      if (
+        dispatchStage === PROJECT_CHAT_DISPATCH_STAGE_UNCONFIRMED
+        || (!complete && dispatchStage === null)
+      ) {
+        res.status(409).json({
+          error: 'Provider delivery could not be confirmed after an interrupted dispatch. Clear Project Chat before retrying this message.',
+          code: dispatchStage === PROJECT_CHAT_DISPATCH_STAGE_UNCONFIRMED
+            ? 'PROJECT_CHAT_DISPATCH_UNCONFIRMED'
+            : 'PROJECT_CHAT_DISPATCH_UNKNOWN',
+          provider,
+          turnId: replay.turn.id,
+          stateVersion: replay.state.version,
+          recoveryRequired: true,
+          admissionOutcome: 'unknown',
+          admissionStatus: 'unknown',
+        });
+        return;
       }
-      const projectType = detectProjectType(projectDir);
+      res.json({
+        sent: true,
+        idempotentReplay: true,
+        sessionKey: replay.turn.providerSessionId,
+        runId: replay.turn.id,
+        turnId: replay.turn.id,
+        status: replay.turn.status.toLowerCase(),
+        complete,
+        model: projectChatClientModel(provider, replay.turn.model),
+        modelValidated: true,
+        ...(provider === 'OPENCLAW' ? { modelVerified: true } : { modelConfigured: true }),
+        provider,
+        runtime: replay.turn.runtime,
+        stateVersion: replay.state.version,
+        executionContext: serializeProjectSandboxContext(executionContext),
+      });
+      return;
+    }
+    const coordination = await requireSelectedProjectChatState({
+      actorUserId: req.user!.userId,
+      projectIdentityId: executionContext.projectId,
+      provider,
+      expectedVersion: req.body?.stateVersion,
+    });
+    if (isNativeProjectChatRouteProvider(provider)) {
+      const currentRun = getProjectNativeRunSnapshot({
+        userId: req.user!.userId,
+        projectId: executionContext.projectId,
+        provider,
+      });
+      if (currentRun?.active) {
+        res.status(409).json({
+          error: `${projectChatProviderDisplayName(provider)} already has an active turn for this project.`,
+          code: 'PROJECT_PROVIDER_RUN_ACTIVE',
+          provider,
+          runId: currentRun.runId,
+          admissionOutcome: 'not_admitted',
+          admissionStatus: 'never_admitted',
+          recoveryRequired: false,
+        });
+        return;
+      }
+    }
+    runtimeAdmission = await acquireProjectChatRuntimeAdmission({
+      actorUserId: req.user!.userId,
+      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
+      projectIdentityId: executionContext.projectId,
+      provider: toPersistedProjectChatProvider(provider),
+      runtime: getProjectChatProviderRuntimeDescriptor(provider).runtime,
+      operation: projectChatRuntimeOperationId('send', provider, messageId),
+      leaseOwner: PROJECT_CHAT_LEASE_OWNER,
+      expectedVersion: coordination.state!.version,
+      leaseDurationMs: PROJECT_CHAT_LEASE_DURATION_MS,
+    });
+    stopRuntimeAdmissionHeartbeat = startProjectChatLeaseHeartbeat({
+      actorUserId: req.user!.userId,
+      projectIdentityId: executionContext.projectId,
+      turnId: runtimeAdmission.turn.id,
+      leaseToken: runtimeAdmission.leaseToken,
+      onLeaseLost: (error) => {
+        console.error('[Project Chat] Runtime admission lease was lost before provider dispatch:', error);
+      },
+    });
+    // Legacy terminal projection repair is a mutation and therefore runs only
+    // while this request owns the exact project-wide runtime admission. Both
+    // OpenClaw and native sends pass through this shared boundary.
+    await repairTerminalProjectChatPresentations({
+      actorUserId: req.user!.userId,
+      projectIdentityId: executionContext.projectId,
+      limit: 100,
+    });
 
-      const fileOpsGuidance = isDedicatedProjectAgent
-        ? `**Project File Operations:**\n- Use exec tool for project file reads and writes. Start from /workspace/project or set workdir to /workspace/project before editing.\n- Use shell commands like cat, sed, python, node, perl, tee, or here-docs to inspect and modify files.\n- Never write project files into /workspace root by accident.\n- All real project paths should be under ${sandboxProjectDir}`
-        : `**File Operations:**\n- Use Read tool with file_path to read files. For large files (>1MB), use offset (line number) and limit (max lines) to read in chunks.\n- Use Write tool to create/overwrite files.\n- Use Edit tool for surgical find-and-replace edits.\n- All paths should be absolute: ${sandboxProjectDir}filename.ext`;
-
-      fullMessage = `[PORTAL PROJECT CONTEXT]
-You are ${assistantName}, an AI coding assistant working on the project "${name}".
-Project Type: ${projectType}
-Project Directory (inside sandbox): ${sandboxProjectDir}
-
-**CRITICAL: You are sandboxed to this project directory.**
-
-${fileOpsGuidance}
-
-**Commands:**
-- Use exec tool to run shell commands (git, npm, node, ls, grep, find, etc.)
-- ${isDedicatedProjectAgent ? 'Your default shell starts in /workspace, so cd /workspace/project first or set workdir to /workspace/project.' : `Set workdir to ${sandboxProjectDir} or cd there first`}
-- Examples: exec git status, exec npm install, exec ls -la
-
-**Internet:**
-- Use web_search for research
-- Use web_fetch to download documentation or resources
-
-**Project Memory:**
-- Read .agent-memory.md to learn project context
-- Update .agent-memory.md when you learn important patterns or decisions
-
-**Security:** Do not try to access files outside ${sandboxProjectDir} - the sandbox prevents this anyway.
+    if (isNativeProjectChatRouteProvider(provider)) {
+      const selectedModel = normalizePortalModelId(model || '');
+      let resolved = await ensureNativeProjectChatBinding({
+        actorUserId: req.user!.userId,
+        workspaceOwnerId: ownerId,
+        projectName: name,
+        projectDir,
+        provider,
+        executionContext,
+        model: selectedModel || null,
+      });
+      const reconciledBinding = await reconcileLegacyProjectChatTerminalHandoff({
+        actorUserId: req.user!.userId,
+        projectIdentityId: executionContext.projectId,
+        provider: toPersistedProjectChatProvider(provider),
+        admission: runtimeAdmission,
+      });
+      const handoffSuffix = await readProjectChatProviderHandoffSuffix({
+        actorUserId: req.user!.userId,
+        projectIdentityId: executionContext.projectId,
+        handoffCursor: reconciledBinding.handoffCursor,
+      });
+      resolved = {
+        ...resolved,
+        binding: reconciledBinding,
+        needsBootstrap: projectChatBindingNeedsHandoff(
+          reconciledBinding,
+          handoffSuffix.transcriptCursor,
+        ),
+        handoffCursor: reconciledBinding.handoffCursor,
+        handoffVersion: reconciledBinding.handoffVersion,
+      };
+      const priorMessages = resolved.needsBootstrap ? handoffSuffix.messages : [];
+      const handoff = buildProjectChatProviderHandoff(priorMessages);
+      const fullMessage = resolved.needsBootstrap
+        ? `[PORTAL PROJECT CONTEXT]
+You are working only inside the Portal project "${name}".
+Your visible workspace root is ${NATIVE_CLI_PROJECT_CONTAINER_ROOT}.
+The Portal enforces the exact ${projectChatProviderDisplayName(provider)} Project Sandbox runtime and policy.
+Do not request broader filesystem access, additional directories, or host-operator authority.
 
 [END CONTEXT]
 
-${message}`;
-    } else if (modelChanged) {
-      fullMessage = `[Note: Model switched to ${selectedModel}]\n\n${message}`;
+${handoff ? `${handoff}\n\n` : ''}[CURRENT USER REQUEST]
+${message}`
+        : message;
+      const now = new Date();
+      await prisma.projectChatSession.upsert({
+        where: { sessionKey: resolved.identity.sessionId },
+        update: {
+          lastActivity: now,
+          model: resolved.binding.model,
+          status: 'active',
+          activeProvider: provider,
+          runtime: resolved.binding.runtime,
+        },
+        create: {
+          userId: req.user!.userId,
+          projectId: executionContext.projectId,
+          sessionKey: resolved.identity.sessionId,
+          model: resolved.binding.model,
+          status: 'active',
+          activeProvider: provider,
+          runtime: resolved.binding.runtime,
+        },
+      });
+      stopRuntimeAdmissionHeartbeat();
+      stopRuntimeAdmissionHeartbeat = null;
+      const turnLease = await promoteProjectChatRuntimeAdmissionToTurn({
+        actorUserId: req.user!.userId,
+        projectIdentityId: executionContext.projectId,
+        turnId: runtimeAdmission.turn.id,
+        leaseToken: runtimeAdmission.leaseToken,
+        runtime: resolved.binding.runtime,
+        providerSessionId: resolved.sessionKey,
+        model: resolved.binding.model,
+        userMessage: {
+          sessionKey: resolved.identity.sessionId,
+          content: message,
+          messageId,
+        },
+      });
+      runtimeAdmissionPromoted = true;
+
+      let currentProviderSessionId = resolved.sessionKey;
+      let durableEventSeq = turnLease.turn.lastEventSeq;
+      let durableEventFailure: unknown = null;
+      const durableEventPersistenceGate = createProjectChatDispatchPersistenceGate();
+      // The native broker emits its initial status synchronously. Hold the
+      // corresponding row write until the DISPATCH_ACCEPTED CAS has finished,
+      // otherwise both Serializable transactions contend on this turn.
+      let durableEventChain: Promise<void> = durableEventPersistenceGate.waitUntilAccepted;
+      const presentationEvents: ProjectNativeRunEvent[] = [];
+      const persistDurableEvent = (event: ProjectNativeRunEvent) => {
+        presentationEvents.push(event);
+        if (presentationEvents.length > PROJECT_CHAT_PRESENTATION_EVENT_LIMIT) {
+          presentationEvents.splice(0, presentationEvents.length - PROJECT_CHAT_PRESENTATION_EVENT_LIMIT);
+        }
+        durableEventChain = durableEventChain.then(async () => {
+          const payload = JSON.parse(JSON.stringify(event));
+          const persisted = await appendProjectChatTurnEvent({
+            actorUserId: req.user!.userId,
+            projectIdentityId: executionContext.projectId,
+            turnId: turnLease.turn.id,
+            leaseToken: turnLease.leaseToken,
+            expectedSeq: durableEventSeq,
+            eventType: String(payload.type || 'status'),
+            payload,
+          });
+          durableEventSeq = persisted.seq;
+        }).catch((error) => {
+          durableEventFailure = error;
+          console.error('[Project Chat] Durable replay persistence failed:', error);
+        });
+      };
+      const stopLeaseHeartbeat = startProjectChatLeaseHeartbeat({
+        actorUserId: req.user!.userId,
+        projectIdentityId: executionContext.projectId,
+        turnId: turnLease.turn.id,
+        leaseToken: turnLease.leaseToken,
+        providerSessionId: () => currentProviderSessionId,
+        onLeaseLost: async (error) => {
+          console.error('[Project Chat] Durable turn lease was lost:', error);
+          await abortProjectNativeRun({
+            userId: req.user!.userId,
+            projectId: executionContext.projectId,
+            provider,
+          });
+        },
+      });
+
+      // Portal files created while admitting the turn must be writable by the
+      // same numeric identity the confined native container runs as.
+      prepareProjectLifecycleWorkspace(projectDir);
+      let run;
+      let dispatchAcceptanceFailed = false;
+      let dispatchQuiescedAfterAcceptanceFailure = false;
+      let providerRunStarted = false;
+      let releaseWorkspaceMutationLease: (() => void) | null =
+        acquireWorkspaceAuthorizationMutationLease(req.user!.userId);
+      const releaseWorkspaceMutation = () => {
+        releaseWorkspaceMutationLease?.();
+        releaseWorkspaceMutationLease = null;
+      };
+      try {
+        run = startProjectNativeRun({
+          userId: req.user!.userId,
+          projectId: executionContext.projectId,
+          provider,
+          runId: turnLease.turn.id,
+          runtime: resolved.binding.runtime,
+          sessionId: resolved.sessionKey,
+          message: fullMessage,
+          model: resolved.binding.model,
+          sender: {
+            label: req.user!.email,
+            userId: req.user!.userId,
+            role: req.user!.role,
+            requestId: turnLease.turn.id,
+          },
+          onSessionResolved: async (sessionId) => {
+            if (sessionId !== resolved.sessionKey) {
+              throw new ProjectChatBindingReadError(
+                `${projectChatProviderDisplayName(provider)} attempted to replace the Portal-native Project session key.`,
+              );
+            }
+            currentProviderSessionId = sessionId;
+            await renewProjectChatTurnLease({
+              actorUserId: req.user!.userId,
+              projectIdentityId: executionContext.projectId,
+              turnId: turnLease.turn.id,
+              leaseToken: turnLease.leaseToken,
+              leaseDurationMs: PROJECT_CHAT_LEASE_DURATION_MS,
+              providerSessionId: sessionId,
+            });
+          },
+          onEvent: persistDurableEvent,
+          onComplete: async () => {
+            // Assistant projection is committed exactly once by terminal
+            // settlement after it re-attests the durable turn generation.
+            // Writing it here allowed a delayed callback to resurrect a row
+            // after destructive reset had already returned.
+            await prisma.projectChatSession.update({
+              where: { sessionKey: resolved.identity.sessionId },
+              data: { status: 'active', lastActivity: new Date() },
+            });
+            await checkpointProjectAfterProviderTurn({
+              projectDir,
+              actorUserId: req.user!.userId,
+              projectId: executionContext.projectId,
+              workspaceOwnerId: ownerId,
+              projectName: name,
+              sessionKey: resolved.identity.sessionId,
+              turnId: turnLease.turn.id,
+              provider,
+              runtime: resolved.binding.runtime,
+              model: resolved.binding.model,
+            });
+          },
+          onError: async () => {
+            await prisma.projectChatSession.update({
+              where: { sessionKey: resolved.identity.sessionId },
+              data: { status: 'error', lastActivity: new Date() },
+            });
+          },
+          onSettled: async ({ status, sessionId, error, fullText }) => {
+            try {
+              stopLeaseHeartbeat();
+              await durableEventChain;
+              await settleProjectChatTurnWithPresentation({
+                turn: turnLease.turn,
+                leaseToken: turnLease.leaseToken,
+                providerStatus: status,
+                providerDispatchObserved: true,
+                providerSessionId: sessionId,
+                providerError: error,
+                durableEventFailure,
+                durableEventCount: durableEventSeq,
+                sessionKey: resolved.identity.sessionId,
+                preferredContent: status === 'completed' ? fullText : null,
+                handoff: {
+                  expectedCursor: resolved.handoffCursor,
+                  expectedHandoffVersion: resolved.handoffVersion,
+                },
+              });
+            } finally {
+              releaseWorkspaceMutation();
+            }
+          },
+        });
+        providerRunStarted = true;
+        try {
+          await durableEventPersistenceGate.releaseAfter(markProjectChatTurnProviderDispatchAccepted({
+            actorUserId: req.user!.userId,
+            projectIdentityId: executionContext.projectId,
+            turnId: turnLease.turn.id,
+            leaseToken: turnLease.leaseToken,
+          }));
+        } catch (acceptanceError) {
+          dispatchAcceptanceFailed = true;
+          try {
+            await abortProjectNativeRun({
+              userId: req.user!.userId,
+              projectId: executionContext.projectId,
+              provider,
+            });
+          } catch {
+            // Exact semantic settlement below remains the authority.
+          }
+          dispatchQuiescedAfterAcceptanceFailure = await waitForProjectNativeRunSettlement({
+            userId: req.user!.userId,
+            projectId: executionContext.projectId,
+            provider,
+            runId: String(run.runId || turnLease.turn.id),
+          });
+          const recoveryError = new ProjectChatLeaseError(
+            'TURN_ACTIVE',
+            dispatchQuiescedAfterAcceptanceFailure
+              ? 'Provider delivery state could not be recorded. The turn was stopped; clear Project Chat before retrying.'
+              : 'Provider delivery state could not be recorded and its callback is still active. Abort or clear Project Chat before retrying.',
+            409,
+          );
+          (recoveryError as Error & { cause?: unknown }).cause = acceptanceError;
+          throw recoveryError;
+        }
+      } catch (error) {
+        durableEventPersistenceGate.release();
+        if (!providerRunStarted) releaseWorkspaceMutation();
+        stopLeaseHeartbeat();
+        await durableEventChain;
+        // Never race an independent terminal write against a provider whose
+        // exact broker callback boundary is still live. The durable
+        // DISPATCH_UNCONFIRMED row remains quarantined for abort/reset.
+        if (dispatchAcceptanceFailed && !dispatchQuiescedAfterAcceptanceFailure) throw error;
+        await settleProjectChatTurnWithPresentation({
+          turn: turnLease.turn,
+          leaseToken: turnLease.leaseToken,
+          providerSessionId: currentProviderSessionId,
+          providerStatus: 'error',
+          providerDispatchObserved: dispatchAcceptanceFailed,
+          providerError: error instanceof Error ? error.message : 'Project provider failed to start',
+          durableEventFailure,
+          durableEventCount: durableEventSeq,
+          sessionKey: resolved.identity.sessionId,
+          handoff: {
+            expectedCursor: resolved.handoffCursor,
+            expectedHandoffVersion: resolved.handoffVersion,
+          },
+        });
+        throw error;
+      }
+
+      const sessionStatePath = path.join(projectDir, '.agent-session.json');
+      const previous = fs.existsSync(sessionStatePath)
+        ? JSON.parse(fs.readFileSync(sessionStatePath, 'utf8'))
+        : {};
+      fs.writeFileSync(sessionStatePath, JSON.stringify({
+        ...previous,
+        initialized: true,
+        model: resolved.configuredModel,
+        modelConfigured: true,
+        lastActivity: now.toISOString(),
+        stableSlug: resolved.identity.stableSlug,
+      }, null, 2), 'utf8');
+
+      res.json({
+        sent: true,
+        sessionKey: resolved.sessionKey,
+        runId: run.runId,
+        model: resolved.configuredModel,
+        modelValidated: true,
+        modelConfigured: true,
+        modelWarning: null,
+        provider,
+        runtime: resolved.binding.runtime,
+        stateVersion: turnLease.state.version,
+        turnId: turnLease.turn.id,
+        executionContext: serializeProjectSandboxContext(executionContext),
+      });
+      return;
     }
 
-    const sandboxSystemMessage = {
-      role: 'system' as const,
-      content: isDedicatedProjectAgent
-        ? `You are ${assistantName}, an AI coding assistant sandboxed to ${sandboxProjectDir}. Use exec for project file reads and writes, and always work from /workspace/project when touching project files. The sandbox is enforced at the container level - you cannot escape it. Running as model: ${selectedModel}`
-        : `You are ${assistantName}, an AI coding assistant sandboxed to ${sandboxProjectDir}. You have full tool access (Read, Write, Edit, exec, web_search, web_fetch). The sandbox is enforced at the container level - you cannot escape it. Use tools to explore files intelligently instead of having everything embedded in prompts. Running as model: ${selectedModel}`
+    if (provider !== 'OPENCLAW') {
+      throw new UnsupportedProjectChatProviderError(provider, 'No qualified Project Sandbox transport is available.');
+    }
+
+    const requestedModel = normalizePortalModelId(model || '');
+    const existingOpenClawBinding = await prisma.projectChatProviderBinding.findUnique({
+      where: {
+        userId_projectId_provider: {
+          userId: req.user!.userId,
+          projectId: executionContext.projectId,
+          provider: 'OPENCLAW',
+        },
+      },
+    });
+
+    prepareProjectLifecycleWorkspace(projectDir);
+    const catalogScope = await ensureOpenClawProjectAgentCatalogScope(executionContext);
+    const modelResolution = await resolveAllowedOpenClawProjectModel(
+      catalogScope.agentId,
+      [
+        requestedModel,
+        existingOpenClawBinding?.model || '',
+        getDefaultModel() || '',
+      ],
+      requestedModel,
+    );
+    let selectedModel = modelResolution.model;
+    let resolved = await ensureOpenClawProjectRuntime({
+      actorUserId: req.user!.userId,
+      workspaceOwnerId: ownerId,
+      projectName: name,
+      projectDir,
+      executionContext,
+      model: existingOpenClawBinding?.model || null,
+    });
+    const sessionKey = resolved.identity.sessionKey;
+    const modelVerification = await verifyAndPersistOpenClawProjectModel({
+      actorUserId: req.user!.userId,
+      projectId: executionContext.projectId,
+      portalSessionKey: resolved.identity.sessionId,
+      providerSessionKey: sessionKey,
+      desiredModel: selectedModel,
+    });
+    selectedModel = modelVerification.verified.model;
+    const reconciledBinding = await reconcileLegacyProjectChatTerminalHandoff({
+      actorUserId: req.user!.userId,
+      projectIdentityId: executionContext.projectId,
+      provider: 'OPENCLAW',
+      admission: runtimeAdmission,
+    });
+    const handoffSuffix = await readProjectChatProviderHandoffSuffix({
+      actorUserId: req.user!.userId,
+      projectIdentityId: executionContext.projectId,
+      handoffCursor: reconciledBinding.handoffCursor,
+    });
+    resolved = {
+      ...resolved,
+      binding: reconciledBinding,
+      needsBootstrap: projectChatBindingNeedsHandoff(
+        reconciledBinding,
+        handoffSuffix.transcriptCursor,
+      ),
+      handoffCursor: reconciledBinding.handoffCursor,
+      handoffVersion: reconciledBinding.handoffVersion,
     };
 
-    // Save user message to DB immediately (before sending)
-    // Extract sessionId from key format: "agent:{agentId}:{sessionId}"
-    const sessionId = sessionKey.split(':').slice(2).join(':');
-    (async () => {
-      try {
-        await prisma.projectChatSession.upsert({
-          where: { sessionKey: sessionId },
-          update: { lastActivity: new Date(), model: selectedModel, status: 'active' },
-          create: { userId: ownerId, projectId: name, sessionKey: sessionId, model: selectedModel, status: 'active' },
-        });
-        await prisma.projectChatMessage.create({
-          data: { projectId: name, userId: ownerId, sessionKey: sessionId, role: 'user', content: message },
-        });
-      } catch (dbErr: any) {
-        console.warn('[Agent Send] DB user message save failed (non-fatal):', dbErr.message);
-      }
-    })();
+    const priorMessages = resolved.needsBootstrap ? handoffSuffix.messages : [];
+    const handoff = buildProjectChatProviderHandoff(priorMessages);
+    const assistantName = await getAssistantName();
+    const memoryPath = path.join(projectDir, '.agent-memory.md');
+    if (!fs.existsSync(memoryPath)) {
+      fs.writeFileSync(memoryPath, `# Project Memory — ${name}\n\n## Overview\n(Describe what this project does)\n`, 'utf-8');
+    }
+    const fullMessage = resolved.needsBootstrap
+      ? `[PORTAL PROJECT CONTEXT]
+You are ${assistantName}, an AI coding assistant working only on the Portal project "${name}".
+Project Type: ${detectProjectType(projectDir)}
+Project Directory: /workspace/project
 
-    // Fire-and-forget via direct gateway RPC.
-    // Do NOT use /v1/chat/completions here: it can leave project chat stuck in
-    // a fake active "Thinking…" state with no real session progress.
-    // Also avoid the portal's long-lived backend websocket here; after gateway
-    // restarts it can lag reconnects while one-shot RPC calls are healthy.
-    void (async () => {
-      try {
-        const rpc = await gatewayRpcCall('chat.send', {
-          sessionKey,
-          message: fullMessage,
-          idempotencyKey: `portal-project-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          deliver: false,
-        }, 30000);
-        if (!rpc.ok) throw new Error(rpc.error || 'chat.send failed');
-        autoCommitProjectChanges(projectDir, ownerId, name, undefined, selectedModel).catch(() => {});
-      } catch (err: any) {
-        console.error(`[Agent Send] Background request failed: ${err?.message || err}`);
-      }
-    })();
+The Portal enforces the project filesystem and public-only network boundary. You cannot access sibling projects, other users, host files, private services, or server administration.
+Use exec inside /workspace/project for file operations and commands. Public HTTPS, Git, package registries, and asset downloads are available through the Portal egress proxy; private, local, metadata, and lateral destinations are denied.
+Read and update .agent-memory.md when durable project context changes. Never request broader mounts, host access, or a bypass of the Project Sandbox.
 
-    // Update session state
-    const updatedMeta: SessionMeta = {
+[END CONTEXT]
+
+${handoff ? `${handoff}\n\n` : ''}[CURRENT USER REQUEST]
+${message}`
+      : message;
+
+    const now = new Date();
+    await prisma.projectChatSession.upsert({
+      where: { sessionKey: resolved.identity.sessionId },
+      update: {
+        lastActivity: now,
+        model: selectedModel,
+        status: 'active',
+        activeProvider: provider,
+        runtime: resolved.binding.runtime,
+      },
+      create: {
+        userId: req.user!.userId,
+        projectId: executionContext.projectId,
+        sessionKey: resolved.identity.sessionId,
+        model: selectedModel,
+        status: 'active',
+        activeProvider: provider,
+        runtime: resolved.binding.runtime,
+      },
+    });
+    stopRuntimeAdmissionHeartbeat();
+    stopRuntimeAdmissionHeartbeat = null;
+    const turnLease = await promoteProjectChatRuntimeAdmissionToTurn({
+      actorUserId: req.user!.userId,
+      projectIdentityId: executionContext.projectId,
+      turnId: runtimeAdmission.turn.id,
+      leaseToken: runtimeAdmission.leaseToken,
+      runtime: resolved.binding.runtime,
+      providerSessionId: sessionKey,
+      model: selectedModel,
+      userMessage: {
+        sessionKey: resolved.identity.sessionId,
+        content: message,
+        messageId,
+      },
+    });
+    runtimeAdmissionPromoted = true;
+
+    let durableEventSeq = turnLease.turn.lastEventSeq;
+    let durableEventFailure: unknown = null;
+    const durableEventPersistenceGate = createProjectChatDispatchPersistenceGate();
+    // The native broker emits its initial status synchronously. Hold the
+    // corresponding row write until the DISPATCH_ACCEPTED CAS has finished,
+    // otherwise both Serializable transactions contend on this turn.
+    let durableEventChain: Promise<void> = durableEventPersistenceGate.waitUntilAccepted;
+    const presentationEvents: ProjectNativeRunEvent[] = [];
+    const persistDurableEvent = (event: ProjectNativeRunEvent) => {
+      presentationEvents.push(event);
+      if (presentationEvents.length > PROJECT_CHAT_PRESENTATION_EVENT_LIMIT) {
+        presentationEvents.splice(0, presentationEvents.length - PROJECT_CHAT_PRESENTATION_EVENT_LIMIT);
+      }
+      durableEventChain = durableEventChain.then(async () => {
+        const payload = JSON.parse(JSON.stringify(event));
+        const persisted = await appendProjectChatTurnEvent({
+          actorUserId: req.user!.userId,
+          projectIdentityId: executionContext.projectId,
+          turnId: turnLease.turn.id,
+          leaseToken: turnLease.leaseToken,
+          expectedSeq: durableEventSeq,
+          eventType: String(payload.type || 'status'),
+          payload,
+        });
+        durableEventSeq = persisted.seq;
+      }).catch((error) => {
+        durableEventFailure = error;
+        console.error('[Project Chat] OpenClaw replay persistence failed:', error);
+      });
+    };
+    const stopLeaseHeartbeat = startProjectChatLeaseHeartbeat({
+      actorUserId: req.user!.userId,
+      projectIdentityId: executionContext.projectId,
+      turnId: turnLease.turn.id,
+      leaseToken: turnLease.leaseToken,
+      providerSessionId: () => sessionKey,
+      onLeaseLost: async (error) => {
+        console.error('[Project Chat] OpenClaw durable turn lease was lost:', error);
+        await abortProjectNativeRun({
+          userId: req.user!.userId,
+          projectId: executionContext.projectId,
+          provider: 'OPENCLAW',
+        });
+      },
+    });
+
+    let run;
+    let dispatchAcceptanceFailed = false;
+    let dispatchQuiescedAfterAcceptanceFailure = false;
+    let providerRunStarted = false;
+    let releaseWorkspaceMutationLease: (() => void) | null =
+      acquireWorkspaceAuthorizationMutationLease(req.user!.userId);
+    const releaseWorkspaceMutation = () => {
+      releaseWorkspaceMutationLease?.();
+      releaseWorkspaceMutationLease = null;
+    };
+    try {
+      run = startProjectNativeRun({
+        userId: req.user!.userId,
+        projectId: executionContext.projectId,
+        provider: 'OPENCLAW',
+        runId: turnLease.turn.id,
+        runtime: resolved.binding.runtime,
+        sessionId: sessionKey,
+        message: fullMessage,
+        model: selectedModel,
+        sender: {
+          label: req.user!.email,
+          userId: req.user!.userId,
+          role: req.user!.role,
+          requestId: turnLease.turn.id,
+        },
+      onEvent: persistDurableEvent,
+      onComplete: async () => {
+          await prisma.projectChatSession.update({
+            where: { sessionKey: resolved.identity.sessionId },
+            data: { status: 'active', lastActivity: new Date() },
+          });
+          await checkpointProjectAfterProviderTurn({
+            projectDir,
+            actorUserId: req.user!.userId,
+            projectId: executionContext.projectId,
+            workspaceOwnerId: ownerId,
+            projectName: name,
+            sessionKey: resolved.identity.sessionId,
+            turnId: turnLease.turn.id,
+            provider,
+            runtime: resolved.binding.runtime,
+            model: selectedModel,
+          });
+        },
+        onError: async () => {
+          await prisma.projectChatSession.update({
+            where: { sessionKey: resolved.identity.sessionId },
+            data: { status: 'error', lastActivity: new Date() },
+          });
+        },
+      onSettled: async ({ status, sessionId, error, fullText }) => {
+        try {
+          stopLeaseHeartbeat();
+          await durableEventChain;
+          await settleProjectChatTurnWithPresentation({
+              turn: turnLease.turn,
+              leaseToken: turnLease.leaseToken,
+              providerStatus: status,
+              providerDispatchObserved: true,
+              providerSessionId: sessionId,
+              providerError: error,
+              durableEventFailure,
+              durableEventCount: durableEventSeq,
+              sessionKey: resolved.identity.sessionId,
+              preferredContent: status === 'completed' ? fullText : null,
+              handoff: {
+                expectedCursor: resolved.handoffCursor,
+                expectedHandoffVersion: resolved.handoffVersion,
+              },
+            });
+        } finally {
+          releaseWorkspaceMutation();
+        }
+        },
+      });
+      providerRunStarted = true;
+      try {
+        await durableEventPersistenceGate.releaseAfter(markProjectChatTurnProviderDispatchAccepted({
+          actorUserId: req.user!.userId,
+          projectIdentityId: executionContext.projectId,
+          turnId: turnLease.turn.id,
+          leaseToken: turnLease.leaseToken,
+        }));
+      } catch (acceptanceError) {
+        dispatchAcceptanceFailed = true;
+        try {
+          await abortProjectNativeRun({
+            userId: req.user!.userId,
+            projectId: executionContext.projectId,
+            provider: 'OPENCLAW',
+          });
+        } catch {
+          // Exact semantic settlement below remains the authority.
+        }
+        dispatchQuiescedAfterAcceptanceFailure = await waitForProjectNativeRunSettlement({
+          userId: req.user!.userId,
+          projectId: executionContext.projectId,
+          provider: 'OPENCLAW',
+          runId: String(run.runId || turnLease.turn.id),
+        });
+        const recoveryError = new ProjectChatLeaseError(
+          'TURN_ACTIVE',
+          dispatchQuiescedAfterAcceptanceFailure
+            ? 'Provider delivery state could not be recorded. The turn was stopped; clear Project Chat before retrying.'
+            : 'Provider delivery state could not be recorded and its callback is still active. Abort or clear Project Chat before retrying.',
+          409,
+        );
+        (recoveryError as Error & { cause?: unknown }).cause = acceptanceError;
+        throw recoveryError;
+      }
+    } catch (error) {
+      durableEventPersistenceGate.release();
+      if (!providerRunStarted) releaseWorkspaceMutation();
+      stopLeaseHeartbeat();
+      await durableEventChain;
+      if (dispatchAcceptanceFailed && !dispatchQuiescedAfterAcceptanceFailure) throw error;
+      await settleProjectChatTurnWithPresentation({
+        turn: turnLease.turn,
+        leaseToken: turnLease.leaseToken,
+        providerSessionId: sessionKey,
+        providerStatus: 'error',
+        providerDispatchObserved: dispatchAcceptanceFailed,
+        providerError: error instanceof Error ? error.message : 'OpenClaw provider failed to start',
+        durableEventFailure,
+        durableEventCount: durableEventSeq,
+        sessionKey: resolved.identity.sessionId,
+        handoff: {
+          expectedCursor: resolved.handoffCursor,
+          expectedHandoffVersion: resolved.handoffVersion,
+        },
+      });
+      throw error;
+    }
+
+    const sessionStatePath = path.join(projectDir, '.agent-session.json');
+    fs.writeFileSync(sessionStatePath, JSON.stringify({
       initialized: true,
       model: selectedModel,
-      lastActivity: new Date().toISOString(),
-      stableSlug,
-    };
-    fs.writeFileSync(sessionStatePath, JSON.stringify(updatedMeta, null, 2), 'utf-8');
+      lastActivity: now.toISOString(),
+      stableSlug: resolved.identity.stableSlug,
+    } satisfies SessionMeta, null, 2), 'utf-8');
 
-    // Return immediately - frontend will poll for response
-    res.json({ sent: true, sessionKey, model: selectedModel, modelWarning: modelResolution.warning || null });
+    res.json({
+      sent: true,
+      sessionKey,
+      runId: run.runId,
+      model: selectedModel,
+      modelValidated: true,
+      modelVerified: true,
+      modelWarning: modelResolution.warning || null,
+      provider,
+      runtime: resolved.binding.runtime,
+      stateVersion: turnLease.state.version,
+      turnId: turnLease.turn.id,
+      executionContext: serializeProjectSandboxContext(executionContext),
+    });
   } catch (error: any) {
-    console.error('[Agent Send] Error:', error.message);
-    res.status(500).json({ error: 'Failed to send message', detail: error.message });
+    let responseError: any = error;
+    stopRuntimeAdmissionHeartbeat?.();
+    stopRuntimeAdmissionHeartbeat = null;
+    if (runtimeAdmission && !runtimeAdmissionPromoted) {
+      try {
+        await finishProjectChatRuntimeAdmission({
+          actorUserId: runtimeAdmission.turn.actorUserId,
+          projectIdentityId: runtimeAdmission.turn.projectIdentityId,
+          turnId: runtimeAdmission.turn.id,
+          leaseToken: runtimeAdmission.leaseToken,
+          status: 'ERROR',
+          errorCode: 'RUNTIME_ADMISSION_OPERATION_FAILED',
+          errorMessage: error instanceof Error ? error.message : 'Project send preparation failed',
+        });
+        runtimeAdmissionFinalizedAfterFailure = true;
+      } catch (finalizationError) {
+        responseError = finalizationError;
+      }
+    }
+    const admissionMetadata = !runtimeAdmission
+      || (!runtimeAdmissionPromoted && runtimeAdmissionFinalizedAfterFailure)
+      ? {
+          admissionOutcome: 'not_admitted',
+          admissionStatus: 'never_admitted',
+          recoveryRequired: false,
+        }
+      : {
+          admissionOutcome: 'unknown',
+          admissionStatus: 'unknown',
+          recoveryRequired: true,
+        };
+    if (sendProjectChatProviderError(res, responseError, admissionMetadata)) return;
+    if (sendProjectChatCoordinationError(res, responseError, admissionMetadata)) return;
+    console.error('[Agent Send] Error:', responseError?.message || responseError);
+    res.status(500).json({ error: 'Failed to send message', ...admissionMetadata });
   }
 });
 
 // POST /api/projects/:name/assistant/read-file - Read a project file (for assistant context)
-router.post('/:name/assistant/read-file', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:name/assistant/read-file', authenticateToken, projectPathSandbox, async (req: Request, res: Response) => {
   try {
-    const ownerId = await getScopedOwnerId(req);
-    const projectDir = getProjectPath(ownerId, req.params.name);
+    const {
+      actorUserId,
+      workspaceOwnerId: ownerId,
+      projectDir,
+    } = resolveActorProjectChatWorkspace(req, req.params.name);
     if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const { executionContext } = await resolveProjectChatOperationContext(
+      actorUserId,
+      ownerId,
+      req.params.name,
+      projectDir,
+      req.body?.provider,
+    );
 
     const { filePath } = req.body;
     if (!filePath) { res.status(400).json({ error: 'filePath required' }); return; }
 
-    const fullPath = path.join(projectDir, filePath);
-    const resolved = path.resolve(fullPath);
-    if (!resolved.startsWith(path.resolve(projectDir))) { res.status(403).json({ error: 'Forbidden' }); return; }
-    if (!fs.existsSync(resolved) || fs.statSync(resolved).isDirectory()) {
+    let resolved: string;
+    try {
+      resolved = resolveExistingProjectEntry(projectDir, filePath, 'file');
+    } catch {
       res.status(404).json({ error: 'File not found' });
       return;
     }
 
-    const stat = fs.statSync(resolved);
+    const stat = fs.lstatSync(resolved);
     if (stat.size > PROJECT_EDIT_MAX_BYTES) {
       res.status(413).json({ error: 'File too large (max 10MB)' });
       return;
     }
 
     const content = fs.readFileSync(resolved, 'utf-8');
-    res.json({ content, path: filePath, size: stat.size });
+    res.json({
+      content,
+      path: filePath,
+      size: stat.size,
+      executionContext: serializeProjectSandboxContext(executionContext),
+    });
   } catch (error) {
+    if (sendProjectChatProviderError(res, error)) return;
     res.status(500).json({ error: 'Failed to read file' });
   }
 });
 
 // GET /api/projects/:name/download - Download project as ZIP
-router.get('/:name/download', authenticateToken, async (req: Request, res: Response) => {
+router.get('/:name/download', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  let snapshotRoot: string | undefined;
   try {
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
     const mode = (req.query.mode as string) || 'clean'; // full | clean | stripped
+    if (!['full', 'clean', 'stripped'].includes(mode)) {
+      res.status(400).json({ error: 'mode must be full, clean, or stripped' });
+      return;
+    }
     
     const projectDir = getProjectPath(ownerId, name);
     if (!fs.existsSync(projectDir)) {
@@ -4555,6 +12908,7 @@ router.get('/:name/download', authenticateToken, async (req: Request, res: Respo
       '.agent-*',
       '.marcus-*',
       '.portal-project.json',
+      '.portal/attachments/**',
       '.git/**',
       'node_modules/**',
       '.venv/**',
@@ -4591,21 +12945,56 @@ router.get('/:name/download', authenticateToken, async (req: Request, res: Respo
 
     const excludePatterns = (mode === 'full') ? alwaysExclude : cleanExclude;
     const stripComments = (mode === 'stripped');
+    const isExcludedArchivePath = (relativePath: string): boolean => {
+      for (const pattern of excludePatterns) {
+        const patternPath = pattern.replace(/\/\*\*$/, '');
+        const entryName = path.basename(relativePath);
+        if (relativePath === patternPath
+            || relativePath.startsWith(`${patternPath}/`)
+            || (pattern.includes('**') && relativePath.includes(patternPath.replace('/**', '')))
+            || (pattern.endsWith('*') && !pattern.includes('/') && entryName.startsWith(pattern.slice(0, -1)))) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    // Archive an inert snapshot. Project workloads can mutate their workspace
+    // concurrently; copying without dereferencing links ensures the later ZIP
+    // walk cannot be raced into reading a host path.
+    snapshotRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-project-download-'));
+    const snapshotDir = path.join(snapshotRoot, 'project');
+    fs.cpSync(projectDir, snapshotDir, {
+      recursive: true,
+      dereference: false,
+      filter: (sourcePath) => {
+        const relativePath = path.relative(projectDir, sourcePath).split(path.sep).join('/');
+        return !relativePath || !isExcludedArchivePath(relativePath);
+      },
+    });
+    const snapshotEntry = fs.lstatSync(snapshotDir);
+    if (snapshotEntry.isSymbolicLink() || !snapshotEntry.isDirectory()) {
+      throw new Error('Project changed while the download snapshot was being created');
+    }
 
     // Set response headers
-    const filename = `${name}-${mode}.zip`;
+    const filename = safeProjectDownloadName(name, mode);
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
 
     // Import archiver
     const archiver = require('archiver');
     const archive = archiver('zip', { zlib: { level: 9 } });
+    const abortArchive = () => {
+      if (!res.writableEnded) archive.abort();
+    };
+    res.once('close', abortArchive);
 
     archive.on('error', (err: Error) => {
       console.error('[Download] Archive error:', err);
       if (!res.headersSent) {
         res.status(500).json({ error: 'Failed to create archive' });
-      }
+      } else res.destroy(err);
     });
 
     // Pipe archive to response
@@ -4693,27 +13082,19 @@ router.get('/:name/download', authenticateToken, async (req: Request, res: Respo
       for (const entry of entries) {
         const fullPath = path.join(dirPath, entry.name);
         const relPath = zipPath ? `${zipPath}/${entry.name}` : entry.name;
+        const entryStat = fs.lstatSync(fullPath);
+
+        // Project ZIP exports never follow links or include special files. A
+        // project agent can create those inside its sandbox, but the host-side
+        // exporter must not turn them into reads from elsewhere on the server.
+        if (entryStat.isSymbolicLink() || (!entryStat.isDirectory() && !entryStat.isFile())) continue;
         
-        // Check if excluded
-        let isExcluded = false;
-        for (const pattern of excludePatterns) {
-          const patternPath = pattern.replace(/\/\*\*$/, '');
-          const entryName = path.basename(relPath);
-          if (relPath === patternPath || 
-              relPath.startsWith(patternPath + '/') ||
-              (pattern.includes('**') && relPath.includes(patternPath.replace('/**', ''))) ||
-              (pattern.endsWith('*') && !pattern.includes('/') && entryName.startsWith(pattern.slice(0, -1)))) {
-            isExcluded = true;
-            break;
-          }
-        }
+        if (isExcludedArchivePath(relPath)) continue;
         
-        if (isExcluded) continue;
-        
-        if (entry.isDirectory()) {
+        if (entryStat.isDirectory()) {
           addDirectory(fullPath, relPath);
         } else {
-          const stat = fs.statSync(fullPath);
+          const stat = entryStat;
           
           // Detect if file is text or binary
           const ext = path.extname(entry.name).toLowerCase();
@@ -4732,7 +13113,7 @@ router.get('/:name/download', authenticateToken, async (req: Request, res: Respo
               let content = fs.readFileSync(fullPath, 'utf-8');
               content = stripCommentsFromCode(content, entry.name);
               archive.append(content, { name: relPath });
-            } catch (err) {
+            } catch {
               // If UTF-8 read fails, treat as binary
               archive.file(fullPath, { name: relPath });
             }
@@ -4744,15 +13125,23 @@ router.get('/:name/download', authenticateToken, async (req: Request, res: Respo
       }
     }
 
-    addDirectory(projectDir);
+    addDirectory(snapshotDir);
 
-    await archive.finalize();
+    try {
+      await archive.finalize();
+    } finally {
+      res.off('close', abortArchive);
+    }
     
     console.log(`[Download] ${name} (${mode}) → ${archive.pointer()} bytes`);
   } catch (error: any) {
     console.error('[Download] Error:', error);
     if (!res.headersSent) {
       res.status(500).json({ error: 'Download failed: ' + error.message });
+    }
+  } finally {
+    if (snapshotRoot) {
+      try { fs.rmSync(snapshotRoot, { recursive: true, force: true }); } catch {}
     }
   }
 });

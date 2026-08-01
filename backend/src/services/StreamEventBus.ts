@@ -8,10 +8,19 @@
 
 import { normalizeRuntimeTurnEvent, type RuntimeTurnEvent } from './RuntimeTurnEvents';
 import { recordRuntimeTurnEvent } from './RuntimeTurnEventHistory';
+import { sanitizeThinkingSubject } from '../utils/thinkingSubject';
 
 export interface StreamEvent {
-  type: 'text' | 'thinking' | 'tool_start' | 'tool_update' | 'tool_end' | 'tool_used' | 'status' | 'done' | 'error' | 'segment_break' | 'compaction_start' | 'compaction_end' | 'run_resumed';
+  type: 'text' | 'thinking' | 'tool_start' | 'tool_update' | 'tool_end' | 'tool_used' | 'status' | 'done' | 'error' | 'exec_approval' | 'segment_break' | 'compaction_start' | 'compaction_end' | 'run_resumed';
+  /**
+   * Set on events the project run broker republishes for browser relays.
+   * Provider subscribers must ignore these: consuming a broker envelope
+   * re-records it, which republishes it, which recurses without bound.
+   */
+  brokerEnvelope?: boolean;
   content?: string;
+  /** Safe provider-exposed preamble/title for a reasoning bubble. */
+  subject?: string;
   toolName?: string;
   toolArgs?: unknown;
   toolResult?: string;
@@ -63,6 +72,40 @@ function getLastRunningToolCall(toolCalls?: StreamToolCall[]): StreamToolCall | 
     }
   }
   return null;
+}
+
+function normalizedToolCallId(event: StreamEvent): string | null {
+  const id = typeof event.toolCallId === 'string' ? event.toolCallId.trim() : '';
+  return id || null;
+}
+
+function findToolCallIndex(toolCalls: StreamToolCall[], toolCallId: string | null): number {
+  if (toolCallId) {
+    return toolCalls.findIndex((call) => call.id === toolCallId);
+  }
+  for (let i = toolCalls.length - 1; i >= 0; i -= 1) {
+    if (toolCalls[i]?.status === 'running') return i;
+  }
+  return -1;
+}
+
+function toolEventFailed(event: StreamEvent): boolean {
+  if (event.isError === true) return true;
+  if (typeof event.exitCode === 'number' && Number.isFinite(event.exitCode) && event.exitCode !== 0) return true;
+  const status = typeof event.status === 'string' ? event.status.trim().toLowerCase() : '';
+  return ['error', 'failed', 'failure', 'cancelled', 'canceled', 'aborted', 'denied'].includes(status);
+}
+
+function normalizedRunId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return normalized || null;
+}
+
+function isSessionLevelEvent(event: StreamEvent): boolean {
+  return event.type === 'compaction_start'
+    || event.type === 'compaction_end'
+    || (event.type === 'status' && event.maintenanceKind === 'maintenance');
 }
 
 const RAIL_SAFE_STATUS_RE = /^(?:thinking[.…]*|connecting directly to openclaw[.…]*|reconnecting to stream[.…]*|resuming stream[.…]*|still responding[.…]*|still working[.…]*|starting codex runtime[.…]*|codex session ready\.?|starting codex turn[.…]*|codex accepted the turn\.?|codex is writing[.…]*|codex is working[.…]*|codex turn completion is delayed; waiting for the final response[.…]*|running tool[.…]*|preparing execution hooks[.…]*|execution hooks ready\.?|waiting for command approval[.…]*|command denied|command approved|approval did not complete|approval failed(?::.*)?|compacting context[.…]*|context compacted\.?|context maintenance (?:in progress|finished|complete(?:d)?)[.…]*|preparing context maintenance[.…]*|memory flush (?:about to start|starting|started|queued|pending|complete(?:d)?)[.…]*|heartbeat check (?:started|starting|running|queued|pending|complete(?:d)?)[.…]*|heartbeat_ok)$/i;
@@ -172,8 +215,30 @@ export class StreamEventBus {
    */
   publish(sessionKey: string, event: StreamEvent): void {
     const info = this.activeStreams.get(sessionKey);
+    const trackedRunId = normalizedRunId(info?.runId);
+    const eventRunId = normalizedRunId(event.runId);
+    if (trackedRunId) {
+      if (eventRunId && trackedRunId !== eventRunId) {
+        // A delayed callback from a settled turn must not mutate the current
+        // run's text/tool snapshot or reach any browser/global subscriber.
+        return;
+      }
+      if (!eventRunId && !isSessionLevelEvent(event)) {
+        // Once a logical turn owns the tracked session (active or dormant),
+        // run-scoped events must prove that identity. Compaction and
+        // maintenance status are deliberately session-level and remain valid
+        // without a run ID.
+        return;
+      }
+    }
+    if (info?.active === false && !isSessionLevelEvent(event)) {
+      // A terminal stream retains its identity only as a CAS predecessor.
+      // Ordinary late callbacks must not resurrect or mutate that dormant run.
+      return;
+    }
     const now = Date.now();
     const runningToolCall = info ? getLastRunningToolCall(info.toolCalls) : null;
+    let resolvedToolCallId: string | undefined;
     if (info) {
       info.lastEventAt = now;
       if (typeof event.provenance === 'string' && event.provenance.trim()) {
@@ -220,51 +285,102 @@ export class StreamEventBus {
           }
         }
       } else if (event.type === 'tool_start') {
-        info.toolName = typeof event.toolName === 'string' && event.toolName.trim() ? event.toolName.trim() : info.toolName;
-        info.statusText = info.toolName ? `Using ${info.toolName}…` : info.statusText;
-        const toolName = info.toolName || 'tool';
-        const existingCalls = Array.isArray(info.toolCalls) ? info.toolCalls : [];
-        info.toolCalls = [
-          ...existingCalls,
-          {
-            id: `tool-${now}-${existingCalls.length + 1}`,
+        const suppliedId = normalizedToolCallId(event);
+        const existingCalls = Array.isArray(info.toolCalls) ? [...info.toolCalls] : [];
+        const existingIndex = suppliedId ? findToolCallIndex(existingCalls, suppliedId) : -1;
+        const existingCall = existingIndex >= 0 ? existingCalls[existingIndex] : null;
+        if (existingCall && existingCall.status !== 'running') {
+          // A stable provider ID cannot start twice. Drop late replay after a
+          // terminal snapshot instead of emitting a contradictory running event.
+          return;
+        } else {
+          info.toolName = typeof event.toolName === 'string' && event.toolName.trim()
+            ? event.toolName.trim()
+            : (existingCall?.name || info.toolName);
+          info.statusText = info.toolName ? `Using ${info.toolName}…` : info.statusText;
+          const toolName = info.toolName || 'tool';
+          const toolCall: StreamToolCall = {
+            id: suppliedId || `tool-${now}-${existingCalls.length + 1}`,
             name: toolName,
             arguments: event.toolArgs,
+            startedAt: existingCall?.startedAt || now,
+            status: 'running',
+          };
+          resolvedToolCallId = toolCall.id;
+          if (existingIndex >= 0) existingCalls[existingIndex] = { ...existingCall!, ...toolCall };
+          else existingCalls.push(toolCall);
+        }
+        info.toolCalls = existingCalls;
+      } else if (event.type === 'tool_update') {
+        const suppliedId = normalizedToolCallId(event);
+        const existingCalls = Array.isArray(info.toolCalls) ? [...info.toolCalls] : [];
+        const existingIndex = findToolCallIndex(existingCalls, suppliedId);
+        const existingCall = existingIndex >= 0 ? existingCalls[existingIndex] : null;
+        const toolName = typeof event.toolName === 'string' && event.toolName.trim()
+          ? event.toolName.trim()
+          : (existingCall?.name || info.toolName || 'tool');
+        info.toolName = toolName;
+        info.statusText = `Using ${toolName}…`;
+        if (existingCall && existingCall.status !== 'running') {
+          // Do not resurrect a completed call in live or reconnect projections.
+          return;
+        } else if (existingIndex >= 0) {
+          existingCalls[existingIndex] = {
+            ...existingCall!,
+            name: toolName,
+            arguments: event.toolArgs !== undefined ? event.toolArgs : existingCall?.arguments,
+            result: typeof event.toolResult === 'string' ? event.toolResult : existingCall?.result,
+            status: 'running',
+          };
+          resolvedToolCallId = existingCalls[existingIndex].id;
+        } else if (suppliedId) {
+          existingCalls.push({
+            id: suppliedId,
+            name: toolName,
+            arguments: event.toolArgs,
+            result: typeof event.toolResult === 'string' ? event.toolResult : undefined,
             startedAt: now,
             status: 'running',
-          },
-        ];
-      } else if (event.type === 'tool_update') {
-        info.toolName = typeof event.toolName === 'string' && event.toolName.trim() ? event.toolName.trim() : info.toolName;
-        if (info.toolName) info.statusText = `Using ${info.toolName}…`;
-        const existingCalls = Array.isArray(info.toolCalls) ? [...info.toolCalls] : [];
-        for (let i = existingCalls.length - 1; i >= 0; i--) {
-          if (existingCalls[i].status === 'running') {
-            existingCalls[i] = {
-              ...existingCalls[i],
-              result: typeof event.toolResult === 'string' ? event.toolResult : existingCalls[i].result,
-              status: 'running',
-            };
-            break;
-          }
+          });
+          resolvedToolCallId = suppliedId;
         }
         info.toolCalls = existingCalls;
+        const activeTool = getLastRunningToolCall(existingCalls);
+        info.toolName = activeTool?.name;
+        info.statusText = activeTool ? `Using ${activeTool.name}…` : undefined;
       } else if (event.type === 'tool_end') {
-        info.statusText = undefined;
+        const suppliedId = normalizedToolCallId(event);
         const existingCalls = Array.isArray(info.toolCalls) ? [...info.toolCalls] : [];
-        const completedStatus = event.status === 'error' ? 'error' : 'done';
-        for (let i = existingCalls.length - 1; i >= 0; i--) {
-          if (existingCalls[i].status === 'running') {
-            existingCalls[i] = {
-              ...existingCalls[i],
-              endedAt: now,
-              result: typeof event.toolResult === 'string' ? event.toolResult : undefined,
-              status: completedStatus,
-            };
-            break;
-          }
+        const existingIndex = findToolCallIndex(existingCalls, suppliedId);
+        const existingCall = existingIndex >= 0 ? existingCalls[existingIndex] : null;
+        const completedStatus: StreamToolCall['status'] = toolEventFailed(event) ? 'error' : 'done';
+        const toolName = typeof event.toolName === 'string' && event.toolName.trim()
+          ? event.toolName.trim()
+          : (existingCall?.name || info.toolName || 'tool');
+        if (existingIndex >= 0) {
+          existingCalls[existingIndex] = {
+            ...existingCall!,
+            name: toolName,
+            endedAt: existingCall?.endedAt || now,
+            result: typeof event.toolResult === 'string' ? event.toolResult : existingCall?.result,
+            status: existingCall?.status === 'error' ? 'error' : completedStatus,
+          };
+          resolvedToolCallId = existingCalls[existingIndex].id;
+        } else if (suppliedId) {
+          existingCalls.push({
+            id: suppliedId,
+            name: toolName,
+            startedAt: now,
+            endedAt: now,
+            result: typeof event.toolResult === 'string' ? event.toolResult : undefined,
+            status: completedStatus,
+          });
+          resolvedToolCallId = suppliedId;
         }
         info.toolCalls = existingCalls;
+        const remainingRunning = getLastRunningToolCall(existingCalls);
+        info.toolName = remainingRunning?.name;
+        info.statusText = remainingRunning ? `Using ${remainingRunning.name}…` : undefined;
       } else if (event.type === 'compaction_start') {
         info.compactionPhase = 'compacting';
         if (!runningToolCall) {
@@ -286,21 +402,31 @@ export class StreamEventBus {
     }
 
     const subs = this.listeners.get(sessionKey);
-    if (subs && subs.size > 2 && event.type === 'text') {
-      // Two subscribers is normal during portal streaming: one OpenClawProvider waiter
-      // plus one browser forwarder. Warn only when we exceed that expected baseline.
+    if (subs && subs.size > 3 && event.type === 'text') {
+      // Three subscribers are normal during portal streaming: the provider
+      // waiter, a route-owned terminal observer that survives browser handoff,
+      // and the current browser forwarder. Warn above that baseline.
       const now = Date.now();
       const lastWarnKey = `__lastDupWarn_${sessionKey}`;
       const lastWarn = (this as any)[lastWarnKey] || 0;
       if (now - lastWarn > 10000) {
         (this as any)[lastWarnKey] = now;
-        console.warn(`[StreamEventBus] ⚠️ EXTRA SUBS: ${subs.size} subscribers for ${sessionKey} on text event (expected <= 2). Check registerWsStreamCleanup / reconnect lifecycle.`);
+        console.warn(`[StreamEventBus] ⚠️ EXTRA SUBS: ${subs.size} subscribers for ${sessionKey} on text event (expected <= 3). Check registerWsStreamCleanup / reconnect lifecycle.`);
       }
     }
+    const toolNormalizedEvent = resolvedToolCallId && !normalizedToolCallId(event)
+      ? { ...event, toolCallId: resolvedToolCallId }
+      : event;
+    const normalizedSubject = sanitizeThinkingSubject(toolNormalizedEvent.subject);
+    const normalizedEvent = normalizedSubject
+      ? { ...toolNormalizedEvent, subject: normalizedSubject }
+      : Object.prototype.hasOwnProperty.call(toolNormalizedEvent, 'subject')
+        ? (({ subject: _subject, ...rest }) => rest)(toolNormalizedEvent)
+        : toolNormalizedEvent;
     const nextTurnSeq = (this.turnEventSeq.get(sessionKey) || 0) + 1;
-    const turnEvent = event.turnEvent || normalizeRuntimeTurnEvent({
+    const turnEvent = normalizedEvent.turnEvent || normalizeRuntimeTurnEvent({
       sessionKey,
-      event,
+      event: normalizedEvent,
       info,
       seq: nextTurnSeq,
       now,
@@ -308,17 +434,26 @@ export class StreamEventBus {
     if (turnEvent) {
       this.turnEventSeq.set(sessionKey, nextTurnSeq);
       const recent = this.recentTurnEvents.get(sessionKey) || [];
-      recent.push(turnEvent);
+      const previous = recent[recent.length - 1];
+      const replacesSameLiveThought = turnEvent.type === 'assistant_reasoning'
+        && turnEvent.replace === true
+        && previous?.type === 'assistant_reasoning'
+        && (previous.runId || '') === (turnEvent.runId || '');
+      if (replacesSameLiveThought) {
+        recent[recent.length - 1] = turnEvent;
+      } else {
+        recent.push(turnEvent);
+      }
       this.recentTurnEvents.set(sessionKey, recent.slice(-500));
       recordRuntimeTurnEvent(sessionKey, turnEvent);
     }
 
     const outboundBase: StreamEvent = info
-      && !(typeof event.model === 'string' && event.model.trim())
+      && !(typeof normalizedEvent.model === 'string' && normalizedEvent.model.trim())
       && typeof info.model === 'string'
       && info.model.trim()
-        ? { ...event, model: info.model.trim() }
-        : event;
+        ? { ...normalizedEvent, model: info.model.trim() }
+        : normalizedEvent;
     const outboundEvent: StreamEvent = turnEvent
       ? { ...outboundBase, turnEvent }
       : outboundBase;
@@ -329,27 +464,27 @@ export class StreamEventBus {
           cb(outboundEvent);
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(`[StreamEventBus] Subscriber error for ${sessionKey}: ${msg}`);
+          // The first frames are the only way to locate a recursive
+          // subscriber on a live host; messages alone are a dead end.
+          const frames = err instanceof Error && err.stack
+            ? `\n${err.stack.split('\n').slice(0, 14).join('\n')}`
+            : '';
+          console.error(`[StreamEventBus] Subscriber error for ${sessionKey}: ${msg}${frames}`);
         }
       }
     }
 
-    // Notify global listeners when:
-    // 1. No per-session subscribers exist (the global listener is the only path
-    //    to forward events — covers post-restart, compaction, etc.)
-    // 2. Always for compaction events (they need to reach the browser even when
-    //    per-session subscribers exist, though the gateway handler deduplicates)
-    const noPerSessionSubs = !subs || subs.size === 0;
-    const isCompaction = event.type === 'compaction_start' || event.type === 'compaction_end';
-    const isMaintenance = event.maintenanceKind === 'maintenance';
-    if (noPerSessionSubs || isCompaction || isMaintenance) {
-      for (const cb of this.globalListeners) {
-        try {
-          cb(sessionKey, outboundEvent);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.error(`[StreamEventBus] Global listener error: ${msg}`);
-        }
+    // Always notify global listeners. The gateway decides per browser socket
+    // whether that socket already has a direct session subscription. This
+    // distinction matters because providers and route settlement code also use
+    // per-session subscribers internally: an internal observer must not prevent
+    // a reconnected browser from receiving the rest of a live turn.
+    for (const cb of this.globalListeners) {
+      try {
+        cb(sessionKey, outboundEvent);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[StreamEventBus] Global listener error: ${msg}`);
       }
     }
   }
@@ -376,11 +511,18 @@ export class StreamEventBus {
   /**
    * Update the stream phase for a session. Creates the entry if needed.
    */
-  updateStreamPhase(sessionKey: string, info: Partial<StreamInfo> & { phase: StreamInfo['phase'] }): void {
+  updateStreamPhase(sessionKey: string, info: Partial<StreamInfo> & { phase: StreamInfo['phase'] }): boolean {
     const existing = this.activeStreams.get(sessionKey);
+    const assertedRunId = normalizedRunId(info.runId);
+    const existingRunId = normalizedRunId(existing?.runId);
+    if (existing?.active === false) return false;
+    if (existingRunId && (
+      assertedRunId && existingRunId !== assertedRunId
+    )) {
+      return false;
+    }
     const nextStatusText = 'statusText' in info ? normalizeRailStatusText(info.statusText) : undefined;
     if (existing) {
-      const wasDormant = existing.active === false;
       const runningToolCall = getLastRunningToolCall(existing.toolCalls);
       const nextPhase = runningToolCall && info.phase !== 'tool' ? 'tool' : info.phase;
       const shouldPreserveToolStatus = Boolean(runningToolCall) && info.phase !== 'tool';
@@ -390,7 +532,7 @@ export class StreamEventBus {
       if (!existing.toolName && runningToolCall?.name) {
         existing.toolName = runningToolCall.name;
       }
-      if ('runId' in info) existing.runId = info.runId;
+      if (!existingRunId && assertedRunId) existing.runId = assertedRunId;
       if ('statusText' in info && !shouldPreserveToolStatus) {
         if (nextStatusText) existing.statusText = nextStatusText;
         else if (info.statusText == null) existing.statusText = undefined;
@@ -401,12 +543,6 @@ export class StreamEventBus {
       if ('provenance' in info) existing.provenance = info.provenance;
       if ('model' in info) existing.model = info.model;
       if ('compactionPhase' in info) existing.compactionPhase = info.compactionPhase;
-      if (wasDormant) {
-        existing.startedAt = info.startedAt || Date.now();
-        existing.latestText = this.latestText.get(sessionKey) || '';
-        existing.toolCalls = [];
-        delete existing.lastDoneAt;
-      }
       existing.lastEventAt = Date.now();
     } else {
       const runningToolCall = getLastRunningToolCall(Array.isArray(info.toolCalls) ? info.toolCalls : []);
@@ -420,19 +556,27 @@ export class StreamEventBus {
         model: info.model,
         compactionPhase: info.compactionPhase,
         startedAt: info.startedAt || Date.now(),
-        runId: info.runId,
+        runId: assertedRunId || undefined,
         latestText: this.latestText.get(sessionKey) || '',
         lastEventAt: Date.now(),
       });
     }
+    return true;
   }
 
   /**
    * Mark a stream as started (called when PersistentGatewayWs sees first event).
    */
-  startStream(sessionKey: string, runId?: string, info?: Partial<StreamInfo>): void {
+  startStream(sessionKey: string, runId?: string, info?: Partial<StreamInfo>): boolean {
+    const assertedRunId = normalizedRunId(runId);
+    const existing = this.activeStreams.get(sessionKey);
+    const existingRunId = normalizedRunId(existing?.runId);
+    if (existing?.active === false) return false;
+    if (existingRunId && assertedRunId !== existingRunId) {
+      return false;
+    }
     const statusText = normalizeRailStatusText(info?.statusText) || 'Thinking…';
-    if (!this.activeStreams.has(sessionKey)) {
+    if (!existing) {
       this.activeStreams.set(sessionKey, {
         active: true,
         phase: 'thinking',
@@ -442,39 +586,118 @@ export class StreamEventBus {
         model: info?.model,
         compactionPhase: info?.compactionPhase || 'idle',
         startedAt: Date.now(),
-        runId,
+        runId: assertedRunId || undefined,
         latestText: this.latestText.get(sessionKey) || '',
         lastEventAt: Date.now(),
       });
     } else {
-      const current = this.activeStreams.get(sessionKey)!;
-      const wasDormant = current.active === false;
+      const current = existing;
       current.active = true;
-      if (wasDormant) {
-        current.phase = 'thinking';
-        current.startedAt = Date.now();
-        current.toolName = undefined;
-        current.toolCalls = [];
-        current.statusText = statusText;
-        current.compactionPhase = info?.compactionPhase || 'idle';
-        current.latestText = this.latestText.get(sessionKey) || '';
-        delete current.lastDoneAt;
-      }
-      if (runId) current.runId = runId;
+      if (assertedRunId) current.runId = assertedRunId;
       if (info?.provenance) current.provenance = info.provenance;
       if (info?.model) current.model = info.model;
       current.lastEventAt = Date.now();
       current.latestText = this.latestText.get(sessionKey) || current.latestText || '';
     }
+    return true;
+  }
+
+  /**
+   * Explicitly activate a dormant stream after an exact predecessor CAS.
+   * Ordinary start/phase/publish calls deliberately cannot cross a terminal
+   * boundary, so a delayed callback cannot revive a completed run.
+   */
+  resumeStream(sessionKey: string, runId: string, info?: Partial<StreamInfo>): boolean {
+    const assertedRunId = normalizedRunId(runId);
+    const existing = this.activeStreams.get(sessionKey);
+    if (!assertedRunId
+      || !existing
+      || existing.active !== false
+      || normalizedRunId(existing.runId) !== assertedRunId) {
+      return false;
+    }
+
+    this.turnEventSeq.delete(sessionKey);
+    this.recentTurnEvents.delete(sessionKey);
+    existing.active = true;
+    existing.phase = 'thinking';
+    existing.startedAt = Date.now();
+    existing.toolName = undefined;
+    existing.toolCalls = [];
+    existing.statusText = normalizeRailStatusText(info?.statusText) || 'Thinking…';
+    existing.compactionPhase = info?.compactionPhase || 'idle';
+    existing.latestText = this.latestText.get(sessionKey) || '';
+    if (info?.provenance) existing.provenance = info.provenance;
+    if (info?.model) existing.model = info.model;
+    existing.lastEventAt = Date.now();
+    delete existing.lastDoneAt;
+    return true;
+  }
+
+  /**
+   * Atomically replace the identity of a tracked stream. This is the only API
+   * that may move an identified stream from one run ID to another. Dormant
+   * streams remain dormant until startStream touches the newly adopted ID.
+   */
+  adoptStreamRun(
+    sessionKey: string,
+    expectedRunId: string | null,
+    nextRunId: string,
+    info?: Partial<StreamInfo>,
+  ): boolean {
+    const existing = this.activeStreams.get(sessionKey);
+    const expected = normalizedRunId(expectedRunId);
+    const next = normalizedRunId(nextRunId);
+    const currentRunId = normalizedRunId(existing?.runId);
+    if (!existing || !next || currentRunId !== expected) {
+      return false;
+    }
+
+    const adoptedDormantRun = existing.active === false && currentRunId !== next;
+    if (adoptedDormantRun) {
+      this.turnEventSeq.delete(sessionKey);
+      this.recentTurnEvents.delete(sessionKey);
+    }
+
+    const runningToolCall = getLastRunningToolCall(existing.toolCalls);
+    if (info?.phase) {
+      existing.phase = runningToolCall && info.phase !== 'tool' ? 'tool' : info.phase;
+    }
+    if ('toolName' in (info || {})) existing.toolName = info?.toolName;
+    if (!existing.toolName && runningToolCall?.name) existing.toolName = runningToolCall.name;
+    if (Array.isArray(info?.toolCalls)) existing.toolCalls = [...info.toolCalls];
+    if ('statusText' in (info || {})) {
+      const statusText = normalizeRailStatusText(info?.statusText);
+      if (statusText) existing.statusText = statusText;
+      else if (info?.statusText == null) existing.statusText = undefined;
+    }
+    if ('provenance' in (info || {})) existing.provenance = info?.provenance;
+    if ('model' in (info || {})) existing.model = info?.model;
+    if ('compactionPhase' in (info || {})) existing.compactionPhase = info?.compactionPhase;
+    if (typeof info?.startedAt === 'number' && Number.isFinite(info.startedAt)) {
+      existing.startedAt = info.startedAt;
+    }
+    existing.runId = next;
+    existing.lastEventAt = Date.now();
+    return true;
   }
 
   /**
    * Clear stream state for a session (stream completed or errored).
    */
-  clearStream(sessionKey: string): void {
+  clearStream(sessionKey: string, expectedRunId?: string | null): boolean {
+    const existing = this.activeStreams.get(sessionKey);
+    if (expectedRunId !== undefined) {
+      if (!existing || normalizedRunId(existing.runId) !== normalizedRunId(expectedRunId)) {
+        return false;
+      }
+    }
     this.activeStreams.delete(sessionKey);
     this.lastSeenText.delete(sessionKey);
     this.latestText.delete(sessionKey);
+    this.turnEventSeq.delete(sessionKey);
+    this.recentTurnEvents.delete(sessionKey);
+    return true;
   }
 
   /**
@@ -491,8 +714,13 @@ export class StreamEventBus {
    * Preserves subscribers and listener registration. Resets text tracking so the next
    * run segment starts with a fresh accumulator. Records lastDoneAt for resumption detection.
    */
-  softClearStream(sessionKey: string): void {
+  softClearStream(sessionKey: string, expectedRunId?: string | null): boolean {
     const info = this.activeStreams.get(sessionKey);
+    if (expectedRunId !== undefined) {
+      if (!info || normalizedRunId(info.runId) !== normalizedRunId(expectedRunId)) {
+        return false;
+      }
+    }
     const lastDoneAt = Date.now();
     // Preserve lastDoneAt in a minimal "dormant" entry so we can detect resumption
     this.activeStreams.set(sessionKey, {
@@ -505,6 +733,7 @@ export class StreamEventBus {
       model: info?.model,
       compactionPhase: info?.compactionPhase,
       startedAt: info?.startedAt || lastDoneAt,
+      runId: info?.runId,
       latestText: '',
       lastEventAt: lastDoneAt,
       lastDoneAt,
@@ -512,6 +741,7 @@ export class StreamEventBus {
     this.lastSeenText.delete(sessionKey);
     this.latestText.delete(sessionKey);
     // NOTE: listeners are NOT removed — they stay alive for the next run segment
+    return true;
   }
 
   /**

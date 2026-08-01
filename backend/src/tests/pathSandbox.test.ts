@@ -2,7 +2,7 @@
  * Path Sandbox Test Suite
  * 
  * Verifies that project agents cannot escape their sandbox.
- * 7 tests covering all attack vectors from the Solar_system incident.
+ * Covers the attack vectors preserved by the historical sandbox-escape regression.
  */
 
 import path from 'path';
@@ -12,28 +12,40 @@ import { validateProjectPath } from '../middleware/pathSandbox';
 
 const TEST_USER = 'test-user-123';
 const TEST_PROJECT = 'my-project';
-const TEST_PROJECTS_ROOT = process.env.PORTAL_PROJECTS_ROOT || path.join(process.env.PORTAL_ROOT || '/portal', 'projects');
-const PROJECT_BASE = path.join(TEST_PROJECTS_ROOT, TEST_USER, TEST_PROJECT);
+let testRoot: string;
+let testProjectsRoot: string;
+let projectBase: string;
 
 // Create a temp directory structure for symlink tests
 let tempDir: string;
 let symlinkPath: string;
+let danglingSymlinkPath: string;
 
 beforeAll(() => {
+  testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-path-sandbox-'));
+  testProjectsRoot = path.join(testRoot, 'projects');
+  projectBase = path.join(testProjectsRoot, TEST_USER, TEST_PROJECT);
+
   // Ensure the project directory exists for tests
-  fs.mkdirSync(PROJECT_BASE, { recursive: true });
-  fs.writeFileSync(path.join(PROJECT_BASE, 'index.html'), '<h1>test</h1>');
-  fs.mkdirSync(path.join(PROJECT_BASE, 'src'), { recursive: true });
-  fs.writeFileSync(path.join(PROJECT_BASE, 'src/app.js'), 'console.log("test")');
+  fs.mkdirSync(projectBase, { recursive: true });
+  fs.writeFileSync(path.join(projectBase, 'index.html'), '<h1>test</h1>');
+  fs.mkdirSync(path.join(projectBase, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(projectBase, 'src/app.js'), 'console.log("test")');
 
   // Create a symlink that points outside the sandbox
-  const outsideRoot = process.env.TEST_SANDBOX_OUTSIDE_ROOT || '/var/tmp';
+  const outsideRoot = path.join(testRoot, 'outside');
   fs.mkdirSync(outsideRoot, { recursive: true });
   tempDir = fs.mkdtempSync(path.join(outsideRoot, 'sandbox-test-'));
   fs.writeFileSync(path.join(tempDir, 'secret.txt'), 'secret data');
-  symlinkPath = path.join(PROJECT_BASE, 'escape-link');
+  symlinkPath = path.join(projectBase, 'escape-link');
+  danglingSymlinkPath = path.join(projectBase, 'dangling-link');
   try {
     fs.symlinkSync(tempDir, symlinkPath);
+  } catch {
+    // May fail if symlink already exists
+  }
+  try {
+    fs.symlinkSync(path.join(tempDir, 'missing-target'), danglingSymlinkPath);
   } catch {
     // May fail if symlink already exists
   }
@@ -43,29 +55,58 @@ afterAll(() => {
   // Cleanup
   try {
     if (symlinkPath && fs.existsSync(symlinkPath)) fs.unlinkSync(symlinkPath);
-    if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
-    // Don't remove PROJECT_BASE as it may be used by the real app
+    if (danglingSymlinkPath) {
+      try { fs.unlinkSync(danglingSymlinkPath); } catch {}
+    }
+    if (testRoot) fs.rmSync(testRoot, { recursive: true, force: true });
   } catch {}
 });
 
+function validateTestPath(requestedPath: string) {
+  return validateProjectPath(requestedPath, TEST_USER, TEST_PROJECT, { projectsBase: testProjectsRoot });
+}
+
 describe('Path Sandbox', () => {
+
+  // A Project that no longer exists is an ordinary 404, not a containment
+  // violation. Answering "Access denied: path outside project sandbox" made
+  // opening a file in a just-deleted or just-renamed Project look like a
+  // security event, and logged it as one.
+  test('reports a missing project as not found rather than a violation', () => {
+    const result = validateProjectPath(
+      'index.html',
+      TEST_USER,
+      'project-that-was-deleted',
+      { projectsBase: testProjectsRoot },
+    );
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) {
+      expect(result.notFound).toBe(true);
+      expect(result.reason).toBe('Project not found');
+    }
+  });
+
+  test('a real escape is still a violation, not a not-found', () => {
+    const result = validateTestPath('../../../../etc/passwd');
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) {
+      expect(result.notFound).toBeFalsy();
+    }
+  });
 
   // Test 1: Allow valid project file access
   test('allows valid project file access', () => {
-    const result = validateProjectPath('index.html', TEST_USER, TEST_PROJECT);
+    const result = validateTestPath('index.html');
     expect(result.allowed).toBe(true);
     if (result.allowed) {
-      expect(result.resolvedPath).toBe(path.join(PROJECT_BASE, 'index.html'));
+      expect(result.resolvedPath).toBe(path.join(projectBase, 'index.html'));
     }
 
-    const result2 = validateProjectPath('src/app.js', TEST_USER, TEST_PROJECT);
+    const result2 = validateTestPath('src/app.js');
     expect(result2.allowed).toBe(true);
 
     // Absolute path within project should also work
-    const result3 = validateProjectPath(
-      path.join(PROJECT_BASE, 'src/app.js'),
-      TEST_USER, TEST_PROJECT
-    );
+    const result3 = validateTestPath(path.join(projectBase, 'src/app.js'));
     expect(result3.allowed).toBe(true);
   });
 
@@ -80,7 +121,7 @@ describe('Path Sandbox', () => {
     ];
 
     for (const p of cases) {
-      const result = validateProjectPath(p, TEST_USER, TEST_PROJECT);
+      const result = validateTestPath(p);
       expect(result.allowed).toBe(false);
       if (!result.allowed) {
         expect(result.reason).toContain('escapes project sandbox');
@@ -99,7 +140,7 @@ describe('Path Sandbox', () => {
     ];
 
     for (const p of cases) {
-      const result = validateProjectPath(p, TEST_USER, TEST_PROJECT);
+      const result = validateTestPath(p);
       expect(result.allowed).toBe(false);
     }
   });
@@ -107,15 +148,18 @@ describe('Path Sandbox', () => {
   // Test 4: Block symlink escapes
   test('blocks symlink escapes', () => {
     // The symlink 'escape-link' points to tempDir (outside sandbox)
-    const result = validateProjectPath('escape-link/secret.txt', TEST_USER, TEST_PROJECT);
+    const result = validateTestPath('escape-link/secret.txt');
     expect(result.allowed).toBe(false);
     if (!result.allowed) {
       expect(result.reason).toContain('Symlink escapes project sandbox');
     }
 
     // Direct symlink reference
-    const result2 = validateProjectPath('escape-link', TEST_USER, TEST_PROJECT);
+    const result2 = validateTestPath('escape-link');
     expect(result2.allowed).toBe(false);
+
+    const result3 = validateTestPath('dangling-link/child.txt');
+    expect(result3.allowed).toBe(false);
   });
 
   // Test 5: Block access to portal directories
@@ -128,7 +172,7 @@ describe('Path Sandbox', () => {
     ];
 
     for (const p of cases) {
-      const result = validateProjectPath(p, TEST_USER, TEST_PROJECT);
+      const result = validateTestPath(p);
       expect(result.allowed).toBe(false);
       if (!result.allowed) {
         // Either blocked as absolute outside project or as portal dir
@@ -148,7 +192,7 @@ describe('Path Sandbox', () => {
     ];
 
     for (const p of cases) {
-      const result = validateProjectPath(p, TEST_USER, TEST_PROJECT);
+      const result = validateTestPath(p);
       expect(result.allowed).toBe(false);
     }
   });
@@ -177,7 +221,7 @@ describe('Path Sandbox', () => {
     
     // Verify the validateProjectPath correctly rejects - this confirms
     // the full pipeline: validate → reject → (in real usage) log to ActivityLog
-    const result = validateProjectPath('/etc/passwd', TEST_USER, TEST_PROJECT);
+    const result = validateTestPath('/etc/passwd');
     expect(result.allowed).toBe(false);
     
     // Cleanup

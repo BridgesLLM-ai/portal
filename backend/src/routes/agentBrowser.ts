@@ -1,14 +1,22 @@
 import { Router, Request, Response } from 'express';
 import type { IncomingMessage } from 'http';
 import type { Duplex } from 'stream';
-import { execSync } from 'child_process';
 import fs from 'fs';
 import { authenticateToken } from '../middleware/auth';
-import { isElevatedRole } from '../utils/authz';
+import { canAccessPortal, isElevatedRole } from '../utils/authz';
 import { verifyAccessToken, type JwtPayload } from '../utils/jwt';
 import { prisma } from '../config/database';
 import { isAllowedWebSocketOrigin } from '../utils/websocketOrigin';
 import WebSocket, { WebSocketServer } from 'ws';
+import { parseSafeCookieHeader } from '../utils/safeCookies';
+import { desktopExecDetached } from '../utils/desktopEnv';
+import {
+  MAX_AGENT_BROWSER_BUFFERED_BYTES,
+  isExactWebSocketPath,
+  validateSharedBrowserUrl,
+} from '../services/remoteDesktopPolicy';
+import { subscribeToAuthorizationChanges } from '../services/authorizationChangeBus';
+import { subscribeToGlobalWorkspaceAuthorizationFence } from '../services/workspaceAuthorizationBarrier';
 
 const router = Router();
 
@@ -16,6 +24,12 @@ const CDP_HTTP_URL = 'http://127.0.0.1:18801/json/list';
 const CDP_WS_BASE = 'ws://127.0.0.1:18801/devtools/page';
 const SCREENSHOT_INTERVAL_MS = 500;
 const SCREENSHOT_TIMEOUT_MS = 4000;
+const MAX_STREAM_CLIENTS = 4;
+const SHARED_BROWSER_STATE_DIR = '/home/bridgesrd/.config/bridges-agent-browser';
+const SHARED_BROWSER_PROFILE_DIR = `${SHARED_BROWSER_STATE_DIR}/session/profile`;
+const SHARED_BROWSER_LOG_DIR = `${SHARED_BROWSER_STATE_DIR}/logs`;
+const SHARED_BROWSER_LOG_PATH = `${SHARED_BROWSER_LOG_DIR}/launcher.log`;
+const SHARED_BROWSER_SYSTEMD_UNIT = 'bridgesllm-shared-browser.service';
 
 type CdpTarget = {
   id: string;
@@ -34,22 +48,6 @@ type BrowserPage = {
 type StreamClientMessage = {
   targetId?: string;
 };
-
-function parseCookies(cookieHeader: string): Record<string, string> {
-  const cookies: Record<string, string> = {};
-  if (!cookieHeader) return cookies;
-
-  cookieHeader.split(';').forEach((pair) => {
-    const idx = pair.indexOf('=');
-    if (idx > 0) {
-      const key = pair.substring(0, idx).trim();
-      const value = pair.substring(idx + 1).trim();
-      cookies[key] = decodeURIComponent(value);
-    }
-  });
-
-  return cookies;
-}
 
 function getTargetWsUrl(target: Pick<CdpTarget, 'id' | 'webSocketDebuggerUrl'>): string {
   return target.webSocketDebuggerUrl || `${CDP_WS_BASE}/${encodeURIComponent(target.id)}`;
@@ -174,20 +172,31 @@ async function captureScreenshotFromTarget(target: CdpTarget): Promise<Buffer> {
   });
 }
 
-async function getAuthorizedAdminFromUpgrade(req: IncomingMessage): Promise<JwtPayload | null> {
-  const cookies = parseCookies(req.headers.cookie || '');
+async function getAuthorizedAdminFromUpgrade(
+  req: IncomingMessage,
+  verifiedUser?: JwtPayload,
+): Promise<JwtPayload | null> {
+  const cookies = parseSafeCookieHeader(req.headers.cookie);
   const token = cookies.accessToken;
-  if (!token) return null;
-
-  const user = verifyAccessToken(token);
+  const user = verifiedUser || (token ? verifyAccessToken(token) : null);
   if (!user) return null;
-
   const dbUser = await prisma.user.findUnique({
     where: { id: user.userId },
-    select: { id: true, email: true, role: true, accountStatus: true, isActive: true, sandboxEnabled: true },
+    select: {
+      id: true,
+      email: true,
+      role: true,
+      accountStatus: true,
+      isActive: true,
+      sandboxEnabled: true,
+      authorizationVersion: true,
+    },
   } as any);
 
-  if (!dbUser || !dbUser.isActive || !isElevatedRole(dbUser.role)) {
+  if (!dbUser
+    || !canAccessPortal((dbUser as any).accountStatus, dbUser.isActive)
+    || !isElevatedRole(dbUser.role)
+    || (user.authorizationVersion ?? 1) !== Number((dbUser as any).authorizationVersion ?? 1)) {
     return null;
   }
 
@@ -197,6 +206,7 @@ async function getAuthorizedAdminFromUpgrade(req: IncomingMessage): Promise<JwtP
     role: dbUser.role,
     accountStatus: (dbUser as any).accountStatus,
     sandboxEnabled: !!(dbUser as any).sandboxEnabled,
+    authorizationVersion: Number((dbUser as any).authorizationVersion ?? 1),
   } satisfies JwtPayload;
 }
 
@@ -247,8 +257,12 @@ router.get('/screenshot/:targetId', async (req: Request, res: Response) => {
 
 router.post('/open-in-desktop', async (req: Request, res: Response) => {
   try {
-    const requestedUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
-    const safeUrl = requestedUrl && /^https?:\/\//i.test(requestedUrl) ? requestedUrl : '';
+    const requestedUrl = validateSharedBrowserUrl(req.body?.url);
+    if (!requestedUrl.ok) {
+      res.status(400).json({ error: requestedUrl.error });
+      return;
+    }
+    const safeUrl = requestedUrl.url;
     const launcher = '/usr/local/bin/bridges-rd-shared-chrome.sh';
 
     if (!fs.existsSync(launcher)) {
@@ -256,14 +270,26 @@ router.post('/open-in-desktop', async (req: Request, res: Response) => {
       return;
     }
 
-    // Use centralized desktop env to ensure DISPLAY, PULSE_SERVER, etc. are set
-    const { desktopExecDetached } = require('../utils/desktopEnv');
     // Shell-quote the URL properly — JSON.stringify is NOT safe for shell contexts
     const shellQuote = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
-    const chromeCmd = `${launcher} ${safeUrl ? shellQuote(safeUrl) : ''} >/tmp/bridges-agent-browser.log 2>&1`;
-    desktopExecDetached(chromeCmd);
+    const chromeCmd = [
+      'umask 077',
+      `mkdir -p ${shellQuote(SHARED_BROWSER_STATE_DIR)} ${shellQuote(SHARED_BROWSER_LOG_DIR)}`,
+      `chmod 700 ${shellQuote(SHARED_BROWSER_STATE_DIR)} ${shellQuote(SHARED_BROWSER_LOG_DIR)}`,
+      `exec ${shellQuote(launcher)}${safeUrl ? ` ${shellQuote(safeUrl)}` : ''} >>${shellQuote(SHARED_BROWSER_LOG_PATH)} 2>&1`,
+    ].join('; ');
+    desktopExecDetached(chromeCmd, SHARED_BROWSER_SYSTEMD_UNIT);
 
-    res.json({ ok: true, url: safeUrl || null, mode: 'remote-desktop-shared-browser', cdpPort: 18801, sharedProfileDir: '/tmp/bridges-agent-browser/profile', launcher });
+    res.json({
+      ok: true,
+      url: safeUrl || null,
+      mode: 'remote-desktop-shared-browser',
+      cdpPort: 18801,
+      sharedStateDir: SHARED_BROWSER_STATE_DIR,
+      sharedProfileDir: SHARED_BROWSER_PROFILE_DIR,
+      logPath: SHARED_BROWSER_LOG_PATH,
+      launcher,
+    });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to open browser in remote desktop' });
   }
@@ -272,7 +298,16 @@ router.post('/open-in-desktop', async (req: Request, res: Response) => {
 export function attachAgentBrowserWebSocket(httpServer: import('http').Server) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
 
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
+    const user = (req as any).__portalUser as JwtPayload | undefined;
+    if (!user) {
+      ws.close(4001, 'Unauthorized');
+      return;
+    }
+    if (wss.clients.size > MAX_STREAM_CLIENTS) {
+      ws.close(1013, 'Too many browser stream clients');
+      return;
+    }
     let selectedTargetId: string | null = null;
     let interval: NodeJS.Timeout | null = null;
     let inFlight = false;
@@ -286,6 +321,7 @@ export function attachAgentBrowserWebSocket(httpServer: import('http').Server) {
 
     const captureAndSend = async () => {
       if (inFlight || ws.readyState !== WebSocket.OPEN) return;
+      if (ws.bufferedAmount > MAX_AGENT_BROWSER_BUFFERED_BYTES) return;
       inFlight = true;
 
       try {
@@ -309,7 +345,7 @@ export function attachAgentBrowserWebSocket(httpServer: import('http').Server) {
         });
 
         const image = await captureScreenshotFromTarget(target);
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount <= MAX_AGENT_BROWSER_BUFFERED_BYTES) {
           ws.send(image, { binary: true });
         }
       } catch (error: any) {
@@ -330,9 +366,11 @@ export function attachAgentBrowserWebSocket(httpServer: import('http').Server) {
     ws.on('message', (raw) => {
       try {
         const message = JSON.parse(raw.toString()) as StreamClientMessage;
-        if (message.targetId && typeof message.targetId === 'string') {
+        if (message.targetId && typeof message.targetId === 'string' && message.targetId.length <= 256) {
           selectedTargetId = message.targetId;
           void captureAndSend();
+        } else if (message.targetId) {
+          sendJson(ws, { type: 'error', error: 'Invalid target identifier' });
         }
       } catch {
         sendJson(ws, { type: 'error', error: 'Invalid stream control message' });
@@ -350,7 +388,7 @@ export function attachAgentBrowserWebSocket(httpServer: import('http').Server) {
 
   httpServer.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const url = req.url || '';
-    if (!url.startsWith('/api/agent-browser/stream')) return;
+    if (!isExactWebSocketPath(url, '/api/agent-browser/stream')) return;
 
     const origin = req.headers.origin;
     if (!isAllowedWebSocketOrigin(origin, req.headers.host)) {
@@ -359,19 +397,65 @@ export function attachAgentBrowserWebSocket(httpServer: import('http').Server) {
       return;
     }
 
-    void getAuthorizedAdminFromUpgrade(req).then((user) => {
-      if (!user) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    const cookies = parseSafeCookieHeader(req.headers.cookie);
+    const token = cookies.accessToken;
+    const tokenUser = token ? verifyAccessToken(token) : null;
+    if (!tokenUser) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    let authorizationRevoked = false;
+    let unsubscribed = false;
+    let globalSubscriptionReady = false;
+    const revokeForGlobalFence = () => {
+      authorizationRevoked = true;
+      if (globalSubscriptionReady) socket.destroy();
+    };
+    let unsubscribeGlobalFence = subscribeToGlobalWorkspaceAuthorizationFence(
+      revokeForGlobalFence,
+    );
+    globalSubscriptionReady = true;
+    if (authorizationRevoked) {
+      unsubscribeGlobalFence();
+      socket.write('HTTP/1.1 409 Conflict\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    const unsubscribeAuthorization = subscribeToAuthorizationChanges(tokenUser.userId, () => {
+      authorizationRevoked = true;
+      socket.destroy();
+    });
+    const cleanupAuthorization = () => {
+      if (unsubscribed) return;
+      unsubscribed = true;
+      socket.removeListener('close', cleanupAuthorization);
+      unsubscribeGlobalFence();
+      unsubscribeGlobalFence = () => {};
+      unsubscribeAuthorization();
+    };
+    socket.once('close', cleanupAuthorization);
+
+    void getAuthorizedAdminFromUpgrade(req, tokenUser).then((user) => {
+      if (authorizationRevoked || socket.destroyed || !user) {
+        cleanupAuthorization();
+        if (!socket.destroyed) socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
         socket.destroy();
         return;
       }
 
       (req as any).__portalUser = user;
-      wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit('connection', ws, req);
-      });
+      try {
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          wss.emit('connection', ws, req);
+        });
+      } catch {
+        cleanupAuthorization();
+        socket.destroy();
+      }
     }).catch(() => {
-      socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+      cleanupAuthorization();
+      if (!socket.destroyed) socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
       socket.destroy();
     });
   });

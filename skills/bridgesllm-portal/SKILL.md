@@ -1,145 +1,84 @@
 ---
-name: bridgesllm-portal
-description: 'Comprehensive guide for operating the BridgesLLM Portal — a self-hosted AI platform. Use when working with portal features including Remote Desktop (shared browser, VNC), email (reading/sending via Stalwart), file management, projects, agent chat, automations, terminal, apps deployment, dashboard, user accounts, system administration, or debugging the portal itself. Triggers on: portal, bridgesllm, Remote Desktop, shared browser, desktop browser, check the browser, console errors, email, send email, read email, inbox, file manager, upload, project, deploy, agent chat, automations, cron jobs, terminal, apps, dashboard, user account, settings, admin, setup wizard.'
+name: "bridgesllm-portal"
+description: "Operate BridgesLLM Portal: chats, projects, files, mail, apps, tasks, admin, setup, maintenance, and Remote Desktop."
 ---
 
 # BridgesLLM Portal
 
-Self-hosted AI platform running on a VPS. Stack: React+Vite frontend, Express+Prisma backend, PostgreSQL, Caddy reverse proxy.
+Use this skill to operate the installed Portal or diagnose its product surfaces. Prefer the authenticated Portal UI and API over direct database, filesystem, service, or OpenClaw mutations.
 
-**Portal backend**: `http://127.0.0.1:4001` (internal) → `https://<domain>/` (public via Caddy)
-**OpenClaw gateway**: `http://127.0.0.1:18789`
-**Service**: `bridgesllm-product.service`
+## Operating contract
 
-## Architecture Overview
+1. Identify the authenticated user and role.
+2. Read the surface's status, capabilities, or configuration endpoint before acting. Installed paths, model catalogs, limits, and optional services can differ.
+3. Discover the installation's origin capabilities from GET /api/settings/public before promising features: `originMode` is `domain`, `tailnet`, or `local`; `mail.available` (with `reason`) and `appHosting` are the truth for Mail and hosted deploy/share availability. Private tailnet/local origins have no public mail authority and no isolated app-content origin, so Mail and new hosted shares are genuinely unavailable there — the backend fails those requests closed (409/503) before any side effect. Do not chase Stalwart, DNS, or Caddy when the capability contract already says unavailable.
+4. Use Portal-owned APIs for Portal-owned state. They enforce ownership, scanning, path containment, leases, audit records, and cleanup.
+5. Treat 401, 403, 409, 410, 423, 429, and 503 as state, policy, contention, retirement, or readiness signals. Do not bypass them with direct host access.
+6. Re-read the resulting state after every mutation. Do not infer success from a button click or an accepted background job.
+7. Keep secrets out of URLs, logs, transcripts, shell history, screenshots, and chat.
+8. Never edit or rebuild the deployed Portal runtime as a normal operating shortcut. Portal updates verify a signed artifact and record deploy provenance.
 
-```
-Caddy (HTTPS) → Express backend (:4001)
-                 ├── React SPA (frontend)
-                 ├── PostgreSQL (Prisma ORM)
-                 ├── OpenClaw gateway (RPC + WebSocket)
-                 ├── Stalwart mail (JMAP :8580)
-                 ├── Remote Desktop (VNC :5901, noVNC :6080)
-                 └── Agent providers (Claude Code, Codex, OpenClaw, Ollama, Gemini, Agent Zero)
-```
+The public origin terminates HTTPS through Caddy. The Portal backend normally listens on loopback port 4001, but use the configured origin and same-origin routes instead of assuming hostnames or ports.
 
-## Features — Quick Reference
+## Pick the right surface
 
-| Feature | Page Route | Backend Route | Reference |
-|---------|-----------|---------------|-----------|
-| Dashboard | `/dashboard` | `/api/system/stats` | — |
-| Agent Chat | `/agent-chats` | `/api/gateway/ws` | [agent-chat.md](references/agent-chat.md) |
-| Agent Tools | `/agent-tools` | `/api/agent-tools`, `/api/skills` | [agent-chat.md](references/agent-chat.md) |
-| Remote Desktop | `/desktop` | `/api/remote-desktop` | [remote-desktop.md](references/remote-desktop.md) |
-| Email | `/mail` | `/api/mail` | [email.md](references/email.md) |
-| Files | `/files` | `/api/files` | [files-and-projects.md](references/files-and-projects.md) |
-| Projects | `/projects` | `/api/projects` | [files-and-projects.md](references/files-and-projects.md) |
-| Terminal | `/terminal` | `/api/terminal` | — |
-| Apps | `/apps` | `/api/apps` | [files-and-projects.md](references/files-and-projects.md) |
-| Automations | `/agent-tools` (tab) | `/api/automations` | [automations.md](references/automations.md) |
-| Settings | `/settings` | `/api/settings/public` | — |
-| Admin | `/admin` | `/api/admin` | [admin.md](references/admin.md) |
+- **Main Agent Chat**: OWNER/SUB_ADMIN host-operator work. It can intentionally control the server.
+- **Project Chat**: one authenticated actor plus one immutable project. Public Internet is brokered; host, private network, sibling user, and sibling project access are denied. Provider availability is attested and may be empty.
+- **Projects**: source files, Git, dependencies, preview/deploy, shares, and project-bound activity.
+- **Apps**: uploaded or project-deployed applications and share links.
+- **Files**: the user's isolated file library. It is not a server filesystem browser.
+- **Mail**: the signed-in user's mailbox plus role-authorized shared accounts.
+- **Agent Tools / Skills / Automations / Tasks**: operator-managed runtimes and jobs.
+- **Terminal**: an OWNER/SUB_ADMIN host shell. Its confirmation UI prevents accidents; it is not a privilege boundary.
+- **Settings / Admin / Maintenance / Backups**: configuration and host operations with server-side role and safety gates.
+- **Remote Desktop**: authenticated same-origin noVNC plus the visible Shared Browser.
 
-## File System Layout
+## Role model
 
-```
-/opt/bridgesllm/portal/          # Portal source + built assets
-  ├── backend/src/               # TypeScript source
-  ├── backend/dist/              # Compiled JS (what runs)
-  ├── frontend/src/              # React source
-  ├── frontend/dist/             # Built SPA (served by Express)
-  └── skills/                    # Bundled OpenClaw skills
-/portal/                         # Runtime data
-  ├── projects/                  # User projects (code, git repos)
-  ├── apps/                      # Deployed apps
-  └── project-zips/              # Upload staging
-/var/portal-files/               # User file uploads
-  └── user-<uuid>/uploads/       # Per-user upload directory
-/etc/caddy/Caddyfile             # Reverse proxy config
-/var/lib/stalwart-mail/          # Email server data
-```
+- **OWNER**: full product and host control; owner-only account, updater, backup, and high-risk settings operations.
+- **SUB_ADMIN**: deliberate root-equivalent operator through Main Agent Chat, Terminal, Tasks, maintenance, and Remote Desktop. Some ownership and release actions remain OWNER-only.
+- **USER**: approved daily-use surfaces for their own state.
+- **VIEWER**: approved read-limited access where the server permits it.
 
-## Shared Browser (Remote Desktop)
+Never infer permission from a visible control. The backend decision is authoritative.
 
-Control the shared Chrome visible in the VNC desktop. Both agent and user see the same browser.
+## Shared Browser first for visible web work
 
-**Policy:** For portal UI work, debugging, "open this", "check the browser", console inspection, or anything the user may want to watch or guide live, use this shared browser path first. Treat OpenClaw's hidden headless browser as fallback-only for cases where the user explicitly wants invisible/background automation or the shared browser is unavailable.
+For requests such as “open this,” “check the browser,” “show me,” authenticated UI debugging, or anything the user may guide live, use the Shared Browser before hidden browser automation.
 
-**Decision rule:** If the request is visual, auth-gated, collaborative, or phrased like "open this," "check this page," "show me," "look at the browser," or "go there for me," do **not** default to pasting links into chat. Instead, launch the shared browser and navigate there so the user can see the same page. Only send raw links when the user explicitly asks for a link, wants something for later, or the shared browser path is not the right tool.
+Resolve this skill directory, then run:
 
-- **CDP port**: 18801 (shared desktop Chrome)
-- **OpenClaw headless**: 18800 (separate — agent automation, NOT visible)
-- **Profile**: `/home/bridgesrd/.config/bridges-agent-browser`
+~~~bash
+bash <skill-dir>/scripts/shared-browser.sh launch [https://example.com]
+bash <skill-dir>/scripts/shared-browser.sh tabs
+bash <skill-dir>/scripts/shared-browser.sh current
+bash <skill-dir>/scripts/shared-browser.sh navigate https://example.com
+bash <skill-dir>/scripts/shared-browser.sh screenshot [output-path]
+bash <skill-dir>/scripts/shared-browser.sh console [duration-ms]
+bash <skill-dir>/scripts/shared-browser.sh evaluate 'document.title'
+~~~
 
-### Commands
+The helper targets loopback CDP 18801 for the browser visible in Remote Desktop. The hidden OpenClaw browser is a separate runtime. Load references/remote-desktop.md before setup, recovery, or service work.
 
-The shared browser script is at `scripts/shared-browser.sh` relative to this skill directory.
-Resolve the full path before running: `SKILL_DIR/<this skill's directory>/scripts/shared-browser.sh`
+## Debugging workflow
 
-```bash
-# First, always check if Chrome is running — launch if needed:
-bash <skill-dir>/scripts/shared-browser.sh launch
+1. Reproduce through the affected Portal surface as the affected role.
+2. Capture the visible state and browser console when relevant.
+3. Inspect the Portal response/status and recent service logs without exposing credentials.
+4. Distinguish product source, compiled runtime, persistent data, and external provider state.
+5. Fix source in the development checkout, validate it, and deploy only through the signed candidate/update workflow.
+6. Verify the exact request path, persistence after refresh/reconnect, and a nearby negative permission case.
 
-# Then use these commands:
-bash <skill-dir>/scripts/shared-browser.sh tabs                    # List open tabs
-bash <skill-dir>/scripts/shared-browser.sh current                 # Get active page title + URL
-bash <skill-dir>/scripts/shared-browser.sh navigate <url>          # Navigate to URL (user sees it)
-bash <skill-dir>/scripts/shared-browser.sh screenshot [path]       # Capture page screenshot
-bash <skill-dir>/scripts/shared-browser.sh console [duration_ms]   # Capture console output (default 3s)
-bash <skill-dir>/scripts/shared-browser.sh evaluate '<js>'         # Run JavaScript on the page
-bash <skill-dir>/scripts/shared-browser.sh launch [url]            # Start Chrome if not running
-```
+Do not hand-edit backend/dist, frontend/dist, the live database, OpenClaw config, Caddy, or systemd merely to make a product test pass.
 
-Where `<skill-dir>` is the directory containing this SKILL.md file.
+## Load only the reference you need
 
-### When to Use Shared Browser
+- references/agent-chat.md — Main vs Project Chat, providers, models, streaming, long turns, tools.
+- references/files-and-projects.md — Files, chunked upload, Projects, Git, apps, shares, Project attachments.
+- references/email.md — mailbox scope, send/read actions, attachments, scanning, reconciliation.
+- references/automations.md — Automations and durable Tasks/jobs.
+- references/admin.md — roles, Dashboard, Settings, Admin, setup, updates, maintenance, backups, Terminal.
+- references/remote-desktop.md — noVNC, Shared Browser, runtime services, recovery, diagnostics.
+- references/remote-gpu.md — Ollama backends, native Tailscale Remote GPU, model pulls, backend authority.
 
-- **Debugging**: User says "look at this" → `screenshot` + `console`
-- **Showing work**: Navigate to a page so user can see it in the VNC iframe
-- **Testing portal**: Open the portal URL, check for errors, fix, reload
-- **Collaborative**: User opens a page, you read it; you navigate, they interact
-
-## Portal Debugging Workflow
-
-When debugging portal issues:
-
-1. **`screenshot`** — see what the user sees
-2. **`console`** — read JavaScript errors
-3. **`evaluate 'document.querySelector(...)'`** — inspect DOM state
-4. Read backend logs: `journalctl -u bridgesllm-product -n 50 --no-pager`
-5. Fix source in the source checkout first, not by ad-hoc editing the deployed runtime tree
-6. If validation needs deployment, copy only the validated build output into `/opt/bridgesllm/portal/` deliberately
-7. Build: `cd backend && npm run build` or `cd frontend && npm run build`
-8. Restart only when the backend changed: `systemctl restart bridgesllm-product`
-9. Verify fix in shared browser
-
-## Quick Reference — Common Operations
-
-### Restart portal
-```bash
-systemctl restart bridgesllm-product.service
-```
-
-### Check portal logs
-```bash
-journalctl -u bridgesllm-product -n 100 --no-pager
-```
-
-### Rebuild backend only
-```bash
-cd /opt/bridgesllm/portal/backend && npm run build
-systemctl restart bridgesllm-product
-```
-
-### Rebuild frontend only
-```bash
-cd /opt/bridgesllm/portal/frontend && npm run build
-# No restart needed — Express serves static files
-```
-
-### Check service health
-```bash
-systemctl is-active bridgesllm-product
-curl -s http://127.0.0.1:4001/health
-curl -s http://127.0.0.1:4001/api/system/stats | head -c 200
-```
+Model lists, package versions, prices, quotas, storage paths, and provider availability are intentionally discovered at runtime rather than embedded here.

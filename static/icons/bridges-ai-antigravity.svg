@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Google Antigravity terminal runtime launcher">
+  <defs><linearGradient id="g" x1="20" y1="16" x2="108" y2="112"><stop stop-color="#6ea8ff"/><stop offset=".52" stop-color="#8a7dff"/><stop offset="1" stop-color="#e26dce"/></linearGradient></defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="#090b1b" stroke="#b8c7ff" stroke-width="4"/>
+  <path d="M64 24c8 23 17 32 40 40-23 8-32 17-40 40-8-23-17-32-40-40 23-8 32-17 40-40Z" fill="url(#g)"/>
+  <text x="64" y="73" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="22" font-weight="800" fill="#fff">AG</text>
+</svg>

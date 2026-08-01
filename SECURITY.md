@@ -1,124 +1,175 @@
 # Security Policy
 
-## Supported Versions
+## Supported releases
 
-| Version | Supported          |
-|---------|--------------------|
-| 3.x     | ✅ Active support  |
-| < 3.0   | ❌ No longer supported |
+| Release | Status |
+|---|---|
+| 4.0.x | Current stable release |
+| 3.26.x | Security fixes only during the 4.0 transition |
+| Earlier releases | Upgrade required |
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
-If you discover a security vulnerability, please report it responsibly:
+Do not open a public issue. Email **support@bridgesllm.com** with a description,
+reproduction steps, affected version, and impact. We will acknowledge the report
+and coordinate remediation and disclosure.
 
-1. **Do NOT open a public issue**
-2. Email **support@bridgesllm.com** with:
-   - Description of the vulnerability
-   - Steps to reproduce
-   - Potential impact assessment
-3. You'll receive an acknowledgment within 48 hours
-4. We'll work with you on a fix and coordinated disclosure
+## Architecture
 
-## Architecture Overview
+BridgesLLM Portal is a single-server product. Caddy terminates HTTPS and proxies
+the React/Express application. The backend owns authentication, authorization,
+PostgreSQL state, user files, project identities, provider coordination, mail
+integration, backups, and system administration. OpenClaw and native provider
+adapters are separate execution systems behind explicit Portal trust scopes.
 
-BridgesLLM Portal runs as a Node.js backend behind Caddy (automatic HTTPS reverse proxy) on a single server. The portal manages user authentication, routes requests to OpenClaw (the AI agent framework), and provides the browser-based UI. All communication happens over HTTPS.
-
+```text
+Browser --HTTPS--> Caddy --> Portal backend --> PostgreSQL
+                              |-- OpenClaw gateway
+                              |-- native provider adapters
+                              |-- Stalwart JMAP
+                              |-- controlled Project runtimes
+                              `-- host services (elevated routes only)
 ```
-Browser ──HTTPS──▶ Caddy ──▶ Portal Backend ──▶ OpenClaw Gateway
-                                    │
-                                    ├──▶ Database (PostgreSQL via Prisma)
-                                    ├──▶ File System (sandboxed paths)
-                                    └──▶ Docker (project sandboxes)
-```
 
-## Security Measures
+## Authentication and authorization
 
-### Network & Transport
+- Access and refresh credentials use secure cookies or an authorization header;
+  normal authenticated APIs do not accept query-string bearer tokens.
+- First-run bootstrap credentials are short-lived, single-use, origin-bound,
+  stored as hashes, transported in URL fragments, and accepted only after a
+  verified HTTPS origin or an explicit localhost SSH-tunnel flow.
+- Accounts have `ACTIVE`, `PENDING`, `DISABLED`, or `BANNED` status. Only active
+  accounts can enter the Portal.
+- `OWNER` and `SUB_ADMIN` are elevated operators. Main Agent Chat, Terminal,
+  Remote Desktop, agent jobs, maintenance, and other host-control surfaces are
+  restricted accordingly. `SUB_ADMIN` is intentionally root-equivalent for
+  operations; the role-assignment UI states that consequence.
+- `USER` can use interactive tenant surfaces such as Files, Projects, Project
+  Chat, and Mail, subject to ownership checks. `VIEWER` is non-interactive.
+- Owner-only actions, typed confirmations, durable admission locks, and
+  server-side preconditions protect destructive or high-impact operations.
 
-- **HTTPS only** — automatic TLS certificates via Let's Encrypt, managed by Caddy. HSTS enabled with `max-age=15552000; includeSubDomains`.
-- **Firewall** — UFW configured during installation. Only ports 22 (SSH), 80 (HTTP redirect), and 443 (HTTPS) are exposed externally. Internal Docker bridge ports are restricted to container subnets.
-- **Security headers** — Content-Security-Policy, X-Content-Type-Options (`nosniff`), X-Frame-Options (`SAMEORIGIN`), Referrer-Policy (`strict-origin-when-cross-origin`) set via Caddy and Express middleware.
-- **Shell-escape enforcement** — all user-influenced parameters (commit messages, branch names, file paths, URLs) are properly escaped before reaching any shell command. Input validated against strict allowlist regexes.
+## Two agent trust scopes
 
-### Authentication & Authorization
+### `HOST_OPERATOR`
 
-- **JWT authentication** — separate access and refresh tokens. Access tokens are short-lived. Tokens are read from the `Authorization` header or secure cookies only — query parameter authentication was removed to prevent token leakage in server logs and browser history.
-- **Role-based access control** — four account roles:
-  - **Owner** — full administrative access, user management, system configuration
-  - **Sub-Admin** — elevated access, can manage users and settings
-  - **User** — standard interactive access to chat, projects, files, terminal
-  - **Viewer** — read-only access (cannot use interactive features)
-- **Account states** — accounts can be Active, Pending (requires admin approval), Disabled, or Banned. Only Active accounts can access the portal.
-- **Setup wizard protection** — a middleware (`requireSetupComplete`) prevents access to the portal until initial setup is finished, preventing unauthorized use during installation.
+Main Agent Chat is an operator surface for `OWNER` and `SUB_ADMIN`. Its purpose
+is to administer the server, so an approved turn may read and modify host files,
+run commands, and use the network. Treat it like an SSH session mediated by an
+agent. Provider approval prompts are accident controls, not tenant isolation.
 
-### Code Execution Sandboxing
+### `PROJECT_SANDBOX`
 
-- **Docker isolation** — project agents run inside isolated Docker containers (`openclaw-sandbox:bookworm-slim`). Each project gets its own container with:
-  - A bind mount limited to that project's directory only
-  - No access to the host workspace (`workspaceAccess: "none"`)
-  - Sandboxing mode set to `all` (all commands run inside the container)
-  - Session-scoped containers that are cleaned up when the session ends
-- **Network control** — sandbox containers use Docker bridge networking. The container can reach the internet (for package installs, web fetches) but cannot access the host's local services unless explicitly configured.
+Project Chat is always keyed to the authenticated actor and one immutable
+database project identity. Human workspace-sharing rules do not change that
+principal. Enabled adapters receive one writable project mount and a non-root,
+read-only, capability-dropped runtime. They do not receive sibling projects,
+host configuration, provider credentials, the Docker socket, host namespaces,
+devices, or published ports.
 
-### File System Protection
+Every fresh and resumed turn synchronously verifies the exact provider config,
+image ID, labels, mounts, environment, resource limits, network, proxy, and live
+container. Failure makes the provider unavailable; there is no default-bridge,
+host-adapter, or stale-container fallback.
 
-- **Path sandbox middleware** — a dedicated middleware (`pathSandbox`) prevents project agents and API consumers from accessing files outside their designated project directory (`/portal/projects/{userId}/{projectName}/`). It protects against:
-  - Directory traversal attacks (`../`)
-  - Symlink escapes
-  - Absolute paths pointing outside the project
-  - Access to system directories (`/root`, `/etc`, `/proc`, `/sys`, `/var/log`, `/var/run`, `/tmp`, `/home`)
-  - Access to portal source code directories
-  - Access to other users' uploads (`/portal/files/`)
-- **Violation tracking** — repeated sandbox violations from the same source are tracked and escalated. Three violations within 15 minutes triggers heightened monitoring.
-- **User file isolation** — user uploads are stored at `/portal/files/{userId}/`, separated from project files. Each user can only access their own uploads.
+Project workloads have useful public Internet access through an authenticated
+Portal-controlled egress plane. The runtime has no direct route. The proxy and
+firewall reject loopback, host interfaces, RFC1918, CGNAT, link-local/cloud
+metadata, Docker/service networks, IPv6 ULA/link-local, mixed DNS results, DNS
+rebinding, redirects to private destinations, unsafe schemes, and unapproved
+ports. Public HTTPS, HTTPS Git, package registries, and asset downloads are the
+supported positive paths.
 
-### Input Validation & Database
+See [docs/PROJECT_SANDBOXING.md](docs/PROJECT_SANDBOXING.md) for the complete
+identity, lifecycle, provider-switch, cleanup, and qualification contract.
 
-- **Parameterized queries** — all database access goes through Prisma ORM, which uses parameterized queries. No raw SQL string concatenation.
-- **Schema validation** — API inputs are validated using Zod schemas before processing.
-- **PostgreSQL database** — stored locally on the server. No external database connections.
+## Files, uploads, projects, and apps
 
-### Malware Scanning
+- Canonical-path and inode-aware containment rejects traversal, symlink escapes,
+  special files, cross-user paths, and project-root identity drift.
+- Uploads, chunks, archives, images, mail attachments, thumbnails, and deployed
+  app content have explicit count, size, time, and output bounds.
+- User-controlled uploads are rejected when ClamAV reports malware **or when a
+  required scan cannot complete**. The product does not silently accept
+  unscanned content.
+- ZIP extraction validates every entry and commits only after bounded extraction
+  and scanning succeed.
+- Active app content is isolated from the authenticated Portal origin. Share and
+  API proxy requests are bound to the selected app/share identity and policy.
+- Networked Git, dependency, and lifecycle operations use the same controlled
+  Project workload runner; local-only operations use `network=none`.
 
-- **ClamAV integration** — uploaded files are scanned for malware using the ClamAV daemon (`clamdscan`) before being stored. If a threat is detected, the upload is rejected. If ClamAV is unavailable, the system logs a warning but allows the upload (fail-open — see Known Limitations).
+## Network and transport
 
-### Mail Server
+- Caddy provides TLS and security headers for Portal traffic. HTTP setup cannot
+  receive owner or provider credentials.
+- UFW defaults to denying unsolicited inbound traffic. Portal, JMAP, database,
+  Remote Desktop internals, CDP, app backends, and provider control endpoints are
+  loopback-only unless a documented public protocol deliberately requires
+  exposure.
+- Stalwart JMAP stays internal. Public mail protocols are exposed only through
+  the configured mail service with TLS; SMTP relay policy remains enforced by
+  Stalwart.
+- Reverse proxies and application code use one trusted-proxy/IP policy rather
+  than trusting arbitrary forwarded headers.
+- WebSocket and Socket.IO namespaces repeat account and role authorization at
+  connection time; server-wide operator streams are elevated-only.
 
-- **Loopback binding** — the built-in Stalwart mail server is configured to accept connections from localhost only. It is not exposed as an open relay.
+## Secrets and provider authentication
 
-### Credential Storage
+- Runtime secrets are stored outside public artifacts and returned to clients
+  only when a narrowly defined product flow requires it.
+- Provider setup distinguishes browser OAuth, device flow, CLI reuse, setup
+  tokens, and API keys. The backend is the provider catalog source; the frontend
+  does not invent aliases or entitlement upgrades.
+- Setup, OAuth, and password-reset state is expiring, owner-bound where
+  applicable, replay-resistant, and redacted from logs and normal API responses.
+- Signed release artifacts bind the manifest, complete runtime inventory, source
+  version, and content hashes. A verified deployment stamp is written only after
+  postflight checks succeed and is restored exactly on rollback.
 
-- **API keys and tokens** — stored in the OpenClaw configuration file on the server's local filesystem. Access to this file requires server-level (SSH/root) access.
-- **Gateway authentication** — the portal communicates with the OpenClaw gateway using a token stored in a restricted file (`600` permissions).
-- **Third-party secrets** — credentials for external services (X API, etc.) are stored in dedicated files with `600` permissions under `~/.clawdbot/secrets/` or `~/.openclaw/secrets/`.
+## Data, mail, backups, and maintenance
 
-## Known Limitations
+- PostgreSQL migrations are shipped with the release and applied against the
+  configured database URL, including external/custom PostgreSQL deployments.
+- Mailbox provisioning uses durable reconciliation. Desired database state is
+  retained and retried instead of deleting Stalwart data on a transient failure.
+- Comprehensive backups cover the database, projects, apps, uploads, Portal
+  state, Stalwart data/configuration, and OpenClaw state. “Keep data” uninstall
+  preserves those locations.
+- Guarded system updates require a fresh structurally valid backup, matching
+  database checksum, explicit maintenance-window acknowledgement, and a
+  server-side single-job lock.
 
-These are areas where the current security model has trade-offs. We document them here for transparency:
+## Known boundaries
 
-1. **Single-server model** — BridgesLLM Portal runs everything (portal, database, agent, sandbox containers) on one server. There is no network-level separation between the portal backend and the agent runtime. This is a deliberate trade-off for simplicity and cost. For high-security deployments, consider running the portal behind a VPN or restricting SSH access.
+1. **Single-server deployment.** Portal deliberately combines several services
+   on one host. Project isolation reduces tenant blast radius but does not turn
+   the VPS into separate virtual machines.
+2. **Elevated agent operation.** Main Agent Chat and Terminal are powerful by
+   design. Grant `SUB_ADMIN` only to people trusted with root-equivalent access.
+3. **Docker is part of the boundary.** Images, daemon configuration, kernel, and
+   firewall must remain patched. Release qualification includes adversarial live
+   escape tests; no container system is a substitute for an independently
+   isolated VM for hostile multi-tenant code.
+4. **Third-party availability.** Provider, DNS, certificate, package-registry,
+   and mail failures can make a feature unavailable. The Portal reports that
+   state rather than fabricating success or zero usage.
 
-2. **ClamAV fail-open** — if the ClamAV daemon is not running, file uploads proceed without scanning. This prevents the scan system from blocking normal operations, but means uploads are unscanned during ClamAV downtime. Monitor ClamAV service health if upload scanning is important to your deployment.
+## Hardening recommendations
 
-3. **Main agent workspace access** — the main OpenClaw agent (outside of project sandboxes) runs with full server access. It can read and write files, run commands, and access the network. Project agents are sandboxed, but the main agent is intentionally unrestricted to support administrative tasks. Users should understand that conversations with the main agent have the same trust level as an SSH session.
+- Use SSH keys, restrict administrative source addresses, and keep UFW enabled.
+- Keep the supported Node, OpenClaw core/plugin pair, Docker, Caddy, PostgreSQL,
+  Stalwart, ClamAV, and host packages current through the tested updater paths.
+- Keep `clamav-daemon`, `clamav-freshclam`, and the configured host malware agent
+  active; investigate any scan-unavailable state rather than bypassing it.
+- Schedule and restore-test comprehensive backups, especially before upgrades.
+- Review active users and reserve `OWNER`/`SUB_ADMIN` for trusted operators.
+- Keep the Portal, provider control ports, database, app backends, Remote Desktop,
+  CDP, and Docker interfaces off the public network.
 
-4. **Container escape** — Docker provides process and filesystem isolation, not a full security boundary. A determined attacker with code execution inside a container may attempt to escape. For untrusted workloads, consider additional hardening (gVisor, user namespaces, or dedicated VMs).
+## Responsible disclosure
 
-5. **No built-in audit log UI** — the portal does not currently expose a consolidated audit log of all agent actions in the browser. Server logs (journalctl) capture all activity, but there is no searchable, user-facing audit trail yet. This is on the roadmap.
-
-## Hardening Recommendations
-
-For production deployments:
-
-- **Restrict SSH access** — use key-based authentication only, disable password login, and consider restricting SSH to specific IP ranges or a VPN.
-- **Enable automatic security updates** — configure `unattended-upgrades` for the host OS.
-- **Monitor ClamAV** — ensure `clamav-daemon` and `clamav-freshclam` are both running so uploaded files are scanned with current signatures.
-- **Back up regularly** — the database, configuration, and project files should be backed up. The installer does not configure automated backups.
-- **Review firewall rules** — verify that only necessary ports are exposed. The default UFW configuration is restrictive, but custom rules may widen the attack surface.
-
-## Responsible Disclosure
-
-We appreciate the security research community and will:
-- Acknowledge your contribution in release notes (with permission)
-- Not take legal action against good-faith security research
-- Work to fix verified vulnerabilities within 7 days
+We will work with good-faith reporters on verification, remediation, credit, and
+coordinated disclosure. Public proof-of-concept publication should wait until a
+fix is available to users.

@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import {
-  Timer, Plus, Play, Pause, Trash2, Edit2, Clock, 
-  Calendar, RefreshCw, X, ChevronRight, AlertCircle,
+  Timer, Plus, Play, Trash2, Edit2, Clock,
+  Calendar, RefreshCw, X, AlertCircle,
   CheckCircle, XCircle, Loader2, History, Zap, Bot
 } from 'lucide-react';
 import { automationsAPI, gatewayAPI } from '../api/endpoints';
+import ViewportModal from '../components/ViewportModal';
 
 /* ─── Types ─────────────────────────────────────────────── */
 
@@ -14,6 +15,7 @@ interface CronJob {
   name: string;
   enabled: boolean;
   agentId?: string;
+  sessionTarget?: string;
   schedule: {
     kind: string;
     expr: string;
@@ -136,6 +138,24 @@ function formatDuration(ms: number): string {
   return `${Math.round(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
 }
 
+function defaultTimeZone(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+}
+
+const SUPPORTED_TIME_ZONES: string[] = (() => {
+  try {
+    const values = (Intl as typeof Intl & { supportedValuesOf?: (key: string) => string[] }).supportedValuesOf?.('timeZone');
+    if (Array.isArray(values) && values.length > 0) return values;
+  } catch {
+    // Fall back to a compact, globally useful list on older browsers.
+  }
+  return ['UTC', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'Europe/London', 'Europe/Paris', 'Asia/Tokyo'];
+})();
+
+function isEditableAgentAutomation(job: CronJob): boolean {
+  return job.payload?.kind === 'agentTurn' && job.sessionTarget !== 'main';
+}
+
 function normalizeRun(raw: any): CronRun {
   const startedAtMs = Number(raw?.startedAtMs || raw?.runAtMs || raw?.ts || raw?.startedAt || raw?.startAt || Date.now());
   const completedAtMs = raw?.completedAtMs ? Number(raw.completedAtMs) : (raw?.completedAt ? Number(raw.completedAt) : undefined);
@@ -164,46 +184,35 @@ const cardVariant = {
 const modalVariant = {
   hidden: { opacity: 0, scale: 0.95 },
   show: { opacity: 1, scale: 1, transition: { type: 'spring', stiffness: 300, damping: 30 } },
-  exit: { opacity: 0, scale: 0.95, transition: { duration: 0.15 } },
 };
-const slideInVariant = {
-  hidden: { x: '100%' },
-  show: { x: 0, transition: { type: 'spring', stiffness: 300, damping: 30 } },
-  exit: { x: '100%', transition: { duration: 0.2 } },
-};
-
 /* ─── Job Card Component ────────────────────────────────── */
 
 interface JobCardProps {
   job: CronJob;
-  deleting?: boolean;
-  onToggle: (id: string, enabled: boolean) => void;
+  activeMutation: AutomationCardMutation | null;
+  onToggle: (id: string, enabled: boolean) => Promise<void>;
   onEdit: (job: CronJob) => void;
   onDelete: (id: string) => void;
-  onRunNow: (id: string) => void;
+  onRunNow: (id: string) => Promise<void>;
   onViewRuns: (job: CronJob) => void;
 }
 
-function JobCard({ job, deleting = false, onToggle, onEdit, onDelete, onRunNow, onViewRuns }: JobCardProps) {
-  const [running, setRunning] = useState(false);
-  const [toggling, setToggling] = useState(false);
+type AutomationCardMutation = {
+  kind: 'run' | 'toggle';
+  jobId: string;
+};
+
+function JobCard({ job, activeMutation, onToggle, onEdit, onDelete, onRunNow, onViewRuns }: JobCardProps) {
+  const running = activeMutation?.kind === 'run' && activeMutation.jobId === job.id;
+  const toggling = activeMutation?.kind === 'toggle' && activeMutation.jobId === job.id;
+  const mutationActive = activeMutation !== null;
   
-  const handleRunNow = async () => {
-    setRunning(true);
-    try {
-      await onRunNow(job.id);
-    } finally {
-      setRunning(false);
-    }
+  const handleRunNow = () => {
+    void onRunNow(job.id);
   };
   
-  const handleToggle = async () => {
-    setToggling(true);
-    try {
-      await onToggle(job.id, !job.enabled);
-    } finally {
-      setToggling(false);
-    }
+  const handleToggle = () => {
+    void onToggle(job.id, !job.enabled);
   };
   
   const statusIcon = useMemo(() => {
@@ -212,27 +221,17 @@ function JobCard({ job, deleting = false, onToggle, onEdit, onDelete, onRunNow, 
     if (status === 'error' || status === 'failed') return <XCircle size={14} className="text-red-400" />;
     return null;
   }, [job.state?.lastRunStatus]);
+  const editable = isEditableAgentAutomation(job);
   
   return (
     <motion.div
       variants={cardVariant}
       className={`relative overflow-hidden rounded-2xl border backdrop-blur-xl p-5 flex flex-col gap-4 hover-lift transition-all duration-200 ${
-        deleting
-          ? 'bg-gradient-to-br from-red-900/20 to-slate-950/60 border-red-500/20 opacity-60 pointer-events-none'
-          : job.enabled
-            ? 'bg-gradient-to-br from-slate-800/50 to-slate-900/50 border-white/[0.08]'
-            : 'bg-gradient-to-br from-slate-900/50 to-slate-950/50 border-white/[0.04] opacity-70'
+        job.enabled
+          ? 'bg-gradient-to-br from-slate-800/50 to-slate-900/50 border-white/[0.08]'
+          : 'bg-gradient-to-br from-slate-900/50 to-slate-950/50 border-white/[0.04] opacity-70'
       }`}
     >
-      {deleting && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-950/45 backdrop-blur-[1px]">
-          <div className="inline-flex items-center gap-2 rounded-full border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-200">
-            <Loader2 size={14} className="animate-spin" />
-            Deleting…
-          </div>
-        </div>
-      )}
-
       {/* Header */}
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
@@ -292,8 +291,13 @@ function JobCard({ job, deleting = false, onToggle, onEdit, onDelete, onRunNow, 
       <div className="flex items-center gap-2 pt-2 border-t border-white/[0.06]">
         {/* Toggle Switch */}
         <button
+          role="switch"
+          aria-checked={job.enabled}
+          aria-label={toggling ? `${job.enabled ? 'Disabling' : 'Enabling'} ${job.name}…` : `${job.enabled ? 'Disable' : 'Enable'} ${job.name}`}
+          aria-busy={toggling}
           onClick={handleToggle}
-          disabled={toggling}
+          disabled={mutationActive || !editable}
+          title={editable ? (job.enabled ? 'Disable' : 'Enable') : 'This job type must be managed in OpenClaw'}
           className={`relative w-11 h-6 rounded-full transition-colors ${
             job.enabled ? 'bg-emerald-500' : 'bg-slate-700'
           } ${toggling ? 'opacity-50' : ''}`}
@@ -310,6 +314,7 @@ function JobCard({ job, deleting = false, onToggle, onEdit, onDelete, onRunNow, 
         {/* Action Buttons */}
         <button
           onClick={() => onViewRuns(job)}
+          aria-label={`View runs for ${job.name}`}
           className="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-white/[0.06] transition-colors"
           title="View runs"
         >
@@ -318,7 +323,9 @@ function JobCard({ job, deleting = false, onToggle, onEdit, onDelete, onRunNow, 
         
         <button
           onClick={handleRunNow}
-          disabled={running}
+          disabled={mutationActive || !editable}
+          aria-busy={running}
+          aria-label={editable ? (running ? `Running ${job.name}…` : `Run ${job.name} now`) : `${job.name} must be managed in OpenClaw`}
           className="p-2 rounded-lg text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors disabled:opacity-50"
           title="Run now"
         >
@@ -327,16 +334,20 @@ function JobCard({ job, deleting = false, onToggle, onEdit, onDelete, onRunNow, 
         
         <button
           onClick={() => onEdit(job)}
-          className="p-2 rounded-lg text-slate-400 hover:text-blue-400 hover:bg-blue-500/10 transition-colors"
-          title="Edit"
+          disabled={mutationActive || !editable}
+          aria-label={editable ? `Edit ${job.name}` : `${job.name} must be edited in OpenClaw`}
+          className="p-2 rounded-lg text-slate-400 hover:text-blue-400 hover:bg-blue-500/10 transition-colors disabled:cursor-not-allowed disabled:opacity-35 disabled:hover:bg-transparent disabled:hover:text-slate-400"
+          title={editable ? 'Edit' : 'This job type must be edited in OpenClaw'}
         >
           <Edit2 size={16} />
         </button>
         
         <button
           onClick={() => onDelete(job.id)}
-          className="p-2 rounded-lg text-slate-400 hover:text-red-400 hover:bg-red-500/10 transition-colors"
-          title="Delete"
+          disabled={mutationActive || !editable}
+          aria-label={editable ? `Delete ${job.name}` : `${job.name} cannot be deleted from the Portal`}
+          className="p-2 rounded-lg text-slate-400 hover:text-red-400 hover:bg-red-500/10 transition-colors disabled:cursor-not-allowed disabled:opacity-35 disabled:hover:bg-transparent disabled:hover:text-slate-400"
+          title={editable ? 'Delete' : 'This job type must be managed in OpenClaw'}
         >
           <Trash2 size={16} />
         </button>
@@ -370,7 +381,13 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
   const [availableModels, setAvailableModels] = useState<Array<{ id: string; alias: string | null; displayName: string }>>([]);
   const [message, setMessage] = useState('');
   const [thinking, setThinking] = useState('off');
-  const [tz, setTz] = useState('America/New_York');
+  const [tz, setTz] = useState(defaultTimeZone);
+  const nameInputRef = useRef<HTMLInputElement>(null);
+  const savingRef = useRef(false);
+
+  const handleRequestClose = useCallback(() => {
+    if (!savingRef.current) onClose();
+  }, [onClose]);
   
   // Reset form when job changes
   useEffect(() => {
@@ -380,7 +397,7 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
       setModel(job.payload?.model || '');
       setMessage(job.payload?.message || '');
       setThinking(job.payload?.thinking || 'off');
-      setTz(job.schedule.tz || 'America/New_York');
+      setTz(job.schedule.tz || defaultTimeZone());
       
       // Parse schedule
       const expr = job.schedule.expr;
@@ -416,7 +433,7 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
       setModel('');
       setMessage('');
       setThinking('off');
-      setTz('America/New_York');
+      setTz(defaultTimeZone());
     }
     setSubmitError(null);
     setValidationErrors({});
@@ -441,6 +458,7 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
   
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (savingRef.current) return;
     setSubmitError(null);
 
     const errors: ValidationErrors = {};
@@ -449,7 +467,7 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
     const trimmedModel = model.trim();
     const trimmedTask = message.trim();
     const trimmedCustomCron = customCron.trim();
-    const validCron = /^(\*|[0-5]?\d)(\/\d+)?\s+(\*|[01]?\d|2[0-3])(\-\d+|\/\d+)?\s+(\*|[1-9]|[12]\d|3[01])(\-\d+|\/\d+)?\s+(\*|[1-9]|1[0-2])(\-\d+|\/\d+)?\s+(\*|[0-6]|\d-\d)(\/\d+)?$/;
+    const validCron = /^[a-zA-Z0-9*?,/\-#LW]+(?:\s+[a-zA-Z0-9*?,/\-#LW]+){4}$/;
     if (!trimmedName) errors.name = 'Name is required.';
     if (!trimmedTask) errors.task = 'Task prompt is required.';
     if (!trimmedAgent || !/^[a-zA-Z0-9_-]+$/.test(trimmedAgent)) {
@@ -470,6 +488,7 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
       return;
     }
 
+    savingRef.current = true;
     setSaving(true);
     
     try {
@@ -481,9 +500,9 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
         dayOfWeek: scheduleType === 'weekly' ? dayOfWeek : undefined,
         schedule: scheduleType === 'custom' ? trimmedCustomCron : undefined,
         agent: trimmedAgent,
-        model: trimmedModel || undefined,
+        model: trimmedModel || (job ? null : undefined),
         message: trimmedTask,
-        thinking: thinking !== 'off' ? thinking : undefined,
+        thinking: thinking !== 'off' ? thinking : (job ? null : undefined),
         tz,
       });
       onClose();
@@ -491,6 +510,7 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
       console.error('Failed to save job:', err);
       setSubmitError(err instanceof Error ? err.message : 'Failed to save automation');
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -500,63 +520,70 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
   const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
   
   return (
-    <AnimatePresence>
+    <ViewportModal
+      open={isOpen}
+      onDismiss={handleRequestClose}
+      dismissible={!saving}
+      initialFocusRef={nameInputRef}
+      className="bg-black/60 p-4 backdrop-blur-sm"
+    >
       <motion.div
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
-        onClick={onClose}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="automation-editor-title"
+        variants={modalVariant}
+        initial="hidden"
+        animate="show"
+        className="flex max-h-[calc(100%_-_2rem)] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-white/[0.08] bg-slate-900 shadow-2xl"
       >
-        <motion.div
-          variants={modalVariant}
-          initial="hidden"
-          animate="show"
-          exit="exit"
-          onClick={(e) => e.stopPropagation()}
-          className="w-full max-w-lg bg-slate-900 border border-white/[0.08] rounded-2xl shadow-2xl overflow-hidden"
-        >
           {/* Header */}
           <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.08]">
-            <h2 className="text-lg font-semibold text-white">
+            <h2 id="automation-editor-title" className="text-lg font-semibold text-white">
               {job ? 'Edit Automation' : 'New Automation'}
             </h2>
             <button
-              onClick={onClose}
-              className="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-white/[0.06] transition-colors"
+              aria-label="Close automation editor"
+              onClick={handleRequestClose}
+              disabled={saving}
+              className="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-white/[0.06] transition-colors disabled:opacity-50"
             >
               <X size={20} />
             </button>
           </div>
           
           {/* Form */}
-          <form onSubmit={handleSubmit} className="p-6 space-y-5 max-h-[70vh] overflow-y-auto">
+          <form id="automation-editor-form" onSubmit={handleSubmit} className="min-h-0 flex-1 space-y-5 overflow-y-auto p-6">
             {/* Name */}
             <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">Name</label>
+              <label htmlFor="automation-name" className="block text-sm font-medium text-slate-300 mb-2">Name</label>
               <input
+                ref={nameInputRef}
+                id="automation-name"
+                aria-label="Automation name"
                 type="text"
                 value={name}
                 onChange={(e) => { setName(e.target.value); setValidationErrors(prev => ({ ...prev, name: undefined })); }}
                 placeholder="My automation"
                 className="w-full px-4 py-2.5 bg-slate-800 border border-white/[0.08] rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50"
                 required
+                maxLength={200}
               />
               {validationErrors.name && <p className="mt-1.5 text-xs text-red-400">{validationErrors.name}</p>}
             </div>
             
             {/* Schedule Type */}
-            <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">Schedule</label>
+            <fieldset>
+              <legend className="block text-sm font-medium text-slate-300 mb-2">Schedule</legend>
               <div className="grid grid-cols-5 gap-2">
                 {(['interval', 'hourly', 'daily', 'weekly', 'custom'] as const).map((type) => (
                   <button
                     key={type}
                     type="button"
+                    aria-pressed={scheduleType === type}
                     onClick={() => setScheduleType(type)}
                     className={`px-3 py-2 rounded-lg text-xs font-medium capitalize transition-colors ${
                       scheduleType === type
-                        ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                        ? 'accent-active border'
                         : 'bg-slate-800 text-slate-400 border border-white/[0.08] hover:bg-slate-700'
                     }`}
                   >
@@ -564,13 +591,15 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
                   </button>
                 ))}
               </div>
-            </div>
+            </fieldset>
             
             {/* Schedule Options */}
             {scheduleType === 'interval' && (
               <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">Run every</label>
+                <label htmlFor="automation-interval" className="block text-sm font-medium text-slate-300 mb-2">Run every</label>
                 <select
+                  id="automation-interval"
+                  aria-label="Automation interval"
                   value={interval}
                   onChange={(e) => setInterval(e.target.value)}
                   className="w-full px-4 py-2.5 bg-slate-800 border border-white/[0.08] rounded-xl text-white focus:outline-none focus:border-emerald-500/50"
@@ -591,8 +620,10 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
               <div className="grid grid-cols-2 gap-4">
                 {scheduleType === 'weekly' && (
                   <div>
-                    <label className="block text-sm font-medium text-slate-300 mb-2">Day</label>
+                    <label htmlFor="automation-day" className="block text-sm font-medium text-slate-300 mb-2">Day</label>
                     <select
+                      id="automation-day"
+                      aria-label="Automation day of week"
                       value={dayOfWeek}
                       onChange={(e) => setDayOfWeek(parseInt(e.target.value, 10))}
                       className="w-full px-4 py-2.5 bg-slate-800 border border-white/[0.08] rounded-xl text-white focus:outline-none focus:border-emerald-500/50"
@@ -604,8 +635,10 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
                   </div>
                 )}
                 <div className={scheduleType === 'daily' ? 'col-span-2' : ''}>
-                  <label className="block text-sm font-medium text-slate-300 mb-2">Time</label>
+                  <label htmlFor="automation-time" className="block text-sm font-medium text-slate-300 mb-2">Time</label>
                   <input
+                    id="automation-time"
+                    aria-label="Automation time"
                     type="time"
                     value={time}
                     onChange={(e) => setTime(e.target.value)}
@@ -617,12 +650,15 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
             
             {scheduleType === 'custom' && (
               <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">Cron Expression</label>
+                <label htmlFor="automation-cron" className="block text-sm font-medium text-slate-300 mb-2">Cron Expression</label>
                 <input
+                  id="automation-cron"
+                  aria-label="Custom cron expression"
                   type="text"
                   value={customCron}
                   onChange={(e) => { setCustomCron(e.target.value); setValidationErrors(prev => ({ ...prev, schedule: undefined })); }}
                   placeholder="*/30 * * * *"
+                  maxLength={256}
                   className="w-full px-4 py-2.5 bg-slate-800 border border-white/[0.08] rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50 font-mono text-sm"
                 />
                 {validationErrors.schedule && <p className="mt-1.5 text-xs text-red-400">{validationErrors.schedule}</p>}
@@ -634,39 +670,39 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
             
             {/* Timezone */}
             <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">Timezone</label>
+              <label htmlFor="automation-timezone" className="block text-sm font-medium text-slate-300 mb-2">Timezone</label>
               <select
+                id="automation-timezone"
+                aria-label="Automation timezone"
                 value={tz}
                 onChange={(e) => setTz(e.target.value)}
                 className="w-full px-4 py-2.5 bg-slate-800 border border-white/[0.08] rounded-xl text-white focus:outline-none focus:border-emerald-500/50"
               >
-                <option value="America/New_York">Eastern (New York)</option>
-                <option value="America/Chicago">Central (Chicago)</option>
-                <option value="America/Denver">Mountain (Denver)</option>
-                <option value="America/Los_Angeles">Pacific (Los Angeles)</option>
-                <option value="UTC">UTC</option>
-                <option value="Europe/London">London</option>
-                <option value="Europe/Paris">Paris</option>
-                <option value="Asia/Tokyo">Tokyo</option>
+                {SUPPORTED_TIME_ZONES.map((zone) => <option key={zone} value={zone}>{zone}</option>)}
               </select>
             </div>
             
             {/* Agent & Model */}
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">Agent</label>
+                <label htmlFor="automation-agent" className="block text-sm font-medium text-slate-300 mb-2">Agent</label>
                 <input
+                  id="automation-agent"
+                  aria-label="Automation agent"
                   type="text"
                   value={agent}
                   onChange={(e) => { setAgent(e.target.value); setValidationErrors(prev => ({ ...prev, agent: undefined })); }}
                   placeholder="main"
+                  maxLength={128}
                   className="w-full px-4 py-2.5 bg-slate-800 border border-white/[0.08] rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50"
                 />
                 {validationErrors.agent && <p className="mt-1.5 text-xs text-red-400">{validationErrors.agent}</p>}
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">Model (optional)</label>
+                <label htmlFor="automation-model" className="block text-sm font-medium text-slate-300 mb-2">Model (optional)</label>
                 <select
+                  id="automation-model"
+                  aria-label="Automation model"
                   value={model}
                   onChange={(e) => { setModel(e.target.value); setValidationErrors(prev => ({ ...prev, model: undefined })); }}
                   className="w-full px-4 py-2.5 bg-slate-800 border border-white/[0.08] rounded-xl text-white focus:outline-none focus:border-emerald-500/50"
@@ -684,8 +720,10 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
             
             {/* Thinking Level */}
             <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">Thinking Level</label>
+              <label htmlFor="automation-thinking" className="block text-sm font-medium text-slate-300 mb-2">Thinking Level</label>
               <select
+                id="automation-thinking"
+                aria-label="Automation thinking level"
                 value={thinking}
                 onChange={(e) => setThinking(e.target.value)}
                 className="w-full px-4 py-2.5 bg-slate-800 border border-white/[0.08] rounded-xl text-white focus:outline-none focus:border-emerald-500/50"
@@ -695,24 +733,29 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
                 <option value="low">Low</option>
                 <option value="medium">Medium</option>
                 <option value="high">High</option>
+                <option value="xhigh">Extra high</option>
+                <option value="adaptive">Adaptive</option>
               </select>
             </div>
             
             {/* Message */}
             <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">Prompt / Task</label>
+              <label htmlFor="automation-task" className="block text-sm font-medium text-slate-300 mb-2">Prompt / Task</label>
               <textarea
+                id="automation-task"
+                aria-label="Automation prompt or task"
                 value={message}
                 onChange={(e) => { setMessage(e.target.value); setValidationErrors(prev => ({ ...prev, task: undefined })); }}
                 placeholder="What should the agent do?"
                 rows={4}
+                maxLength={65536}
                 className="w-full px-4 py-2.5 bg-slate-800 border border-white/[0.08] rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50 resize-none"
                 required
               />
               {validationErrors.task && <p className="mt-1.5 text-xs text-red-400">{validationErrors.task}</p>}
             </div>
             {submitError && (
-              <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+              <div role="alert" className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
                 {submitError}
               </div>
             )}
@@ -722,23 +765,25 @@ function JobModal({ isOpen, job, defaultAgent = 'main', onClose, onSave }: JobMo
           <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-white/[0.08] bg-slate-900/50">
             <button
               type="button"
-              onClick={onClose}
-              className="px-4 py-2 rounded-lg text-slate-400 hover:text-white hover:bg-white/[0.06] transition-colors"
+              onClick={handleRequestClose}
+              disabled={saving}
+              className="px-4 py-2 rounded-lg text-slate-400 hover:text-white hover:bg-white/[0.06] transition-colors disabled:opacity-50"
             >
               Cancel
             </button>
             <button
-              onClick={handleSubmit}
+              type="submit"
+              form="automation-editor-form"
               disabled={saving || !name || !message}
+              aria-busy={saving}
               className="px-5 py-2 rounded-lg bg-emerald-500 text-white font-medium hover:bg-emerald-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
             >
               {saving && <Loader2 size={16} className="animate-spin" />}
-              {job ? 'Save Changes' : 'Create'}
+              {saving ? (job ? 'Saving…' : 'Creating…') : (job ? 'Save Changes' : 'Create')}
             </button>
           </div>
-        </motion.div>
       </motion.div>
-    </AnimatePresence>
+    </ViewportModal>
   );
 }
 
@@ -754,56 +799,62 @@ function RunHistoryDrawer({ isOpen, job, onClose }: RunHistoryDrawerProps) {
   const [runs, setRuns] = useState<CronRun[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestSequenceRef = useRef(0);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   
   const loadRuns = useCallback(async () => {
     if (!job) return;
+    const sequence = ++requestSequenceRef.current;
     setLoading(true);
     setError(null);
     try {
       const data = await automationsAPI.runs(job.id, 50);
+      if (sequence !== requestSequenceRef.current) return;
       const nextRuns = Array.isArray(data.runs) ? data.runs.map(normalizeRun) : [];
       setRuns(nextRuns);
     } catch (err) {
+      if (sequence !== requestSequenceRef.current) return;
       console.error('Failed to load automation runs:', err);
       const message = err instanceof Error ? err.message : 'Failed to load run history';
       setError(message);
       setRuns([]);
     } finally {
-      setLoading(false);
+      if (sequence === requestSequenceRef.current) setLoading(false);
     }
   }, [job]);
 
   useEffect(() => {
     if (isOpen && job) {
-      loadRuns();
+      void loadRuns();
     }
+    return () => { requestSequenceRef.current += 1; };
   }, [isOpen, job, loadRuns]);
   
   return (
-    <AnimatePresence>
-      {isOpen && (
-        <>
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm"
-            onClick={onClose}
-          />
-          <motion.div
-            variants={slideInVariant}
-            initial="hidden"
-            animate="show"
-            exit="exit"
-            className="fixed right-0 top-0 bottom-0 z-50 w-full max-w-md bg-slate-900 border-l border-white/[0.08] shadow-2xl flex flex-col"
-          >
+    <ViewportModal
+      open={isOpen}
+      onDismiss={onClose}
+      initialFocusRef={closeButtonRef}
+      className="bg-black/40 backdrop-blur-sm"
+    >
+      <motion.div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="automation-run-history-title"
+        initial={{ x: '100%' }}
+        animate={{ x: 0 }}
+        transition={{ type: 'spring', stiffness: 300, damping: 30 }}
+        className="ml-auto flex h-full w-full max-w-md flex-col border-l border-white/[0.08] bg-slate-900 shadow-2xl"
+      >
             {/* Header */}
             <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.08]">
               <div>
-                <h2 className="text-lg font-semibold text-white">Run History</h2>
+                <h2 id="automation-run-history-title" className="text-lg font-semibold text-white">Run History</h2>
                 <p className="text-sm text-slate-400 truncate mt-0.5">{job?.name}</p>
               </div>
               <button
+                ref={closeButtonRef}
+                aria-label="Close run history"
                 onClick={onClose}
                 className="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-white/[0.06] transition-colors"
               >
@@ -871,10 +922,8 @@ function RunHistoryDrawer({ isOpen, job, onClose }: RunHistoryDrawerProps) {
                 ))
               )}
             </div>
-          </motion.div>
-        </>
-      )}
-    </AnimatePresence>
+      </motion.div>
+    </ViewportModal>
   );
 }
 
@@ -924,10 +973,15 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
   const [editingJob, setEditingJob] = useState<CronJob | null>(null);
   const [historyJob, setHistoryJob] = useState<CronJob | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
-  const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deleteSubmitting, setDeleteSubmitting] = useState(false);
+  const [cardMutation, setCardMutation] = useState<AutomationCardMutation | null>(null);
+  const cardMutationAdmissionRef = useRef<AutomationCardMutation | null>(null);
+  const deleteSubmittingRef = useRef(false);
+  const deleteCancelRef = useRef<HTMLButtonElement>(null);
   const inFlightRef = useRef<AbortController | null>(null);
   const refreshTimerRef = useRef<number | null>(null);
+  const delayedRefreshTimersRef = useRef<Set<number>>(new Set());
 
   const fetchJobs = useCallback(async (opts?: { isRefresh?: boolean; force?: boolean }) => {
     const isRefresh = Boolean(opts?.isRefresh);
@@ -953,14 +1007,23 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
     } finally {
       if (inFlightRef.current === controller) {
         inFlightRef.current = null;
+        setLoading(false);
+        setRefreshing(false);
       }
-      setLoading(false);
-      setRefreshing(false);
     }
   }, [agentId]);
 
+  const scheduleRefresh = useCallback((delayMs: number) => {
+    const timer = window.setTimeout(() => {
+      delayedRefreshTimersRef.current.delete(timer);
+      void fetchJobs({ isRefresh: true });
+    }, delayMs);
+    delayedRefreshTimersRef.current.add(timer);
+  }, [fetchJobs]);
+
   useEffect(() => {
     void fetchJobs({ force: true });
+    const delayedTimers = delayedRefreshTimersRef.current;
 
     const tick = () => {
       if (document.visibilityState !== 'visible') return;
@@ -977,15 +1040,19 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
       document.removeEventListener('visibilitychange', tick);
       inFlightRef.current?.abort();
       inFlightRef.current = null;
+      for (const timer of delayedTimers) window.clearTimeout(timer);
+      delayedTimers.clear();
     };
   }, [fetchJobs]);
   
   const handleCreate = () => {
+    if (cardMutationAdmissionRef.current) return;
     setEditingJob(null);
     setModalOpen(true);
   };
   
   const handleEdit = (job: CronJob) => {
+    if (cardMutationAdmissionRef.current) return;
     setEditingJob(job);
     setModalOpen(true);
   };
@@ -1003,12 +1070,15 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
       await fetchJobs({ isRefresh: true });
     } catch (err) {
       const message = extractApiError(err, 'Failed to save automation');
-      setActionError(message);
-      throw err;
+      throw new Error(message);
     }
   };
   
   const handleToggle = async (id: string, enabled: boolean) => {
+    if (cardMutationAdmissionRef.current || deleteSubmittingRef.current) return;
+    const admission: AutomationCardMutation = { kind: 'toggle', jobId: id };
+    cardMutationAdmissionRef.current = admission;
+    setCardMutation(admission);
     setActionError(null);
     try {
       await automationsAPI.toggle(id, enabled);
@@ -1016,45 +1086,64 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
     } catch (err) {
       const message = extractApiError(err, 'Failed to update automation state');
       setActionError(message);
-    }
-  };
-  
-  const handleDelete = async (id: string) => {
-    setDeleteConfirm(id);
-  };
-  
-  const confirmDelete = async () => {
-    if (deleteConfirm) {
-      const id = deleteConfirm;
-      setActionError(null);
-      setDeleteSubmitting(true);
-      setDeletingJobId(id);
-      setDeleteConfirm(null);
-      try {
-        await automationsAPI.remove(id);
-        setJobs((current) => current.filter((job) => job.id !== id));
-        setTimeout(() => {
-          void fetchJobs({ isRefresh: true });
-        }, 300);
-      } catch (err) {
-        const message = extractApiError(err, 'Failed to delete automation');
-        setActionError(message);
-        await fetchJobs({ isRefresh: true });
-      } finally {
-        setDeletingJobId(null);
-        setDeleteSubmitting(false);
+    } finally {
+      if (cardMutationAdmissionRef.current === admission) {
+        cardMutationAdmissionRef.current = null;
+        setCardMutation(null);
       }
     }
   };
   
+  const handleDelete = (id: string) => {
+    if (deleteSubmittingRef.current || cardMutationAdmissionRef.current) return;
+    setDeleteError(null);
+    setDeleteConfirm(id);
+  };
+
+  const handleDeleteDismiss = useCallback(() => {
+    if (deleteSubmittingRef.current) return;
+    setDeleteError(null);
+    setDeleteConfirm(null);
+  }, []);
+  
+  const confirmDelete = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const id = deleteConfirm;
+    if (!id || deleteSubmittingRef.current || cardMutationAdmissionRef.current) return;
+
+    deleteSubmittingRef.current = true;
+    setDeleteError(null);
+    setDeleteSubmitting(true);
+    try {
+      await automationsAPI.remove(id);
+      setJobs((current) => current.filter((job) => job.id !== id));
+      setDeleteConfirm(null);
+      scheduleRefresh(300);
+    } catch (err) {
+      setDeleteError(extractApiError(err, 'Failed to delete automation'));
+    } finally {
+      deleteSubmittingRef.current = false;
+      setDeleteSubmitting(false);
+    }
+  };
+  
   const handleRunNow = async (id: string) => {
+    if (cardMutationAdmissionRef.current || deleteSubmittingRef.current) return;
+    const admission: AutomationCardMutation = { kind: 'run', jobId: id };
+    cardMutationAdmissionRef.current = admission;
+    setCardMutation(admission);
     setActionError(null);
     try {
       await automationsAPI.runNow(id);
-      setTimeout(() => fetchJobs({ isRefresh: true }), 1500);
+      scheduleRefresh(1500);
     } catch (err) {
       const message = extractApiError(err, 'Failed to run automation');
       setActionError(message);
+    } finally {
+      if (cardMutationAdmissionRef.current === admission) {
+        cardMutationAdmissionRef.current = null;
+        setCardMutation(null);
+      }
     }
   };
   
@@ -1089,7 +1178,8 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
             </button>
             <button
               onClick={handleCreate}
-              className="px-4 py-2.5 rounded-xl bg-emerald-500 text-white font-medium hover:bg-emerald-600 transition-colors flex items-center gap-2"
+              disabled={cardMutation !== null}
+              className="px-4 py-2.5 rounded-xl bg-emerald-500 text-white font-medium hover:bg-emerald-600 transition-colors flex items-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Plus size={18} />
               <span className="hidden sm:inline">New Automation</span>
@@ -1110,7 +1200,8 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
           </button>
           <button
             onClick={handleCreate}
-            className="px-3 py-2 rounded-lg bg-emerald-500 text-white text-sm font-medium hover:bg-emerald-600 transition-colors flex items-center gap-1.5"
+            disabled={cardMutation !== null}
+            className="px-3 py-2 rounded-lg bg-emerald-500 text-white text-sm font-medium hover:bg-emerald-600 transition-colors flex items-center gap-1.5 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Plus size={16} />
             New Automation
@@ -1152,7 +1243,7 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
             <JobCard
               key={job.id}
               job={job}
-              deleting={deletingJobId === job.id}
+              activeMutation={cardMutation}
               onToggle={handleToggle}
               onEdit={handleEdit}
               onDelete={handleDelete}
@@ -1180,53 +1271,57 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
       />
       
       {/* Delete Confirmation */}
-      <AnimatePresence>
-        {deleteConfirm && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
-            onClick={() => setDeleteConfirm(null)}
-          >
-            <motion.div
-              variants={modalVariant}
-              initial="hidden"
-              animate="show"
-              exit="exit"
-              onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-sm bg-slate-900 border border-white/[0.08] rounded-2xl shadow-2xl p-6"
+      <ViewportModal
+        open={Boolean(deleteConfirm)}
+        onDismiss={handleDeleteDismiss}
+        dismissible={!deleteSubmitting}
+        initialFocusRef={deleteCancelRef}
+        className="bg-black/60 p-4 backdrop-blur-sm"
+      >
+        <form
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-automation-title"
+          aria-describedby="delete-automation-description"
+          onSubmit={confirmDelete}
+          className="w-full max-w-sm rounded-2xl border border-white/[0.08] bg-slate-900 p-6 shadow-2xl"
+        >
+          <div className="mb-4 flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-red-500/15">
+              <Trash2 size={20} className="text-red-400" />
+            </div>
+            <h3 id="delete-automation-title" className="text-lg font-semibold text-white">Delete Automation?</h3>
+          </div>
+          <p id="delete-automation-description" className="mb-6 text-slate-400">
+            This action cannot be undone. The automation will be permanently removed.
+          </p>
+          {deleteError && (
+            <div role="alert" className="mb-4 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {deleteError}
+            </div>
+          )}
+          <div className="flex items-center justify-end gap-3">
+            <button
+              ref={deleteCancelRef}
+              type="button"
+              onClick={handleDeleteDismiss}
+              disabled={deleteSubmitting}
+              className="rounded-lg px-4 py-2 text-slate-400 transition-colors hover:bg-white/[0.06] hover:text-white disabled:opacity-50"
             >
-              <div className="flex items-center gap-3 mb-4">
-                <div className="w-10 h-10 rounded-xl bg-red-500/15 flex items-center justify-center">
-                  <Trash2 size={20} className="text-red-400" />
-                </div>
-                <h3 className="text-lg font-semibold text-white">Delete Automation?</h3>
-              </div>
-              <p className="text-slate-400 mb-6">
-                This action cannot be undone. The automation will be permanently removed.
-              </p>
-              <div className="flex items-center justify-end gap-3">
-                <button
-                  onClick={() => setDeleteConfirm(null)}
-                  disabled={deleteSubmitting}
-                  className="px-4 py-2 rounded-lg text-slate-400 hover:text-white hover:bg-white/[0.06] transition-colors disabled:opacity-50"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={confirmDelete}
-                  disabled={deleteSubmitting}
-                  className="px-4 py-2 rounded-lg bg-red-500 text-white font-medium hover:bg-red-600 transition-colors disabled:opacity-60 disabled:cursor-not-allowed inline-flex items-center gap-2"
-                >
-                  {deleteSubmitting && <Loader2 size={16} className="animate-spin" />}
-                  {deleteSubmitting ? 'Deleting…' : 'Delete'}
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={deleteSubmitting}
+              aria-busy={deleteSubmitting}
+              className="inline-flex items-center gap-2 rounded-lg bg-red-500 px-4 py-2 font-medium text-white transition-colors hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {deleteSubmitting && <Loader2 size={16} className="animate-spin" />}
+              {deleteSubmitting ? 'Deleting…' : 'Delete'}
+            </button>
+          </div>
+        </form>
+      </ViewportModal>
     </div>
   );
 }

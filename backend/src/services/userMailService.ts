@@ -6,17 +6,17 @@
  */
 
 import crypto from 'crypto';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../config/database';
 import { isReservedSystemMailboxUsername, normalizeMailboxUsername } from '../utils/reservedMailboxUsernames';
+import { decryptSecret, encryptSecret } from '../utils/authSecrets';
+import { assertPortalFeatureAvailable } from '../utils/portalFeatureCapabilities';
+import {
+  enqueueMailboxReconciliation,
+  requireMailboxReconciled,
+} from './mailboxReconciliation';
 
-function getStalwartUrl() { return process.env.STALWART_URL || 'http://127.0.0.1:8580'; }
-function getStalwartAdminPass() { return process.env.STALWART_ADMIN_PASS || ''; }
-const STALWART_ADMIN_USER = 'admin';
 function getMailDomain() { return process.env.MAIL_DOMAIN || 'localhost'; }
-
-function adminAuthHeader(): string {
-  return 'Basic ' + Buffer.from(`${STALWART_ADMIN_USER}:${getStalwartAdminPass()}`).toString('base64');
-}
 
 function generateMailPassword(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -26,6 +26,15 @@ function generateMailPassword(): string {
     password += chars[bytes[i] % chars.length];
   }
   return password;
+}
+
+async function lockUserMailboxRows(tx: Prisma.TransactionClient, userId: string): Promise<void> {
+  await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE`;
+}
+
+async function lockMailboxUsername(tx: Prisma.TransactionClient, username: string): Promise<void> {
+  // The void return of pg_advisory_xact_lock is not deserializable; cast it.
+  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${username}, 7124))::text`;
 }
 
 async function ensureLegacyMailboxMigrated(userId: string): Promise<void> {
@@ -51,33 +60,27 @@ async function ensureLegacyMailboxMigrated(userId: string): Promise<void> {
     return;
   }
 
-  await prisma.mailboxAccount.upsert({
-    where: { username: normalized },
-    update: {
-      userId,
-      mailPassword: user.mailPassword,
-      isPrimary: true,
-    },
-    create: {
-      userId,
-      username: normalized,
-      mailPassword: user.mailPassword,
-      isPrimary: true,
-    },
-  });
-}
+  const encryptedPassword = encryptSecret(decryptSecret(user.mailPassword));
+  await prisma.$transaction(async (tx) => {
+    await lockMailboxUsername(tx, normalized);
+    await lockUserMailboxRows(tx, userId);
+    const existingMailboxOwner = await tx.mailboxAccount.findUnique({
+      where: { username: normalized },
+      select: { userId: true },
+    });
+    if (existingMailboxOwner && existingMailboxOwner.userId !== userId) {
+      throw new Error(`Mailbox username '${normalized}' is already owned by another Portal user`);
+    }
 
-async function setPrimaryMailbox(userId: string, mailboxId: string): Promise<void> {
-  await prisma.$transaction([
-    prisma.mailboxAccount.updateMany({
-      where: { userId },
-      data: { isPrimary: false },
-    }),
-    prisma.mailboxAccount.update({
-      where: { id: mailboxId },
-      data: { isPrimary: true },
-    }),
-  ]);
+    await tx.mailboxAccount.updateMany({ where: { userId }, data: { isPrimary: false } });
+    await tx.mailboxAccount.upsert({
+      where: { username: normalized },
+      update: { mailPassword: encryptedPassword, isPrimary: true },
+      create: { userId, username: normalized, mailPassword: encryptedPassword, isPrimary: true },
+    });
+    await tx.user.update({ where: { id: userId }, data: { mailPassword: encryptedPassword } });
+  });
+  await requireMailboxReconciled(normalized);
 }
 
 export async function provisionUserMailbox(
@@ -85,85 +88,76 @@ export async function provisionUserMailbox(
   userId: string,
   options?: { makePrimary?: boolean }
 ): Promise<string> {
+  // Mailbox desired state must not be created in origin modes that cannot
+  // operate mail. Keep this assertion ahead of the Prisma transaction so
+  // Tailnet/local mode cannot leave stale rows for the reconciler to process.
+  assertPortalFeatureAvailable('mail');
+
   const stalwartName = normalizeMailboxUsername(username);
+  if (!stalwartName) throw new Error('Mailbox username is required');
   if (isReservedSystemMailboxUsername(stalwartName)) {
     throw new Error(`Mailbox username '${stalwartName}' is reserved for system use`);
   }
 
-  const email = `${stalwartName}@${getMailDomain()}`;
-
-  // If this user already has a DB record with a password, reuse it to avoid
-  // Stalwart/DB password drift from partial failures.
-  const existingMailbox = await prisma.mailboxAccount.findUnique({
-    where: { username: stalwartName },
-    select: { mailPassword: true },
-  });
-  const password = existingMailbox?.mailPassword || generateMailPassword();
-
   try {
-    const createRes = await fetch(`${getStalwartUrl()}/api/principal`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': adminAuthHeader(),
-      },
-      body: JSON.stringify({
-        type: 'individual',
-        name: stalwartName,
-        secrets: [password],
-        emails: [email],
-        roles: ['user'],
-        quota: 1073741824,
-      }),
-    });
-
-    if (createRes.status === 409) {
-      console.log(`[userMail] Account '${stalwartName}' already exists, updating password`);
-      const patchRes = await fetch(`${getStalwartUrl()}/api/principal/${stalwartName}`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': adminAuthHeader(),
-        },
-        body: JSON.stringify([
-          { action: 'set', field: 'secrets', value: [password] },
-        ]),
+    const password = await prisma.$transaction(async (tx) => {
+      // The username advisory lock protects global mailbox ownership, while
+      // the user-row lock serializes primary selection for this account.
+      await lockMailboxUsername(tx, stalwartName);
+      await lockUserMailboxRows(tx, userId);
+      const existingMailbox = await tx.mailboxAccount.findUnique({
+        where: { username: stalwartName },
+        select: { mailPassword: true, userId: true },
       });
-      if (!patchRes.ok) {
-        const text = await patchRes.text();
-        throw new Error(`Failed to update Stalwart account '${stalwartName}': ${patchRes.status} ${text}`);
+      if (existingMailbox && existingMailbox.userId !== userId) {
+        throw new Error(`Mailbox username '${stalwartName}' is already owned by another Portal user`);
       }
-    } else if (!createRes.ok) {
-      const text = await createRes.text();
-      throw new Error(`Failed to create Stalwart account '${stalwartName}': ${createRes.status} ${text}`);
-    } else {
-      console.log(`[userMail] Created Stalwart account: ${stalwartName}@${getMailDomain()}`);
-    }
+      const password = existingMailbox?.mailPassword
+        ? decryptSecret(existingMailbox.mailPassword)
+        : generateMailPassword();
 
-    const mailbox = await prisma.mailboxAccount.upsert({
-      where: { username: stalwartName },
-      update: {
-        userId,
-        mailPassword: password,
-      },
-      create: {
-        userId,
-        username: stalwartName,
-        mailPassword: password,
-        isPrimary: false,
-      },
-      select: { id: true },
-    });
+      const encryptedPassword = encryptSecret(password);
+      const currentPrimary = await tx.mailboxAccount.findFirst({
+        where: { userId, isPrimary: true },
+        select: { id: true },
+      });
+      const makePrimary = options?.makePrimary !== false || !currentPrimary;
+      if (makePrimary) {
+        await tx.mailboxAccount.updateMany({ where: { userId }, data: { isPrimary: false } });
+      }
 
-    if (options?.makePrimary !== false) {
-      await setPrimaryMailbox(userId, mailbox.id);
-    }
+      const mailbox = await tx.mailboxAccount.upsert({
+        where: { username: stalwartName },
+        update: {
+          mailPassword: encryptedPassword,
+          ...(makePrimary ? { isPrimary: true } : {}),
+        },
+        create: {
+          userId,
+          username: stalwartName,
+          mailPassword: encryptedPassword,
+          isPrimary: makePrimary,
+        },
+        select: { id: true },
+      });
 
-    await prisma.user.update({
-      where: { id: userId },
-      data: { mailPassword: password },
-    });
-
+      const primary = makePrimary
+        ? { id: mailbox.id, mailPassword: encryptedPassword }
+        : await tx.mailboxAccount.findFirst({
+          where: { userId, isPrimary: true },
+          select: { id: true, mailPassword: true },
+        });
+      if (!primary) throw new Error('Mailbox primary invariant could not be established');
+      await tx.user.update({
+        where: { id: userId },
+        data: { mailPassword: primary.mailPassword },
+      });
+      return password;
+    }, { timeout: 30_000 });
+    // The trigger-created task is durable before Stalwart is touched. An
+    // ambiguous timeout leaves the task queued and an idempotent retry repairs
+    // the external principal from current database desired state.
+    await requireMailboxReconciled(stalwartName);
     return password;
   } catch (error) {
     console.error(`[userMail] Failed to provision mailbox for '${stalwartName}':`, error);
@@ -171,49 +165,73 @@ export async function provisionUserMailbox(
   }
 }
 
-export async function deleteUserMailbox(username: string): Promise<void> {
+async function deleteMailboxAccount(username: string, expectedUserId?: string): Promise<void> {
   const stalwartName = normalizeMailboxUsername(username);
+  if (!stalwartName) throw new Error('Mailbox username is required');
   if (isReservedSystemMailboxUsername(stalwartName)) {
     throw new Error(`Refusing to delete reserved system mailbox '${stalwartName}' through user mailbox cleanup`);
   }
 
   try {
-    const res = await fetch(`${getStalwartUrl()}/api/principal/${stalwartName}`, {
-      method: 'DELETE',
-      headers: {
-        'Authorization': adminAuthHeader(),
-      },
-    });
+    const deletedDesiredRow = await prisma.$transaction(async (tx) => {
+      await lockMailboxUsername(tx, stalwartName);
+      const existing = await tx.mailboxAccount.findUnique({
+        where: { username: stalwartName },
+        select: { id: true, userId: true },
+      });
+      if (expectedUserId && existing && existing.userId !== expectedUserId) {
+        throw new Error(`Mailbox '${stalwartName}' is owned by a different Portal user`);
+      }
+      if (existing) await lockUserMailboxRows(tx, existing.userId);
+      if (!existing) return false;
+      const deleted = await tx.mailboxAccount.deleteMany({
+        where: { id: existing.id, userId: expectedUserId || existing.userId },
+      });
+      if (deleted.count !== 1) throw new Error('Mailbox account changed while it was being deleted');
 
-    if (!res.ok && res.status !== 404) {
-      const text = await res.text();
-      throw new Error(`Failed to delete Stalwart account '${stalwartName}': ${res.status} ${text}`);
-    }
+      let primary = await tx.mailboxAccount.findFirst({
+        where: { userId: existing.userId, isPrimary: true },
+        select: { id: true, mailPassword: true },
+      });
+      if (!primary) {
+        const replacement = await tx.mailboxAccount.findFirst({
+          where: { userId: existing.userId },
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          select: { id: true, mailPassword: true },
+        });
+        if (replacement) {
+          await tx.mailboxAccount.update({
+            where: { id: replacement.id },
+            data: { isPrimary: true },
+          });
+          primary = replacement;
+        }
+      }
 
-    console.log(`[userMail] Deleted Stalwart account: ${stalwartName}`);
+      await tx.user.update({
+        where: { id: existing.userId },
+        data: { mailPassword: primary?.mailPassword ?? null },
+      });
+      return true;
+    }, { timeout: 30_000 });
+
+    // Cascading user deletion removes MailboxAccount before cleanup runs. Its
+    // DB trigger already leaves a task tombstone; explicitly enqueue when the
+    // desired row was gone before this call so cleanup remains durable too.
+    if (!deletedDesiredRow) await enqueueMailboxReconciliation(stalwartName);
+    await requireMailboxReconciled(stalwartName);
   } catch (error) {
     console.error(`[userMail] Failed to delete mailbox for '${stalwartName}':`, error);
     throw error;
   }
+}
 
-  await prisma.mailboxAccount.deleteMany({ where: { username: stalwartName } }).catch((error) => {
-    console.error(`[userMail] Failed to delete mailbox account row for '${stalwartName}':`, error);
-  });
+export async function deleteUserMailbox(username: string): Promise<void> {
+  await deleteMailboxAccount(username);
 }
 
 export async function deleteUserMailboxByUserId(username: string, userId: string): Promise<void> {
-  await deleteUserMailbox(username);
-
-  const primary = await prisma.mailboxAccount.findFirst({
-    where: { userId },
-    orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
-    select: { mailPassword: true },
-  });
-
-  await prisma.user.update({
-    where: { id: userId },
-    data: { mailPassword: primary?.mailPassword ?? null },
-  });
+  await deleteMailboxAccount(username, userId);
 }
 
 export async function getUserMailAccounts(userId: string): Promise<Array<{
@@ -257,12 +275,19 @@ export async function getUserMailAccounts(userId: string): Promise<Array<{
     }
   }
 
+  // Do not hand credentials to JMAP callers while the corresponding Stalwart
+  // principal is only desired/queued. This makes degraded mail state explicit
+  // instead of returning credentials that are not yet usable.
+  for (const mailbox of user?.mailboxAccounts || []) {
+    await requireMailboxReconciled(mailbox.username);
+  }
+
   return (user?.mailboxAccounts || [])
     .filter((mailbox) => !isReservedSystemMailboxUsername(mailbox.username))
     .map((mailbox) => ({
       id: mailbox.id,
       username: mailbox.username,
-      password: mailbox.mailPassword,
+      password: decryptSecret(mailbox.mailPassword),
       isPrimary: mailbox.isPrimary,
     }));
 }

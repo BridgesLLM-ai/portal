@@ -10,6 +10,8 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'anthropic/sonnet-4.6': 'anthropic/claude-sonnet-4-6',
   'anthropic/claude-sonnet-4.6': 'anthropic/claude-sonnet-4-6',
   'anthropic/claude-sonnet-4-6': 'anthropic/claude-sonnet-4-6',
+  'anthropic/opus-5': 'anthropic/claude-opus-5',
+  'anthropic/claude-opus-5': 'anthropic/claude-opus-5',
   'anthropic/opus-4.8': 'anthropic/claude-opus-4-8',
   'anthropic/claude-opus-4.8': 'anthropic/claude-opus-4-8',
   'anthropic/claude-opus-4-8': 'anthropic/claude-opus-4-8',
@@ -24,6 +26,8 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'claude-cli/sonnet-4.6': 'anthropic/claude-sonnet-4-6',
   'claude-cli/claude-sonnet-4.6': 'anthropic/claude-sonnet-4-6',
   'claude-cli/claude-sonnet-4-6': 'anthropic/claude-sonnet-4-6',
+  'claude-cli/opus-5': 'anthropic/claude-opus-5',
+  'claude-cli/claude-opus-5': 'anthropic/claude-opus-5',
   'claude-cli/opus-4.8': 'anthropic/claude-opus-4-8',
   'claude-cli/claude-opus-4.8': 'anthropic/claude-opus-4-8',
   'claude-cli/claude-opus-4-8': 'anthropic/claude-opus-4-8',
@@ -50,12 +54,17 @@ const GOOGLE_MODEL_MAP: Record<string, string> = {
   'google/gemini-3.1-flash-preview': 'google/gemini-3-flash-preview',
   'google/gemini-3.1-flash-lite-preview': 'google/gemini-3.1-flash-lite',
   'google/gemini-3-flash-lite': 'google/gemini-3.1-flash-lite',
-  'google-gemini-cli/gemini-3-flash': 'google-gemini-cli/gemini-3-flash-preview',
-  'google-gemini-cli/gemini-3.1-pro': 'google-gemini-cli/gemini-3.1-pro-preview',
-  'google-gemini-cli/gemini-3.1-flash': 'google-gemini-cli/gemini-3-flash-preview',
-  'google-gemini-cli/gemini-3.1-flash-preview': 'google-gemini-cli/gemini-3-flash-preview',
-  'google-gemini-cli/gemini-3.1-flash-lite-preview': 'google-gemini-cli/gemini-3.1-flash-lite',
-  'google-gemini-cli/gemini-3-flash-lite': 'google-gemini-cli/gemini-3.1-flash-lite',
+  // google-gemini-cli/* is a legacy runtime-encoded model namespace.
+  // OpenClaw 2026.7.1 persists canonical google/* refs and records the CLI
+  // choice separately as agentRuntime.id="google-gemini-cli".
+  'google-gemini-cli/gemini-3-flash': 'google/gemini-3-flash-preview',
+  'google-gemini-cli/gemini-3.1-pro': 'google/gemini-3.1-pro-preview',
+  'google-gemini-cli/gemini-3.1-pro-preview': 'google/gemini-3.1-pro-preview',
+  'google-gemini-cli/gemini-3.1-flash': 'google/gemini-3-flash-preview',
+  'google-gemini-cli/gemini-3.1-flash-preview': 'google/gemini-3-flash-preview',
+  'google-gemini-cli/gemini-3.1-flash-lite': 'google/gemini-3.1-flash-lite',
+  'google-gemini-cli/gemini-3.1-flash-lite-preview': 'google/gemini-3.1-flash-lite',
+  'google-gemini-cli/gemini-3-flash-lite': 'google/gemini-3.1-flash-lite',
   'google-antigravity/gemini-3.5-flash-preview': 'google-antigravity/gemini-3.5-flash',
   'google-antigravity/gemini-3.1-pro-preview': 'google-antigravity/gemini-3.1-pro-high',
   'google-antigravity/gemini-3-pro-preview': 'google-antigravity/gemini-3.1-pro-high',
@@ -72,31 +81,45 @@ const OPENAI_CODEX_MODEL_MAP: Record<string, string> = {
   'openai/gpt-5.6': 'openai/gpt-5.6-sol',
   'codex/gpt-5.6': 'openai/gpt-5.6-sol',
   'openai-codex/gpt-5.6': 'openai/gpt-5.6-sol',
-  // Retired 5.4-era refs map onto the closest current runtime model.
-  'gpt-5.4-codex': 'openai/gpt-5.5',
-  'openai-codex/gpt-5.5-pro': 'openai/gpt-5.5',
-  'openai-codex/gpt-5.4-pro': 'openai/gpt-5.5',
-  'openai-codex/gpt-5.4-codex': 'openai/gpt-5.5',
-  'openai-codex/gpt-5.4': 'openai/gpt-5.5',
-  'openai-codex/gpt-5.4-mini': 'openai/gpt-5.5',
+  // GPT-5.5 is OpenClaw's explicit compatibility choice for workspaces that
+  // do not have GPT-5.6 access. Canonicalize legacy prefixes without silently
+  // changing the selected model or its entitlement requirements.
+  'gpt-5.5': 'openai/gpt-5.5',
+  'openai/gpt-5.5': 'openai/gpt-5.5',
+  'codex/gpt-5.5': 'openai/gpt-5.5',
+  'openai-codex/gpt-5.5': 'openai/gpt-5.5',
+  // Provider aliases may be repaired, but an explicit model selection is
+  // entitlement-sensitive and must never be upgraded behind the user's back.
+  // OpenClaw still exposes GPT-5.4, GPT-5.4 Mini/Pro, and GPT-5.5 Pro; its
+  // legacy gpt-5.4-codex row canonicalizes to the exact GPT-5.4 model.
+  'gpt-5.4-codex': 'openai/gpt-5.4',
+  'openai-codex/gpt-5.5-pro': 'openai/gpt-5.5-pro',
+  'openai-codex/gpt-5.4-pro': 'openai/gpt-5.4-pro',
+  'openai-codex/gpt-5.4-codex': 'openai/gpt-5.4',
+  'openai-codex/gpt-5.4': 'openai/gpt-5.4',
+  'openai-codex/gpt-5.4-mini': 'openai/gpt-5.4-mini',
   'openai-codex/gpt-5.2-codex': 'openai/gpt-5.2',
-  'codex/gpt-5.5-pro': 'openai/gpt-5.5',
-  'codex/gpt-5.4': 'openai/gpt-5.5',
-  'codex/gpt-5.4-mini': 'openai/gpt-5.5',
-  'codex/gpt-5.4-pro': 'openai/gpt-5.5',
-  'openai/gpt-5.4': 'openai/gpt-5.5',
-  'openai/gpt-5.4-mini': 'openai/gpt-5.5',
-  'openai/gpt-5.4-pro': 'openai/gpt-5.5',
-  'openai/gpt-5.4-codex': 'openai/gpt-5.5',
+  'codex/gpt-5.5-pro': 'openai/gpt-5.5-pro',
+  'codex/gpt-5.4': 'openai/gpt-5.4',
+  'codex/gpt-5.4-mini': 'openai/gpt-5.4-mini',
+  'codex/gpt-5.4-pro': 'openai/gpt-5.4-pro',
+  'openai/gpt-5.4': 'openai/gpt-5.4',
+  'openai/gpt-5.4-mini': 'openai/gpt-5.4-mini',
+  'openai/gpt-5.4-pro': 'openai/gpt-5.4-pro',
+  'openai/gpt-5.4-codex': 'openai/gpt-5.4',
   'codex/gpt-5.2-codex': 'openai/gpt-5.2',
-  'codex/gpt-5.4-codex': 'openai/gpt-5.5',
+  'codex/gpt-5.4-codex': 'openai/gpt-5.4',
 };
 
 const CURRENT_CODEX_RUNTIME_MODELS = new Set([
+  'gpt-5.5',
+  'gpt-5.5-pro',
   'gpt-5.6-sol',
   'gpt-5.6-terra',
   'gpt-5.6-luna',
-  'gpt-5.5',
+  'gpt-5.4',
+  'gpt-5.4-mini',
+  'gpt-5.4-pro',
   'gpt-5.3-codex',
   'gpt-5.2',
 ]);
@@ -143,6 +166,9 @@ export function normalizePortalModelId(rawModel: string | null | undefined): str
   if (mapped.startsWith('codex/')) {
     return `openai/${mapped.slice('codex/'.length)}`;
   }
+  if (mapped.startsWith('google-gemini-cli/')) {
+    return `google/${mapped.slice('google-gemini-cli/'.length)}`;
+  }
   return mapped;
 }
 
@@ -150,15 +176,8 @@ export function normalizeOpenClawConfigModelId(rawModel: string | null | undefin
   const normalized = normalizePortalModelId(rawModel);
   if (!normalized) return '';
 
-  if (normalized.startsWith('google/')) {
-    const modelName = normalized.slice('google/'.length);
-    if (modelName.startsWith('gemini-3')) {
-      return `google-antigravity/${modelName}`;
-    }
-  }
-
-  if (!normalized.includes('/') && normalized.startsWith('gemini-3')) {
-    return `google-antigravity/${normalized}`;
+  if (!normalized.includes('/') && normalized.startsWith('gemini-')) {
+    return `google/${normalized}`;
   }
 
   if (!normalized.includes('/') && CURRENT_CODEX_RUNTIME_MODELS.has(normalized)) {
@@ -225,7 +244,7 @@ function resolveSafeMaintenanceModel(config: any): string | null {
   const candidates = collectConfiguredMaintenanceModelCandidates(config);
   const codexCandidate = candidates.find((model) => model.startsWith('openai/') || model.startsWith('codex/'));
   if (codexCandidate) return codexCandidate;
-  if (hasCodexAuthProfile(config)) return 'openai/gpt-5.5';
+  if (hasCodexAuthProfile(config)) return 'openai/gpt-5.6-luna';
 
   return candidates.find((model) => !model.startsWith('anthropic/') && !model.startsWith('claude-cli/')) || null;
 }
@@ -302,11 +321,7 @@ export function getPortalModelCatalogAliases(rawModel: string | null | undefined
   addProviderAlias('openai', 'openai-codex');
   addProviderAlias('openai', 'codex');
   addProviderAlias('google-gemini-cli', 'google');
-  addProviderAlias('google-gemini-cli', 'google-antigravity');
   addProviderAlias('google', 'google-gemini-cli');
-  addProviderAlias('google', 'google-antigravity');
-  addProviderAlias('google-antigravity', 'google');
-  addProviderAlias('google-antigravity', 'google-gemini-cli');
   addProviderAlias('claude-cli', 'anthropic');
   addProviderAlias('anthropic', 'claude-cli');
 
@@ -315,7 +330,7 @@ export function getPortalModelCatalogAliases(rawModel: string | null | undefined
       aliases.push(`openai/${normalized}`, `openai-codex/${normalized}`, `codex/${normalized}`);
     }
     if (normalized.startsWith('gemini-')) {
-      aliases.push(`google/${normalized}`, `google-gemini-cli/${normalized}`, `google-antigravity/${normalized}`);
+      aliases.push(`google/${normalized}`, `google-gemini-cli/${normalized}`);
     }
   }
 
@@ -361,17 +376,27 @@ function translateProviderOwnedAlias(provider: string, normalized: string): stri
     }
   };
 
-  if (provider === 'google-gemini-cli' || provider === 'google-antigravity') {
+  if (provider === 'google-gemini-cli') {
+    if (normalized.startsWith('google/')) return normalized;
+    if (normalized.startsWith('google-gemini-cli/')) {
+      return `google/${normalized.slice('google-gemini-cli/'.length)}`;
+    }
+    if (!normalized.includes('/') && normalized.startsWith('gemini-')) {
+      return `google/${normalized}`;
+    }
+  }
+
+  if (provider === 'google-antigravity') {
     if (normalized.startsWith('google/')) {
       const modelName = normalized.slice('google/'.length);
-      return `${provider}/${provider === 'google-antigravity' ? antigravityModelName(modelName) : modelName}`;
+      return `${provider}/${antigravityModelName(modelName)}`;
     }
     if (normalized.startsWith('google-antigravity/') || normalized.startsWith('google-gemini-cli/')) {
       const modelName = normalized.replace(/^google-(?:antigravity|gemini-cli)\//, '');
-      return `${provider}/${provider === 'google-antigravity' ? antigravityModelName(modelName) : modelName}`;
+      return `${provider}/${antigravityModelName(modelName)}`;
     }
     if (!normalized.includes('/') && normalized.startsWith('gemini-')) {
-      return `${provider}/${provider === 'google-antigravity' ? antigravityModelName(normalized) : normalized}`;
+      return `${provider}/${antigravityModelName(normalized)}`;
     }
   }
 
@@ -468,8 +493,7 @@ function modelForCurrentCodexRuntime(normalized: string): string {
   const openAiFamily = provider === 'openai' || provider === 'openai-codex' || provider === 'codex' || !provider;
   if (!openAiFamily) return normalized;
 
-  if (modelName === 'gpt-5.5-pro') return 'openai/gpt-5.5';
-  if (/^gpt-5\.4(?:-|$)/.test(modelName)) return 'openai/gpt-5.5';
+  if (modelName === 'gpt-5.4-codex') return 'openai/gpt-5.4';
   if (CURRENT_CODEX_RUNTIME_MODELS.has(modelName)) return `openai/${modelName}`;
   return normalized;
 }
@@ -551,6 +575,7 @@ export function normalizePortalModelList(models: string[] | null | undefined): s
 // sonnet-5 claude-cli turns currently return empty output.
 const RECOMMENDED_CLAUDE_SUBSCRIPTION_MODELS = [
   'anthropic/claude-fable-5',
+  'anthropic/claude-opus-5',
   'anthropic/claude-opus-4-8',
   'anthropic/claude-sonnet-4-6',
   'anthropic/claude-haiku-4-5',

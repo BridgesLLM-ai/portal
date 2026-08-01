@@ -6,7 +6,18 @@
  * - Tables, links, bold/italic via remark-gfm
  * - Dark-mode styling consistent with the portal theme
  */
-import { Children, isValidElement, useState, useCallback, useEffect, useMemo, memo, type ReactNode } from 'react';
+import {
+  Children,
+  isValidElement,
+  useState,
+  useCallback,
+  useEffect,
+  useMemo,
+  memo,
+  type AnchorHTMLAttributes,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -16,31 +27,107 @@ import rehypeHighlight from 'rehype-highlight';
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import { Copy, Check, Eye, EyeOff, Maximize2, Minimize2 } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { useAuthStore } from '../../contexts/AuthContext';
+import {
+  buildFileDeepLink,
+  type FileDeepLinkTarget,
+} from '../../utils/workspaceNavigation';
 
-function resolvePortalHref(rawHref?: string): { href: string; external?: boolean } {
+function resolvePortalHref(rawHref?: string): {
+  href: string;
+  external?: boolean;
+  fileTarget?: FileDeepLinkTarget;
+} {
   const href = String(rawHref || '').trim();
   if (!href) return { href: '#' };
 
-  const portalAbsolute = href.match(/^https?:\/\/[^/]+(\/files\?(?:file|path)=[^\s#]+)/i);
-  if (portalAbsolute?.[1]) return { href: portalAbsolute[1] };
-  if (/^https?:\/\//i.test(href) || href.startsWith('mailto:') || href.startsWith('tel:')) return { href, external: true };
+  if (/^https?:\/\//i.test(href)) {
+    try {
+      const absolute = new URL(href);
+      if (
+        typeof window !== 'undefined'
+        && absolute.origin === window.location.origin
+        && /^\/files(?:\/|$)/i.test(absolute.pathname)
+      ) {
+        return resolvePortalHref(`${absolute.pathname}${absolute.search}${absolute.hash}`);
+      }
+    } catch {
+      // Malformed absolute links remain external and never gain Portal target semantics.
+    }
+    return { href, external: true };
+  }
+  if (href.startsWith('mailto:') || href.startsWith('tel:')) return { href, external: true };
 
   const uploadedFile = href.match(/\/api\/files\/([^\s?#)]+)/i);
-  if (uploadedFile?.[1]) return { href: `/files?file=${encodeURIComponent(uploadedFile[1])}` };
+  if (uploadedFile?.[1]) {
+    try {
+      return { href: '/files', fileTarget: { fileId: decodeURIComponent(uploadedFile[1]) } };
+    } catch {
+      return { href: '/files' };
+    }
+  }
 
-  const fileQuery = href.match(/^\/files\?file=([^\s#]+)/i);
-  if (fileQuery?.[1]) return { href: `/files?file=${fileQuery[1]}` };
-  const pathQuery = href.match(/^\/files\?path=([^\s#]+)/i);
-  if (pathQuery?.[1]) return { href: `/files?path=${pathQuery[1]}` };
+  if (/^\/files\?/i.test(href)) {
+    const params = new URLSearchParams(href.slice(href.indexOf('?') + 1));
+    const fileId = params.get('file')?.trim() || undefined;
+    const path = params.get('path')?.trim() || undefined;
+    if (fileId || path) return { href: '/files', fileTarget: { fileId, path } };
+  }
 
   const explicitPath = href.match(/(?:server(?:_|\s)path|path):\s*([^\]\n)]+)/i)?.[1]?.trim()
     || href.match(/^\/?var\/portal-files\/[^\s)]+/i)?.[0]
     || href.match(/^\/?(?:root\/)?\.openclaw\/media\/portal-files\/[^\s)]+/i)?.[0]
     || href.match(/^~\/?\.openclaw\/media\/portal-files\/[^\s)]+/i)?.[0];
-  if (explicitPath) return { href: `/files?path=${encodeURIComponent(explicitPath)}` };
+  if (explicitPath) return { href: '/files', fileTarget: { path: explicitPath } };
 
   if (/^\/files(?:[/?#]|$)/i.test(href)) return { href };
   return { href, external: !href.startsWith('/') };
+}
+
+function PortalMarkdownLink({
+  href,
+  children,
+  onClick,
+  ...props
+}: AnchorHTMLAttributes<HTMLAnchorElement>) {
+  const navigate = useNavigate();
+  const { user } = useAuthStore();
+  const resolved = resolvePortalHref(href);
+  const handleClick = (event: ReactMouseEvent<HTMLAnchorElement>) => {
+    onClick?.(event);
+    if (event.defaultPrevented || !resolved.fileTarget) return;
+    // Modified clicks intentionally open the non-sensitive Files root. The
+    // target token is per-tab and is minted only for an ordinary local click.
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    const authorizationVersion = Number(user?.authorizationVersion ?? 1);
+    if (!user?.id || !Number.isSafeInteger(authorizationVersion) || authorizationVersion < 1) {
+      navigate('/files');
+      return;
+    }
+    try {
+      navigate(buildFileDeepLink(
+        resolved.fileTarget.fileId,
+        resolved.fileTarget.path,
+        { actorUserId: user.id, authorizationVersion },
+      ));
+    } catch {
+      navigate('/files');
+    }
+  };
+  return (
+    <a
+      href={resolved.href}
+      target={resolved.external ? '_blank' : undefined}
+      rel={resolved.external ? 'noopener noreferrer' : undefined}
+      className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 decoration-emerald-400/30 hover:decoration-emerald-400/60 transition-colors"
+      onClick={handleClick}
+      {...props}
+    >
+      {children}
+    </a>
+  );
 }
 
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
@@ -214,8 +301,8 @@ function PreviewableCodeBlock({ className, children, isStreaming = false, ...pro
     : <code className={codeClassName}>{codeText}</code>;
 
   return (
-    <div className="group my-3 rounded-2xl border border-white/10 bg-[#090F26]/85 shadow-[0_12px_40px_rgba(0,0,0,0.28),inset_0_1px_0_rgba(255,255,255,0.04)]">
-      <div className="sticky top-3 z-30 rounded-t-2xl border-b border-white/10 bg-[#0B132F]/95 backdrop-blur-md supports-[backdrop-filter]:bg-[#0B132F]/85">
+    <div className="group my-3 rounded-2xl border border-theme-border bg-theme-surface-raised shadow-[0_12px_40px_rgba(0,0,0,0.16),inset_0_1px_0_rgba(255,255,255,0.04)]">
+      <div className="sticky top-3 z-30 rounded-t-2xl border-b border-theme-border bg-theme-surface/95 backdrop-blur-md">
         <div className="flex items-center justify-between gap-3 px-3 py-2">
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-[10px] uppercase tracking-[0.08em] text-slate-400 font-semibold">{language || 'code'}</span>
@@ -269,13 +356,13 @@ function PreviewableCodeBlock({ className, children, isStreaming = false, ...pro
 
       <div className="overflow-hidden rounded-b-2xl">
         {activeView === 'preview' && previewDoc ? (
-          <div className="bg-[#050816]">
+          <div className="bg-theme-surface">
             <div className="flex items-center justify-between px-4 py-2 text-[11px] text-slate-400 border-b border-white/10 bg-gradient-to-r from-blue-500/10 via-cyan-500/5 to-transparent">
               <span>{expanded ? 'Expanded preview' : 'Inline preview'}</span>
               <span className="text-slate-500">Sandboxed render</span>
             </div>
             {shouldDeferIframe ? (
-              <div className={`flex items-center justify-center px-4 text-xs text-slate-400 bg-[#0A112B] ${expanded ? 'h-[75vh] min-h-[36rem]' : 'h-[24rem]'}`}>
+              <div className={`flex items-center justify-center px-4 text-xs text-theme-text-muted bg-theme-surface-strong ${expanded ? 'h-[75vh] min-h-[36rem]' : 'h-[24rem]'}`}>
                 Preview will be available when the response completes.
               </div>
             ) : (
@@ -290,8 +377,8 @@ function PreviewableCodeBlock({ className, children, isStreaming = false, ...pro
           </div>
         ) : (
           <div className={expanded ? 'max-h-none overflow-visible' : 'max-h-[11rem] overflow-hidden'}>
-            <pre className="relative m-0 overflow-x-auto bg-[#090F26] p-4 text-[12px] leading-relaxed" {...props}>
-              {!expanded && <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-[#090F26] to-transparent z-10" />}
+            <pre className="relative m-0 overflow-x-auto bg-theme-surface-raised p-4 text-[12px] leading-relaxed" {...props}>
+              {!expanded && <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-theme-surface-raised to-transparent z-10" />}
               {renderedCodeChild}
             </pre>
           </div>
@@ -353,17 +440,10 @@ const components = {
     );
   },
   a({ href, children, ...props }: any) {
-    const resolved = resolvePortalHref(href);
     return (
-      <a
-        href={resolved.href}
-        target={resolved.external ? '_blank' : undefined}
-        rel={resolved.external ? 'noopener noreferrer' : undefined}
-        className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 decoration-emerald-400/30 hover:decoration-emerald-400/60 transition-colors"
-        {...props}
-      >
+      <PortalMarkdownLink href={href} {...props}>
         {children}
-      </a>
+      </PortalMarkdownLink>
     );
   },
   blockquote({ children, ...props }: any) {
@@ -466,18 +546,16 @@ function parsePortalTextToNodes(text: string): any[] | null {
     if (/^\/api\/files\//i.test(core)) {
       const fileId = core.replace(/^\/api\/files\//i, '').trim();
       if (fileId) {
-        nodes.push(buildPortalLinkNode(`/files?file=${encodeURIComponent(fileId)}`, core));
+        nodes.push(buildPortalLinkNode(core, core));
       } else {
         nodes.push({ type: 'text', value: core });
       }
     } else if (/^\/files\?(?:file|path)=/i.test(core)) {
       nodes.push(buildPortalLinkNode(core, core));
     } else if (/^https?:\/\/[^/]+\/files\?(?:file|path)=/i.test(core)) {
-      const resolved = resolvePortalHref(core);
-      nodes.push(buildPortalLinkNode(resolved.href, core));
+      nodes.push(buildPortalLinkNode(core, core));
     } else {
-      const normalizedPath = core.startsWith('/') ? core : `/${core}`;
-      nodes.push(buildPortalLinkNode(`/files?path=${encodeURIComponent(normalizedPath)}`, core));
+      nodes.push(buildPortalLinkNode(core, core));
     }
     if (trailing) nodes.push({ type: 'text', value: trailing });
     lastIndex = end;

@@ -1,25 +1,56 @@
-import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense, useContext, type ReactNode } from 'react';
+import { UNSAFE_NavigationContext, useLocation, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useDropzone } from 'react-dropzone';
-import { projectsAPI, aiAPI, alertsAPI } from '../api/endpoints';
+import {
+  projectsAPI,
+  aiAPI,
+  type ProjectIdentityProof,
+  type ProjectSummary,
+  type ProjectTreeEntry,
+} from '../api/endpoints';
 import { extractError, logError } from '../utils/errorHelpers';
+import {
+  bindWorkspaceAuthorizationToXhr,
+  workspaceAuthorizedFetch,
+} from '../utils/workspaceAuthorizedFetch';
+import { useAuthStore } from '../contexts/AuthContext';
+import { useTheme } from '../contexts/ThemeContext';
+import {
+  claimRouteOperation,
+  isRouteOperationOwner,
+  releaseRouteOperation,
+} from '../contexts/RouteOperationContext';
 import ConfirmDialog from '../components/ConfirmDialog';
 import ViewportOverlay from '../components/ViewportOverlay';
+import ViewportModal from '../components/ViewportModal';
 import { useIsMobile } from '../hooks/useIsMobile';
-import MobileOverflowMenu, { MenuAction } from '../components/mobile/MobileOverflowMenu';
+import MobileOverflowMenu from '../components/mobile/MobileOverflowMenu';
 import sounds from '../utils/sounds';
+import { deleteProjectAwaitingSettle as awaitProjectDeleteSettle } from '../utils/projectDeleteSettle';
 import { ProgressNotification, ProgressNotificationProps } from '../components/shared/ProgressNotification';
+import type { ProjectChatActivity } from '../components/chat/ProjectChatPanel';
+import {
+  PROJECT_ZIP_MAX_BYTES,
+  REMOTE_DESKTOP_RUNTIME_WARNING,
+  ProjectFileWriteQueue,
+  canLaunchProjectRuntimeDemo,
+  hasProjectDeepLinkParams,
+  isSameProjectDocument,
+  isValidProjectRelativePath,
+  parseProjectDeepLink,
+  type ProjectFileWrite,
+} from '../utils/projectSurface';
 import {
   Rocket, Play, Plus, Trash2, X, Loader2, FolderOpen, FileText, FileCode,
   GitBranch, GitCommit, Upload, ChevronRight, ChevronDown,
-  Save, Eye, RefreshCw, Bot, Send, Globe, Copy, Check,
-  FolderPlus, FilePlus, ExternalLink, Share2, Link, Clock,
+  Save, Eye, RefreshCw, Bot, Globe, Copy, Check,
+  FolderPlus, FilePlus, ExternalLink, Share2,
   Undo2, ArrowUp, ArrowDown, Circle, Download,
   Diff, History, Maximize2, Minimize2, Search,
   Activity, FileQuestion, Zap, AlertCircle, CheckCircle,
-  PanelLeftClose, PanelLeft, Command, Lock, Shield, Edit3,
-  Image, Film, Music, Volume2, ZoomIn, ZoomOut, RotateCw, Mic, MicOff, Bell, GripVertical, Move, Mail, SendHorizonal
+  PanelLeftClose, PanelLeft, Command, Lock, Edit3,
+  Image, Film, Music, Volume2, ZoomIn, ZoomOut, Mail, SendHorizonal
 } from 'lucide-react';
 const LazyMonacoEditor = lazy(() => import('../components/projects/LazyMonacoEditor'));
 const LazyProjectPdfViewer = lazy(() => import('../components/projects/ProjectPdfViewer'));
@@ -30,8 +61,8 @@ const LazyMarkdownPreviewFrame = lazy(() => import('../components/projects/Markd
 const LazyProjectChatPanel = lazy(() => import('../components/chat/ProjectChatPanel'));
 
 // --- Types ---
-interface TreeEntry { name: string; type: 'file' | 'directory'; path: string; size?: number; gitStatus?: string; }
-interface Project { name: string; hasGit: boolean; currentBranch: string; deployedUrl: string; createdAt: string; updatedAt: string; }
+type TreeEntry = ProjectTreeEntry;
+type Project = ProjectSummary;
 interface GitFile { path: string; status: string; raw: string; }
 interface CommitEntry { hash: string; short: string; author: string; email: string; date: string; message: string; }
 interface Branch { name: string; current: boolean; remote: boolean; }
@@ -42,8 +73,307 @@ interface EnhancedCommit {
 }
 interface ShareLink { id: string; token: string; isActive: boolean; isPublic: boolean; currentUses: number; maxUses: number | null; expiresAt: string | null; createdAt: string; }
 interface ActivityEntry { id: string; action: string; resource: string; resourceId?: string; severity: string; createdAt: string; }
+interface DeploymentProcessState {
+  status: string;
+  deployType: string;
+  supportedActions: string[];
+  port?: number;
+  logs: string[];
+  restartCount: number;
+  lastError?: string;
+  limitation?: string;
+  message?: string;
+}
+
+type ProjectOperation = Readonly<{
+  kind: 'deploy' | 'git' | 'rename' | ProjectChatActivity['kind'];
+  projectName: string;
+  projectGeneration: number;
+  token: number;
+  provider?: ProjectChatActivity['provider'];
+  runtime?: boolean;
+  gitAction?: 'commit' | 'pull' | 'push' | 'checkout' | 'checkout-new' | 'reset-file' | 'revert';
+  gitTarget?: string;
+  renameSourceName?: string;
+  renameTargetName?: string;
+  renameAttemptId?: string;
+  renameIdentity?: ProjectIdentityProof;
+  activity?: Readonly<ProjectChatActivity>;
+}>;
+
+type ProjectRenamePhase =
+  | 'idle'
+  | 'submitting'
+  | 'reconciling'
+  | 'indeterminate'
+  | 'not-admitted'
+  | 'recovery-retired'
+  | 'recovery-blocked'
+  | 'storage-blocked';
+
+type StoredProjectRenameAttempt = Readonly<{
+  version: 2;
+  actorId: string;
+  attemptId: string;
+  sourceName: string;
+  targetName: string;
+  identity: ProjectIdentityProof;
+  phase: 'indeterminate';
+}>;
+
+type StoredProjectRenameRead =
+  | Readonly<{ status: 'none' }>
+  | Readonly<{ status: 'malformed' }>
+  | Readonly<{ status: 'unavailable' }>
+  | Readonly<{ status: 'valid'; attempt: StoredProjectRenameAttempt }>;
+
+type StoredProjectRenameInventoryRead =
+  | Readonly<{ status: 'available'; attempts: readonly StoredProjectRenameAttempt[] }>
+  | Readonly<{ status: 'unavailable'; attempts: readonly [] }>;
+
+type ProjectRenameStorageWrite = Readonly<{
+  status: 'persisted' | 'unavailable' | 'unverified';
+}>;
+
+type ProjectRenameStorageRetirement = Readonly<{
+  status: 'retired' | 'unavailable' | 'unverified';
+}>;
+
+type ProjectRenameStorageBlock = Readonly<{
+  operation: ProjectOperation;
+  recovery: 'safe-release' | 'reconcile';
+}>;
+
+type ShareActionOwner = Readonly<{
+  kind: 'create' | 'email' | 'delete' | 'make-public' | 'toggle' | 'refresh';
+  projectName: string;
+  projectGeneration: number;
+  linkId?: string;
+  token: number;
+}>;
+
+
+type ShareLinkAvailability = 'active' | 'disabled' | 'expired' | 'exhausted';
+
+function getShareLinkAvailability(link: ShareLink, now = Date.now()): ShareLinkAvailability {
+  if (link.expiresAt) {
+    const expiresAt = new Date(link.expiresAt).getTime();
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) return 'expired';
+  }
+  if (link.maxUses !== null && link.currentUses >= link.maxUses) return 'exhausted';
+  if (!link.isActive) return 'disabled';
+  return 'active';
+}
 
 const LAST_SELECTED_PROJECT_KEY = 'projects-last-selected';
+const PROJECT_RENAME_ATTEMPT_STORAGE_PREFIX = 'portal:project-rename-attempt:';
+const OLLAMA_ANALYSIS_FALLBACK = 'qwen3.5:4b';
+
+function projectIdentitiesMatch(left: ProjectIdentityProof, right: ProjectIdentityProof): boolean {
+  return left.id === right.id && left.generation === right.generation;
+}
+
+function isCanonicalProjectName(value: string): boolean {
+  const canonical = value.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 120);
+  return Boolean(canonical) && canonical !== '.' && canonical !== '..' && canonical === value;
+}
+
+function projectRenameStorageKey(projectIdentityId: string, attemptId: string): string {
+  return `${PROJECT_RENAME_ATTEMPT_STORAGE_PREFIX}${encodeURIComponent(projectIdentityId)}:${attemptId}`;
+}
+
+function parseStoredProjectRenameAttempt(raw: string, actorId: string): StoredProjectRenameRead {
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    const identity = value.identity as Record<string, unknown> | null;
+    if (
+      value.version !== 2
+      || value.actorId !== actorId
+      || value.phase !== 'indeterminate'
+      || typeof value.attemptId !== 'string'
+      || !/^[a-zA-Z0-9_-]{16,128}$/.test(value.attemptId)
+      || typeof value.sourceName !== 'string'
+      || !isCanonicalProjectName(value.sourceName)
+      || typeof value.targetName !== 'string'
+      || !isCanonicalProjectName(value.targetName)
+      || !identity
+      || typeof identity.id !== 'string'
+      || !identity.id
+      || identity.id.length > 128
+      || !Number.isSafeInteger(identity.generation)
+      || (identity.generation as number) < 1
+    ) return { status: 'malformed' };
+    return {
+      status: 'valid',
+      attempt: Object.freeze({
+        version: 2,
+        actorId,
+        phase: 'indeterminate',
+        attemptId: value.attemptId,
+        sourceName: value.sourceName,
+        targetName: value.targetName,
+        identity: Object.freeze({ id: identity.id, generation: identity.generation as number }),
+      }),
+    };
+  } catch {
+    return { status: 'malformed' };
+  }
+}
+
+function readStoredProjectRenameAttempt(
+  actorId: string,
+  projectIdentityId: string,
+  attemptId: string,
+): StoredProjectRenameRead {
+  let raw: string | null;
+  try {
+    // This record is the browser-side half of rename admission. It must
+    // survive a closed tab/browser restart; sessionStorage would silently
+    // discard the only attempt ID needed to reconcile an ambiguous PATCH.
+    raw = localStorage.getItem(projectRenameStorageKey(projectIdentityId, attemptId));
+  } catch {
+    return { status: 'unavailable' };
+  }
+  if (raw === null) return { status: 'none' };
+  const parsed = parseStoredProjectRenameAttempt(raw, actorId);
+  if (
+    parsed.status === 'valid'
+    && projectRenameStorageKey(parsed.attempt.identity.id, parsed.attempt.attemptId)
+      !== projectRenameStorageKey(projectIdentityId, attemptId)
+  ) return { status: 'malformed' };
+  return parsed;
+}
+
+function listStoredProjectRenameAttempts(actorId: string): StoredProjectRenameInventoryRead {
+  const attempts: StoredProjectRenameAttempt[] = [];
+  try {
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith(PROJECT_RENAME_ATTEMPT_STORAGE_PREFIX)) continue;
+      const raw = localStorage.getItem(key);
+      if (raw === null) continue;
+      const parsed = parseStoredProjectRenameAttempt(raw, actorId);
+      if (
+        parsed.status === 'valid'
+        && key === projectRenameStorageKey(parsed.attempt.identity.id, parsed.attempt.attemptId)
+      ) {
+        attempts.push(parsed.attempt);
+        continue;
+      }
+      // Version 1 used one account-wide key. Rename was compile-time rejected
+      // in every build that wrote it, so this stale non-admitted tombstone is
+      // safe to retire and must not keep unrelated projects locked.
+      const legacy = (() => {
+        try { return JSON.parse(raw) as Record<string, unknown>; } catch { return null; }
+      })();
+      if (legacy?.version === 1 && legacy.actorId === actorId && key === `${PROJECT_RENAME_ATTEMPT_STORAGE_PREFIX}${actorId}`) {
+        localStorage.removeItem(key);
+        index -= 1;
+      }
+    }
+    return { status: 'available', attempts };
+  } catch {
+    return { status: 'unavailable', attempts: [] };
+  }
+}
+
+function storedProjectRenameAttemptMatches(
+  stored: StoredProjectRenameAttempt,
+  actorId: string,
+  operation: ProjectOperation,
+): boolean {
+  return stored.actorId === actorId
+    && stored.attemptId === operation.renameAttemptId
+    && stored.sourceName === operation.renameSourceName
+    && stored.targetName === operation.renameTargetName
+    && !!operation.renameIdentity
+    && projectIdentitiesMatch(stored.identity, operation.renameIdentity);
+}
+
+function persistProjectRenameAttempt(actorId: string, operation: ProjectOperation): ProjectRenameStorageWrite {
+  if (
+    !operation.renameAttemptId
+    || !operation.renameSourceName
+    || !operation.renameTargetName
+    || !operation.renameIdentity
+  ) return { status: 'unverified' };
+  const stored: StoredProjectRenameAttempt = Object.freeze({
+    version: 2,
+    actorId,
+    phase: 'indeterminate',
+    attemptId: operation.renameAttemptId,
+    sourceName: operation.renameSourceName,
+    targetName: operation.renameTargetName,
+    identity: operation.renameIdentity,
+  });
+  try {
+    localStorage.setItem(
+      projectRenameStorageKey(stored.identity.id, stored.attemptId),
+      JSON.stringify(stored),
+    );
+  } catch {
+    return { status: 'unavailable' };
+  }
+  const readback = readStoredProjectRenameAttempt(actorId, stored.identity.id, stored.attemptId);
+  if (readback.status === 'unavailable') return { status: 'unavailable' };
+  if (
+    readback.status !== 'valid'
+    || !storedProjectRenameAttemptMatches(readback.attempt, actorId, operation)
+  ) return { status: 'unverified' };
+  return { status: 'persisted' };
+}
+
+function clearStoredProjectRenameAttempt(
+  actorId: string,
+  operation: ProjectOperation,
+): ProjectRenameStorageRetirement {
+  if (!operation.renameIdentity || !operation.renameAttemptId) return { status: 'unverified' };
+  const storageKey = projectRenameStorageKey(operation.renameIdentity.id, operation.renameAttemptId);
+  const stored = readStoredProjectRenameAttempt(
+    actorId,
+    operation.renameIdentity.id,
+    operation.renameAttemptId,
+  );
+  if (stored.status === 'unavailable') return { status: 'unavailable' };
+  if (stored.status === 'none') return { status: 'retired' };
+  if (
+    stored.status !== 'valid'
+    || !storedProjectRenameAttemptMatches(stored.attempt, actorId, operation)
+  ) return { status: 'unverified' };
+  try {
+    localStorage.removeItem(storageKey);
+  } catch {
+    return { status: 'unavailable' };
+  }
+  const readback = readStoredProjectRenameAttempt(
+    actorId,
+    operation.renameIdentity.id,
+    operation.renameAttemptId,
+  );
+  if (readback.status === 'unavailable') return { status: 'unavailable' };
+  return readback.status === 'none'
+    ? { status: 'retired' }
+    : { status: 'unverified' };
+}
+
+function isAuthoritativeRenameNonAdmission(error: unknown, attemptId: string): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const response = (error as { response?: { data?: unknown } }).response;
+  if (!response?.data || typeof response.data !== 'object') return false;
+  const data = response.data as Record<string, unknown>;
+  return data.admitted === false
+    && data.status === 'not_admitted'
+    && data.attemptId === attemptId
+    && typeof data.code === 'string';
+}
+
+function formatOllamaModelLabel(model: string): string {
+  return model
+    .replace(/^ollama\//, '')
+    .split(/([:._/-])/)
+    .map((part) => (/^[a-z]/.test(part) ? `${part.charAt(0).toUpperCase()}${part.slice(1)}` : part))
+    .join('');
+}
 
 // --- Helpers ---
 function getFileIcon(name: string) {
@@ -170,18 +500,20 @@ function ProjectImageViewer({ src, name }: { src: string; name: string }) {
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Controls */}
-      <div className="flex items-center justify-center gap-1 py-1.5 border-b border-white/5 bg-black/20 flex-shrink-0">
-        <button onClick={() => setZoom(z => Math.max(0.1, z - 0.25))} className="p-1.5 rounded hover:bg-white/10 text-slate-400 hover:text-white"><ZoomOut size={14} /></button>
+      <div className="flex items-center justify-center gap-1 py-1.5 border-b border-theme-border bg-theme-surface-raised flex-shrink-0">
+        <button aria-label="Zoom out" onClick={() => setZoom(z => Math.max(0.1, z - 0.25))} className="p-1.5 rounded hover:bg-white/10 text-slate-400 hover:text-white"><ZoomOut size={14} /></button>
         <span className="text-[10px] text-slate-500 w-12 text-center tabular-nums">{Math.round(zoom * 100)}%</span>
-        <button onClick={() => setZoom(z => Math.min(10, z + 0.25))} className="p-1.5 rounded hover:bg-white/10 text-slate-400 hover:text-white"><ZoomIn size={14} /></button>
+        <button aria-label="Zoom in" onClick={() => setZoom(z => Math.min(10, z + 0.25))} className="p-1.5 rounded hover:bg-white/10 text-slate-400 hover:text-white"><ZoomIn size={14} /></button>
         <div className="w-px h-3 bg-white/10 mx-1" />
         <button onClick={resetView} className="px-2 py-1 text-[10px] rounded hover:bg-white/10 text-slate-400 hover:text-white">Reset</button>
         <div className="w-px h-3 bg-white/10 mx-1" />
-        <a href={src} download className="p-1.5 rounded hover:bg-white/10 text-slate-400 hover:text-emerald-400"><Download size={14} /></a>
+        <a href={src} download aria-label={`Download ${name}`} className="p-1.5 rounded hover:bg-white/10 text-slate-400 hover:text-emerald-400"><Download size={14} /></a>
       </div>
       {/* Image */}
-      <div
-        className="flex-1 overflow-hidden flex items-center justify-center bg-[#0a0a0f] cursor-grab active:cursor-grabbing select-none"
+      <button
+        type="button"
+        aria-label="Project image viewer. Use arrow keys to pan and plus or minus to zoom."
+        className="flex-1 overflow-hidden flex items-center justify-center border-0 bg-[#0a0a0f] p-0 cursor-grab active:cursor-grabbing select-none"
         style={{ backgroundImage: 'url("data:image/svg+xml,%3Csvg width=\'20\' height=\'20\' xmlns=\'http://www.w3.org/2000/svg\'%3E%3Crect width=\'10\' height=\'10\' fill=\'%23111\'/%3E%3Crect x=\'10\' y=\'10\' width=\'10\' height=\'10\' fill=\'%23111\'/%3E%3Crect x=\'10\' width=\'10\' height=\'10\' fill=\'%230d0d0d\'/%3E%3Crect y=\'10\' width=\'10\' height=\'10\' fill=\'%230d0d0d\'/%3E%3C/svg%3E")' }}
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
@@ -189,6 +521,17 @@ function ProjectImageViewer({ src, name }: { src: string; name: string }) {
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
         onDoubleClick={() => zoom === 1 ? setZoom(2) : resetView()}
+        onKeyDown={(event) => {
+          const delta = event.shiftKey ? 50 : 10;
+          if (event.key === 'ArrowLeft') setPosition((current) => ({ ...current, x: current.x - delta }));
+          else if (event.key === 'ArrowRight') setPosition((current) => ({ ...current, x: current.x + delta }));
+          else if (event.key === 'ArrowUp') setPosition((current) => ({ ...current, y: current.y - delta }));
+          else if (event.key === 'ArrowDown') setPosition((current) => ({ ...current, y: current.y + delta }));
+          else if (event.key === '+' || event.key === '=') setZoom((current) => Math.min(10, current + 0.25));
+          else if (event.key === '-') setZoom((current) => Math.max(0.1, current - 0.25));
+          else return;
+          event.preventDefault();
+        }}
       >
         {!loaded && !error && <Loader2 size={24} className="animate-spin text-slate-600 absolute" />}
         <img
@@ -205,21 +548,21 @@ function ProjectImageViewer({ src, name }: { src: string; name: string }) {
           onLoad={() => setLoaded(true)}
           onError={() => setError(true)}
         />
-      </div>
+      </button>
     </div>
   );
 }
 
 function ProjectAudioViewer({ src, name }: { src: string; name: string }) {
   return (
-    <div className="flex-1 flex flex-col items-center justify-center gap-6 bg-[#0a0a0f]">
+    <div className="flex-1 flex flex-col items-center justify-center gap-6 bg-theme-surface">
       <div className="w-28 h-28 rounded-2xl bg-gradient-to-br from-purple-500/20 to-blue-500/20 border border-white/10 flex items-center justify-center">
         <Volume2 size={44} className="text-purple-400" />
       </div>
       <div className="text-center">
-        <p className="font-medium text-sm text-white">{name}</p>
+        <p className="font-medium text-sm text-theme-text">{name}</p>
       </div>
-      <audio src={src} controls autoPlay className="w-full max-w-md" />
+      <audio src={src} controls autoPlay aria-label={`Audio preview for ${name}`} className="w-full max-w-md" />
       <a href={src} download className="text-xs text-emerald-400 hover:text-emerald-300 flex items-center gap-1"><Download size={12} /> Download</a>
     </div>
   );
@@ -230,6 +573,7 @@ function ProjectVideoViewer({ src, name }: { src: string; name: string }) {
     <div className="flex-1 flex items-center justify-center bg-black p-4">
       <video
         src={src}
+        aria-label={`Video preview for ${name}`}
         controls
         autoPlay
         className="max-w-full max-h-full rounded-lg"
@@ -239,115 +583,111 @@ function ProjectVideoViewer({ src, name }: { src: string; name: string }) {
   );
 }
 
-function getToolEmoji(toolName: string): string {
-  const t = toolName.toLowerCase().replace(/_/g, '');
-  if (t.includes('search') || t.includes('web')) return '🔍';
-  if (t.includes('read') || t.includes('file') || t.includes('cat')) return '📄';
-  if (t.includes('write') || t.includes('save') || t.includes('create')) return '✏️';
-  if (t.includes('edit') || t.includes('patch') || t.includes('replace')) return '🔧';
-  if (t.includes('exec') || t.includes('run') || t.includes('shell') || t.includes('bash') || t.includes('command')) return '⚡';
-  if (t.includes('browser') || t.includes('navigate') || t.includes('screenshot')) return '🌐';
-  if (t.includes('image') || t.includes('vision') || t.includes('photo')) return '🖼️';
-  if (t.includes('memory') || t.includes('recall')) return '🧠';
-  if (t.includes('message') || t.includes('send') || t.includes('notify')) return '💬';
-  if (t.includes('fetch') || t.includes('download') || t.includes('curl')) return '📥';
-  if (t.includes('git') || t.includes('commit') || t.includes('push')) return '📦';
-  if (t.includes('deploy') || t.includes('build')) return '🚀';
-  if (t.includes('delete') || t.includes('remove') || t.includes('trash')) return '🗑️';
-  if (t.includes('list') || t.includes('ls') || t.includes('dir')) return '📋';
-  if (t.includes('think') || t.includes('reason') || t.includes('analyze')) return '💭';
-  return '🔧';
-}
+function ResponsiveProjectPanel({
+  isMobile,
+  mobileLabel,
+  desktopWidth = 340,
+  onDismiss,
+  children,
+}: {
+  isMobile: boolean;
+  mobileLabel: string;
+  desktopWidth?: number;
+  onDismiss: () => void;
+  children: ReactNode;
+}) {
+  const panel = (
+    <motion.div
+      role={isMobile ? 'dialog' : undefined}
+      aria-modal={isMobile ? 'true' : undefined}
+      aria-label={isMobile ? mobileLabel : undefined}
+      initial={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
+      animate={isMobile ? { opacity: 1, x: 0 } : { width: desktopWidth, opacity: 1 }}
+      exit={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
+      transition={{ duration: 0.15 }}
+      className={isMobile
+        ? 'flex h-full w-full flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
+        : 'border-l border-white/5 flex flex-col overflow-hidden flex-shrink-0 bg-[#080B20]/50'}
+    >
+      {children}
+    </motion.div>
+  );
 
-function parseMessageSections(content: string): { type: 'text' | 'tool' | 'thinking'; content: string }[] {
-  const sections: { type: 'text' | 'tool' | 'thinking'; content: string }[] = [];
-  const lines = content.split('\n');
-  let currentType: 'text' | 'tool' | 'thinking' = 'text';
-  let currentLines: string[] = [];
-
-  const flush = () => {
-    const text = currentLines.join('\n').trim();
-    if (text) sections.push({ type: currentType, content: text });
-    currentLines = [];
-  };
-
-  for (const line of lines) {
-    if (/^(🔧|Tool|Running|Executing|tool_call|<tool)/i.test(line.trim())) {
-      flush();
-      currentType = 'tool';
-      currentLines.push(line);
-    } else if (/^(🧠|Thinking|<thinking)/i.test(line.trim())) {
-      flush();
-      currentType = 'thinking';
-      currentLines.push(line);
-    } else if (currentType !== 'text' && line.trim() === '') {
-      flush();
-      currentType = 'text';
-    } else {
-      currentLines.push(line);
-    }
-  }
-  flush();
-  return sections.length ? sections : [{ type: 'text', content }];
-}
-
-function TruncatableContent({ content, maxHeight = 300 }: { content: string; maxHeight?: number }) {
-  const [expanded, setExpanded] = useState(false);
-  const contentRef = useRef<HTMLDivElement>(null);
-  const [needsTruncation, setNeedsTruncation] = useState(false);
-
-  useEffect(() => {
-    if (contentRef.current && contentRef.current.scrollHeight > maxHeight) {
-      setNeedsTruncation(true);
-    }
-  }, [content, maxHeight]);
-
-  const sections = parseMessageSections(content);
+  if (!isMobile) return panel;
 
   return (
-    <div>
-      <div
-        ref={contentRef}
-        className={!expanded && needsTruncation ? 'overflow-hidden' : ''}
-        style={!expanded && needsTruncation ? { maxHeight: `${maxHeight}px` } : undefined}
-      >
-        {sections.map((section, i) => (
-          <div key={i}>
-            {sections.length > 1 && i > 0 && (
-              <div className="border-t border-white/5 my-1.5" />
-            )}
-            {section.type === 'tool' && (
-              <div className="text-[10px] text-amber-400/60 font-medium mb-0.5">🔧 Tool</div>
-            )}
-            {section.type === 'thinking' && (
-              <div className="text-[10px] text-purple-400/60 font-medium mb-0.5">🧠 Thinking</div>
-            )}
-            <div className={`text-[11px] whitespace-pre-wrap break-words leading-relaxed ${
-              section.type === 'tool' ? 'text-amber-200/80 font-mono text-[10px] pl-2 border-l border-amber-500/20' :
-              section.type === 'thinking' ? 'text-purple-200/70 italic text-[10px] pl-2 border-l border-purple-500/20' :
-              ''
-            }`}>
-              {section.content}
-            </div>
-          </div>
-        ))}
-      </div>
-      {needsTruncation && (
-        <button
-          onClick={() => setExpanded(!expanded)}
-          className="text-[10px] text-emerald-400 hover:text-emerald-300 mt-1"
-        >
-          {expanded ? '▲ Show less' : '▼ Show more...'}
-        </button>
-      )}
-    </div>
+    <ViewportModal
+      open
+      onDismiss={onDismiss}
+      className="items-stretch justify-stretch bg-[#080B20]/98 backdrop-blur-sm"
+    >
+      {panel}
+    </ViewportModal>
+  );
+}
+
+function ResponsiveProjectSidebar({
+  isMobile,
+  onDismiss,
+  children,
+}: {
+  isMobile: boolean;
+  onDismiss: () => void;
+  children: ReactNode;
+}) {
+  const sidebar = (
+    <motion.div
+      id="projects-sidebar"
+      role={isMobile ? 'dialog' : undefined}
+      aria-modal={isMobile ? 'true' : undefined}
+      aria-label={isMobile ? 'Projects sidebar' : undefined}
+      initial={{ width: 0, opacity: 0, ...(isMobile ? { x: -280 } : {}) }}
+      animate={{ width: isMobile ? 280 : 224, opacity: 1, ...(isMobile ? { x: 0 } : {}) }}
+      exit={{ width: 0, opacity: 0, ...(isMobile ? { x: -280 } : {}) }}
+      transition={{ duration: 0.15, ...(isMobile ? { type: 'spring', damping: 25 } : {}) }}
+      className={`border-r border-white/5 flex h-full max-w-[calc(100dvw-2rem)] flex-col flex-shrink-0 overflow-hidden bg-[#080B20]/95 ${
+        isMobile ? 'self-start' : ''
+      }`}
+    >
+      {children}
+    </motion.div>
+  );
+
+  if (!isMobile) return sidebar;
+
+  return (
+    <ViewportModal
+      open
+      onDismiss={onDismiss}
+      className="items-stretch justify-start bg-black/60"
+    >
+      {sidebar}
+    </ViewportModal>
   );
 }
 
 // --- Main Component ---
 export default function AppsPage() {
   // Core state
+  const navigationContext = useContext(UNSAFE_NavigationContext);
+  const routerNavigator = navigationContext?.navigator;
   const navigate = useNavigate();
+  const location = useLocation();
+  const { user } = useAuthStore();
+  const { resolvedTheme } = useTheme();
+  const projectNavigationBinding = useMemo(() => {
+    const authorizationVersion = Number(user?.authorizationVersion ?? 1);
+    if (!user?.id || !Number.isSafeInteger(authorizationVersion) || authorizationVersion < 1) return null;
+    return { actorUserId: user.id, authorizationVersion };
+  }, [user?.authorizationVersion, user?.id]);
+  const projectDeepLinkPresent = useMemo(
+    () => hasProjectDeepLinkParams(location.search),
+    [location.search],
+  );
+  const projectDeepLink = useMemo(
+    () => parseProjectDeepLink(location.search, projectNavigationBinding),
+    [location.search, projectNavigationBinding],
+  );
   const isMobile = useIsMobile();
   const isLocalPortalOrigin = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
   const [projects, setProjects] = useState<Project[]>([]);
@@ -362,14 +702,31 @@ export default function AppsPage() {
   const [saving, setSaving] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
   const [deploying, setDeploying] = useState(false);
+  const [projectOperation, setProjectOperation] = useState<ProjectOperation | null>(null);
   const [deployStatus, setDeployStatus] = useState<'idle' | 'deploying' | 'success' | 'failed'>('idle');
   const [isRuntimeProject, setIsRuntimeProject] = useState(false);
   const [checkingProject, setCheckingProject] = useState(false);
+  const [deploymentProcess, setDeploymentProcess] = useState<DeploymentProcessState | null>(null);
+  const [deploymentControlBusy, setDeploymentControlBusy] = useState<'start' | 'stop' | 'restart' | 'refresh' | 'undeploy' | null>(null);
+  const [deploymentControlError, setDeploymentControlError] = useState<string | null>(null);
+  const [pendingUndeploy, setPendingUndeploy] = useState<string | null>(null);
   
   // Progress notification state for deploy/install flow
   const [progressNotification, setProgressNotification] = useState<ProgressNotificationProps | null>(null);
   const installEventSourceRef = useRef<EventSource | null>(null);
   const projectRestoreAttempted = useRef(false);
+  const projectActorIdRef = useRef(useAuthStore.getState().user?.id || '');
+  const initialRenameReadRef = useRef<StoredProjectRenameInventoryRead | null>(null);
+  if (!initialRenameReadRef.current) {
+    initialRenameReadRef.current = projectActorIdRef.current
+      ? listStoredProjectRenameAttempts(projectActorIdRef.current)
+      : { status: 'available', attempts: [] };
+  }
+  const restoredRenameAttemptsRef = useRef<StoredProjectRenameAttempt[]>(
+    initialRenameReadRef.current.status === 'available'
+      ? [...initialRenameReadRef.current.attempts]
+      : [],
+  );
 
   // Create dialog
   const [showCreate, setShowCreate] = useState(false);
@@ -383,7 +740,7 @@ export default function AppsPage() {
   const [uploadProgress, setUploadProgress] = useState<string | null>(null);
 
   // Panels
-  const [activePanel, setActivePanel] = useState<'git' | 'ai' | 'share' | 'activity' | null>(null);
+  const [activePanel, setActivePanel] = useState<'git' | 'share' | 'activity' | 'deployment' | null>(null);
   const [gitTab, setGitTab] = useState<'changes' | 'log' | 'branches'>('changes');
   const [gitStatus, setGitStatus] = useState<{ branch: string; ahead: number; behind: number; files: GitFile[]; clean: boolean } | null>(null);
   const [commitLog, setCommitLog] = useState<CommitEntry[]>([]);
@@ -393,30 +750,62 @@ export default function AppsPage() {
   const [commitDiff, setCommitDiff] = useState<{ hash: string; output: string; diff: string } | null>(null);
   const [gitLoading, setGitLoading] = useState(false);
   const [newBranchName, setNewBranchName] = useState('');
+  const gitLoadingCountRef = useRef(0);
+  const gitStatusGenerationRef = useRef(0);
+  const gitLogGenerationRef = useRef(0);
+  const gitBranchesGenerationRef = useRef(0);
+  const beginGitLoading = useCallback(() => {
+    gitLoadingCountRef.current += 1;
+    setGitLoading(true);
+  }, []);
+  const endGitLoading = useCallback(() => {
+    gitLoadingCountRef.current = Math.max(0, gitLoadingCountRef.current - 1);
+    setGitLoading(gitLoadingCountRef.current > 0);
+  }, []);
 
   // Enhanced git log
   const [enhancedCommits, setEnhancedCommits] = useState<EnhancedCommit[]>([]);
   const [expandedCommit, setExpandedCommit] = useState<string | null>(null);
-  const [diffViewCommit, setDiffViewCommit] = useState<{ hash: string; diff: string } | null>(null);
   const [revertTarget, setRevertTarget] = useState<EnhancedCommit | null>(null);
   const [reverting, setReverting] = useState(false);
   const [revertResult, setRevertResult] = useState<{ success: boolean; message: string } | null>(null);
+  const revertCancelButtonRef = useRef<HTMLButtonElement>(null);
+  const commitDiffCloseButtonRef = useRef<HTMLButtonElement>(null);
+  const fullscreenExitButtonRef = useRef<HTMLButtonElement>(null);
+  const fileSearchInputRef = useRef<HTMLInputElement>(null);
   const [logBranchFilter, setLogBranchFilter] = useState<string>('');
 
-  // AI panel
-  const [aiMessage, setAiMessage] = useState('');
-  const [aiResponse, setAiResponse] = useState('');
-  const [aiLoading, setAiLoading] = useState(false);
 
-  // Agent Chat
+  // Project Chat
   const [agentChatOpen, setAgentChatOpen] = useState(false);
+  const [projectFilter, setProjectFilter] = useState('');
+  const projectDeepLinkSelectionRef = useRef<string | null>(null);
+  const projectDeepLinkFileRef = useRef<string | null>(null);
+  const [projectsCollapsed, setProjectsCollapsed] = useState<boolean>(() => localStorage.getItem('projects-sidebar-collapsed') === '1');
+  const visibleSidebarProjects = useMemo(() => {
+    const filtered = projectsCollapsed
+      ? projects.filter((project) => project.name === selectedProject)
+      : projects.filter((project) => (
+          !projectFilter.trim()
+          || project.name.toLowerCase().includes(projectFilter.trim().toLowerCase())
+        ));
+    const selectedIndex = filtered.findIndex((project) => project.name === selectedProject);
+    if (selectedIndex <= 0) return filtered;
+    return [
+      filtered[selectedIndex],
+      ...filtered.slice(0, selectedIndex),
+      ...filtered.slice(selectedIndex + 1),
+    ];
+  }, [projectFilter, projects, projectsCollapsed, selectedProject]);
   
   // Title bar path editing
   const [editingPath, setEditingPath] = useState(false);
   const [pathEditValue, setPathEditValue] = useState('');
 
   // Code analysis
-  const [analyzeModel, setAnalyzeModel] = useState<string>('qwen3:4b');
+  const [analyzeModel, setAnalyzeModel] = useState<string>('');
+  const [analyzeModels, setAnalyzeModels] = useState<string[]>([]);
+  const [ollamaAvailable, setOllamaAvailable] = useState<boolean | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisResults, setAnalysisResults] = useState<any[]>([]);
   const [showAnalysisPanel, setShowAnalysisPanel] = useState(false);
@@ -427,7 +816,23 @@ export default function AppsPage() {
   const [shareIsPublic, setShareIsPublic] = useState(true);
   const [sharePassword, setSharePassword] = useState('');
   const [sharePasswordConfirm, setSharePasswordConfirm] = useState('');
+  const [shareExpiresAt, setShareExpiresAt] = useState('');
+  const [shareMaxUses, setShareMaxUses] = useState('');
   const [confirmPublicId, setConfirmPublicId] = useState<string | null>(null);
+  const [shareCreating, setShareCreating] = useState(false);
+  const [shareMutationIds, setShareMutationIds] = useState<Set<string>>(() => new Set());
+  const shareMutationIdsRef = useRef(new Set<string>());
+  const [emailingLinkId, setEmailingLinkId] = useState<string | null>(null);
+  const [shareEmailInput, setShareEmailInput] = useState('');
+  const [shareEmailSending, setShareEmailSending] = useState(false);
+  const [shareEmailSuccess, setShareEmailSuccess] = useState<string | null>(null);
+  const [shareEmailError, setShareEmailError] = useState<string | null>(null);
+  const [shareRefreshError, setShareRefreshError] = useState<string | null>(null);
+  const [shareRefreshing, setShareRefreshing] = useState(false);
+  const [shareDeleteBusy, setShareDeleteBusy] = useState(false);
+  const [shareDeleteError, setShareDeleteError] = useState<string | null>(null);
+  const [shareMakePublicBusy, setShareMakePublicBusy] = useState(false);
+  const [shareMakePublicError, setShareMakePublicError] = useState<string | null>(null);
 
   // Activity
   const [activityLogs, setActivityLogs] = useState<ActivityEntry[]>([]);
@@ -436,13 +841,17 @@ export default function AppsPage() {
   const [showNewFile, setShowNewFile] = useState(false);
   const [newFilePath, setNewFilePath] = useState('');
   const [newFileIsDir, setNewFileIsDir] = useState(false);
+  const [creatingEntry, setCreatingEntry] = useState(false);
 
   // File upload dialog
   const [showUploadDialog, setShowUploadDialog] = useState(false);
   const [uploadTargetPath, setUploadTargetPath] = useState('');
   const [uploadFiles, setUploadFiles] = useState<File[]>([]);
   const [uploadingFiles, setUploadingFiles] = useState(false);
-  const [uploadDragOver, setUploadDragOver] = useState(false);
+  const createProjectNameInputRef = useRef<HTMLInputElement>(null);
+  const newProjectEntryInputRef = useRef<HTMLInputElement>(null);
+  const uploadDestinationSelectRef = useRef<HTMLSelectElement>(null);
+  const projectRenameInputRef = useRef<HTMLInputElement>(null);
 
   // Inline rename in file tree
   const [renamingEntry, setRenamingEntry] = useState<{ path: string; name: string; type: 'file' | 'directory' } | null>(null);
@@ -460,33 +869,335 @@ export default function AppsPage() {
 
   // Auto-save
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingAutoSaveRef = useRef<ProjectFileWrite | null>(null);
+  const fileWriteQueueRef = useRef(new ProjectFileWriteQueue());
+  const projectsRef = useRef<Project[]>(projects);
+  const selectedProjectRef = useRef<string | null>(selectedProject);
+  const openFileRef = useRef<typeof openFile>(openFile);
+  const openFileHandlerRef = useRef<(filePath: string, preserveDeepLink?: boolean) => Promise<void>>();
+  const editorContentRef = useRef(editorContent);
+  const editorRevisionRef = useRef(0);
+  const projectLoadGenerationRef = useRef(0);
+  const treeRefreshGenerationRef = useRef(0);
+  const fileLoadGenerationRef = useRef(0);
+  const directoryLoadGenerationRef = useRef(new Map<string, number>());
+  const pendingDirectoryLoadsRef = useRef(new Set<string>());
+  const zipUploadXhrRef = useRef<XMLHttpRequest | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mountedRef = useRef(true);
+  const modifiedRef = useRef(modified);
+  const projectRenameInFlightRef = useRef<ProjectOperation | null>(null);
+  const projectRenameRequestActiveRef = useRef(false);
+  const projectRenameStorageBlockRef = useRef<ProjectRenameStorageBlock | null>(null);
+  const projectRenameRetryBoundaryRef = useRef<'none' | 'confirm' | 'armed'>('none');
+  const reconcileOwnedProjectRenameRef = useRef<(operation: ProjectOperation) => Promise<void>>(async () => undefined);
+  const entryRenameInFlightRef = useRef(false);
+  const pathEditInFlightRef = useRef(false);
+  const createProjectInFlightRef = useRef(false);
+  const createEntryInFlightRef = useRef(false);
+  const uploadFilesInFlightRef = useRef(false);
+  const deleteInFlightRef = useRef<Readonly<{
+    kind: 'project' | 'file';
+    name: string;
+    projectName: string;
+    path?: string;
+  }> | null>(null);
+  const projectOperationRef = useRef<ProjectOperation | null>(null);
+  const projectOperationTokenRef = useRef(0);
+  const projectNavigationReleaseRef = useRef<(() => void) | null>(null);
+  const projectNavigationGuardRef = useRef<{
+    url: string;
+    state: unknown;
+    historyIndex: number | null;
+  } | null>(null);
+  const shareCreateInFlightRef = useRef(false);
+  const shareEmailInFlightRef = useRef(false);
+  const shareDeleteInFlightRef = useRef(false);
+  const shareMakePublicInFlightRef = useRef(false);
+  const shareActionOwnerRef = useRef<ShareActionOwner | null>(null);
+
+  const releaseProjectNavigationLock = useCallback(() => {
+    projectNavigationReleaseRef.current?.();
+    projectNavigationReleaseRef.current = null;
+    projectNavigationGuardRef.current = null;
+  }, []);
+
+  const acquireProjectNavigationLock = useCallback(() => {
+    if (projectNavigationReleaseRef.current) return;
+    const originalPush = routerNavigator.push;
+    const originalReplace = routerNavigator.replace;
+    const originalGo = routerNavigator.go;
+    const blockedPush: typeof routerNavigator.push = () => undefined;
+    const blockedReplace: typeof routerNavigator.replace = () => undefined;
+    const blockedGo: typeof routerNavigator.go = () => undefined;
+    routerNavigator.push = blockedPush;
+    routerNavigator.replace = blockedReplace;
+    routerNavigator.go = blockedGo;
+    const browserHistoryIndex = window.history.state?.idx;
+    projectNavigationGuardRef.current = {
+      url: window.location.href,
+      state: window.history.state,
+      historyIndex: typeof browserHistoryIndex === 'number' ? browserHistoryIndex : null,
+    };
+    projectNavigationReleaseRef.current = () => {
+      if (routerNavigator.push === blockedPush) routerNavigator.push = originalPush;
+      if (routerNavigator.replace === blockedReplace) routerNavigator.replace = originalReplace;
+      if (routerNavigator.go === blockedGo) routerNavigator.go = originalGo;
+    };
+  }, [routerNavigator]);
+
+  const claimProjectOperation = useCallback((operation: ProjectOperation) => {
+    if (
+      projectOperationRef.current
+      || deleteInFlightRef.current
+      || selectedProjectRef.current !== operation.projectName
+      || projectLoadGenerationRef.current !== operation.projectGeneration
+      || !claimRouteOperation(operation)
+    ) return false;
+    projectOperationRef.current = operation;
+    acquireProjectNavigationLock();
+    setProjectOperation(operation);
+    return true;
+  }, [acquireProjectNavigationLock]);
+
+  const releaseProjectOperation = useCallback((operation: ProjectOperation) => {
+    if (projectOperationRef.current !== operation) return;
+    projectOperationRef.current = null;
+    setProjectOperation(null);
+    releaseProjectNavigationLock();
+    releaseRouteOperation(operation);
+  }, [releaseProjectNavigationLock]);
+
+  const claimGitMutation = useCallback((
+    gitAction: NonNullable<ProjectOperation['gitAction']>,
+    gitTarget?: string,
+  ): ProjectOperation | null => {
+    const projectName = selectedProjectRef.current;
+    if (!projectName) return null;
+    const operation = Object.freeze({
+      kind: 'git' as const,
+      gitAction,
+      gitTarget,
+      projectName,
+      projectGeneration: projectLoadGenerationRef.current,
+      token: ++projectOperationTokenRef.current,
+    });
+    if (!claimProjectOperation(operation)) return null;
+    beginGitLoading();
+    return operation;
+  }, [beginGitLoading, claimProjectOperation]);
+
+  const releaseGitMutation = useCallback((operation: ProjectOperation) => {
+    endGitLoading();
+    releaseProjectOperation(operation);
+  }, [endGitLoading, releaseProjectOperation]);
+
+  const verifyGitMutation = useCallback(async (operation: ProjectOperation) => {
+    const fresh = await projectsAPI.git(operation.projectName, 'status');
+    if (
+      projectOperationRef.current !== operation
+      || selectedProjectRef.current !== operation.projectName
+      || projectLoadGenerationRef.current !== operation.projectGeneration
+    ) throw new Error('The project changed before Git status could be verified.');
+    setGitStatus(fresh);
+    return fresh as { branch?: string; files?: GitFile[] };
+  }, []);
+
+  const handleProjectChatActivity = useCallback((
+    activity: Readonly<ProjectChatActivity>,
+    active: boolean,
+  ) => {
+    if (active) {
+      const operation = Object.freeze({
+        kind: activity.kind,
+        projectName: activity.projectName,
+        provider: activity.provider,
+        projectGeneration: projectLoadGenerationRef.current,
+        token: ++projectOperationTokenRef.current,
+        activity,
+      });
+      return claimProjectOperation(operation);
+    }
+    const current = projectOperationRef.current;
+    if (
+      !current
+      || current.kind !== activity.kind
+      || current.activity !== activity
+    ) return false;
+    releaseProjectOperation(current);
+    return true;
+  }, [claimProjectOperation, releaseProjectOperation]);
+
+  useEffect(() => {
+    const preventProjectUnload = (event: BeforeUnloadEvent) => {
+      if (
+        !projectOperationRef.current
+        && !deleteInFlightRef.current
+        && !shareActionOwnerRef.current
+      ) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    const preventProjectHistoryTraversal = (event: PopStateEvent) => {
+      if (
+        !projectOperationRef.current
+        && !deleteInFlightRef.current
+        && !shareActionOwnerRef.current
+      ) return;
+      const guard = projectNavigationGuardRef.current;
+      if (!guard) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      const nextIndex = window.history.state?.idx;
+      if (guard.historyIndex !== null && typeof nextIndex === 'number') {
+        const distanceToOwner = guard.historyIndex - nextIndex;
+        if (distanceToOwner !== 0) window.history.go(distanceToOwner);
+        return;
+      }
+      window.history.pushState(guard.state, '', guard.url);
+    };
+    window.addEventListener('beforeunload', preventProjectUnload);
+    window.addEventListener('popstate', preventProjectHistoryTraversal, true);
+    return () => {
+      window.removeEventListener('beforeunload', preventProjectUnload);
+      window.removeEventListener('popstate', preventProjectHistoryTraversal, true);
+    };
+  }, []);
+
+  useEffect(() => () => {
+    releaseProjectNavigationLock();
+    const projectOwner = projectOperationRef.current;
+    if (projectOwner) {
+      projectOperationRef.current = null;
+      releaseRouteOperation(projectOwner);
+    }
+    const deleteOwner = deleteInFlightRef.current;
+    if (deleteOwner) {
+      deleteInFlightRef.current = null;
+      releaseRouteOperation(deleteOwner);
+    }
+    const shareOwner = shareActionOwnerRef.current;
+    if (shareOwner) {
+      shareActionOwnerRef.current = null;
+      releaseRouteOperation(shareOwner);
+    }
+  }, [releaseProjectNavigationLock]);
+
+  const isShareActionInFlight = useCallback(() => shareActionOwnerRef.current !== null, []);
+  const claimShareAction = useCallback((owner: ShareActionOwner) => {
+    if (
+      shareActionOwnerRef.current
+      || projectOperationRef.current
+      || deleteInFlightRef.current
+      || selectedProjectRef.current !== owner.projectName
+      || projectLoadGenerationRef.current !== owner.projectGeneration
+      || !claimRouteOperation(owner)
+    ) return false;
+    shareActionOwnerRef.current = owner;
+    acquireProjectNavigationLock();
+    return true;
+  }, [acquireProjectNavigationLock]);
+  const releaseShareAction = useCallback((owner: ShareActionOwner) => {
+    if (shareActionOwnerRef.current !== owner) return;
+    shareActionOwnerRef.current = null;
+    releaseProjectNavigationLock();
+    releaseRouteOperation(owner);
+  }, [releaseProjectNavigationLock]);
+  const shareActionActive = shareCreating
+    || shareEmailSending
+    || shareDeleteBusy
+    || shareMakePublicBusy
+    || shareRefreshing
+    || shareMutationIds.size > 0;
+  const toggleActivePanel = useCallback((panel: 'git' | 'share' | 'activity' | 'deployment') => {
+    if (projectOperationRef.current?.kind === 'git') return;
+    if (activePanel === 'share' && isShareActionInFlight()) return;
+    setActivePanel((current) => current === panel ? null : panel);
+  }, [activePanel, isShareActionInFlight]);
+
+  selectedProjectRef.current = selectedProject;
+  openFileRef.current = openFile;
+  editorContentRef.current = editorContent;
+  modifiedRef.current = modified;
 
   // Toast — enhanced with detail/hint support
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info'; detail?: string; hint?: string } | null>(null);
   const [toastExpanded, setToastExpanded] = useState(false);
   const [toastCopied, setToastCopied] = useState(false);
-  const [pendingDelete, setPendingDelete] = useState<{ kind: 'project' | 'file'; name: string; path?: string } | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<{
+    kind: 'project' | 'file';
+    name: string;
+    projectName: string;
+    path?: string;
+  } | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  // Shown while a delete waits out a chat turn's runtime lease instead of
+  // failing at the user for a condition that clears itself.
+  const [deleteSettleNotice, setDeleteSettleNotice] = useState<string | null>(null);
+  const [pendingResetFile, setPendingResetFile] = useState<string | null>(null);
+  const [resetFileError, setResetFileError] = useState<string | null>(null);
 
-  const showToast = (message: string, type: 'success' | 'error' | 'info' = 'success', durationOrOpts?: number | { duration?: number; detail?: string; hint?: string }) => {
+  const showToast = useCallback((message: string, type: 'success' | 'error' | 'info' = 'success', durationOrOpts?: number | { duration?: number; detail?: string; hint?: string }) => {
     const opts = typeof durationOrOpts === 'number' ? { duration: durationOrOpts } : (durationOrOpts || {});
     setToast({ message, type, detail: opts.detail, hint: opts.hint });
     setToastExpanded(false);
     setToastCopied(false);
     const duration = opts.duration || (type === 'error' ? 20000 : 3000);
-    setTimeout(() => setToast(null), duration);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => {
+      setToast(null);
+      toastTimerRef.current = null;
+    }, duration);
     
     // Play appropriate sound
     if (type === 'success') sounds.success();
     else if (type === 'error') sounds.error();
     else if (type === 'info') sounds.notification();
-  };
+  }, []);
 
   /** Show error toast from any caught error, with full context */
-  const showErrorToast = (err: unknown, context: string) => {
+  const showErrorToast = useCallback((err: unknown, context: string) => {
     const extracted = extractError(err, context);
     logError(err, context);
     showToast(extracted.message, 'error', { detail: extracted.detail, hint: extracted.hint });
-  };
+  }, [showToast]);
+
+  const persistProjectFile = useCallback(async (write: ProjectFileWrite) => {
+    await fileWriteQueueRef.current.enqueue(write, async (queuedWrite) => {
+      await projectsAPI.writeFile(queuedWrite.projectName, queuedWrite.filePath, queuedWrite.content);
+      if (
+        mountedRef.current
+        &&
+        isSameProjectDocument(
+          selectedProjectRef.current,
+          openFileRef.current?.path,
+          queuedWrite,
+        )
+        && editorRevisionRef.current === queuedWrite.revision
+        && editorContentRef.current === queuedWrite.content
+      ) {
+        setOpenFile((current) => current?.path === queuedWrite.filePath
+          ? { ...current, content: queuedWrite.content }
+          : current);
+        setModified(false);
+      }
+    });
+  }, []);
+
+  const flushPendingAutoSave = useCallback(() => {
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    const pending = pendingAutoSaveRef.current;
+    pendingAutoSaveRef.current = null;
+    if (!pending) return Promise.resolve();
+    return persistProjectFile(pending).catch((error) => {
+      logError(error, 'Auto-save failed');
+      throw error;
+    });
+  }, [persistProjectFile]);
 
   // --- Auto-suggest project name from repository URL ---
   useEffect(() => {
@@ -498,37 +1209,113 @@ export default function AppsPage() {
         setNewName(suggestedName);
       }
     }
-  }, [cloneUrl]);
+  }, [cloneUrl, newName]);
 
   // --- Data Loading ---
   const loadProjects = useCallback(async () => {
     try {
       const data = await projectsAPI.list();
-      setProjects(data.projects || []);
+      projectsRef.current = data.projects;
+      setProjects(data.projects);
     } catch (err) { showErrorToast(err, 'Loading projects'); } finally { setLoading(false); }
-  }, []);
+  }, [showErrorToast]);
 
   useEffect(() => { loadProjects(); }, [loadProjects]);
 
-  const selectProject = async (name: string) => {
+  useEffect(() => {
+    let cancelled = false;
+    aiAPI.ollamaStatus()
+      .then((status) => {
+        if (cancelled) return;
+        const models = Array.from(new Set(
+          (Array.isArray(status?.models) ? status.models : [])
+            .filter((model: unknown): model is string => typeof model === 'string' && model.trim().length > 0)
+            .map((model: string) => model.trim()),
+        ));
+        const configuredDefault = typeof status?.defaultModel === 'string' && status.defaultModel.trim()
+          ? status.defaultModel.trim()
+          : OLLAMA_ANALYSIS_FALLBACK;
+        const options = models.length > 0 ? models : [configuredDefault];
+        setAnalyzeModels(options);
+        setAnalyzeModel((current) => options.includes(current)
+          ? current
+          : options.includes(configuredDefault) ? configuredDefault : options[0]);
+        setOllamaAvailable(Boolean(status?.available && models.length > 0));
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        logError(error, 'Loading installed Ollama models');
+        setAnalyzeModels([OLLAMA_ANALYSIS_FALLBACK]);
+        setAnalyzeModel(OLLAMA_ANALYSIS_FALLBACK);
+        setOllamaAvailable(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  const selectProject = useCallback(async (name: string) => {
+    if (projectOperationRef.current || deleteInFlightRef.current || isShareActionInFlight()) return;
+    const previousProject = selectedProjectRef.current;
+    const previousFile = openFileRef.current;
+    try {
+      await flushPendingAutoSave();
+      if (previousProject && previousFile) {
+        await fileWriteQueueRef.current.waitFor(previousProject, previousFile.path);
+      }
+    } catch (error) {
+      showErrorToast(error, `Saving ${previousFile?.path || 'the open file'} before switching projects`);
+      return;
+    }
+    // A deploy or provider qualification may have claimed this project while
+    // the save barrier was settling. Do not let a previously admitted click
+    // switch the project after that immutable operation owns the workspace.
+    if (projectOperationRef.current || deleteInFlightRef.current) return;
+    const generation = ++projectLoadGenerationRef.current;
+    treeRefreshGenerationRef.current += 1;
+    gitStatusGenerationRef.current += 1;
+    gitLogGenerationRef.current += 1;
+    gitBranchesGenerationRef.current += 1;
+    fileLoadGenerationRef.current += 1;
+    directoryLoadGenerationRef.current.clear();
+    pendingDirectoryLoadsRef.current.clear();
+    selectedProjectRef.current = name;
+    openFileRef.current = null;
     setSelectedProject(name);
     try {
       localStorage.setItem(LAST_SELECTED_PROJECT_KEY, name);
     } catch {}
     setOpenFile(null);
     setOpenMedia(null);
+    setTree([]);
+    setExpandedDirs({});
     setModified(false);
     setSelectedDiff(null);
     setCommitDiff(null);
+    setGitStatus(null);
+    setCommitLog([]);
+    setEnhancedCommits([]);
+    setBranches([]);
+    setShares([]);
+    setShareRefreshError(null);
+    setEmailingLinkId(null);
+    setShareEmailInput('');
+    setShareEmailSuccess(null);
+    setActivityLogs([]);
     setDeployStatus('idle');
     setIsRuntimeProject(false);
+    setDeploymentProcess(null);
+    setDeploymentControlError(null);
     try {
       const data = await projectsAPI.getTree(name);
-      setTree(data.tree || []);
+      if (generation !== projectLoadGenerationRef.current || selectedProjectRef.current !== name) return;
+      const inventoryProject = projectsRef.current.find((project) => project.name === name);
+      if (!inventoryProject || !projectIdentitiesMatch(data.identity, inventoryProject.identity)) {
+        throw new Error('The project identity changed while its file tree was loading.');
+      }
+      setTree(data.tree);
       setExpandedDirs({});
       
       // Check if this is a runtime project (Python, C++, or Node CLI)
-      const fileNames = (data.tree || []).filter((e: TreeEntry) => e.type === 'file').map((e: TreeEntry) => e.name);
+      const fileNames = data.tree.filter((e: TreeEntry) => e.type === 'file').map((e: TreeEntry) => e.name);
       const hasMainPy = fileNames.includes('main.py');
       const hasRequirementsTxt = fileNames.includes('requirements.txt');
       const hasMainCpp = fileNames.includes('main.cpp');
@@ -543,11 +1330,43 @@ export default function AppsPage() {
         setIsRuntimeProject(true);
       }
       // Note: Node CLI detection requires checking package.json contents, handled server-side
-    } catch (err) { showErrorToast(err, `Loading project "${name}"`); }
-  };
+    } catch (err) {
+      if (generation === projectLoadGenerationRef.current && selectedProjectRef.current === name) {
+        showErrorToast(err, `Loading project "${name}"`);
+      }
+    }
+  }, [flushPendingAutoSave, isShareActionInFlight, showErrorToast]);
 
   useEffect(() => {
-    if (loading || selectedProject || projectRestoreAttempted.current) return;
+    if (!projectDeepLinkPresent || projectDeepLink) return;
+    projectDeepLinkSelectionRef.current = null;
+    projectDeepLinkFileRef.current = null;
+    navigate('/projects', { replace: true });
+  }, [navigate, projectDeepLink, projectDeepLinkPresent]);
+
+  useEffect(() => {
+    if (loading || !projectDeepLinkPresent || !projectDeepLink) {
+      if (!projectDeepLinkPresent) projectDeepLinkSelectionRef.current = null;
+      return;
+    }
+    const targetExists = projects.some((project) => project.name === projectDeepLink.project);
+    if (!targetExists) {
+      projectDeepLinkSelectionRef.current = null;
+      projectDeepLinkFileRef.current = null;
+      navigate('/projects', { replace: true });
+      return;
+    }
+    if (projectOperationRef.current || isShareActionInFlight()) return;
+    const targetKey = `${projectDeepLink.project}\u0000${projectDeepLink.file || ''}`;
+    if (projectDeepLinkSelectionRef.current === targetKey) return;
+    projectDeepLinkSelectionRef.current = targetKey;
+    if (selectedProjectRef.current !== projectDeepLink.project) {
+      void selectProject(projectDeepLink.project);
+    }
+  }, [isShareActionInFlight, loading, navigate, projectDeepLink, projectDeepLinkPresent, projectOperation, projects, selectProject, shareActionActive]);
+
+  useEffect(() => {
+    if (loading || selectedProject || projectDeepLinkPresent || projectRestoreAttempted.current) return;
     projectRestoreAttempted.current = true;
     try {
       const lastSelected = localStorage.getItem(LAST_SELECTED_PROJECT_KEY);
@@ -559,82 +1378,196 @@ export default function AppsPage() {
       }
       void selectProject(lastSelected);
     } catch {}
-  }, [loading, projects, selectedProject]);
+  }, [loading, projectDeepLinkPresent, projects, selectProject, selectedProject]);
 
-  const refreshTree = async () => {
-    if (!selectedProject) return;
+  const refreshTree = async (projectName = selectedProjectRef.current) => {
+    if (!projectName) return;
+    const generation = projectLoadGenerationRef.current;
+    const refreshGeneration = ++treeRefreshGenerationRef.current;
+    const expandedPaths = Object.keys(expandedDirs);
     try {
-      const data = await projectsAPI.getTree(selectedProject);
-      setTree(data.tree || []);
-      const newExpanded: Record<string, TreeEntry[]> = {};
-      for (const dirPath of Object.keys(expandedDirs)) {
-        try {
-          const d = await projectsAPI.getTree(selectedProject, dirPath);
-          newExpanded[dirPath] = d.tree || [];
-        } catch (err) { logError(err, `Refreshing subdirectory: ${dirPath}`); }
+      const [data, expandedResults] = await Promise.all([
+        projectsAPI.getTree(projectName),
+        Promise.all(expandedPaths.map(async (dirPath) => {
+          try {
+            const result = await projectsAPI.getTree(projectName, dirPath);
+            const inventoryProject = projectsRef.current.find((project) => project.name === projectName);
+            if (!inventoryProject || !projectIdentitiesMatch(result.identity, inventoryProject.identity)) {
+              throw new Error('The project identity changed while a subdirectory was loading.');
+            }
+            return [dirPath, result.tree] as const;
+          } catch (err) {
+            logError(err, `Refreshing subdirectory: ${dirPath}`);
+            return [dirPath, null] as const;
+          }
+        })),
+      ]);
+      if (
+        generation !== projectLoadGenerationRef.current
+        || refreshGeneration !== treeRefreshGenerationRef.current
+        || selectedProjectRef.current !== projectName
+      ) return;
+      const inventoryProject = projectsRef.current.find((project) => project.name === projectName);
+      if (!inventoryProject || !projectIdentitiesMatch(data.identity, inventoryProject.identity)) {
+        throw new Error('The project identity changed while its file tree was refreshing.');
       }
+      setTree(data.tree);
+      const newExpanded: Record<string, TreeEntry[]> = {};
+      expandedResults.forEach(([dirPath, entries]) => {
+        if (entries) newExpanded[dirPath] = entries;
+      });
       setExpandedDirs(newExpanded);
     } catch (err) { logError(err, 'Refreshing file tree'); }
   };
 
   // Git operations
-  const loadGitStatus = async () => {
+  const loadGitStatus = useCallback(async () => {
     if (!selectedProject) return;
-    setGitLoading(true);
+    const projectName = selectedProject;
+    const requestGeneration = ++gitStatusGenerationRef.current;
+    beginGitLoading();
     try {
-      const data = await projectsAPI.git(selectedProject, 'status');
-      setGitStatus(data);
-    } catch (err) { showErrorToast(err, 'Loading git status'); } finally { setGitLoading(false); }
-  };
+      const data = await projectsAPI.git(projectName, 'status');
+      if (selectedProjectRef.current === projectName && gitStatusGenerationRef.current === requestGeneration) setGitStatus(data);
+    } catch (err) {
+      if (selectedProjectRef.current === projectName && gitStatusGenerationRef.current === requestGeneration) {
+        showErrorToast(err, 'Loading git status');
+      }
+    } finally { endGitLoading(); }
+  }, [beginGitLoading, endGitLoading, selectedProject, showErrorToast]);
 
-  const loadCommitLog = async () => {
+  const loadCommitLog = useCallback(async () => {
     if (!selectedProject) return;
-    setGitLoading(true);
+    const projectName = selectedProject;
+    const requestGeneration = ++gitLogGenerationRef.current;
+    beginGitLoading();
     try {
-      const data = await projectsAPI.gitEnhancedLog(selectedProject, logBranchFilter || undefined);
+      const data = await projectsAPI.gitEnhancedLog(projectName, logBranchFilter || undefined);
+      if (selectedProjectRef.current !== projectName || gitLogGenerationRef.current !== requestGeneration) return;
       setEnhancedCommits(data.commits || []);
       // Also keep basic log for backwards compat
       setCommitLog((data.commits || []).map((c: EnhancedCommit) => ({ hash: c.hash, short: c.short, author: c.author, email: c.email, date: c.date, message: c.message })));
-    } catch (err) {
+    } catch {
+      if (selectedProjectRef.current !== projectName || gitLogGenerationRef.current !== requestGeneration) return;
       // Fallback to basic log
       try {
-        const data = await projectsAPI.git(selectedProject, 'log');
+        const data = await projectsAPI.git(projectName, 'log');
+        if (selectedProjectRef.current !== projectName || gitLogGenerationRef.current !== requestGeneration) return;
         setCommitLog(data.commits || []);
         setEnhancedCommits([]);
-      } catch (err2) { showErrorToast(err2, 'Loading commit log'); }
-    } finally { setGitLoading(false); }
-  };
+      } catch (err2) {
+        if (selectedProjectRef.current === projectName && gitLogGenerationRef.current === requestGeneration) {
+          showErrorToast(err2, 'Loading commit log');
+        }
+      }
+    } finally { endGitLoading(); }
+  }, [beginGitLoading, endGitLoading, logBranchFilter, selectedProject, showErrorToast]);
 
-  const loadBranches = async () => {
+  const loadBranches = useCallback(async () => {
     if (!selectedProject) return;
-    setGitLoading(true);
+    const projectName = selectedProject;
+    const requestGeneration = ++gitBranchesGenerationRef.current;
+    beginGitLoading();
     try {
-      const data = await projectsAPI.git(selectedProject, 'branches');
-      setBranches(data.branches || []);
-    } catch (err) { showErrorToast(err, 'Loading branches'); } finally { setGitLoading(false); }
-  };
+      const data = await projectsAPI.git(projectName, 'branches');
+      if (selectedProjectRef.current === projectName && gitBranchesGenerationRef.current === requestGeneration) setBranches(data.branches || []);
+    } catch (err) {
+      if (selectedProjectRef.current === projectName && gitBranchesGenerationRef.current === requestGeneration) {
+        showErrorToast(err, 'Loading branches');
+      }
+    } finally { endGitLoading(); }
+  }, [beginGitLoading, endGitLoading, selectedProject, showErrorToast]);
 
-  const loadShares = async () => {
-    if (!selectedProject) return;
+  const loadShares = useCallback(async (requestedProject = selectedProjectRef.current) => {
+    if (!requestedProject) return false;
+    const projectName = requestedProject;
     try {
-      const data = await projectsAPI.listShares(selectedProject);
-      setShares(data.shares || []);
-    } catch (err) { logError(err, 'Loading shares'); }
-  };
+      const data = await projectsAPI.listShares(projectName);
+      if (selectedProjectRef.current === projectName) {
+        setShares(data.shares || []);
+        setShareRefreshError(null);
+      }
+      return true;
+    } catch (err) {
+      logError(err, 'Loading shares');
+      if (selectedProjectRef.current === projectName) {
+        const extracted = extractError(err, 'Refreshing share links');
+        setShares([]);
+        setShareRefreshError(`${extracted.message} The list was cleared so stale links cannot be changed. Retry the refresh.`);
+      }
+      return false;
+    }
+  }, []);
 
-  const loadActivity = async () => {
-    if (!selectedProject) return;
+  const retryLoadShares = useCallback(async () => {
+    const projectName = selectedProjectRef.current;
+    if (!projectName || shareActionOwnerRef.current) return;
+    const owner = Object.freeze({
+      kind: 'refresh' as const,
+      projectName,
+      projectGeneration: projectLoadGenerationRef.current,
+      token: ++projectOperationTokenRef.current,
+    });
+    if (!claimShareAction(owner)) return;
+    setShareRefreshing(true);
     try {
-            const apiUrl = import.meta.env.VITE_API_URL || '';
-      const resp = await fetch(`${apiUrl}/projects/${selectedProject}/activity?limit=20`, {
+      await loadShares(projectName);
+    } finally {
+      releaseShareAction(owner);
+      setShareRefreshing(false);
+    }
+  }, [claimShareAction, loadShares, releaseShareAction]);
+
+  const loadActivity = useCallback(async () => {
+    if (!selectedProject) return;
+    const projectName = selectedProject;
+    try {
+      const apiUrl = import.meta.env.VITE_API_URL || '';
+      const resp = await workspaceAuthorizedFetch(`${apiUrl}/projects/${encodeURIComponent(projectName)}/activity?limit=20`, {
         credentials: 'include',
       });
       if (resp.ok) {
         const data = await resp.json();
-        setActivityLogs(data.logs || []);
+        if (selectedProjectRef.current === projectName) setActivityLogs(data.logs || []);
       }
     } catch (err) { logError(err, 'Loading activity logs'); }
-  };
+  }, [selectedProject]);
+
+  const loadDeploymentProcess = useCallback(async (
+    requestedProject = selectedProjectRef.current,
+  ) => {
+    const projectName = requestedProject;
+    if (!projectName) return;
+    const generation = projectLoadGenerationRef.current;
+    const inventory = projectsRef.current.find((project) => project.name === projectName);
+    if (!inventory?.deployment) {
+      if (selectedProjectRef.current === projectName) setDeploymentProcess(null);
+      return;
+    }
+    setDeploymentControlBusy((current) => current || 'refresh');
+    setDeploymentControlError(null);
+    try {
+      const status = await projectsAPI.appProcess(projectName, 'status');
+      if (
+        selectedProjectRef.current !== projectName
+        || projectLoadGenerationRef.current !== generation
+      ) return;
+      setDeploymentProcess(status);
+    } catch (error) {
+      if (
+        selectedProjectRef.current !== projectName
+        || projectLoadGenerationRef.current !== generation
+      ) return;
+      setDeploymentControlError(extractError(error).message || 'Could not load deployment status');
+    } finally {
+      if (
+        selectedProjectRef.current === projectName
+        && projectLoadGenerationRef.current === generation
+      ) {
+        setDeploymentControlBusy((current) => current === 'refresh' ? null : current);
+      }
+    }
+  }, []);
 
   // Load panel data
   useEffect(() => {
@@ -645,65 +1578,144 @@ export default function AppsPage() {
     }
     if (activePanel === 'share' && selectedProject) loadShares();
     if (activePanel === 'activity' && selectedProject) loadActivity();
-  }, [activePanel, gitTab, selectedProject]);
+    if (activePanel === 'deployment' && selectedProject) void loadDeploymentProcess(selectedProject);
+  }, [activePanel, gitTab, loadActivity, loadBranches, loadCommitLog, loadDeploymentProcess, loadGitStatus, loadShares, selectedProject]);
 
   const viewFileDiff = async (filePath: string) => {
     if (!selectedProject) return;
+    const projectName = selectedProject;
     try {
-      const data = await projectsAPI.git(selectedProject, 'diff', { file: filePath });
-      setSelectedDiff({ file: filePath, content: data.output || 'No changes' });
+      const data = await projectsAPI.git(projectName, 'diff', { file: filePath });
+      if (selectedProjectRef.current === projectName) {
+        setSelectedDiff({ file: filePath, content: data.output || 'No changes' });
+      }
     } catch (err) { showErrorToast(err, `Viewing diff for ${filePath}`); }
   };
 
   const viewCommitDiff = async (hash: string) => {
     if (!selectedProject) return;
+    const projectName = selectedProject;
     try {
-      const data = await projectsAPI.git(selectedProject, 'diff-commit', { hash });
-      setCommitDiff({ hash, output: data.output, diff: data.diff });
+      const data = await projectsAPI.git(projectName, 'diff-commit', { hash });
+      if (selectedProjectRef.current === projectName) {
+        setCommitDiff({ hash, output: data.output, diff: data.diff });
+      }
     } catch (err) { showErrorToast(err, `Viewing commit diff ${hash.substring(0, 7)}`); }
   };
 
   const handleRevert = async () => {
-    if (!selectedProject || !revertTarget) return;
+    if (!selectedProject || !revertTarget || reverting || gitLoadingCountRef.current > 0) return;
+    const target = Object.freeze({ hash: revertTarget.hash, message: revertTarget.message });
+    const operation = claimGitMutation('revert', target.hash);
+    if (!operation) return;
     setReverting(true);
     setRevertResult(null);
     try {
-      const data = await projectsAPI.gitRevert(selectedProject, revertTarget.hash);
-      setRevertResult({ success: true, message: `Reverted "${revertTarget.message}" — new commit: ${data.newHash?.substring(0, 7)}` });
-      setTimeout(() => { setRevertTarget(null); setRevertResult(null); loadCommitLog(); }, 2000);
+      const data = await projectsAPI.gitRevert(operation.projectName, target.hash);
+      const newHash = typeof data?.newHash === 'string' ? data.newHash.trim() : '';
+      if (!newHash) throw new Error('Git did not return the new revert commit identity.');
+      const [, freshLog] = await Promise.all([
+        verifyGitMutation(operation),
+        projectsAPI.gitEnhancedLog(operation.projectName, undefined, 25),
+      ]);
+      const commits = (freshLog?.commits || []) as EnhancedCommit[];
+      if (!commits.some((commit) => commit.hash === newHash)) {
+        throw new Error('The fresh Git history did not confirm the revert commit.');
+      }
+      setEnhancedCommits(commits);
+      setCommitLog(commits.map((commit) => ({
+        hash: commit.hash,
+        short: commit.short,
+        author: commit.author,
+        email: commit.email,
+        date: commit.date,
+        message: commit.message,
+      })));
+      await refreshTree(operation.projectName);
+      setRevertResult({ success: true, message: `Reverted "${target.message}" — new commit: ${newHash.substring(0, 7)}` });
     } catch (e: any) {
       const msg = e.response?.data?.error || e.message || 'Revert failed';
       setRevertResult({ success: false, message: msg });
-    } finally { setReverting(false); }
+    } finally {
+      setReverting(false);
+      releaseGitMutation(operation);
+    }
   };
 
   // --- File Operations ---
   const toggleDir = async (dirPath: string) => {
     if (expandedDirs[dirPath]) {
+      directoryLoadGenerationRef.current.set(dirPath, (directoryLoadGenerationRef.current.get(dirPath) || 0) + 1);
+      pendingDirectoryLoadsRef.current.delete(dirPath);
       const next = { ...expandedDirs };
       delete next[dirPath];
       setExpandedDirs(next);
     } else {
+      const existingGeneration = directoryLoadGenerationRef.current.get(dirPath);
+      if (pendingDirectoryLoadsRef.current.has(dirPath)) {
+        directoryLoadGenerationRef.current.set(dirPath, (existingGeneration || 0) + 1);
+        pendingDirectoryLoadsRef.current.delete(dirPath);
+        return;
+      }
+      const generation = (existingGeneration || 0) + 1;
+      directoryLoadGenerationRef.current.set(dirPath, generation);
+      pendingDirectoryLoadsRef.current.add(dirPath);
+      const projectName = selectedProjectRef.current;
+      if (!projectName) return;
       try {
-        const data = await projectsAPI.getTree(selectedProject!, dirPath);
-        setExpandedDirs(prev => ({ ...prev, [dirPath]: data.tree || [] }));
+        const data = await projectsAPI.getTree(projectName, dirPath);
+        const inventoryProject = projectsRef.current.find((project) => project.name === projectName);
+        if (!inventoryProject || !projectIdentitiesMatch(data.identity, inventoryProject.identity)) {
+          throw new Error('The project identity changed while a directory was opening.');
+        }
+        if (
+          selectedProjectRef.current === projectName
+          && directoryLoadGenerationRef.current.get(dirPath) === generation
+        ) {
+          setExpandedDirs(prev => ({ ...prev, [dirPath]: data.tree }));
+        }
       } catch (err) { logError(err, `Expanding directory: ${dirPath}`); }
+      finally {
+        if (directoryLoadGenerationRef.current.get(dirPath) === generation) {
+          pendingDirectoryLoadsRef.current.delete(dirPath);
+        }
+      }
     }
   };
 
-  const openFileHandler = async (filePath: string) => {
-    if (!selectedProject) return;
+  const openFileHandler = async (filePath: string, preserveDeepLink = false) => {
+    if (projectOperationRef.current) return;
+    if (!preserveDeepLink && projectDeepLinkPresent) {
+      navigate('/projects', { replace: true });
+    }
+    const previousProject = selectedProjectRef.current;
+    const previousFile = openFileRef.current;
+    if (!previousProject) return;
+    try {
+      await flushPendingAutoSave();
+      if (previousFile) {
+        await fileWriteQueueRef.current.waitFor(previousProject, previousFile.path);
+      }
+    } catch (error) {
+      showErrorToast(error, `Saving ${previousFile?.path || 'the open file'} before opening another file`);
+      return;
+    }
+    if (projectOperationRef.current) return;
+    const projectName = selectedProjectRef.current;
+    if (!projectName) return;
+    const generation = ++fileLoadGenerationRef.current;
     setSelectedDiff(null);
     setCommitDiff(null);
     
     const category = getFileCategory(filePath);
     if (category !== 'code') {
       // Media/binary file — use raw endpoint
+      openFileRef.current = null;
       setOpenFile(null);
       setOpenMedia({
         path: filePath,
         category,
-        url: getProjectRawUrl(selectedProject, filePath),
+        url: getProjectRawUrl(projectName, filePath),
       });
       setModified(false);
       return;
@@ -712,61 +1724,99 @@ export default function AppsPage() {
     // Code/text file — use existing text endpoint
     setOpenMedia(null);
     try {
-      const data = await projectsAPI.readFile(selectedProject, filePath);
-      setOpenFile({ path: filePath, content: data.content, language: data.language });
+      const data = await projectsAPI.readFile(projectName, filePath);
+      if (
+        generation !== fileLoadGenerationRef.current
+        || selectedProjectRef.current !== projectName
+      ) return;
+      const nextOpenFile = { path: filePath, content: data.content, language: data.language };
+      openFileRef.current = nextOpenFile;
+      editorContentRef.current = data.content;
+      editorRevisionRef.current += 1;
+      setOpenFile(nextOpenFile);
       setEditorContent(data.content);
       setModified(false);
     } catch (err: any) {
       const tooLarge = err?.response?.status === 413;
-      if (tooLarge) {
+      if (tooLarge && generation === fileLoadGenerationRef.current && selectedProjectRef.current === projectName) {
+        openFileRef.current = null;
         setOpenFile(null);
         setOpenMedia({
           path: filePath,
           category: 'text',
-          url: getProjectRawUrl(selectedProject, filePath, { mode: 'text' }),
+          url: getProjectRawUrl(projectName, filePath, { mode: 'text' }),
           note: 'Preview only, this file is larger than the 10MB inline editor limit.',
         });
         setModified(false);
         showToast('Opened in read-only preview mode because the file is larger than 10MB.', 'info');
         return;
       }
-      showErrorToast(err, `Opening file: ${filePath}`);
+      if (generation === fileLoadGenerationRef.current && selectedProjectRef.current === projectName) {
+        showErrorToast(err, `Opening file: ${filePath}`);
+      }
     }
   };
+  openFileHandlerRef.current = openFileHandler;
 
   const saveFile = async () => {
-    if (!selectedProject || !openFile) return;
+    const projectName = selectedProjectRef.current;
+    const currentFile = openFileRef.current;
+    if (!projectName || !currentFile) return;
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    pendingAutoSaveRef.current = null;
+    const write: ProjectFileWrite = {
+      projectName,
+      filePath: currentFile.path,
+      content: editorContentRef.current,
+      revision: editorRevisionRef.current,
+    };
     setSaving(true);
     try {
-      await projectsAPI.writeFile(selectedProject, openFile.path, editorContent);
-      setOpenFile(prev => prev ? { ...prev, content: editorContent } : null);
-      setModified(false);
-      showToast('File saved');
-      await refreshTree();
-    } catch (err) { showErrorToast(err, `Saving file: ${openFile.path}`); } finally { setSaving(false); }
+      await persistProjectFile(write);
+      showToast(`Saved ${write.filePath}`);
+      await refreshTree(write.projectName);
+    } catch (err) { showErrorToast(err, `Saving file: ${write.filePath}`); } finally { setSaving(false); }
   };
 
   // Auto-save: debounce 2s after typing
   const handleEditorChange = (val: string | undefined) => {
     const newVal = val || '';
+    editorContentRef.current = newVal;
+    editorRevisionRef.current += 1;
     setEditorContent(newVal);
     setModified(newVal !== openFile?.content);
     // Auto-save after 2s of no typing
     if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
     if (newVal !== openFile?.content) {
-      autoSaveTimerRef.current = setTimeout(async () => {
-        if (selectedProject && openFile) {
-          try {
-            await projectsAPI.writeFile(selectedProject, openFile.path, newVal);
-            setOpenFile(prev => prev ? { ...prev, content: newVal } : null);
-            setModified(false);
-          } catch (err) { logError(err, 'Auto-save failed'); }
-        }
+      const projectName = selectedProjectRef.current;
+      const currentFile = openFileRef.current;
+      if (!projectName || !currentFile) return;
+      const write: ProjectFileWrite = {
+        projectName,
+        filePath: currentFile.path,
+        content: newVal,
+        revision: editorRevisionRef.current,
+      };
+      pendingAutoSaveRef.current = write;
+      autoSaveTimerRef.current = setTimeout(() => {
+        autoSaveTimerRef.current = null;
+        if (pendingAutoSaveRef.current === write) pendingAutoSaveRef.current = null;
+        void persistProjectFile(write).catch((err) => showErrorToast(err, `Auto-saving ${write.filePath}`));
       }, 2000);
+    } else {
+      pendingAutoSaveRef.current = null;
     }
   };
 
   const handleZipSelect = (file: File) => {
+    if (file.size > PROJECT_ZIP_MAX_BYTES) {
+      setZipFile(null);
+      showToast('Project ZIP files are limited to 200MB.', 'error');
+      return;
+    }
     setZipFile(file);
     if (!newName.trim()) {
       setNewName(file.name.replace(/\.zip$/i, '').replace(/[^a-zA-Z0-9_-]/g, '-'));
@@ -774,117 +1824,54 @@ export default function AppsPage() {
   };
 
   const uploadZipProject = async () => {
-    if (!zipFile || !newName.trim()) return;
+    if (!zipFile || !newName.trim() || zipUploadXhrRef.current) return;
+    if (zipFile.size > PROJECT_ZIP_MAX_BYTES) {
+      showToast('Project ZIP files are limited to 200MB.', 'error');
+      return;
+    }
     setZipUploading(true);
     setUploadProgress('Uploading...');
-        const apiUrl = import.meta.env.VITE_API_URL || '';
-    const CHUNK_THRESHOLD = 500 * 1024 * 1024; // 500MB - chunked upload threshold
+    const apiUrl = import.meta.env.VITE_API_URL || '';
 
     try {
-      let result: any;
-
-      if (zipFile.size <= CHUNK_THRESHOLD) {
-        // Direct upload for files under threshold
-        result = await new Promise<any>((resolve, reject) => {
-          const formData = new FormData();
-          formData.append('file', zipFile);
-          formData.append('name', newName);
-          const xhr = new XMLHttpRequest();
-          xhr.open('POST', `${apiUrl}/projects/upload-zip`);
-          xhr.withCredentials = true;
-          xhr.upload.onprogress = (e) => {
-            if (e.lengthComputable) {
-              const pct = Math.round((e.loaded / e.total) * 100);
-              setUploadProgress(`Uploading... ${pct}%`);
-            }
-          };
-          xhr.onload = () => {
-            if (xhr.status >= 200 && xhr.status < 300) {
-              setUploadProgress('Extracting & setting up...');
-              try { resolve(JSON.parse(xhr.responseText)); } catch { resolve({}); }
-            } else {
-              try { reject(new Error(JSON.parse(xhr.responseText).error || 'Upload failed')); }
-              catch { reject(new Error('Upload failed')); }
-            }
-          };
-          xhr.onerror = () => reject(new Error('Network error'));
-          xhr.send(formData);
-        });
-      } else {
-        // Chunked upload for large files
-        setUploadProgress('🔄 Switching to chunked upload for large file...');
-        const CHUNK_SIZE = 5 * 1024 * 1024;
-        const totalChunks = Math.ceil(zipFile.size / CHUNK_SIZE);
-        const baseUrl = window.location.origin || window.location.origin;
-
-        // Init chunked upload
-        const initResp = await fetch(`${baseUrl}/api/upload/init`, {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fileName: zipFile.name, fileSize: zipFile.size, totalChunks }),
-        });
-        if (!initResp.ok) throw new Error('Failed to init chunked upload');
-        const { uploadId } = await initResp.json();
-
-        // Upload chunks
-        for (let i = 0; i < totalChunks; i++) {
-          const start = i * CHUNK_SIZE;
-          const end = Math.min(start + CHUNK_SIZE, zipFile.size);
-          const chunk = await zipFile.slice(start, end).arrayBuffer();
-          const pct = Math.round(((i + 1) / totalChunks) * 100);
-          setUploadProgress(`📦 Chunked upload: ${pct}% (chunk ${i + 1}/${totalChunks})`);
-
-          let retries = 3;
-          while (retries > 0) {
-            try {
-              const resp = await fetch(`${baseUrl}/api/upload/chunk`, {
-                method: 'POST',
-                credentials: 'include',
-                headers: {
-                  'x-upload-id': uploadId,
-                  'x-chunk-index': i.toString(),
-                  'Content-Type': 'application/octet-stream',
-                },
-                body: chunk,
-              });
-              if (!resp.ok) throw new Error(`Chunk ${i} failed: ${resp.status}`);
-              break;
-            } catch (e) {
-              retries--;
-              if (retries === 0) throw e;
-              await new Promise(r => setTimeout(r, 1000 * (4 - retries)));
-            }
+      const result = await new Promise<any>((resolve, reject) => {
+        const formData = new FormData();
+        formData.append('file', zipFile);
+        formData.append('name', newName);
+        const xhr = new XMLHttpRequest();
+        zipUploadXhrRef.current = xhr;
+        xhr.open('POST', `${apiUrl}/projects/upload-zip`);
+        const authorizationBinding = bindWorkspaceAuthorizationToXhr(xhr);
+        xhr.withCredentials = true;
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) {
+            const percent = Math.round((event.loaded / event.total) * 100);
+            setUploadProgress(`Uploading... ${percent}%`);
           }
-        }
-
-        // Complete chunked upload
-        const completeResp = await fetch(`${baseUrl}/api/upload/complete`, {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ uploadId, projectName: newName }),
-        });
-        if (!completeResp.ok) throw new Error('Failed to complete chunked upload');
-        result = await completeResp.json();
-
-        // If chunked upload completed but we need to create project from the uploaded file
-        if (result.filePath) {
-          setUploadProgress('Extracting & setting up project...');
-          const createResp = await fetch(`${apiUrl}/projects/create-from-upload`, {
-            method: 'POST',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: newName, filePath: result.filePath }),
-          });
-          if (createResp.ok) {
-            result = await createResp.json();
+        };
+        xhr.onload = () => {
+          try {
+            authorizationBinding.validateResponse();
+          } catch (error) {
+            reject(error);
+            return;
+          }
+          if (xhr.status >= 200 && xhr.status < 300) {
+            setUploadProgress('Extracting & setting up...');
+            try { resolve(JSON.parse(xhr.responseText)); } catch { resolve({}); }
           } else {
-            const errorData = await createResp.json().catch(() => ({}));
-            throw new Error(errorData.error || 'Failed to create project from uploaded ZIP');
+            try { reject(new Error(JSON.parse(xhr.responseText).error || 'Upload failed')); }
+            catch { reject(new Error('Upload failed')); }
           }
-        }
-      }
+        };
+        xhr.onerror = () => reject(new Error('Network error'));
+        xhr.onabort = () => reject(Object.assign(new Error('Upload cancelled'), { name: 'AbortError' }));
+        xhr.onloadend = () => {
+          authorizationBinding.dispose();
+          if (zipUploadXhrRef.current === xhr) zipUploadXhrRef.current = null;
+        };
+        xhr.send(formData);
+      });
 
       setShowCreate(false);
       setNewName('');
@@ -897,148 +1884,729 @@ export default function AppsPage() {
       }
       await loadProjects();
     } catch (err: any) {
-      showToast(err.message || 'Failed to upload ZIP', 'error');
+      if (err?.name !== 'AbortError') showToast(err.message || 'Failed to upload ZIP', 'error');
       setUploadProgress(null);
-    } finally { setZipUploading(false); }
+    } finally {
+      zipUploadXhrRef.current = null;
+      setZipUploading(false);
+    }
   };
 
   const createProject = async () => {
-    if (!newName.trim()) return;
+    const requestedName = newName.trim();
+    const requestedCloneUrl = cloneUrl.trim();
+    if (!requestedName) return;
     if (createMode === 'zip') { await uploadZipProject(); return; }
+    if (createMode === 'clone' && !requestedCloneUrl) return;
+    if (createProjectInFlightRef.current) return;
+    createProjectInFlightRef.current = true;
     setCreating(true);
     try {
       if (createMode === 'clone') {
-        await projectsAPI.clone(cloneUrl, newName);
+        await projectsAPI.clone(requestedCloneUrl, requestedName);
       } else {
-        await projectsAPI.create(newName, template);
+        await projectsAPI.create(requestedName, template);
       }
       setShowCreate(false);
       setNewName('');
       setCloneUrl('');
       await loadProjects();
       showToast('Project created');
-    } catch (err) { showErrorToast(err, 'Creating project'); } finally { setCreating(false); }
+    } catch (err) { showErrorToast(err, 'Creating project'); } finally {
+      createProjectInFlightRef.current = false;
+      setCreating(false);
+    }
   };
 
-  const requestDeleteProject = (name: string) => setPendingDelete({ kind: 'project', name });
+  const requestDeleteProject = (name: string) => {
+    if (projectOperationRef.current || deleteInFlightRef.current) return;
+    const project = projectsRef.current.find((entry) => entry.name === name);
+    if (!project?.destructiveActions.allowed) return;
+    setDeleteError(null);
+    setPendingDelete({ kind: 'project', name, projectName: name });
+  };
 
   const [renamingProject, setRenamingProject] = useState<string | null>(null);
   const [renameProjectValue, setRenameProjectValue] = useState('');
+  const [renameProjectError, setRenameProjectError] = useState<string | null>(null);
+  const [renameProjectPhase, setRenameProjectPhase] = useState<ProjectRenamePhase>('idle');
 
-  const startRenameProject = (name: string) => {
+  const isMountedProjectRenameOwner = useCallback((operation: ProjectOperation) => (
+    mountedRef.current
+    && projectRenameInFlightRef.current === operation
+    && projectOperationRef.current === operation
+    && isRouteOperationOwner(operation)
+  ), []);
+
+  const blockProjectRenameStorageRecovery = useCallback((
+    operation: ProjectOperation,
+    action: 'persist' | 'retire',
+    recovery: ProjectRenameStorageBlock['recovery'],
+  ) => {
+    if (!isMountedProjectRenameOwner(operation)) return false;
+    projectRenameStorageBlockRef.current = Object.freeze({ operation, recovery });
+    setRenameProjectPhase('storage-blocked');
+    setRenameProjectError(action === 'persist' && recovery === 'safe-release'
+      ? 'Portal could not verify the provisional rename recovery record, so it did not submit the rename. The operation remains locked until Portal can prove that provisional record is retired.'
+      : action === 'persist'
+        ? 'Portal cannot verify that this admitted rename recovery record is durable. The rename remains locked and will not be submitted again. Restore browser local storage, then retry recovery.'
+        : 'Portal proved the rename outcome but could not verify retirement of its recovery record. The rename remains locked. Restore browser local storage, then retry recovery.');
+    return true;
+  }, [isMountedProjectRenameOwner]);
+
+  const startRenameProject = async (name: string) => {
+    if (projectOperationRef.current) return;
+    const sourceProject = projectsRef.current.find((project) => project.name === name);
+    if (!sourceProject?.destructiveActions.allowed) return;
+    // The operation owner is bound to the selected project. A rename dialog
+    // opened from an unselected row must operate on that row's project, so
+    // select it before arming anything.
+    if (selectedProjectRef.current !== name) {
+      await selectProject(name);
+      if (selectedProjectRef.current !== name) return;
+    }
+    if (projectOperationRef.current) return;
+    projectRenameInFlightRef.current = null;
+    projectRenameRequestActiveRef.current = false;
+    projectRenameStorageBlockRef.current = null;
+    projectRenameRetryBoundaryRef.current = 'none';
+    const actorId = projectActorIdRef.current;
+    const storedInventory = actorId
+      ? listStoredProjectRenameAttempts(actorId)
+      : { status: 'available' as const, attempts: [] };
+    const stored = storedInventory.attempts.find((attempt) => (
+      attempt.identity.id === sourceProject.identity.id
+    ));
+    if (stored) {
+      const operation = Object.freeze({
+        kind: 'rename' as const,
+        projectName: name,
+        projectGeneration: projectLoadGenerationRef.current,
+        token: ++projectOperationTokenRef.current,
+        renameSourceName: stored.sourceName,
+        renameTargetName: stored.targetName,
+        renameAttemptId: stored.attemptId,
+        renameIdentity: stored.identity,
+      });
+      if (!claimProjectOperation(operation)) return;
+      projectRenameInFlightRef.current = operation;
+      setRenameProjectPhase('indeterminate');
+      setRenameProjectError('This project has an interrupted rename. Check its saved status before starting another rename.');
+      setRenamingProject(stored.sourceName);
+      setRenameProjectValue(stored.targetName);
+      return;
+    }
+    setRenameProjectPhase('idle');
+    setRenameProjectError(null);
     setRenamingProject(name);
     setRenameProjectValue(name);
   };
 
-  const submitRenameProject = async () => {
-    if (!renamingProject || !renameProjectValue.trim()) { setRenamingProject(null); return; }
-    const newName = renameProjectValue.trim();
-    if (newName === renamingProject) { setRenamingProject(null); return; }
-    try {
-      const wasAgentChatActive = localStorage.getItem(`agent-active-${renamingProject}`) === 'true';
-      const result = await projectsAPI.rename(renamingProject, newName);
-      if (wasAgentChatActive) {
-        localStorage.setItem(`agent-active-${result.name}`, 'true');
-        localStorage.removeItem(`agent-active-${renamingProject}`);
-      }
-      if (selectedProject === renamingProject) {
-        setSelectedProject(result.name);
-        localStorage.setItem(LAST_SELECTED_PROJECT_KEY, result.name);
-      }
-      await loadProjects();
-      showToast(`Renamed to "${result.name}"`);
-    } catch (err) { showErrorToast(err, 'Renaming project'); }
+  const dismissRenameProject = () => {
+    if (projectRenameRequestActiveRef.current) return;
+    const operation = projectRenameInFlightRef.current;
+    projectRenameInFlightRef.current = null;
+    projectRenameStorageBlockRef.current = null;
+    projectRenameRetryBoundaryRef.current = 'none';
+    if (operation) releaseProjectOperation(operation);
+    setRenameProjectPhase('idle');
+    setRenameProjectError(null);
     setRenamingProject(null);
   };
 
-  const doDelete = async () => {
-    if (!pendingDelete) return;
-    if (pendingDelete.kind === 'project') {
+  const reconcileProjectRename = async (operation: ProjectOperation) => {
+    const oldName = operation.renameSourceName!;
+    const newName = operation.renameTargetName!;
+    const identity = operation.renameIdentity!;
+    const committedIdentity: ProjectIdentityProof = {
+      id: identity.id,
+      generation: identity.generation + 1,
+    };
+    if (!Number.isSafeInteger(committedIdentity.generation)) {
+      throw new Error('The admitted Project identity generation cannot be advanced safely.');
+    }
+    const inventory = await projectsAPI.list();
+    const source = inventory.projects.find((project) => project.name === oldName);
+    const target = inventory.projects.find((project) => project.name === newName);
+
+    if (!source && target && projectIdentitiesMatch(target.identity, committedIdentity)) {
+      const treeReadback = await projectsAPI.getTree(newName);
+      if (!projectIdentitiesMatch(treeReadback.identity, committedIdentity) || treeReadback.currentPath !== '') {
+        throw new Error('The renamed project tree did not prove the admitted immutable project identity.');
+      }
+      return { status: 'committed' as const, projects: inventory.projects, tree: treeReadback.tree };
+    }
+
+    if (
+      source
+      && !target
+      && projectIdentitiesMatch(source.identity, identity)
+      && source.destructiveActions.allowed
+    ) {
+      // The server only re-enables destructive actions after the durable
+      // lifecycle journal is ACTIVE again. That makes an unchanged identity,
+      // original namespace, and enabled lifecycle controls authoritative
+      // rollback proof after expired-lease recovery—not an ambiguous snapshot.
+      return { status: 'rolled-back' as const, projects: inventory.projects };
+    }
+
+    if (source && !target && projectIdentitiesMatch(source.identity, identity)) {
+      return { status: 'indeterminate' as const };
+    }
+
+    throw new Error('The project namespace does not provide authoritative proof for this rename attempt.');
+  };
+
+  const completeProjectRename = (
+    operation: ProjectOperation,
+    result: Readonly<{ projects: Project[]; tree: TreeEntry[] }>,
+  ): boolean => {
+    if (
+      !isMountedProjectRenameOwner(operation)
+      || selectedProjectRef.current !== operation.projectName
+      || projectLoadGenerationRef.current !== operation.projectGeneration
+    ) return false;
+    const oldName = operation.renameSourceName!;
+    const newName = operation.renameTargetName!;
+    const actorId = projectActorIdRef.current;
+    if (!actorId) {
+      blockProjectRenameStorageRecovery(operation, 'retire', 'reconcile');
+      return false;
+    }
+    const retirement = clearStoredProjectRenameAttempt(actorId, operation);
+    if (!isMountedProjectRenameOwner(operation)) return false;
+    if (retirement.status !== 'retired') {
+      blockProjectRenameStorageRecovery(operation, 'retire', 'reconcile');
+      return false;
+    }
+    projectRenameStorageBlockRef.current = null;
+    projectsRef.current = result.projects;
+    setProjects(result.projects);
+    try {
+      if (localStorage.getItem(`agent-active-${oldName}`) === 'true') {
+        localStorage.setItem(`agent-active-${newName}`, 'true');
+        localStorage.removeItem(`agent-active-${oldName}`);
+      }
+    } catch (error) {
+      logError(error, 'Updating optional renamed-project activity preference');
+    }
+    if (selectedProjectRef.current === oldName) {
+      projectLoadGenerationRef.current += 1;
+      treeRefreshGenerationRef.current += 1;
+      fileLoadGenerationRef.current += 1;
+      selectedProjectRef.current = newName;
+      setSelectedProject(newName);
+      setTree(result.tree);
       try {
-        await projectsAPI.delete(pendingDelete.name);
-        if (selectedProject === pendingDelete.name) {
+        localStorage.setItem(LAST_SELECTED_PROJECT_KEY, newName);
+      } catch (error) {
+        logError(error, 'Updating optional last-selected project preference');
+      }
+    }
+    projectRenameRequestActiveRef.current = false;
+    projectRenameInFlightRef.current = null;
+    releaseProjectOperation(operation);
+    setRenameProjectPhase('idle');
+    setRenamingProject(null);
+    setRenameProjectError(null);
+    showToast(`Renamed to "${newName}"`);
+    return true;
+  };
+
+  const completeRolledBackProjectRename = (
+    operation: ProjectOperation,
+    projects: Project[],
+  ): boolean => {
+    if (!isMountedProjectRenameOwner(operation)) return false;
+    const actorId = projectActorIdRef.current;
+    if (!actorId) {
+      blockProjectRenameStorageRecovery(operation, 'retire', 'reconcile');
+      return false;
+    }
+    const retirement = clearStoredProjectRenameAttempt(actorId, operation);
+    if (!isMountedProjectRenameOwner(operation)) return false;
+    if (retirement.status !== 'retired') {
+      blockProjectRenameStorageRecovery(operation, 'retire', 'reconcile');
+      return false;
+    }
+    projectRenameStorageBlockRef.current = null;
+    projectsRef.current = projects;
+    setProjects(projects);
+    projectRenameRequestActiveRef.current = false;
+    projectRenameInFlightRef.current = null;
+    releaseProjectOperation(operation);
+    setRenameProjectPhase('not-admitted');
+    setRenameProjectError(
+      'The interrupted rename was restored automatically. You may deliberately try the rename again.',
+    );
+    return true;
+  };
+
+  const retainIndeterminateProjectRename = (operation: ProjectOperation, error?: unknown) => {
+    if (!isMountedProjectRenameOwner(operation)) return false;
+    const actorId = projectActorIdRef.current;
+    if (!actorId) return blockProjectRenameStorageRecovery(operation, 'persist', 'reconcile');
+    const persistence = persistProjectRenameAttempt(actorId, operation);
+    if (!isMountedProjectRenameOwner(operation)) return false;
+    if (persistence.status !== 'persisted') {
+      return blockProjectRenameStorageRecovery(operation, 'persist', 'reconcile');
+    }
+    projectRenameStorageBlockRef.current = null;
+    const detail = error ? extractError(error, 'Reconciling project rename').message : '';
+    setRenameProjectPhase('indeterminate');
+    setRenameProjectError(
+      `Portal cannot yet prove whether this rename committed. It will not submit the rename again. ${detail}`.trim(),
+    );
+    return true;
+  };
+
+  const reconcileOwnedProjectRename = async (operation: ProjectOperation) => {
+    if (projectRenameRequestActiveRef.current || !isMountedProjectRenameOwner(operation)) return;
+    projectRenameRequestActiveRef.current = true;
+    setRenameProjectPhase('reconciling');
+    setRenameProjectError(null);
+    try {
+      const result = await reconcileProjectRename(operation);
+      if (!isMountedProjectRenameOwner(operation)) return;
+      if (result.status === 'committed') {
+        completeProjectRename(operation, result);
+        return;
+      }
+      if (result.status === 'rolled-back') {
+        completeRolledBackProjectRename(operation, result.projects);
+        return;
+      }
+      retainIndeterminateProjectRename(operation);
+    } catch (error) {
+      if (!isMountedProjectRenameOwner(operation)) return;
+      logError(error, 'Reconciling project rename');
+      retainIndeterminateProjectRename(operation, error);
+    } finally {
+      if (isMountedProjectRenameOwner(operation)) {
+        projectRenameRequestActiveRef.current = false;
+      }
+    }
+  };
+  reconcileOwnedProjectRenameRef.current = reconcileOwnedProjectRename;
+
+  const retryPreAdmissionProjectRenameRelease = (operation: ProjectOperation) => {
+    if (!isMountedProjectRenameOwner(operation)) return;
+    const storageBlock = projectRenameStorageBlockRef.current;
+    if (storageBlock?.operation !== operation || storageBlock.recovery !== 'safe-release') return;
+    projectRenameRequestActiveRef.current = true;
+    setRenameProjectPhase('reconciling');
+    setRenameProjectError(null);
+    const actorId = projectActorIdRef.current;
+    const retirement = actorId
+      ? clearStoredProjectRenameAttempt(actorId, operation)
+      : { status: 'unavailable' as const };
+    if (!isMountedProjectRenameOwner(operation)) return;
+    projectRenameRequestActiveRef.current = false;
+    if (retirement.status !== 'retired') {
+      blockProjectRenameStorageRecovery(operation, 'retire', 'safe-release');
+      return;
+    }
+    projectRenameStorageBlockRef.current = null;
+    projectRenameInFlightRef.current = null;
+    // Retiring a provisional pre-admission record and admitting a new rename
+    // must never be two clicks from the same double-activation sequence. The
+    // next activation only arms a new attempt; a later deliberate activation
+    // is required before any PATCH can leave the browser.
+    projectRenameRetryBoundaryRef.current = 'confirm';
+    setRenameProjectPhase('recovery-retired');
+    setRenameProjectError('No rename request was admitted. Recovery storage is available again. Confirm that you want to arm a new rename attempt.');
+    releaseProjectOperation(operation);
+  };
+
+  const submitRenameProject = async () => {
+    if (projectRenameRequestActiveRef.current) return;
+    if (
+      !projectRenameInFlightRef.current
+      && projectRenameRetryBoundaryRef.current === 'confirm'
+    ) {
+      projectRenameRetryBoundaryRef.current = 'armed';
+      setRenameProjectPhase('not-admitted');
+      setRenameProjectError('A new rename attempt is armed. Choose Try rename again to submit it.');
+      return;
+    }
+    const oldName = renamingProject;
+    const newName = renameProjectValue.trim();
+    if (!oldName || !newName) {
+      setRenameProjectError('Enter a project name.');
+      return;
+    }
+    if (newName === oldName) {
+      setRenamingProject(null);
+      setRenameProjectError(null);
+      return;
+    }
+    if (!isCanonicalProjectName(newName)) {
+      setRenameProjectError('Use a project name without reserved path characters and no more than 120 characters.');
+      return;
+    }
+    const existingAttempt = projectRenameInFlightRef.current;
+    if (existingAttempt) {
+      if (
+        existingAttempt.renameSourceName !== oldName
+        || existingAttempt.renameTargetName !== newName
+        || (renameProjectPhase !== 'indeterminate' && renameProjectPhase !== 'storage-blocked')
+      ) return;
+      if (
+        renameProjectPhase === 'storage-blocked'
+        && projectRenameStorageBlockRef.current?.operation === existingAttempt
+        && projectRenameStorageBlockRef.current.recovery === 'safe-release'
+      ) {
+        retryPreAdmissionProjectRenameRelease(existingAttempt);
+        return;
+      }
+      await reconcileOwnedProjectRename(existingAttempt);
+      return;
+    }
+    const sourceProject = projectsRef.current.find((project) => project.name === oldName);
+    if (!sourceProject) {
+      setRenameProjectError('The source project is no longer present in the verified project inventory.');
+      return;
+    }
+    // The dialog owns exactly the project it was opened for; the operation is
+    // never rebound to whichever project happens to be globally selected.
+    const operation = Object.freeze({
+      kind: 'rename' as const,
+      projectName: oldName,
+      projectGeneration: projectLoadGenerationRef.current,
+      token: ++projectOperationTokenRef.current,
+      renameSourceName: oldName,
+      renameTargetName: newName,
+      renameAttemptId: globalThis.crypto.randomUUID(),
+      renameIdentity: Object.freeze({ ...sourceProject.identity }),
+    });
+    if (!claimProjectOperation(operation)) {
+      setRenameProjectError('Another project operation is in progress. Finish it, then try the rename again.');
+      return;
+    }
+    projectRenameRetryBoundaryRef.current = 'none';
+    projectRenameInFlightRef.current = operation;
+    projectRenameRequestActiveRef.current = true;
+    setRenameProjectPhase('submitting');
+    setRenameProjectError(null);
+    let submitted = false;
+    let terminalNonAdmission = false;
+    try {
+      if (selectedProjectRef.current === oldName && openFileRef.current) {
+        await flushPendingAutoSave();
+        if (!isMountedProjectRenameOwner(operation)) return;
+        await fileWriteQueueRef.current.waitFor(oldName, openFileRef.current.path);
+        if (!isMountedProjectRenameOwner(operation)) return;
+      }
+      const preflight = await projectsAPI.getTree(oldName);
+      if (!isMountedProjectRenameOwner(operation)) return;
+      if (
+        preflight.currentPath !== ''
+        || !projectIdentitiesMatch(preflight.identity, operation.renameIdentity!)
+      ) {
+        throw new Error('The project identity changed before rename admission.');
+      }
+      const actorId = projectActorIdRef.current;
+      if (!actorId) throw new Error('The authenticated project owner is unavailable.');
+      // Persist before admission. A refresh in the following instruction gap
+      // must conservatively reconcile this exact attempt, never create another.
+      const persistence = persistProjectRenameAttempt(actorId, operation);
+      if (!isMountedProjectRenameOwner(operation)) return;
+      if (persistence.status !== 'persisted') {
+        blockProjectRenameStorageRecovery(operation, 'persist', 'safe-release');
+        return;
+      }
+      submitted = true;
+      await projectsAPI.rename(oldName, newName, {
+        attemptId: operation.renameAttemptId!,
+        identity: operation.renameIdentity!,
+      });
+      if (!isMountedProjectRenameOwner(operation)) return;
+      const result = await reconcileProjectRename(operation);
+      if (!isMountedProjectRenameOwner(operation)) return;
+      if (result.status === 'committed') {
+        completeProjectRename(operation, result);
+        return;
+      }
+      if (result.status === 'rolled-back') {
+        completeRolledBackProjectRename(operation, result.projects);
+        return;
+      }
+      retainIndeterminateProjectRename(operation);
+    } catch (err) {
+      if (!isMountedProjectRenameOwner(operation)) return;
+      if (!submitted || isAuthoritativeRenameNonAdmission(err, operation.renameAttemptId!)) {
+        const actorId = projectActorIdRef.current;
+        const retirement = actorId
+          ? clearStoredProjectRenameAttempt(actorId, operation)
+          : { status: 'unavailable' as const };
+        if (!isMountedProjectRenameOwner(operation)) return;
+        if (retirement.status !== 'retired') {
+          blockProjectRenameStorageRecovery(operation, 'retire', 'safe-release');
+          return;
+        }
+        projectRenameStorageBlockRef.current = null;
+        terminalNonAdmission = true;
+        const extracted = extractError(err, 'Renaming project');
+        logError(err, 'Project rename was not admitted');
+        setRenameProjectPhase('not-admitted');
+        setRenameProjectError(`${extracted.message} You may deliberately try the rename again.`);
+      } else {
+        logError(err, 'Project rename response was indeterminate');
+        try {
+          const result = await reconcileProjectRename(operation);
+          if (!isMountedProjectRenameOwner(operation)) return;
+          if (result.status === 'committed') {
+            completeProjectRename(operation, result);
+            return;
+          }
+          if (result.status === 'rolled-back') {
+            completeRolledBackProjectRename(operation, result.projects);
+            return;
+          }
+          retainIndeterminateProjectRename(operation, err);
+        } catch (reconcileError) {
+          if (!isMountedProjectRenameOwner(operation)) return;
+          logError(reconcileError, 'Project rename reconciliation failed');
+          retainIndeterminateProjectRename(operation, reconcileError);
+        }
+      }
+    } finally {
+      if (isMountedProjectRenameOwner(operation)) {
+        projectRenameRequestActiveRef.current = false;
+        if (terminalNonAdmission) {
+          projectRenameInFlightRef.current = null;
+          releaseProjectOperation(operation);
+        }
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (loading || !selectedProject || projectOperationRef.current || deleteInFlightRef.current) return;
+    const selectedInventoryProject = projects.find((project) => project.name === selectedProject);
+    if (!selectedInventoryProject) return;
+    const storedIndex = restoredRenameAttemptsRef.current.findIndex((attempt) => (
+      attempt.identity.id === selectedInventoryProject.identity.id
+    ));
+    if (storedIndex === -1) return;
+    const stored = restoredRenameAttemptsRef.current[storedIndex];
+    const operation = Object.freeze({
+      kind: 'rename' as const,
+      projectName: selectedProject,
+      projectGeneration: projectLoadGenerationRef.current,
+      token: ++projectOperationTokenRef.current,
+      renameSourceName: stored.sourceName,
+      renameTargetName: stored.targetName,
+      renameAttemptId: stored.attemptId,
+      renameIdentity: stored.identity,
+    });
+    if (!claimProjectOperation(operation)) return;
+    restoredRenameAttemptsRef.current.splice(storedIndex, 1);
+    projectRenameInFlightRef.current = operation;
+    setRenamingProject(stored.sourceName);
+    setRenameProjectValue(stored.targetName);
+    setRenameProjectPhase('indeterminate');
+    setRenameProjectError('Recovering an interrupted rename. Portal will only reconcile the admitted attempt.');
+    void reconcileOwnedProjectRenameRef.current(operation);
+  }, [claimProjectOperation, loading, projects, selectedProject]);
+
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
+  const doDelete = async () => {
+    if (!pendingDelete || deleteInFlightRef.current) return;
+    const request = pendingDelete.kind === 'project'
+      ? Object.freeze({
+        kind: 'project' as const,
+        name: pendingDelete.name,
+        projectName: pendingDelete.projectName,
+      })
+      : pendingDelete.path
+        ? Object.freeze({
+          kind: 'file' as const,
+          name: pendingDelete.name,
+          projectName: pendingDelete.projectName,
+          path: pendingDelete.path,
+        })
+        : null;
+    if (!request || !claimRouteOperation(request)) return;
+    deleteInFlightRef.current = request;
+    acquireProjectNavigationLock();
+    setDeleteBusy(true);
+    setDeleteError(null);
+    let completed = false;
+    if (request.kind === 'project') {
+      try {
+        if (selectedProjectRef.current === request.projectName && openFileRef.current) {
+          await flushPendingAutoSave();
+          await fileWriteQueueRef.current.waitFor(request.projectName, openFileRef.current.path);
+        }
+        await awaitProjectDeleteSettle(
+          request.projectName,
+          (name) => projectsAPI.delete(name),
+          {
+            onWaiting: (waitMs) => {
+              if (deleteInFlightRef.current !== request) return;
+              setDeleteError(null);
+              setDeleteSettleNotice(
+                `Still finishing a chat turn — deleting as soon as it settles (retrying in ${Math.max(1, Math.ceil(waitMs / 1000))}s)…`,
+              );
+            },
+          },
+        );
+        setDeleteSettleNotice(null);
+        if (selectedProjectRef.current === request.projectName) {
+          // The Agent panel must not keep polling a project that no longer
+          // exists — that surfaced as "cannot find project" errors.
+          if (agentChatOpen) closeAgentChat();
+          selectedProjectRef.current = null;
+          openFileRef.current = null;
+          projectLoadGenerationRef.current += 1;
+          treeRefreshGenerationRef.current += 1;
+          fileLoadGenerationRef.current += 1;
           setSelectedProject(null);
           setOpenFile(null);
           localStorage.removeItem(LAST_SELECTED_PROJECT_KEY);
         }
         await loadProjects();
         showToast('Project deleted');
-      } catch (err) { showErrorToast(err, `Deleting project "${pendingDelete.name}"`); }
-    } else if (pendingDelete.kind === 'file' && selectedProject && pendingDelete.path) {
+        completed = true;
+      } catch (err) {
+        setDeleteSettleNotice(null);
+        setDeleteError((err as any)?.response?.data?.error || (err as any)?.message || `Could not delete project "${request.name}".`);
+        showErrorToast(err, `Deleting project "${request.name}"`);
+      }
+    } else {
       try {
-        await projectsAPI.deleteFile(selectedProject, pendingDelete.path);
-        if (openFile?.path === pendingDelete.path) setOpenFile(null);
-        await refreshTree();
+        const currentOpenPath = openFileRef.current?.path;
+        const removesOpenFile = Boolean(currentOpenPath && (
+          currentOpenPath === request.path
+          || currentOpenPath.startsWith(`${request.path}/`)
+        ));
+        await flushPendingAutoSave();
+        if (currentOpenPath) await fileWriteQueueRef.current.waitFor(request.projectName, currentOpenPath);
+        await projectsAPI.deleteFile(request.projectName, request.path);
+        if (removesOpenFile && selectedProjectRef.current === request.projectName) {
+          fileLoadGenerationRef.current += 1;
+          openFileRef.current = null;
+          setOpenFile(null);
+          setModified(false);
+        }
+        if (openMedia && (openMedia.path === request.path || openMedia.path.startsWith(`${request.path}/`))) {
+          setOpenMedia(null);
+        }
+        await refreshTree(request.projectName);
         showToast('Deleted');
-      } catch (err) { showErrorToast(err, `Deleting file "${pendingDelete.path}"`); }
+        completed = true;
+      } catch (err) {
+        setDeleteError((err as any)?.response?.data?.error || (err as any)?.message || `Could not delete "${request.path}".`);
+        showErrorToast(err, `Deleting file "${request.path}"`);
+      }
     }
-    setPendingDelete(null);
+    if (deleteInFlightRef.current === request) {
+      deleteInFlightRef.current = null;
+      releaseProjectNavigationLock();
+      releaseRouteOperation(request);
+      setDeleteBusy(false);
+      if (completed) setPendingDelete(null);
+    }
   };
 
   const commitChanges = async () => {
-    if (!selectedProject || !commitMsg.trim()) return;
-    setGitLoading(true);
+    const message = commitMsg.trim();
+    if (!selectedProject || !message || gitLoadingCountRef.current > 0) return;
+    const operation = claimGitMutation('commit');
+    if (!operation) return;
     try {
-      await projectsAPI.git(selectedProject, 'commit', { message: commitMsg });
+      await projectsAPI.git(operation.projectName, 'commit', { message });
+      await verifyGitMutation(operation);
       setCommitMsg('');
       showToast('Changes committed');
-      await loadGitStatus();
-      await refreshTree();
-    } catch (err) { showErrorToast(err, 'Committing changes'); } finally { setGitLoading(false); }
+      await refreshTree(operation.projectName);
+    } catch (err) { showErrorToast(err, 'Committing changes or verifying Git status'); } finally { releaseGitMutation(operation); }
   };
 
   const gitPull = async () => {
-    if (!selectedProject) return;
-    setGitLoading(true);
+    if (!selectedProject || gitLoadingCountRef.current > 0) return;
+    const operation = claimGitMutation('pull');
+    if (!operation) return;
     try {
-      const data = await projectsAPI.git(selectedProject, 'pull');
+      const data = await projectsAPI.git(operation.projectName, 'pull');
+      await verifyGitMutation(operation);
       showToast(data.output || 'Pull complete');
-      await loadGitStatus();
-    } catch (err) { showErrorToast(err, 'Git pull'); } finally { setGitLoading(false); }
+      await refreshTree(operation.projectName);
+    } catch (err) { showErrorToast(err, 'Pulling or verifying Git changes'); } finally { releaseGitMutation(operation); }
   };
 
   const gitPush = async () => {
-    if (!selectedProject) return;
-    setGitLoading(true);
+    if (!selectedProject || gitLoadingCountRef.current > 0) return;
+    const operation = claimGitMutation('push');
+    if (!operation) return;
     try {
-      const data = await projectsAPI.git(selectedProject, 'push');
+      const data = await projectsAPI.git(operation.projectName, 'push');
+      await verifyGitMutation(operation);
       showToast(data.output || 'Push complete');
-      await loadGitStatus();
-    } catch (err) { showErrorToast(err, 'Git push'); } finally { setGitLoading(false); }
+    } catch (err) { showErrorToast(err, 'Pushing or verifying Git changes'); } finally { releaseGitMutation(operation); }
   };
 
   const switchBranch = async (branchName: string) => {
-    if (!selectedProject) return;
-    setGitLoading(true);
+    if (!selectedProject || gitLoadingCountRef.current > 0) return;
+    const requestedBranch = branchName;
+    const operation = claimGitMutation('checkout', requestedBranch);
+    if (!operation) return;
     try {
-      await projectsAPI.git(selectedProject, 'checkout', { branch: branchName });
-      showToast(`Switched to ${branchName}`);
+      await projectsAPI.git(operation.projectName, 'checkout', { branch: requestedBranch });
+      const fresh = await verifyGitMutation(operation);
+      if (fresh.branch && fresh.branch !== requestedBranch) {
+        throw new Error(`Git remained on ${fresh.branch}; the branch switch was not confirmed.`);
+      }
+      showToast(`Switched to ${requestedBranch}`);
       await loadBranches();
-      await refreshTree();
+      await refreshTree(operation.projectName);
       await loadProjects();
-    } catch (err) { showErrorToast(err, `Switching to branch: ${branchName}`); } finally { setGitLoading(false); }
+    } catch (err) { showErrorToast(err, `Switching to or verifying branch: ${requestedBranch}`); } finally { releaseGitMutation(operation); }
   };
 
   const createBranch = async () => {
-    if (!selectedProject || !newBranchName.trim()) return;
-    setGitLoading(true);
+    const requestedBranch = newBranchName.trim();
+    if (!selectedProject || !requestedBranch || gitLoadingCountRef.current > 0) return;
+    const operation = claimGitMutation('checkout-new', requestedBranch);
+    if (!operation) return;
     try {
-      await projectsAPI.git(selectedProject, 'checkout-new', { branch: newBranchName });
+      await projectsAPI.git(operation.projectName, 'checkout-new', { branch: requestedBranch });
+      const fresh = await verifyGitMutation(operation);
+      if (fresh.branch && fresh.branch !== requestedBranch) {
+        throw new Error(`Git remained on ${fresh.branch}; the new branch was not confirmed.`);
+      }
       setNewBranchName('');
-      showToast(`Created branch ${newBranchName}`);
+      showToast(`Created branch ${requestedBranch}`);
       await loadBranches();
       await loadProjects();
-    } catch (err) { showErrorToast(err, `Creating branch: ${newBranchName}`); } finally { setGitLoading(false); }
+    } catch (err) { showErrorToast(err, `Creating or verifying branch: ${requestedBranch}`); } finally { releaseGitMutation(operation); }
   };
 
-  const resetFile = async (filePath: string) => {
-    if (!selectedProject) return;
+  const resetFile = async (filePath: string): Promise<boolean> => {
+    if (!selectedProject || gitLoadingCountRef.current > 0) return false;
+    const operation = claimGitMutation('reset-file', filePath);
+    if (!operation) return false;
+    const requestedPath = filePath;
+    setResetFileError(null);
     try {
-      await projectsAPI.git(selectedProject, 'reset-file', { file: filePath });
-      showToast(`Reset: ${filePath}`);
-      await loadGitStatus();
-      await refreshTree();
-    } catch (err) { showErrorToast(err, `Resetting file: ${filePath}`); }
+      await projectsAPI.git(operation.projectName, 'reset-file', { file: requestedPath });
+      const fresh = await verifyGitMutation(operation);
+      if (fresh.files?.some((file) => file.path === requestedPath)) {
+        throw new Error('Git still reports uncommitted changes for that file.');
+      }
+      await refreshTree(operation.projectName);
+      setPendingResetFile(null);
+      showToast(`Reset: ${requestedPath}`);
+      return true;
+    } catch (err: any) {
+      setResetFileError(err?.response?.data?.error || err?.message || `Could not reset ${requestedPath}.`);
+      showErrorToast(err, `Resetting or verifying file: ${requestedPath}`);
+      return false;
+    } finally {
+      releaseGitMutation(operation);
+    }
   };
 
   // Install dependencies via SSE stream (using fetch for POST with SSE)
@@ -1051,7 +2619,7 @@ export default function AppsPage() {
     let success = false;
     
     try {
-      const response = await fetch(`${apiUrl}/projects/${encodeURIComponent(projectName)}/install-deps`, {
+      const response = await workspaceAuthorizedFetch(`${apiUrl}/projects/${encodeURIComponent(projectName)}/install-deps`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -1115,7 +2683,9 @@ export default function AppsPage() {
                       installEventSourceRef.current = null;
                       setProgressNotification(null);
                     },
-                    onDismiss: () => setProgressNotification(null),
+                    onDismiss: () => {
+                      if (!projectOperationRef.current) setProgressNotification(null);
+                    },
                   });
                 } else if (eventType === 'progress') {
                   if (data.text) logs.push(data.text);
@@ -1150,7 +2720,7 @@ export default function AppsPage() {
                   } : null);
                 }
               } catch (parseError) {
-                console.warn('Failed to parse SSE data:', eventData);
+                console.warn('Failed to parse SSE data:', eventData, parseError);
               }
               eventType = '';
               eventData = '';
@@ -1180,58 +2750,103 @@ export default function AppsPage() {
     return success;
   };
 
-  const deployProject = async () => {
-    if (!selectedProject) return;
-    
-    // First check for dependencies (for runtime projects)
-    if (isRuntimeProject) {
-      try {
-        const depsResult = await projectsAPI.checkDeps(selectedProject);
-        
-        if (depsResult.needsInstall && depsResult.packages?.length > 0) {
-          // Show notification and install dependencies
-          setProgressNotification({
-            id: `deps-${selectedProject}`,
-            title: 'Checking Dependencies',
-            status: 'pending',
-            progress: 0,
-            statusText: `Found ${depsResult.packages.length} missing packages`,
-            logs: [`Packages: ${depsResult.packages.join(', ')}`],
-            onDismiss: () => setProgressNotification(null),
-          });
-          
-          const installSuccess = await installDependencies(selectedProject);
-          if (!installSuccess) {
-            showErrorToast(new Error('Dependency installation cancelled or failed'), 'Installing dependencies');
-            return;
-          }
-          
-          // Brief pause before deploy
-          await new Promise(r => setTimeout(r, 300));
-        }
-      } catch (err) {
-        // Dependency check failed, continue with deploy anyway
-        console.warn('Dependency check failed:', err);
-      }
+  // Ctrl+K uses a per-tab opaque target tied to this exact authorization
+  // generation. Clearing workspace state invalidates every historical URL.
+  useEffect(() => {
+    if (!projectDeepLink?.file) {
+      projectDeepLinkFileRef.current = null;
+      return;
     }
-    
-    // Now deploy
-    setDeploying(true);
-    setDeployStatus('deploying');
-    
-    // Show deploy notification
-    setProgressNotification({
-      id: `deploy-${selectedProject}`,
-      title: isRuntimeProject ? 'Running Project' : 'Deploying Project',
-      status: 'active',
-      progress: 20,
-      statusText: isRuntimeProject ? 'Launching on desktop...' : 'Building and deploying...',
-      onDismiss: () => setProgressNotification(null),
+    if (selectedProject !== projectDeepLink.project) return;
+    if (projectOperationRef.current) return;
+    const targetKey = `${projectDeepLink.project}\u0000${projectDeepLink.file}`;
+    if (projectDeepLinkFileRef.current === targetKey) return;
+    projectDeepLinkFileRef.current = targetKey;
+    void openFileHandlerRef.current?.(projectDeepLink.file, true);
+  }, [projectDeepLink, projectOperation, selectedProject]);
+
+  const deployProject = async () => {
+    const projectName = selectedProjectRef.current;
+    if (!projectName || projectOperationRef.current) return;
+    const projectGeneration = projectLoadGenerationRef.current;
+    const runtime = isRuntimeProject;
+    // Runtime (Python/C++/desktop) projects demo inside Remote Desktop, which
+    // is deliberately restricted to Owner/Sub-Admin. Tell non-elevated users
+    // up front instead of failing after a deploy.
+    if (runtime && !canLaunchProjectRuntimeDemo(useAuthStore.getState().user?.role)) {
+      setProgressNotification({
+        id: `deploy-denied-${projectName}`,
+        title: 'Remote Desktop required',
+        status: 'error',
+        progress: 0,
+        statusText: REMOTE_DESKTOP_RUNTIME_WARNING,
+        onDismiss: () => setProgressNotification(null),
+      });
+      return;
+    }
+    const operation = Object.freeze({
+      kind: 'deploy' as const,
+      projectName,
+      projectGeneration,
+      token: ++projectOperationTokenRef.current,
+      runtime,
     });
-    
+    if (!claimProjectOperation(operation)) return;
+    const operationIsCurrent = () => (
+      projectOperationRef.current === operation
+      && selectedProjectRef.current === operation.projectName
+      && projectLoadGenerationRef.current === operation.projectGeneration
+    );
+    setDeploying(true);
     try {
-      const data = await projectsAPI.deploy(selectedProject);
-      
+      // First check for dependencies (for runtime projects).
+      if (operation.runtime) {
+        try {
+          const depsResult = await projectsAPI.checkDeps(operation.projectName);
+          if (!operationIsCurrent()) return;
+          if (depsResult.needsInstall && depsResult.packages?.length > 0) {
+            setProgressNotification({
+              id: `deps-${operation.projectName}`,
+              title: 'Checking Dependencies',
+              status: 'pending',
+              progress: 0,
+              statusText: `Found ${depsResult.packages.length} missing packages`,
+              logs: [`Packages: ${depsResult.packages.join(', ')}`],
+              onDismiss: () => {
+                if (!projectOperationRef.current) setProgressNotification(null);
+              },
+            });
+            const installSuccess = await installDependencies(operation.projectName);
+            if (!operationIsCurrent()) return;
+            if (!installSuccess) {
+              showErrorToast(new Error('Dependency installation cancelled or failed'), 'Installing dependencies');
+              return;
+            }
+            await new Promise(r => setTimeout(r, 300));
+            if (!operationIsCurrent()) return;
+          }
+        } catch (err) {
+          if (!operationIsCurrent()) return;
+          // Dependency check failure is advisory; the deploy endpoint performs
+          // its own authoritative validation.
+          console.warn('Dependency check failed:', err);
+        }
+      }
+
+      setDeployStatus('deploying');
+      setProgressNotification({
+        id: `deploy-${operation.projectName}`,
+        title: operation.runtime ? 'Running Project' : 'Deploying Project',
+        status: 'active',
+        progress: 20,
+        statusText: operation.runtime ? 'Launching on desktop...' : 'Building and deploying...',
+        onDismiss: () => {
+          if (!projectOperationRef.current) setProgressNotification(null);
+        },
+      });
+
+      const data = await projectsAPI.deploy(operation.projectName);
+      if (!operationIsCurrent()) return;
       setProgressNotification(prev => prev ? {
         ...prev,
         status: 'complete',
@@ -1240,22 +2855,30 @@ export default function AppsPage() {
       } : null);
       
       setDeployStatus('success');
-      
-      // Handle runtime projects - redirect to desktop
+
       if (data.deployType === 'runtime') {
         await loadProjects();
-        setTimeout(() => {
-          setDeployStatus('idle');
-          setProgressNotification(null);
-          navigate('/desktop');
-        }, 1500);
+        if (!operationIsCurrent()) return;
+        await new Promise(r => setTimeout(r, 1500));
+        if (!operationIsCurrent()) return;
+        setDeployStatus('idle');
+        setProgressNotification(null);
+        setDeploying(false);
+        releaseProjectOperation(operation);
+        navigate('/desktop');
+        return;
       } else {
         await loadProjects();
+        if (!operationIsCurrent()) return;
         setTimeout(() => {
-          setDeployStatus('idle');
+          if (
+            selectedProjectRef.current === operation.projectName
+            && projectLoadGenerationRef.current === operation.projectGeneration
+          ) setDeployStatus('idle');
         }, 3000);
       }
     } catch (err) {
+      if (!operationIsCurrent()) return;
       const errObj = extractError(err);
       setProgressNotification(prev => prev ? {
         ...prev,
@@ -1265,9 +2888,97 @@ export default function AppsPage() {
       } : null);
       
       setDeployStatus('failed');
-      setTimeout(() => setDeployStatus('idle'), 5000);
-    } finally { 
-      setDeploying(false); 
+      setTimeout(() => {
+        if (
+          selectedProjectRef.current === operation.projectName
+          && projectLoadGenerationRef.current === operation.projectGeneration
+        ) setDeployStatus('idle');
+      }, 5000);
+    } finally {
+      if (projectOperationRef.current === operation) {
+        setDeploying(false);
+        releaseProjectOperation(operation);
+      }
+    }
+  };
+
+  const controlDeploymentProcess = async (action: 'start' | 'stop' | 'restart') => {
+    const projectName = selectedProjectRef.current;
+    if (!projectName || projectOperationRef.current || deploymentControlBusy) return;
+    const operation = Object.freeze({
+      kind: 'deploy' as const,
+      projectName,
+      projectGeneration: projectLoadGenerationRef.current,
+      token: ++projectOperationTokenRef.current,
+      runtime: false,
+    });
+    if (!claimProjectOperation(operation)) return;
+    const operationIsCurrent = () => (
+      projectOperationRef.current === operation
+      && selectedProjectRef.current === projectName
+      && projectLoadGenerationRef.current === operation.projectGeneration
+    );
+    setDeploymentControlBusy(action);
+    setDeploymentControlError(null);
+    try {
+      const status = await projectsAPI.appProcess(projectName, action);
+      if (!operationIsCurrent()) return;
+      setDeploymentProcess(status);
+      await loadProjects();
+      if (
+        projectOperationRef.current === operation
+        && selectedProjectRef.current === projectName
+      ) {
+        await loadDeploymentProcess(projectName);
+      }
+    } catch (error) {
+      if (projectOperationRef.current === operation) {
+        setDeploymentControlError(extractError(error).message || `Could not ${action} deployment`);
+      }
+    } finally {
+      if (projectOperationRef.current === operation) releaseProjectOperation(operation);
+      setDeploymentControlBusy(null);
+    }
+  };
+
+  const undeployProject = async () => {
+    const projectName = pendingUndeploy;
+    if (
+      !projectName
+      || selectedProjectRef.current !== projectName
+      || projectOperationRef.current
+      || deploymentControlBusy
+    ) return;
+    const operation = Object.freeze({
+      kind: 'deploy' as const,
+      projectName,
+      projectGeneration: projectLoadGenerationRef.current,
+      token: ++projectOperationTokenRef.current,
+      runtime: false,
+    });
+    if (!claimProjectOperation(operation)) return;
+    const operationIsCurrent = () => (
+      projectOperationRef.current === operation
+      && selectedProjectRef.current === projectName
+      && projectLoadGenerationRef.current === operation.projectGeneration
+    );
+    setDeploymentControlBusy('undeploy');
+    setDeploymentControlError(null);
+    try {
+      await projectsAPI.undeploy(projectName);
+      if (!operationIsCurrent()) return;
+      await loadProjects();
+      setDeploymentProcess(null);
+      setPendingUndeploy(null);
+      setActivePanel(null);
+      showToast('Deployment removed. Project source and chat were preserved.', 'success');
+    } catch (error) {
+      if (projectOperationRef.current === operation) {
+        setDeploymentControlError(extractError(error).message || 'Could not remove deployment');
+      }
+    } finally {
+      if (projectOperationRef.current === operation) releaseProjectOperation(operation);
+      setDeploymentControlBusy(null);
     }
   };
   
@@ -1280,17 +2991,38 @@ export default function AppsPage() {
     };
   }, []);
 
+  useEffect(() => {
+    mountedRef.current = true;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!modifiedRef.current) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warnBeforeUnload);
+    return () => {
+      mountedRef.current = false;
+      window.removeEventListener('beforeunload', warnBeforeUnload);
+      if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+      zipUploadXhrRef.current?.abort();
+      const pending = pendingAutoSaveRef.current;
+      pendingAutoSaveRef.current = null;
+      if (pending) void persistProjectFile(pending).catch((error) => logError(error, 'Final auto-save failed'));
+    };
+  }, [persistProjectFile]);
+
   // Check syntax/compile for runtime projects
   const checkProject = async () => {
     if (!selectedProject) return;
     setCheckingProject(true);
     try {
-      const res = await fetch(`${import.meta.env.VITE_API_URL || '/api'}/projects/${encodeURIComponent(selectedProject)}/check`, {
+      const res = await workspaceAuthorizedFetch(`${import.meta.env.VITE_API_URL || '/api'}/projects/${encodeURIComponent(selectedProject)}/check`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
       });
       const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Project check failed with HTTP ${res.status}`);
       if (data.ok) {
         showToast(`✅ No syntax errors (${data.language})`, 'success');
       } else {
@@ -1305,42 +3037,100 @@ export default function AppsPage() {
   };
 
   const createShareLink = async () => {
-    if (!selectedProject) return;
-    if (!shareIsPublic) {
-      if (sharePassword.length < 8) { showToast('Password must be at least 8 characters', 'error'); return; }
-      if (sharePassword !== sharePasswordConfirm) { showToast('Passwords do not match', 'error'); return; }
+    if (!selectedProject || shareCreateInFlightRef.current || shareActionOwnerRef.current) return;
+    const request = {
+      projectName: selectedProject,
+      isPublic: shareIsPublic,
+      password: sharePassword,
+      passwordConfirm: sharePasswordConfirm,
+      expiresAtInput: shareExpiresAt,
+      maxUsesInput: shareMaxUses,
+    };
+    if (!request.isPublic) {
+      if (request.password.length < 8) { showToast('Password must be at least 8 characters', 'error'); return; }
+      if (request.password !== request.passwordConfirm) { showToast('Passwords do not match', 'error'); return; }
     }
+    const expiresAt = request.expiresAtInput ? new Date(request.expiresAtInput) : null;
+    if (expiresAt && (!Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now())) {
+      showToast('Expiration must be in the future', 'error');
+      return;
+    }
+    const maxUses = request.maxUsesInput ? Number(request.maxUsesInput) : null;
+    if (maxUses !== null && (!Number.isSafeInteger(maxUses) || maxUses < 1 || maxUses > 1_000_000)) {
+      showToast('Visit limit must be a whole number from 1 to 1,000,000', 'error');
+      return;
+    }
+    const owner = Object.freeze({
+      kind: 'create' as const,
+      projectName: request.projectName,
+      projectGeneration: projectLoadGenerationRef.current,
+      token: ++projectOperationTokenRef.current,
+    });
+    if (!claimShareAction(owner)) return;
+    shareCreateInFlightRef.current = true;
+    setShareCreating(true);
     try {
-      await projectsAPI.share(selectedProject, {
-        isPublic: shareIsPublic,
-        ...(shareIsPublic ? {} : { password: sharePassword }),
+      await projectsAPI.share(request.projectName, {
+        isPublic: request.isPublic,
+        ...(request.isPublic ? {} : { password: request.password }),
+        ...(expiresAt ? { expiresAt: expiresAt.toISOString() } : {}),
+        ...(maxUses !== null ? { maxUses } : {}),
       });
-      showToast('Share link created');
       setSharePassword('');
       setSharePasswordConfirm('');
+      setShareExpiresAt('');
+      setShareMaxUses('');
       setShareIsPublic(true);
-      await loadShares();
+      if (await loadShares(request.projectName)) showToast('Share link created');
     } catch (err) { showErrorToast(err, 'Creating share link'); }
-  };
-
-  const revokeShare = async (linkId: string) => {
-    if (!selectedProject) return;
-    try {
-      await projectsAPI.revokeShare(selectedProject, linkId);
-      showToast('Share link revoked');
-      await loadShares();
-    } catch (err) { showErrorToast(err, 'Revoking share link'); }
+    finally {
+      releaseShareAction(owner);
+      shareCreateInFlightRef.current = false;
+      setShareCreating(false);
+    }
   };
 
   const toggleShareActive = async (linkId: string) => {
-    if (!selectedProject) return;
+    if (!selectedProject || shareActionOwnerRef.current) return;
     const share = shares.find(s => s.id === linkId);
-    if (!share) return;
+    if (!share || shareMutationIdsRef.current.has(linkId)) return;
+    const availability = getShareLinkAvailability(share);
+    if (!share.isActive && (availability === 'expired' || availability === 'exhausted')) {
+      showToast(
+        availability === 'expired'
+          ? 'Expired links cannot be reactivated; create a new link.'
+          : 'Links that reached their visit limit cannot be reactivated; create a new link.',
+        'error',
+      );
+      return;
+    }
+    const request = {
+      projectName: selectedProject,
+      linkId,
+      nextActive: !share.isActive,
+      wasActive: share.isActive,
+    };
+    const owner = Object.freeze({
+      kind: 'toggle' as const,
+      projectName: request.projectName,
+      projectGeneration: projectLoadGenerationRef.current,
+      linkId,
+      token: ++projectOperationTokenRef.current,
+    });
+    if (!claimShareAction(owner)) return;
+    shareMutationIdsRef.current.add(linkId);
+    setShareMutationIds(new Set(shareMutationIdsRef.current));
     try {
-      await projectsAPI.updateShare(selectedProject, linkId, { isActive: !share.isActive });
-      showToast(share.isActive ? 'Link disabled' : 'Link activated');
-      await loadShares();
+      await projectsAPI.updateShare(request.projectName, request.linkId, { isActive: request.nextActive });
+      if (await loadShares(request.projectName)) {
+        showToast(request.wasActive ? 'Link disabled' : 'Link activated');
+      }
     } catch (err) { showErrorToast(err, 'Updating share link'); }
+    finally {
+      releaseShareAction(owner);
+      shareMutationIdsRef.current.delete(linkId);
+      setShareMutationIds(new Set(shareMutationIdsRef.current));
+    }
   };
 
   // Download project
@@ -1353,11 +3143,14 @@ export default function AppsPage() {
         stripped: 'Stripped',
       };
       
-      const response = await fetch(`/api/projects/${selectedProject}/download?mode=${mode}`, {
-        headers: {},
+      const response = await workspaceAuthorizedFetch(`/api/projects/${encodeURIComponent(selectedProject)}/download?mode=${mode}`, {
+        credentials: 'include',
       });
 
-      if (!response.ok) throw new Error('Download failed');
+      if (!response.ok) {
+        const errorBody = await response.json().catch(() => ({}));
+        throw new Error(errorBody.error || `Download failed with HTTP ${response.status}`);
+      }
 
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
@@ -1376,70 +3169,123 @@ export default function AppsPage() {
   };
 
   const [pendingDeleteShare, setPendingDeleteShare] = useState<string | null>(null);
-  const [emailingLinkId, setEmailingLinkId] = useState<string | null>(null);
-  const [shareEmailInput, setShareEmailInput] = useState('');
-  const [shareEmailPassword, setShareEmailPassword] = useState('');
-  const [shareEmailSending, setShareEmailSending] = useState(false);
-  const [shareEmailSuccess, setShareEmailSuccess] = useState<string | null>(null);
 
-  const sendShareEmail = async (linkId: string, isPasswordProtected: boolean) => {
-    if (!selectedProject || !shareEmailInput) return;
+  const sendShareEmail = async (linkId: string) => {
+    const recipientEmail = shareEmailInput.trim();
+    if (
+      !selectedProject
+      || !recipientEmail
+      || emailingLinkId !== linkId
+      || shareEmailInFlightRef.current
+      || shareActionOwnerRef.current
+    ) return;
+    const request = { projectName: selectedProject, linkId, recipientEmail };
+    const owner = Object.freeze({
+      kind: 'email' as const,
+      projectName: request.projectName,
+      projectGeneration: projectLoadGenerationRef.current,
+      linkId,
+      token: ++projectOperationTokenRef.current,
+    });
+    if (!claimShareAction(owner)) return;
+    shareEmailInFlightRef.current = true;
     setShareEmailSending(true);
+    setShareEmailError(null);
+    setShareEmailSuccess(null);
     try {
-      await projectsAPI.emailShare(selectedProject, linkId, {
-        recipientEmail: shareEmailInput,
-        ...(isPasswordProtected && shareEmailPassword ? { password: shareEmailPassword } : {}),
+      await projectsAPI.emailShare(request.projectName, request.linkId, {
+        recipientEmail: request.recipientEmail,
       });
-      setShareEmailSuccess(linkId);
-      setTimeout(() => {
-        setShareEmailSuccess(null);
-        setEmailingLinkId(null);
-        setShareEmailInput('');
-        setShareEmailPassword('');
-      }, 2000);
+      setShareEmailSuccess(request.linkId);
     } catch (err) {
-      showErrorToast(err, 'Sending share email');
+      const extracted = extractError(err, 'Sending share email');
+      logError(err, 'Sending share email');
+      setShareEmailError(extracted.message);
     } finally {
+      releaseShareAction(owner);
+      shareEmailInFlightRef.current = false;
       setShareEmailSending(false);
     }
   };
 
   const deleteSharePermanently = async () => {
-    if (!pendingDeleteShare || !selectedProject) return;
+    if (!pendingDeleteShare || !selectedProject || shareDeleteInFlightRef.current || shareActionOwnerRef.current) return;
+    const request = { projectName: selectedProject, linkId: pendingDeleteShare };
+    const owner = Object.freeze({
+      kind: 'delete' as const,
+      projectName: request.projectName,
+      projectGeneration: projectLoadGenerationRef.current,
+      linkId: request.linkId,
+      token: ++projectOperationTokenRef.current,
+    });
+    if (!claimShareAction(owner)) return;
+    shareDeleteInFlightRef.current = true;
+    setShareDeleteBusy(true);
+    setShareDeleteError(null);
     try {
-      await projectsAPI.deleteShare(selectedProject, pendingDeleteShare);
+      await projectsAPI.deleteShare(request.projectName, request.linkId);
       setPendingDeleteShare(null);
-      showToast('Share link deleted');
-      await loadShares();
-    } catch (err) { showErrorToast(err, 'Deleting share link'); }
+      if (await loadShares(request.projectName)) showToast('Share link deleted');
+    } catch (err) {
+      const extracted = extractError(err, 'Deleting share link');
+      logError(err, 'Deleting share link');
+      setShareDeleteError(extracted.message);
+    } finally {
+      releaseShareAction(owner);
+      shareDeleteInFlightRef.current = false;
+      setShareDeleteBusy(false);
+    }
   };
 
-  const copyToClipboard = (text: string, id: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 2000);
-  };
-
-  const askAI = async () => {
-    if (!aiMessage.trim()) return;
-    setAiLoading(true);
+  const makeSharePublic = async () => {
+    if (!confirmPublicId || !selectedProject || shareMakePublicInFlightRef.current || shareActionOwnerRef.current) return;
+    const request = { projectName: selectedProject, linkId: confirmPublicId };
+    const owner = Object.freeze({
+      kind: 'make-public' as const,
+      projectName: request.projectName,
+      projectGeneration: projectLoadGenerationRef.current,
+      linkId: request.linkId,
+      token: ++projectOperationTokenRef.current,
+    });
+    if (!claimShareAction(owner)) return;
+    shareMakePublicInFlightRef.current = true;
+    setShareMakePublicBusy(true);
+    setShareMakePublicError(null);
     try {
-      const context = openFile ? editorContent : undefined;
-      const data = await aiAPI.chat(aiMessage, context);
-      setAiResponse(data.response);
-    } catch (err) { showErrorToast(err, 'AI chat request'); } finally { setAiLoading(false); }
+      await projectsAPI.updateShare(request.projectName, request.linkId, { isPublic: true });
+      setConfirmPublicId(null);
+      if (await loadShares(request.projectName)) showToast('Link is now public');
+    } catch (err) {
+      const extracted = extractError(err, 'Making share link public');
+      logError(err, 'Making share link public');
+      setShareMakePublicError(extracted.message);
+    } finally {
+      releaseShareAction(owner);
+      shareMakePublicInFlightRef.current = false;
+      setShareMakePublicBusy(false);
+    }
   };
 
-  // Agent Chat functions
-  // Agent chat panel — open/close/auto-restore
+  const copyToClipboard = async (text: string, id: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedId(id);
+      setTimeout(() => setCopiedId((current) => current === id ? null : current), 2000);
+    } catch (error) {
+      showErrorToast(error, 'Copying link');
+    }
+  };
+
+  // Project Chat panel — open/close/auto-restore
   const agentAutoRestoreAttempted = useRef<string | null>(null);
 
   const openAgentChat = useCallback(() => {
-    if (!selectedProject) return;
+    if (!selectedProject || projectOperationRef.current) return;
     setAgentChatOpen(true);
   }, [selectedProject]);
 
   const closeAgentChat = useCallback(() => {
+    if (projectOperationRef.current) return;
     if (selectedProject) {
       localStorage.removeItem(`agent-active-${selectedProject}`);
     }
@@ -1463,6 +3309,10 @@ export default function AppsPage() {
 
   const analyzeFile = async () => {
     if (!openFile || !editorContent) return;
+    if (!analyzeModel || ollamaAvailable === false) {
+      showToast('Install and start an Ollama model before running local code analysis.', 'error');
+      return;
+    }
 
     // File size guard
     const lineCount = editorContent.split('\n').length;
@@ -1534,8 +3384,7 @@ export default function AppsPage() {
     lines.splice(startLine, endLine - startLine + 1, issue.code);
 
     const newContent = lines.join('\n');
-    setEditorContent(newContent);
-    setModified(true);
+    handleEditorChange(newContent);
 
     // Remove this issue from results
     setAnalysisResults(prev => prev.filter(i => i !== issue));
@@ -1544,27 +3393,54 @@ export default function AppsPage() {
   };
 
   const createNewFile = async () => {
-    if (!selectedProject || !newFilePath.trim()) return;
+    if (!selectedProject || !newFilePath.trim() || createEntryInFlightRef.current) return;
+    const requestedPath = newFilePath.trim();
+    if (!isValidProjectRelativePath(requestedPath)) {
+      showToast('Use a project-relative path without empty, dot, or parent segments.', 'error');
+      return;
+    }
+    createEntryInFlightRef.current = true;
+    setCreatingEntry(true);
     try {
       if (newFileIsDir) {
-        await projectsAPI.createFile(selectedProject, newFilePath + '/.gitkeep', '');
+        await projectsAPI.createFile(selectedProject, `${requestedPath}/.gitkeep`, '');
       } else {
-        await projectsAPI.createFile(selectedProject, newFilePath, '');
+        await projectsAPI.createFile(selectedProject, requestedPath, '');
       }
       setShowNewFile(false);
       setNewFilePath('');
       await refreshTree();
       showToast(`${newFileIsDir ? 'Folder' : 'File'} created`);
     } catch (err) { showErrorToast(err, `Creating ${newFileIsDir ? 'folder' : 'file'}: ${newFilePath}`); }
+    finally {
+      createEntryInFlightRef.current = false;
+      setCreatingEntry(false);
+    }
   };
 
   const requestDeleteFile = (filePath: string) => {
-    if (!selectedProject) return;
-    setPendingDelete({ kind: 'file', name: filePath.split('/').pop() || filePath, path: filePath });
+    if (!selectedProject || projectOperationRef.current || deleteInFlightRef.current) return;
+    setDeleteError(null);
+    setPendingDelete({
+      kind: 'file',
+      name: filePath.split('/').pop() || filePath,
+      projectName: selectedProject,
+      path: filePath,
+    });
   };
 
   const handleUploadFiles = async () => {
-    if (!selectedProject || uploadFiles.length === 0) return;
+    if (!selectedProject || uploadFiles.length === 0 || uploadFilesInFlightRef.current) return;
+    const aggregateBytes = uploadFiles.reduce((sum, file) => sum + file.size, 0);
+    if (uploadFiles.some((file) => file.size > 100 * 1024 * 1024)) {
+      showToast('Each project upload is limited to 100MB.', 'error');
+      return;
+    }
+    if (aggregateBytes > 500 * 1024 * 1024) {
+      showToast('The combined project upload is limited to 500MB.', 'error');
+      return;
+    }
+    uploadFilesInFlightRef.current = true;
     setUploadingFiles(true);
     try {
       const data = await projectsAPI.uploadFiles(selectedProject, uploadFiles, uploadTargetPath || undefined);
@@ -1580,6 +3456,7 @@ export default function AppsPage() {
     } catch (err) {
       showErrorToast(err, 'Uploading files');
     } finally {
+      uploadFilesInFlightRef.current = false;
       setUploadingFiles(false);
     }
   };
@@ -1587,15 +3464,20 @@ export default function AppsPage() {
   const openUploadDialog = (targetDir?: string) => {
     setUploadTargetPath(targetDir || '');
     setUploadFiles([]);
-    setUploadDragOver(false);
     setShowUploadDialog(true);
   };
 
   // react-dropzone for upload dialog (works on iPad)
   const { getRootProps: getUploadRootProps, getInputProps: getUploadInputProps, isDragActive: uploadIsDragActive } = useDropzone({
+    disabled: uploadingFiles,
     onDrop: (acceptedFiles) => {
       setUploadFiles(prev => [...prev, ...acceptedFiles]);
     },
+    onDropRejected: (rejections) => {
+      showToast(`${rejections.length} file(s) were rejected. Files must be 100MB or smaller.`, 'error');
+    },
+    maxFiles: 50,
+    maxSize: 100 * 1024 * 1024,
     noClick: false,
     noKeyboard: false,
   });
@@ -1616,31 +3498,57 @@ export default function AppsPage() {
   };
 
   const startRenameEntry = (entry: TreeEntry) => {
+    if (projectOperationRef.current) return;
     setRenamingEntry({ path: entry.path, name: entry.name, type: entry.type });
     setRenameValue(entry.name);
   };
 
   const executeRenameEntry = async () => {
+    if (entryRenameInFlightRef.current) return;
     if (!renamingEntry || !selectedProject || !renameValue.trim()) { setRenamingEntry(null); return; }
     const newName = renameValue.trim();
     if (newName === renamingEntry.name) { setRenamingEntry(null); return; }
     // Validate: no path traversal
-    if (newName.includes('/') || newName.includes('\\') || newName === '.' || newName === '..') {
+    if (newName.includes('/') || !isValidProjectRelativePath(newName)) {
       showToast('Invalid name', 'error'); setRenamingEntry(null); return;
     }
     const parentDir = renamingEntry.path.includes('/') ? renamingEntry.path.substring(0, renamingEntry.path.lastIndexOf('/')) : '';
     const newPath = parentDir ? `${parentDir}/${newName}` : newName;
+    const currentOpenFile = openFileRef.current;
+    const openFileIsAffected = Boolean(currentOpenFile && (
+      currentOpenFile.path === renamingEntry.path
+      || currentOpenFile.path.startsWith(`${renamingEntry.path}/`)
+    ));
+    entryRenameInFlightRef.current = true;
     try {
+      if (openFileIsAffected && currentOpenFile) {
+        await flushPendingAutoSave();
+        await fileWriteQueueRef.current.waitFor(selectedProject, currentOpenFile.path);
+      }
       await projectsAPI.renameFile(selectedProject, renamingEntry.path, newPath);
       showToast('Renamed successfully');
       await refreshTree();
       // If the renamed file was open, update the open file path
-      if (openFile && openFile.path === renamingEntry.path) {
-        setOpenFile({ ...openFile, path: newPath });
+      if (openFileIsAffected && currentOpenFile) {
+        const renamedOpenFile = {
+          ...currentOpenFile,
+          path: `${newPath}${currentOpenFile.path.slice(renamingEntry.path.length)}`,
+        };
+        openFileRef.current = renamedOpenFile;
+        setOpenFile(renamedOpenFile);
+      }
+      if (openMedia && (openMedia.path === renamingEntry.path || openMedia.path.startsWith(`${renamingEntry.path}/`))) {
+        const renamedMediaPath = `${newPath}${openMedia.path.slice(renamingEntry.path.length)}`;
+        setOpenMedia({
+          ...openMedia,
+          path: renamedMediaPath,
+          url: getProjectRawUrl(selectedProject, renamedMediaPath, openMedia.category === 'text' ? { mode: 'text' } : undefined),
+        });
       }
     } catch (e: any) {
       showToast(e?.response?.data?.error || 'Failed to rename', 'error');
     } finally {
+      entryRenameInFlightRef.current = false;
       setRenamingEntry(null);
     }
   };
@@ -1674,7 +3582,7 @@ export default function AppsPage() {
     const paths: string[] = [];
     const walk = (items: TreeEntry[]) => {
       for (const item of items) {
-        paths.push(item.path);
+        if (item.type === 'file') paths.push(item.path);
         if (item.type === 'directory' && expanded[item.path]) {
           walk(expanded[item.path]);
         }
@@ -1699,12 +3607,14 @@ export default function AppsPage() {
               <div className="group flex items-center">
                 <button
                   onClick={() => toggleDir(entry.path)}
+                  aria-expanded={Boolean(expandedDirs[entry.path])}
                   className="flex items-center gap-1.5 flex-1 px-2 py-1 text-xs text-slate-300 hover:bg-white/5 rounded transition-colors"
                 >
                   {expandedDirs[entry.path] ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
                   <FolderOpen size={13} className={entry.gitStatus ? 'text-amber-400' : 'text-amber-400/70'} />
                   {renamingEntry?.path === entry.path ? (
                     <input
+                      aria-label={`Rename folder ${entry.name}`}
                       value={renameValue}
                       onChange={e => setRenameValue(e.target.value)}
                       onBlur={executeRenameEntry}
@@ -1720,11 +3630,11 @@ export default function AppsPage() {
                   {entry.gitStatus && !renamingEntry && <span className={`text-[10px] ${gitStatusColor(entry.gitStatus)}`}>●</span>}
                 </button>
                 {!renamingEntry && (
-                  <div className="flex opacity-0 group-hover:opacity-100 transition-all">
-                    <button onClick={e => { e.stopPropagation(); startRenameEntry(entry); }} className="p-0.5 mr-0.5 text-slate-600 hover:text-blue-400 transition-all" title="Rename">
+                  <div className="flex opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-all">
+                    <button aria-label={`Rename folder ${entry.name}`} onClick={e => { e.stopPropagation(); startRenameEntry(entry); }} className="inline-flex size-7 items-center justify-center text-slate-600 hover:text-blue-400 transition-all" title="Rename">
                       <Edit3 size={10} />
                     </button>
-                    <button onClick={() => requestDeleteFile(entry.path)} className="p-0.5 mr-1 text-slate-600 hover:text-red-400 transition-all" title="Delete">
+                    <button aria-label={`Delete folder ${entry.name}`} onClick={() => requestDeleteFile(entry.path)} className="inline-flex size-7 items-center justify-center mr-1 text-slate-600 hover:text-red-400 transition-all" title="Delete">
                       <Trash2 size={10} />
                     </button>
                   </div>
@@ -1736,14 +3646,16 @@ export default function AppsPage() {
             <div className="group flex items-center">
               <button
                 onClick={() => { if (renamingEntry?.path !== entry.path) { openFileHandler(entry.path); if (isMobile) setSidebarVisible(false); } }}
+                disabled={projectOperation !== null}
                 className={`flex items-center gap-1.5 flex-1 px-2 py-1 text-xs rounded transition-colors ${
-                  (openFile?.path === entry.path || openMedia?.path === entry.path) ? 'bg-emerald-500/10 text-emerald-400' : 'text-slate-400 hover:bg-white/5 hover:text-white'
-                }`}
+                  (openFile?.path === entry.path || openMedia?.path === entry.path) ? 'accent-active' : 'text-slate-400 hover:bg-white/5 hover:text-white'
+                } disabled:cursor-not-allowed disabled:opacity-50`}
               >
                 <span className="w-3" />
                 {(() => { const Icon = getFileIcon(entry.name); return <Icon size={13} />; })()}
                 {renamingEntry?.path === entry.path ? (
                   <input
+                    aria-label={`Rename file ${entry.name}`}
                     value={renameValue}
                     onChange={e => setRenameValue(e.target.value)}
                     onBlur={executeRenameEntry}
@@ -1763,11 +3675,11 @@ export default function AppsPage() {
                 )}
               </button>
               {!renamingEntry && (
-                <div className="flex opacity-0 group-hover:opacity-100 transition-all">
-                  <button onClick={e => { e.stopPropagation(); startRenameEntry(entry); }} className="p-0.5 mr-0.5 text-slate-600 hover:text-blue-400 transition-all" title="Rename">
+                <div className="flex opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-all">
+                  <button aria-label={`Rename file ${entry.name}`} onClick={e => { e.stopPropagation(); startRenameEntry(entry); }} className="inline-flex size-7 items-center justify-center text-slate-600 hover:text-blue-400 transition-all" title="Rename">
                     <Edit3 size={10} />
                   </button>
-                  <button onClick={() => requestDeleteFile(entry.path)} className="p-0.5 mr-1 text-slate-600 hover:text-red-400 transition-all" title="Delete">
+                  <button aria-label={`Delete file ${entry.name}`} onClick={() => requestDeleteFile(entry.path)} className="inline-flex size-7 items-center justify-center mr-1 text-slate-600 hover:text-red-400 transition-all" title="Delete">
                     <Trash2 size={10} />
                   </button>
                 </div>
@@ -1798,27 +3710,35 @@ export default function AppsPage() {
 
   // Handle title bar path editing
   const handlePathEdit = async (newPath: string) => {
+    if (pathEditInFlightRef.current) return;
     if (!selectedProject || !openFile) return;
     if (newPath === openFile.path || !newPath.trim()) {
       setEditingPath(false);
       return;
     }
     
-    // Validate path (no .., no leading/trailing slashes)
-    if (newPath.includes('..') || newPath.startsWith('/') || newPath.endsWith('/')) {
+    if (!isValidProjectRelativePath(newPath.trim())) {
       showToast('Invalid path', 'error');
       setEditingPath(false);
       return;
     }
     
+    pathEditInFlightRef.current = true;
     try {
-      await projectsAPI.renameFile(selectedProject, openFile.path, newPath);
-      setOpenFile({ ...openFile, path: newPath });
+      await flushPendingAutoSave();
+      await fileWriteQueueRef.current.waitFor(selectedProject, openFile.path);
+      const normalizedPath = newPath.trim();
+      await projectsAPI.renameFile(selectedProject, openFile.path, normalizedPath);
+      const renamedOpenFile = { ...openFile, path: normalizedPath };
+      openFileRef.current = renamedOpenFile;
+      setOpenFile(renamedOpenFile);
       showToast('File moved - refresh sidebar to see changes');
     } catch (err: any) {
       showToast(err.response?.data?.error || 'Move failed', 'error');
+    } finally {
+      pathEditInFlightRef.current = false;
+      setEditingPath(false);
     }
-    setEditingPath(false);
   };
 
   // File breadcrumbs
@@ -1827,6 +3747,7 @@ export default function AppsPage() {
     if (editingPath) {
       return (
         <input
+          aria-label="File path"
           type="text"
           value={pathEditValue}
           onChange={(e) => setPathEditValue(e.target.value)}
@@ -1844,8 +3765,9 @@ export default function AppsPage() {
     
     const parts = filePath.split('/');
     return (
-      <div 
-        className="flex items-center gap-0.5 text-xs text-slate-500 cursor-pointer hover:text-slate-300 transition-colors group"
+      <button
+        type="button"
+        className="flex items-center gap-0.5 text-left text-xs text-slate-500 hover:text-slate-300 transition-colors group"
         onClick={() => {
           setEditingPath(true);
           setPathEditValue(filePath);
@@ -1859,19 +3781,19 @@ export default function AppsPage() {
           </span>
         ))}
         <Edit3 size={10} className="ml-1 opacity-0 group-hover:opacity-50" />
-      </div>
+      </button>
     );
   };
 
   // Monaco editor component (reused for normal and fullscreen)
   const editorElement = openFile && (
-    <Suspense fallback={<div className="h-full w-full flex items-center justify-center text-slate-500 bg-[#0a0e1a]"><Loader2 size={20} className="animate-spin" /></div>}>
+    <Suspense fallback={<div className="h-full w-full flex items-center justify-center bg-theme-surface text-theme-text-muted"><Loader2 size={20} className="animate-spin" /></div>}>
       <LazyMonacoEditor
       height="100%"
       language={openFile.language}
       value={editorContent}
       onChange={handleEditorChange}
-      theme="vs-dark"
+      theme={resolvedTheme === 'light' ? 'vs' : 'vs-dark'}
       options={{
         minimap: { enabled: editorFullscreen },
         fontSize: editorFullscreen ? 14 : 13,
@@ -1899,12 +3821,14 @@ export default function AppsPage() {
         <ViewportOverlay anchor="top-right" zIndex={1200} className="w-[min(32rem,calc(100vw-2rem))]">
           <AnimatePresence>
             <motion.div
+              role={toast.type === 'error' ? 'alert' : 'status'}
+              aria-live={toast.type === 'error' ? 'assertive' : 'polite'}
               initial={{ opacity: 0, y: -20 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -20 }}
               className={`rounded-xl text-sm font-medium shadow-2xl backdrop-blur-xl border ${
               toast.type === 'success' ? 'bg-emerald-500/90 border-emerald-400/30 text-white' :
-              toast.type === 'error' ? 'bg-red-900/95 border-red-500/50 text-red-100' :
+              toast.type === 'error' ? 'bg-red-700 border-red-500/50 text-white' :
               'bg-blue-500/90 border-blue-400/30 text-white'
             }`}
           >
@@ -1915,6 +3839,8 @@ export default function AppsPage() {
               <div className="flex items-center gap-1 flex-shrink-0 ml-2">
                 {(toast.detail || toast.hint) && (
                   <button
+                    aria-label={toastExpanded ? 'Hide notification details' : 'Show notification details'}
+                    aria-expanded={toastExpanded}
                     onClick={() => setToastExpanded(!toastExpanded)}
                     className="p-1 rounded hover:bg-white/20 transition-colors text-xs"
                     title={toastExpanded ? 'Collapse' : 'Show details'}
@@ -1922,7 +3848,7 @@ export default function AppsPage() {
                     {toastExpanded ? '▲' : '▼'}
                   </button>
                 )}
-                <button onClick={() => setToast(null)} className="p-1 rounded hover:bg-white/20 transition-colors font-bold">✕</button>
+                <button aria-label="Dismiss notification" onClick={() => setToast(null)} className="p-1 rounded hover:bg-white/20 transition-colors font-bold">✕</button>
               </div>
             </div>
             {/* Hint (always visible for errors) */}
@@ -1935,7 +3861,7 @@ export default function AppsPage() {
                 {toast.hint && <div className="text-xs mb-2 opacity-90">💡 <strong>Hint:</strong> {toast.hint}</div>}
                 {toast.detail && (
                   <div className="relative">
-                    <pre className="text-[11px] bg-black/40 rounded-lg p-2.5 overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap font-mono leading-relaxed text-red-200">
+                    <pre className="theme-fixed-dark text-[11px] bg-black/40 rounded-lg p-2.5 overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap font-mono leading-relaxed text-white/95">
                       {toast.detail}
                     </pre>
                     <button
@@ -1944,7 +3870,7 @@ export default function AppsPage() {
                         setToastCopied(true);
                         setTimeout(() => setToastCopied(false), 2000);
                       }}
-                      className="absolute top-1 right-1 px-1.5 py-0.5 rounded text-[10px] bg-black/60 hover:bg-black/80 transition-colors"
+                      className="theme-fixed-dark absolute top-1 right-1 px-1.5 py-0.5 rounded text-[10px] bg-black/60 hover:bg-black/80 text-white transition-colors"
                       title="Copy error details"
                     >
                       {toastCopied ? '✓ Copied' : '📋 Copy'}
@@ -1959,13 +3885,20 @@ export default function AppsPage() {
       )}
 
       {/* Fullscreen Editor Overlay */}
-      <AnimatePresence>
+      <ViewportModal
+        open={editorFullscreen && !!openFile}
+        onDismiss={() => setEditorFullscreen(false)}
+        initialFocusRef={fullscreenExitButtonRef}
+        className="bg-[#0A0E27]/98 backdrop-blur-sm"
+      >
         {editorFullscreen && openFile && (
           <motion.div
+            role="dialog"
+            aria-modal="true"
+            aria-label={`Fullscreen editor for ${openFile.path}`}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 bg-[#0A0E27]/98 backdrop-blur-sm flex flex-col"
+            className="flex h-full w-full flex-col"
           >
             {/* Fullscreen toolbar */}
             <div className="flex items-center justify-between px-4 py-2.5 border-b border-white/10 bg-[#0D1130]/90">
@@ -1976,11 +3909,11 @@ export default function AppsPage() {
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-[10px] text-slate-600 px-2 py-0.5 rounded bg-white/5">{openFile.language}</span>
-                <button onClick={saveFile} disabled={!modified || saving}
+                <button onClick={saveFile} disabled={!modified || saving} aria-busy={saving}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 text-xs disabled:opacity-30 transition-colors">
-                  {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />} Save
+                  {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />} {saving ? 'Saving…' : 'Save'}
                 </button>
-                <button onClick={() => setEditorFullscreen(false)}
+                <button ref={fullscreenExitButtonRef} onClick={() => setEditorFullscreen(false)}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white text-xs transition-colors">
                   <Minimize2 size={12} /> Exit <kbd className="ml-1 text-[9px] px-1 py-0.5 rounded bg-white/5 border border-white/10">ESC</kbd>
                 </button>
@@ -1992,23 +3925,28 @@ export default function AppsPage() {
             </div>
           </motion.div>
         )}
-      </AnimatePresence>
+      </ViewportModal>
 
       {/* File Search Dialog (Ctrl+P) */}
-      <AnimatePresence>
+      <ViewportModal
+        open={showFileSearch && !!selectedProject}
+        onDismiss={() => setShowFileSearch(false)}
+        initialFocusRef={fileSearchInputRef}
+        className="items-start bg-black/60 p-4 pt-[15vh] backdrop-blur-sm"
+      >
         {showFileSearch && selectedProject && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-start justify-center pt-[15vh]" onClick={() => setShowFileSearch(false)}>
-            <motion.div initial={{ scale: 0.95, y: -10 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.95, y: -10 }}
-              className="glass max-w-lg w-full shadow-2xl" onClick={e => e.stopPropagation()}>
+            <motion.div initial={{ scale: 0.95, y: -10 }} animate={{ scale: 1, y: 0 }}
+              role="dialog" aria-modal="true" aria-label="Search project files"
+              className="glass max-h-[calc(85dvh-1rem)] w-full max-w-lg overflow-hidden shadow-2xl">
               <div className="flex items-center gap-2 px-4 py-3 border-b border-white/10">
                 <Search size={14} className="text-slate-500" />
                 <input
+                  ref={fileSearchInputRef}
+                  aria-label="Search project files"
                   value={fileSearchQuery}
                   onChange={e => setFileSearchQuery(e.target.value)}
                   className="flex-1 bg-transparent text-sm text-white placeholder-slate-500 outline-none"
                   placeholder="Search files..."
-                  autoFocus
                 />
                 <kbd className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-slate-500">ESC</kbd>
               </div>
@@ -2017,21 +3955,20 @@ export default function AppsPage() {
                   <div className="px-4 py-6 text-center text-sm text-slate-500">No files found</div>
                 ) : filteredFiles.map(fp => (
                   <button key={fp} onClick={() => { openFileHandler(fp); setShowFileSearch(false); setFileSearchQuery(''); }}
-                    className="w-full px-4 py-2 text-left text-xs text-slate-300 hover:bg-emerald-500/10 hover:text-emerald-400 flex items-center gap-2 transition-colors">
+                    className="w-full px-4 py-2 text-left text-xs text-slate-300 hover:bg-emerald-500/10 hover:text-emerald-400 flex items-center gap-2 transition-colors disabled:cursor-not-allowed disabled:opacity-50">
                     <FileText size={12} className="text-slate-500 flex-shrink-0" />
                     <span className="truncate">{fp}</span>
                   </button>
                 ))}
               </div>
             </motion.div>
-          </motion.div>
         )}
-      </AnimatePresence>
+      </ViewportModal>
 
       {/* Top Bar */}
       <div className="flex items-center justify-between px-2 md:px-4 py-2 md:py-2.5 border-b border-white/5 bg-[#0D1130]/80 flex-shrink-0 gap-1">
         <div className="flex items-center gap-1.5 md:gap-3 min-w-0 flex-shrink overflow-hidden">
-          <button onClick={() => setSidebarVisible(v => !v)} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white transition-colors flex-shrink-0" title="Toggle sidebar (Ctrl+B)">
+          <button aria-label="Toggle projects sidebar" aria-expanded={sidebarVisible} aria-controls="projects-sidebar" onClick={() => setSidebarVisible(v => !v)} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white transition-colors flex-shrink-0" title="Toggle sidebar (Ctrl+B)">
             {sidebarVisible ? <PanelLeftClose size={16} /> : <PanelLeft size={16} />}
           </button>
           <Rocket size={16} className="text-emerald-400 flex-shrink-0 hidden md:block" />
@@ -2057,11 +3994,17 @@ export default function AppsPage() {
             <>
               {openFile && (
                 <button onClick={saveFile} disabled={!modified || saving}
+                  aria-label={saving ? 'Saving file…' : 'Save file'}
+                  aria-busy={saving}
                   className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 text-xs disabled:opacity-30 min-w-[44px] min-h-[44px] justify-center">
                   {saving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
                 </button>
               )}
-              <button onClick={deployProject} disabled={deploying}
+              <button
+                onClick={deployProject}
+                disabled={deploying}
+                aria-label={deploying ? (isRuntimeProject ? 'Starting project…' : 'Deploying project…') : (isRuntimeProject ? 'Run project' : 'Deploy project')}
+                aria-busy={deploying}
                 className={`flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs font-medium min-w-[44px] min-h-[44px] justify-center ${
                   deployStatus === 'success' ? 'bg-emerald-500/20 text-emerald-300' :
                   deployStatus === 'failed' ? 'bg-red-500/20 text-red-300' :
@@ -2074,17 +4017,23 @@ export default function AppsPage() {
               <MobileOverflowMenu actions={[
                 ...(openFile ? [
                   { label: 'Fullscreen Editor', icon: <Maximize2 size={16} />, onClick: () => setEditorFullscreen(true) },
-                  { label: `Analyze (${analyzeModel === 'qwen3:1.7b' ? 'Snappy' : analyzeModel === 'qwen3:8b' ? 'Best' : 'Smart'})`, icon: <Zap size={16} />, onClick: analyzeFile, disabled: analyzing },
+                  { label: `Analyze (${analyzeModel ? formatOllamaModelLabel(analyzeModel) : 'No local model'})`, icon: <Zap size={16} />, onClick: analyzeFile, disabled: analyzing || !analyzeModel || ollamaAvailable === false },
                 ] : []),
                 // Show Check for runtime, Preview for others
                 ...(isRuntimeProject 
                   ? [{ label: 'Check Syntax', icon: <CheckCircle size={16} />, onClick: checkProject, disabled: checkingProject }]
                   : [{ label: 'Preview', icon: <Eye size={16} />, onClick: () => setShowPreview(!showPreview), active: showPreview }]
                 ),
-                { label: 'Git', icon: <GitBranch size={16} />, onClick: () => setActivePanel(activePanel === 'git' ? null : 'git'), active: activePanel === 'git' },
-                { label: 'Activity', icon: <Activity size={16} />, onClick: () => setActivePanel(activePanel === 'activity' ? null : 'activity'), active: activePanel === 'activity' },
-                { label: 'Share', icon: <Share2 size={16} />, onClick: () => setActivePanel(activePanel === 'share' ? null : 'share'), active: activePanel === 'share' },
-                { label: 'Agent AI', icon: <Bot size={16} />, onClick: () => agentChatOpen ? closeAgentChat() : openAgentChat(), active: agentChatOpen },
+                { label: 'Git', icon: <GitBranch size={16} />, onClick: () => toggleActivePanel('git'), active: activePanel === 'git', disabled: shareActionActive && activePanel === 'share' },
+                { label: 'Activity', icon: <Activity size={16} />, onClick: () => toggleActivePanel('activity'), active: activePanel === 'activity', disabled: shareActionActive && activePanel === 'share' },
+                { label: 'Share', icon: <Share2 size={16} />, onClick: () => toggleActivePanel('share'), active: activePanel === 'share', disabled: shareActionActive && activePanel === 'share' },
+                ...(currentProject?.deployment ? [{
+                  label: 'Deployment controls',
+                  icon: <Rocket size={16} />,
+                  onClick: () => toggleActivePanel('deployment'),
+                  active: activePanel === 'deployment',
+                }] : []),
+                { label: 'Project Chat', icon: <Bot size={16} />, onClick: () => agentChatOpen ? closeAgentChat() : openAgentChat(), active: agentChatOpen },
                 { label: 'Download (Full)', icon: <Download size={16} />, onClick: () => downloadProject('full') },
                 { label: 'Download (Clean)', icon: <Download size={16} />, onClick: () => downloadProject('clean') },
                 { label: 'Download (Stripped)', icon: <Download size={16} />, onClick: () => downloadProject('stripped'), variant: 'danger' as const },
@@ -2098,20 +4047,25 @@ export default function AppsPage() {
               {selectedProject && openFile && (
                 <>
                   <button onClick={saveFile} disabled={!modified || saving}
+                    aria-busy={saving}
                     className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 text-xs disabled:opacity-30 transition-colors">
-                    {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />} Save
+                    {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />} {saving ? 'Saving…' : 'Save'}
                   </button>
                   <button onClick={() => setEditorFullscreen(true)}
+                    aria-label="Open fullscreen editor"
                     className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white text-xs transition-colors" title="Fullscreen (Ctrl+Shift+F)">
                     <Maximize2 size={12} />
                   </button>
-                  <select value={analyzeModel} onChange={e => setAnalyzeModel(e.target.value)}
+                  <select value={analyzeModel} onChange={e => setAnalyzeModel(e.target.value)} disabled={analyzeModels.length === 0}
+                    aria-label="Ollama model for code analysis"
                     className="px-2 py-1.5 rounded-lg bg-white/5 border border-white/10 text-xs text-slate-300 focus:outline-none focus:border-purple-500/30">
-                    <option value="qwen3:1.7b">⚡ Snappy (Qwen3 1.7B)</option>
-                    <option value="qwen3:4b">🧠 Smart (Qwen3 4B)</option>
-                    <option value="qwen3:8b">🚀 Best (Qwen3 8B)</option>
+                    {analyzeModels.length === 0 && <option value="">No installed Ollama models</option>}
+                    {analyzeModels.map((model) => (
+                      <option key={model} value={model}>{formatOllamaModelLabel(model)}</option>
+                    ))}
                   </select>
-                  <button onClick={analyzeFile} disabled={analyzing}
+                  <button onClick={analyzeFile} disabled={analyzing || !analyzeModel || ollamaAvailable === false}
+                    aria-busy={analyzing}
                     className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-purple-500/10 text-purple-400 hover:bg-purple-500/20 text-xs transition-colors disabled:opacity-50">
                     {analyzing ? <><Loader2 size={12} className="animate-spin" /> Analyzing...</> : <><Zap size={12} /> Analyze</>}
                   </button>
@@ -2122,8 +4076,9 @@ export default function AppsPage() {
                   {/* Preview button for static/fullstack, Check button for runtime */}
                   {isRuntimeProject ? (
                     <button onClick={checkProject} disabled={checkingProject}
+                      aria-busy={checkingProject}
                       className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${checkingProject ? 'bg-blue-500/20 text-blue-300' : 'bg-blue-500/10 text-blue-400 hover:bg-blue-500/20'}`}>
-                      {checkingProject ? <Loader2 size={12} className="animate-spin" /> : <CheckCircle size={12} />} Check
+                      {checkingProject ? <Loader2 size={12} className="animate-spin" /> : <CheckCircle size={12} />} {checkingProject ? 'Checking…' : 'Check'}
                     </button>
                   ) : (
                     <button onClick={() => setShowPreview(!showPreview)}
@@ -2131,20 +4086,34 @@ export default function AppsPage() {
                       <Eye size={12} /> Preview
                     </button>
                   )}
-                  <button onClick={() => setActivePanel(activePanel === 'git' ? null : 'git')}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${activePanel === 'git' ? 'bg-orange-500/20 text-orange-300 border border-orange-500/30' : 'bg-orange-500/10 text-orange-400 hover:bg-orange-500/20'}`}>
+                  <button onClick={() => toggleActivePanel('git')} disabled={shareActionActive && activePanel === 'share'}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${activePanel === 'git' ? 'bg-orange-500/20 text-orange-300 border border-orange-500/30' : 'bg-orange-500/10 text-orange-400 hover:bg-orange-500/20'}`}>
                     <GitBranch size={12} /> Git
                   </button>
-                  <button onClick={() => setActivePanel(activePanel === 'activity' ? null : 'activity')}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${activePanel === 'activity' ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30' : 'bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/20'}`}>
+                  <button onClick={() => toggleActivePanel('activity')} disabled={shareActionActive && activePanel === 'share'}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${activePanel === 'activity' ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30' : 'bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/20'}`}>
                     <Activity size={12} /> Activity
                   </button>
-                  <button onClick={() => setActivePanel(activePanel === 'share' ? null : 'share')}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${activePanel === 'share' ? 'bg-violet-500/20 text-violet-300 border border-violet-500/30' : 'bg-violet-500/10 text-violet-400 hover:bg-violet-500/20'}`}>
+                  <button onClick={() => toggleActivePanel('share')} disabled={shareActionActive && activePanel === 'share'}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${activePanel === 'share' ? 'bg-violet-500/20 text-violet-300 border border-violet-500/30' : 'bg-violet-500/10 text-violet-400 hover:bg-violet-500/20'}`}>
                     <Share2 size={12} /> Share
                   </button>
+                  {currentProject?.deployment && (
+                    <button
+                      onClick={() => toggleActivePanel('deployment')}
+                      aria-pressed={activePanel === 'deployment'}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${
+                        activePanel === 'deployment'
+                          ? 'bg-sky-500/20 text-sky-300 border border-sky-500/30'
+                          : 'bg-sky-500/10 text-sky-400 hover:bg-sky-500/20'
+                      }`}
+                    >
+                      <Rocket size={12} /> Runtime
+                    </button>
+                  )}
                   {/* Deploy button for static/fullstack, Run button for runtime */}
                   <button onClick={deployProject} disabled={deploying}
+                    aria-busy={deploying}
                     className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors font-medium ${
                       deployStatus === 'success' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' :
                       deployStatus === 'failed' ? 'bg-red-500/20 text-red-300 border border-red-500/30' :
@@ -2154,7 +4123,8 @@ export default function AppsPage() {
                      deployStatus === 'success' ? <CheckCircle size={12} /> :
                      deployStatus === 'failed' ? <AlertCircle size={12} /> :
                      isRuntimeProject ? <Play size={12} /> : <Upload size={12} />}
-                    {deployStatus === 'success' ? (isRuntimeProject ? 'Running!' : 'Deployed!') : 
+                    {deploying ? (isRuntimeProject ? 'Starting…' : 'Deploying…') :
+                     deployStatus === 'success' ? (isRuntimeProject ? 'Running!' : 'Deployed!') :
                      deployStatus === 'failed' ? 'Failed' : 
                      isRuntimeProject ? 'Run' : 'Deploy'}
                   </button>
@@ -2162,20 +4132,24 @@ export default function AppsPage() {
                   {/* Download buttons */}
                   <div className="flex gap-1">
                     <button onClick={() => downloadProject('full')} title="Full backup - everything included"
+                      aria-label="Download full project backup"
                       className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 text-xs transition-colors border border-emerald-500/20">
                       <Download size={12} />
                     </button>
                     <button onClick={() => downloadProject('clean')} title="Clean - no junk files, comments preserved"
+                      aria-label="Download clean project backup"
                       className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20 text-xs transition-colors border border-yellow-500/20">
                       <Download size={12} />
                     </button>
                     <button onClick={() => downloadProject('stripped')} title="Stripped - no junk files, no comments"
+                      aria-label="Download stripped project backup"
                       className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500/20 text-xs transition-colors border border-red-500/20">
                       <Download size={12} />
                     </button>
                   </div>
                   {currentProject?.deployedUrl && (
                     <a href={currentProject.deployedUrl} target="_blank" rel="noopener noreferrer"
+                      aria-label={`Open deployed site for ${currentProject.name}`}
                       className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-white/5 text-slate-400 hover:text-white text-xs transition-colors">
                       <ExternalLink size={12} />
                     </a>
@@ -2183,9 +4157,13 @@ export default function AppsPage() {
                 </>
               )}
               {selectedProject && (
-                <button onClick={() => agentChatOpen ? closeAgentChat() : openAgentChat()}
+                <button
+                  onClick={() => agentChatOpen ? closeAgentChat() : openAgentChat()}
+                  disabled={projectOperation !== null}
+                  aria-label={agentChatOpen ? 'Close Project Chat' : 'Open Project Chat'}
+                  aria-pressed={agentChatOpen}
                   className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${agentChatOpen ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30' : 'bg-purple-500/10 text-purple-400 hover:bg-purple-500/20'}`}>
-                  <Bot size={12} /> Agent
+                  <Bot size={12} /> Project Chat
                 </button>
               )}
             </>
@@ -2195,44 +4173,47 @@ export default function AppsPage() {
 
       <div className="flex-1 flex overflow-hidden">
         {/* Sidebar - Project List & File Tree */}
-        {/* Mobile sidebar backdrop */}
-        <AnimatePresence>
-          {isMobile && sidebarVisible && (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="fixed inset-0 bg-black/60 z-30 md:hidden"
-              onClick={() => setSidebarVisible(false)}
-            />
-          )}
-        </AnimatePresence>
         <AnimatePresence>
           {sidebarVisible && (
-            <motion.div
-              initial={{ width: 0, opacity: 0, ...(isMobile ? { x: -280 } : {}) }}
-              animate={{ width: isMobile ? 280 : 224, opacity: 1, ...(isMobile ? { x: 0 } : {}) }}
-              exit={{ width: 0, opacity: 0, ...(isMobile ? { x: -280 } : {}) }}
-              transition={{ duration: 0.15, ...(isMobile ? { type: 'spring', damping: 25 } : {}) }}
-              className={`border-r border-white/5 flex flex-col flex-shrink-0 overflow-hidden bg-[#080B20]/95 ${
-                isMobile ? 'fixed left-0 top-0 bottom-0 z-40' : ''
-              }`}
+            <ResponsiveProjectSidebar
+              isMobile={isMobile}
+              onDismiss={() => {
+                if (!projectOperationRef.current) setSidebarVisible(false);
+              }}
             >
               <div className="p-2 border-b border-white/5 flex items-center justify-between">
                 <span className="text-[10px] font-medium text-slate-500 uppercase tracking-wider px-1">Projects</span>
                 <div className="flex gap-0.5">
-                  <button onClick={() => { setShowCreate(true); setNewName(''); setCloneUrl(''); setZipFile(null); setUploadProgress(null); }} className="p-1 rounded hover:bg-emerald-500/20 text-emerald-500 hover:text-emerald-400 transition-colors" title="New Project">
+                  <button
+                    aria-label={projectsCollapsed ? 'Expand project list' : 'Collapse project list'}
+                    aria-expanded={!projectsCollapsed}
+                    onClick={() => setProjectsCollapsed((value) => { const next = !value; localStorage.setItem('projects-sidebar-collapsed', next ? '1' : '0'); return next; })}
+                    className="p-1 rounded hover:bg-white/5 text-slate-600 hover:text-white transition-colors"
+                    title={projectsCollapsed ? 'Show all projects' : 'Collapse to the active project'}
+                  >
+                    {projectsCollapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+                  </button>
+                  <button aria-label="Create project" onClick={() => { setShowCreate(true); setNewName(''); setCloneUrl(''); setZipFile(null); setUploadProgress(null); }} className="p-1 rounded hover:bg-emerald-500/20 text-emerald-500 hover:text-emerald-400 transition-colors" title="New Project">
                     <Plus size={14} />
                   </button>
-                  <button onClick={() => setShowFileSearch(true)} className="p-1 rounded hover:bg-white/5 text-slate-600 hover:text-white transition-colors" title="Search files (Ctrl+P)">
+                  <button aria-label="Search project files" onClick={() => setShowFileSearch(true)} className="p-1 rounded hover:bg-white/5 text-slate-600 hover:text-white transition-colors" title="Search files (Ctrl+P)">
                     <Search size={11} />
                   </button>
-                  <button onClick={loadProjects} className="p-1 rounded hover:bg-white/5 text-slate-600 hover:text-white transition-colors" title="Refresh">
+                  <button aria-label="Refresh projects" onClick={loadProjects} className="p-1 rounded hover:bg-white/5 text-slate-600 hover:text-white transition-colors" title="Refresh">
                     <RefreshCw size={11} />
                   </button>
+                  {isMobile && (
+                    <button aria-label="Close projects sidebar" onClick={() => setSidebarVisible(false)} className="inline-flex size-7 items-center justify-center rounded text-slate-500 hover:bg-white/5 hover:text-white">
+                      <X size={14} />
+                    </button>
+                  )}
                 </div>
               </div>
-              <div className="flex-1 overflow-auto">
+              <div
+                role="region"
+                aria-label="Project list"
+                className={`min-h-0 overflow-y-auto ${selectedProject ? 'max-h-[42%] flex-none' : 'flex-1'}`}
+              >
                 {loading ? (
                   <div className="flex justify-center py-8"><Loader2 size={20} className="animate-spin text-emerald-400" /></div>
                 ) : projects.length === 0 ? (
@@ -2243,77 +4224,111 @@ export default function AppsPage() {
                   </div>
                 ) : (
                   <div className="p-1 space-y-0.5">
-                    {projects.map(p => (
+                    {!projectsCollapsed && projects.length > 5 && (
+                      <div className="px-1 pb-1">
+                        <input
+                          aria-label="Filter projects"
+                          value={projectFilter}
+                          onChange={(e) => setProjectFilter(e.target.value)}
+                          placeholder="Filter projects…"
+                          className="w-full bg-white/[0.04] border border-white/10 rounded-md px-2 py-1 text-[11px] text-slate-200 placeholder:text-slate-600 outline-none focus:border-emerald-500/40"
+                        />
+                      </div>
+                    )}
+                    {projectsCollapsed && (
+                      <button
+                        onClick={() => { setProjectsCollapsed(false); localStorage.setItem('projects-sidebar-collapsed', '0'); }}
+                        className="w-full text-left px-2 py-1 text-[10px] text-slate-500 hover:text-slate-300 transition-colors"
+                      >
+                        {projects.length - (selectedProject ? 1 : 0)} more project{projects.length - (selectedProject ? 1 : 0) === 1 ? '' : 's'} hidden — show all
+                      </button>
+                    )}
+                    {visibleSidebarProjects.map(p => (
                       <div key={p.name} className="group">
-                        {renamingProject === p.name ? (
-                          <div className="flex items-center gap-1 px-2 py-1">
-                            <Globe size={13} className="flex-shrink-0 text-emerald-400" />
-                            <input
-                              autoFocus
-                              value={renameProjectValue}
-                              onChange={e => setRenameProjectValue(e.target.value)}
-                              onKeyDown={e => { if (e.key === 'Enter') submitRenameProject(); if (e.key === 'Escape') setRenamingProject(null); }}
-                              onBlur={() => submitRenameProject()}
-                              className="flex-1 min-w-0 bg-white/10 border border-emerald-500/30 rounded px-1.5 py-0.5 text-xs text-white outline-none focus:border-emerald-400/50"
-                            />
-                          </div>
-                        ) : (
-                          <button
-                            onClick={() => selectProject(p.name)}
-                            onDoubleClick={(e) => { e.preventDefault(); startRenameProject(p.name); }}
-                            className={`flex items-center justify-between w-full px-2 py-1.5 text-xs rounded-lg transition-colors ${
-                              selectedProject === p.name ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'text-slate-300 hover:bg-white/5'
+                          <div
+                            className={`flex items-center w-full text-xs rounded-lg transition-colors ${
+                              selectedProject === p.name ? 'accent-active border' : 'text-slate-300 hover:bg-white/5'
                             }`}
                           >
-                            <div className="flex items-center gap-1.5 truncate min-w-0">
+                            <button
+                              disabled={shareActionActive || projectOperation !== null || deleteBusy}
+                              onClick={() => {
+                                if (projectOperationRef.current) return;
+                                if (projectDeepLinkPresent) navigate('/projects', { replace: true });
+                                void selectProject(p.name);
+                              }}
+                              onDoubleClick={(e) => { e.preventDefault(); void startRenameProject(p.name); }}
+                              aria-current={selectedProject === p.name ? 'page' : undefined}
+                              className="flex flex-1 items-center gap-1.5 min-w-0 px-2 py-1.5 text-left disabled:cursor-not-allowed disabled:opacity-50"
+                            >
                               <Globe size={13} className="flex-shrink-0" />
                               <span className="truncate">{p.name}</span>
                               {p.deployedUrl && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0" title="Deployed" />}
                               {p.currentBranch && p.currentBranch !== 'main' && p.currentBranch !== 'master' && (
                                 <span className="text-[9px] text-orange-400/60 flex-shrink-0">⌥ {p.currentBranch}</span>
                               )}
-                            </div>
-                            <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-all flex-shrink-0">
+                            </button>
+                            <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-all flex-shrink-0">
                               <button
-                                onClick={(e) => { e.stopPropagation(); startRenameProject(p.name); }}
-                                className="p-0.5 hover:text-emerald-300 transition-all"
-                                title="Rename project"
+                                aria-label={`Rename project ${p.name}`}
+                                aria-describedby={!p.destructiveActions.allowed ? `project-actions-${p.identity.id}` : undefined}
+                                disabled={!p.destructiveActions.allowed || projectOperation !== null || deleteBusy}
+                                onClick={(e) => { e.stopPropagation(); void startRenameProject(p.name); }}
+                                className="inline-flex size-8 items-center justify-center hover:text-emerald-300 transition-all disabled:cursor-not-allowed disabled:opacity-40"
+                                title={p.destructiveActions.allowed ? 'Rename project' : p.destructiveActions.reason || undefined}
                               >
                                 <Edit3 size={11} />
                               </button>
                               <button
+                                aria-label={`Delete project ${p.name}`}
+                                aria-describedby={!p.destructiveActions.allowed ? `project-actions-${p.identity.id}` : undefined}
+                                disabled={!p.destructiveActions.allowed || projectOperation !== null || deleteBusy}
                                 onClick={(e) => { e.stopPropagation(); requestDeleteProject(p.name); }}
-                                className="p-0.5 hover:text-red-400 transition-all"
-                                title="Delete project"
+                                className="inline-flex size-8 items-center justify-center hover:text-red-400 transition-all disabled:cursor-not-allowed disabled:opacity-40"
+                                title={p.destructiveActions.allowed ? 'Delete project' : p.destructiveActions.reason || undefined}
                               >
                                 <Trash2 size={11} />
                               </button>
                             </div>
-                          </button>
-                        )}
+                          </div>
+                          {!p.destructiveActions.allowed && selectedProject === p.name && (
+                            <p
+                              id={`project-actions-${p.identity.id}`}
+                              className="px-2 pb-1.5 pt-1 text-[10px] leading-relaxed text-amber-200/80"
+                            >
+                              {p.destructiveActions.reason}
+                            </p>
+                          )}
                       </div>
                     ))}
                   </div>
                 )}
+              </div>
 
-                {/* File Tree */}
-                {selectedProject && tree.length > 0 && (
-                  <>
-                    <div className="p-2 border-t border-white/5 flex items-center justify-between">
+              {/* The active project's files own their own scroll pane so a
+                  large project inventory can never push them off-screen. */}
+              {selectedProject && (
+                <div
+                  role="region"
+                  aria-label={`Files for ${selectedProject}`}
+                  className="flex min-h-0 flex-1 flex-col border-t border-white/5"
+                >
+                    <div className="p-2 flex items-center justify-between">
                       <span className="text-[10px] font-medium text-slate-500 uppercase tracking-wider px-1">Files</span>
                       <div className="flex gap-0.5">
-                        <button onClick={() => { setShowNewFile(true); setNewFileIsDir(false); }} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white" title="New File"><FilePlus size={12} /></button>
-                        <button onClick={() => { setShowNewFile(true); setNewFileIsDir(true); }} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white" title="New Folder"><FolderPlus size={12} /></button>
-                        <button onClick={() => openUploadDialog()} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-emerald-400" title="Upload Files"><Upload size={12} /></button>
-                        <button onClick={refreshTree} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white" title="Refresh"><RefreshCw size={12} /></button>
+                        <button aria-label="Create file" onClick={() => { setShowNewFile(true); setNewFileIsDir(false); }} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white" title="New File"><FilePlus size={12} /></button>
+                        <button aria-label="Create folder" onClick={() => { setShowNewFile(true); setNewFileIsDir(true); }} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white" title="New Folder"><FolderPlus size={12} /></button>
+                        <button aria-label="Upload project files" onClick={() => openUploadDialog()} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-emerald-400" title="Upload Files"><Upload size={12} /></button>
+                        <button aria-label="Refresh project files" onClick={() => { void refreshTree(); }} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white" title="Refresh"><RefreshCw size={12} /></button>
                       </div>
                     </div>
-                    <div className="px-1 pb-2">
-                      {renderTree(tree)}
+                    <div className="min-h-0 flex-1 overflow-y-auto px-1 pb-2">
+                      {tree.length > 0 ? renderTree(tree) : (
+                        <p className="px-2 py-3 text-[10px] text-slate-600">No files yet</p>
+                      )}
                     </div>
-                  </>
-                )}
-              </div>
+                </div>
+              )}
 
               {/* Keyboard shortcuts hint */}
               <div className="p-2 border-t border-white/5 text-[9px] text-slate-600 space-y-0.5">
@@ -2321,7 +4336,7 @@ export default function AppsPage() {
                 <div className="flex justify-between"><span>Fullscreen</span><kbd className="px-1 rounded bg-white/5">⌘⇧F</kbd></div>
                 <div className="flex justify-between"><span>Search</span><kbd className="px-1 rounded bg-white/5">⌘P</kbd></div>
               </div>
-            </motion.div>
+            </ResponsiveProjectSidebar>
           )}
         </AnimatePresence>
 
@@ -2332,21 +4347,9 @@ export default function AppsPage() {
               <div className="flex items-center gap-2 px-3 py-1.5 border-b border-white/5 bg-white/[0.02] text-xs">
                 <Diff size={12} className="text-orange-400" />
                 <span className="text-slate-300">{selectedDiff.file ? `Diff: ${selectedDiff.file}` : 'Diff'}</span>
-                <button onClick={() => setSelectedDiff(null)} className="ml-auto text-slate-500 hover:text-white"><X size={14} /></button>
+                <button aria-label="Close file diff" onClick={() => setSelectedDiff(null)} className="ml-auto inline-flex size-8 items-center justify-center text-slate-500 hover:text-white"><X size={14} /></button>
               </div>
-              <div className="flex-1 overflow-auto bg-[#0a0e1a]">{renderDiff(selectedDiff.content)}</div>
-            </>
-          ) : commitDiff ? (
-            <>
-              <div className="flex items-center gap-2 px-3 py-1.5 border-b border-white/5 bg-white/[0.02] text-xs">
-                <History size={12} className="text-blue-400" />
-                <span className="text-slate-300">Commit: {commitDiff.hash.substring(0, 8)}</span>
-                <button onClick={() => setCommitDiff(null)} className="ml-auto text-slate-500 hover:text-white"><X size={14} /></button>
-              </div>
-              <div className="p-3 border-b border-white/5 text-xs text-slate-400 bg-white/[0.01]">
-                <pre className="font-mono whitespace-pre-wrap">{commitDiff.output}</pre>
-              </div>
-              <div className="flex-1 overflow-auto bg-[#0a0e1a]">{renderDiff(commitDiff.diff)}</div>
+              <div className="flex-1 overflow-auto bg-theme-surface-raised">{renderDiff(selectedDiff.content)}</div>
             </>
           ) : openMedia ? (
             /* Media Preview */
@@ -2386,13 +4389,24 @@ export default function AppsPage() {
                 </div>
               </div>
               <div className="flex-1 flex overflow-hidden">
-                <div className={`${showPreview ? 'w-1/2' : 'w-full'} flex-shrink-0`}>
-                  {editorElement}
+                {/* On narrow screens a half-width preview pane has no room and
+                    the toggle looked dead; preview takes the full area there
+                    with an explicit way back to the code. */}
+                <div className={`${showPreview ? (isMobile ? 'hidden' : 'w-1/2') : 'w-full'} flex-shrink-0`}>
+                  {!editorFullscreen && editorElement}
                 </div>
                 {showPreview && (
-                  <div className="w-1/2 border-l border-white/5 bg-white overflow-auto">
-                    <Suspense fallback={<div className="w-full h-full flex items-center justify-center text-slate-500 bg-[#0a0a0a]"><Loader2 size={20} className="animate-spin" /></div>}>
-                      <LazyMarkdownPreviewFrame language={openFile.language} content={editorContent} />
+                  <div className={`${isMobile ? 'w-full' : 'w-1/2 border-l'} border-white/5 bg-white overflow-auto relative`}>
+                    {isMobile && (
+                      <button
+                        onClick={() => setShowPreview(false)}
+                        className="absolute top-2 right-2 z-10 px-2.5 py-1 rounded-md bg-black/70 text-white text-[11px] font-medium border border-white/20"
+                      >
+                        Back to code
+                      </button>
+                    )}
+                    <Suspense fallback={<div className="w-full h-full flex items-center justify-center text-theme-text-muted bg-theme-surface"><Loader2 size={20} className="animate-spin" /></div>}>
+                      <LazyMarkdownPreviewFrame language={openFile.language} content={editorContent} theme={resolvedTheme} />
                     </Suspense>
                   </div>
                 )}
@@ -2417,27 +4431,23 @@ export default function AppsPage() {
           )}
         </div>
 
-        {/* Right Panel - Git / AI / Share / Activity */}
+        {/* Right Panel - Git / Share / Activity */}
         <AnimatePresence>
           {activePanel === 'git' && selectedProject && (
-            <motion.div
-              initial={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
-              animate={isMobile ? { opacity: 1, x: 0 } : { width: 340, opacity: 1 }}
-              exit={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
-              transition={{ duration: 0.15 }}
-              className={isMobile
-                ? 'fixed inset-0 z-50 flex flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
-                : 'border-l border-white/5 flex flex-col overflow-hidden flex-shrink-0 bg-[#080B20]/50'}
+            <ResponsiveProjectPanel
+              isMobile={isMobile}
+              mobileLabel="Project Git panel"
+              onDismiss={() => { if (projectOperationRef.current?.kind !== 'git') setActivePanel(null); }}
             >
               <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
                 <span className="text-xs font-medium flex items-center gap-1.5"><GitBranch size={13} className="text-orange-400" /> Git</span>
                 <div className="flex items-center gap-1">
-                  {gitLoading && <Loader2 size={12} className="animate-spin text-slate-500" />}
-                  <button onClick={() => setActivePanel(null)} className="text-slate-500 hover:text-white p-0.5"><X size={14} /></button>
+                  {gitLoading && projectOperation?.kind !== 'git' && <Loader2 size={12} className="animate-spin text-slate-500" aria-label="Refreshing Git data" />}
+                  <button aria-label="Close Git panel" onClick={() => { if (projectOperationRef.current?.kind !== 'git') setActivePanel(null); }} disabled={projectOperation?.kind === 'git'} className="inline-flex size-8 items-center justify-center text-slate-500 hover:text-white disabled:cursor-wait disabled:opacity-40"><X size={14} /></button>
                 </div>
               </div>
               
-              <div className="flex border-b border-white/5">
+              <div className="flex border-b border-white/5" role="tablist" aria-label="Git views">
                 {[
                   { id: 'changes' as const, label: 'Changes', icon: Circle },
                   { id: 'log' as const, label: 'History', icon: History },
@@ -2445,10 +4455,13 @@ export default function AppsPage() {
                 ].map(tab => (
                   <button
                     key={tab.id}
-                    onClick={() => setGitTab(tab.id)}
+                    role="tab"
+                    aria-selected={gitTab === tab.id}
+                    disabled={projectOperation?.kind === 'git'}
+                    onClick={() => { if (projectOperationRef.current?.kind !== 'git') setGitTab(tab.id); }}
                     className={`flex-1 flex items-center justify-center gap-1 py-2 text-[11px] transition-colors border-b-2 ${
                       gitTab === tab.id ? 'text-orange-400 border-orange-400' : 'text-slate-500 border-transparent hover:text-slate-300'
-                    }`}
+                    } disabled:cursor-wait disabled:opacity-50`}
                   >
                     <tab.icon size={11} />
                     {tab.label}
@@ -2472,9 +4485,9 @@ export default function AppsPage() {
                           {gitStatus.behind > 0 && <span className="text-blue-400 ml-1">↓{gitStatus.behind}</span>}
                         </span>
                         <div className="flex gap-1">
-                          <button onClick={gitPull} className="p-1.5 rounded bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white" title="Pull"><ArrowDown size={12} /></button>
-                          <button onClick={gitPush} className="p-1.5 rounded bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white" title="Push"><ArrowUp size={12} /></button>
-                          <button onClick={loadGitStatus} className="p-1.5 rounded bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white" title="Refresh"><RefreshCw size={12} /></button>
+                          <button aria-label={projectOperation?.kind === 'git' && projectOperation.gitAction === 'pull' ? 'Pulling Git changes' : 'Pull Git changes'} aria-busy={projectOperation?.kind === 'git' && projectOperation.gitAction === 'pull'} disabled={gitLoading} onClick={gitPull} className="p-1.5 rounded bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white disabled:opacity-30" title="Pull">{projectOperation?.kind === 'git' && projectOperation.gitAction === 'pull' ? <Loader2 size={12} className="animate-spin" /> : <ArrowDown size={12} />}</button>
+                          <button aria-label={projectOperation?.kind === 'git' && projectOperation.gitAction === 'push' ? 'Pushing Git changes' : 'Push Git changes'} aria-busy={projectOperation?.kind === 'git' && projectOperation.gitAction === 'push'} disabled={gitLoading} onClick={gitPush} className="p-1.5 rounded bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white disabled:opacity-30" title="Push">{projectOperation?.kind === 'git' && projectOperation.gitAction === 'push' ? <Loader2 size={12} className="animate-spin" /> : <ArrowUp size={12} />}</button>
+                          <button aria-label="Refresh Git status" disabled={gitLoading} onClick={loadGitStatus} className="p-1.5 rounded bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white disabled:opacity-30" title="Refresh"><RefreshCw size={12} /></button>
                         </div>
                       </div>
                     )}
@@ -2488,17 +4501,21 @@ export default function AppsPage() {
                         <span className={`font-mono font-bold w-4 text-center ${gitStatusColor(f.status)}`}>{gitStatusIcon(f.status)}</span>
                         <button onClick={() => viewFileDiff(f.path)} className="flex-1 text-left text-slate-300 hover:text-white truncate">{f.path}</button>
                         {f.status !== 'untracked' && (
-                          <button onClick={() => resetFile(f.path)} className="opacity-0 group-hover:opacity-100 p-0.5 text-slate-600 hover:text-amber-400" title="Discard changes"><Undo2 size={11} /></button>
+                          <button aria-label={`Discard changes to ${f.path}`} disabled={gitLoading} onClick={() => { setResetFileError(null); setPendingResetFile(f.path); }} className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 inline-flex size-7 items-center justify-center text-slate-600 hover:text-amber-400 disabled:opacity-30" title="Discard changes"><Undo2 size={11} /></button>
                         )}
                       </div>
                     ))}
                     {gitStatus && !gitStatus.clean && (
                       <div className="border-t border-white/5 pt-3">
-                        <textarea value={commitMsg} onChange={e => setCommitMsg(e.target.value)} placeholder="Commit message..."
+                        <textarea aria-label="Commit message" value={commitMsg} onChange={e => setCommitMsg(e.target.value)} placeholder="Commit message..."
                           rows={2} className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-xs text-white placeholder-slate-600 resize-none focus:border-orange-500/30 focus:outline-none" />
                         <button onClick={commitChanges} disabled={!commitMsg.trim() || gitLoading}
+                          aria-label={projectOperation?.kind === 'git' && projectOperation.gitAction === 'commit' ? 'Committing Git changes' : 'Commit All Changes'}
+                          aria-busy={projectOperation?.kind === 'git' && projectOperation.gitAction === 'commit'}
                           className="mt-1.5 w-full py-2 rounded-lg bg-orange-500/10 text-orange-400 text-[11px] hover:bg-orange-500/20 flex items-center justify-center gap-1.5 disabled:opacity-30 font-medium transition-colors">
-                          <GitCommit size={12} /> Commit All Changes
+                          {projectOperation?.kind === 'git' && projectOperation.gitAction === 'commit'
+                            ? <><Loader2 size={12} className="animate-spin" /> Committing…</>
+                            : <><GitCommit size={12} /> Commit All Changes</>}
                         </button>
                       </div>
                     )}
@@ -2510,7 +4527,7 @@ export default function AppsPage() {
                     {/* Branch filter */}
                     <div className="px-3 py-2 border-b border-white/5 flex items-center gap-2">
                       <GitBranch size={11} className="text-slate-500" />
-                      <select value={logBranchFilter} onChange={e => { setLogBranchFilter(e.target.value); setTimeout(loadCommitLog, 50); }}
+                      <select aria-label="Filter commits by branch" value={logBranchFilter} onChange={e => setLogBranchFilter(e.target.value)}
                         className="flex-1 bg-white/5 border border-white/10 rounded px-2 py-1 text-[10px] text-slate-300 focus:outline-none focus:border-orange-500/30">
                         <option value="">All branches</option>
                         {branches.filter(b => !b.remote).map(b => <option key={b.name} value={b.name}>{b.name}</option>)}
@@ -2561,7 +4578,6 @@ export default function AppsPage() {
                                 {c.stats.files.length > 0 && (
                                   <div className="bg-white/[0.02] rounded-lg p-2 space-y-1.5">
                                     {c.stats.files.map(f => {
-                                      const total = f.additions + f.deletions;
                                       const addWidth = maxBar > 0 ? (f.additions / maxBar) * 100 : 0;
                                       const delWidth = maxBar > 0 ? (f.deletions / maxBar) * 100 : 0;
                                       return (
@@ -2585,8 +4601,8 @@ export default function AppsPage() {
                                     className="flex-1 py-1.5 rounded-lg bg-blue-500/10 text-blue-400 text-[10px] hover:bg-blue-500/20 flex items-center justify-center gap-1 transition-colors">
                                     <Diff size={11} /> View Diff
                                   </button>
-                                  <button onClick={(e) => { e.stopPropagation(); setRevertTarget(c); }}
-                                    className="flex-1 py-1.5 rounded-lg bg-amber-500/10 text-amber-400 text-[10px] hover:bg-amber-500/20 flex items-center justify-center gap-1 transition-colors">
+                                  <button disabled={gitLoading} onClick={(e) => { e.stopPropagation(); setRevertTarget(c); }}
+                                    className="flex-1 py-1.5 rounded-lg bg-amber-500/10 text-amber-400 text-[10px] hover:bg-amber-500/20 flex items-center justify-center gap-1 transition-colors disabled:opacity-30">
                                     <Undo2 size={11} /> Revert
                                   </button>
                                 </div>
@@ -2614,16 +4630,16 @@ export default function AppsPage() {
                 {gitTab === 'branches' && (
                   <div className="p-3 space-y-3">
                     <div className="flex gap-1.5">
-                      <input value={newBranchName} onChange={e => setNewBranchName(e.target.value)} onKeyDown={e => e.key === 'Enter' && createBranch()}
+                      <input aria-label="New branch name" value={newBranchName} onChange={e => setNewBranchName(e.target.value)} onKeyDown={e => e.key === 'Enter' && createBranch()}
                         placeholder="New branch name..." className="flex-1 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-xs text-white placeholder-slate-600 focus:border-orange-500/30 focus:outline-none" />
-                      <button onClick={createBranch} disabled={!newBranchName.trim()} className="px-3 py-2 rounded-lg bg-orange-500/10 text-orange-400 text-xs hover:bg-orange-500/20 disabled:opacity-30"><Plus size={12} /></button>
+                      <button aria-label={projectOperation?.kind === 'git' && projectOperation.gitAction === 'checkout-new' ? 'Creating Git branch' : 'Create branch'} aria-busy={projectOperation?.kind === 'git' && projectOperation.gitAction === 'checkout-new'} onClick={createBranch} disabled={!newBranchName.trim() || gitLoading} className="px-3 py-2 rounded-lg bg-orange-500/10 text-orange-400 text-xs hover:bg-orange-500/20 disabled:opacity-30">{projectOperation?.kind === 'git' && projectOperation.gitAction === 'checkout-new' ? <Loader2 size={12} className="animate-spin" /> : <Plus size={12} />}</button>
                     </div>
                     <div className="space-y-0.5">
                       <div className="text-[10px] text-slate-600 uppercase tracking-wider mb-1">Local</div>
                       {branches.filter(b => !b.remote).map(b => (
-                        <button key={b.name} onClick={() => !b.current && switchBranch(b.name)}
-                          className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition-colors ${b.current ? 'bg-orange-500/10 text-orange-400' : 'text-slate-400 hover:bg-white/5 hover:text-white'}`}>
-                          <GitBranch size={12} />
+                        <button key={b.name} disabled={gitLoading || b.current} aria-busy={projectOperation?.kind === 'git' && projectOperation.gitAction === 'checkout' && projectOperation.gitTarget === b.name} onClick={() => !b.current && switchBranch(b.name)}
+                          className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition-colors disabled:opacity-50 ${b.current ? 'bg-orange-500/10 text-orange-400' : 'text-slate-400 hover:bg-white/5 hover:text-white'}`}>
+                          {projectOperation?.kind === 'git' && projectOperation.gitAction === 'checkout' && projectOperation.gitTarget === b.name ? <Loader2 size={12} className="animate-spin" /> : <GitBranch size={12} />}
                           <span className="truncate">{b.name}</span>
                           {b.current && <Check size={12} className="ml-auto" />}
                         </button>
@@ -2632,8 +4648,8 @@ export default function AppsPage() {
                         <>
                           <div className="text-[10px] text-slate-600 uppercase tracking-wider mt-3 mb-1">Remote</div>
                           {branches.filter(b => b.remote).map(b => (
-                            <button key={b.name} onClick={() => switchBranch(b.name.replace('origin/', ''))}
-                              className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-slate-500 hover:bg-white/5 hover:text-slate-300 transition-colors">
+                            <button key={b.name} disabled={gitLoading} onClick={() => switchBranch(b.name.replace('origin/', ''))}
+                              className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-slate-500 hover:bg-white/5 hover:text-slate-300 transition-colors disabled:opacity-50">
                               <Globe size={12} />
                               <span className="truncate">{b.name}</span>
                             </button>
@@ -2644,53 +4660,20 @@ export default function AppsPage() {
                   </div>
                 )}
               </div>
-            </motion.div>
-          )}
-
-          {/* AI Panel */}
-          {activePanel === 'ai' && (
-            <motion.div
-              initial={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
-              animate={isMobile ? { opacity: 1, x: 0 } : { width: 340, opacity: 1 }}
-              exit={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
-              transition={{ duration: 0.15 }}
-              className={isMobile
-                ? 'fixed inset-0 z-50 flex flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
-                : 'border-l border-white/5 flex flex-col overflow-hidden flex-shrink-0 bg-[#080B20]/50'}>
-              <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
-                <span className="text-xs font-medium flex items-center gap-1.5"><Bot size={13} className="text-purple-400" /> Agent AI</span>
-                <button onClick={() => setActivePanel(null)} className="text-slate-500 hover:text-white p-0.5"><X size={14} /></button>
-              </div>
-              <div className="flex-1 overflow-auto p-3">
-                {aiResponse && (
-                  <div className="text-xs text-slate-300 bg-purple-500/5 border border-purple-500/10 rounded-lg p-3 whitespace-pre-wrap leading-relaxed">{aiResponse}</div>
-                )}
-                {aiLoading && <div className="flex justify-center py-8"><Loader2 size={20} className="animate-spin text-purple-400" /></div>}
-              </div>
-              <div className="p-3 border-t border-white/5">
-                <div className="flex gap-2">
-                  <input value={aiMessage} onChange={e => setAiMessage(e.target.value)} onKeyDown={e => e.key === 'Enter' && askAI()}
-                    placeholder="Ask about your code..." className="flex-1 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-xs text-white placeholder-slate-600 focus:border-purple-500/30 focus:outline-none" />
-                  <button onClick={askAI} disabled={aiLoading || !aiMessage.trim()}
-                    className="p-2 rounded-lg bg-purple-500/10 text-purple-400 hover:bg-purple-500/20 disabled:opacity-30 transition-colors"><Send size={14} /></button>
-                </div>
-              </div>
-            </motion.div>
+            </ResponsiveProjectPanel>
           )}
 
           {/* Analysis Results Panel */}
           {showAnalysisPanel && (
-            <motion.div
-              initial={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
-              animate={isMobile ? { opacity: 1, x: 0 } : { width: 380, opacity: 1 }}
-              exit={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
-              transition={{ duration: 0.15 }}
-              className={isMobile
-                ? 'fixed inset-0 z-50 flex flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
-                : 'border-l border-white/5 flex flex-col overflow-hidden flex-shrink-0 bg-[#080B20]/50'}>
+            <ResponsiveProjectPanel
+              isMobile={isMobile}
+              mobileLabel="Project analysis results"
+              desktopWidth={380}
+              onDismiss={() => setShowAnalysisPanel(false)}
+            >
               <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
                 <span className="text-xs font-medium flex items-center gap-1.5"><Zap size={13} className="text-purple-400" /> Analysis Results</span>
-                <button onClick={() => setShowAnalysisPanel(false)} className="text-slate-500 hover:text-white p-0.5"><X size={14} /></button>
+                <button aria-label="Close analysis results" onClick={() => setShowAnalysisPanel(false)} className="inline-flex size-8 items-center justify-center text-slate-500 hover:text-white"><X size={14} /></button>
               </div>
               {analyzing && (
                 <div className="h-1 bg-white/10 overflow-hidden">
@@ -2735,24 +4718,156 @@ export default function AppsPage() {
                   </div>
                 ))}
               </div>
-            </motion.div>
+            </ResponsiveProjectPanel>
+          )}
+
+          {/* Deployment controls */}
+          {activePanel === 'deployment' && selectedProject && currentProject?.deployment && (
+            <ResponsiveProjectPanel
+              isMobile={isMobile}
+              mobileLabel="Project deployment controls"
+              onDismiss={() => {
+                if (!deploymentControlBusy) setActivePanel(null);
+              }}
+            >
+              <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
+                <span className="text-xs font-medium flex items-center gap-1.5">
+                  <Rocket size={13} className="text-sky-400" /> Deployment
+                </span>
+                <div className="flex items-center gap-1">
+                  <button
+                    aria-label="Refresh deployment status"
+                    onClick={() => { void loadDeploymentProcess(selectedProject); }}
+                    disabled={deploymentControlBusy !== null}
+                    className="inline-flex size-8 items-center justify-center text-slate-500 hover:text-white disabled:cursor-wait disabled:opacity-40"
+                  >
+                    <RefreshCw size={12} className={deploymentControlBusy === 'refresh' ? 'animate-spin' : ''} />
+                  </button>
+                  <button
+                    aria-label="Close deployment controls"
+                    onClick={() => setActivePanel(null)}
+                    disabled={deploymentControlBusy !== null}
+                    className="inline-flex size-8 items-center justify-center text-slate-500 hover:text-white disabled:cursor-wait disabled:opacity-40"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              </div>
+              <div className="flex-1 overflow-auto p-3 space-y-3">
+                {deploymentControlError && (
+                  <div role="alert" className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-xs text-red-200">
+                    {deploymentControlError}
+                  </div>
+                )}
+                <div className="rounded-lg border border-white/5 bg-white/[0.02] p-3 text-xs">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-slate-500">Type</span>
+                    <span className="font-medium text-slate-200">{deploymentProcess?.deployType || currentProject.deployment.deployType}</span>
+                  </div>
+                  <div className="mt-2 flex items-center justify-between gap-3">
+                    <span className="text-slate-500">Status</span>
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                      (deploymentProcess?.status || currentProject.deployment.processStatus) === 'running'
+                        ? 'bg-emerald-500/10 text-emerald-300'
+                        : (deploymentProcess?.status || currentProject.deployment.processStatus) === 'error'
+                          ? 'bg-red-500/10 text-red-300'
+                          : 'bg-slate-500/10 text-slate-300'
+                    }`}>
+                      {deploymentProcess?.status || currentProject.deployment.processStatus}
+                    </span>
+                  </div>
+                  {(deploymentProcess?.port || currentProject.deployment.port) && (
+                    <div className="mt-2 flex items-center justify-between gap-3">
+                      <span className="text-slate-500">Internal port</span>
+                      <code className="text-slate-300">{deploymentProcess?.port || currentProject.deployment.port}</code>
+                    </div>
+                  )}
+                  {typeof deploymentProcess?.restartCount === 'number' && (
+                    <div className="mt-2 flex items-center justify-between gap-3">
+                      <span className="text-slate-500">Restarts</span>
+                      <span className="text-slate-300">{deploymentProcess.restartCount}</span>
+                    </div>
+                  )}
+                </div>
+
+                {deploymentProcess?.limitation && (
+                  <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-[11px] leading-relaxed text-amber-100">
+                    {deploymentProcess.limitation}
+                  </div>
+                )}
+                {deploymentProcess?.lastError && (
+                  <div role="alert" className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-[11px] text-red-200">
+                    {deploymentProcess.lastError}
+                  </div>
+                )}
+
+                {deploymentProcess?.supportedActions.includes('start') && (
+                  <div className="grid grid-cols-3 gap-2">
+                    <button
+                      onClick={() => { void controlDeploymentProcess('start'); }}
+                      disabled={deploymentControlBusy !== null || deploymentProcess.status === 'running'}
+                      className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg bg-emerald-500/10 text-xs text-emerald-300 hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {deploymentControlBusy === 'start' ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} Start
+                    </button>
+                    <button
+                      onClick={() => { void controlDeploymentProcess('stop'); }}
+                      disabled={deploymentControlBusy !== null || deploymentProcess.status === 'stopped'}
+                      className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg bg-amber-500/10 text-xs text-amber-300 hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {deploymentControlBusy === 'stop' ? <Loader2 size={12} className="animate-spin" /> : <Circle size={11} />} Stop
+                    </button>
+                    <button
+                      onClick={() => { void controlDeploymentProcess('restart'); }}
+                      disabled={deploymentControlBusy !== null || deploymentProcess.status === 'stopped'}
+                      className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg bg-sky-500/10 text-xs text-sky-300 hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {deploymentControlBusy === 'restart' ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} Restart
+                    </button>
+                  </div>
+                )}
+
+                {deploymentProcess?.deployType === 'fullstack' && (
+                  <div className="rounded-lg border border-white/5 bg-black/20">
+                    <div className="border-b border-white/5 px-3 py-2 text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                      Recent logs
+                    </div>
+                    <pre className="max-h-52 overflow-auto whitespace-pre-wrap break-words p-3 text-[10px] leading-relaxed text-slate-300">
+                      {deploymentProcess.logs.length > 0 ? deploymentProcess.logs.join('\n') : 'No runtime logs yet.'}
+                    </pre>
+                  </div>
+                )}
+
+                <button
+                  onClick={() => {
+                    setDeploymentControlError(null);
+                    setPendingUndeploy(selectedProject);
+                  }}
+                  disabled={deploymentControlBusy !== null}
+                  className="inline-flex min-h-[42px] w-full items-center justify-center gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-300 hover:bg-red-500/20 disabled:cursor-wait disabled:opacity-40"
+                >
+                  {deploymentControlBusy === 'undeploy' ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
+                  Remove deployment
+                </button>
+                <p className="text-[10px] leading-relaxed text-slate-600">
+                  Project source, Git history, and Project Chat remain. Hosted files, runtime state, and deployment share links are removed.
+                </p>
+              </div>
+            </ResponsiveProjectPanel>
           )}
 
           {/* Activity Panel */}
           {activePanel === 'activity' && selectedProject && (
-            <motion.div
-              initial={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
-              animate={isMobile ? { opacity: 1, x: 0 } : { width: 340, opacity: 1 }}
-              exit={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
-              transition={{ duration: 0.15 }}
-              className={isMobile
-                ? 'fixed inset-0 z-50 flex flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
-                : 'border-l border-white/5 flex flex-col overflow-hidden flex-shrink-0 bg-[#080B20]/50'}>
+            <ResponsiveProjectPanel
+              isMobile={isMobile}
+              mobileLabel="Project activity panel"
+              onDismiss={() => setActivePanel(null)}
+            >
               <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
                 <span className="text-xs font-medium flex items-center gap-1.5"><Activity size={13} className="text-cyan-400" /> Activity</span>
                 <div className="flex items-center gap-1">
-                  <button onClick={loadActivity} className="text-slate-500 hover:text-white p-0.5"><RefreshCw size={12} /></button>
-                  <button onClick={() => setActivePanel(null)} className="text-slate-500 hover:text-white p-0.5"><X size={14} /></button>
+                  <button aria-label="Refresh project activity" onClick={loadActivity} className="inline-flex size-8 items-center justify-center text-slate-500 hover:text-white"><RefreshCw size={12} /></button>
+                  <button aria-label="Close activity panel" onClick={() => setActivePanel(null)} className="inline-flex size-8 items-center justify-center text-slate-500 hover:text-white"><X size={14} /></button>
                 </div>
               </div>
               <div className="flex-1 overflow-auto">
@@ -2780,22 +4895,21 @@ export default function AppsPage() {
                   </div>
                 )}
               </div>
-            </motion.div>
+            </ResponsiveProjectPanel>
           )}
 
           {/* Share Panel */}
           {activePanel === 'share' && selectedProject && (
-            <motion.div
-              initial={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
-              animate={isMobile ? { opacity: 1, x: 0 } : { width: 340, opacity: 1 }}
-              exit={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
-              transition={{ duration: 0.15 }}
-              className={isMobile
-                ? 'fixed inset-0 z-50 flex flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
-                : 'border-l border-white/5 flex flex-col overflow-hidden flex-shrink-0 bg-[#080B20]/50'}>
+            <ResponsiveProjectPanel
+              isMobile={isMobile}
+              mobileLabel="Project sharing panel"
+              onDismiss={() => {
+                if (!isShareActionInFlight()) setActivePanel(null);
+              }}
+            >
               <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
                 <span className="text-xs font-medium flex items-center gap-1.5"><Share2 size={13} className="text-violet-400" /> Share & Hosting</span>
-                <button onClick={() => setActivePanel(null)} className="text-slate-500 hover:text-white p-0.5"><X size={14} /></button>
+                <button aria-label="Close sharing panel" onClick={() => { if (!isShareActionInFlight()) setActivePanel(null); }} disabled={shareActionActive} className="inline-flex size-8 items-center justify-center text-slate-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"><X size={14} /></button>
               </div>
               <div className="flex-1 overflow-auto p-3 space-y-4">
                 {isLocalPortalOrigin && (
@@ -2812,15 +4926,30 @@ export default function AppsPage() {
                       <code className="flex-1 text-[11px] text-emerald-300 bg-black/30 px-2 py-1.5 rounded truncate">
                         {window.location.origin}{currentProject.deployedUrl}
                       </code>
-                      <button onClick={() => copyToClipboard(window.location.origin + currentProject.deployedUrl, 'hosted')}
+                      <button aria-label="Copy hosted project URL" onClick={() => copyToClipboard(window.location.origin + currentProject.deployedUrl, 'hosted')}
                         className="p-1.5 rounded bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-colors">
                         {copiedId === 'hosted' ? <Check size={12} /> : <Copy size={12} />}
                       </button>
-                      <a href={currentProject.deployedUrl} target="_blank" rel="noopener noreferrer"
+                      <a aria-label="Open hosted project" href={currentProject.deployedUrl} target="_blank" rel="noopener noreferrer"
                         className="p-1.5 rounded bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-colors">
                         <ExternalLink size={12} />
                       </a>
                     </div>
+                  </div>
+                )}
+                {shareRefreshError && (
+                  <div role="alert" className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-[11px] text-amber-100">
+                    <p>{shareRefreshError}</p>
+                    <button
+                      type="button"
+                      onClick={() => { void retryLoadShares(); }}
+                      disabled={shareActionActive}
+                      aria-busy={shareRefreshing}
+                      className="mt-2 inline-flex min-w-24 items-center justify-center gap-1.5 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 py-1.5 font-medium text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {shareRefreshing && <Loader2 size={11} className="animate-spin" />}
+                      {shareRefreshing ? 'Refreshing…' : 'Retry refresh'}
+                    </button>
                   </div>
                 )}
                 {!currentProject?.deployedUrl && (
@@ -2832,16 +4961,16 @@ export default function AppsPage() {
                 {currentProject?.deployedUrl && (
                   <>
                     {/* Create new share link */}
-                    <div className="bg-white/[0.02] border border-white/5 rounded-lg p-3 space-y-3">
+                    <fieldset disabled={shareActionActive || Boolean(shareRefreshError)} className="min-w-0 bg-white/[0.02] border border-white/5 rounded-lg p-3 space-y-3 disabled:opacity-70">
                       <div className="text-[10px] text-slate-500 uppercase font-medium tracking-wider">New Share Link</div>
                       <div className="flex gap-2">
-                        <button onClick={() => setShareIsPublic(true)}
+                        <button aria-pressed={shareIsPublic} onClick={() => setShareIsPublic(true)}
                           className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-[11px] font-medium transition-all ${
                             shareIsPublic ? 'bg-green-500/10 text-green-400 border border-green-500/30' : 'bg-white/5 text-slate-500 border border-white/10'
                           }`}>
                           <Globe size={12} /> Public
                         </button>
-                        <button onClick={() => setShareIsPublic(false)}
+                        <button aria-pressed={!shareIsPublic} onClick={() => setShareIsPublic(false)}
                           className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-[11px] font-medium transition-all ${
                             !shareIsPublic ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30' : 'bg-white/5 text-slate-500 border border-white/10'
                           }`}>
@@ -2850,10 +4979,10 @@ export default function AppsPage() {
                       </div>
                       {!shareIsPublic && (
                         <div className="space-y-2">
-                          <input type="password" value={sharePassword} onChange={e => setSharePassword(e.target.value)}
+                          <input aria-label="Share link password" type="password" maxLength={128} value={sharePassword} onChange={e => setSharePassword(e.target.value)}
                             placeholder="Password (min 8 chars)"
                             className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-xs text-white placeholder-slate-600 focus:border-amber-500/30 focus:outline-none" />
-                          <input type="password" value={sharePasswordConfirm} onChange={e => setSharePasswordConfirm(e.target.value)}
+                          <input aria-label="Confirm share link password" type="password" maxLength={128} value={sharePasswordConfirm} onChange={e => setSharePasswordConfirm(e.target.value)}
                             placeholder="Confirm password"
                             className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-xs text-white placeholder-slate-600 focus:border-amber-500/30 focus:outline-none" />
                           {sharePassword.length > 0 && sharePassword.length < 8 && (
@@ -2867,12 +4996,40 @@ export default function AppsPage() {
                           )}
                         </div>
                       )}
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        <label className="space-y-1 text-[10px] text-slate-500">
+                          <span>Expires (optional)</span>
+                          <input
+                            aria-label="Share link expiration"
+                            type="datetime-local"
+                            value={shareExpiresAt}
+                            onChange={event => setShareExpiresAt(event.target.value)}
+                            className="w-full px-2 py-1.5 rounded-lg bg-white/5 border border-white/10 text-[11px] text-white focus:border-violet-500/30 focus:outline-none"
+                          />
+                        </label>
+                        <label className="space-y-1 text-[10px] text-slate-500">
+                          <span>Visit limit (optional)</span>
+                          <input
+                            aria-label="Share link visit limit"
+                            type="number"
+                            min={1}
+                            max={1_000_000}
+                            step={1}
+                            value={shareMaxUses}
+                            onChange={event => setShareMaxUses(event.target.value)}
+                            placeholder="Unlimited"
+                            className="w-full px-2 py-1.5 rounded-lg bg-white/5 border border-white/10 text-[11px] text-white placeholder-slate-600 focus:border-violet-500/30 focus:outline-none"
+                          />
+                        </label>
+                      </div>
                       <button onClick={createShareLink}
-                        disabled={!shareIsPublic && (sharePassword.length < 8 || sharePassword !== sharePasswordConfirm)}
+                        disabled={shareActionActive || (!shareIsPublic && (sharePassword.length < 8 || sharePassword !== sharePasswordConfirm))}
+                        aria-busy={shareCreating}
                         className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg bg-violet-500/10 text-violet-400 text-[11px] hover:bg-violet-500/20 transition-colors disabled:opacity-30 font-medium">
-                        <Plus size={11} /> Create {shareIsPublic ? 'Public' : 'Password-Protected'} Link
+                        {shareCreating ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
+                        {shareCreating ? 'Creating…' : `Create ${shareIsPublic ? 'Public' : 'Password-Protected'} Link`}
                       </button>
-                    </div>
+                    </fieldset>
 
                     {/* Existing share links */}
                     <div className="flex items-center justify-between">
@@ -2883,7 +5040,7 @@ export default function AppsPage() {
                     ) : (
                       <div className="space-y-2">
                         {shares.map(link => (
-                          <div key={link.id} className={`rounded-lg border ${link.isActive ? 'bg-white/[0.02] border-white/5' : 'bg-white/[0.01] border-white/[0.03] opacity-50'}`}>
+                          <div key={link.id} className={`rounded-lg border ${getShareLinkAvailability(link) === 'active' ? 'bg-white/[0.02] border-white/5' : 'bg-white/[0.01] border-white/[0.03] opacity-60'}`}>
                             <div className="p-2.5">
                               <div className="flex items-center gap-2 mb-1.5">
                                 {link.isPublic ? (
@@ -2893,27 +5050,33 @@ export default function AppsPage() {
                                 )}
                                 <code className="text-[10px] text-slate-400 truncate flex-1">/share/{link.token}</code>
                                 {/* Email button */}
-                                {link.isActive && (
+                                {getShareLinkAvailability(link) === 'active' && (
                                   <button
+                                    type="button"
                                     onClick={() => {
+                                      if (isShareActionInFlight()) return;
+                                      setShareEmailError(null);
+                                      setShareEmailSuccess(null);
                                       if (emailingLinkId === link.id) {
                                         setEmailingLinkId(null);
                                         setShareEmailInput('');
-                                        setShareEmailPassword('');
                                       } else {
                                         setEmailingLinkId(link.id);
                                         setShareEmailInput('');
-                                        setShareEmailPassword('');
                                       }
                                     }}
-                                    className={`p-1 rounded hover:bg-white/5 transition ${emailingLinkId === link.id ? 'text-violet-400' : 'text-slate-500 hover:text-violet-400'}`}
+                                    disabled={shareActionActive}
+                                    aria-label={emailingLinkId === link.id ? 'Close share email form' : 'Send share link via email'}
+                                    className={`p-1 rounded hover:bg-white/5 transition disabled:cursor-not-allowed disabled:opacity-40 ${emailingLinkId === link.id ? 'text-violet-400' : 'text-slate-500 hover:text-violet-400'}`}
                                     title="Send via email"
                                   >
                                     <Mail size={10} />
                                   </button>
                                 )}
                                 <button onClick={() => copyToClipboard(`${window.location.origin}/share/${link.token}`, link.id)}
-                                  className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white">
+                                  disabled={getShareLinkAvailability(link) !== 'active'}
+                                  aria-label="Copy share link"
+                                  className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-40">
                                   {copiedId === link.id ? <Check size={10} className="text-emerald-400" /> : <Copy size={10} />}
                                 </button>
                               </div>
@@ -2922,24 +5085,45 @@ export default function AppsPage() {
                                   {link.isPublic ? 'Public' : 'Password-Protected'}
                                 </span>
                                 <span className="text-slate-700">•</span>
-                                <span className="text-slate-600">{link.currentUses} views{link.maxUses ? ` / ${link.maxUses} max` : ''}</span>
+                                <span className="text-slate-600">{link.currentUses} visits{link.maxUses ? ` / ${link.maxUses} max` : ''}</span>
+                                {link.expiresAt && (
+                                  <><span className="text-slate-700">•</span><span className="text-slate-600">expires {new Date(link.expiresAt).toLocaleString()}</span></>
+                                )}
                               </div>
                               <div className="flex items-center justify-between text-[10px] text-slate-600">
                                 <span>{timeAgo(link.createdAt)}</span>
                                 <div className="flex items-center gap-3">
-                                  {link.isActive && !link.isPublic && (
-                                    <button onClick={() => setConfirmPublicId(link.id)} className="text-green-400/60 hover:text-green-400">Make Public</button>
+                                  {getShareLinkAvailability(link) === 'active' && !link.isPublic && (
+                                    <button
+                                      onClick={() => {
+                                        setShareMakePublicError(null);
+                                        setConfirmPublicId(link.id);
+                                      }}
+                                      disabled={shareActionActive}
+                                      className="text-green-400/60 hover:text-green-400 disabled:cursor-not-allowed disabled:opacity-40"
+                                    >
+                                      Make Public
+                                    </button>
                                   )}
                                   <button onClick={() => toggleShareActive(link.id)}
-                                    className={`px-2 py-0.5 rounded text-[10px] font-medium transition ${
-                                      link.isActive
+                                    disabled={shareActionActive || getShareLinkAvailability(link) === 'expired' || getShareLinkAvailability(link) === 'exhausted'}
+                                    className={`px-2 py-0.5 rounded text-[10px] font-medium transition disabled:cursor-wait disabled:opacity-50 ${
+                                      getShareLinkAvailability(link) === 'active'
                                         ? 'bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30'
                                         : 'bg-slate-500/20 text-slate-400 hover:bg-slate-500/30'
                                     }`}>
-                                    {link.isActive ? 'Active' : 'Disabled'}
+                                    {shareMutationIds.has(link.id)
+                                      ? 'Updating…'
+                                      : getShareLinkAvailability(link) === 'expired'
+                                        ? 'Expired'
+                                        : getShareLinkAvailability(link) === 'exhausted'
+                                          ? 'Limit reached'
+                                          : getShareLinkAvailability(link) === 'active' ? 'Active' : 'Disabled'}
                                   </button>
-                                  <button onClick={() => setPendingDeleteShare(link.id)}
-                                    className="text-red-400/40 hover:text-red-400 transition" title="Delete permanently">
+                                  <button onClick={() => { setShareDeleteError(null); setPendingDeleteShare(link.id); }}
+                                    disabled={shareActionActive}
+                                    aria-label="Delete share link permanently"
+                                    className="text-red-400/40 hover:text-red-400 transition disabled:cursor-not-allowed disabled:opacity-40" title="Delete permanently">
                                     <Trash2 size={11} />
                                   </button>
                                 </div>
@@ -2954,25 +5138,29 @@ export default function AppsPage() {
                                 </p>
                                 <div className="space-y-1.5">
                                   <input
+                                    aria-label="Recipient email address"
                                     type="email"
+                                    maxLength={320}
                                     placeholder="Recipient email address"
                                     value={shareEmailInput}
-                                    onChange={e => setShareEmailInput(e.target.value)}
-                                    onKeyDown={e => e.key === 'Enter' && sendShareEmail(link.id, !link.isPublic)}
+                                    disabled={shareActionActive || shareEmailSuccess === link.id}
+                                    onChange={e => { setShareEmailInput(e.target.value); setShareEmailError(null); setShareEmailSuccess(null); }}
+                                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void sendShareEmail(link.id); } }}
                                     className="w-full px-2.5 py-1.5 rounded-md bg-black/30 border border-white/10 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-violet-500/50"
                                   />
                                   {!link.isPublic && (
-                                    <input
-                                      type="text"
-                                      placeholder="Password to include in email (optional)"
-                                      value={shareEmailPassword}
-                                      onChange={e => setShareEmailPassword(e.target.value)}
-                                      className="w-full px-2.5 py-1.5 rounded-md bg-black/30 border border-amber-500/20 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-amber-500/40"
-                                    />
+                                    <p className="rounded-md border border-amber-500/20 bg-amber-500/5 px-2.5 py-2 text-[10px] text-amber-200">
+                                      For security, the password is never included with the link. Send it separately.
+                                    </p>
+                                  )}
+                                  {shareEmailError && (
+                                    <p role="alert" className="rounded-md border border-red-500/20 bg-red-500/10 px-2.5 py-2 text-[10px] text-red-200">{shareEmailError}</p>
                                   )}
                                   <button
-                                    onClick={() => sendShareEmail(link.id, !link.isPublic)}
-                                    disabled={!shareEmailInput || shareEmailSending || shareEmailSuccess === link.id}
+                                    type="button"
+                                    onClick={() => sendShareEmail(link.id)}
+                                    disabled={!shareEmailInput.trim() || shareActionActive || shareEmailSuccess === link.id || getShareLinkAvailability(link) !== 'active'}
+                                    aria-busy={shareEmailSending}
                                     className={`w-full flex items-center justify-center gap-1.5 py-1.5 rounded-md text-xs font-medium transition ${
                                       shareEmailSuccess === link.id
                                         ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
@@ -2997,7 +5185,7 @@ export default function AppsPage() {
                   </>
                 )}
               </div>
-            </motion.div>
+            </ResponsiveProjectPanel>
           )}
 
           {/* Confirm Delete Share Link */}
@@ -3008,8 +5196,15 @@ export default function AppsPage() {
             confirmLabel="Delete"
             variant="danger"
             icon="trash"
+            busy={shareDeleteBusy}
+            busyLabel="Deleting…"
+            error={shareDeleteError}
             onConfirm={deleteSharePermanently}
-            onCancel={() => setPendingDeleteShare(null)}
+            onCancel={() => {
+              if (shareDeleteInFlightRef.current) return;
+              setShareDeleteError(null);
+              setPendingDeleteShare(null);
+            }}
           />
 
           {/* Confirm Make Public Dialog */}
@@ -3020,21 +5215,19 @@ export default function AppsPage() {
             confirmLabel="Yes, Make Public"
             variant="danger"
             icon="shield"
-            onConfirm={async () => {
-              if (confirmPublicId && selectedProject) {
-                try {
-                  await projectsAPI.updateShare(selectedProject, confirmPublicId, { isPublic: true });
-                  showToast('Link is now public');
-                  await loadShares();
-                } catch (err) { showErrorToast(err, 'Making share link public'); }
-              }
+            busy={shareMakePublicBusy}
+            busyLabel="Making public…"
+            error={shareMakePublicError}
+            onConfirm={makeSharePublic}
+            onCancel={() => {
+              if (shareMakePublicInFlightRef.current) return;
+              setShareMakePublicError(null);
               setConfirmPublicId(null);
             }}
-            onCancel={() => setConfirmPublicId(null)}
           />
         </AnimatePresence>
 
-        {/* Agent Chat Panel — WebSocket streaming */}
+        {/* Project Chat Panel */}
         <AnimatePresence>
           {agentChatOpen && selectedProject && (
             <Suspense fallback={null}>
@@ -3042,57 +5235,62 @@ export default function AppsPage() {
                 key={`project-agent-chat:${selectedProject}`}
                 projectName={selectedProject}
                 onClose={closeAgentChat}
+                onActivityChange={handleProjectChatActivity}
               />
             </Suspense>
           )}
         </AnimatePresence>
       </div>
 
-      {/* Floating Agent Button */}
-      {selectedProject && !agentChatOpen && (
-        <ViewportOverlay anchor="bottom-right" zIndex={1000}>
-          <button
-            onClick={openAgentChat}
-            className="w-12 h-12 rounded-full bg-purple-500/20 border border-purple-500/30 flex items-center justify-center shadow-lg shadow-purple-500/10 hover:bg-purple-500/30 transition-colors"
-            title="Chat with Agent"
-          >
-            <Bot size={20} className="text-purple-400" />
-          </button>
-        </ViewportOverlay>
-      )}
-
       {/* Create Project Dialog */}
-      <AnimatePresence>
-        {showCreate && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={() => setShowCreate(false)}>
-            <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }}
-              className="glass max-w-md w-full p-6 space-y-4" onClick={e => e.stopPropagation()}>
+      <ViewportModal
+        open={showCreate}
+        onDismiss={() => setShowCreate(false)}
+        dismissible={!(creating || zipUploading)}
+        initialFocusRef={createProjectNameInputRef}
+        className="bg-black/70 p-4 backdrop-blur-sm"
+      >
+        <motion.div
+          initial={{ scale: 0.95, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="create-project-title"
+          className="glass max-h-[calc(100dvh-2rem)] w-full max-w-md space-y-4 overflow-y-auto p-6"
+        >
               <div className="flex justify-between items-center">
-                <h3 className="text-lg font-semibold">New Project</h3>
-                <button onClick={() => setShowCreate(false)} className="text-slate-400 hover:text-white"><X size={20} /></button>
+                <h3 id="create-project-title" className="text-lg font-semibold">New Project</h3>
+                <button
+                  aria-label={zipUploading ? 'Cancel project ZIP upload' : 'Close new project dialog'}
+                  disabled={creating}
+                  onClick={() => {
+                    if (zipUploading) zipUploadXhrRef.current?.abort();
+                    else setShowCreate(false);
+                  }}
+                  className="inline-flex size-8 items-center justify-center text-slate-400 hover:text-white disabled:opacity-30"
+                ><X size={20} /></button>
               </div>
 
               <div className="flex gap-2">
                 {(['template', 'clone', 'zip'] as const).map(mode => (
-                  <button key={mode} onClick={() => setCreateMode(mode)}
-                    className={`flex-1 py-2 rounded-xl text-sm font-medium transition-all ${createMode === mode ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30' : 'bg-white/5 text-slate-400 border border-white/10'}`}>
+                  <button key={mode} aria-pressed={createMode === mode} disabled={creating || zipUploading} onClick={() => setCreateMode(mode)}
+                    className={`flex-1 py-2 rounded-xl text-sm font-medium transition-all border ${createMode === mode ? 'accent-active' : 'bg-white/5 text-slate-400 border-white/10'}`}>
                     {mode === 'template' ? 'Template' : mode === 'clone' ? 'Clone Repo' : 'Upload ZIP'}
                   </button>
                 ))}
               </div>
 
               <div>
-                <label className="text-xs text-slate-400 block mb-1">Project Name</label>
-                <input value={newName} onChange={e => setNewName(e.target.value)}
+                <label htmlFor="new-project-name" className="text-xs text-slate-400 block mb-1">Project Name</label>
+                <input ref={createProjectNameInputRef} id="new-project-name" aria-label="Project name" value={newName} maxLength={120} disabled={creating || zipUploading} onChange={e => setNewName(e.target.value)}
                   onKeyDown={e => e.key === 'Enter' && createProject()}
                   className="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white placeholder-slate-500 text-sm focus:border-emerald-500/30 focus:outline-none"
-                  placeholder="my-project" autoFocus />
+                  placeholder="my-project" />
               </div>
 
               {createMode === 'template' ? (
-                <div>
-                  <label className="text-xs text-slate-400 block mb-1">Template</label>
+                <fieldset>
+                  <legend className="text-xs text-slate-400 block mb-1">Template</legend>
                   <div className="grid grid-cols-5 gap-2">
                     {[
                       { id: 'static-html', label: 'HTML', icon: '🌐', desc: 'Static site' },
@@ -3101,19 +5299,19 @@ export default function AppsPage() {
                       { id: 'python', label: 'Python', icon: '🐍', desc: 'Script/app' },
                       { id: 'cpp', label: 'C++', icon: '⚙️', desc: 'Compiled' },
                     ].map(t => (
-                      <button key={t.id} onClick={() => setTemplate(t.id)}
-                        className={`p-3 rounded-xl text-center text-xs transition-all ${template === t.id ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-400' : 'bg-white/5 border border-white/10 text-slate-400 hover:border-white/20'}`}>
+                      <button key={t.id} aria-pressed={template === t.id} onClick={() => setTemplate(t.id)}
+                        className={`p-3 rounded-xl text-center text-xs transition-all border ${template === t.id ? 'accent-active' : 'bg-white/5 border-white/10 text-slate-400 hover:border-white/20'}`}>
                         <span className="text-lg block mb-1">{t.icon}</span>
                         {t.label}
                         <span className="block text-[9px] text-slate-600 mt-0.5">{t.desc}</span>
                       </button>
                     ))}
                   </div>
-                </div>
+                </fieldset>
               ) : createMode === 'clone' ? (
                 <div>
-                  <label className="text-xs text-slate-400 block mb-1">Repository URL</label>
-                  <input value={cloneUrl} onChange={e => setCloneUrl(e.target.value)}
+                  <label htmlFor="new-project-repository" className="text-xs text-slate-400 block mb-1">Repository URL</label>
+                  <input id="new-project-repository" aria-label="Repository URL" value={cloneUrl} disabled={creating || zipUploading} onChange={e => setCloneUrl(e.target.value)}
                     className="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white placeholder-slate-500 text-sm focus:border-emerald-500/30 focus:outline-none"
                     placeholder="https://git.example.com/user/repo.git" />
                   {cloneUrl && newName && (
@@ -3125,11 +5323,11 @@ export default function AppsPage() {
               ) : (
                 <div className="space-y-3">
                   <div>
-                    <label className="text-xs text-slate-400 block mb-1">ZIP File</label>
+                    <p className="text-xs text-slate-400 block mb-1">ZIP File</p>
                     <label className={`flex items-center justify-center gap-2 p-4 rounded-xl border-2 border-dashed cursor-pointer transition-all ${
                       zipFile ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-white/10 hover:border-emerald-500/20 bg-white/[0.02]'
                     }`}>
-                      <input type="file" accept=".zip" className="hidden"
+                      <input aria-label="Choose project ZIP file" type="file" accept=".zip,application/zip" disabled={zipUploading} className="hidden"
                         onChange={e => { const file = e.target.files?.[0]; if (file) handleZipSelect(file); }} />
                       {zipFile ? (
                         <div className="text-center">
@@ -3168,53 +5366,83 @@ export default function AppsPage() {
 
               <button onClick={createProject}
                 disabled={(creating || zipUploading) || !newName.trim() || (createMode === 'zip' && !zipFile) || (createMode === 'clone' && !cloneUrl.trim())}
-                className="w-full py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-white font-medium text-sm disabled:opacity-50 flex items-center justify-center gap-2 transition-colors">
+                aria-busy={creating || zipUploading}
+                className="inline-flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl bg-emerald-500 py-3 text-sm font-medium text-white transition-colors hover:bg-emerald-400 disabled:cursor-wait disabled:opacity-50">
                 {(creating || zipUploading) && <Loader2 size={16} className="animate-spin" />}
-                {createMode === 'clone' ? 'Clone' : createMode === 'zip' ? 'Upload & Create' : 'Create'} Project
+                {zipUploading
+                  ? 'Uploading project…'
+                  : creating
+                    ? createMode === 'clone' ? 'Cloning project…' : 'Creating project…'
+                    : createMode === 'clone' ? 'Clone Project' : createMode === 'zip' ? 'Upload & Create Project' : 'Create Project'}
               </button>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+        </motion.div>
+      </ViewportModal>
 
       {/* New File Dialog */}
-      <AnimatePresence>
-        {showNewFile && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={() => setShowNewFile(false)}>
-            <motion.div initial={{ scale: 0.95 }} animate={{ scale: 1 }} exit={{ scale: 0.95 }}
-              className="glass max-w-sm w-full p-6 space-y-4" onClick={e => e.stopPropagation()}>
-              <h3 className="font-semibold">New {newFileIsDir ? 'Folder' : 'File'}</h3>
-              <input value={newFilePath} onChange={e => setNewFilePath(e.target.value)}
+      <ViewportModal
+        open={showNewFile}
+        onDismiss={() => setShowNewFile(false)}
+        dismissible={!creatingEntry}
+        initialFocusRef={newProjectEntryInputRef}
+        className="bg-black/70 p-4 backdrop-blur-sm"
+      >
+        <motion.div
+          initial={{ scale: 0.95, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="new-project-entry-title"
+          className="glass max-h-[calc(100dvh-2rem)] w-full max-w-sm space-y-4 overflow-y-auto p-6"
+        >
+              <h3 id="new-project-entry-title" className="font-semibold">New {newFileIsDir ? 'Folder' : 'File'}</h3>
+              <input ref={newProjectEntryInputRef} aria-label={newFileIsDir ? 'New folder name' : 'New file name'} value={newFilePath} disabled={creatingEntry} onChange={e => setNewFilePath(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && createNewFile()}
                 className="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white placeholder-slate-500 text-sm focus:border-emerald-500/30 focus:outline-none"
-                placeholder={newFileIsDir ? 'folder-name' : 'filename.ext'} autoFocus />
-              <button onClick={createNewFile} disabled={!newFilePath.trim()}
-                className="w-full py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-white font-medium text-sm disabled:opacity-50 transition-colors">
-                Create
+                placeholder={newFileIsDir ? 'folder-name' : 'filename.ext'} />
+              <button onClick={createNewFile} disabled={!newFilePath.trim() || creatingEntry}
+                aria-busy={creatingEntry}
+                className="inline-flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl bg-emerald-500 py-2.5 text-sm font-medium text-white transition-colors hover:bg-emerald-400 disabled:cursor-wait disabled:opacity-50">
+                {creatingEntry && <Loader2 size={14} className="animate-spin" />}
+                {creatingEntry ? `Creating ${newFileIsDir ? 'folder' : 'file'}…` : `Create ${newFileIsDir ? 'Folder' : 'File'}`}
               </button>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+        </motion.div>
+      </ViewportModal>
 
       {/* Upload Files Dialog */}
-      <AnimatePresence>
-        {showUploadDialog && selectedProject && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={() => !uploadingFiles && setShowUploadDialog(false)}>
-            <motion.div initial={{ scale: 0.95 }} animate={{ scale: 1 }} exit={{ scale: 0.95 }}
-              className="glass max-w-md w-full p-6 space-y-4" onClick={e => e.stopPropagation()}>
+      <ViewportModal
+        open={showUploadDialog && !!selectedProject}
+        onDismiss={() => setShowUploadDialog(false)}
+        dismissible={!uploadingFiles}
+        initialFocusRef={uploadDestinationSelectRef}
+        className="bg-black/70 p-4 backdrop-blur-sm"
+      >
+        <motion.div
+          initial={{ scale: 0.95, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="upload-project-files-title"
+          className="glass max-h-[calc(100dvh-2rem)] w-full max-w-md space-y-4 overflow-y-auto p-6"
+        >
               <div className="flex items-center justify-between">
-                <h3 className="font-semibold flex items-center gap-2"><Upload size={16} className="text-emerald-400" /> Upload Files</h3>
-                <button onClick={() => !uploadingFiles && setShowUploadDialog(false)} className="text-slate-500 hover:text-white"><X size={16} /></button>
+                <h3 id="upload-project-files-title" className="font-semibold flex items-center gap-2"><Upload size={16} className="text-emerald-400" /> Upload Files</h3>
+                <button
+                  aria-label="Close upload files dialog"
+                  disabled={uploadingFiles}
+                  onClick={() => setShowUploadDialog(false)}
+                  className="inline-flex size-8 items-center justify-center text-slate-500 hover:text-white disabled:cursor-wait disabled:opacity-40"
+                ><X size={16} /></button>
               </div>
 
               {/* Target directory selector */}
               <div>
-                <label className="text-[10px] text-slate-500 uppercase tracking-wider block mb-1">Upload to directory</label>
+                <label htmlFor="project-upload-directory" className="text-[10px] text-slate-500 uppercase tracking-wider block mb-1">Upload to directory</label>
                 <select
+                  ref={uploadDestinationSelectRef}
+                  id="project-upload-directory"
+                  aria-label="Upload destination directory"
                   value={uploadTargetPath}
+                  disabled={uploadingFiles}
                   onChange={e => setUploadTargetPath(e.target.value)}
                   className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-emerald-500/30 focus:outline-none"
                 >
@@ -3228,18 +5456,20 @@ export default function AppsPage() {
               {/* Drag and drop zone (react-dropzone for iPad compatibility) */}
               <div
                 {...getUploadRootProps()}
-                className={`border-2 border-dashed rounded-xl p-6 text-center transition-all cursor-pointer ${
-                  uploadIsDragActive
+                className={`border-2 border-dashed rounded-xl p-6 text-center transition-all ${
+                  uploadingFiles
+                    ? 'cursor-wait border-white/10 bg-white/[0.02] opacity-55'
+                    : uploadIsDragActive
                     ? 'border-emerald-400 bg-emerald-500/10'
-                    : 'border-white/10 hover:border-white/20 hover:bg-white/[0.02]'
+                    : 'cursor-pointer border-white/10 hover:border-white/20 hover:bg-white/[0.02]'
                 }`}
               >
-                <input {...getUploadInputProps()} />
+                <input {...getUploadInputProps({ 'aria-label': 'Choose files to upload' })} aria-label="Choose files to upload" />
                 <Upload size={28} className={`mx-auto mb-2 ${uploadIsDragActive ? 'text-emerald-400' : 'text-slate-600'}`} />
                 <p className="text-sm text-slate-400">
                   {uploadIsDragActive ? 'Drop files here' : 'Drag & drop files or click to browse'}
                 </p>
-                <p className="text-[10px] text-slate-600 mt-1">Any file type • Up to 500MB per file</p>
+                <p className="text-[10px] text-slate-600 mt-1">Any file type • 100MB per file • 500MB total</p>
               </div>
 
               {/* File list */}
@@ -3252,8 +5482,10 @@ export default function AppsPage() {
                       <span className="text-slate-300 truncate flex-1">{file.name}</span>
                       <span className="text-[10px] text-slate-600 flex-shrink-0">{(file.size / 1024).toFixed(1)}KB</span>
                       <button
+                        aria-label={`Remove ${file.name} from upload`}
+                        disabled={uploadingFiles}
                         onClick={() => setUploadFiles(prev => prev.filter((_, idx) => idx !== i))}
-                        className="text-slate-600 hover:text-red-400 flex-shrink-0"
+                        className="inline-flex size-7 flex-shrink-0 items-center justify-center text-slate-600 hover:text-red-400 disabled:cursor-wait disabled:opacity-40"
                       >
                         <X size={12} />
                       </button>
@@ -3266,14 +5498,97 @@ export default function AppsPage() {
               <button
                 onClick={handleUploadFiles}
                 disabled={uploadingFiles || uploadFiles.length === 0}
-                className="w-full py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-white font-medium text-sm disabled:opacity-50 flex items-center justify-center gap-2 transition-colors"
+                aria-busy={uploadingFiles}
+                className="inline-flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl bg-emerald-500 py-2.5 text-sm font-medium text-white transition-colors hover:bg-emerald-400 disabled:cursor-wait disabled:opacity-50"
               >
-                {uploadingFiles ? <><Loader2 size={16} className="animate-spin" /> Uploading...</> : <><Upload size={16} /> Upload {uploadFiles.length} file{uploadFiles.length !== 1 ? 's' : ''}</>}
+                {uploadingFiles ? <><Loader2 size={16} className="animate-spin" /> Uploading files…</> : <><Upload size={16} /> Upload {uploadFiles.length} file{uploadFiles.length !== 1 ? 's' : ''}</>}
               </button>
-            </motion.div>
-          </motion.div>
+        </motion.div>
+      </ViewportModal>
+
+      <ViewportModal
+        open={!!renamingProject}
+        onDismiss={dismissRenameProject}
+        dismissible={renameProjectPhase !== 'submitting' && renameProjectPhase !== 'reconciling'}
+        initialFocusRef={projectRenameInputRef}
+        className="bg-black/70 p-4 backdrop-blur-sm"
+      >
+        {renamingProject && (
+          <form
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="rename-project-title"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void submitRenameProject();
+            }}
+            className="w-full max-w-md rounded-xl border border-theme-border bg-theme-surface p-5 shadow-2xl"
+          >
+            <h3 id="rename-project-title" className="text-base font-semibold text-theme-text">
+              Rename project “{renamingProject}”
+            </h3>
+            <p className="mt-2 text-sm text-slate-400">
+              Project files, deployment state, and Project Chat identity will remain attached to this project.
+            </p>
+            <label htmlFor="rename-project-name" className="mt-4 block text-xs font-medium text-slate-300">
+              New project name
+            </label>
+            <input
+              ref={projectRenameInputRef}
+              id="rename-project-name"
+              value={renameProjectValue}
+              disabled={!!projectRenameInFlightRef.current || renameProjectPhase === 'recovery-blocked'}
+              onChange={(event) => {
+                setRenameProjectValue(event.target.value);
+                setRenameProjectError(null);
+              }}
+              className="mt-1 min-h-[44px] w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none focus:border-emerald-500/50 disabled:cursor-wait disabled:opacity-60"
+            />
+            {renameProjectError && (
+              <div role="alert" className="mt-3 rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+                {renameProjectError}
+              </div>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={renameProjectPhase === 'submitting' || renameProjectPhase === 'reconciling'}
+                onClick={dismissRenameProject}
+                className="min-h-[44px] rounded-lg px-4 py-2 text-sm text-slate-300 hover:bg-white/5 disabled:cursor-wait disabled:opacity-40"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={
+                  renameProjectPhase === 'submitting'
+                  || renameProjectPhase === 'reconciling'
+                  || renameProjectPhase === 'recovery-blocked'
+                  || !renameProjectValue.trim()
+                }
+                aria-busy={renameProjectPhase === 'submitting' || renameProjectPhase === 'reconciling'}
+                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-400 disabled:cursor-wait disabled:opacity-50"
+              >
+                {renameProjectPhase === 'submitting'
+                  ? <><Loader2 size={15} className="animate-spin" /> Renaming project…</>
+                  : renameProjectPhase === 'reconciling'
+                    ? <><Loader2 size={15} className="animate-spin" /> Checking rename status…</>
+                    : renameProjectPhase === 'indeterminate'
+                      ? 'Check rename status'
+                    : renameProjectPhase === 'storage-blocked'
+                      ? 'Retry rename recovery'
+                      : renameProjectPhase === 'recovery-retired'
+                        ? 'Arm new rename attempt'
+                      : renameProjectPhase === 'not-admitted'
+                        ? 'Try rename again'
+                        : renameProjectPhase === 'recovery-blocked'
+                          ? 'Rename blocked'
+                        : 'Rename project'}
+              </button>
+            </div>
+          </form>
         )}
-      </AnimatePresence>
+      </ViewportModal>
 
       {/* Delete Confirmation */}
       <ConfirmDialog
@@ -3284,22 +5599,79 @@ export default function AppsPage() {
         confirmLabel="Delete"
         variant="danger"
         icon={pendingDelete?.kind === 'project' ? 'shield' : 'trash'}
+        error={deleteError}
+        busy={deleteBusy}
+        busyLabel={deleteSettleNotice
+          || (pendingDelete?.kind === 'project' ? 'Deleting project…' : 'Deleting…')}
         onConfirm={doDelete}
-        onCancel={() => setPendingDelete(null)}
+        onCancel={() => {
+          if (deleteInFlightRef.current) return;
+          setDeleteError(null);
+          setDeleteSettleNotice(null);
+          setPendingDelete(null);
+        }}
+      />
+
+      <ConfirmDialog
+        open={!!pendingUndeploy}
+        title={`Remove deployment for "${pendingUndeploy || ''}"?`}
+        message="The Project source, Git history, and Project Chat will be preserved."
+        detail="Hosted files, runtime state, and deployment share links will be permanently removed."
+        confirmLabel="Remove deployment"
+        variant="danger"
+        icon="trash"
+        error={deploymentControlError}
+        busy={deploymentControlBusy === 'undeploy'}
+        busyLabel="Removing deployment…"
+        onConfirm={() => { void undeployProject(); }}
+        onCancel={() => {
+          if (deploymentControlBusy === 'undeploy') return;
+          setDeploymentControlError(null);
+          setPendingUndeploy(null);
+        }}
+      />
+
+      <ConfirmDialog
+        open={!!pendingResetFile}
+        title="Discard file changes?"
+        message="This restores the file from Git and permanently discards its uncommitted changes."
+        detail={pendingResetFile || undefined}
+        confirmLabel="Discard changes"
+        variant="warning"
+        icon="warning"
+        error={resetFileError}
+        busy={projectOperation?.kind === 'git' && projectOperation.gitAction === 'reset-file'}
+        busyLabel="Discarding changes…"
+        onConfirm={() => {
+          const filePath = pendingResetFile;
+          if (filePath) void resetFile(filePath);
+        }}
+        onCancel={() => {
+          if (projectOperationRef.current?.kind === 'git') return;
+          setResetFileError(null);
+          setPendingResetFile(null);
+        }}
       />
 
       {/* Revert Confirmation Modal */}
-      <AnimatePresence>
+      <ViewportModal
+        open={!!revertTarget}
+        onDismiss={() => {
+          if (projectOperationRef.current?.kind === 'git') return;
+          setRevertTarget(null);
+          setRevertResult(null);
+        }}
+        dismissible={!reverting}
+        initialFocusRef={revertCancelButtonRef}
+        className="bg-black/70 p-4 backdrop-blur-sm"
+      >
         {revertTarget && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 backdrop-blur-sm"
-            onClick={() => !reverting && setRevertTarget(null)}>
-            <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }}
-              className="bg-[#0d1117] border border-white/10 rounded-xl p-5 max-w-md w-full mx-4 shadow-2xl"
-              onClick={e => e.stopPropagation()}>
+            <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }}
+              role="dialog" aria-modal="true" aria-labelledby="revert-commit-title"
+              className="max-h-[calc(100dvh-2rem)] w-full max-w-md overflow-y-auto rounded-xl border border-theme-border bg-theme-surface p-5 shadow-2xl">
               <div className="flex items-center gap-2 mb-4">
                 <AlertCircle size={20} className="text-amber-400" />
-                <h3 className="text-sm font-semibold text-white">Revert Commit?</h3>
+                <h3 id="revert-commit-title" className="text-sm font-semibold text-white">Revert Commit?</h3>
               </div>
               
               <div className="bg-white/5 rounded-lg p-3 mb-4 space-y-2">
@@ -3338,36 +5710,42 @@ export default function AppsPage() {
               )}
 
               <div className="flex gap-2">
-                <button onClick={() => { setRevertTarget(null); setRevertResult(null); }} disabled={reverting}
+                <button ref={revertCancelButtonRef} onClick={() => {
+                  if (projectOperationRef.current?.kind === 'git') return;
+                  setRevertTarget(null);
+                  setRevertResult(null);
+                }} disabled={reverting}
                   className="flex-1 py-2 rounded-lg bg-white/5 text-slate-400 text-xs hover:bg-white/10 transition-colors disabled:opacity-30">
-                  Cancel
+                  {revertResult?.success ? 'Close' : 'Cancel'}
                 </button>
                 <button onClick={handleRevert} disabled={reverting || revertResult?.success === true}
+                  aria-busy={reverting}
                   className="flex-1 py-2 rounded-lg bg-amber-500/20 text-amber-400 text-xs hover:bg-amber-500/30 font-medium flex items-center justify-center gap-1.5 transition-colors disabled:opacity-30">
-                  {reverting ? <><Loader2 size={12} className="animate-spin" /> Reverting...</> : <><Undo2 size={12} /> Confirm Revert</>}
+                  {reverting ? <><Loader2 size={12} className="animate-spin" /> Reverting…</> : <><Undo2 size={12} /> Confirm Revert</>}
                 </button>
               </div>
             </motion.div>
-          </motion.div>
         )}
-      </AnimatePresence>
+      </ViewportModal>
 
       {/* Side-by-Side Diff Viewer Modal */}
-      <AnimatePresence>
+      <ViewportModal
+        open={!!commitDiff}
+        onDismiss={() => setCommitDiff(null)}
+        initialFocusRef={commitDiffCloseButtonRef}
+        className="bg-black/70 p-4 backdrop-blur-sm"
+      >
         {commitDiff && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 backdrop-blur-sm"
-            onClick={() => setCommitDiff(null)}>
-            <motion.div initial={{ scale: 0.95, y: 20 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.95, y: 20 }}
-              className="bg-[#0d1117] border border-white/10 rounded-xl max-w-[90vw] w-full max-h-[85vh] mx-4 shadow-2xl flex flex-col overflow-hidden"
-              onClick={e => e.stopPropagation()}>
+            <motion.div initial={{ scale: 0.95, y: 20 }} animate={{ scale: 1, y: 0 }}
+              role="dialog" aria-modal="true" aria-label="Commit diff"
+              className="flex max-h-[calc(100dvh-2rem)] w-full max-w-[90vw] flex-col overflow-hidden rounded-xl border border-theme-border bg-theme-surface shadow-2xl">
               <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
                 <div className="flex items-center gap-2">
                   <Diff size={14} className="text-blue-400" />
                   <span className="text-xs font-medium text-white">Commit Diff</span>
                   <span className="text-[10px] font-mono text-orange-400 bg-orange-500/10 px-1.5 py-0.5 rounded">{commitDiff.hash.substring(0, 7)}</span>
                 </div>
-                <button onClick={() => setCommitDiff(null)} className="text-slate-500 hover:text-white p-1"><X size={14} /></button>
+                <button ref={commitDiffCloseButtonRef} aria-label="Close commit diff" onClick={() => setCommitDiff(null)} className="inline-flex size-8 items-center justify-center text-slate-500 hover:text-white"><X size={14} /></button>
               </div>
               
               {/* Stats summary */}
@@ -3463,9 +5841,8 @@ export default function AppsPage() {
                 })()}
               </div>
             </motion.div>
-          </motion.div>
         )}
-      </AnimatePresence>
+      </ViewportModal>
       
       {/* Progress Notification for deploy/install */}
       <AnimatePresence>

@@ -1,9 +1,12 @@
 import React, { useState } from 'react';
 import { AlertTriangle, CheckCircle2, ChevronRight, ClipboardPaste, Copy, ExternalLink, Loader2, X } from 'lucide-react';
 import client from '../../api/client';
+import ViewportModal from '../ViewportModal';
 import ModelSelector, { type SelectableModel } from './ModelSelector';
 import type { ProviderUIConfig } from './providerConfig';
 import { getModelFamilyKey, mergeModelCatalog, pickPreferredModel } from './modelCatalog';
+import { getOAuthProviderPresentation, getOAuthStartRecoveryDisposition, isOAuthFlowCancelled, isOAuthFlowExpired, isOAuthFlowReadyForModel, readStructuredOAuthFlowState, readStructuredOAuthStartFailure } from './oauthFlowContract';
+import { cancelOAuthSession } from './oauthCancellation';
 
 interface OAuthSetupFlowProps {
   provider: ProviderUIConfig;
@@ -12,7 +15,7 @@ interface OAuthSetupFlowProps {
   onCancel: () => void;
 }
 
-type Step = 'prereqs' | 'start' | 'waiting' | 'device' | 'paste' | 'model' | 'done' | 'error';
+type Step = 'prereqs' | 'start' | 'waiting' | 'device' | 'paste' | 'finalizing' | 'model' | 'done' | 'error';
 type FlowKind = 'oauth' | 'native-cli';
 
 function nativeCliBridgeNote(providerId: string): { title: string; body: string; command?: string } | null {
@@ -41,6 +44,8 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
   const [authUrl, setAuthUrl] = useState<string | null>(null);
   const [deviceCode, setDeviceCode] = useState<string | null>(null);
   const [verificationUrl, setVerificationUrl] = useState<string | null>(null);
+  const [expiresAt, setExpiresAt] = useState<number | null>(null);
+  const [secondsRemaining, setSecondsRemaining] = useState<number | null>(null);
   const [callbackUrl, setCallbackUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [popupBlocked, setPopupBlocked] = useState(false);
@@ -51,6 +56,37 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
   const [availableModels, setAvailableModels] = useState<SelectableModel[]>(provider.defaultModels);
   const [loadingModels, setLoadingModels] = useState(false);
   const [googleProjectId, setGoogleProjectId] = useState('');
+  const [credentialProfileId, setCredentialProfileId] = useState<string | null>(null);
+  const [sessionOwned, setSessionOwned] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancellationError, setCancellationError] = useState<string | null>(null);
+  const [recoverySession, setRecoverySession] = useState(false);
+  const [reviewState, setReviewState] = useState<'committed' | 'review_required' | null>(null);
+  // A stuck credential lifecycle from a prior failed sign-in makes every retry
+  // return 409; offer a one-click reset that clears the bookkeeping and retries.
+  const [lifecycleConflict, setLifecycleConflict] = useState(false);
+  const [resettingLifecycle, setResettingLifecycle] = useState(false);
+  // Non-fatal finalization notice (e.g. an inconclusive live model probe); the
+  // sign-in still completes and the user can pick a default model.
+  const [finalizationWarning, setFinalizationWarning] = useState<string | null>(null);
+  const operationRef = React.useRef<string | null>(null);
+  const [operation, setOperation] = useState<string | null>(null);
+  const pollGenerationRef = React.useRef(0);
+  const mutationGenerationRef = React.useRef(0);
+
+  const claimOperation = React.useCallback((name: string) => {
+    if (operationRef.current) return false;
+    operationRef.current = name;
+    mutationGenerationRef.current += 1;
+    setOperation(name);
+    return true;
+  }, []);
+
+  const releaseOperation = React.useCallback((name: string) => {
+    if (operationRef.current !== name) return;
+    operationRef.current = null;
+    setOperation(null);
+  }, []);
 
   // Check if a default model is already configured; only auto-select if not
   React.useEffect(() => {
@@ -114,56 +150,186 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
 
   const isOpenAI = provider.id === 'openai-codex';
   const isGoogle = provider.id === 'google-gemini-cli';
-  const providerLabel = isOpenAI ? 'OpenAI' : 'Google';
-  const callbackPort = isOpenAI ? '1455' : '8085';
-  const callbackPathExample = isOpenAI ? `localhost:${callbackPort}/auth/callback?...` : `localhost:${callbackPort}/oauth2callback?...`;
+  const isXai = provider.id === 'xai';
+  const presentation = getOAuthProviderPresentation(provider.id, provider.name);
+  const providerLabel = presentation.label;
+  const callbackPathExample = presentation.callbackExample || 'localhost:8085/oauth2callback?...';
   const nativeCliNote = nativeCliBridgeNote(provider.id);
 
-  // Poll for auto-completion (local callback server may catch the redirect directly on VPS)
-  const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
   React.useEffect(() => {
-    if ((step === 'waiting' || step === 'device' || step === 'paste') && sessionId) {
-      pollRef.current = setInterval(async () => {
+    if (step !== 'device' || !expiresAt) {
+      setSecondsRemaining(null);
+      return;
+    }
+
+    const updateRemaining = () => {
+      const remaining = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+      setSecondsRemaining(remaining);
+    };
+
+    updateRemaining();
+    const timer = window.setInterval(updateRemaining, 1000);
+    return () => window.clearInterval(timer);
+  }, [expiresAt, step]);
+
+  // Poll for auto-completion (local callback server may catch the redirect directly on VPS)
+  const pollRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  React.useEffect(() => {
+    if ((step === 'waiting' || step === 'device' || step === 'paste' || step === 'finalizing' || (step === 'error' && sessionOwned)) && sessionId) {
+      let stopped = false;
+      const generation = ++pollGenerationRef.current;
+      const stopPolling = () => {
+        stopped = true;
+        if (pollRef.current) {
+          clearTimeout(pollRef.current);
+          pollRef.current = null;
+        }
+      };
+      const scheduleNext = () => {
+        if (!stopped && generation === pollGenerationRef.current) pollRef.current = setTimeout(() => { void pollOnce(); }, 2000);
+      };
+      const pollOnce = async () => {
+        if (operationRef.current) {
+          scheduleNext();
+          return;
+        }
+        const mutationGeneration = mutationGenerationRef.current;
         try {
           const statusPath = flowKind === 'native-cli'
             ? `${apiBase}/native-cli/status/${sessionId}`
             : `${apiBase}/oauth/status/${sessionId}`;
-          const { data } = await client.get(statusPath);
-          if (data?.status === 'complete') {
-            if (pollRef.current) clearInterval(pollRef.current);
+          const { data } = await client.get(statusPath, { timeout: 10_000 });
+          if (stopped || generation !== pollGenerationRef.current || operationRef.current || mutationGeneration !== mutationGenerationRef.current) return;
+          const structured = readStructuredOAuthFlowState(data);
+          setError(null);
+          if (structured.verificationUrl) setVerificationUrl(structured.verificationUrl);
+          if (structured.userCode) setDeviceCode(structured.userCode);
+          if (structured.expiresAt) setExpiresAt(structured.expiresAt);
+
+          if (recoverySession) {
+            if (structured.status === 'complete') {
+              setFatalError('The interrupted provider sign-in may have committed a credential. Cancel it to run the required server re-attestation before leaving this dialog.');
+            } else if (isOAuthFlowExpired(structured) || isOAuthFlowCancelled(structured) || structured.status === 'error') {
+              const detail = structured.error ? `${structured.error} ` : '';
+              setFatalError(`${detail}The interrupted provider sign-in reached a terminal state, but Portal must still re-attest it through cancellation.`);
+            } else if (structured.cleanupPending) {
+              setFatalError(structured.error || 'Portal is still stopping and reconciling this provider sign-in.');
+            }
+            return;
+          }
+
+          if (structured.cleanupPending && (isOAuthFlowExpired(structured) || isOAuthFlowCancelled(structured) || structured.status === 'error')) {
+            setFatalError(structured.error || 'Portal is still stopping and reconciling this provider sign-in.');
+            return;
+          }
+
+          const completionReady = isOAuthFlowReadyForModel(structured, flowKind === 'oauth');
+          if (completionReady) {
+            if (isXai && !structured.createdProfileId) {
+              stopPolling();
+              setFatalError('xAI sign-in finished, but Portal could not bind the exact saved credential. Disconnect xAI before retrying.');
+              setStep('error');
+              return;
+            }
+            if (structured.createdProfileId) setCredentialProfileId(structured.createdProfileId);
+            setFinalizationWarning(structured.finalizationWarning);
+            setSessionOwned(false);
+            stopPolling();
             setStep('model');
-          } else if (data?.status === 'error' && data?.error) {
-            if (pollRef.current) clearInterval(pollRef.current);
-            setFatalError(data.error);
+          } else if (structured.createdProfileId && (isOAuthFlowExpired(structured) || isOAuthFlowCancelled(structured) || structured.status === 'error')) {
+            setSessionOwned(false);
+            setSessionId(null);
+            setReviewState('committed');
+            stopPolling();
+            setFatalError(structured.error || 'A provider credential was committed, but final setup failed. Review the provider before starting another sign-in.');
+            setStep('error');
+          } else if (isOAuthFlowExpired(structured)) {
+            setSessionOwned(false);
+            stopPolling();
+            setFatalError('This device code expired. Start a fresh sign-in to get a new code.');
+            setStep('error');
+          } else if (isOAuthFlowCancelled(structured)) {
+            setSessionOwned(false);
+            stopPolling();
+            setFatalError('This sign-in was cancelled. Start again when you are ready.');
+            setStep('error');
+          } else if (structured.status === 'error') {
+            setSessionOwned(false);
+            stopPolling();
+            setFatalError(structured.error || 'Provider sign-in failed. Start a fresh sign-in and try again.');
             setStep('error');
           }
         } catch (err: any) {
-          if (flowKind === 'native-cli') {
-            if (pollRef.current) clearInterval(pollRef.current);
-            setFatalError(err?.response?.data?.error || err?.message || 'Provider login completed, but final setup failed.');
+          if (stopped || generation !== pollGenerationRef.current || operationRef.current || mutationGeneration !== mutationGenerationRef.current) return;
+          const structuredError = readStructuredOAuthFlowState(err?.response?.data);
+          if (flowKind === 'oauth' && structuredError.status === 'complete' && structuredError.finalized !== true) {
+            setError(structuredError.error || `${provider.name} sign-in succeeded. Portal is retrying final setup…`);
+            return;
+          }
+          if (step === 'error' && sessionOwned) {
+            setFatalError(structuredError.error || err?.message || 'Portal is still reconciling this provider sign-in.');
+            return;
+          }
+          if (flowKind === 'native-cli' || (isXai && structuredError.error)) {
+            stopPolling();
+            setFatalError(structuredError.error || err?.message || 'Provider login completed, but final setup failed.');
             setStep('error');
           }
+        } finally {
+          scheduleNext();
         }
-      }, 2000);
+      };
+      void pollOnce();
+      return stopPolling;
     }
     return () => {
-      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      if (pollRef.current) { clearTimeout(pollRef.current); pollRef.current = null; }
     };
-  }, [step, sessionId, apiBase, flowKind]);
+  }, [step, sessionId, sessionOwned, recoverySession, apiBase, flowKind, isXai, provider.name]);
 
   const startFlow = async () => {
+    if (sessionOwned || reviewState || !claimOperation('start')) return;
     setLoading(true);
     setError(null);
+    setLifecycleConflict(false);
+    setCancellationError(null);
+    setCredentialProfileId(null);
+    setRecoverySession(false);
     try {
       if (isOpenAI) {
+        setFlowKind('native-cli');
         const { data } = await client.post(`${apiBase}/native-cli/start`, { provider: 'codex' });
-        if (data.success === false && data.error) {
-          setFatalError(data.error);
+        if (data.success === false) {
+          const startFailure = readStructuredOAuthStartFailure(data);
+          const disposition = getOAuthStartRecoveryDisposition(startFailure);
+          if (disposition === 'cleanup_required' && startFailure.sessionId) {
+            setSessionId(startFailure.sessionId);
+            setSessionOwned(true);
+            setRecoverySession(true);
+          } else if (disposition === 'committed' || disposition === 'review_required') {
+            setSessionId(null);
+            setSessionOwned(false);
+            setReviewState(disposition);
+          }
+          setFatalError(startFailure.error || 'Failed to start Codex login.');
+          setStep('error');
+          return;
+        }
+        const nextSessionId = typeof data?.sessionId === 'string' ? data.sessionId.trim() : '';
+        if (!nextSessionId) {
+          setSessionOwned(false);
+          setReviewState('review_required');
+          setFatalError('Portal received an incomplete Codex start response and cannot prove whether authentication began. Review Codex before starting another login.');
           setStep('error');
           return;
         }
         setFlowKind('native-cli');
-        setSessionId(data.sessionId);
+        setSessionId(nextSessionId);
+        setSessionOwned(data.status !== 'complete');
+        if (data.status === 'complete') {
+          setStep('model');
+          return;
+        }
         const url = data.verificationUrl || 'https://auth.openai.com/codex/device';
         setVerificationUrl(url);
         setDeviceCode(data.deviceCode || null);
@@ -181,16 +347,55 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
       }
 
       const body: Record<string, string> = { provider: provider.id };
+      setFlowKind('oauth');
       if (isGoogle && googleProjectId.trim()) body.googleProjectId = googleProjectId.trim();
       const { data } = await client.post(`${apiBase}/oauth/start`, body);
-      if (data.success === false && data.error) {
-        setFatalError(data.error);
+      if (data?.success === false) {
+        const startFailure = readStructuredOAuthStartFailure(data);
+        const disposition = getOAuthStartRecoveryDisposition(startFailure);
+        if (disposition === 'cleanup_required' && startFailure.sessionId) {
+          setSessionId(startFailure.sessionId);
+          setSessionOwned(true);
+          setRecoverySession(true);
+        } else if (disposition === 'committed' || disposition === 'review_required') {
+          setSessionId(null);
+          setSessionOwned(false);
+          setReviewState(disposition);
+        }
+        setFatalError(startFailure.error || 'Failed to start provider sign-in.');
         setStep('error');
         return;
       }
       setFlowKind('oauth');
-      setSessionId(data.sessionId);
-      const url = data.authUrl || null;
+      const structured = readStructuredOAuthFlowState(data);
+      const nextSessionId = structured.sessionId;
+      if (!nextSessionId) {
+        setReviewState('review_required');
+        setFatalError('Portal received an incomplete OAuth start response and cannot prove whether a credential was committed. Review the provider before starting another sign-in.');
+        setStep('error');
+        return;
+      }
+      if (isOAuthFlowReadyForModel(structured, true)) {
+        if (isXai && !structured.createdProfileId) {
+          setSessionId(nextSessionId);
+          setSessionOwned(true);
+          setFatalError('xAI sign-in finished, but Portal could not bind the exact saved credential. Cancel this session and review xAI before retrying.');
+          setStep('error');
+          return;
+        }
+        setSessionId(nextSessionId);
+        setSessionOwned(false);
+        if (structured.createdProfileId) setCredentialProfileId(structured.createdProfileId);
+        setFinalizationWarning(structured.finalizationWarning);
+        setStep('model');
+        return;
+      }
+      setSessionId(nextSessionId);
+      setSessionOwned(true);
+      setVerificationUrl(structured.verificationUrl);
+      setDeviceCode(structured.userCode);
+      setExpiresAt(structured.expiresAt);
+      const url = structured.verificationUrl;
       setAuthUrl(url);
       if (url) {
         try {
@@ -200,9 +405,50 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
           setPopupBlocked(true);
         }
       }
-      setStep('waiting');
+      setStep(presentation.completionMode === 'device_code' ? 'device' : 'waiting');
     } catch (err: any) {
-      const msg = err?.response?.data?.error || err?.message || 'Failed to start sign-in';
+      const startFailure = readStructuredOAuthStartFailure(err?.response?.data);
+      const msg = startFailure.error || err?.message || 'Failed to start sign-in';
+      // A stuck-lifecycle 409 carries only {error, code} — no credentialState —
+      // so the disposition helper would route it to the terminal error step and
+      // the reset action would never render. Detect it before any disposition
+      // early-return; the ledger conflict never owns a live session, so this
+      // cannot shadow a cleanup path.
+      const conflictCode = err?.response?.data?.code;
+      const isLifecycleConflict = err?.response?.status === 409
+        && !startFailure.sessionId
+        && startFailure.credentialState !== 'committed'
+        && (conflictCode === 'PROVIDER_CREDENTIAL_LIFECYCLE_CONFLICT'
+          || /recovering the previous authorization lifecycle|already owns this provider credential/i.test(String(msg)));
+      if (isLifecycleConflict) {
+        setLifecycleConflict(true);
+        setError(msg);
+        return;
+      }
+      // A busy operation gate (e.g. a just-cancelled sign-in still reconciling)
+      // resolves by itself in seconds; keep it a retryable inline notice.
+      if (err?.response?.status === 409 && !startFailure.sessionId && /already running/i.test(String(msg))) {
+        setError(msg);
+        return;
+      }
+      const disposition = getOAuthStartRecoveryDisposition(startFailure);
+      if (disposition === 'cleanup_required' && startFailure.sessionId) {
+        setSessionId(startFailure.sessionId);
+        setSessionOwned(true);
+        setRecoverySession(true);
+        setFatalError(msg);
+        setStep('error');
+        return;
+      }
+      if (disposition === 'committed' || disposition === 'review_required') {
+        setSessionId(null);
+        setSessionOwned(false);
+        setRecoverySession(false);
+        setReviewState(disposition);
+        setFatalError(msg);
+        setStep('error');
+        return;
+      }
       if (typeof msg === 'string' && (msg.includes('exited with code') || msg.includes('process'))) {
         setFatalError(msg);
         setStep('error');
@@ -211,11 +457,87 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
       }
     } finally {
       setLoading(false);
+      releaseOperation('start');
     }
   };
 
+  const resetLifecycleAndRetry = async () => {
+    if (resettingLifecycle || operationRef.current) return;
+    setResettingLifecycle(true);
+    setError(null);
+    try {
+      await client.post(`${apiBase}/oauth/reset-lifecycle`, { provider: provider.id });
+      setLifecycleConflict(false);
+      await startFlow();
+    } catch (err: any) {
+      setError(err?.response?.data?.error || err?.message || 'Could not reset the previous sign-in. Try again in a moment.');
+    } finally {
+      setResettingLifecycle(false);
+    }
+  };
+
+  const cancelActiveSession = async (): Promise<'cancelled' | 'blocked' | 'review'> => {
+    if (operationRef.current || reviewState) return 'blocked';
+    if (!sessionId || !sessionOwned) return 'cancelled';
+    if (!claimOperation('cancel')) return 'blocked';
+    setCancelling(true);
+    setCancellationError(null);
+    const result = await cancelOAuthSession(apiBase, sessionId);
+    setCancelling(false);
+    if (result.outcome === 'committed' || result.outcome === 'review_required') {
+      setSessionOwned(false);
+      setSessionId(null);
+      setRecoverySession(false);
+      setReviewState(result.outcome);
+      setFatalError(result.error || 'Review the provider before starting another sign-in.');
+      setStep('error');
+      releaseOperation('cancel');
+      return 'review';
+    }
+    if (result.outcome !== 'cancelled') {
+      setCancellationError(result.error || 'Cancellation could not be verified. Keep this dialog open and retry cancellation.');
+      releaseOperation('cancel');
+      return 'blocked';
+    }
+    setSessionOwned(false);
+    setSessionId(null);
+    setRecoverySession(false);
+    releaseOperation('cancel');
+    return 'cancelled';
+  };
+
+  const cancelActiveFlow = async () => {
+    if (reviewState || operationRef.current) return;
+    const result = await cancelActiveSession();
+    if (result !== 'cancelled') return;
+    onCancel();
+  };
+
+  const retryFlow = async () => {
+    if (reviewState || operationRef.current) return;
+    const result = await cancelActiveSession();
+    if (result !== 'cancelled') return;
+    setSessionId(null);
+    setAuthUrl(null);
+    setVerificationUrl(null);
+    setDeviceCode(null);
+    setExpiresAt(null);
+    setSecondsRemaining(null);
+    setPopupBlocked(false);
+    setError(null);
+    setFatalError(null);
+    setCancellationError(null);
+    setCredentialProfileId(null);
+    setStep('prereqs');
+  };
+
+  const acknowledgeReview = () => {
+    if (operationRef.current) return;
+    onCancel();
+  };
+
   const submitCallback = async () => {
-    if (!sessionId) return;
+    if (!sessionId || !callbackUrl.trim() || !claimOperation('callback')) return;
     setLoading(true);
     setError(null);
     try {
@@ -224,20 +546,38 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
         setError(data.error || 'Sign-in failed. Try starting over.');
         return;
       }
-      setStep('model');
+      const structured = readStructuredOAuthFlowState(data);
+      if (isOAuthFlowReadyForModel(structured, true)) {
+        if (structured.createdProfileId) setCredentialProfileId(structured.createdProfileId);
+        setFinalizationWarning(structured.finalizationWarning);
+        setSessionOwned(false);
+        setStep('model');
+        return;
+      }
+      setError('Authorization was accepted. Portal is verifying the saved credential before loading models.');
+      setStep('finalizing');
     } catch (err: any) {
       setError(err?.response?.data?.error || err?.message || 'Failed to complete sign-in');
     } finally {
       setLoading(false);
+      releaseOperation('callback');
     }
   };
 
   const finish = async () => {
+    if (!claimOperation('model')) return;
     setLoading(true);
     setError(null);
     try {
       if (selectedModel) {
-        await client.post(`${apiBase}/set-default-model`, { model: selectedModel });
+        const { data } = await client.post(`${apiBase}/set-default-model`, {
+          model: selectedModel,
+          provider: provider.id,
+          ...(isXai ? { profileId: credentialProfileId } : {}),
+        });
+        if (typeof data?.warning === 'string' && data.warning.trim()) {
+          setFinalizationWarning(data.warning.trim());
+        }
       }
       setStep('done');
       onComplete();
@@ -245,25 +585,42 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
       setError(err?.response?.data?.error || err?.message || 'Signed in, but failed to set default model');
     } finally {
       setLoading(false);
+      releaseOperation('model');
     }
   };
 
   // ── Shell ──
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-lg overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl" style={{ maxHeight: '92vh' }}>
+    <ViewportModal
+      open
+      onDismiss={() => { void cancelActiveFlow(); }}
+      dismissible={!loading && !cancelling && !sessionOwned && !reviewState && !operation}
+      className="bg-black/70 p-4 backdrop-blur-sm"
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="oauth-provider-setup-title"
+        className="max-h-[calc(100dvh-2rem)] w-full max-w-lg overflow-y-auto rounded-2xl border border-theme-border bg-theme-surface text-theme-text shadow-2xl"
+      >
 
         {/* Header */}
         <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
-          <h2 className="text-base font-semibold text-white">
+          <h2 id="oauth-provider-setup-title" className="text-base font-semibold text-white">
             {step === 'done' ? '✓ Done' : `Set up ${provider.name}`}
           </h2>
-          <button type="button" onClick={onCancel} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white">
-            <X className="h-4 w-4" />
+          <button type="button" onClick={() => { void cancelActiveFlow(); }} disabled={loading || cancelling || Boolean(operation) || Boolean(reviewState)} aria-busy={cancelling} aria-label="Close provider setup" className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white disabled:cursor-wait disabled:opacity-50">
+            {cancelling ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
           </button>
         </div>
 
         <div className="px-5 py-5">
+
+          {cancellationError ? (
+            <div className="mb-4 rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200" role="alert">
+              <AlertTriangle className="mb-1 inline h-4 w-4" /> {cancellationError}
+            </div>
+          ) : null}
 
           {/* ── Step: Prerequisites ── */}
           {step === 'prereqs' ? (
@@ -372,6 +729,32 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                 </>
               ) : null}
 
+              {isXai ? (
+                <>
+                  <p className="text-sm leading-relaxed text-slate-300">
+                    You'll sign in with your <strong className="text-white">Grok account</strong> using OpenClaw's device authorization flow.
+                    No API key or localhost callback is required.
+                  </p>
+                  <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-4">
+                    <div className="text-sm font-medium text-white">Before you start:</div>
+                    <ul className="mt-3 space-y-2.5 text-sm text-slate-300">
+                      <li className="flex items-start gap-2">
+                        <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />
+                        <span>Use the xAI account whose Grok subscription you want this server to use. xAI decides subscription eligibility.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />
+                        <span>Keep this window open. The portal will show a short code and finish automatically after authorization.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />
+                        <span>Subscription usage is separate from xAI developer API-key billing.</span>
+                      </li>
+                    </ul>
+                  </div>
+                </>
+              ) : null}
+
               {nativeCliNote ? (
                 <div className="rounded-lg border border-slate-700/50 bg-slate-800/30 px-4 py-3 text-sm text-slate-300">
                   {provider.id === 'openai-codex'
@@ -386,15 +769,16 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
 
               <button
                 type="button"
-                onClick={() => { setStep('start'); }}
+                onClick={() => { if (!operationRef.current) setStep('start'); }}
+                disabled={Boolean(operation)}
                 className="flex w-full items-center justify-center gap-2 rounded-xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 shadow transition hover:bg-slate-100 active:bg-slate-200"
               >
                 I'm ready — next step
                 <ChevronRight className="h-4 w-4" />
               </button>
 
-              <button type="button" onClick={onCancel} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition">
-                Cancel
+              <button type="button" onClick={() => { void cancelActiveFlow(); }} disabled={cancelling || Boolean(operation)} aria-busy={cancelling} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition disabled:cursor-wait disabled:opacity-50">
+                {cancelling ? 'Cancelling…' : 'Cancel'}
               </button>
             </div>
           ) : null}
@@ -403,11 +787,25 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
           {step === 'start' ? (
             <div className="space-y-5">
               <p className="text-sm text-slate-300">
-                Click the button below to open {providerLabel} sign-in in a new tab.
+                {isXai
+                  ? 'Start sign-in to generate a short xAI device code.'
+                  : `Click the button below to open ${providerLabel} sign-in in a new tab.`}
               </p>
 
               {error ? (
                 <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">{error}</div>
+              ) : null}
+
+              {lifecycleConflict ? (
+                <button
+                  type="button"
+                  onClick={() => { void resetLifecycleAndRetry(); }}
+                  disabled={resettingLifecycle || loading}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl border border-amber-400/30 bg-amber-500/15 px-5 py-3 text-sm font-semibold text-amber-100 transition hover:bg-amber-500/25 disabled:cursor-wait disabled:opacity-50"
+                >
+                  {resettingLifecycle ? <Loader2 className="h-4 w-4 animate-spin" /> : <AlertTriangle className="h-4 w-4" />}
+                  {resettingLifecycle ? 'Resetting…' : 'Reset the previous sign-in and try again'}
+                </button>
               ) : null}
 
               <button
@@ -420,7 +818,7 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                 Sign in with {providerLabel}
               </button>
 
-              <button type="button" onClick={() => setStep('prereqs')} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition">
+              <button type="button" onClick={() => { if (!operationRef.current) setStep('prereqs'); }} disabled={Boolean(operation)} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition disabled:cursor-wait disabled:opacity-50">
                 ← Back
               </button>
             </div>
@@ -479,15 +877,16 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
 
               <button
                 type="button"
-                onClick={() => setStep('paste')}
+                onClick={() => { if (!operationRef.current) setStep('paste'); }}
+                disabled={Boolean(operation)}
                 className="flex w-full items-center justify-center gap-2 rounded-xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 shadow transition hover:bg-slate-100 active:bg-slate-200"
               >
                 <ClipboardPaste className="h-4 w-4" />
                 I copied the URL — paste it now
               </button>
 
-              <button type="button" onClick={onCancel} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition">
-                Cancel
+              <button type="button" onClick={() => { void cancelActiveFlow(); }} disabled={cancelling || Boolean(operation)} aria-busy={cancelling} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition disabled:cursor-wait disabled:opacity-50">
+                {cancelling ? 'Cancelling…' : 'Cancel'}
               </button>
             </div>
           ) : null}
@@ -501,26 +900,35 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                 </div>
               ) : (
                 <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
-                  <strong>A new tab opened.</strong> Enter the code there, then come back.
+                  {verificationUrl
+                    ? <><strong>A new tab opened.</strong> Enter the code there, then come back.</>
+                    : <><strong>Preparing device authorization.</strong> The verification link and code will appear here.</>}
                 </div>
               )}
 
               <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-5 text-center">
                 <p className="text-sm text-slate-400">Go to</p>
-                <a
-                  href={verificationUrl || 'https://auth.openai.com/codex/device'}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="mt-1 inline-block text-base font-semibold text-sky-300 underline"
-                >
-                  {verificationUrl || 'https://auth.openai.com/codex/device'}
-                </a>
+                {verificationUrl ? (
+                  <a
+                    href={verificationUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-1 inline-block break-all text-base font-semibold text-sky-300 underline"
+                  >
+                    {verificationUrl}
+                  </a>
+                ) : (
+                  <div className="mt-2 inline-flex items-center gap-2 text-sm text-slate-300">
+                    <Loader2 className="h-4 w-4 animate-spin" /> Waiting for the secure verification link…
+                  </div>
+                )}
                 <div className="mt-5 text-xs font-semibold uppercase tracking-wide text-slate-500">Enter this code</div>
                 <div className="mt-3 inline-flex items-center gap-3 rounded-xl border border-sky-500/30 bg-sky-500/10 px-5 py-4">
                   <span className="text-2xl font-semibold tracking-widest text-white">{deviceCode || 'Waiting...'}</span>
                   {deviceCode ? (
                     <button
                       type="button"
+                      aria-label="Copy device code"
                       onClick={() => navigator.clipboard.writeText(deviceCode)}
                       className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300 transition hover:border-slate-600 hover:bg-slate-800"
                     >
@@ -528,11 +936,17 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                     </button>
                   ) : null}
                 </div>
-                <p className="mt-4 text-sm text-slate-400">Waiting for authorization...</p>
+                <p className="mt-4 text-sm text-slate-400">
+                  {secondsRemaining !== null
+                    ? (secondsRemaining > 0
+                      ? `Waiting for authorization… Code expires in ${Math.floor(secondsRemaining / 60)}:${String(secondsRemaining % 60).padStart(2, '0')}.`
+                      : 'Checking the final authorization state with OpenClaw…')
+                    : 'Waiting for authorization…'}
+                </p>
               </div>
 
-              <button type="button" onClick={onCancel} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition">
-                Cancel
+              <button type="button" onClick={() => { void cancelActiveFlow(); }} disabled={cancelling || Boolean(operation)} aria-busy={cancelling} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition disabled:cursor-wait disabled:opacity-50">
+                {cancelling ? 'Cancelling…' : 'Cancel sign-in'}
               </button>
             </div>
           ) : null}
@@ -545,6 +959,7 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
               </p>
 
               <textarea
+                aria-label="OAuth callback URL"
                 value={callbackUrl}
                 onChange={(e) => setCallbackUrl(e.target.value)}
                 rows={4}
@@ -569,13 +984,21 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                 Complete Sign-In
               </button>
 
-              <button type="button" onClick={() => setStep('waiting')} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition">
+              <button type="button" onClick={() => { if (!operationRef.current) setStep('waiting'); }} disabled={Boolean(operation)} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition disabled:cursor-wait disabled:opacity-50">
                 ← Back
               </button>
             </div>
           ) : null}
 
           {/* ── Step: Model ── */}
+          {step === 'finalizing' ? (
+            <div className="space-y-4 py-8 text-center" role="status">
+              <Loader2 className="mx-auto h-8 w-8 animate-spin text-emerald-400" />
+              <p className="text-sm text-slate-300">Verifying the saved {providerLabel} credential before loading models…</p>
+              {error ? <p className="text-xs text-slate-500">{error}</p> : null}
+            </div>
+          ) : null}
+
           {step === 'model' ? (
             <div className="space-y-4">
               <div className="flex items-center gap-2 text-emerald-400">
@@ -584,8 +1007,19 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
               </div>
 
               <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
-                All available {provider.name} models have been added automatically. You can use any of them in the portal.
+                {isXai
+                  ? 'These are OpenClaw-compatible xAI chat models. Portal will live-test the exact signed-in credential and selected model before saving it as the default.'
+                  : 'Models discovered for this connection have been registered. When live discovery is unavailable, the portal shows tested compatibility defaults instead.'}
               </div>
+
+              {finalizationWarning ? (
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-300" />
+                    <span>{finalizationWarning}</span>
+                  </div>
+                </div>
+              ) : null}
 
               <p className="text-sm text-slate-300">
                 Optionally, choose a default model. You can change this anytime in Settings.
@@ -674,17 +1108,36 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                   </ul>
                 </div>
               ) : null}
+              {isXai ? (
+                <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-4 text-sm text-slate-300">
+                  <div className="font-medium text-white">Common causes:</div>
+                  <ul className="mt-2 space-y-1.5">
+                    <li>• The short code expired or authorization was denied.</li>
+                    <li>• The signed-in xAI account is not eligible for subscription OAuth.</li>
+                    <li>• OpenClaw's bundled xAI plugin is unavailable on this server.</li>
+                  </ul>
+                </div>
+              ) : null}
 
-              <button
-                type="button"
-                onClick={() => { setError(null); setFatalError(null); setStep('prereqs'); }}
-                className="flex w-full items-center justify-center gap-2 rounded-xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 shadow transition hover:bg-slate-100"
-              >
-                Try Again
-              </button>
-              <button type="button" onClick={onCancel} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition">
-                Cancel
-              </button>
+              {reviewState ? (
+                <button type="button" onClick={acknowledgeReview} className="flex w-full items-center justify-center gap-2 rounded-xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 shadow transition hover:bg-slate-100">
+                  Close and review provider status
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => { void retryFlow(); }}
+                    disabled={cancelling || Boolean(operation)}
+                    className="flex w-full items-center justify-center gap-2 rounded-xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 shadow transition hover:bg-slate-100 disabled:cursor-wait disabled:opacity-50"
+                  >
+                    Try Again
+                  </button>
+                  <button type="button" onClick={() => { void cancelActiveFlow(); }} disabled={cancelling || Boolean(operation)} aria-busy={cancelling} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition disabled:cursor-wait disabled:opacity-50">
+                    {cancelling ? 'Cancelling…' : 'Cancel'}
+                  </button>
+                </>
+              )}
             </div>
           ) : null}
 
@@ -694,7 +1147,15 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
               <CheckCircle2 className="mx-auto h-10 w-10 text-emerald-400" />
               <h3 className="text-lg font-semibold text-white">{provider.name} connected</h3>
               <p className="text-sm text-slate-400">You're ready to use AI in the portal.</p>
-              <button type="button" onClick={onCancel} className="rounded-xl bg-slate-800 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-slate-700">
+              {finalizationWarning ? (
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-left text-sm text-amber-100">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-300" />
+                    <span>{finalizationWarning}</span>
+                  </div>
+                </div>
+              ) : null}
+              <button type="button" onClick={() => { void cancelActiveFlow(); }} className="rounded-xl bg-slate-800 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-slate-700">
                 Close
               </button>
             </div>
@@ -702,6 +1163,6 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
 
         </div>
       </div>
-    </div>
+    </ViewportModal>
   );
 }

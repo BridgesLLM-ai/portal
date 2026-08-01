@@ -1,8 +1,17 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle2, ExternalLink, Loader2, ShieldCheck, X } from 'lucide-react';
 import client from '../../api/client';
+import ViewportModal from '../ViewportModal';
 import ModelSelector, { SelectableModel } from './ModelSelector';
 import type { ProviderUIConfig } from './providerConfig';
+import { useAuthStore } from '../../contexts/AuthContext';
+import {
+  isAuthoritativeCredentialWriteRejection,
+  loadOrCreateCredentialOperation,
+  retireCredentialOperation,
+  verifyCredentialOperation,
+  type DurableCredentialOperation,
+} from './credentialOperationStorage';
 
 interface ApiKeySetupFlowProps {
   provider: ProviderUIConfig;
@@ -21,6 +30,7 @@ interface ValidationResponse {
 }
 
 export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCancel }: ApiKeySetupFlowProps) {
+  const actorScope = useAuthStore((state) => state.user?.id ? `user:${state.user.id}` : 'setup:pending');
   const [step, setStep] = useState<FlowStep>('instructions');
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
@@ -30,6 +40,7 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
   const [setDefault, setSetDefault] = useState(false);
   const [savingMessage, setSavingMessage] = useState('Saving API key...');
   const [saveError, setSaveError] = useState<string | null>(null);
+  const saveOperationRef = useRef<DurableCredentialOperation | null>(null);
 
   // Only auto-select a default model if no default is already configured
   useEffect(() => {
@@ -84,6 +95,8 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
     setStep('saving');
     setSaveError(null);
     try {
+      const operation = loadOrCreateCredentialOperation(actorScope, 'api-key', provider.id);
+      saveOperationRef.current = operation;
       setSavingMessage('Saving API key...');
       await new Promise((resolve) => setTimeout(resolve, 250));
       if (selectedModel && setDefault) {
@@ -91,30 +104,55 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
       setSavingMessage('Restarting AI engine...');
+      verifyCredentialOperation(operation);
       await client.post(`${apiBase}/save-key`, {
         provider: provider.id,
         apiKey,
         setDefault: selectedModel ? setDefault : false,
         model: selectedModel || undefined,
+        operationId: operation.operationId,
       });
+      retireCredentialOperation(operation);
+      saveOperationRef.current = null;
       setStep('done');
       onComplete();
     } catch (error: any) {
+      const operation = saveOperationRef.current;
+      if (operation && isAuthoritativeCredentialWriteRejection(error)) {
+        try {
+          retireCredentialOperation(operation);
+          saveOperationRef.current = null;
+        } catch (storageError: any) {
+          setSaveError(storageError?.message || 'Portal could not retire the rejected credential operation.');
+          setStep('model');
+          return;
+        }
+      }
       setSaveError(error?.response?.data?.error || error?.message || 'Failed to save API key');
       setStep('model');
     }
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
-      <div className="max-h-[90vh] w-full max-w-4xl overflow-y-auto rounded-3xl border border-slate-800 bg-slate-900 shadow-2xl">
+    <ViewportModal
+      open
+      onDismiss={onCancel}
+      dismissible={step !== 'saving'}
+      className="bg-black/50 p-4 backdrop-blur-sm"
+    >
+      <div
+        className="max-h-[calc(100dvh-2rem)] w-full max-w-4xl overflow-y-auto rounded-3xl border border-theme-border bg-theme-surface text-theme-text shadow-2xl"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="api-key-setup-title"
+      >
         <div className="flex items-start justify-between gap-4 border-b border-slate-800 px-6 py-5">
           <div>
             <div className="text-xs font-semibold uppercase tracking-[0.2em] text-emerald-300">AI Provider Setup</div>
-            <h2 className="mt-2 text-2xl font-semibold text-white">{provider.name}</h2>
+            <h2 id="api-key-setup-title" className="mt-2 text-2xl font-semibold text-white">{provider.name}</h2>
             <p className="mt-2 text-sm text-slate-400">{provider.description}</p>
           </div>
-          <button type="button" onClick={onCancel} className="rounded-xl border border-slate-800 bg-slate-950/70 p-2 text-slate-400 transition hover:text-white">
+          <button type="button" onClick={onCancel} disabled={step === 'saving'} className="rounded-xl border border-slate-800 bg-slate-950/70 p-2 text-slate-400 transition hover:text-white disabled:cursor-wait disabled:opacity-50" aria-label={`Close ${provider.name} setup`}>
             <X className="h-4 w-4" />
           </button>
         </div>
@@ -187,12 +225,13 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
               <div className="relative">
                 <input
                   type={showKey ? 'text' : 'password'}
+                  aria-label={`${provider.name} API key`}
                   value={apiKey}
                   onChange={(event) => setApiKey(event.target.value)}
                   placeholder={provider.keyPlaceholder || 'Paste your API key'}
                   className="w-full rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 pr-12 text-white placeholder-slate-500 outline-none transition focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
                 />
-                <button type="button" onClick={() => setShowKey((current) => !current)} className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-slate-400 hover:text-white">
+                <button type="button" onClick={() => setShowKey((current) => !current)} className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-slate-400 hover:text-white" aria-label={showKey ? `Hide ${provider.name} API key` : `Show ${provider.name} API key`}>
                   {showKey ? 'Hide' : 'Show'}
                 </button>
               </div>
@@ -288,6 +327,6 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
           ) : null}
         </div>
       </div>
-    </div>
+    </ViewportModal>
   );
 }

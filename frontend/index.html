@@ -9,6 +9,28 @@
     <title>BridgesLLM Portal</title>
     <meta name="description" content="BridgesLLM Portal - Cutting-edge control center" />
     <meta name="theme-color" content="#0A0E27" />
+    <script>
+      // Resolve the saved preference before CSS or React paints. React's
+      // layout effect keeps later changes synchronized; this bootstrap avoids
+      // a dark flash when a light/system user reloads the Portal.
+      (() => {
+        let resolved = 'dark';
+        try {
+          const saved = localStorage.getItem('theme');
+          if (saved === 'light') resolved = 'light';
+          else if (saved === 'system' && window.matchMedia?.('(prefers-color-scheme: light)').matches) resolved = 'light';
+        } catch {
+          // Storage can be unavailable in hardened/private browser contexts.
+        }
+        document.documentElement.setAttribute('data-theme', resolved);
+        document.documentElement.style.colorScheme = resolved;
+        document.documentElement.style.backgroundColor = resolved === 'light' ? '#f2f5f9' : '#0A0E27';
+        document.querySelector('meta[name="theme-color"]')?.setAttribute(
+          'content',
+          resolved === 'light' ? '#f2f5f9' : '#0A0E27',
+        );
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -3,5 +3,6 @@
   <property name="general" type="empty">
     <property name="SaveOnExit" type="bool" value="false"/>
     <property name="SessionName" type="string" value="Default"/>
+    <property name="LockCommand" type="string" value="/bin/true"/>
   </property>
 </channel>

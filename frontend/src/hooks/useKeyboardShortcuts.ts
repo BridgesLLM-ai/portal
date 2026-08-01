@@ -54,45 +54,38 @@ export function useKeyboardShortcuts(shortcuts: ShortcutConfig[], enabled = true
   }, [handleKeyDown]);
 }
 
-// Global shortcut registry for help modal
-export const GLOBAL_SHORTCUTS: Record<string, ShortcutConfig[]> = {
+export type ShortcutDisplay = Omit<ShortcutConfig, 'handler' | 'preventDefault'>;
+
+// Display-only registry for the help modal. Keep this list narrower than the
+// live handlers: an advertised shortcut is a product promise, not a wishlist.
+export const GLOBAL_SHORTCUTS: Record<string, ShortcutDisplay[]> = {
   general: [
-    { key: 'k', ctrl: true, handler: () => {}, description: 'Open command palette' },
-    { key: 'b', ctrl: true, handler: () => {}, description: 'Toggle sidebar' },
-    { key: '/', ctrl: true, handler: () => {}, description: 'Toggle Assistant AI' },
-    { key: 'Escape', handler: () => {}, description: 'Close modal/panel' },
-    { key: '?', shift: true, handler: () => {}, description: 'Show keyboard shortcuts' },
+    { key: 'k', ctrl: true, description: 'Open command palette' },
+    { key: 'Escape', description: 'Close the active modal or panel' },
+    { key: '?', shift: true, description: 'Show keyboard shortcuts' },
   ],
   editor: [
-    { key: 's', ctrl: true, handler: () => {}, description: 'Save file' },
-    { key: 'f', ctrl: true, handler: () => {}, description: 'Find' },
-    { key: 'h', ctrl: true, handler: () => {}, description: 'Find and replace' },
-    { key: '/', ctrl: true, handler: () => {}, description: 'Toggle comment' },
-    { key: 'w', ctrl: true, handler: () => {}, description: 'Close tab' },
-    { key: 'Tab', ctrl: true, handler: () => {}, description: 'Next tab' },
-    { key: 'Tab', ctrl: true, shift: true, handler: () => {}, description: 'Previous tab' },
+    { key: 's', ctrl: true, description: 'Save file' },
+    { key: 'f', ctrl: true, description: 'Find' },
+    { key: 'h', ctrl: true, description: 'Find and replace' },
+    { key: '/', ctrl: true, description: 'Toggle comment' },
   ],
-  fileTree: [
-    { key: 'ArrowUp', handler: () => {}, description: 'Navigate up' },
-    { key: 'ArrowDown', handler: () => {}, description: 'Navigate down' },
-    { key: 'ArrowRight', handler: () => {}, description: 'Expand folder' },
-    { key: 'ArrowLeft', handler: () => {}, description: 'Collapse folder' },
-    { key: 'Enter', handler: () => {}, description: 'Open file/toggle folder' },
-    { key: 'Delete', handler: () => {}, description: 'Delete file' },
-    { key: 'F2', handler: () => {}, description: 'Rename file' },
-    { key: 'n', ctrl: true, handler: () => {}, description: 'New file' },
+  projects: [
+    { key: 'b', ctrl: true, description: 'Toggle project sidebar' },
+    { key: 'p', ctrl: true, description: 'Search project files' },
+    { key: 'F', ctrl: true, shift: true, description: 'Toggle editor fullscreen' },
   ],
   terminal: [
-    { key: 'ArrowUp', handler: () => {}, description: 'Previous command/suggestion' },
-    { key: 'ArrowDown', handler: () => {}, description: 'Next command/suggestion' },
-    { key: 'Tab', handler: () => {}, description: 'Fill suggestion' },
-    { key: 'Escape', handler: () => {}, description: 'Exit autocomplete/return to chat' },
-    { key: 'Enter', handler: () => {}, description: 'Execute command' },
+    { key: 'ArrowUp', description: 'Previous command or suggestion' },
+    { key: 'ArrowDown', description: 'Next command or suggestion' },
+    { key: 'Tab', description: 'Fill suggestion' },
+    { key: 'Escape', description: 'Exit autocomplete or return to chat' },
+    { key: 'Enter', description: 'Execute command' },
   ],
 };
 
 // Pretty format shortcut for display
-export function formatShortcut(shortcut: ShortcutConfig): string {
+export function formatShortcut(shortcut: ShortcutDisplay): string {
   const parts: string[] = [];
   const mod = isMac ? '⌘' : 'Ctrl';
   

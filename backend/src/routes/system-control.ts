@@ -1,251 +1,267 @@
 import { Router } from 'express';
-import { authenticateToken, requireAdmin } from '../middleware/auth';
+import type { Prisma } from '@prisma/client';
+import { authenticateToken } from '../middleware/auth';
+import { requireAdmin, requireOwner } from '../middleware/requireAdmin';
 import { prisma } from '../config/database';
-import { config } from '../config/env';
+import { isOwnerRole } from '../utils/authz';
+import {
+  PRIVILEGED_CONFIRMATION,
+  isTypedConfirmationMatch,
+} from '../utils/privilegedConfirmation';
+import {
+  getLocalOllamaRestartCapability,
+  getOllamaRuntimeStatus,
+  OllamaSystemControlError,
+  restartLocalOllamaService,
+  unloadAllOllamaModels,
+} from '../services/ollamaSystemControl';
+import {
+  OllamaAuthorityBarrierBusyError,
+  withOllamaAuthorityMutationFence,
+} from '../services/ollamaAuthorityBarrier';
 
 const router = Router();
 
 router.use(authenticateToken, requireAdmin);
 
-const OLLAMA_CTRL_URL = process.env.OLLAMA_CTRL_URL || 'http://host.docker.internal:19123';
-const LEGACY_OLLAMA_CTRL_SECRET = 'ollama-ctrl-8f3k2j';
+let activeControlAction: 'unload' | 'restart' | null = null;
 
-function getOllamaCtrlSecret(): string {
-  // Existing installs and the host-side control helper both supported this
-  // loopback-only legacy secret before the hardening pass. Keep it as a
-  // compatibility fallback until the installer provisions a per-install secret.
-  return process.env.OLLAMA_CTRL_SECRET || LEGACY_OLLAMA_CTRL_SECRET;
+async function recordActivity(input: {
+  userId: string;
+  action: 'OLLAMA_UNLOAD' | 'OLLAMA_RESTART';
+  message: string;
+  severity: 'INFO' | 'WARNING' | 'ERROR';
+  metadata: Prisma.InputJsonObject;
+}): Promise<void> {
+  await prisma.activityLog.create({
+    data: {
+      userId: input.userId,
+      action: input.action,
+      resource: 'system',
+      metadata: input.metadata,
+      translatedMessage: input.message,
+      severity: input.severity,
+    },
+  }).catch((error) => console.error('[ollama-control] Activity log write failed:', error));
 }
 
-// Call the host-side Ollama control API
-async function ollamaCtrl(path: string, method: 'GET' | 'POST' = 'GET'): Promise<any> {
-  const resp = await fetch(`${OLLAMA_CTRL_URL}${path}`, {
-    method,
-    headers: { 'X-Secret': getOllamaCtrlSecret() },
-    signal: AbortSignal.timeout(30000)
-  });
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Ollama control API error (${resp.status}): ${text}`);
+function controlErrorResponse(error: unknown): {
+  status: number;
+  code: string;
+  message: string;
+} {
+  if (error instanceof OllamaSystemControlError) {
+    return { status: error.statusCode, code: error.code, message: error.message };
   }
-  return resp.json();
+  if (error instanceof OllamaAuthorityBarrierBusyError) {
+    return { status: error.statusCode, code: error.code, message: error.message };
+  }
+  return {
+    status: 500,
+    code: 'OLLAMA_CONTROL_FAILED',
+    message: 'Portal could not complete the Ollama control action. Check the server service log and retry.',
+  };
+}
+
+async function runExclusiveControlAction<T>(
+  action: 'unload' | 'restart',
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (activeControlAction) {
+    throw new OllamaSystemControlError(
+      'OLLAMA_REJECTED',
+      `An Ollama ${activeControlAction} action is already running. Wait for it to finish and retry.`,
+      409,
+    );
+  }
+  activeControlAction = action;
+  try {
+    return await withOllamaAuthorityMutationFence(operation);
+  } finally {
+    activeControlAction = null;
+  }
+}
+
+function requireControlConfirmation(
+  received: unknown,
+  expected: string,
+  description: string,
+): { error: string; confirmationPhrase: string } | null {
+  if (isTypedConfirmationMatch(expected, received)) return null;
+  return {
+    error: `Type ${expected} to ${description}.`,
+    confirmationPhrase: expected,
+  };
 }
 
 /**
- * Emergency Ollama controls
- * POST /api/system-control/ollama/kill - Kill all Ollama runners
- * POST /api/system-control/ollama/restart - Stop and restart Ollama service
+ * Owner-only host controls. The unload action uses Ollama's supported API and
+ * the restart action invokes the installer-managed local systemd unit. This
+ * removes the legacy control-sidecar/shared-secret dependency.
  */
+router.post('/ollama/kill', requireOwner, async (req, res) => {
+  const confirmationError = requireControlConfirmation(
+    req.body?.confirmation,
+    PRIVILEGED_CONFIRMATION.ollamaUnload,
+    'unload every running Ollama model',
+  );
+  if (confirmationError) {
+    res.status(400).json(confirmationError);
+    return;
+  }
 
-router.post('/ollama/kill', async (req, res) => {
   const userId = req.user!.userId;
-  
   try {
-    console.log('🚨 Emergency: Killing Ollama runners');
-    
-    const result = await ollamaCtrl('/kill', 'POST');
-    const load = result.load || 0;
-    
-    // Log to activity
-    await prisma.activityLog.create({
-      data: {
-        userId,
-        action: 'OLLAMA_KILL',
-        resource: 'system',
-        metadata: { runnersKilled: true, load },
-        translatedMessage: `🛑 Emergency: Killed Ollama (load: ${load.toFixed(2)})`,
-        severity: 'WARNING'
-      }
-    }).catch(err => console.error('Failed to log activity:', err));
-    
+    const result = await runExclusiveControlAction('unload', () => unloadAllOllamaModels());
+    const message = result.alreadyIdle
+      ? 'Ollama already had no running models.'
+      : `Unloaded ${result.unloadedModels.length} Ollama model${result.unloadedModels.length === 1 ? '' : 's'} from memory.`;
+    await recordActivity({
+      userId,
+      action: 'OLLAMA_UNLOAD',
+      message,
+      severity: 'WARNING',
+      metadata: {
+        alreadyIdle: result.alreadyIdle,
+        unloadedCount: result.unloadedModels.length,
+      },
+    });
     res.json({
       success: true,
-      message: 'Ollama killed successfully',
-      load: load,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error: any) {
-    console.error('Failed to kill Ollama:', error);
-    
-    // Log failure
-    await prisma.activityLog.create({
-      data: {
-        userId,
-        action: 'OLLAMA_KILL',
-        resource: 'system',
-        metadata: { error: error.message },
-        translatedMessage: `❌ Failed to kill Ollama: ${error.message}`,
-        severity: 'ERROR'
-      }
-    }).catch(err => console.error('Failed to log activity:', err));
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-router.post('/ollama/restart', async (req, res) => {
-  const userId = req.user!.userId;
-  
-  try {
-    console.log('🔄 Restarting Ollama service');
-    
-    const result = await ollamaCtrl('/restart', 'POST');
-    const isActive = result.active === 'active';
-    const load = result.load || 0;
-    
-    // Log to activity
-    await prisma.activityLog.create({
-      data: {
-        userId,
-        action: 'OLLAMA_RESTART',
-        resource: 'system',
-        metadata: { active: isActive, load },
-        translatedMessage: `🔄 Restarted Ollama (${isActive ? 'active' : 'inactive'}, load: ${load.toFixed(2)})`,
-        severity: 'INFO'
-      }
-    }).catch(err => console.error('Failed to log activity:', err));
-    
-    res.json({
-      success: true,
-      message: isActive ? 'Ollama restarted successfully' : 'Ollama stopped (not started)',
-      active: isActive,
-      load: load,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error: any) {
-    console.error('Failed to restart Ollama:', error);
-    
-    // Log failure
-    await prisma.activityLog.create({
-      data: {
-        userId,
-        action: 'OLLAMA_RESTART',
-        resource: 'system',
-        metadata: { error: error.message },
-        translatedMessage: `❌ Failed to restart Ollama: ${error.message}`,
-        severity: 'ERROR'
-      }
-    }).catch(err => console.error('Failed to log activity:', err));
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-router.get('/ollama/status', async (req, res) => {
-  try {
-    const result = await ollamaCtrl('/status');
-    const isActive = result.active === 'active';
-    const runnerCount = result.runners || 0;
-    const load = result.load || 0;
-    const stuckRunners: any[] = [];
-    
-    res.json({
-      success: true,
-      active: isActive,
-      runnerCount,
-      stuckRunners,
-      load,
-      loadWarning: load > 4.0,
-      loadCritical: load > 6.0,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error: any) {
-    console.error('Failed to get Ollama status:', error);
-    res.json({
-      success: true,
-      active: false,
-      runnerCount: 0,
-      stuckRunners: [],
-      load: 0,
-      loadWarning: false,
-      loadCritical: false,
-      unavailable: true,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-router.get('/ollama/model-status', authenticateToken, async (req, res) => {
-  try {
-    const model = req.query.model as string;
-    const result = await ollamaCtrl(`/model-status${model ? `?model=${encodeURIComponent(model)}` : ''}`);
-    
-    res.json({
-      success: true,
-      runningModels: result.running_models || [],
-      targetModel: result.target_model,
-      modelLoaded: result.model_loaded || false,
-      isLoading: result.is_loading || false,
-      totalRunning: result.total_running || 0,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error: any) {
-    console.error('Failed to get Ollama model status:', error);
-    res.json({
-      success: true,
-      runningModels: [],
-      targetModel: null,
-      modelLoaded: false,
-      isLoading: false,
-      totalRunning: 0,
-      unavailable: true,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// Smart proxy-aware status: checks the Ollama proxy to determine backend (GPU remote vs CPU local)
-router.get('/ollama/proxy-status', authenticateToken, async (_req, res) => {
-  const ollamaUrl = config.ollamaApiUrl;
-  try {
-    // Check version (gets x-ollama-backend header from proxy)
-    const versionRes = await fetch(`${ollamaUrl}/api/version`, { signal: AbortSignal.timeout(3000) });
-    const backend = versionRes.headers.get('x-ollama-backend') || 'unknown';
-    const version = await versionRes.json() as any;
-
-    // Get models list
-    const tagsRes = await fetch(`${ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(3000) });
-    const tagsData = await tagsRes.json() as any;
-    const models = (tagsData.models || []).map((m: any) => ({
-      name: m.name,
-      size: m.details?.parameter_size || 'unknown',
-      family: m.details?.family || 'unknown',
-    }));
-
-    // Get running models
-    let runningModels: string[] = [];
-    try {
-      const psRes = await fetch(`${ollamaUrl}/api/ps`, { signal: AbortSignal.timeout(3000) });
-      const psData = await psRes.json() as any;
-      runningModels = (psData.models || []).map((m: any) => m.name);
-    } catch {}
-
-    res.json({
-      available: true,
-      backend, // 'gpu-remote' | 'cpu-local' | 'cpu-local-fallback' | 'unknown'
-      version: version.version,
-      models,
-      runningModels,
-      isGpu: backend === 'gpu-remote',
+      message,
+      ...result,
+      verified: true,
       timestamp: new Date().toISOString(),
     });
-  } catch (error: any) {
+  } catch (error) {
+    console.error('[ollama-control] Model unload failed:', error);
+    const response = controlErrorResponse(error);
+    await recordActivity({
+      userId,
+      action: 'OLLAMA_UNLOAD',
+      message: 'Ollama model unload failed. Check the server service log.',
+      severity: 'ERROR',
+      metadata: { code: response.code },
+    });
+    res.status(response.status).json({ success: false, error: response.message, code: response.code });
+  }
+});
+
+router.post('/ollama/restart', requireOwner, async (req, res) => {
+  const confirmationError = requireControlConfirmation(
+    req.body?.confirmation,
+    PRIVILEGED_CONFIRMATION.ollamaRestart,
+    'restart the local Ollama service',
+  );
+  if (confirmationError) {
+    res.status(400).json(confirmationError);
+    return;
+  }
+
+  const userId = req.user!.userId;
+  try {
+    const result = await runExclusiveControlAction('restart', async () => {
+      const capability = await getLocalOllamaRestartCapability();
+      if (!capability.available) {
+        throw new OllamaSystemControlError(
+          capability.code,
+          capability.message,
+          capability.statusCode,
+        );
+      }
+      // Re-check inside the service immediately before invoking systemd. The
+      // route guard makes the direct POST fail closed; the service guard
+      // protects non-HTTP callers and closes the check/use race.
+      return restartLocalOllamaService();
+    });
+    const message = 'Local Ollama service restarted and is active.';
+    await recordActivity({
+      userId,
+      action: 'OLLAMA_RESTART',
+      message,
+      severity: 'INFO',
+      metadata: { active: result.active, version: result.version },
+    });
     res.json({
-      available: false,
-      backend: 'offline',
-      version: null,
-      models: [],
-      runningModels: [],
-      isGpu: false,
+      success: true,
+      message,
+      active: result.active,
+      version: result.version,
+      verified: true,
       timestamp: new Date().toISOString(),
     });
+  } catch (error) {
+    console.error('[ollama-control] Service restart failed:', error);
+    const response = controlErrorResponse(error);
+    await recordActivity({
+      userId,
+      action: 'OLLAMA_RESTART',
+      message: 'Ollama service restart failed. Check the server service log.',
+      severity: 'ERROR',
+      metadata: { code: response.code },
+    });
+    res.status(response.status).json({ success: false, error: response.message, code: response.code });
   }
+});
+
+router.get('/ollama/status', requireOwner, async (_req, res) => {
+  const status = await getOllamaRuntimeStatus();
+  res.json({
+    success: true,
+    active: status.available,
+    runnerCount: status.runningModels.length,
+    stuckRunners: [],
+    load: 0,
+    loadWarning: false,
+    loadCritical: false,
+    unavailable: !status.available,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+router.get('/ollama/model-status', requireOwner, async (req, res) => {
+  const status = await getOllamaRuntimeStatus();
+  const targetModel = String(req.query.model || '').trim() || null;
+  res.json({
+    success: true,
+    runningModels: status.runningModels,
+    targetModel,
+    modelLoaded: targetModel ? status.runningModels.includes(targetModel) : false,
+    isLoading: false,
+    totalRunning: status.runningModels.length,
+    unavailable: !status.available,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Smart proxy-aware status: reports exact catalog tags and the actions the
+// current account may request. Local restart remains available while the
+// local backend is offline, but never while an active or disconnected native
+// Remote GPU binding reserves Ollama authority.
+router.get('/ollama/proxy-status', requireOwner, async (req, res) => {
+  const [status, restartCapability] = await Promise.all([
+    getOllamaRuntimeStatus(),
+    getLocalOllamaRestartCapability(),
+  ]);
+  const owner = isOwnerRole(req.user?.role);
+  res.json({
+    ...status,
+    controls: {
+      unload: {
+        ownerOnly: true,
+        allowed: owner,
+        available: status.available && status.runningModels.length > 0,
+        confirmationPhrase: owner ? PRIVILEGED_CONFIRMATION.ollamaUnload : null,
+      },
+      restart: {
+        ownerOnly: true,
+        allowed: owner,
+        available: restartCapability.available,
+        confirmationPhrase: owner ? PRIVILEGED_CONFIRMATION.ollamaRestart : null,
+      },
+    },
+    timestamp: new Date().toISOString(),
+  });
 });
 
 export default router;

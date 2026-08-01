@@ -13,33 +13,95 @@ import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { execSync, spawn } from 'child_process';
-import { getGatewayToken, hasGatewayToken } from '../utils/gatewayToken';
+import { recycleStalwartContainerPreservingData } from '../services/stalwartRecovery';
 import dns from 'dns/promises';
 import { prisma } from '../config/database';
 import { hashPassword, validatePasswordStrength } from '../utils/password';
 import { PORTAL_VERSION } from '../version';
 import { generateAccessToken, generateRefreshToken } from '../utils/jwt';
 import { AppError } from '../middleware/errorHandler';
-import { config } from '../config/env';
 import { APPEARANCE_DEFAULTS, SECURITY_DEFAULTS } from '../config/settings.schema';
 import multer from 'multer';
 import { clearAuthCookies, setAuthCookies } from '../utils/authCookies';
 import { provisionUserMailbox } from '../services/userMailService';
 import {
-  buildIpFallbackCaddyConfig,
   configureDomainAndHttps,
   getCodingToolsStatus,
   getPublicIp,
   installCodingTool,
+  removePortalSetupIpAccess,
   updateEnvFile,
 } from '../utils/serverSetup';
-import { getOllamaRecommendationsByRam } from '../utils/ollamaRecommendations';
+import { getOllamaRecommendationsByRam, isValidOllamaModelName, readAvailableMemoryBytes } from '../utils/ollamaRecommendations';
 import { isReservedSystemMailboxUsername } from '../utils/reservedMailboxUsernames';
+import crypto from 'crypto';
+import {
+  BRANDING_DIR,
+  UnsafeImageUploadError,
+  cleanupBasenamePrefixVariants,
+  normalizeBrandingLogoToPng,
+} from '../services/imageAssets';
+import {
+  SETUP_BOOTSTRAP_HEADER,
+  SETUP_HANDOFF_HEADER,
+  SETUP_HANDOFF_TTL_SECONDS,
+  SETUP_SESSION_TTL_SECONDS,
+  SETUP_STATE_COMPLETE,
+  SETUP_STATE_KEY,
+  classifySetupTransport,
+  classifySetupProgress,
+  hashSetupCredential,
+  setupBrowserContextMatches,
+  validateSetupBootstrapCredential,
+  validateSetupLogoUrl,
+  validateSetupSessionCredential,
+} from '../services/setupHardening';
+import {
+  getStalwartDkimSigningConfig,
+  provisionStalwartDkim,
+  readStoredStalwartDkimRecords,
+  type StalwartDkimDnsRecord,
+} from '../services/stalwartDkim';
+import { getOpenClawSetupReadiness } from '../services/openclawSetupReadiness';
+import { digestAuthToken } from '../utils/authSecrets';
+import { canonicalEmail } from '../utils/identity';
+import {
+  OllamaPullBusyError,
+  type OllamaPullSnapshot,
+} from '../services/ollamaPullManager';
+import { setupLocalOllamaPullManager } from '../services/setupLocalOllamaPullManager';
+import { DEFAULT_LOCAL_OLLAMA_ENDPOINT } from '../utils/localOllamaEndpoint';
+import { requestLocalOllamaJson } from '../services/localOllamaTransport';
+import {
+  OLLAMA_TAILNET_ONBOARDING_KEY,
+  OLLAMA_TAILNET_ONBOARDING_PHASE,
+  normalizeOllamaTailnetOnboardingPhase,
+} from '../services/ollamaTailnetOnboarding';
+import {
+  configuredPortalOriginMode,
+  getPortalFeatureCapabilities,
+  portalFeatureUnavailableResponse,
+} from '../utils/portalFeatureCapabilities';
+import { assertNoProjectAuthorizationTransitionActive } from '../services/projectAuthorizationTransition';
+import { publishAuthorizationChanged } from '../services/authorizationChangeBus';
 
 const router = Router();
 
 const PORTAL_ROOT = process.env.PORTAL_ROOT || '/opt/bridgesllm/portal';
 const INSTALL_ROOT = path.dirname(PORTAL_ROOT);
+const SETUP_COMPLETION_LOCK_ID = '743825119402031';
+const SETUP_ENV_KEYS = [
+  'SETUP_TOKEN',
+  'SETUP_TOKEN_EXPIRES_AT',
+  'SETUP_TOKEN_USED_AT',
+  'SETUP_SESSION_TOKEN_HASH',
+  'SETUP_SESSION_ORIGIN',
+  'SETUP_SESSION_EXPIRES_AT',
+  'SETUP_HANDOFF_TOKEN_HASH',
+  'SETUP_HANDOFF_ORIGIN',
+  'SETUP_HANDOFF_EXPIRES_AT',
+] as const;
+type SetupEnvKey = typeof SETUP_ENV_KEYS[number];
 
 // ═══════════════════════════════════════════════════════════════
 // Schemas
@@ -47,19 +109,24 @@ const INSTALL_ROOT = path.dirname(PORTAL_ROOT);
 
 const completeSetupSchema = z.object({
   name: z.string().min(2, 'Name must be at least 2 characters').max(100).transform(n => n.trim()),
-  email: z.string().email('Invalid email'),
+  email: z.string().email('Invalid email').transform(canonicalEmail),
   password: z.string().min(8, 'Password must be at least 8 characters'),
   portalName: z.string().min(2).max(120).optional(),
   theme: z.enum(['light', 'dark', 'system']).optional(),
   accentColor: z.string().regex(/^#[0-9a-fA-F]{6}$/, 'accentColor must be a hex color').optional(),
-  logoUrl: z.string().max(2000).optional(),
+  logoUrl: z.string().max(240).optional(),
   registrationMode: z.enum(['open', 'approval', 'closed']).optional(),
   allowTelemetry: z.boolean().optional(),
   searchEngineVisibility: z.enum(['visible', 'hidden']).optional(),
+  tailnetRequested: z.boolean().optional().default(false),
 });
 
 const testEmailSchema = z.object({
   email: z.string().email('Invalid email'),
+});
+
+const tailnetOnboardingSchema = z.object({
+  requested: z.boolean(),
 });
 
 const configureDomainSchema = z.object({
@@ -74,7 +141,11 @@ const configureDomainSchema = z.object({
 // ═══════════════════════════════════════════════════════════════
 
 
-async function createUniqueUsername(baseName: string, email: string): Promise<string> {
+async function createUniqueUsername(
+  baseName: string,
+  email: string,
+  db: Pick<typeof prisma, 'user'> = prisma,
+): Promise<string> {
   const fromName = baseName.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
   const fromEmail = email.split('@')[0].toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
   const base = fromName || fromEmail || 'admin';
@@ -83,7 +154,7 @@ async function createUniqueUsername(baseName: string, email: string): Promise<st
   let suffix = 1;
   while (true) {
     if (!isReservedSystemMailboxUsername(candidate)) {
-      const existing = await prisma.user.findUnique({ where: { username: candidate } });
+      const existing = await db.user.findUnique({ where: { username: candidate } });
       if (!existing) return candidate;
     }
     suffix += 1;
@@ -92,6 +163,9 @@ async function createUniqueUsername(baseName: string, email: string): Promise<st
 }
 
 function getDomain(req?: Request): string {
+  // A private ts.net machine name is an access origin, not a public mail
+  // domain. Never let CORS/request-host inference promote it into MX authority.
+  if (configuredPortalOriginMode() === 'tailnet') return '';
   const corsOrigin = process.env.CORS_ORIGIN || '';
   if (corsOrigin) {
     try {
@@ -130,10 +204,9 @@ async function checkStalwartHealth(): Promise<boolean> {
   }
 }
 
-function teardownStalwart(mailDir: string): void {
-  console.warn('[setup/install-mail] Stalwart jmap health check failed; tearing down and recreating container');
-  execSync('cd /opt/bridgesllm/stalwart && docker compose down -v 2>/dev/null; docker rm -f stalwart-mail 2>/dev/null; rm -rf /opt/bridgesllm/stalwart/data', { timeout: 120000, shell: '/bin/bash' });
-  fs.mkdirSync(path.join(mailDir, 'data'), { recursive: true });
+function recycleStalwartForRecovery(mailDir: string): void {
+  console.warn('[setup/install-mail] Recycling the Stalwart container while preserving stored mail');
+  recycleStalwartContainerPreservingData(mailDir);
 }
 
 /**
@@ -181,13 +254,14 @@ async function ensureStalwartDomain(domain: string, adminPass: string): Promise<
 }
 
 async function createStalwartAccount(domain: string, adminPass: string, name: string, pass: string): Promise<{ ok: boolean; error?: string; body?: any }> {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Basic ${Buffer.from(`admin:${adminPass}`).toString('base64')}`,
+  };
   try {
     const response = await fetch('http://127.0.0.1:8580/api/principal', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Basic ${Buffer.from(`admin:${adminPass}`).toString('base64')}`,
-      },
+      headers,
       body: JSON.stringify({
         type: 'individual',
         name,
@@ -203,6 +277,29 @@ async function createStalwartAccount(domain: string, adminPass: string, name: st
     let body: any = null;
     try { body = raw ? JSON.parse(raw) : null; } catch { body = raw; }
 
+    const alreadyExists = response.status === 409
+      || (body && typeof body === 'object' && body.error === 'fieldAlreadyExists');
+    if (alreadyExists) {
+      // Idempotent setup: converge a pre-existing account to the requested
+      // credentials/address instead of failing the mail installation.
+      const patch = await fetch(`http://127.0.0.1:8580/api/principal/${encodeURIComponent(name)}`, {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify([
+          { action: 'set', field: 'secrets', value: [pass] },
+          { action: 'set', field: 'emails', value: [`${name}@${domain}`] },
+        ]),
+        signal: AbortSignal.timeout(10000),
+      });
+      const patchRaw = await patch.text();
+      let patchBody: any = null;
+      try { patchBody = patchRaw ? JSON.parse(patchRaw) : null; } catch { patchBody = patchRaw; }
+      if (!patch.ok || (patchBody && typeof patchBody === 'object' && patchBody.error)) {
+        return { ok: false, error: `existing account update failed: ${patchBody && typeof patchBody === 'object' && patchBody.error ? String(patchBody.error) : `HTTP ${patch.status}`}`, body: patchBody };
+      }
+      return { ok: true, body: patchBody };
+    }
+
     if (!response.ok) {
       return { ok: false, error: typeof body === 'object' && body?.error ? String(body.error) : raw || `HTTP ${response.status}`, body };
     }
@@ -214,22 +311,6 @@ async function createStalwartAccount(domain: string, adminPass: string, name: st
     return { ok: false, error: error?.message || 'Request failed' };
   }
 }
-function generateDkimKey(mailDir: string): string {
-  const keyPath = path.join(mailDir, 'dkim.key');
-  try {
-    execSync(`openssl genrsa -out "${keyPath}" 2048 2>/dev/null`, { timeout: 10000 });
-    const pubkey = execSync(`openssl rsa -in "${keyPath}" -pubout -outform DER 2>/dev/null | base64 -w0`, {
-      timeout: 5000,
-      encoding: 'utf-8',
-    }).trim();
-    const record = `v=DKIM1; k=rsa; p=${pubkey}`;
-    fs.writeFileSync(path.join(mailDir, 'dkim-dns-record.txt'), record);
-    return record;
-  } catch {
-    return 'v=DKIM1; k=rsa; p=YOUR_DKIM_PUBLIC_KEY';
-  }
-}
-
 /**
  * Guard: block all routes except /status when setup is done.
  */
@@ -246,66 +327,206 @@ export async function requireSetupPending(_req: Request, _res: Response, next: N
   }
 }
 
+function setupTransportForRequest(req: Request) {
+  return classifySetupTransport({
+    protocol: req.protocol,
+    host: req.get('host') || '',
+    requestIp: req.ip,
+    remoteAddress: req.socket.remoteAddress,
+  });
+}
+
+function assertSecureSetupBrowserRequest(req: Request, options: { httpsOnly?: boolean } = {}) {
+  const transport = setupTransportForRequest(req);
+  if (!transport.allowed || (options.httpsOnly && transport.kind !== 'https')) {
+    throw new AppError(426, options.httpsOnly
+      ? 'This setup handoff must be completed on the verified HTTPS domain.'
+      : transport.reason || 'Sensitive setup is allowed only through verified HTTPS or the installer SSH tunnel.');
+  }
+  if (!setupBrowserContextMatches({
+    transport,
+    method: req.method,
+    originHeader: req.get('origin'),
+    fetchSiteHeader: req.get('sec-fetch-site'),
+  })) {
+    throw new AppError(403, 'Setup request origin could not be verified. Open setup from the installer link in the same browser origin.');
+  }
+  return transport;
+}
+
+function bearerSetupToken(req: Request): string {
+  const authorization = String(req.headers.authorization || '');
+  const match = /^Bearer ([A-Za-z0-9_-]{32,512})$/.exec(authorization);
+  return match?.[1] || '';
+}
+
+function setupCredentialError(code: string, subject: string): AppError {
+  if (code === 'expired') {
+    return new AppError(410, `${subject} expired. Re-run the installer with --reinstall to mint a new protected setup link.`);
+  }
+  if (code === 'replayed') {
+    return new AppError(409, `${subject} was already exchanged. Resume this browser tab or re-run the installer with --reinstall.`);
+  }
+  if (code === 'misconfigured') {
+    return new AppError(503, `${subject} is unavailable. Re-run the installer to resume setup safely.`);
+  }
+  if (code === 'origin') {
+    return new AppError(403, `${subject} belongs to a different setup origin.`);
+  }
+  return new AppError(403, `Invalid or missing ${subject.toLowerCase()}. Use the protected link printed by the installer.`);
+}
+
 /**
- * Guard: validate one-time setup token.
- * Token comes from query param (?token=...) or Authorization header (Bearer ...).
- * If SETUP_TOKEN is not set in env, skip validation (dev mode / already cleared).
+ * Guard: validate the short-lived setup bearer minted by /bootstrap. The raw
+ * installer bootstrap secret is never accepted here, in query parameters, or
+ * from a public HTTP origin.
  */
-export function requireSetupToken(req: Request, _res: Response, next: NextFunction) {
-  const expectedToken = process.env.SETUP_TOKEN;
+export function requireSetupToken(req: Request, res: Response, next: NextFunction) {
+  try {
+    const transport = assertSecureSetupBrowserRequest(req);
+    const validation = validateSetupSessionCredential({
+      providedToken: bearerSetupToken(req),
+      expectedTokenHash: process.env.SETUP_SESSION_TOKEN_HASH,
+      expectedOrigin: process.env.SETUP_SESSION_ORIGIN,
+      requestOrigin: transport.origin,
+      expiresAt: process.env.SETUP_SESSION_EXPIRES_AT,
+    });
+    if (!validation.ok) throw setupCredentialError(validation.code, 'Setup session');
+    noStoreSetupResponse(res);
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
 
-  // No token configured — allow access (dev mode or token already cleared post-setup)
-  if (!expectedToken) return next();
-
-  const providedToken =
-    (req.query.token as string) ||
-    (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : '') ||
-    (req.headers['x-setup-token'] as string);
-
-  if (!providedToken || providedToken !== expectedToken) {
-    return next(new AppError(403, 'Invalid or missing setup token. Use the URL from your terminal.'));
+function persistSetupEnvironment(updates: Partial<Record<SetupEnvKey, string | undefined>>): void {
+  const envPath = path.join(PORTAL_ROOT, 'backend', '.env.production');
+  if (!fs.existsSync(envPath)) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new AppError(503, 'Setup state file is unavailable. Re-run the installer.');
+    }
+    for (const [key, value] of Object.entries(updates)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    return;
   }
 
-  next();
+  let content = fs.readFileSync(envPath, 'utf8');
+  for (const [key, value] of Object.entries(updates)) {
+    if (!(SETUP_ENV_KEYS as readonly string[]).includes(key)) {
+      throw new Error(`Refusing unsupported setup environment key: ${key}`);
+    }
+    const linePattern = new RegExp(`^${key}=.*(?:\\n|$)`, 'gm');
+    content = content.replace(linePattern, '');
+    if (value !== undefined) {
+      if (content && !content.endsWith('\n')) content += '\n';
+      content += `${key}=${value}\n`;
+    }
+  }
+
+  const stagedPath = `${envPath}.setup-state-${process.pid}-${crypto.randomUUID()}.tmp`;
+  let renamed = false;
+  try {
+    fs.writeFileSync(stagedPath, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    const stagedFd = fs.openSync(stagedPath, 'r');
+    try { fs.fsyncSync(stagedFd); } finally { fs.closeSync(stagedFd); }
+    fs.renameSync(stagedPath, envPath);
+    renamed = true;
+    // Once rename succeeds, the in-memory replay boundary must advance even
+    // if a later chmod/directory-fsync diagnostic fails.
+    for (const [key, value] of Object.entries(updates)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.chmodSync(envPath, 0o600);
+    const directoryFd = fs.openSync(path.dirname(envPath), 'r');
+    try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
+  } finally {
+    if (!renamed) {
+      try { fs.unlinkSync(stagedPath); } catch {}
+    }
+  }
+
+}
+
+function noStoreSetupResponse(res: Response): void {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+}
+
+async function assertSetupBootstrapOpen(): Promise<void> {
+  const [ownerCount, setupStateRow] = await Promise.all([
+    prisma.user.count({ where: { role: 'OWNER' as any } }),
+    prisma.systemSetting.findUnique({ where: { key: SETUP_STATE_KEY } }),
+  ]);
+  const progress = classifySetupProgress({
+    ownerCount,
+    setupState: setupStateRow?.value,
+    hasSetupToken: !!process.env.SETUP_TOKEN,
+  });
+  if (progress.setupComplete || (!progress.needsSetup && !progress.isReinstall)) {
+    throw new AppError(403, 'Initial setup is already complete.');
+  }
 }
 
 /**
- * Clear SETUP_TOKEN from .env.production after setup completes.
+ * Stage removal of SETUP_TOKEN before the database commit. The final rename is
+ * atomic and happens only after the owner/settings/session transaction commits;
+ * a database rollback aborts the staged file and leaves setup resumable.
  */
-function clearSetupToken(): void {
+function prepareSetupTokenRemoval(): { commit: () => void; abort: () => void } {
   const envPath = path.join(PORTAL_ROOT, 'backend', '.env.production');
+  if (!fs.existsSync(envPath)) {
+    return {
+      commit: () => {
+        for (const key of SETUP_ENV_KEYS) delete process.env[key];
+      },
+      abort: () => undefined,
+    };
+  }
+
+  const content = fs.readFileSync(envPath, 'utf-8');
+  let sanitized = content.replace(/^# One-time setup token.*\n?/m, '');
+  for (const key of SETUP_ENV_KEYS) {
+    sanitized = sanitized.replace(new RegExp(`^${key}=.*\\n?`, 'm'), '');
+  }
+  const stagedPath = `${envPath}.setup-${process.pid}-${crypto.randomUUID()}.tmp`;
+  fs.writeFileSync(stagedPath, sanitized, { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
+  const stagedFd = fs.openSync(stagedPath, 'r');
   try {
-    if (!fs.existsSync(envPath)) return;
-    let content = fs.readFileSync(envPath, 'utf-8');
-    // Remove the SETUP_TOKEN line entirely
-    content = content.replace(/^SETUP_TOKEN=.*\n?/m, '');
-    // Also remove the comment line above it if present
-    content = content.replace(/^# One-time setup token.*\n?/m, '');
-    fs.writeFileSync(envPath, content, { mode: 0o600 });
-    // Clear from current process memory
-    delete process.env.SETUP_TOKEN;
-  } catch { /* best-effort */ }
+    fs.fsyncSync(stagedFd);
+  } finally {
+    fs.closeSync(stagedFd);
+  }
+
+  let settled = false;
+  return {
+    commit: () => {
+      if (settled) return;
+      fs.renameSync(stagedPath, envPath);
+      fs.chmodSync(envPath, 0o600);
+      for (const key of SETUP_ENV_KEYS) delete process.env[key];
+      settled = true;
+    },
+    abort: () => {
+      if (settled) return;
+      try { fs.unlinkSync(stagedPath); } catch {}
+      settled = true;
+    },
+  };
 }
 
-// File upload for logo
-const logoStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    const dir = path.join(INSTALL_ROOT, 'assets', 'branding');
-    fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `logo-${Date.now()}${ext}`);
-  },
-});
-
 const uploadLogo = multer({
-  storage: logoStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB — logos can be large PNGs/SVGs
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1, fields: 4, parts: 6 },
   fileFilter: (_req, file, cb) => {
-    const allowed = ['image/png', 'image/jpeg', 'image/gif', 'image/svg+xml', 'image/webp'];
-    cb(null, allowed.includes(file.mimetype));
+    const allowed = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+    if (!allowed.includes(file.mimetype)) {
+      return cb(new AppError(400, 'Only PNG, JPEG, WebP, and GIF raster logos are supported.'));
+    }
+    cb(null, true);
   },
 });
 
@@ -336,18 +557,124 @@ function maskOwnerHint(email?: string | null, username?: string | null): string 
 }
 
 /**
+ * POST /api/setup/bootstrap
+ * Exchange the installer fragment secret once for a short-lived, origin-bound
+ * bearer. The secret never appears in an HTTP request URL or remains reusable.
+ */
+router.post('/bootstrap', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const transport = assertSecureSetupBrowserRequest(req);
+    const providedToken = String(req.get(SETUP_BOOTSTRAP_HEADER) || '');
+    let validation = validateSetupBootstrapCredential({
+      providedToken,
+      expectedToken: process.env.SETUP_TOKEN,
+      expiresAt: process.env.SETUP_TOKEN_EXPIRES_AT,
+      usedAt: process.env.SETUP_TOKEN_USED_AT,
+    });
+    if (!validation.ok) throw setupCredentialError(validation.code, 'Setup bootstrap');
+
+    await assertSetupBootstrapOpen();
+
+    // Re-check immediately before the synchronous atomic state transition so
+    // two concurrent exchanges cannot both consume the same bootstrap secret.
+    validation = validateSetupBootstrapCredential({
+      providedToken,
+      expectedToken: process.env.SETUP_TOKEN,
+      expiresAt: process.env.SETUP_TOKEN_EXPIRES_AT,
+      usedAt: process.env.SETUP_TOKEN_USED_AT,
+    });
+    if (!validation.ok) throw setupCredentialError(validation.code, 'Setup bootstrap');
+
+    const now = Math.floor(Date.now() / 1000);
+    const sessionExpiresAt = Math.min(validation.expiresAt, now + SETUP_SESSION_TTL_SECONDS);
+    const setupToken = crypto.randomBytes(32).toString('base64url');
+    persistSetupEnvironment({
+      SETUP_TOKEN_USED_AT: String(now),
+      SETUP_SESSION_TOKEN_HASH: hashSetupCredential(setupToken),
+      SETUP_SESSION_ORIGIN: transport.origin,
+      SETUP_SESSION_EXPIRES_AT: String(sessionExpiresAt),
+      SETUP_HANDOFF_TOKEN_HASH: undefined,
+      SETUP_HANDOFF_ORIGIN: undefined,
+      SETUP_HANDOFF_EXPIRES_AT: undefined,
+    });
+
+    noStoreSetupResponse(res);
+    res.json({
+      success: true,
+      setupToken,
+      origin: transport.origin,
+      expiresAt: new Date(sessionExpiresAt * 1000).toISOString(),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/setup/bootstrap/handoff
+ * Consume the one-time domain handoff only after the browser has reached the
+ * exact HTTPS origin proven by configure-domain.
+ */
+router.post('/bootstrap/handoff', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const transport = assertSecureSetupBrowserRequest(req, { httpsOnly: true });
+    await assertSetupBootstrapOpen();
+
+    const validation = validateSetupSessionCredential({
+      providedToken: req.get(SETUP_HANDOFF_HEADER),
+      expectedTokenHash: process.env.SETUP_HANDOFF_TOKEN_HASH,
+      expectedOrigin: process.env.SETUP_HANDOFF_ORIGIN,
+      requestOrigin: transport.origin,
+      expiresAt: process.env.SETUP_HANDOFF_EXPIRES_AT,
+    });
+    if (!validation.ok) throw setupCredentialError(validation.code, 'HTTPS setup handoff');
+
+    const now = Math.floor(Date.now() / 1000);
+    const bootstrapExpiry = Number.parseInt(String(process.env.SETUP_TOKEN_EXPIRES_AT || ''), 10);
+    if (!Number.isSafeInteger(bootstrapExpiry) || now >= bootstrapExpiry) {
+      throw setupCredentialError('expired', 'Setup bootstrap');
+    }
+    const sessionExpiresAt = Math.min(bootstrapExpiry, now + SETUP_SESSION_TTL_SECONDS);
+    const setupToken = crypto.randomBytes(32).toString('base64url');
+    persistSetupEnvironment({
+      SETUP_SESSION_TOKEN_HASH: hashSetupCredential(setupToken),
+      SETUP_SESSION_ORIGIN: transport.origin,
+      SETUP_SESSION_EXPIRES_AT: String(sessionExpiresAt),
+      SETUP_HANDOFF_TOKEN_HASH: undefined,
+      SETUP_HANDOFF_ORIGIN: undefined,
+      SETUP_HANDOFF_EXPIRES_AT: undefined,
+    });
+
+    noStoreSetupResponse(res);
+    res.json({
+      success: true,
+      setupToken,
+      origin: transport.origin,
+      expiresAt: new Date(sessionExpiresAt * 1000).toISOString(),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * GET /api/setup/status
  * Always accessible — checks if setup is needed.
  */
-router.get('/status', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/status', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const ownerCount = await prisma.user.count({ where: { role: 'OWNER' as any } });
-    const needsSetup = ownerCount === 0;
-
-    // Reinstall detection: OWNER exists but SETUP_TOKEN is present in env
-    // This means the installer ran fresh on a preserved database.
-    // The user needs to reset their password to regain access.
-    const isReinstall = ownerCount > 0 && !!process.env.SETUP_TOKEN;
+    const [ownerCount, setupStateRow, tailnetOnboardingRow] = await Promise.all([
+      prisma.user.count({ where: { role: 'OWNER' as any } }),
+      prisma.systemSetting.findUnique({ where: { key: SETUP_STATE_KEY } }),
+      prisma.systemSetting.findUnique({
+        where: { key: OLLAMA_TAILNET_ONBOARDING_KEY },
+      }),
+    ]);
+    const { needsSetup, isReinstall, setupComplete } = classifySetupProgress({
+      ownerCount,
+      setupState: setupStateRow?.value,
+      hasSetupToken: !!process.env.SETUP_TOKEN,
+    });
 
     let ownerHint: string | undefined;
     if (isReinstall) {
@@ -355,10 +682,23 @@ router.get('/status', async (_req: Request, res: Response, next: NextFunction) =
       ownerHint = maskOwnerHint((owner as any)?.email, (owner as any)?.username);
     }
 
+    const setupTransport = setupTransportForRequest(req);
+    noStoreSetupResponse(res);
     res.json({
       needsSetup,
+      setupState: setupComplete ? SETUP_STATE_COMPLETE : isReinstall ? 'recovery' : 'pending',
+      setupTransport: {
+        allowed: setupTransport.allowed,
+        kind: setupTransport.kind,
+        reason: setupTransport.reason,
+      },
       version: PORTAL_VERSION,
       incompleteSteps: needsSetup ? ['adminAccount', 'portalIdentity', 'security', 'domain', 'email', 'ai'] : [],
+      tailnetOnboarding: {
+        phase: normalizeOllamaTailnetOnboardingPhase(
+          tailnetOnboardingRow?.value,
+        ),
+      },
       ...(isReinstall && { isReinstall: true, ownerHint }),
     });
   } catch (error) {
@@ -367,22 +707,46 @@ router.get('/status', async (_req: Request, res: Response, next: NextFunction) =
 });
 
 /**
+ * POST /api/setup/tailnet-onboarding
+ * Persist the non-secret external-GPU handoff choice while setup is pending.
+ * The completion transaction writes the same snapshot again so a lost browser
+ * response cannot strand the Owner between initial setup and Settings.
+ */
+router.post(
+  '/tailnet-onboarding',
+  requireSetupPending,
+  requireSetupToken,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { requested } = tailnetOnboardingSchema.parse(req.body);
+      const phase = requested
+        ? OLLAMA_TAILNET_ONBOARDING_PHASE.REQUESTED
+        : OLLAMA_TAILNET_ONBOARDING_PHASE.NOT_REQUESTED;
+      await prisma.systemSetting.upsert({
+        where: { key: OLLAMA_TAILNET_ONBOARDING_KEY },
+        update: { value: phase },
+        create: {
+          key: OLLAMA_TAILNET_ONBOARDING_KEY,
+          value: phase,
+        },
+      });
+      noStoreSetupResponse(res);
+      res.json({ phase });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/**
  * POST /api/setup/reinstall-reset
  * Reset the OWNER's password during a reinstall (preserved database).
  * Only available when SETUP_TOKEN is present (fresh install detected existing DB).
  * After reset, clears the SETUP_TOKEN so the portal operates normally.
  */
 router.post('/reinstall-reset', requireSetupToken, async (req: Request, res: Response, next: NextFunction) => {
+  let tokenRemoval: ReturnType<typeof prepareSetupTokenRemoval> | undefined;
   try {
-    // Only allowed during reinstall — OWNER exists + SETUP_TOKEN present
-    const owner = await prisma.user.findFirst({ where: { role: 'OWNER' as any } });
-    if (!owner) {
-      throw new AppError(400, 'No owner account found. Use normal setup instead.');
-    }
-    if (!process.env.SETUP_TOKEN) {
-      throw new AppError(403, 'Not in reinstall mode.');
-    }
-
     const { password } = req.body;
     if (!password || typeof password !== 'string') {
       throw new AppError(400, 'Password is required.');
@@ -394,24 +758,54 @@ router.post('/reinstall-reset', requireSetupToken, async (req: Request, res: Res
     }
 
     const passwordHash = await hashPassword(password);
-    await prisma.user.update({
-      where: { id: owner.id },
-      data: { passwordHash },
-    });
+    tokenRemoval = prepareSetupTokenRemoval();
+    const owner = await prisma.$transaction(async (tx) => {
+      // pg_advisory_xact_lock returns void, which Prisma cannot deserialize; the
+      // text cast keeps the lock while giving the driver a readable column.
+      await tx.$queryRawUnsafe(`SELECT pg_advisory_xact_lock(${SETUP_COMPLETION_LOCK_ID}::bigint)::text`);
+      await assertNoProjectAuthorizationTransitionActive(tx);
+      const [currentOwner, setupState] = await Promise.all([
+        tx.user.findFirst({ where: { role: 'OWNER' as any } }),
+        tx.systemSetting.findUnique({ where: { key: SETUP_STATE_KEY } }),
+      ]);
+      if (!currentOwner) {
+        throw new AppError(400, 'No owner account found. Use normal setup instead.');
+      }
+      if (setupState?.value === SETUP_STATE_COMPLETE) {
+        throw new AppError(403, 'Setup recovery is closed because initial setup already completed.');
+      }
 
-    // Reinstall recovery must revoke any preserved browser/device sessions.
-    // Otherwise an old refresh token can survive the password reset and keep
-    // access to the preserved portal state.
-    await prisma.session.deleteMany({
-      where: { userId: owner.id },
+      const updatedOwner = await tx.user.update({
+        where: { id: currentOwner.id },
+        data: {
+          passwordHash,
+          // Deleting refresh sessions is insufficient for already-issued access
+          // tokens. Advance the durable generation so every old token and
+          // generation-bound host runtime fails closed immediately.
+          authorizationVersion: { increment: 1 },
+        },
+      });
+      // Reinstall recovery must revoke any preserved browser/device sessions.
+      await tx.session.deleteMany({ where: { userId: currentOwner.id } });
+      await tx.systemSetting.upsert({
+        where: { key: SETUP_STATE_KEY },
+        update: { value: SETUP_STATE_COMPLETE },
+        create: { key: SETUP_STATE_KEY, value: SETUP_STATE_COMPLETE },
+      });
+      return updatedOwner;
+    }, { isolationLevel: 'Serializable', maxWait: 10_000, timeout: 30_000 });
+
+    publishAuthorizationChanged({
+      type: 'authorization_changed',
+      userId: owner.id,
+      authorizationVersion: Number((owner as any).authorizationVersion),
+      reasons: ['credential_recovery'],
     });
+    tokenRemoval.commit();
 
     // Clear any stale auth cookies carried by the current browser so the user
     // lands on a clean sign-in flow with the new password.
     clearAuthCookies(req, res);
-
-    // Clear the setup token — reinstall recovery is complete
-    clearSetupToken();
 
     res.json({
       ok: true,
@@ -420,6 +814,7 @@ router.post('/reinstall-reset', requireSetupToken, async (req: Request, res: Res
       email: (owner as any).email,
     });
   } catch (error) {
+    tokenRemoval?.abort();
     next(error);
   }
 });
@@ -479,6 +874,8 @@ router.get('/system-info', requireSetupPending, requireSetupToken, async (_req: 
       components,
       currentDomain: getDomain(),
       installProfile: process.env.INSTALL_PROFILE || 'server',
+      originMode: configuredPortalOriginMode(),
+      featureCapabilities: getPortalFeatureCapabilities(),
     });
   } catch (error) {
     next(error);
@@ -502,7 +899,7 @@ router.post('/check-dns', requireSetupPending, requireSetupToken, async (req: Re
       resolvedIps = await dns.resolve4(domain);
       resolves = resolvedIps.length > 0;
       pointsToUs = resolvedIps.includes(publicIp);
-    } catch (err: any) {
+    } catch {
       // DNS lookup failed — domain doesn't resolve
     }
 
@@ -531,7 +928,46 @@ router.post('/configure-domain', requireSetupPending, requireSetupToken, async (
   try {
     const { domain } = configureDomainSchema.parse(req.body);
     const result = await configureDomainAndHttps(domain);
-    res.json(result);
+
+    // The wizard entered through the loopback tunnel, so public-IP HTTP is not
+    // needed for continuity. Remove the temporary proxy block before offering
+    // any domain handoff; a failed removal leaves the wizard on loopback.
+    removePortalSetupIpAccess();
+    updateEnvFile({
+      DOMAIN: domain,
+      CORS_ORIGIN: `http://localhost:4001,http://127.0.0.1:4001,https://${domain},https://www.${domain}`,
+    });
+
+    if (!result.httpsReady) {
+      noStoreSetupResponse(res);
+      res.json({
+        ...result,
+        url: '',
+        message: 'Domain configured, but a trusted HTTPS certificate is not ready yet. Stay on the SSH tunnel and retry HTTPS setup.',
+      });
+      return;
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const currentSessionExpiry = Number.parseInt(String(process.env.SETUP_SESSION_EXPIRES_AT || ''), 10);
+    if (!Number.isSafeInteger(currentSessionExpiry) || now >= currentSessionExpiry) {
+      throw setupCredentialError('expired', 'Setup session');
+    }
+    const handoffExpiresAt = Math.min(currentSessionExpiry, now + SETUP_HANDOFF_TTL_SECONDS);
+    const handoffToken = crypto.randomBytes(32).toString('base64url');
+    const targetOrigin = `https://${domain}`;
+    persistSetupEnvironment({
+      SETUP_HANDOFF_TOKEN_HASH: hashSetupCredential(handoffToken),
+      SETUP_HANDOFF_ORIGIN: targetOrigin,
+      SETUP_HANDOFF_EXPIRES_AT: String(handoffExpiresAt),
+    });
+
+    noStoreSetupResponse(res);
+    res.json({
+      ...result,
+      handoffToken,
+      handoffExpiresAt: new Date(handoffExpiresAt * 1000).toISOString(),
+    });
   } catch (error) {
     next(error);
   }
@@ -543,17 +979,35 @@ router.post('/configure-domain', requireSetupPending, requireSetupToken, async (
  */
 router.get('/mail-status', requireSetupPending, requireSetupToken, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const unavailable = portalFeatureUnavailableResponse('mail');
+    if (unavailable) {
+      res.json({
+        available: false,
+        configured: false,
+        canSend: false,
+        dkimConfigured: false,
+        dnsRecords: [],
+        domain: '',
+        hasDomain: false,
+        supported: false,
+        reason: unavailable.error,
+      });
+      return;
+    }
     const domain = getDomain(req);
     const stalwartUrl = process.env.STALWART_URL || 'http://127.0.0.1:8580';
 
     let available = false;
     let configured = false;
     let canSend = false;
+    const mailDir = path.join(INSTALL_ROOT, 'stalwart');
+    const dkimRecords = domain ? readStoredStalwartDkimRecords(mailDir, domain) : [];
+    const dkimConfigured = dkimRecords.length === 2;
 
     try {
       const response = await fetch(`${stalwartUrl}/.well-known/jmap`, { signal: AbortSignal.timeout(3000) });
       available = response.ok;
-      configured = !!process.env.STALWART_ADMIN_PASS;
+      configured = !!process.env.STALWART_ADMIN_PASS && dkimConfigured;
     } catch {}
 
     if (available && configured) {
@@ -569,31 +1023,30 @@ router.get('/mail-status', requireSetupPending, requireSetupToken, async (req: R
       } catch {}
     }
 
-    const dnsRecords = domain ? generateDnsRecords(domain) : [];
+    const dnsRecords = domain ? generateDnsRecords(domain, dkimRecords) : [];
 
-    res.json({ available, configured, canSend, dnsRecords, domain, hasDomain: !!domain });
+    res.json({ available, configured, canSend, dkimConfigured, dnsRecords, domain, hasDomain: !!domain });
   } catch (error) {
     next(error);
   }
 });
 
-function generateDnsRecords(domain: string): Array<{ type: string; name: string; value: string; priority?: number; description: string }> {
-  const publicIp = getPublicIp();
+function generateDnsRecords(
+  domain: string,
+  suppliedDkimRecords?: StalwartDkimDnsRecord[],
+): Array<{ type: string; name: string; value: string; priority?: number; description: string }> {
   const mailDir = path.join(INSTALL_ROOT, 'stalwart');
-  
-  let dkimValue = 'v=DKIM1; k=rsa; p=YOUR_DKIM_PUBLIC_KEY';
-  const dkimPath = path.join(mailDir, 'dkim-dns-record.txt');
-  try {
-    if (fs.existsSync(dkimPath)) {
-      const saved = fs.readFileSync(dkimPath, 'utf-8').trim();
-      if (saved.startsWith('v=DKIM1')) dkimValue = saved;
-    }
-  } catch {}
+  const dkimRecords = suppliedDkimRecords || readStoredStalwartDkimRecords(mailDir, domain);
 
   // Only return DKIM + DMARC here — mail A, MX, and SPF are already shown
   // in the domain setup step so we don't ask users to add them twice.
   return [
-    { type: 'TXT', name: 'default._domainkey', value: dkimValue, description: 'Cryptographic email signature — verifies emails are really from you' },
+    ...dkimRecords.map(record => ({
+      type: 'TXT',
+      name: record.name,
+      value: record.value,
+      description: `${record.algorithm.toUpperCase()} DKIM signature — verifies emails are really from you`,
+    })),
     { type: 'TXT', name: '_dmarc', value: `v=DMARC1; p=quarantine; rua=mailto:postmaster@${domain}`, description: 'Policy for handling suspicious emails' },
   ];
 }
@@ -605,6 +1058,22 @@ function generateDnsRecords(domain: string): Array<{ type: string; name: string;
  */
 router.get('/mail-preflight', requireSetupPending, requireSetupToken, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const unavailable = portalFeatureUnavailableResponse('mail');
+    if (unavailable) {
+      res.json({
+        provider: 'unsupported',
+        providerName: 'Private Tailnet mode',
+        dockerOk: false,
+        port25Open: false,
+        smtpBlocked: false,
+        providerInstructions: unavailable.error,
+        providerLink: null,
+        canSelfHost: false,
+        supported: false,
+        reason: unavailable.error,
+      });
+      return;
+    }
     const net = require('net');
 
     // Detect VPS provider from metadata endpoints or hostname patterns
@@ -735,6 +1204,11 @@ router.get('/mail-preflight', requireSetupPending, requireSetupToken, async (req
  */
 router.post('/install-mail', requireSetupPending, requireSetupToken, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const unavailable = portalFeatureUnavailableResponse('mail');
+    if (unavailable) {
+      res.status(409).json(unavailable);
+      return;
+    }
     const domain = getDomain(req);
     if (!domain) {
       throw new AppError(400, 'A domain must be configured before setting up email. Complete the Domain step first.');
@@ -864,10 +1338,7 @@ ansi = false
 enable = true
 
 # DKIM signing — sign outbound mail from local domains
-[auth.dkim.sign]
-"0.if" = "is_local_domain(sender_domain)"
-"0.then" = '["rsa-" + sender_domain, "ed25519-" + sender_domain]'
-"1.else" = "false"
+${getStalwartDkimSigningConfig()}
 
 # Admin credentials
 [authentication.fallback-admin]
@@ -903,7 +1374,7 @@ secret = "${adminPass}"
     if (stalwartAlreadyRunning) {
       const healthy = await checkStalwartHealth();
       if (!healthy) {
-        teardownStalwart(mailDir);
+        recycleStalwartForRecovery(mailDir);
         stalwartAlreadyRunning = false;
         recreated = true;
       }
@@ -917,10 +1388,10 @@ secret = "${adminPass}"
     // Without this, account creation returns "notFound: <domain>".
     const domainResult = await ensureStalwartDomain(domain, adminPass);
     if (!domainResult.ok) {
-      // If domain creation fails, try teardown + recreate once
+      // If domain creation fails, retry once with the same persistent mail store.
       if (!recreated) {
-        console.warn('[setup/install-mail] Domain creation failed; tearing down Stalwart:', domainResult.error);
-        teardownStalwart(mailDir);
+        console.warn('[setup/install-mail] Domain creation failed; retrying with a data-preserving container recycle:', domainResult.error);
+        recycleStalwartForRecovery(mailDir);
         await startFreshStalwart();
         recreated = true;
         const retryDomain = await ensureStalwartDomain(domain, adminPass);
@@ -936,8 +1407,8 @@ secret = "${adminPass}"
     let noreplyResult = await createStalwartAccount(domain, adminPass, 'noreply', noreplyPass);
 
     if ((!supportResult.ok || !noreplyResult.ok) && !recreated) {
-      console.warn('[setup/install-mail] Account creation failed; tearing down and recreating Stalwart', supportResult, noreplyResult);
-      teardownStalwart(mailDir);
+      console.warn('[setup/install-mail] Account creation failed; retrying with a data-preserving container recycle', supportResult, noreplyResult);
+      recycleStalwartForRecovery(mailDir);
       await startFreshStalwart();
       recreated = true;
       const retryDomain2 = await ensureStalwartDomain(domain, adminPass);
@@ -953,7 +1424,12 @@ secret = "${adminPass}"
       throw new AppError(500, `Failed to create Stalwart accounts: ${detail || 'unknown error'}`);
     }
 
-    const dkimRecord = generateDkimKey(mailDir);
+    const dkimRecords = await provisionStalwartDkim({
+      domain,
+      adminPass,
+      mailDir,
+      baseUrl: 'http://127.0.0.1:8580',
+    });
 
     updateEnvFile({
       STALWART_URL: 'http://127.0.0.1:8580',
@@ -964,12 +1440,19 @@ secret = "${adminPass}"
       STALWART_NOREPLY_PASS: noreplyPass,
       MAIL_DOMAIN: domain,
     });
+    process.env.STALWART_URL = 'http://127.0.0.1:8580';
+    process.env.STALWART_ADMIN_PASS = adminPass;
+    process.env.STALWART_SUPPORT_USER = 'support';
+    process.env.STALWART_SUPPORT_PASS = supportPass;
+    process.env.STALWART_NOREPLY_USER = 'noreply';
+    process.env.STALWART_NOREPLY_PASS = noreplyPass;
+    process.env.MAIL_DOMAIN = domain;
 
     try {
       execSync('ufw allow 25/tcp 2>/dev/null; ufw allow 587/tcp 2>/dev/null; ufw allow 993/tcp 2>/dev/null', { timeout: 5000, shell: '/bin/bash' });
     } catch {}
 
-    const dnsRecords = generateDnsRecords(domain);
+    const dnsRecords = generateDnsRecords(domain, dkimRecords);
 
     res.json({
       success: true,
@@ -992,8 +1475,13 @@ secret = "${adminPass}"
 /**
  * POST /api/setup/test-email
  */
-router.post('/test-email', requireSetupPending, requireSetupToken, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/test-email', requireSetupPending, requireSetupToken, async (req: Request, res: Response) => {
   try {
+    const unavailable = portalFeatureUnavailableResponse('mail');
+    if (unavailable) {
+      res.status(409).json(unavailable);
+      return;
+    }
     const { email } = testEmailSchema.parse(req.body);
     const domain = getDomain(req);
 
@@ -1027,6 +1515,8 @@ router.post('/test-email', requireSetupPending, requireSetupToken, async (req: R
         to: email,
         subject: 'Test Email — Portal Setup',
         text: 'This test email confirms your mail server is configured correctly.',
+        disableFileAccess: true,
+        disableUrlAccess: true,
       });
     }
 
@@ -1043,9 +1533,15 @@ router.post('/test-email', requireSetupPending, requireSetupToken, async (req: R
 router.post('/upload-logo', requireSetupPending, requireSetupToken, uploadLogo.single('file'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded');
-    const url = `/static-assets/branding/${req.file.filename}`;
+    const filename = `portal-logo-${crypto.randomUUID()}.png`;
+    await normalizeBrandingLogoToPng(req.file.buffer, path.join(BRANDING_DIR, filename), 512);
+    cleanupBasenamePrefixVariants(BRANDING_DIR, 'portal-logo-', filename);
+    const url = `/static-assets/branding/${filename}`;
     res.json({ success: true, url });
   } catch (error) {
+    if (error instanceof UnsafeImageUploadError) {
+      return next(new AppError(400, error.message));
+    }
     next(error);
   }
 });
@@ -1056,26 +1552,32 @@ router.post('/upload-logo', requireSetupPending, requireSetupToken, uploadLogo.s
  */
 router.get('/ollama-status', requireSetupPending, requireSetupToken, async (_req: Request, res: Response, next: NextFunction) => {
   try {
-    const ollamaUrl = process.env.OLLAMA_API_URL || 'http://127.0.0.1:11434';
-
     let running = false;
     let models: string[] = [];
 
     try {
-      const response = await fetch(`${ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(3000) });
-      if (response.ok) {
-        running = true;
-        const data = await response.json() as any;
-        models = (data?.models || []).map((m: any) => m.name);
-      }
+      const data = await requestLocalOllamaJson<any>({
+        path: '/api/tags',
+        method: 'GET',
+        timeoutMs: 3_000,
+        maxResponseBytes: 2 * 1024 * 1024,
+      });
+      running = true;
+      models = Array.isArray(data?.models)
+        ? data.models.slice(0, 1_000).flatMap((entry: any) => {
+          const name = typeof entry?.name === 'string' ? entry.name.trim() : '';
+          return isValidOllamaModelName(name) ? [name] : [];
+        })
+        : [];
     } catch {}
 
     const os = require('os');
     const totalRam = os.totalmem();
     const ramGb = Math.round((totalRam / (1024 ** 3)) * 10) / 10;
-    const { ramTier, warning, recommendedModels } = getOllamaRecommendationsByRam(totalRam);
+    const availableRam = readAvailableMemoryBytes(totalRam);
+    const { ramTier, availableRamGb, reservedHeadroomGb, warning, recommendedModels } = getOllamaRecommendationsByRam(totalRam, availableRam);
 
-    res.json({ running, endpoint: ollamaUrl, models, ramGb, ramTier, warning, recommendedModels });
+    res.json({ running, endpoint: DEFAULT_LOCAL_OLLAMA_ENDPOINT, models, ramGb, availableRamGb, reservedHeadroomGb, ramTier, warning, recommendedModels });
   } catch (error) {
     next(error);
   }
@@ -1088,29 +1590,34 @@ router.get('/ollama-status', requireSetupPending, requireSetupToken, async (_req
 router.post('/ollama-pull', requireSetupPending, requireSetupToken, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { model } = req.body;
-    if (!model || typeof model !== 'string' || model.length > 200) {
+    if (!isValidOllamaModelName(model)) {
       throw new AppError(400, 'Invalid model name');
     }
-    if (!/^[a-zA-Z0-9._:/-]+$/.test(model)) {
-      throw new AppError(400, 'Invalid model name format');
-    }
 
-    const ollamaUrl = process.env.OLLAMA_API_URL || 'http://127.0.0.1:11434';
-
-    const response = await fetch(`${ollamaUrl}/api/pull`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: model, stream: false }),
-      signal: AbortSignal.timeout(300000),
+    let resolveCompletion: (job: OllamaPullSnapshot) => void = () => undefined;
+    const completion = new Promise<OllamaPullSnapshot>((resolve) => {
+      resolveCompletion = resolve;
     });
+    const job = setupLocalOllamaPullManager.start(model, { onDone: resolveCompletion });
+    const cancelDisconnectedPull = () => {
+      if (!res.writableEnded) setupLocalOllamaPullManager.cancel(job.id);
+    };
+    req.once('aborted', cancelDisconnectedPull);
+    res.once('close', cancelDisconnectedPull);
+    const completed = await completion;
+    req.off('aborted', cancelDisconnectedPull);
+    res.off('close', cancelDisconnectedPull);
 
-    if (!response.ok) {
-      const text = await response.text().catch(() => 'Unknown error');
-      throw new AppError(502, `Ollama pull failed: ${text}`);
+    if (completed.state !== 'succeeded') {
+      throw new AppError(502, `Ollama pull ${completed.state.replace('_', ' ')}`);
     }
 
     res.json({ success: true, model });
   } catch (error) {
+    if (error instanceof OllamaPullBusyError) {
+      next(new AppError(409, error.message));
+      return;
+    }
     next(error);
   }
 });
@@ -1121,34 +1628,7 @@ router.post('/ollama-pull', requireSetupPending, requireSetupToken, async (req: 
  */
 router.get('/openclaw-status', requireSetupPending, requireSetupToken, async (_req: Request, res: Response, next: NextFunction) => {
   try {
-    const gatewayUrl = process.env.OPENCLAW_API_URL || 'http://127.0.0.1:18789';
-    const token = getGatewayToken();
-
-    let installed = false;
-    let version = '';
-    let gatewayRunning = false;
-
-    try {
-      execSync('command -v openclaw', { timeout: 2000, stdio: 'ignore' });
-      installed = true;
-      version = execSync('openclaw --version 2>/dev/null', { encoding: 'utf-8', timeout: 3000 }).trim().split('\n')[0] || '';
-    } catch {}
-
-    if (installed) {
-      try {
-        const r = await fetch(`${gatewayUrl}/health`, { signal: AbortSignal.timeout(3000) });
-        gatewayRunning = r.ok;
-      } catch {}
-    }
-
-    res.json({
-      installed,
-      version,
-      gatewayRunning,
-      gatewayUrl,
-      hasToken: !!token,
-      description: 'OpenClaw is the AI agent framework that powers intelligent features like code generation, chat, and automation.',
-    });
+    res.json(await getOpenClawSetupReadiness());
   } catch (error) {
     next(error);
   }
@@ -1193,46 +1673,146 @@ router.post('/install-coding-tool', requireSetupPending, requireSetupToken, asyn
  * Create admin account and save all settings. Final step.
  */
 router.post('/complete', requireSetupToken, async (req: Request, res: Response, next: NextFunction) => {
+  let tokenRemoval: ReturnType<typeof prepareSetupTokenRemoval> | undefined;
+  let transactionCommitted = false;
   try {
-    const existingOwner = await prisma.user.findFirst({ where: { role: 'OWNER' as any } });
-    if (existingOwner) {
-      throw new AppError(409, 'Setup already completed. An owner account exists.');
-    }
-
     const body = completeSetupSchema.parse(req.body);
     const strength = validatePasswordStrength(body.password);
     if (!strength.valid) {
       throw new AppError(400, strength.errors.join('. '));
     }
 
-    const username = await createUniqueUsername(body.name, body.email);
+    let logoUrl: string;
+    try {
+      logoUrl = validateSetupLogoUrl(body.logoUrl, BRANDING_DIR) || APPEARANCE_DEFAULTS.logoUrl;
+    } catch (error: any) {
+      throw new AppError(400, error?.message || 'The setup logo is invalid.');
+    }
+
+    const ownerId = crypto.randomUUID();
     const passwordHash = await hashPassword(body.password);
+    const refreshToken = generateRefreshToken({ userId: ownerId });
+    const refreshTokenHash = digestAuthToken('refresh', refreshToken);
 
     const nameParts = body.name.split(/\s+/);
     const firstName = nameParts[0] || body.name;
     const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : undefined;
 
-    const user = await prisma.user.create({
-      data: {
-        email: body.email,
-        username,
-        passwordHash,
-        firstName,
-        lastName,
-        role: 'OWNER' as any,
-        accountStatus: 'ACTIVE',
-        isActive: true,
-        sandboxEnabled: false,
-      },
-    } as any);
+    const settingsToUpsert: Record<string, string> = {
+      'appearance.portalName': body.portalName ?? APPEARANCE_DEFAULTS.portalName,
+      'appearance.theme': body.theme ?? APPEARANCE_DEFAULTS.theme,
+      'appearance.accentColor': body.accentColor ?? APPEARANCE_DEFAULTS.accentColor,
+      'appearance.logoUrl': logoUrl,
+      'security.registrationMode': body.registrationMode ?? SECURITY_DEFAULTS.registrationMode,
+      'security.sandboxDefaultEnabled': 'true',
+      'system.allowTelemetry': body.allowTelemetry === false ? 'false' : 'true',
+      'system.searchEngineVisibility': body.searchEngineVisibility === 'visible' ? 'visible' : 'hidden',
+      [OLLAMA_TAILNET_ONBOARDING_KEY]: body.tailnetRequested
+        ? OLLAMA_TAILNET_ONBOARDING_PHASE.REQUESTED
+        : OLLAMA_TAILNET_ONBOARDING_PHASE.NOT_REQUESTED,
+    };
 
-    // Provision mail account for owner — retry up to 3 times with delay
-    // (Stalwart may still be starting after the email setup step)
-    if (process.env.STALWART_ADMIN_PASS) {
+    // Confirm the setup token can be removed before committing any owner row.
+    tokenRemoval = prepareSetupTokenRemoval();
+    const user = await prisma.$transaction(async (tx) => {
+      // A database-scoped lock prevents concurrent requests/processes from
+      // creating two owners. Serializable isolation closes the remaining race.
+      // pg_advisory_xact_lock returns void, which Prisma cannot deserialize; the
+      // text cast keeps the lock while giving the driver a readable column.
+      await tx.$queryRawUnsafe(`SELECT pg_advisory_xact_lock(${SETUP_COMPLETION_LOCK_ID}::bigint)::text`);
+      await assertNoProjectAuthorizationTransitionActive(tx);
+      const existingOwner = await tx.user.findFirst({ where: { role: 'OWNER' as any } });
+      if (existingOwner) {
+        throw new AppError(409, 'Setup already completed. An owner account exists.');
+      }
+
+      const username = await createUniqueUsername(body.name, body.email, tx);
+      const createdUser = await tx.user.create({
+        data: {
+          id: ownerId,
+          email: body.email,
+          username,
+          passwordHash,
+          firstName,
+          lastName,
+          role: 'OWNER' as any,
+          accountStatus: 'ACTIVE',
+          isActive: true,
+          sandboxEnabled: false,
+        },
+      } as any);
+
+      for (const [key, value] of Object.entries(settingsToUpsert)) {
+        await tx.systemSetting.upsert({
+          where: { key },
+          update: { value },
+          create: { key, value },
+        });
+      }
+
+      await tx.session.create({
+        data: {
+          userId: createdUser.id,
+          refreshTokenHash,
+          ipAddress: req.ip || 'unknown',
+          userAgent: req.headers['user-agent'] || 'unknown',
+          expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        },
+      });
+
+      await tx.activityLog.create({
+        data: {
+          userId: createdUser.id,
+          action: 'SETUP_COMPLETE',
+          resource: 'system',
+          severity: 'INFO',
+          ipAddress: req.ip || 'unknown',
+          userAgent: req.headers['user-agent'] || 'unknown',
+          translatedMessage: `Initial setup completed — admin: ${createdUser.email}`,
+          metadata: {
+            portalName: settingsToUpsert['appearance.portalName'],
+            registrationMode: settingsToUpsert['security.registrationMode'],
+          },
+        },
+      });
+
+      // Written last: this marker proves the owner/settings/session transaction
+      // reached its durable terminal state.
+      await tx.systemSetting.upsert({
+        where: { key: SETUP_STATE_KEY },
+        update: { value: SETUP_STATE_COMPLETE },
+        create: { key: SETUP_STATE_KEY, value: SETUP_STATE_COMPLETE },
+      });
+      return createdUser;
+    }, { isolationLevel: 'Serializable', maxWait: 10_000, timeout: 30_000 });
+    transactionCommitted = true;
+
+    try {
+      tokenRemoval.commit();
+    } catch (error) {
+      // The committed database marker keeps all setup/recovery endpoints closed
+      // even if the atomic env rename is interrupted. Disable the in-memory
+      // token now and leave a loud diagnostic for operator cleanup.
+      for (const key of SETUP_ENV_KEYS) delete process.env[key];
+      tokenRemoval.abort();
+      console.error('[setup] Initial setup committed, but SETUP_TOKEN could not be removed from .env.production:', error);
+    }
+
+    const accessToken = generateAccessToken({
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      authorizationVersion: Number((user as any).authorizationVersion ?? 1),
+    });
+    setAuthCookies(req, res, accessToken, refreshToken, 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
+
+    // Mail is an optional external side effect. It runs only after the atomic
+    // Portal commit and cannot roll setup back or strand the wizard.
+    if (getPortalFeatureCapabilities().mail.available && process.env.STALWART_ADMIN_PASS) {
       let mailProvisioned = false;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          await provisionUserMailbox(username, user.id, { makePrimary: true });
+          await provisionUserMailbox(user.username, user.id, { makePrimary: true });
           mailProvisioned = true;
           console.log(`[setup] Owner mailbox provisioned on attempt ${attempt}`);
           break;
@@ -1246,97 +1826,30 @@ router.post('/complete', requireSetupToken, async (req: Request, res: Response, 
       }
     }
 
-    // Save settings
-    const settingsToUpsert: Record<string, string> = {
-      'appearance.portalName': body.portalName ?? APPEARANCE_DEFAULTS.portalName,
-      'appearance.theme': body.theme ?? APPEARANCE_DEFAULTS.theme,
-      'appearance.accentColor': body.accentColor ?? APPEARANCE_DEFAULTS.accentColor,
-      'appearance.logoUrl': body.logoUrl ?? APPEARANCE_DEFAULTS.logoUrl,
-      'security.registrationMode': body.registrationMode ?? SECURITY_DEFAULTS.registrationMode,
-      'security.sandboxDefaultEnabled': 'true',
-      'system.allowTelemetry': body.allowTelemetry === false ? 'false' : 'true',
-      'system.searchEngineVisibility': body.searchEngineVisibility === 'visible' ? 'visible' : 'hidden',
-    };
-
-    await Promise.all(
-      Object.entries(settingsToUpsert).map(([key, value]) =>
-        prisma.systemSetting.upsert({
-          where: { key },
-          update: { value },
-          create: { key, value },
-        })
-      )
-    );
-
-    // Generate auth tokens
-    const accessToken = generateAccessToken({
-      userId: user.id,
-      email: user.email,
-      role: user.role,
-    });
-    const refreshToken = generateRefreshToken({ userId: user.id });
-    const refreshTokenHash = await hashPassword(refreshToken);
-
-    await prisma.session.create({
-      data: {
-        userId: user.id,
-        refreshTokenHash,
-        ipAddress: req.ip || 'unknown',
-        userAgent: req.headers['user-agent'] || 'unknown',
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      },
-    });
-
-    setAuthCookies(req, res, accessToken, refreshToken, 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
-
-    await prisma.activityLog.create({
-      data: {
-        userId: user.id,
-        action: 'SETUP_COMPLETE',
-        resource: 'system',
-        severity: 'INFO',
-        ipAddress: req.ip || 'unknown',
-        userAgent: req.headers['user-agent'] || 'unknown',
-        translatedMessage: `Initial setup completed — admin: ${user.email}`,
-        metadata: {
-          portalName: settingsToUpsert['appearance.portalName'],
-          registrationMode: settingsToUpsert['security.registrationMode'],
-        },
-      },
-    }).catch(() => {});
-
-    // Clear the one-time setup token — wizard is complete, endpoint is permanently locked
-    clearSetupToken();
-
     // Clean up: strip the temporary http://<IP> origin that was kept alive for
     // the HTTP→HTTPS wizard handoff. Only the domain origins should remain.
-    const envPath = path.join(PORTAL_ROOT, 'backend', '.env.production');
-    if (fs.existsSync(envPath)) {
-      let envContent = fs.readFileSync(envPath, 'utf-8');
-      // Remove ,http://<ip> patterns from CORS_ORIGIN
-      envContent = envContent.replace(
-        /^(CORS_ORIGIN=.+?),http:\/\/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/m,
-        '$1'
-      );
-      fs.writeFileSync(envPath, envContent);
+    try {
+      const envPath = path.join(PORTAL_ROOT, 'backend', '.env.production');
+      if (fs.existsSync(envPath)) {
+        let envContent = fs.readFileSync(envPath, 'utf-8');
+        envContent = envContent.replace(
+          /^(CORS_ORIGIN=.+?),http:\/\/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/m,
+          '$1'
+        );
+        fs.writeFileSync(envPath, envContent, { mode: 0o600 });
+      }
+    } catch (error) {
+      console.warn('[setup] Setup committed, but temporary IP CORS cleanup failed:', error);
     }
 
-    // Also remove the IP-only Caddy block now that setup is complete
+    // Remove only the temporary Portal-owned IP block. The shared helper
+    // validates a same-directory candidate before atomically replacing the
+    // Caddyfile and restores the exact prior file if reload fails.
     try {
-      const caddyPath = '/etc/caddy/Caddyfile';
-      if (fs.existsSync(caddyPath)) {
-        let caddyContent = fs.readFileSync(caddyPath, 'utf-8');
-        // Remove the "http://<IP>" server block that was kept for setup
-        // The block has nested braces (reverse_proxy { ... }), so [^}]*\} only
-        // matches the inner brace. Use [\s\S]*? to match across the full block.
-        caddyContent = caddyContent.replace(
-          /\n*# Keep IP access alive during setup[^\n]*\nhttp:\/\/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s*\{[\s\S]*?\n\}\n*/g,
-          '\n'
-        );
-        fs.writeFileSync(caddyPath, caddyContent.trim() + '\n');
-        execSync('systemctl reload caddy', { timeout: 5000, stdio: 'ignore' });
-      }
-    } catch {}
+      removePortalSetupIpAccess();
+    } catch (error: any) {
+      console.warn(`[setup] Could not remove temporary Caddy IP access safely: ${error?.message || error}`);
+    }
 
     // Schedule a service restart so CORS_ORIGIN, Secure cookie flag, and other
     // .env.production changes (from configure-domain etc.) take effect.
@@ -1357,7 +1870,11 @@ router.post('/complete', requireSetupToken, async (req: Request, res: Response, 
         role: user.role,
       },
     });
-  } catch (error) {
+  } catch (error: any) {
+    if (!transactionCommitted) tokenRemoval?.abort();
+    if (error?.code === 'P2034' || error?.code === 'P2002') {
+      return next(new AppError(409, 'Setup changed while this request was running. Check setup status and retry.'));
+    }
     next(error);
   }
 });

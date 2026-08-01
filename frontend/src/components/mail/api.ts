@@ -4,7 +4,7 @@
 function withAccount(path: string, account?: string): string {
   if (!account) return path;
   const sep = path.includes('?') ? '&' : '?';
-  return `${path}${sep}account=${account}`;
+  return `${path}${sep}account=${encodeURIComponent(account)}`;
 }
 
 export async function apiFetch(path: string, opts?: RequestInit & { account?: string }) {
@@ -20,6 +20,25 @@ export async function apiFetch(path: string, opts?: RequestInit & { account?: st
     throw new Error(err.error || `HTTP ${res.status}`);
   }
   return res.json();
+}
+
+export async function apiDownloadAttachment(
+  blobId: string,
+  capability: string,
+  account?: string,
+): Promise<Blob> {
+  if (!capability) throw new Error('Attachment authorization is unavailable. Refresh the message and try again.');
+  const url = `/api/mail${withAccount(`/attachments/${encodeURIComponent(blobId)}`, account)}`;
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: { 'X-Mail-Attachment-Capability': capability },
+    credentials: 'include',
+  });
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(error.error || `HTTP ${res.status}`);
+  }
+  return res.blob();
 }
 
 export async function apiSendWithAttachments(
@@ -57,7 +76,8 @@ export interface MailAccount {
 export async function fetchMailAccounts(): Promise<{ accounts: MailAccount[]; hasMailbox: boolean }> {
   const res = await fetch('/api/mail/accounts', { credentials: 'include' });
   if (!res.ok) {
-    return { accounts: [], hasMailbox: false };
+    const error = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(error.error || `HTTP ${res.status}`);
   }
   return res.json();
 }

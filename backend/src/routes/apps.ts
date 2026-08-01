@@ -1,37 +1,93 @@
 import { Router, Request, Response } from 'express';
+import { captureBoundedMultipartBody } from '../utils/proxyMultipartBody';
+import {
+  APP_API_ID_HEADER,
+  addConfiguredAppApiSecret,
+  buildAppApiTargetUrl,
+  configuredAppApiTarget,
+} from '../utils/appApiProxyAuth';
+import { createAppApiAbortContext, serializeAppApiRequestBody, streamAppApiResponse } from '../utils/appApiProxy';
 import multer from 'multer';
 import path from 'path';
-import { getAppPort } from '../services/app-process.service';
+import { getAppTarget } from '../services/app-process.service';
 import fs from 'fs';
-import crypto from 'crypto';
-import { execFileSync, execSync } from 'child_process';
 import { nanoid } from 'nanoid';
 import bcrypt from 'bcrypt';
 import { authenticateToken } from '../middleware/auth';
 import { requireApproved } from '../middleware/requireApproved';
-import extract from 'extract-zip';
 import { scanFile } from '../services/virusScan';
 import { prisma } from '../config/database';
 import { config } from '../config/env';
-import { escapeHtml, isBlockedAppStaticPath, isPathWithin } from '../utils/appFileSecurity';
+import {
+  escapeHtml,
+  isBlockedAppStaticPath,
+  isPathWithin,
+  resolveExistingAppDirectory,
+  resolveExistingPathWithin,
+} from '../utils/appFileSecurity';
+import {
+  SharePasswordAttemptLimiter,
+  isValidShareToken,
+  issueShareGrant,
+  parseShareLinkOptions,
+  shareGrantCookieName,
+  sharePasswordBinding,
+  validateSharePassword,
+  verifyShareGrant,
+} from '../utils/shareAccessSecurity';
+import { APP_ZIP_LIMITS, safeExtractZipToNewDirectory } from '../services/safeZipExtraction';
+import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
+import { portalFeatureUnavailableResponse } from '../utils/portalFeatureCapabilities';
 
 const router = Router();
 
-const APPS_DIR = '/portal/apps';
-const ZIPS_DIR = '/portal/app-zips';
+export interface AppsStorageOptions {
+  appsDir?: string;
+  zipsDir?: string;
+  portalRoot?: string;
+}
+
+export function resolveAppsStoragePaths(options: AppsStorageOptions = {}) {
+  const portalRoot = path.resolve(options.portalRoot || process.env.PORTAL_DATA_ROOT || process.env.PORTAL_ROOT || '/portal');
+  return {
+    appsDir: path.resolve(options.appsDir || process.env.PORTAL_APPS_ROOT || path.join(portalRoot, 'apps')),
+    zipsDir: path.resolve(options.zipsDir || process.env.PORTAL_APP_ZIPS_ROOT || path.join(portalRoot, 'app-zips')),
+  };
+}
+
+const appsStoragePaths = resolveAppsStoragePaths();
+export const APPS_DIR = appsStoragePaths.appsDir;
+export const ZIPS_DIR = appsStoragePaths.zipsDir;
+const HOSTED_APPS_DIR = process.env.APPS_ROOT || '/var/www/bridgesllm-apps';
+const MAX_APP_DESCRIPTION_LENGTH = 4_000;
+const MAX_SHARE_HTML_BYTES = 5 * 1024 * 1024;
+const MAX_APPS_PER_USER = 500;
+const MAX_SHARE_LINKS_PER_APP = 1_000;
+const MAX_RETURNED_SHARE_LINKS_PER_APP = 100;
 
 function redactShareLink<T extends { passwordHash?: string | null }>(shareLink: T): Omit<T, 'passwordHash'> {
-  const { passwordHash, ...safeShareLink } = shareLink;
+  const { passwordHash: _passwordHash, ...safeShareLink } = shareLink;
   return safeShareLink;
 }
 
-fs.mkdirSync(APPS_DIR, { recursive: true });
-fs.mkdirSync(ZIPS_DIR, { recursive: true });
+export function initializeAppsStorage(options: AppsStorageOptions = {}): ReturnType<typeof resolveAppsStoragePaths> {
+  const paths = Object.keys(options).length > 0 ? resolveAppsStoragePaths(options) : appsStoragePaths;
+  ensureRuntimeDirectory(paths.appsDir, { mode: 0o755 });
+  ensureRuntimeDirectory(paths.zipsDir, { mode: 0o700, enforceMode: true });
+  return paths;
+}
 
 const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, ZIPS_DIR),
-  filename: (_req, file, cb) => {
-    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname)}`);
+  destination: (_req, _file, cb) => {
+    try {
+      initializeAppsStorage();
+      cb(null, ZIPS_DIR);
+    } catch (error: any) {
+      cb(error, ZIPS_DIR);
+    }
+  },
+  filename: (_req, _file, cb) => {
+    cb(null, `${nanoid(24)}.zip`);
   },
 });
 
@@ -39,7 +95,7 @@ const upload = multer({
   storage,
   limits: { fileSize: 200 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    if (file.mimetype === 'application/zip' || file.originalname.endsWith('.zip')) {
+    if (file.mimetype === 'application/zip' || file.originalname.toLowerCase().endsWith('.zip')) {
       cb(null, true);
     } else {
       cb(new Error('Only ZIP files are allowed'));
@@ -49,6 +105,8 @@ const upload = multer({
 
 // POST /api/apps - upload and extract
 router.post('/', authenticateToken, requireApproved, upload.single('file'), async (req: Request, res: Response) => {
+  let appDir: string | undefined;
+  let createdAppId: string | undefined;
   try {
     if (!req.file) {
       res.status(400).json({ error: 'No zip file provided' });
@@ -58,18 +116,28 @@ router.post('/', authenticateToken, requireApproved, upload.single('file'), asyn
     // Virus scan the uploaded zip
     const scanResult = await scanFile(req.file.path);
     if (!scanResult.clean) {
-      fs.unlinkSync(req.file.path);
-      res.status(400).json({ error: `File rejected: malware detected (${scanResult.threat})` });
+      res.status(scanResult.scannerAvailable ? 400 : 503).json({
+        error: scanResult.scannerAvailable
+          ? `File rejected: malware detected (${scanResult.threat})`
+          : 'App upload is temporarily unavailable because malware scanning could not complete',
+      });
       return;
     }
 
-    const name = (req.body.name || path.basename(req.file.originalname, '.zip')).replace(/[^a-zA-Z0-9_-]/g, '_');
-    const description = req.body.description || '';
-    const appDir = path.join(APPS_DIR, `${req.user!.userId}-${name}-${Date.now()}`);
+    const name = String(req.body.name || path.basename(req.file.originalname, '.zip'))
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .slice(0, 120) || 'app';
+    const description = req.body.description === undefined ? '' : req.body.description;
+    if (typeof description !== 'string' || description.length > MAX_APP_DESCRIPTION_LENGTH) {
+      res.status(400).json({ error: 'Description must not exceed 4000 characters' });
+      return;
+    }
+    appDir = path.join(APPS_DIR, `${req.user!.userId}-${name}-${Date.now()}-${nanoid(8)}`);
 
-    fs.mkdirSync(appDir, { recursive: true });
-    // extract-zip uses yauzl which validates entry paths against zip slip by default
-    await extract(req.file.path, { dir: path.resolve(appDir) });
+    await safeExtractZipToNewDirectory(req.file.path, appDir, {
+      limits: APP_ZIP_LIMITS,
+      collapseSingleRoot: false,
+    });
 
 
     // Auto-detect project type
@@ -116,6 +184,7 @@ router.post('/', authenticateToken, requireApproved, upload.single('file'), asyn
         zipPath: appDir,
       },
     });
+    createdAppId = app.id;
 
     await prisma.activityLog.create({
       data: {
@@ -125,12 +194,24 @@ router.post('/', authenticateToken, requireApproved, upload.single('file'), asyn
         resourceId: app.id,
         severity: 'INFO',
       },
-    });
+    }).catch(() => {});
 
+    createdAppId = undefined;
+    appDir = undefined;
     res.status(201).json({ ...app, detectedType, suggestedCommand });
   } catch (error) {
     console.error('App upload error:', error);
+    if (createdAppId) {
+      try { await prisma.app.delete({ where: { id: createdAppId } }); } catch {}
+    }
+    if (appDir) {
+      try { fs.rmSync(appDir, { recursive: true, force: true }); } catch {}
+    }
     res.status(500).json({ error: 'Failed to upload app' });
+  } finally {
+    if (req.file?.path) {
+      try { fs.unlinkSync(req.file.path); } catch {}
+    }
   }
 });
 
@@ -139,8 +220,14 @@ router.get('/', authenticateToken, requireApproved, async (req: Request, res: Re
   try {
     const apps = await prisma.app.findMany({
       where: { userId: req.user!.userId },
-      include: { shareLinks: { where: { isActive: true } } },
+      include: {
+        shareLinks: {
+          orderBy: { createdAt: 'desc' },
+          take: MAX_RETURNED_SHARE_LINKS_PER_APP,
+        },
+      },
       orderBy: { createdAt: 'desc' },
+      take: MAX_APPS_PER_USER,
     });
 
     const safeApps = apps.map(({ shareLinks, ...app }) => ({
@@ -167,9 +254,16 @@ router.delete('/:id', authenticateToken, requireApproved, async (req: Request, r
       return;
     }
 
-    // Remove extracted directory
+    // Delete only a real app directory inside one of the managed roots. A
+    // database path or symlink must never turn this endpoint into recursive
+    // deletion elsewhere on the host.
     if (fs.existsSync(app.zipPath)) {
-      fs.rmSync(app.zipPath, { recursive: true, force: true });
+      const managedPath = resolveExistingAppDirectory(app.zipPath, [APPS_DIR]);
+      if (!managedPath) {
+        res.status(409).json({ error: 'Deployed project apps must be removed from Projects so their runtime can be stopped safely' });
+        return;
+      }
+      fs.rmSync(managedPath, { recursive: true, force: true });
     }
 
     await prisma.app.delete({ where: { id: app.id } });
@@ -194,6 +288,11 @@ router.delete('/:id', authenticateToken, requireApproved, async (req: Request, r
 // POST /api/apps/:id/share - create share link
 router.post('/:id/share', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
+    const unavailable = portalFeatureUnavailableResponse('appHosting');
+    if (unavailable) {
+      res.status(409).json(unavailable);
+      return;
+    }
     const app = await prisma.app.findFirst({
       where: { id: req.params.id, userId: req.user!.userId },
     });
@@ -203,16 +302,75 @@ router.post('/:id/share', authenticateToken, requireApproved, async (req: Reques
       return;
     }
 
+    const existingShareCount = await prisma.appShareLink.count({ where: { appId: app.id, userId: req.user!.userId } });
+    if (existingShareCount >= MAX_SHARE_LINKS_PER_APP) {
+      res.status(409).json({ error: 'This app reached the retained share-link limit; delete an old link before creating another' });
+      return;
+    }
+
     const token = nanoid(21);
+    let options;
+    try {
+      options = parseShareLinkOptions(req.body || {});
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    // App share links are public by default, and the Apps library only offers
+    // expiry and use limits. But this route silently dropped `isPublic` and
+    // `password` if a caller sent them, creating a public link while the
+    // caller believed it was protected. Every read path here already gates on
+    // `!isPublic && passwordHash`, so honour both rather than downgrade in
+    // silence. This matches the Project share contract on the same table.
+    const requestedPublic = req.body?.isPublic;
+    const isPublic = requestedPublic === undefined ? true : requestedPublic !== false;
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    let passwordHash: string | null = null;
+    if (!isPublic) {
+      if (!password) {
+        res.status(400).json({ error: 'Password required for password-protected links' });
+        return;
+      }
+      try {
+        validateSharePassword(password);
+      } catch (error: any) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      passwordHash = await bcrypt.hash(password, 12);
+    } else if (password) {
+      // A password with a public link is a contradiction. Refusing is the only
+      // honest answer: quietly ignoring it hands back a link that protects
+      // nothing while the caller thinks otherwise.
+      res.status(400).json({
+        error: 'A share password requires a private link. Send isPublic: false with the password.',
+        code: 'SHARE_PASSWORD_REQUIRES_PRIVATE_LINK',
+      });
+      return;
+    }
+
     const shareLink = await prisma.appShareLink.create({
       data: {
         appId: app.id,
         userId: req.user!.userId,
         token,
-        expiresAt: req.body.expiresAt ? new Date(req.body.expiresAt) : null,
-        maxUses: req.body.maxUses || null,
+        expiresAt: options.expiresAt,
+        maxUses: options.maxUses,
+        isPublic,
+        passwordHash,
       },
     });
+
+    await prisma.activityLog.create({
+      data: {
+        userId: req.user!.userId,
+        action: 'APP_SHARE_CREATE',
+        resource: 'app',
+        resourceId: app.id,
+        severity: 'INFO',
+        metadata: { shareLinkId: shareLink.id, expiresAt: options.expiresAt, maxUses: options.maxUses },
+      },
+    }).catch(() => {});
 
     res.status(201).json({ shareLink: redactShareLink(shareLink), url: `/share/${token}` });
   } catch (error) {
@@ -221,72 +379,137 @@ router.post('/:id/share', authenticateToken, requireApproved, async (req: Reques
   }
 });
 
+// GET /api/apps/:id/share - bounded owner-scoped share history
+router.get('/:id/share', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const app = await prisma.app.findFirst({ where: { id: req.params.id, userId: req.user!.userId }, select: { id: true } });
+    if (!app) { res.status(404).json({ error: 'App not found' }); return; }
+    const shareLinks = await prisma.appShareLink.findMany({
+      where: { appId: app.id, userId: req.user!.userId },
+      orderBy: { createdAt: 'desc' },
+      take: MAX_RETURNED_SHARE_LINKS_PER_APP,
+    });
+    res.json({ shareLinks: shareLinks.map((link) => redactShareLink(link)) });
+  } catch (error) {
+    console.error('List app share links error:', error);
+    res.status(500).json({ error: 'Failed to list share links' });
+  }
+});
+
+// PATCH /api/apps/:id/share/:linkId - enable/disable an owned retained link
+router.patch('/:id/share/:linkId', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    if (typeof req.body?.isActive !== 'boolean') {
+      res.status(400).json({ error: 'isActive boolean is required' });
+      return;
+    }
+    if (req.body.isActive) {
+      const unavailable = portalFeatureUnavailableResponse('appHosting');
+      if (unavailable) {
+        res.status(409).json(unavailable);
+        return;
+      }
+    }
+    const link = await prisma.appShareLink.findFirst({
+      where: { id: req.params.linkId, appId: req.params.id, userId: req.user!.userId },
+    });
+    if (!link) { res.status(404).json({ error: 'Share link not found' }); return; }
+
+    if (req.body.isActive) {
+      if (link.expiresAt && link.expiresAt.getTime() <= Date.now()) {
+        res.status(409).json({ error: 'Expired links cannot be reactivated; create a new link' });
+        return;
+      }
+      if (link.maxUses !== null && link.currentUses >= link.maxUses) {
+        res.status(409).json({ error: 'Links that reached their visit limit cannot be reactivated; create a new link' });
+        return;
+      }
+    }
+
+    const updated = await prisma.appShareLink.update({
+      where: { id: link.id },
+      data: { isActive: req.body.isActive },
+    });
+    await prisma.activityLog.create({
+      data: {
+        userId: req.user!.userId,
+        action: req.body.isActive ? 'APP_SHARE_ENABLE' : 'APP_SHARE_DISABLE',
+        resource: 'app',
+        resourceId: req.params.id,
+        severity: 'INFO',
+        metadata: { shareLinkId: link.id },
+      },
+    }).catch(() => {});
+    res.json({ shareLink: redactShareLink(updated) });
+  } catch (error) {
+    console.error('Update app share link error:', error);
+    res.status(500).json({ error: 'Failed to update share link' });
+  }
+});
+
+// DELETE /api/apps/:id/share/:linkId - permanently remove an owned link
+router.delete('/:id/share/:linkId', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const deleted = await prisma.appShareLink.deleteMany({
+      where: { id: req.params.linkId, appId: req.params.id, userId: req.user!.userId },
+    });
+    if (deleted.count !== 1) { res.status(404).json({ error: 'Share link not found' }); return; }
+    await prisma.activityLog.create({
+      data: {
+        userId: req.user!.userId,
+        action: 'APP_SHARE_DELETE',
+        resource: 'app',
+        resourceId: req.params.id,
+        severity: 'INFO',
+        metadata: { shareLinkId: req.params.linkId },
+      },
+    }).catch(() => {});
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete app share link error:', error);
+    res.status(500).json({ error: 'Failed to delete share link' });
+  }
+});
+
 // Shared app routes (NO AUTH) - mounted at /share
 export const shareRouter = Router();
 
-// Rate limiter for password attempts
-const passwordAttempts = new Map<string, { count: number; resetAt: number }>();
+const passwordAttemptLimiter = new SharePasswordAttemptLimiter();
 
-function checkRateLimit(ip: string, token: string): { allowed: boolean; retryAfter?: number } {
-  const key = `${ip}:${token}`;
-  const now = Date.now();
-  const record = passwordAttempts.get(key);
-
-  if (!record || now > record.resetAt) {
-    passwordAttempts.set(key, { count: 1, resetAt: now + 60000 });
-    return { allowed: true };
-  }
-
-  if (record.count >= 5) {
-    const retryAfter = Math.ceil((record.resetAt - now) / 1000);
-    return { allowed: false, retryAfter };
-  }
-
-  record.count++;
-  return { allowed: true };
+function requestIsSecure(req: Request): boolean {
+  return req.secure || String(req.headers['x-forwarded-proto'] || '').toLowerCase().includes('https');
 }
 
-// Session-based access grants stored in HMAC-signed cookies
-function signShareAccessPayload(payloadBase64: string): string {
-  return crypto.createHmac('sha256', config.jwtSecret).update(payloadBase64).digest('hex');
+function hasShareGrant(
+  req: Request,
+  link: { id: string; token: string; passwordHash?: string | null },
+  kind: 'password' | 'visit',
+): boolean {
+  const cookie = req.cookies?.[shareGrantCookieName(kind, link.token)];
+  const binding = kind === 'password' && link.passwordHash ? sharePasswordBinding(link.passwordHash) : undefined;
+  return verifyShareGrant(cookie, { kind, token: link.token, linkId: link.id, binding }, config.jwtSecret);
 }
 
-function hasSessionAccess(req: Request, token: string): boolean {
-  try {
-    const cookie = req.cookies?.[`share_access_${token}`];
-    if (!cookie) return false;
-    const [payloadBase64, signature] = String(cookie).split('.');
-    if (!payloadBase64 || !signature) return false;
-
-    const expected = signShareAccessPayload(payloadBase64);
-    const provided = Buffer.from(signature, 'hex');
-    const expectedBuf = Buffer.from(expected, 'hex');
-    if (provided.length !== expectedBuf.length || !crypto.timingSafeEqual(provided, expectedBuf)) {
-      return false;
-    }
-
-    const parsed = JSON.parse(Buffer.from(payloadBase64, 'base64').toString());
-    return parsed.token === token && parsed.expiresAt > Date.now();
-  } catch {
-    return false;
-  }
-}
-
-function grantSessionAccess(res: Response, token: string) {
-  const payload = { token, expiresAt: Date.now() + 3600000 }; // 1 hour
-  const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64');
-  const signature = signShareAccessPayload(payloadBase64);
-  const encoded = `${payloadBase64}.${signature}`;
-  res.cookie(`share_access_${token}`, encoded, {
+function grantShareAccess(
+  req: Request,
+  res: Response,
+  link: { id: string; token: string; passwordHash?: string | null },
+  kind: 'password' | 'visit',
+): void {
+  const expiresAt = Date.now() + 60 * 60 * 1000;
+  const binding = kind === 'password' && link.passwordHash ? sharePasswordBinding(link.passwordHash) : undefined;
+  const encoded = issueShareGrant({ kind, token: link.token, linkId: link.id, binding, expiresAt }, config.jwtSecret);
+  res.cookie(shareGrantCookieName(kind, link.token), encoded, {
     httpOnly: true,
-    secure: true,
-    sameSite: 'lax',
-    maxAge: 3600000, // 1 hour
-    path: `/share/${token}`,
+    secure: requestIsSecure(req),
+    sameSite: 'strict',
+    maxAge: 60 * 60 * 1000,
+    path: `/share/${link.token}`,
   });
 }
 
 async function findShareLink(token: string) {
+  if (!isValidShareToken(token)) return null;
   return prisma.appShareLink.findFirst({
     where: {
       token,
@@ -297,30 +520,48 @@ async function findShareLink(token: string) {
   });
 }
 
-async function enforceShareAccessWindow(link: { id: string; maxUses: number | null; currentUses: number; app: { isActive: boolean } }, res: Response): Promise<boolean> {
-  if (!link.app.isActive) {
+async function enforceShareAccessWindow(
+  link: { userId: string; app: { userId: string; isActive: boolean } },
+  res: Response,
+): Promise<boolean> {
+  if (!link.app.isActive || link.userId !== link.app.userId) {
     res.status(404).send('App not found or link expired');
     return false;
   }
-
-  if (link.maxUses && link.currentUses >= link.maxUses) {
-    res.status(404).send('Link expired (max uses reached)');
-    return false;
-  }
-
   return true;
 }
 
-function shouldCountShareUse(requestedPath?: string): boolean {
-  if (!requestedPath) return true;
-  return !/\.(css|js|mjs|jsx|ts|tsx|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|map|json|webp|avif|mp4|webm|ogg|mp3|wav|pdf)$/i.test(requestedPath);
-}
+async function claimShareVisit(
+  req: Request,
+  res: Response,
+  link: { id: string; token: string; maxUses: number | null },
+): Promise<boolean> {
+  if (hasShareGrant(req, link, 'visit')) return true;
 
-async function recordShareUse(linkId: string): Promise<void> {
-  await prisma.appShareLink.update({
-    where: { id: linkId },
-    data: { currentUses: { increment: 1 } },
-  });
+  const activeWindow = {
+    id: link.id,
+    isActive: true,
+    OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+  };
+  let claimed;
+  if (link.maxUses !== null) {
+    claimed = await prisma.appShareLink.updateMany({
+      where: { ...activeWindow, currentUses: { lt: link.maxUses } },
+      data: { currentUses: { increment: 1 } },
+    });
+  } else {
+    claimed = await prisma.appShareLink.updateMany({
+      where: activeWindow,
+      data: { currentUses: { increment: 1 } },
+    });
+  }
+  if (claimed.count !== 1) {
+    res.status(404).send('Link expired or max uses reached');
+    return false;
+  }
+
+  grantShareAccess(req, res, link, 'visit');
+  return true;
 }
 
 function renderPasswordLandingPage(token: string, projectName?: string): string {
@@ -451,25 +692,36 @@ function renderPasswordLandingPage(token: string, projectName?: string): string 
 async function serveAppFile(app: { zipPath: string }, requestedPath: string, res: Response, token?: string): Promise<boolean> {
   try {
     const appDir = app.zipPath;
-    const resolvedAppDir = path.resolve(appDir);
+    const resolvedAppDir = resolveExistingAppDirectory(appDir, [APPS_DIR, HOSTED_APPS_DIR]);
+
+    if (!resolvedAppDir) {
+      console.error('[Share] App directory is missing or outside the managed roots');
+      res.status(404).send('Not found');
+      return true;
+    }
 
     if (!fs.existsSync(resolvedAppDir)) {
-      console.error(`[Share] App directory not found: ${resolvedAppDir}`);
+      console.error('[Share] App directory not found');
       return false;
     }
 
     // Prefer built artifacts when app root contains source + dist/ output.
     // Some shared apps are stored as full project folders (root index.html points to /src/main.tsx),
     // which white-screens when served by the portal runtime.
-    const distDir = path.resolve(path.join(resolvedAppDir, 'dist'));
-    const contentRoot = fs.existsSync(path.join(distDir, 'index.html')) ? distDir : resolvedAppDir;
+    const distDir = resolveExistingPathWithin(resolvedAppDir, path.join(resolvedAppDir, 'dist'));
+    const distIndex = distDir ? resolveExistingPathWithin(distDir, path.join(distDir, 'index.html')) : null;
+    const contentRoot = distDir && distIndex && fs.statSync(distIndex).isFile() ? distDir : resolvedAppDir;
 
     if (contentRoot !== resolvedAppDir) {
       console.log(`[Share] Using dist content root: ${contentRoot} (from ${resolvedAppDir})`);
     } else {
       // Guard: if no dist/ and root index.html contains Vite dev markers, refuse to serve it
-      const guardIndex = path.join(resolvedAppDir, 'index.html');
-      if (fs.existsSync(guardIndex)) {
+      const guardIndex = resolveExistingPathWithin(resolvedAppDir, path.join(resolvedAppDir, 'index.html'));
+      if (guardIndex) {
+        if (fs.statSync(guardIndex).size > MAX_SHARE_HTML_BYTES) {
+          res.status(413).send('App HTML is too large to serve safely');
+          return true;
+        }
         const guardHtml = fs.readFileSync(guardIndex, 'utf-8');
         if (guardHtml.includes('/src/main.tsx') || guardHtml.includes('/src/main.ts') || guardHtml.includes('/src/main.jsx')) {
           console.error(`[Share] BLOCKED: ${resolvedAppDir}/index.html contains Vite dev entry. Build artifacts (dist/) missing.`);
@@ -487,23 +739,31 @@ async function serveAppFile(app: { zipPath: string }, requestedPath: string, res
       return true;
     }
 
-    const fullPath = path.join(contentRoot, filePath);
-    const resolvedPath = path.resolve(fullPath);
+    const fullPath = path.resolve(path.join(contentRoot, filePath));
 
     // Directory traversal protection
-    if (!isPathWithin(contentRoot, resolvedPath)) {
-      console.error(`[Share] Directory traversal attempt: ${resolvedPath}`);
+    if (!isPathWithin(contentRoot, fullPath)) {
+      console.error('[Share] Directory traversal attempt');
       res.status(403).send('Forbidden');
       return true;
     }
 
     // Serve file if it exists and is not a directory
-    if (fs.existsSync(resolvedPath)) {
+    if (fs.existsSync(fullPath)) {
+      const resolvedPath = resolveExistingPathWithin(contentRoot, fullPath);
+      if (!resolvedPath) {
+        res.status(404).send('Not found');
+        return true;
+      }
       const stats = fs.statSync(resolvedPath);
 
       if (!stats.isDirectory()) {
         // Special handling for HTML files - inject <base> tag so relative assets resolve correctly
         if (token && resolvedPath.endsWith('.html')) {
+          if (stats.size > MAX_SHARE_HTML_BYTES) {
+            res.status(413).send('App HTML is too large to serve safely');
+            return true;
+          }
           const html = fs.readFileSync(resolvedPath, 'utf-8');
           const baseTag = `<base href="/share/${token}/">`;
           let modifiedHtml;
@@ -524,21 +784,21 @@ async function serveAppFile(app: { zipPath: string }, requestedPath: string, res
         return true;
       } else {
         // If it's a directory, try serving index.html from it
-        const indexPath = path.join(resolvedPath, 'index.html');
-        if (fs.existsSync(indexPath)) {
+        const indexPath = resolveExistingPathWithin(contentRoot, path.join(resolvedPath, 'index.html'));
+        if (indexPath && fs.statSync(indexPath).isFile()) {
           return serveAppFile(app, path.join(requestedPath || '', 'index.html'), res, token);
         }
       }
     }
 
     // SPA fallback - serve root index.html for client-side routing (non-file paths)
-    const rootIndex = path.join(contentRoot, 'index.html');
-    if (fs.existsSync(rootIndex) && requestedPath && !requestedPath.includes('.')) {
+    const rootIndex = resolveExistingPathWithin(contentRoot, path.join(contentRoot, 'index.html'));
+    if (rootIndex && fs.statSync(rootIndex).isFile() && requestedPath && !requestedPath.includes('.')) {
       console.log(`[Share] SPA fallback: ${rootIndex}`);
       return serveAppFile(app, '', res, token);
     }
 
-    console.error(`[Share] File not found: ${resolvedPath}`);
+    console.error('[Share] File not found');
     return false;
   } catch (error) {
     console.error('[Share] serveAppFile error:', error);
@@ -555,6 +815,7 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
   const proxiedPath = req.params[0] || '';
   const qsIndex = req.originalUrl.indexOf('?');
   const query = qsIndex >= 0 ? req.originalUrl.slice(qsIndex) : '';
+  let proxyTimedOut = false;
 
   try {
     const link = await findShareLink(token);
@@ -569,40 +830,41 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
 
     // If password-protected, require established share session.
     if (!link.isPublic && link.passwordHash) {
-      if (!hasSessionAccess(req, token)) {
+      if (!hasShareGrant(req, link, 'password')) {
         res.status(401).json({ error: 'Unauthorized' });
         return;
       }
     }
 
-    // Default target: portal API
-    const target = "/api/" + proxiedPath + query;
+    if (!(await claimShareVisit(req, res, link))) return;
 
-    // Resolve backend target via env-var convention: APP_API_TARGET_{NAMESPACE}
-    // e.g. APP_API_TARGET_MY_APP=http://127.0.0.1:5005
-    // Fallback: managed app port -> portal self-proxy.
-    const namespace = proxiedPath.includes('/') ? proxiedPath.split('/')[0] : proxiedPath;
-    const envKey = 'APP_API_TARGET_' + namespace.toUpperCase().replace(/-/g, '_');
-    let targetUrl = process.env[envKey]
-      ? process.env[envKey] + target
-      : req.protocol + "://" + req.get('host') + target;
+    // Do not read a potentially large request body until the share token,
+    // access window, and optional password session have all been validated.
+    if (!(await captureBoundedMultipartBody(req, res))) {
+      return;
+    }
 
-    // Check managed fullstack app port as secondary. runningApps is keyed by
-    // deployId (`${userId}-${appName}`), not by App DB id. If the in-memory
-    // registry is unavailable but the app record still has a port, try it and
-    // let the fetch fail cleanly if the process is actually down.
-    if (!process.env[envKey]) {
-      const deployId = `${link.userId}-${link.app.name}`;
-      const appPort = getAppPort(deployId) || link.app.port;
-      if (appPort) {
-        targetUrl = `http://127.0.0.1:${appPort}${target}`;
-      }
+    // Target and secret selection are bound to the selected App row, never to
+    // the caller-controlled first path segment. Managed targets are attested
+    // internal-container addresses; explicit overrides must be loopback
+    // targets keyed by the App id (APP_API_TARGET_<APP_ID>). There is no
+    // Portal self-proxy fallback.
+    const deployId = `${link.userId}-${link.app.name}`;
+    const registeredTarget = getAppTarget(deployId);
+    const baseTarget = configuredAppApiTarget(link.app.id)
+      || registeredTarget
+      || undefined;
+    const targetUrl = baseTarget ? buildAppApiTargetUrl(baseTarget, proxiedPath, query) : undefined;
+    if (!targetUrl) {
+      res.status(502).json({ error: 'App API backend is not configured' });
+      return;
     }
 
     const incomingHeaders = req.headers as Record<string, string | string[] | undefined>;
     const upstreamHeaderAllowlist = new Set([
       'accept',
       'accept-language',
+      'authorization',
       'content-type',
       'if-match',
       'if-none-match',
@@ -622,15 +884,8 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
     // Always pass share token context; downstream can choose to honor it.
     forwardHeaders['x-share-token'] = token;
     forwardHeaders['x-portal-proxy'] = 'share-app-api';
-
-    // Optional internal marker for selected share API prefixes.
-    const internalPrefixes = (process.env.SHARE_INTERNAL_API_PREFIXES || '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (internalPrefixes.some((p) => proxiedPath === p || proxiedPath.startsWith(p + '/'))) {
-      forwardHeaders['x-internal-service'] = 'share-proxy';
-    }
+    forwardHeaders[APP_API_ID_HEADER] = link.app.id;
+    addConfiguredAppApiSecret(forwardHeaders, link.app.id);
 
     const method = req.method.toUpperCase();
     const shouldSendBody = !['GET', 'HEAD'].includes(method);
@@ -638,53 +893,31 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
     // express.json() consumed the stream. For JSON, serialize as before.
     let body: any = undefined;
     if (shouldSendBody) {
-      const incomingCt = (req as any).headers['content-type'] || '';
-      if (incomingCt.includes('multipart/form-data') && (req as any).rawBody) {
-        body = (req as any).rawBody;
-      } else {
-        body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body ?? {});
-      }
+      const incomingCt = String((req as any).headers['content-type'] || '');
+      body = serializeAppApiRequestBody(incomingCt, req.body, (req as any).rawBody);
     }
 
-    const upstream = await fetch(targetUrl, {
-      method,
-      headers: forwardHeaders,
-      body,
-      redirect: 'manual',
-    });
-
-    res.status(upstream.status);
-    const skippedProxyResponseHeaders = new Set([
-      'content-encoding',
-      'content-length',
-      'transfer-encoding',
-      'connection',
-      'keep-alive',
-      'proxy-authenticate',
-      'proxy-authorization',
-      'te',
-      'trailer',
-      'upgrade',
-    ]);
-    upstream.headers.forEach((value, key) => {
-      if (skippedProxyResponseHeaders.has(key.toLowerCase())) return;
-      res.setHeader(key, value);
-    });
-
-    // Use arrayBuffer for binary-safe response forwarding (e.g., PDF downloads)
-    const contentType = upstream.headers.get('content-type') || '';
-    if (contentType.includes('application/pdf') || contentType.includes('application/octet-stream')) {
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      res.send(buf);
-    } else {
-      const responseText = await upstream.text();
-      res.send(responseText);
+    const abortContext = createAppApiAbortContext(req, res);
+    try {
+      const upstream = await fetch(targetUrl, {
+        method,
+        headers: forwardHeaders,
+        body,
+        redirect: 'manual',
+        signal: abortContext.signal,
+      });
+      await streamAppApiResponse(upstream, res, { locationBasePath: `/share/${token}` });
+      console.log(`[ShareAPI] ${method} app=${link.app.id} path=/api/${proxiedPath} status=${upstream.status}`);
+    } finally {
+      proxyTimedOut = abortContext.didTimeout();
+      abortContext.cleanup();
     }
-
-    console.log('[ShareAPI] ' + method + ' /share/' + token + '/api/' + proxiedPath + ' -> ' + target + ' (' + upstream.status + ')');
   } catch (error) {
     console.error('[ShareAPI] proxy error:', error);
-    res.status(502).json({ error: 'Share API proxy error' });
+    if (!res.headersSent) {
+      res.status(proxyTimedOut ? 504 : 502).json({ error: proxyTimedOut ? 'Share API backend timeout' : 'Share API proxy error' });
+    }
+    else if (!res.writableEnded) res.end();
   }
 });
 
@@ -698,10 +931,11 @@ shareRouter.get('/:token/progress', async (req: Request, res: Response) => {
 
     // Check password session if protected
     if (!link.isPublic && link.passwordHash) {
-      if (!hasSessionAccess(req, token)) {
+      if (!hasShareGrant(req, link, 'password')) {
         res.status(401).json({ error: 'Unauthorized' }); return;
       }
     }
+    if (!(await claimShareVisit(req, res, link))) return;
 
     res.json({ data: link.progressData || null });
   } catch (error) {
@@ -720,21 +954,30 @@ shareRouter.put('/:token/progress', async (req: Request, res: Response) => {
 
     // Check password session if protected
     if (!link.isPublic && link.passwordHash) {
-      if (!hasSessionAccess(req, token)) {
+      if (!hasShareGrant(req, link, 'password')) {
         res.status(401).json({ error: 'Unauthorized' }); return;
       }
     }
+    if (!(await claimShareVisit(req, res, link))) return;
 
     // Validate payload size (max 1MB)
     const body = JSON.stringify(req.body);
-    if (body.length > 1048576) {
+    if (typeof body !== 'string' || Buffer.byteLength(body, 'utf8') > 1048576) {
       res.status(413).json({ error: 'Progress data too large' }); return;
     }
 
-    await prisma.appShareLink.update({
-      where: { id: link.id },
+    const updated = await prisma.appShareLink.updateMany({
+      where: {
+        id: link.id,
+        isActive: true,
+        OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+      },
       data: { progressData: req.body as any },
     });
+    if (updated.count !== 1) {
+      res.status(404).json({ error: 'Link is no longer active' });
+      return;
+    }
 
     res.json({ success: true });
   } catch (error) {
@@ -748,16 +991,10 @@ shareRouter.post('/:token/auth', async (req: Request, res: Response) => {
   try {
     const { token } = req.params;
     const { password } = req.body;
-    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const ip = String(req.ip || req.socket.remoteAddress || 'unknown').slice(0, 128);
 
-    const rl = checkRateLimit(ip, token);
-    if (!rl.allowed) {
-      res.status(429).json({ error: `Too many attempts. Try again in ${rl.retryAfter} seconds.` });
-      return;
-    }
-
-    if (!password) {
-      res.status(400).json({ error: 'Password required' });
+    if (!isValidShareToken(token)) {
+      res.status(404).json({ error: 'Link not found' });
       return;
     }
 
@@ -766,14 +1003,29 @@ shareRouter.post('/:token/auth', async (req: Request, res: Response) => {
       res.status(404).json({ error: 'Link not found' });
       return;
     }
+    if (!(await enforceShareAccessWindow(link, res))) return;
 
-    const valid = await bcrypt.compare(password, link.passwordHash);
-    if (!valid) {
-      res.status(401).json({ error: 'Incorrect password' });
+    if (typeof password !== 'string' || !password || Buffer.byteLength(password, 'utf8') > 72) {
+      res.status(400).json({ error: 'Password required' });
       return;
     }
 
-    grantSessionAccess(res, token);
+    const rl = passwordAttemptLimiter.begin(ip, token);
+    if (!rl.allowed) {
+      res.setHeader('Retry-After', String(rl.retryAfter || 60));
+      res.status(429).json({ error: 'Too many attempts. Try again later.' });
+      return;
+    }
+
+    const valid = await bcrypt.compare(password, link.passwordHash);
+    if (!valid) {
+      res.status(401).json({ error: 'Authentication failed' });
+      return;
+    }
+
+    passwordAttemptLimiter.success(ip, token);
+    if (!(await claimShareVisit(req, res, link))) return;
+    grantShareAccess(req, res, link, 'password');
     res.json({ success: true });
   } catch (error) {
     console.error('Share auth error:', error);
@@ -797,14 +1049,14 @@ shareRouter.get('/:token', async (req: Request, res: Response) => {
 
     // If password-protected, check session access
     if (!shareLink.isPublic && shareLink.passwordHash) {
-      if (!hasSessionAccess(req, token)) {
+      if (!hasShareGrant(req, shareLink, 'password')) {
         res.setHeader('Content-Type', 'text/html');
         res.send(renderPasswordLandingPage(token, shareLink.app.name));
         return;
       }
     }
 
-    await recordShareUse(shareLink.id);
+    if (!(await claimShareVisit(req, res, shareLink))) return;
 
     // Serve index.html
     if (await serveAppFile(shareLink.app, 'index.html', res, token)) return;
@@ -837,7 +1089,7 @@ shareRouter.get('/:token/*', async (req: Request, res: Response) => {
 
     // If password-protected, check session access
     if (!shareLink.isPublic && shareLink.passwordHash) {
-      if (!hasSessionAccess(req, token)) {
+      if (!hasShareGrant(req, shareLink, 'password')) {
         // For non-HTML asset requests, return 401 instead of the landing page
         // This prevents browsers from caching HTML as CSS/JS
         if (requestedPath && /\.(css|js|mjs|jsx|ts|tsx|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|map|json|webp|avif|mp4|webm|ogg|mp3|wav)$/i.test(requestedPath)) {
@@ -850,10 +1102,8 @@ shareRouter.get('/:token/*', async (req: Request, res: Response) => {
       }
     }
 
-    if (shouldCountShareUse(requestedPath)) {
-      await recordShareUse(shareLink.id);
-    }
-    console.log(`[Share] Wildcard route: token=${token}, path=${requestedPath}, zipPath=${shareLink.app.zipPath}`);
+    if (!(await claimShareVisit(req, res, shareLink))) return;
+    console.log(`[Share] Wildcard route: link=${shareLink.id}, path=${requestedPath}`);
     if (await serveAppFile(shareLink.app, requestedPath, res, token)) return;
     res.status(404).send('Not found');
   } catch (error) {

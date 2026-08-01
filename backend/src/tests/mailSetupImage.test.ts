@@ -17,4 +17,11 @@ describe('mail setup Stalwart image pin', () => {
     expect(adminSource).not.toContain('stalwartlabs/stalwart:latest');
     expect(adminSource).not.toContain('stalwartlabs/mail-server:v0.11.8');
   });
+
+  test('automatic mail recovery cannot delete the persistent Stalwart store', () => {
+    for (const source of [setupSource, adminSource]) {
+      expect(source).not.toContain('docker compose down -v');
+      expect(source).not.toContain('rm -rf /opt/bridgesllm/stalwart/data');
+    }
+  });
 });

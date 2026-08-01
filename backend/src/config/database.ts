@@ -7,6 +7,8 @@ const prismaClientSingleton = () => {
 };
 
 declare global {
+  // `var` is required for a process-global declaration that survives module reloads.
+  // eslint-disable-next-line no-var
   var prisma: undefined | ReturnType<typeof prismaClientSingleton>;
 }
 

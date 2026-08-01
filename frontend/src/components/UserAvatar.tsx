@@ -88,24 +88,29 @@ export default function UserAvatar({ size = 'w-10 h-10', ringColor = 'ring-purpl
   }, [assistant, isAuthenticated, user]);
 
   const initial = assistant ? 'A' : (username || 'U')[0].toUpperCase();
-  const defaultRing = assistant ? 'ring-emerald-500/50' : ringColor;
-  const defaultBg = assistant ? 'bg-emerald-500/20' : 'bg-purple-500/20';
-  const defaultText = assistant ? 'text-emerald-400' : 'text-purple-400';
+  const defaultRing = assistant ? 'accent-avatar' : ringColor;
+  const defaultBg = assistant ? '' : 'bg-purple-500/20';
+  const defaultText = assistant ? '' : 'text-purple-400';
 
   return (
     <>
-      <div
+      <button
+        type="button"
+        disabled={!editable}
+        aria-label={editable ? `Change ${assistant ? 'assistant' : 'user'} avatar` : `${assistant ? 'Assistant' : username || 'User'} avatar`}
         className="relative flex-shrink-0 group"
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
-        onClick={editable ? () => setEditorOpen(true) : undefined}
+        onClick={() => {
+          if (editable) setEditorOpen(true);
+        }}
         style={editable ? { cursor: 'pointer' } : undefined}
       >
         {avatarUrl ? (
           <img
             src={avatarUrl}
             alt={assistant ? 'Assistant' : username || 'User'}
-            className={`avatar-hq ${size} rounded-full object-cover ring-2 ${defaultRing} ${assistant ? 'shadow-lg shadow-emerald-500/20' : ''}`}
+            className={`avatar-hq ${size} rounded-full object-cover ring-2 ${defaultRing}`}
             onError={() => {
               if (assistant) setAssistantAvatarUrl(null);
               else setCachedUserAvatarUrl(null);
@@ -143,11 +148,11 @@ export default function UserAvatar({ size = 'w-10 h-10', ringColor = 'ring-purpl
           />
         )}
         {editable && hover && (
-          <div className="absolute inset-0 rounded-full bg-black/60 flex items-center justify-center">
+          <div className="theme-fixed-dark absolute inset-0 rounded-full bg-black/60 flex items-center justify-center">
             <Pencil size={14} className="text-white" />
           </div>
         )}
-      </div>
+      </button>
       {editable && (
         <AvatarEditor
           isOpen={editorOpen}

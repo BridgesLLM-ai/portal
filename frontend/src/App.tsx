@@ -2,20 +2,17 @@ import { useEffect, useRef, useState, lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from './contexts/AuthContext';
 import { canUseInteractivePortal, isElevated } from './utils/authz';
-import { ChatStateProvider } from './contexts/ChatStateProvider';
 import { activityAPI } from './api/endpoints';
 import { usePublicSettings } from './hooks/usePublicSettings';
-import Layout from './components/Layout';
 import ErrorBoundary from './components/ErrorBoundary';
 import LoginPage from './pages/LoginPage';
-import DashboardPage from './pages/DashboardPage';
-import SetupWizardPage from './pages/SetupWizardPage';
-import LandingPage from './pages/LandingPage';
-import DocsPage from './pages/DocsPage';
 import ForgotPasswordPage from './pages/ForgotPasswordPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
+import { RouteOperationProvider } from './contexts/RouteOperationContext';
+import { useWorkspaceAuthorizationLifecycle } from './hooks/useWorkspaceAuthorizationLifecycle';
 
 const MODULE_RELOAD_PREFIX = 'portal-module-reload:';
+const SETUP_STATUS_TIMEOUT_MS = 8_000;
 
 function isModuleLoadFailure(error: unknown) {
   const message = error instanceof Error ? error.message : String(error ?? '');
@@ -61,6 +58,11 @@ function lazyWithModuleRetry<T extends { default: React.ComponentType<unknown> }
 }
 
 const DesktopPage = lazyWithModuleRetry('DesktopPage', () => import('./pages/DesktopPage'));
+const PortalLayoutShell = lazyWithModuleRetry('PortalLayoutShell', () => import('./components/PortalLayoutShell'));
+const DashboardPage = lazyWithModuleRetry('DashboardPage', () => import('./pages/DashboardPage'));
+const SetupWizardPage = lazyWithModuleRetry('SetupWizardPage', () => import('./pages/SetupWizardPage'));
+const LandingPage = lazyWithModuleRetry('LandingPage', () => import('./pages/LandingPage'));
+const DocsPage = lazyWithModuleRetry('DocsPage', () => import('./pages/DocsPage'));
 const AppsPage = lazyWithModuleRetry('AppsPage', () => import('./pages/AppsPage'));
 const FilesPage = lazyWithModuleRetry('FilesPage', () => import('./pages/FilesPage'));
 const AgentChatPage = lazyWithModuleRetry('AgentChatPage', () => import('./pages/AgentChatPage'));
@@ -124,6 +126,53 @@ function BootstrapFallback() {
   );
 }
 
+function SessionRestoreFallback({
+  onRetry,
+  onSignOut,
+}: {
+  onRetry: () => void;
+  onSignOut: () => void;
+}) {
+  // Retry is the right first move, but it is not always the answer: if the
+  // cached session cannot be confirmed at all, retrying forever is a dead end.
+  // Signing out has to be reachable from this screen.
+  const [signingOut, setSigningOut] = useState(false);
+  return (
+    <div className="flex min-h-dvh items-center justify-center bg-theme-bg px-6 text-center text-theme-text" role="alert">
+      <div className="max-w-md rounded-2xl border border-amber-500/20 bg-amber-500/10 p-6">
+        <h1 className="text-lg font-semibold text-white">Session check unavailable</h1>
+        <p className="mt-2 text-sm leading-6 text-slate-300">
+          The Portal could not confirm your cached session, so authenticated pages remain locked.
+        </p>
+        <div className="mt-5 flex flex-col gap-2 sm:flex-row sm:justify-center">
+          <button
+            type="button"
+            onClick={onRetry}
+            disabled={signingOut}
+            className="min-h-[44px] rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-400 disabled:opacity-60"
+          >
+            Retry session check
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setSigningOut(true);
+              onSignOut();
+            }}
+            disabled={signingOut}
+            className="min-h-[44px] rounded-xl border border-slate-500/40 bg-slate-900/40 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900/70 disabled:opacity-60"
+          >
+            {signingOut ? 'Signing out…' : 'Sign out and start fresh'}
+          </button>
+        </div>
+        <p className="mt-3 text-xs leading-5 text-slate-400">
+          Signing out clears the cached session on this device and returns you to the login page.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function LegacyAgentToolsRedirect({ tab }: { tab: 'automations' | 'usage' | 'skills' }) {
   const location = useLocation();
   const params = new URLSearchParams(location.search);
@@ -133,25 +182,34 @@ function LegacyAgentToolsRedirect({ tab }: { tab: 'automations' | 'usage' | 'ski
 }
 
 export default function App() {
-  const { restoreSession, isAuthenticated } = useAuthStore();
+  const {
+    restoreSession,
+    isAuthenticated,
+    sessionRestoreError,
+    abandonQuarantinedSession,
+  } = useAuthStore();
+  useWorkspaceAuthorizationLifecycle();
   const heartbeatRef = useRef<ReturnType<typeof setInterval>>();
   const [setupChecked, setSetupChecked] = useState(false);
   const [needsSetup, setNeedsSetup] = useState<boolean>(false);
   const [isReinstall, setIsReinstall] = useState<boolean>(false);
+  const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
   const publicSettings = usePublicSettings();
   const setupModeActive = needsSetup || isReinstall;
 
   useEffect(() => {
     let cancelled = false;
-    const bootstrapFailoverTimer = window.setTimeout(() => {
-      if (!cancelled) {
-        setSetupChecked(true);
-      }
-    }, 4000);
+    const setupController = new AbortController();
+    const setupTimeout = window.setTimeout(() => setupController.abort(), SETUP_STATUS_TIMEOUT_MS);
 
     const bootstrap = async () => {
       try {
-        const res = await fetch('/api/setup/status');
+        const res = await fetch('/api/setup/status', {
+          cache: 'no-store',
+          credentials: 'same-origin',
+          headers: { Accept: 'application/json' },
+          signal: setupController.signal,
+        });
         if (res.ok) {
           const data = await res.json();
           if (cancelled) return;
@@ -164,13 +222,14 @@ export default function App() {
           }
         }
       } catch {
-        // ignore setup-check failure and continue normal restore flow
+        // A slow/unavailable setup check must not strand session restoration.
+      } finally {
+        window.clearTimeout(setupTimeout);
       }
 
       try {
         await restoreSession();
       } finally {
-        window.clearTimeout(bootstrapFailoverTimer);
         if (!cancelled) {
           setSetupChecked(true);
         }
@@ -181,41 +240,60 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      window.clearTimeout(bootstrapFailoverTimer);
+      setupController.abort();
+      window.clearTimeout(setupTimeout);
     };
-  }, [restoreSession]);
+  }, [restoreSession, bootstrapAttempt]);
 
 
   useEffect(() => {
-    if (publicSettings?.portalName) document.title = publicSettings.portalName;
-    if (publicSettings?.logoUrl) {
-      let link = document.querySelector("link[rel='icon']") as HTMLLinkElement | null;
-      if (!link) {
-        link = document.createElement('link');
-        link.rel = 'icon';
-        document.head.appendChild(link);
-      }
-      link.href = publicSettings.logoUrl;
+    document.title = publicSettings?.portalName?.trim() || 'BridgesLLM Portal';
+    let link = document.querySelector("link[data-portal-favicon='true']") as HTMLLinkElement | null;
+    if (!link) {
+      link = document.createElement('link');
+      link.rel = 'icon';
+      link.dataset.portalFavicon = 'true';
+      document.head.appendChild(link);
     }
+    link.href = publicSettings?.logoUrl?.trim() || '/favicon.ico';
   }, [publicSettings]);
 
   // Session heartbeat — update last_activity every 5 min
   useEffect(() => {
-    if (!isAuthenticated) return;
+    if (!isAuthenticated || sessionRestoreError) return;
     const sendHeartbeat = () => activityAPI.heartbeat().catch(() => {});
     heartbeatRef.current = setInterval(sendHeartbeat, 5 * 60 * 1000);
     return () => {
       if (heartbeatRef.current) clearInterval(heartbeatRef.current);
     };
-  }, [isAuthenticated]);
+  }, [isAuthenticated, sessionRestoreError]);
 
   if (!setupChecked) {
     return <BootstrapFallback />;
   }
 
+  if (sessionRestoreError) {
+    return (
+      <SessionRestoreFallback
+        onRetry={() => {
+          setSetupChecked(false);
+          setBootstrapAttempt((attempt) => attempt + 1);
+        }}
+        onSignOut={() => {
+          // A full navigation, not a router push: the router is not mounted in
+          // this state, and reloading also drops any wedged in-memory client.
+          void abandonQuarantinedSession().finally(() => {
+            window.location.replace('/login');
+          });
+        }}
+      />
+    );
+  }
+
   return (
     <BrowserRouter>
-      <Routes>
+      <RouteOperationProvider>
+        <Routes>
         <Route
           path="/login"
           element={
@@ -287,14 +365,15 @@ export default function App() {
               <Navigate to="/setup" replace />
             ) : (
               <ProtectedRoute>
-                <ChatStateProvider>
-                  <Layout />
-                </ChatStateProvider>
+                <LazyRoute>
+                  <PortalLayoutShell />
+                </LazyRoute>
               </ProtectedRoute>
             )
           }
         >
-          <Route path="dashboard" element={<DashboardPage />} />
+          <Route path="dashboard" element={<LazyRoute><DashboardPage /></LazyRoute>} />
+          <Route path="errors" element={<div />} />
           <Route path="files" element={<InteractiveRoute><LazyRoute><FilesPage /></LazyRoute></InteractiveRoute>} />
           {/* Terminal is rendered persistently in Layout.tsx — this route just prevents fallback */}
           <Route path="terminal" element={<AdminRoute><div /></AdminRoute>} />
@@ -314,10 +393,11 @@ export default function App() {
         </Route>
         <Route
           path="/setup"
-          element={setupModeActive ? <SetupWizardPage /> : <Navigate to={isAuthenticated ? '/dashboard' : '/login'} replace />}
+          element={setupModeActive ? <LazyRoute><SetupWizardPage /></LazyRoute> : <Navigate to={isAuthenticated ? '/dashboard' : '/login'} replace />}
         />
         <Route path="*" element={setupModeActive ? <Navigate to="/setup" replace /> : isAuthenticated ? <Navigate to="/dashboard" replace /> : <LoginRedirect />} />
-      </Routes>
+        </Routes>
+      </RouteOperationProvider>
     </BrowserRouter>
   );
 }

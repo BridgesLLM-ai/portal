@@ -1,66 +1,120 @@
-import { useState, useEffect, useRef } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useState, useEffect, useId, useRef } from 'react';
 import {
   ArrowLeft, Reply, Users, Forward, Eye, EyeOff, FolderInput,
-  Trash2, Flag, Clock, Loader2, Shield, Download, Paperclip,
+  Trash2, Flag, Clock, Loader2, Shield, Download,
   FolderDown, Check,
 } from 'lucide-react';
 import { formatSize, senderDisplay, senderInitials } from './helpers';
 import { MoveToDropdown } from './MoveToDropdown';
-import { apiFetch } from './api';
-import type { EmailFull, ComposeState, MailboxInfo } from './types';
+import { apiDownloadAttachment, apiFetch } from './api';
+import type { EmailFull, ComposeState, MailboxInfo, MailMutationChangeHandler } from './types';
 import sounds from '../../utils/sounds';
+import { buildEmailDocument, containsRemoteMailContent } from './emailDocument';
 
 interface EmailDetailProps {
   emailId: string;
   onBack: () => void;
-  onRefresh: () => void;
+  onRefresh: () => boolean | void | Promise<boolean | void>;
   mailboxes: MailboxInfo[];
   onCompose: (state: ComposeState) => void;
   isMobile: boolean;
+  onMutationChange?: MailMutationChangeHandler;
   account?: string;
 }
 
+type CommittedMailboxMutation =
+  | { kind: 'move'; emailId: string; targetMailboxId: string; account?: string }
+  | { kind: 'trash'; emailId: string; account?: string };
+
+type EmailDetailMutation =
+  | { kind: 'read'; emailId: string; read: boolean; account?: string }
+  | CommittedMailboxMutation
+  | { kind: 'mailbox-refresh'; operation: CommittedMailboxMutation['kind']; emailId: string; account?: string }
+  | { kind: 'flag'; emailId: string; flagged: boolean; account?: string }
+  | { kind: 'attachment-save'; blobId: string; downloadToken: string; account?: string }
+  | { kind: 'attachment-download'; blobId: string; downloadToken: string; fileName: string; account?: string };
+
 export default function EmailDetail({
-  emailId, onBack, onRefresh, mailboxes, onCompose, isMobile, account,
+  emailId, onBack, onRefresh, mailboxes, onCompose, isMobile, onMutationChange, account,
 }: EmailDetailProps) {
   const [email, setEmail] = useState<EmailFull | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [showMoveMenu, setShowMoveMenu] = useState(false);
-  const [savingBlobId, setSavingBlobId] = useState<string | null>(null);
+  const [activeMutation, setActiveMutation] = useState<EmailDetailMutation | null>(null);
+  const [committedMailboxMutation, setCommittedMailboxMutation] = useState<CommittedMailboxMutation | null>(null);
   const [savedBlobIds, setSavedBlobIds] = useState<Set<string>>(new Set());
+  const [attachmentError, setAttachmentError] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [showRemoteContent, setShowRemoteContent] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const moveRef = useRef<HTMLDivElement>(null);
+  const moveRef = useRef<HTMLButtonElement>(null);
+  const mutationAdmissionRef = useRef<EmailDetailMutation | null>(null);
+  const committedMailboxMutationRef = useRef<CommittedMailboxMutation | null>(null);
+  const moveMenuId = useId();
+  const mutationBusy = activeMutation !== null;
+  const interactionBlocked = mutationBusy || committedMailboxMutation !== null;
 
   useEffect(() => {
+    let cancelled = false;
     setLoading(true);
+    setEmail(null);
     setError('');
+    setActionError('');
+    committedMailboxMutationRef.current = null;
+    setCommittedMailboxMutation(null);
+    setAttachmentError('');
+    setSavedBlobIds(new Set());
+    setShowRemoteContent(false);
     apiFetch(`/messages/${emailId}`, { account })
       .then((data) => {
+        if (cancelled) return;
         setEmail(data);
-        if (data?.isUnread) {
-          apiFetch(`/messages/${emailId}/read`, {
-            method: 'POST',
-            body: JSON.stringify({ read: true }),
+        if (data?.isUnread && !mutationAdmissionRef.current) {
+          const admission: EmailDetailMutation = Object.freeze({
+            kind: 'read',
+            emailId,
+            read: true,
             account,
-          }).then(() => onRefresh()).catch(() => {});
+          });
+          mutationAdmissionRef.current = admission;
+          onMutationChange?.(Object.freeze({
+            kind: admission.kind,
+            label: 'Marking message as read',
+            account: admission.account,
+          }));
+          setActiveMutation(admission);
+          apiFetch(`/messages/${admission.emailId}/read`, {
+            method: 'POST',
+            body: JSON.stringify({ read: admission.read }),
+            account: admission.account,
+          }).then(async () => {
+            if (cancelled) return;
+            setEmail((current) => current?.id === admission.emailId
+              ? { ...current, isUnread: false }
+              : current);
+            if ((await onRefresh()) === false) {
+              throw new Error('The message was marked as read, but the mailbox snapshot could not be refreshed.');
+            }
+          }).catch((err: any) => {
+            if (!cancelled) setActionError(err?.message || 'The message opened, but its read status could not be updated.');
+          }).finally(() => {
+            if (mutationAdmissionRef.current === admission) {
+              mutationAdmissionRef.current = null;
+              onMutationChange?.(null);
+              setActiveMutation(null);
+            }
+          });
         }
       })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
-  }, [emailId]);
-
-  useEffect(() => {
-    if (!showMoveMenu) return;
-    const handler = (e: MouseEvent) => {
-      if (moveRef.current && !moveRef.current.contains(e.target as Node)) {
-        setShowMoveMenu(false);
-      }
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, [showMoveMenu]);
+      .catch((err) => {
+        if (!cancelled) setError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [account, emailId, onMutationChange, onRefresh]);
 
   // Write HTML into sandboxed iframe - mobile-first approach
   useEffect(() => {
@@ -74,39 +128,13 @@ export default function EmailDetail({
       content = email.bodyValues[htmlPart.partId].value;
       isHtml = true;
     } else if (textPart && email.bodyValues[textPart.partId]) {
-      content = `<pre style="white-space:pre-wrap;font-family:system-ui,sans-serif;font-size:14px;color:#e2e8f0;margin:0;">${
-        email.bodyValues[textPart.partId].value
-          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      }</pre>`;
+      content = email.bodyValues[textPart.partId].value;
     }
 
     const doc = iframeRef.current.contentDocument;
     if (doc) {
       doc.open();
-      if (isHtml) {
-        // For HTML emails: preserve original styling, add responsive scaling
-        doc.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
-          /* Don't force dark mode on HTML emails — respect their design */
-          body { margin: 0; padding: 16px; font-family: system-ui, sans-serif; font-size: 14px; line-height: 1.6; overflow-wrap: break-word; word-break: break-word; }
-          a { color: #6366f1; }
-          img { max-width: 100% !important; height: auto !important; }
-          table { max-width: 100% !important; }
-          /* Make email content scale to fit mobile */
-          @media (max-width: 640px) {
-            body { padding: 12px; font-size: 15px; }
-            table { width: 100% !important; }
-            td { display: block !important; width: 100% !important; box-sizing: border-box; }
-          }
-        </style></head><body>${content}</body></html>`);
-      } else {
-        // For plain text: dark mode is fine
-        doc.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
-          body { margin: 0; padding: 16px; background: #0a0e1a; color: #e2e8f0; font-family: system-ui, sans-serif; font-size: 14px; line-height: 1.6; overflow-wrap: break-word; word-break: break-word; }
-          a { color: #818cf8; }
-          blockquote { border-left: 3px solid #334155; padding-left: 12px; margin-left: 0; color: #94a3b8; }
-          @media (max-width: 640px) { body { padding: 12px; font-size: 15px; } }
-        </style></head><body>${content}</body></html>`);
-      }
+      doc.write(buildEmailDocument(content, isHtml, showRemoteContent));
       doc.close();
 
       // Auto-resize iframe to content height (eliminates scrollbar-in-scrollbar)
@@ -118,92 +146,304 @@ export default function EmailDetail({
       };
 
       // Resize after images load
-      setTimeout(resizeIframe, 100);
-      setTimeout(resizeIframe, 500);
-      setTimeout(resizeIframe, 2000);
+      const timers = [100, 500, 2000].map(delay => window.setTimeout(resizeIframe, delay));
       
       // Also listen for load events on images
       const images = doc.querySelectorAll('img');
       images.forEach(img => img.addEventListener('load', resizeIframe));
+      return () => {
+        timers.forEach(timer => window.clearTimeout(timer));
+        images.forEach(img => img.removeEventListener('load', resizeIframe));
+      };
     }
-  }, [email]);
+    return undefined;
+  }, [email, showRemoteContent]);
 
   const handleToggleRead = async () => {
-    if (!email) return;
+    if (!email || mutationAdmissionRef.current || committedMailboxMutationRef.current) return;
+    const admission: EmailDetailMutation = Object.freeze({
+      kind: 'read',
+      emailId: email.id,
+      read: email.isUnread,
+      account,
+    });
+    mutationAdmissionRef.current = admission;
+    onMutationChange?.(Object.freeze({
+      kind: admission.kind,
+      label: admission.read ? 'Marking message as read' : 'Marking message as unread',
+      account: admission.account,
+    }));
+    setActiveMutation(admission);
+    setActionError('');
     try {
-      const newRead = email.isUnread;
-      await apiFetch(`/messages/${email.id}/read`, {
+      await apiFetch(`/messages/${admission.emailId}/read`, {
         method: 'POST',
-        body: JSON.stringify({ read: newRead }),
-        account,
+        body: JSON.stringify({ read: admission.read }),
+        account: admission.account,
       });
       sounds.click();
-      setEmail(prev => prev ? { ...prev, isUnread: !newRead } : prev);
-      onRefresh();
-    } catch {}
+      setEmail((current) => current?.id === admission.emailId
+        ? { ...current, isUnread: !admission.read }
+        : current);
+      if ((await onRefresh()) === false) {
+        throw new Error('The read state changed, but the mailbox snapshot could not be refreshed. Use Refresh before another action.');
+      }
+    } catch (actionFailure: any) {
+      setActionError(actionFailure?.message || 'Read status could not be updated.');
+    } finally {
+      if (mutationAdmissionRef.current === admission) {
+        mutationAdmissionRef.current = null;
+        onMutationChange?.(null);
+        setActiveMutation(null);
+      }
+    }
   };
 
   const handleMove = async (targetMailboxId: string) => {
-    if (!email) return;
+    if (!email || mutationAdmissionRef.current || committedMailboxMutationRef.current) return;
+    const admission: EmailDetailMutation = Object.freeze({
+      kind: 'move',
+      emailId: email.id,
+      targetMailboxId,
+      account,
+    });
+    mutationAdmissionRef.current = admission;
+    onMutationChange?.(Object.freeze({
+      kind: admission.kind,
+      label: 'Moving message',
+      account: admission.account,
+    }));
+    setActiveMutation(admission);
+    setActionError('');
     try {
-      await apiFetch(`/messages/${email.id}/move`, {
+      await apiFetch(`/messages/${admission.emailId}/move`, {
         method: 'POST',
-        body: JSON.stringify({ targetMailboxId }),
-        account,
+        body: JSON.stringify({ targetMailboxId: admission.targetMailboxId }),
+        account: admission.account,
       });
       sounds.success();
+      committedMailboxMutationRef.current = admission;
+      setCommittedMailboxMutation(admission);
+      if ((await onRefresh()) === false) {
+        throw new Error('The message was moved, but Portal could not verify the refreshed mailbox. Retry mailbox refresh; the move will not be sent again.');
+      }
+      committedMailboxMutationRef.current = null;
+      setCommittedMailboxMutation(null);
       onBack();
-      onRefresh();
-    } catch {}
+    } catch (actionFailure: any) {
+      const committed = committedMailboxMutationRef.current === admission;
+      setActionError(committed
+        ? actionFailure?.message || 'The message was moved, but Portal could not verify the refreshed mailbox. Retry mailbox refresh; the move will not be sent again.'
+        : actionFailure?.message || 'The message could not be moved.');
+      if (committed) setShowMoveMenu(false);
+      else throw actionFailure;
+    } finally {
+      if (mutationAdmissionRef.current === admission) {
+        mutationAdmissionRef.current = null;
+        onMutationChange?.(null);
+        setActiveMutation(null);
+      }
+    }
   };
 
   const handleTrash = async () => {
-    if (!email) return;
+    if (!email || mutationAdmissionRef.current || committedMailboxMutationRef.current) return;
+    const admission: EmailDetailMutation = Object.freeze({
+      kind: 'trash',
+      emailId: email.id,
+      account,
+    });
+    mutationAdmissionRef.current = admission;
+    onMutationChange?.(Object.freeze({
+      kind: admission.kind,
+      label: 'Moving message to Trash',
+      account: admission.account,
+    }));
+    setActiveMutation(admission);
+    setActionError('');
     try {
-      await apiFetch(`/messages/${email.id}/trash`, { method: 'POST', account });
+      await apiFetch(`/messages/${admission.emailId}/trash`, { method: 'POST', account: admission.account });
       sounds.delete();
+      committedMailboxMutationRef.current = admission;
+      setCommittedMailboxMutation(admission);
+      if ((await onRefresh()) === false) {
+        throw new Error('The message was moved to Trash, but Portal could not verify the refreshed mailbox. Retry mailbox refresh; the trash request will not be sent again.');
+      }
+      committedMailboxMutationRef.current = null;
+      setCommittedMailboxMutation(null);
       onBack();
-      onRefresh();
-    } catch {}
+    } catch (actionFailure: any) {
+      const committed = committedMailboxMutationRef.current === admission;
+      setActionError(committed
+        ? actionFailure?.message || 'The message was moved to Trash, but Portal could not verify the refreshed mailbox. Retry mailbox refresh; the trash request will not be sent again.'
+        : actionFailure?.message || 'The message could not be moved to Trash.');
+    } finally {
+      if (mutationAdmissionRef.current === admission) {
+        mutationAdmissionRef.current = null;
+        onMutationChange?.(null);
+        setActiveMutation(null);
+      }
+    }
+  };
+
+  const retryMailboxRefresh = async () => {
+    const committed = committedMailboxMutationRef.current;
+    if (!committed || mutationAdmissionRef.current) return;
+    const admission: EmailDetailMutation = Object.freeze({
+      kind: 'mailbox-refresh',
+      operation: committed.kind,
+      emailId: committed.emailId,
+      account: committed.account,
+    });
+    mutationAdmissionRef.current = admission;
+    onMutationChange?.(Object.freeze({
+      kind: admission.kind,
+      label: committed.kind === 'move' ? 'Verifying moved message' : 'Verifying trashed message',
+      account: admission.account,
+    }));
+    setActiveMutation(admission);
+    setActionError('');
+    try {
+      if ((await onRefresh()) === false) {
+        throw new Error(committed.kind === 'move'
+          ? 'Portal still could not verify the moved message in a refreshed mailbox. Retry mailbox refresh; the move will not be sent again.'
+          : 'Portal still could not verify the trashed message in a refreshed mailbox. Retry mailbox refresh; the trash request will not be sent again.');
+      }
+      if (committedMailboxMutationRef.current !== committed) return;
+      committedMailboxMutationRef.current = null;
+      setCommittedMailboxMutation(null);
+      onBack();
+    } catch (refreshFailure: any) {
+      setActionError(refreshFailure?.message || 'Portal could not verify the refreshed mailbox. Retry will not repeat the accepted mailbox action.');
+    } finally {
+      if (mutationAdmissionRef.current === admission) {
+        mutationAdmissionRef.current = null;
+        onMutationChange?.(null);
+        setActiveMutation(null);
+      }
+    }
   };
 
   const handleFlag = async () => {
-    if (!email) return;
+    if (!email || mutationAdmissionRef.current || committedMailboxMutationRef.current) return;
+    const admission: EmailDetailMutation = Object.freeze({
+      kind: 'flag',
+      emailId: email.id,
+      flagged: !email.isFlagged,
+      account,
+    });
+    mutationAdmissionRef.current = admission;
+    onMutationChange?.(Object.freeze({
+      kind: admission.kind,
+      label: admission.flagged ? 'Flagging message' : 'Removing message flag',
+      account: admission.account,
+    }));
+    setActiveMutation(admission);
+    setActionError('');
     try {
-      await apiFetch(`/messages/${email.id}/flag`, {
+      await apiFetch(`/messages/${admission.emailId}/flag`, {
         method: 'POST',
-        body: JSON.stringify({ flagged: !email.isFlagged }),
-        account,
+        body: JSON.stringify({ flagged: admission.flagged }),
+        account: admission.account,
       });
       sounds.click();
-      setEmail(prev => prev ? { ...prev, isFlagged: !prev.isFlagged } : prev);
-    } catch {}
+      setEmail((current) => current?.id === admission.emailId
+        ? { ...current, isFlagged: admission.flagged }
+        : current);
+    } catch (actionFailure: any) {
+      setActionError(actionFailure?.message || 'The flag could not be updated.');
+    } finally {
+      if (mutationAdmissionRef.current === admission) {
+        mutationAdmissionRef.current = null;
+        onMutationChange?.(null);
+        setActiveMutation(null);
+      }
+    }
   };
 
-  const saveAttachmentToFiles = async (att: { blobId: string; name: string | null; type: string }) => {
-    setSavingBlobId(att.blobId);
+  const saveAttachmentToFiles = async (att: EmailFull['attachments'][number]) => {
+    if (!att.downloadToken || mutationAdmissionRef.current || committedMailboxMutationRef.current) return;
+    const admission: EmailDetailMutation = Object.freeze({
+      kind: 'attachment-save',
+      blobId: att.blobId,
+      downloadToken: att.downloadToken,
+      account,
+    });
+    mutationAdmissionRef.current = admission;
+    onMutationChange?.(Object.freeze({
+      kind: admission.kind,
+      label: 'Saving attachment to Files',
+      account: admission.account,
+    }));
+    setActiveMutation(admission);
+    setAttachmentError('');
     try {
-      await apiFetch(`/attachments/${att.blobId}/save-to-files`, {
+      await apiFetch(`/attachments/${admission.blobId}/save-to-files`, {
         method: 'POST',
-        body: JSON.stringify({
-          filename: att.name || 'attachment',
-          contentType: att.type,
-        }),
-        account,
+        body: JSON.stringify({ token: admission.downloadToken }),
+        account: admission.account,
       });
       sounds.success();
-      setSavedBlobIds(prev => new Set(prev).add(att.blobId));
+      setSavedBlobIds(prev => new Set(prev).add(admission.blobId));
       setTimeout(() => {
         setSavedBlobIds(prev => {
           const next = new Set(prev);
-          next.delete(att.blobId);
+          next.delete(admission.blobId);
           return next;
         });
       }, 2000);
-    } catch {
+    } catch (saveError: any) {
       sounds.error();
+      setAttachmentError(saveError?.message || 'Attachment could not be saved');
     } finally {
-      setSavingBlobId(null);
+      if (mutationAdmissionRef.current === admission) {
+        mutationAdmissionRef.current = null;
+        onMutationChange?.(null);
+        setActiveMutation(null);
+      }
+    }
+  };
+
+  const downloadMailAttachment = async (att: EmailFull['attachments'][number]) => {
+    if (!att.downloadToken || mutationAdmissionRef.current || committedMailboxMutationRef.current) return;
+    const admission: EmailDetailMutation = Object.freeze({
+      kind: 'attachment-download',
+      blobId: att.blobId,
+      downloadToken: att.downloadToken,
+      fileName: att.name || 'attachment',
+      account,
+    });
+    mutationAdmissionRef.current = admission;
+    onMutationChange?.(Object.freeze({
+      kind: admission.kind,
+      label: 'Downloading attachment',
+      account: admission.account,
+    }));
+    setActiveMutation(admission);
+    setAttachmentError('');
+    try {
+      const blob = await apiDownloadAttachment(
+        admission.blobId,
+        admission.downloadToken,
+        admission.account,
+      );
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = admission.fileName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+    } catch (downloadError: any) {
+      sounds.error();
+      setAttachmentError(downloadError?.message || 'Attachment download failed');
+    } finally {
+      if (mutationAdmissionRef.current === admission) {
+        mutationAdmissionRef.current = null;
+        onMutationChange?.(null);
+        setActiveMutation(null);
+      }
     }
   };
 
@@ -217,43 +457,64 @@ export default function EmailDetail({
   );
   if (!email) return null;
 
+  const readBusy = activeMutation?.kind === 'read';
+  const trashBusy = activeMutation?.kind === 'trash';
+  const flagBusy = activeMutation?.kind === 'flag';
+  const mailboxRefreshBusy = activeMutation?.kind === 'mailbox-refresh';
+  const requestBack = () => {
+    if (!mutationAdmissionRef.current && !committedMailboxMutationRef.current) onBack();
+  };
+  const requestCompose = (mode: ComposeState['mode']) => {
+    if (!mutationAdmissionRef.current && !committedMailboxMutationRef.current) onCompose({ mode, replyTo: email });
+  };
+
   // Mobile bottom action bar items
   const mobileActions = (
     <div className="flex items-center justify-around py-2 px-2 border-t border-white/[0.06] bg-[#080B20] flex-shrink-0 safe-area-bottom">
       <button
-        onClick={() => onCompose({ mode: 'reply', replyTo: email })}
-        className="flex flex-col items-center gap-0.5 p-2 rounded-xl text-violet-300 active:bg-violet-600/20 transition-colors min-w-[56px]"
+        onClick={() => requestCompose('reply')}
+        disabled={interactionBlocked}
+        className="flex flex-col items-center gap-0.5 p-2 rounded-xl text-violet-300 active:bg-violet-600/20 disabled:cursor-wait disabled:opacity-50 transition-colors min-w-[56px]"
       >
         <Reply size={20} />
         <span className="text-[10px]">Reply</span>
       </button>
       <button
-        onClick={() => onCompose({ mode: 'replyAll', replyTo: email })}
-        className="flex flex-col items-center gap-0.5 p-2 rounded-xl text-violet-300 active:bg-violet-600/20 transition-colors min-w-[56px]"
+        onClick={() => requestCompose('replyAll')}
+        disabled={interactionBlocked}
+        className="flex flex-col items-center gap-0.5 p-2 rounded-xl text-violet-300 active:bg-violet-600/20 disabled:cursor-wait disabled:opacity-50 transition-colors min-w-[56px]"
       >
         <Users size={18} />
         <span className="text-[10px]">Reply All</span>
       </button>
       <button
-        onClick={() => onCompose({ mode: 'forward', replyTo: email })}
-        className="flex flex-col items-center gap-0.5 p-2 rounded-xl text-slate-300 active:bg-white/[0.06] transition-colors min-w-[56px]"
+        onClick={() => requestCompose('forward')}
+        disabled={interactionBlocked}
+        className="flex flex-col items-center gap-0.5 p-2 rounded-xl text-slate-300 active:bg-white/[0.06] disabled:cursor-wait disabled:opacity-50 transition-colors min-w-[56px]"
       >
         <Forward size={20} />
         <span className="text-[10px]">Forward</span>
       </button>
       <button
-        onClick={handleTrash}
-        className="flex flex-col items-center gap-0.5 p-2 rounded-xl text-slate-400 active:bg-red-500/20 transition-colors min-w-[56px]"
+        onClick={() => { void handleTrash(); }}
+        disabled={interactionBlocked}
+        aria-busy={trashBusy}
+        aria-label={trashBusy ? 'Moving message to Trash…' : 'Move message to Trash'}
+        className="flex flex-col items-center gap-0.5 p-2 rounded-xl text-slate-400 active:bg-red-500/20 disabled:cursor-wait disabled:opacity-50 transition-colors min-w-[56px]"
       >
-        <Trash2 size={20} />
-        <span className="text-[10px]">Trash</span>
+        {trashBusy ? <Loader2 size={20} className="animate-spin" /> : <Trash2 size={20} />}
+        <span className="text-[10px]">{trashBusy ? 'Trashing…' : 'Trash'}</span>
       </button>
       <button
-        onClick={handleFlag}
-        className={`flex flex-col items-center gap-0.5 p-2 rounded-xl transition-colors min-w-[56px] ${email.isFlagged ? 'text-amber-400' : 'text-slate-400 active:bg-amber-500/20'}`}
+        aria-label={email.isFlagged ? 'Remove flag' : 'Flag message'}
+        aria-pressed={email.isFlagged}
+        onClick={() => { void handleFlag(); }}
+        disabled={interactionBlocked}
+        aria-busy={flagBusy}
+        className={`flex flex-col items-center gap-0.5 p-2 rounded-xl disabled:cursor-wait disabled:opacity-50 transition-colors min-w-[56px] ${email.isFlagged ? 'text-amber-400' : 'text-slate-400 active:bg-amber-500/20'}`}
       >
-        <Flag size={20} />
-        <span className="text-[10px]">Flag</span>
+        {flagBusy ? <Loader2 size={20} className="animate-spin" /> : <Flag size={20} />}
+        <span className="text-[10px]">{flagBusy ? 'Updating…' : 'Flag'}</span>
       </button>
     </div>
   );
@@ -261,46 +522,71 @@ export default function EmailDetail({
   // Desktop toolbar
   const desktopToolbar = (
     <div className="flex items-center gap-1.5 px-4 py-2 border-b border-white/[0.06] flex-shrink-0 bg-[#080B20]">
-      <button onClick={onBack} className="p-1.5 rounded-lg hover:bg-white/[0.06] text-slate-400 hover:text-white transition-colors">
+      <button aria-label="Back to message list" onClick={requestBack} disabled={interactionBlocked} className="p-1.5 rounded-lg hover:bg-white/[0.06] text-slate-400 hover:text-white disabled:cursor-wait disabled:opacity-50 transition-colors">
         <ArrowLeft size={16} />
       </button>
       <div className="flex-1" />
       <button
-        onClick={() => onCompose({ mode: 'reply', replyTo: email })}
-        className="px-3 py-1.5 text-xs rounded-lg bg-violet-600/20 hover:bg-violet-600/30 text-violet-300 font-medium flex items-center gap-1.5 transition-colors"
+        onClick={() => requestCompose('reply')}
+        disabled={interactionBlocked}
+        className="px-3 py-1.5 text-xs rounded-lg bg-violet-600/20 hover:bg-violet-600/30 text-violet-300 font-medium flex items-center gap-1.5 disabled:cursor-wait disabled:opacity-50 transition-colors"
       >
         <Reply size={12} /> Reply
       </button>
       <button
-        onClick={() => onCompose({ mode: 'replyAll', replyTo: email })}
-        className="px-3 py-1.5 text-xs rounded-lg bg-violet-600/20 hover:bg-violet-600/30 text-violet-300 font-medium flex items-center gap-1.5 transition-colors"
+        onClick={() => requestCompose('replyAll')}
+        disabled={interactionBlocked}
+        className="px-3 py-1.5 text-xs rounded-lg bg-violet-600/20 hover:bg-violet-600/30 text-violet-300 font-medium flex items-center gap-1.5 disabled:cursor-wait disabled:opacity-50 transition-colors"
         title="Reply All"
       >
         <Users size={12} /> Reply All
       </button>
       <button
-        onClick={() => onCompose({ mode: 'forward', replyTo: email })}
-        className="px-3 py-1.5 text-xs rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-slate-300 font-medium flex items-center gap-1.5 transition-colors"
+        onClick={() => requestCompose('forward')}
+        disabled={interactionBlocked}
+        className="px-3 py-1.5 text-xs rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-slate-300 font-medium flex items-center gap-1.5 disabled:cursor-wait disabled:opacity-50 transition-colors"
         title="Forward"
       >
         <Forward size={12} /> Forward
       </button>
-      <button onClick={handleToggleRead} className="p-1.5 rounded-lg hover:bg-white/[0.06] text-slate-400 hover:text-white transition-colors" title={email.isUnread ? 'Mark as read' : 'Mark as unread'}>
-        {email.isUnread ? <Eye size={14} /> : <EyeOff size={14} />}
+      <button aria-label={readBusy ? 'Updating message read status…' : email.isUnread ? 'Mark as read' : 'Mark as unread'} onClick={() => { void handleToggleRead(); }} disabled={interactionBlocked} aria-busy={readBusy} className="p-1.5 rounded-lg hover:bg-white/[0.06] text-slate-400 hover:text-white disabled:cursor-wait disabled:opacity-50 transition-colors" title={email.isUnread ? 'Mark as read' : 'Mark as unread'}>
+        {readBusy ? <Loader2 size={14} className="animate-spin" /> : email.isUnread ? <Eye size={14} /> : <EyeOff size={14} />}
       </button>
-      <div className="relative" ref={moveRef}>
-        <button onClick={() => setShowMoveMenu(!showMoveMenu)} className="p-1.5 rounded-lg hover:bg-white/[0.06] text-slate-400 hover:text-white transition-colors" title="Move to folder">
+      <div className="relative">
+        <button
+          ref={moveRef}
+          type="button"
+          aria-label="Move message to folder"
+          aria-haspopup="menu"
+          aria-expanded={showMoveMenu}
+          aria-controls={showMoveMenu ? moveMenuId : undefined}
+          onClick={() => { if (!mutationAdmissionRef.current && !committedMailboxMutationRef.current) setShowMoveMenu((current) => !current); }}
+          disabled={interactionBlocked}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowDown') {
+              event.preventDefault();
+              if (!mutationAdmissionRef.current && !committedMailboxMutationRef.current) setShowMoveMenu(true);
+            }
+          }}
+          className="p-1.5 rounded-lg hover:bg-white/[0.06] text-slate-400 hover:text-white disabled:cursor-wait disabled:opacity-50 transition-colors"
+          title="Move to folder"
+        >
           <FolderInput size={14} />
         </button>
-        {showMoveMenu && (
-          <MoveToDropdown mailboxes={mailboxes} onMove={handleMove} onClose={() => setShowMoveMenu(false)} />
-        )}
+        <MoveToDropdown
+          open={showMoveMenu}
+          anchorRef={moveRef}
+          menuId={moveMenuId}
+          mailboxes={mailboxes}
+          onMove={handleMove}
+          onClose={() => { if (!mutationAdmissionRef.current) setShowMoveMenu(false); }}
+        />
       </div>
-      <button onClick={handleTrash} className="p-1.5 rounded-lg hover:bg-red-500/20 text-slate-400 hover:text-red-400 transition-colors" title="Move to trash">
-        <Trash2 size={14} />
+      <button aria-label={trashBusy ? 'Moving message to Trash…' : 'Move message to trash'} onClick={() => { void handleTrash(); }} disabled={interactionBlocked} aria-busy={trashBusy} className="p-1.5 rounded-lg hover:bg-red-500/20 text-slate-400 hover:text-red-400 disabled:cursor-wait disabled:opacity-50 transition-colors" title="Move to trash">
+        {trashBusy ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
       </button>
-      <button onClick={handleFlag} className={`p-1.5 rounded-lg hover:bg-amber-500/20 ${email.isFlagged ? 'text-amber-400' : 'text-slate-400 hover:text-amber-400'} transition-colors`} title="Toggle flag">
-        <Flag size={14} />
+      <button aria-label={flagBusy ? 'Updating message flag…' : email.isFlagged ? 'Remove flag' : 'Flag message'} aria-pressed={email.isFlagged} onClick={() => { void handleFlag(); }} disabled={interactionBlocked} aria-busy={flagBusy} className={`p-1.5 rounded-lg hover:bg-amber-500/20 disabled:cursor-wait disabled:opacity-50 ${email.isFlagged ? 'text-amber-400' : 'text-slate-400 hover:text-amber-400'} transition-colors`} title="Toggle flag">
+        {flagBusy ? <Loader2 size={14} className="animate-spin" /> : <Flag size={14} />}
       </button>
     </div>
   );
@@ -310,18 +596,36 @@ export default function EmailDetail({
       {/* Mobile: back button header */}
       {isMobile ? (
         <div className="flex items-center gap-2 px-2 py-2 border-b border-white/[0.06] flex-shrink-0">
-          <button onClick={onBack} className="p-2 rounded-xl text-slate-400 hover:text-white active:bg-white/[0.06] transition-colors">
+          <button aria-label="Back to message list" onClick={requestBack} disabled={interactionBlocked} className="p-2 rounded-xl text-slate-400 hover:text-white active:bg-white/[0.06] disabled:cursor-wait disabled:opacity-50 transition-colors">
             <ArrowLeft size={20} />
           </button>
           <div className="flex-1 min-w-0">
             <div className="text-sm font-medium text-white truncate">{email.subject}</div>
           </div>
-          <button onClick={handleToggleRead} className="p-2 rounded-xl text-slate-400 active:bg-white/[0.06] transition-colors">
-            {email.isUnread ? <Eye size={18} /> : <EyeOff size={18} />}
+          <button aria-label={readBusy ? 'Updating message read status…' : email.isUnread ? 'Mark as read' : 'Mark as unread'} onClick={() => { void handleToggleRead(); }} disabled={interactionBlocked} aria-busy={readBusy} className="p-2 rounded-xl text-slate-400 active:bg-white/[0.06] disabled:cursor-wait disabled:opacity-50 transition-colors">
+            {readBusy ? <Loader2 size={18} className="animate-spin" /> : email.isUnread ? <Eye size={18} /> : <EyeOff size={18} />}
           </button>
         </div>
       ) : (
         desktopToolbar
+      )}
+
+      {actionError && (!showMoveMenu || committedMailboxMutation) && (
+        <div role="alert" className="flex items-center justify-between gap-3 border-b border-red-500/20 bg-red-500/10 px-4 py-2 text-xs text-red-300 md:px-5">
+          <span>{actionError}</span>
+          {committedMailboxMutation && (
+            <button
+              type="button"
+              onClick={() => { void retryMailboxRefresh(); }}
+              disabled={mutationBusy}
+              aria-busy={mailboxRefreshBusy}
+              className="inline-flex min-h-[36px] shrink-0 items-center gap-1.5 rounded-lg border border-red-400/30 bg-red-500/10 px-3 py-1.5 font-medium text-red-100 transition hover:bg-red-500/20 disabled:cursor-wait disabled:opacity-50"
+            >
+              {mailboxRefreshBusy && <Loader2 size={13} className="animate-spin" />}
+              {mailboxRefreshBusy ? 'Refreshing mailbox…' : 'Retry mailbox refresh'}
+            </button>
+          )}
+        </div>
       )}
 
       {/* Email header */}
@@ -358,31 +662,42 @@ export default function EmailDetail({
       {/* Attachments */}
       {email.attachments.length > 0 && (
         <div className="px-4 md:px-5 py-2.5 border-b border-white/[0.06] flex-shrink-0">
+          {attachmentError && <div role="alert" className="mb-2 text-xs text-red-400">{attachmentError}</div>}
           <div className="flex flex-wrap gap-2">
             {email.attachments.map((att) => (
               <div key={att.partId} className="flex items-center gap-1">
                 <button
-                  disabled={att.isDangerous}
-                  onClick={() => {
-                    if (!att.isDangerous) {
-                      window.open(`/api/mail/attachments/${att.blobId}?name=${encodeURIComponent(att.name || 'file')}&type=${encodeURIComponent(att.type)}${account && account !== 'personal' ? `&account=${account}` : ''}`, '_blank');
-                    }
-                  }}
+                  disabled={att.isDangerous || !att.downloadToken || interactionBlocked}
+                  onClick={() => void downloadMailAttachment(att)}
                   className={`flex items-center gap-1.5 px-3 py-2 rounded-l-xl text-xs transition-colors ${
-                    att.isDangerous
+                    att.isDangerous || !att.downloadToken
                       ? 'bg-red-500/10 border border-red-500/30 text-red-300 cursor-not-allowed'
                       : 'bg-white/[0.04] border border-white/[0.06] border-r-0 text-slate-300 hover:bg-white/[0.08] active:bg-white/[0.12] cursor-pointer'
                   }`}
+                  aria-label={activeMutation?.kind === 'attachment-download' && activeMutation.blobId === att.blobId
+                    ? `Downloading ${att.name || 'attachment'}…`
+                    : `Download ${att.name || 'attachment'}`}
+                  aria-busy={activeMutation?.kind === 'attachment-download' && activeMutation.blobId === att.blobId}
                 >
-                  {att.isDangerous ? <Shield size={14} className="text-red-400" /> : <Download size={14} />}
+                  {att.isDangerous || !att.downloadToken
+                    ? <Shield size={14} className="text-red-400" />
+                    : activeMutation?.kind === 'attachment-download' && activeMutation.blobId === att.blobId
+                      ? <Loader2 size={14} className="animate-spin" />
+                      : <Download size={14} />}
                   <span className="max-w-[140px] sm:max-w-[200px] truncate">{att.name || 'attachment'}</span>
                   <span className="text-slate-500">{formatSize(att.size)}</span>
-                  {att.isDangerous && <span className="text-red-400 font-medium">BLOCKED</span>}
+                  {(att.isDangerous || !att.downloadToken) && <span className="text-red-400 font-medium">BLOCKED</span>}
                 </button>
-                {!att.isDangerous && (
+                {!att.isDangerous && att.downloadToken && (
                   <button
-                    disabled={savingBlobId === att.blobId || savedBlobIds.has(att.blobId)}
-                    onClick={() => saveAttachmentToFiles(att)}
+                    disabled={interactionBlocked || savedBlobIds.has(att.blobId)}
+                    onClick={() => { void saveAttachmentToFiles(att); }}
+                    aria-label={activeMutation?.kind === 'attachment-save' && activeMutation.blobId === att.blobId
+                      ? `Saving ${att.name || 'attachment'} to Files…`
+                      : savedBlobIds.has(att.blobId)
+                        ? 'Saved to Files'
+                        : 'Save to Files'}
+                    aria-busy={activeMutation?.kind === 'attachment-save' && activeMutation.blobId === att.blobId}
                     className={`flex items-center gap-1 px-2.5 py-2 rounded-r-xl text-xs border transition-colors ${
                       savedBlobIds.has(att.blobId)
                         ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
@@ -390,7 +705,7 @@ export default function EmailDetail({
                     }`}
                     title="Save to Files"
                   >
-                    {savingBlobId === att.blobId ? (
+                    {activeMutation?.kind === 'attachment-save' && activeMutation.blobId === att.blobId ? (
                       <Loader2 size={13} className="animate-spin" />
                     ) : savedBlobIds.has(att.blobId) ? (
                       <><Check size={13} /> <span>Saved!</span></>
@@ -402,6 +717,20 @@ export default function EmailDetail({
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {email.htmlBody?.[0] && containsRemoteMailContent(email.bodyValues[email.htmlBody[0].partId]?.value || '') && (
+        <div className="flex items-center justify-between gap-3 border-b border-white/[0.06] bg-amber-500/[0.06] px-4 py-2 text-xs text-amber-200 md:px-5">
+          <span>{showRemoteContent ? 'Remote email content is enabled for this message.' : 'Remote images and styles are blocked to protect your privacy.'}</span>
+          <button
+            type="button"
+            onClick={() => { if (!mutationAdmissionRef.current && !committedMailboxMutationRef.current) setShowRemoteContent(value => !value); }}
+            disabled={interactionBlocked}
+            className="shrink-0 rounded-lg border border-amber-400/20 bg-amber-500/10 px-2.5 py-1.5 font-medium text-amber-200 hover:bg-amber-500/20 disabled:cursor-wait disabled:opacity-50"
+          >
+            {showRemoteContent ? 'Block again' : 'Load once'}
+          </button>
         </div>
       )}
 

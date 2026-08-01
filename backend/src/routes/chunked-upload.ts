@@ -1,268 +1,274 @@
 import { Router, Request, Response } from 'express';
-import path from 'path';
-import fs from 'fs';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import mime from 'mime-types';
 import { authenticateToken } from '../middleware/auth';
+import { requireApproved } from '../middleware/requireApproved';
 import { prisma } from '../config/database';
-import { getUserUploadDir } from './files';
+import {
+  buildDirectFileUrl,
+  ensureToolMirror,
+  getUserUploadDir,
+  removeToolMirror,
+} from './files';
+import {
+  ChunkedUploadError,
+  ChunkedUploadManager,
+  PORTAL_UPLOAD_CHUNK_SIZE,
+  PORTAL_UPLOAD_MAX_FILE_SIZE,
+} from '../services/chunkedUpload.service';
+import { scanFile } from '../services/virusScan';
+import { getWorkspaceOwnerId } from '../utils/workspaceScope';
+import { startUploadOrphanCleanup, stopUploadOrphanCleanup } from '../services/uploadOrphanCleanup';
+import { resolveContainedPath } from '../services/containedPath';
 
 const router = Router();
-const CHUNKS_DIR = '/var/portal-files/.chunks';
+export const CHUNKS_DIR = path.resolve(
+  process.env.PORTAL_UPLOAD_CHUNKS_ROOT
+    || path.join(process.env.PORTAL_FILES_ROOT || '/var/portal-files', '.chunks'),
+);
+let uploadManager: ChunkedUploadManager | undefined;
+let cleanupTimer: NodeJS.Timeout | undefined;
 
-fs.mkdirSync(CHUNKS_DIR, { recursive: true });
-
-interface ChunkSession {
-  fileName: string;
-  fileSize: number;
-  totalChunks: number;
-  receivedChunks: Set<number>;
-  uploadId: string;
-  userId: string;
-  createdAt: number;
-  paused: boolean;
+function getUploadManager(): ChunkedUploadManager {
+  if (!uploadManager) uploadManager = new ChunkedUploadManager({ chunksDir: CHUNKS_DIR });
+  return uploadManager;
 }
 
-const sessions = new Map<string, ChunkSession>();
+export function initializeChunkedUploadRuntime(): void {
+  getUploadManager();
+  startUploadOrphanCleanup();
+  if (cleanupTimer) return;
+  cleanupTimer = setInterval(() => getUploadManager().cleanupExpiredSessions(), 30 * 60 * 1000);
+  cleanupTimer.unref();
+}
 
-// Clean stale sessions every 30 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of sessions) {
-    if (now - session.createdAt > 3600000) {
-      const chunkDir = path.join(CHUNKS_DIR, id);
-      if (fs.existsSync(chunkDir)) fs.rmSync(chunkDir, { recursive: true, force: true });
-      sessions.delete(id);
-    }
-  }
-}, 1800000);
+export function shutdownChunkedUploadRuntime(): void {
+  if (cleanupTimer) clearInterval(cleanupTimer);
+  cleanupTimer = undefined;
+  stopUploadOrphanCleanup();
+}
 
-// POST /api/upload/init
-router.post('/init', authenticateToken, async (req: Request, res: Response) => {
-  try {
-    const { fileName, fileSize, totalChunks } = req.body;
-    if (!fileName || !fileSize || !totalChunks) {
-      res.status(400).json({ error: 'fileName, fileSize, totalChunks required' });
-      return;
-    }
-
-    const uploadId = crypto.randomBytes(16).toString('hex');
-    const chunkDir = path.join(CHUNKS_DIR, uploadId);
-    fs.mkdirSync(chunkDir, { recursive: true });
-
-    sessions.set(uploadId, {
-      fileName,
-      fileSize,
-      totalChunks,
-      receivedChunks: new Set(),
-      uploadId,
-      userId: req.user!.userId,
-      createdAt: Date.now(),
-      paused: false,
-    });
-
-    res.json({ uploadId, chunkSize: 5 * 1024 * 1024 });
-  } catch (error) {
-    console.error('Init upload error:', error);
-    res.status(500).json({ error: 'Failed to initialize upload' });
-  }
-});
-
-// POST /api/upload/chunk
-router.post('/chunk', authenticateToken, async (req: Request, res: Response) => {
-  try {
-    const uploadId = req.headers['x-upload-id'] as string;
-    const chunkIndex = parseInt(req.headers['x-chunk-index'] as string);
-
-    if (!uploadId || isNaN(chunkIndex)) {
-      res.status(400).json({ error: 'x-upload-id and x-chunk-index headers required' });
-      return;
-    }
-
-    const session = sessions.get(uploadId);
-    if (!session || session.userId !== req.user!.userId) {
-      res.status(404).json({ error: 'Upload session not found' });
-      return;
-    }
-
-    if (session.paused) {
-      res.status(409).json({ error: 'Upload is paused' });
-      return;
-    }
-
-    const chunkPath = path.join(CHUNKS_DIR, uploadId, `chunk-${chunkIndex}`);
-
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => {
-      const buffer = Buffer.concat(chunks);
-      fs.writeFileSync(chunkPath, buffer);
-      session.receivedChunks.add(chunkIndex);
-
-      res.json({
-        received: chunkIndex,
-        total: session.totalChunks,
-        receivedCount: session.receivedChunks.size,
-        progress: Math.round((session.receivedChunks.size / session.totalChunks) * 100),
-      });
-    });
-  } catch (error) {
-    console.error('Chunk upload error:', error);
-    res.status(500).json({ error: 'Failed to upload chunk' });
-  }
-});
-
-// POST /api/upload/pause
-router.post('/pause', authenticateToken, async (req: Request, res: Response) => {
-  const { uploadId } = req.body;
-  const session = sessions.get(uploadId);
-  if (!session || session.userId !== req.user!.userId) {
-    res.status(404).json({ error: 'Session not found' });
+function sendUploadError(res: Response, error: unknown, fallback: string): void {
+  if (error instanceof ChunkedUploadError) {
+    res.status(error.statusCode).json({ error: error.message });
     return;
   }
-  session.paused = true;
-  res.json({ paused: true, receivedChunks: session.receivedChunks.size });
-});
+  console.error(fallback, error);
+  res.status(500).json({ error: fallback });
+}
 
-// POST /api/upload/resume
-router.post('/resume', authenticateToken, async (req: Request, res: Response) => {
-  const { uploadId } = req.body;
-  const session = sessions.get(uploadId);
-  if (!session || session.userId !== req.user!.userId) {
-    res.status(404).json({ error: 'Session not found' });
-    return;
+function parseChunkIndex(raw: unknown): number {
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) {
+    throw new ChunkedUploadError('x-chunk-index must be a non-negative integer');
   }
-  session.paused = false;
-  const missing: number[] = [];
-  for (let i = 0; i < session.totalChunks; i++) {
-    if (!session.receivedChunks.has(i)) missing.push(i);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new ChunkedUploadError('x-chunk-index is too large');
+  return parsed;
+}
+
+function parseContentLength(raw: unknown): number | undefined {
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) {
+    throw new ChunkedUploadError('Content-Length is invalid');
   }
-  res.json({ paused: false, receivedChunks: session.receivedChunks.size, missingChunks: missing });
-});
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new ChunkedUploadError('Content-Length is too large', 413);
+  return parsed;
+}
 
-// POST /api/upload/complete
-router.post('/complete', authenticateToken, async (req: Request, res: Response) => {
-  try {
-    const { uploadId } = req.body;
-    const session = sessions.get(uploadId);
-    if (!session || session.userId !== req.user!.userId) {
-      res.status(404).json({ error: 'Upload session not found' });
-      return;
-    }
-
-    if (session.receivedChunks.size !== session.totalChunks) {
-      res.status(400).json({
-        error: 'Not all chunks received',
-        received: session.receivedChunks.size,
-        expected: session.totalChunks,
-      });
-      return;
-    }
-
-    const userDir = getUserUploadDir(session.userId);
-    fs.mkdirSync(userDir, { recursive: true });
-
-    const ext = path.extname(session.fileName);
-    const base = path.basename(session.fileName, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
-    const finalName = `${base}-${Date.now()}${ext}`;
-    const finalPath = path.join(userDir, finalName);
-
-    const writeStream = fs.createWriteStream(finalPath);
-    for (let i = 0; i < session.totalChunks; i++) {
-      const chunkPath = path.join(CHUNKS_DIR, uploadId, `chunk-${i}`);
-      const chunkData = fs.readFileSync(chunkPath);
-      writeStream.write(chunkData);
-    }
-    writeStream.end();
-
-    await new Promise<void>((resolve, reject) => {
-      writeStream.on('finish', resolve);
-      writeStream.on('error', reject);
-    });
-
-    const stat = fs.statSync(finalPath);
-
-    const mimeMap: Record<string, string> = {
-      '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
-      '.webp': 'image/webp', '.svg': 'image/svg+xml', '.bmp': 'image/bmp',
-      '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.avi': 'video/x-msvideo',
-      '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.flac': 'audio/flac',
-      '.pdf': 'application/pdf', '.zip': 'application/zip', '.gz': 'application/gzip',
-      '.tar': 'application/x-tar', '.7z': 'application/x-7z-compressed', '.rar': 'application/vnd.rar',
-      '.js': 'application/javascript', '.ts': 'text/typescript', '.json': 'application/json',
-      '.html': 'text/html', '.css': 'text/css', '.txt': 'text/plain', '.md': 'text/markdown',
-      '.py': 'text/x-python', '.sh': 'text/x-shellscript',
-      '.doc': 'application/msword', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      '.xls': 'application/vnd.ms-excel', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      '.ppt': 'application/vnd.ms-powerpoint', '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    };
-    const mimeType = mimeMap[ext.toLowerCase()] || 'application/octet-stream';
-
-    const file = await prisma.file.create({
-      data: {
-        userId: session.userId,
-        path: finalName,
-        originalName: session.fileName,
-        size: BigInt(stat.size),
-        mimeType,
-      },
-    });
-
-    // Cleanup chunks
-    const chunkDir = path.join(CHUNKS_DIR, uploadId);
-    fs.rmSync(chunkDir, { recursive: true, force: true });
-    sessions.delete(uploadId);
-
-    await prisma.activityLog.create({
-      data: {
-        userId: session.userId,
-        action: 'FILE_UPLOAD_CHUNKED',
-        resource: 'file',
-        resourceId: file.id,
-        severity: 'INFO',
-      },
-    });
-
-    res.json({ ...file, size: file.size.toString(), filePath: finalName });
-  } catch (error) {
-    console.error('Complete upload error:', error);
-    res.status(500).json({ error: 'Failed to complete upload' });
-  }
-});
-
-// GET /api/upload/status/:uploadId
-router.get('/status/:uploadId', authenticateToken, async (req: Request, res: Response) => {
-  const session = sessions.get(req.params.uploadId);
-  if (!session || session.userId !== req.user!.userId) {
-    res.status(404).json({ error: 'Session not found' });
-    return;
-  }
-  const missing: number[] = [];
-  for (let i = 0; i < session.totalChunks; i++) {
-    if (!session.receivedChunks.has(i)) missing.push(i);
-  }
-  res.json({
+function serializeSession(session: ReturnType<ChunkedUploadManager['get']>) {
+  const missingChunks = getUploadManager().missingChunks(session);
+  return {
     uploadId: session.uploadId,
     fileName: session.fileName,
     fileSize: session.fileSize,
     totalChunks: session.totalChunks,
     receivedChunks: session.receivedChunks.size,
-    missingChunks: missing,
+    missingChunks,
     progress: Math.round((session.receivedChunks.size / session.totalChunks) * 100),
     paused: session.paused,
-  });
+  };
+}
+
+// POST /api/upload/init
+router.post('/init', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const session = getUploadManager().create(req.user!.userId, req.body || {});
+    res.json({
+      uploadId: session.uploadId,
+      chunkSize: getUploadManager().chunkSize,
+      maxFileSize: getUploadManager().maxFileSize,
+      expiresInMs: 60 * 60 * 1000,
+    });
+  } catch (error) {
+    sendUploadError(res, error, 'Failed to initialize upload');
+  }
 });
 
-// DELETE /api/upload/:uploadId - Cancel upload
-router.delete('/:uploadId', authenticateToken, async (req: Request, res: Response) => {
-  const session = sessions.get(req.params.uploadId);
-  if (!session || session.userId !== req.user!.userId) {
-    res.status(404).json({ error: 'Session not found' });
-    return;
+// POST /api/upload/chunk
+router.post('/chunk', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const uploadId = String(req.headers['x-upload-id'] || '');
+    if (!uploadId) throw new ChunkedUploadError('x-upload-id header is required');
+    const chunkIndex = parseChunkIndex(req.headers['x-chunk-index']);
+    const contentLength = parseContentLength(req.headers['content-length']);
+    const session = await getUploadManager().receiveChunk(
+      uploadId,
+      req.user!.userId,
+      chunkIndex,
+      req,
+      contentLength,
+    );
+    res.json({
+      received: chunkIndex,
+      total: session.totalChunks,
+      receivedCount: session.receivedChunks.size,
+      progress: Math.round((session.receivedChunks.size / session.totalChunks) * 100),
+    });
+  } catch (error) {
+    sendUploadError(res, error, 'Failed to upload chunk');
   }
-  const chunkDir = path.join(CHUNKS_DIR, session.uploadId);
-  if (fs.existsSync(chunkDir)) fs.rmSync(chunkDir, { recursive: true, force: true });
-  sessions.delete(session.uploadId);
-  res.json({ cancelled: true });
 });
+
+router.post('/pause', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const session = getUploadManager().setPaused(String(req.body?.uploadId || ''), req.user!.userId, true);
+    res.json({ paused: true, receivedChunks: session.receivedChunks.size });
+  } catch (error) {
+    sendUploadError(res, error, 'Failed to pause upload');
+  }
+});
+
+router.post('/resume', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const session = getUploadManager().setPaused(String(req.body?.uploadId || ''), req.user!.userId, false);
+    res.json(serializeSession(session));
+  } catch (error) {
+    sendUploadError(res, error, 'Failed to resume upload');
+  }
+});
+
+// POST /api/upload/complete
+router.post('/complete', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  const uploadId = String(req.body?.uploadId || '');
+  let assembledPath: string | undefined;
+  let finalPath: string | undefined;
+  let finalName: string | undefined;
+  let ownerId: string | undefined;
+  let createdFileId: string | undefined;
+  try {
+    const assembled = await getUploadManager().assemble(uploadId, req.user!.userId);
+    assembledPath = assembled.assembledPath;
+    const session = assembled.session;
+
+    const scanResult = await scanFile(assembledPath);
+    if (!scanResult.clean) {
+      getUploadManager().releaseCompletion(uploadId, req.user!.userId, assembledPath);
+      assembledPath = undefined;
+      if (scanResult.scannerAvailable) getUploadManager().cancel(uploadId, req.user!.userId);
+      await prisma.activityLog.create({
+        data: {
+          userId: req.user!.userId,
+          action: scanResult.scannerAvailable ? 'MALWARE_BLOCKED' : 'UPLOAD_SCAN_UNAVAILABLE',
+          resource: 'file',
+          severity: scanResult.scannerAvailable ? 'CRITICAL' : 'WARNING',
+          metadata: { filename: session.fileName, reason: scanResult.scannerAvailable ? scanResult.threat : 'scanner-unavailable' },
+        },
+      }).catch(() => {});
+      res.status(scanResult.scannerAvailable ? 400 : 503).json({
+        error: scanResult.scannerAvailable
+          ? `File rejected: malware detected (${scanResult.threat})`
+          : 'Upload completion is temporarily unavailable because malware scanning could not complete',
+      });
+      return;
+    }
+
+    ownerId = await getWorkspaceOwnerId(req.user!);
+    const userDir = getUserUploadDir(ownerId);
+
+    const ext = path.extname(session.fileName).slice(0, 32);
+    const base = path.basename(session.fileName, ext).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 160) || 'file';
+    finalName = `${base}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`;
+    finalPath = resolveContainedPath(userDir, finalName, { mustExist: false });
+    try {
+      fs.linkSync(assembledPath, finalPath);
+    } catch (error: any) {
+      if (!['EXDEV', 'EPERM', 'EMLINK'].includes(error?.code || '')) throw error;
+      fs.copyFileSync(assembledPath, finalPath, fs.constants.COPYFILE_EXCL);
+    }
+    fs.chmodSync(finalPath, 0o600);
+
+    const file = await prisma.file.create({
+      data: {
+        userId: ownerId,
+        path: finalName,
+        originalName: session.fileName,
+        size: BigInt(session.fileSize),
+        mimeType: mime.lookup(session.fileName) || 'application/octet-stream',
+      },
+    });
+    createdFileId = file.id;
+    const diskPath = ensureToolMirror(ownerId, finalPath, finalName);
+    const toolUrl = buildDirectFileUrl(file.id, req);
+    getUploadManager().finish(uploadId, req.user!.userId);
+
+    await prisma.activityLog.create({
+      data: {
+        userId: req.user!.userId,
+        action: 'FILE_UPLOAD_CHUNKED',
+        resource: 'file',
+        resourceId: file.id,
+        severity: 'INFO',
+      },
+    }).catch(() => {});
+
+    res.json({
+      ...file,
+      size: file.size.toString(),
+      filePath: finalName,
+      diskPath,
+      originalDiskPath: finalPath,
+      toolUrl,
+    });
+  } catch (error) {
+    if (createdFileId) {
+      try { await prisma.file.delete({ where: { id: createdFileId } }); } catch {}
+    }
+    if (ownerId && finalName) removeToolMirror(ownerId, finalName);
+    if (finalPath) {
+      try { fs.unlinkSync(finalPath); } catch {}
+    }
+    if (uploadId) {
+      try { getUploadManager().releaseCompletion(uploadId, req.user!.userId, assembledPath); } catch {}
+    }
+    sendUploadError(res, error, 'Failed to complete upload');
+  }
+});
+
+router.get('/status/:uploadId', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    res.json(serializeSession(getUploadManager().get(req.params.uploadId, req.user!.userId)));
+  } catch (error) {
+    sendUploadError(res, error, 'Failed to read upload status');
+  }
+});
+
+router.delete('/:uploadId', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    getUploadManager().cancel(req.params.uploadId, req.user!.userId);
+    res.json({ cancelled: true });
+  } catch (error) {
+    sendUploadError(res, error, 'Failed to cancel upload');
+  }
+});
+
+export const CHUNKED_UPLOAD_CONTRACT = {
+  chunkSize: PORTAL_UPLOAD_CHUNK_SIZE,
+  maxFileSize: PORTAL_UPLOAD_MAX_FILE_SIZE,
+};
 
 export default router;

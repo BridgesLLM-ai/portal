@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { copyTextToClipboard } from '../utils/clipboardCopy';
 import { useNavigate } from 'react-router-dom';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
@@ -12,6 +13,7 @@ import {
   Download,
   Eye,
   EyeOff,
+  ExternalLink,
   Globe,
   Loader2,
   Lock,
@@ -30,11 +32,90 @@ import client from '../api/client';
 import AiProviderSetup from '../components/ai-setup/AiProviderSetup';
 import { sounds } from '../utils/sounds';
 import { DEFAULT_REGISTRATION_MODE } from '../utils/securityDefaults';
+import {
+  refreshPublicSettings,
+  type PortalFeatureAvailability,
+  type PortalOriginMode,
+} from '../hooks/usePublicSettings';
+import {
+  buildSetupHttpsHandoffUrl,
+  getPostSetupDestination,
+  getPreviousSetupStep,
+  getSetupBrowserTransport,
+  getSetupLogoValidationError,
+  getSetupNavigationState,
+  isSetupAiRuntimeReady,
+  readSetupFragmentCredential,
+  scrubSetupSecretsFromUrl,
+  SETUP_LOGO_MIME_TYPES,
+  SETUP_SESSION_STORAGE_KEY,
+} from './setupWizardFlow';
 
 type ThemeMode = 'dark' | 'light' | 'system';
 type RegistrationMode = 'open' | 'approval' | 'closed';
 type AsyncState = 'idle' | 'loading' | 'success' | 'error';
 type DomainPath = 'domain' | 'skip';
+type BootstrapState = 'loading' | 'ready' | 'required' | 'error' | 'blocked';
+type WizardActionKind =
+  | 'check-dns'
+  | 'configure-domain'
+  | 'install-mail'
+  | 'test-email'
+  | 'install-coding-tool'
+  | 'pull-model'
+  | 'tailnet-onboarding'
+  | 'install-rd'
+  | 'complete'
+  | 'reinstall-reset';
+
+interface WizardActionOwner {
+  kind: WizardActionKind;
+  step: number;
+  label: string;
+  subject?: string;
+}
+
+interface SetupNavigationGuard {
+  token: string;
+  url: string;
+  baseState: unknown;
+  owner: WizardActionOwner | null;
+}
+
+const SETUP_NAVIGATION_GUARD_STATE_KEY = '__bridgesSetupActionGuard';
+const SETUP_STATUS_TIMEOUT_MS = 8_000;
+const SETUP_COMPLETION_TIMEOUT_MS = 30_000;
+
+function withSetupDeadline<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = globalThis.setTimeout(() => reject(new Error(message)), timeoutMs);
+    operation.then(
+      (value) => {
+        globalThis.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        globalThis.clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function setupNavigationGuardState(baseState: unknown, token: string) {
+  const nextState = baseState && typeof baseState === 'object'
+    ? { ...(baseState as Record<string, unknown>) }
+    : {};
+  nextState[SETUP_NAVIGATION_GUARD_STATE_KEY] = token;
+  return nextState;
+}
+
+function setupNavigationBaseState(state: unknown) {
+  if (!state || typeof state !== 'object') return state;
+  const nextState = { ...(state as Record<string, unknown>) };
+  delete nextState[SETUP_NAVIGATION_GUARD_STATE_KEY];
+  return nextState;
+}
 
 interface DnsRecord {
   type: string;
@@ -52,6 +133,14 @@ interface SystemInfoResponse {
   osName: string;
   currentDomain?: string;
   installProfile?: 'local' | 'server';
+  originMode?: PortalOriginMode;
+  featureCapabilities?: {
+    originMode: PortalOriginMode;
+    experimental: boolean;
+    privateNetworkOnly: boolean;
+    mail: PortalFeatureAvailability;
+    appHosting: PortalFeatureAvailability;
+  };
   components: Record<string, { installed: boolean; running?: boolean; version?: string }>;
 }
 
@@ -68,9 +157,12 @@ interface MailStatusResponse {
   available: boolean;
   configured: boolean;
   canSend: boolean;
+  dkimConfigured?: boolean;
   dnsRecords: DnsRecord[];
   domain?: string;
   hasDomain: boolean;
+  supported?: boolean;
+  reason?: string;
 }
 
 interface InstallMailResponse {
@@ -84,6 +176,10 @@ interface OllamaModelRecommendation {
   name: string;
   description: string;
   size: string;
+  minAvailableRamGb: number;
+  contextWindow: string;
+  useCase: 'general' | 'coding' | 'reasoning';
+  sourceUrl: string;
 }
 
 interface OllamaStatusResponse {
@@ -91,6 +187,8 @@ interface OllamaStatusResponse {
   endpoint: string;
   models: string[];
   ramGb: number;
+  availableRamGb: number;
+  reservedHeadroomGb: number;
   ramTier: string;
   warning: string | null;
   recommendedModels: OllamaModelRecommendation[];
@@ -98,10 +196,24 @@ interface OllamaStatusResponse {
 
 interface OpenClawStatusResponse {
   installed: boolean;
-  version: string;
+  version: string | null;
+  corePackageVersion: string | null;
+  runningVersion: string | null;
   gatewayRunning: boolean;
+  authenticatedRpc: boolean;
   gatewayUrl: string;
   hasToken: boolean;
+  tokenParity: boolean;
+  codexPluginVersion: string | null;
+  codexPluginInstallSpec: string | null;
+  credentialStoreReady: boolean;
+  credentialStoreWritable: boolean;
+  testedCorePackageVersion: string;
+  testedRuntimeVersion: string;
+  testedCodexPluginVersion: string;
+  testedPairReady: boolean;
+  ready: boolean;
+  blockers: Array<{ code: string; message: string }>;
   description: string;
 }
 
@@ -150,7 +262,7 @@ const SECURITY_FEATURES = [
   { icon: '👋', title: 'Welcome emails', description: 'Onboard new users automatically' },
 ];
 
-const inputClass = 'w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-white placeholder-slate-500 outline-none transition focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500';
+const inputClass = 'w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-white placeholder-slate-500 outline-none transition accent-focus';
 const cardClass = 'rounded-2xl border border-slate-800 bg-slate-900/70';
 
 function friendlyError(error: any, fallback: string) {
@@ -175,28 +287,22 @@ function validatePasswordPolicy(password: string): { valid: boolean; errors: str
 
 function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }) {
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
 
   const handleCopy = async () => {
-    try {
-      // navigator.clipboard requires HTTPS — fall back for plain HTTP
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(value);
-      } else {
-        const textarea = document.createElement('textarea');
-        textarea.value = value;
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand('copy');
-        document.body.removeChild(textarea);
-      }
+    setCopyFailed(false);
+    const copiedOk = await copyTextToClipboard(value);
+
+    if (copiedOk) {
       setCopied(true);
       sounds.success();
       setTimeout(() => setCopied(false), 1500);
-    } catch {
-      sounds.error();
+      return;
     }
+    // Never play a failure sound without saying what failed.
+    setCopyFailed(true);
+    sounds.error();
+    setTimeout(() => setCopyFailed(false), 4000);
   };
 
   return (
@@ -206,26 +312,33 @@ function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }
       className="inline-flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-300 transition hover:border-slate-600 hover:bg-slate-800"
     >
       {copied ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
-      <span className={copied ? 'text-emerald-400' : ''}>{copied ? 'Copied' : label}</span>
+      <span className={copied ? 'text-emerald-400' : copyFailed ? 'text-amber-400' : ''}>
+        {copied ? 'Copied' : copyFailed ? 'Select and copy manually' : label}
+      </span>
     </button>
   );
 }
 
-function PasswordInput({ value, onChange, placeholder }: { value: string; onChange: (value: string) => void; placeholder?: string }) {
+function PasswordInput({ id, value, onChange, ariaLabel, placeholder, disabled = false }: { id: string; value: string; onChange: (value: string) => void; ariaLabel: string; placeholder?: string; disabled?: boolean }) {
   const [show, setShow] = useState(false);
 
   return (
     <div className="relative">
       <input
+        id={id}
         type={show ? 'text' : 'password'}
         value={value}
         onChange={(event) => onChange(event.target.value)}
+        disabled={disabled}
+        aria-label={ariaLabel}
         placeholder={placeholder}
         className={`${inputClass} pr-11`}
       />
       <button
         type="button"
         onClick={() => setShow((current) => !current)}
+        disabled={disabled}
+        aria-label={`${show ? 'Hide' : 'Show'} ${ariaLabel.toLowerCase()}`}
         className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 transition hover:text-slate-200"
       >
         {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
@@ -236,7 +349,7 @@ function PasswordInput({ value, onChange, placeholder }: { value: string; onChan
 
 function StepIndicator({ currentStep }: { currentStep: number }) {
   return (
-    <div className="grid grid-cols-4 gap-2 md:grid-cols-8">
+    <div className="grid grid-cols-3 gap-2 sm:grid-cols-5 xl:grid-cols-9">
       {STEPS.map((step, index) => {
         const Icon = step.icon;
         const active = index === currentStep;
@@ -247,7 +360,7 @@ function StepIndicator({ currentStep }: { currentStep: number }) {
             <div
               className={[
                 'flex h-10 w-10 items-center justify-center rounded-full border transition-all',
-                active ? 'border-emerald-400 bg-emerald-500 text-white shadow-lg shadow-emerald-500/20 scale-105' : '',
+                active ? 'accent-active scale-105' : '',
                 complete ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : '',
                 !active && !complete ? 'border-slate-800 bg-slate-900 text-slate-500' : '',
               ].join(' ')}
@@ -284,41 +397,128 @@ export default function SetupWizardPage() {
   const navigate = useNavigate();
   const { restoreSession } = useAuthStore();
   const redirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bootstrapExchangeStartedRef = useRef(false);
 
-  // Extract one-time setup token from URL query param
-  const setupToken = useMemo(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.get('token') || '';
+  const browserTransport = useMemo(
+    () => getSetupBrowserTransport(window.location.protocol, window.location.hostname),
+    [],
+  );
+  const [initialFragmentCredential, setInitialFragmentCredential] = useState(
+    () => readSetupFragmentCredential(window.location.hash),
+  );
+  const [setupSessionToken, setSetupSessionToken] = useState(() => {
+    try { return window.sessionStorage.getItem(SETUP_SESSION_STORAGE_KEY) || ''; } catch { return ''; }
+  });
+  const setupSessionTokenRef = useRef(setupSessionToken);
+  setupSessionTokenRef.current = setupSessionToken;
+  const [bootstrapState, setBootstrapState] = useState<BootstrapState>(() => {
+    if (browserTransport === 'blocked') return 'blocked';
+    return 'loading';
+  });
+  const [bootstrapError, setBootstrapError] = useState('');
+
+  // Keep the non-secret navigation state resumable across HTTPS handoff,
+  // service restart, and an accidental refresh. Password fields are never
+  // persisted in browser storage or the URL.
+  const initialNavigation = useMemo(
+    () => getSetupNavigationState(window.location.search, STEPS.length - 1),
+    [],
+  );
+
+  const api = client;
+
+  useEffect(() => {
+    // Fragments are not sent to the server, and this removes them before any
+    // user navigation, copy, screenshot, or external provider flow.
+    const scrubbed = scrubSetupSecretsFromUrl(window.location.href);
+    if (scrubbed !== window.location.href) {
+      window.history.replaceState(window.history.state, '', scrubbed);
+    }
   }, []);
 
-  // Restore step from URL (used after HTTP→HTTPS redirect preserves progress)
-  const initialStep = useMemo(() => {
-    const params = new URLSearchParams(window.location.search);
-    const s = parseInt(params.get('step') || '0', 10);
-    return Number.isFinite(s) && s >= 0 && s <= 8 ? s : 0;
-  }, []);
-
-  // Setup-aware API helper — attaches token to every setup call
-  const setupClient = useMemo(() => {
-    const instance = client;
-    // Add interceptor to inject setup token
-    const interceptorId = instance.interceptors.request.use((cfg) => {
-      if (setupToken && cfg.url?.startsWith('/setup/') && cfg.url !== '/setup/status') {
+  useEffect(() => {
+    const interceptorId = api.interceptors.request.use((cfg) => {
+      if (
+        setupSessionTokenRef.current
+        && cfg.url?.startsWith('/setup/')
+        && cfg.url !== '/setup/status'
+        && !cfg.url.startsWith('/setup/bootstrap')
+      ) {
         cfg.headers = cfg.headers || {};
-        cfg.headers['x-setup-token'] = setupToken;
+        cfg.headers.Authorization = `Bearer ${setupSessionTokenRef.current}`;
       }
       return cfg;
     });
-    // Return cleanup for the interceptor
-    return { client: instance, interceptorId };
-  }, [setupToken]);
+    return () => api.interceptors.request.eject(interceptorId);
+  }, [api]);
 
-  // Shortcut
-  const api = setupClient.client;
+  useEffect(() => {
+    if (browserTransport === 'blocked') {
+      setBootstrapState('blocked');
+      return;
+    }
+    if (bootstrapExchangeStartedRef.current) return;
+    bootstrapExchangeStartedRef.current = true;
+    setBootstrapState('loading');
 
-  const [step, setStep] = useState(initialStep);
+    // Ask the server to classify the real socket/proxy path before sending any
+    // bootstrap or resumed bearer. Browser hostname checks alone cannot prove
+    // that "localhost" was not forwarded through an exposed reverse proxy.
+    withSetupDeadline(
+      api.get('/setup/status', { params: { _transport: Date.now() }, timeout: SETUP_STATUS_TIMEOUT_MS }),
+      SETUP_STATUS_TIMEOUT_MS,
+      'The setup transport check timed out.',
+    )
+      .then(async ({ data: status }) => {
+        if (!status?.setupTransport || status.setupTransport.allowed !== true) {
+          const reason = String(status?.setupTransport?.reason || 'The server could not verify HTTPS or a true loopback connection.');
+          setBootstrapError(reason);
+          setBootstrapState(status?.setupTransport?.allowed === false ? 'blocked' : 'error');
+          return null;
+        }
+        if (setupSessionToken && !initialFragmentCredential) {
+          setBootstrapState('ready');
+          return null;
+        }
+        if (!initialFragmentCredential) {
+          setBootstrapState('required');
+          return null;
+        }
+
+        const isHandoff = initialFragmentCredential.kind === 'handoff';
+        const endpoint = isHandoff ? '/setup/bootstrap/handoff' : '/setup/bootstrap';
+        const header = isHandoff ? 'x-setup-handoff' : 'x-setup-bootstrap';
+        const oneTimeCredential = initialFragmentCredential.value;
+        setInitialFragmentCredential(null);
+        return api.post(endpoint, {}, { headers: { [header]: oneTimeCredential } });
+      })
+      .then((response) => {
+        if (!response) return;
+        const { data } = response;
+        const nextToken = String(data?.setupToken || '');
+        if (!/^[A-Za-z0-9_-]{32,512}$/.test(nextToken)) {
+          throw new Error('Portal returned an invalid setup session.');
+        }
+        try { window.sessionStorage.setItem(SETUP_SESSION_STORAGE_KEY, nextToken); } catch {}
+        setupSessionTokenRef.current = nextToken;
+        setSetupSessionToken(nextToken);
+        setBootstrapError('');
+        setBootstrapState('ready');
+      })
+      .catch((err: any) => {
+        try { window.sessionStorage.removeItem(SETUP_SESSION_STORAGE_KEY); } catch {}
+        setupSessionTokenRef.current = '';
+        setSetupSessionToken('');
+        setBootstrapError(friendlyError(err, 'The protected setup link could not be exchanged. Re-run the installer with --reinstall for a new link.'));
+        setBootstrapState('error');
+      });
+  }, [api, browserTransport, initialFragmentCredential, setupSessionToken]);
+
+  const [step, setStep] = useState(initialNavigation.step);
+  const [quickSetup, setQuickSetup] = useState(initialNavigation.quickSetup);
   const [error, setError] = useState('');
   const [setupComplete, setSetupComplete] = useState(false);
+  const [setupRecoveryError, setSetupRecoveryError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
   const [name, setName] = useState('');
@@ -342,9 +542,9 @@ export default function SetupWizardPage() {
   const [domainPath, setDomainPath] = useState<DomainPath>('domain');
   const [domain, setDomain] = useState('');
   const [dnsStatus, setDnsStatus] = useState<DnsCheckResponse | null>(null);
-  const [dnsState, setDnsState] = useState<AsyncState>('idle');
   const [domainConfigState, setDomainConfigState] = useState<AsyncState>('idle');
   const [configuredDomainUrl, setConfiguredDomainUrl] = useState('');
+  const [domainHandoffToken, setDomainHandoffToken] = useState('');
   const [domainMessage, setDomainMessage] = useState('');
 
   const [tokenInvalid, setTokenInvalid] = useState(false);
@@ -362,16 +562,121 @@ export default function SetupWizardPage() {
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatusResponse | null>(null);
   const [ollamaState, setOllamaState] = useState<AsyncState>('idle');
   const [pullingModel, setPullingModel] = useState('');
+  const [tailnetRequested, setTailnetRequested] = useState(false);
   const [openClawStatus, setOpenClawStatus] = useState<OpenClawStatusResponse | null>(null);
   const [openClawState, setOpenClawState] = useState<AsyncState>('idle');
   const [codingToolsStatus, setCodingToolsStatus] = useState<CodingToolStatusResponse | null>(null);
-  const [installingTool, setInstallingTool] = useState('');
 
   const [rdSetupState, setRdSetupState] = useState<AsyncState>('idle');
   const [rdSetupMessage, setRdSetupMessage] = useState('');
   const [rdSetupSteps, setRdSetupSteps] = useState<Array<{ step: string; ok: boolean; message: string }>>([]);
+  const wizardActionRef = useRef<WizardActionOwner | null>(null);
+  const setupNavigationGuardRef = useRef<SetupNavigationGuard | null>(null);
+  const setupLifecycleGenerationRef = useRef(0);
+  const [activeWizardAction, setActiveWizardAction] = useState<WizardActionOwner | null>(null);
+  const aiRuntimeReady = useMemo(() => isSetupAiRuntimeReady(openClawStatus), [openClawStatus]);
 
-  const progress = useMemo(() => ((step + 1) / STEPS.length) * 100, [step]);
+  const finishWizardAction = useCallback((owner: WizardActionOwner) => {
+    if (wizardActionRef.current !== owner) return;
+    wizardActionRef.current = null;
+    setActiveWizardAction((current) => current === owner ? null : current);
+  }, []);
+
+  const claimWizardAction = useCallback((owner: WizardActionOwner) => {
+    if (wizardActionRef.current) return null;
+
+    const existingGuard = setupNavigationGuardRef.current;
+    const currentState = window.history.state as Record<string, unknown> | null;
+    if (
+      existingGuard
+      && existingGuard.owner === null
+      && currentState?.[SETUP_NAVIGATION_GUARD_STATE_KEY] === existingGuard.token
+    ) {
+      existingGuard.url = window.location.href;
+      existingGuard.baseState = setupNavigationBaseState(currentState);
+      existingGuard.owner = owner;
+      setupLifecycleGenerationRef.current += 1;
+      wizardActionRef.current = owner;
+      setActiveWizardAction(owner);
+      return owner;
+    }
+
+    const baseState = setupNavigationBaseState(window.history.state);
+    const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const url = window.location.href;
+    try {
+      window.history.replaceState(baseState, '', url);
+      window.history.pushState(setupNavigationGuardState(baseState, token), '', url);
+    } catch {
+      setError('This setup step could not lock browser navigation. Reload the protected setup link and retry.');
+      return null;
+    }
+
+    setupNavigationGuardRef.current = { token, url, baseState, owner };
+    setupLifecycleGenerationRef.current += 1;
+    wizardActionRef.current = owner;
+    setActiveWizardAction(owner);
+    return owner;
+  }, []);
+
+  const releaseWizardAction = useCallback((owner: WizardActionOwner) => {
+    if (wizardActionRef.current !== owner) return;
+    const guard = setupNavigationGuardRef.current;
+    if (guard?.owner === owner) {
+      guard.owner = null;
+    }
+    finishWizardAction(owner);
+  }, [finishWizardAction]);
+
+  const navigateAfterWizardAction = useCallback((owner: WizardActionOwner, target: string) => {
+    if (wizardActionRef.current !== owner) return;
+    const guard = setupNavigationGuardRef.current;
+    const state = window.history.state as Record<string, unknown> | null;
+    if (guard?.owner === owner && state?.[SETUP_NAVIGATION_GUARD_STATE_KEY] === guard.token) {
+      // Collapse the same-URL sentinel first, then replace the underlying Setup
+      // entry. Browser Back from the destination must not reopen an invalid,
+      // already-consumed setup session.
+      setupNavigationGuardRef.current = null;
+      const completeNavigation = (event: PopStateEvent) => {
+        event.stopImmediatePropagation();
+        finishWizardAction(owner);
+        navigate(target, { replace: true });
+      };
+      window.addEventListener('popstate', completeNavigation, { capture: true, once: true });
+      window.history.back();
+      return;
+    }
+    setupNavigationGuardRef.current = null;
+    finishWizardAction(owner);
+    navigate(target, { replace: true });
+  }, [finishWizardAction, navigate]);
+
+  const navigateAfterSetupRecovery = useCallback((target: string) => {
+    const guard = setupNavigationGuardRef.current;
+    const state = window.history.state as Record<string, unknown> | null;
+    if (guard && state?.[SETUP_NAVIGATION_GUARD_STATE_KEY] === guard.token) {
+      setupNavigationGuardRef.current = null;
+      const completeNavigation = (event: PopStateEvent) => {
+        event.stopImmediatePropagation();
+        navigate(target, { replace: true });
+      };
+      window.addEventListener('popstate', completeNavigation, { capture: true, once: true });
+      window.history.back();
+      return;
+    }
+    navigate(target, { replace: true });
+  }, [navigate]);
+
+  const wizardActionActive = activeWizardAction !== null;
+  const ownsWizardAction = (kind: WizardActionKind, subject?: string) => (
+    activeWizardAction?.kind === kind
+    && (subject === undefined || activeWizardAction.subject === subject)
+  );
+
+  const progress = useMemo(
+    () => quickSetup ? (step === 0 ? 50 : 100) : ((step + 1) / STEPS.length) * 100,
+    [quickSetup, step],
+  );
   const emailLooksValid = useMemo(() => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email), [email]);
   const passwordPolicy = useMemo(() => validatePasswordPolicy(password), [password]);
   const adminStepValid = useMemo(
@@ -379,21 +684,27 @@ export default function SetupWizardPage() {
     [confirmPassword, emailLooksValid, name, password, passwordPolicy.valid],
   );
   const domainConfigured = useMemo(() => Boolean(configuredDomainUrl || mailStatus?.domain || dnsStatus?.pointsToUs), [configuredDomainUrl, mailStatus?.domain, dnsStatus?.pointsToUs]);
+  const setupMailCapability = systemInfo?.featureCapabilities?.mail;
+  const setupMailAvailable = setupMailCapability?.available !== false;
+  const isTailnetOrigin = systemInfo?.originMode === 'tailnet';
 
   const goNext = () => {
+    if (wizardActionRef.current) return;
     sounds.click();
     setError('');
 
     // If domain/HTTPS was configured while we're still on HTTP, use Next as the
     // explicit handoff into the secure portal instead of auto-redirecting.
     if (step === 1 && configuredDomainUrl && window.location.protocol === 'http:') {
-      const newUrl = new URL(window.location.href);
-      const httpsBase = new URL(configuredDomainUrl);
-      newUrl.protocol = httpsBase.protocol;
-      newUrl.hostname = httpsBase.hostname;
-      newUrl.port = httpsBase.port || '';
-      newUrl.searchParams.set('step', String(step + 1));
-      window.location.href = newUrl.toString();
+      if (!domainHandoffToken) {
+        setError('HTTPS has not been proven yet. Retry Configure HTTPS while keeping the SSH tunnel open.');
+        return;
+      }
+      window.location.href = buildSetupHttpsHandoffUrl({
+        targetUrl: configuredDomainUrl,
+        handoffToken: domainHandoffToken,
+        navigation: { step: step + 1, quickSetup },
+      });
       return;
     }
 
@@ -401,30 +712,96 @@ export default function SetupWizardPage() {
   };
 
   const goBack = () => {
+    if (wizardActionRef.current) return;
     sounds.click();
     setError('');
-    setStep((current) => Math.max(current - 1, 0));
+    const previous = getPreviousSetupStep({ step, quickSetup });
+    setQuickSetup(previous.quickSetup);
+    setStep(previous.step);
   };
 
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    url.searchParams.set('step', String(step));
+    if (quickSetup) url.searchParams.set('mode', 'quick');
+    else url.searchParams.delete('mode');
+    window.history.replaceState(window.history.state, '', url.toString());
+  }, [quickSetup, step]);
+
+  useEffect(() => {
+    const blockUnload = (event: BeforeUnloadEvent) => {
+      if (!wizardActionRef.current) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+
+    const blockHistoryBack = (event: PopStateEvent) => {
+      const guard = setupNavigationGuardRef.current;
+      if (!guard) return;
+      const state = event.state as Record<string, unknown> | null;
+
+      if (!guard.owner) {
+        if (state?.[SETUP_NAVIGATION_GUARD_STATE_KEY] === guard.token) return;
+        // The current page owns one same-URL sentinel entry. When no mutation
+        // is running, transparently skip that entry so a normal Back still
+        // leaves Setup in one user action.
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setupNavigationGuardRef.current = null;
+        window.history.back();
+        return;
+      }
+
+      if (state?.[SETUP_NAVIGATION_GUARD_STATE_KEY] === guard.token) return;
+
+      // The guard entry uses the exact same URL as the live setup step. Restore
+      // it synchronously and stop Router's listener before a same-document Back
+      // can unmount the wizard while host work is still running.
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      window.history.pushState(
+        setupNavigationGuardState(guard.baseState, guard.token),
+        '',
+        guard.url,
+      );
+    };
+
+    window.addEventListener('beforeunload', blockUnload);
+    window.addEventListener('popstate', blockHistoryBack, true);
+    return () => {
+      window.removeEventListener('beforeunload', blockUnload);
+      window.removeEventListener('popstate', blockHistoryBack, true);
+    };
+  }, [finishWizardAction]);
+
+  const invalidateSetupSession = useCallback((message: string) => {
+    try { window.sessionStorage.removeItem(SETUP_SESSION_STORAGE_KEY); } catch {}
+    setupSessionTokenRef.current = '';
+    setSetupSessionToken('');
+    setTokenInvalid(true);
+    setBootstrapError(message);
+  }, []);
+
   const loadSystemInfo = useCallback(async () => {
+    if (bootstrapState !== 'ready') return;
     setSystemInfoState('loading');
     try {
       const { data } = await api.get<SystemInfoResponse>('/setup/system-info');
       setSystemInfo(data);
       setSystemInfoState('success');
-      if (data.currentDomain) {
+      if (data.currentDomain && data.originMode !== 'tailnet') {
         setDomain(data.currentDomain);
         setConfiguredDomainUrl(`https://${data.currentDomain}`);
       }
     } catch (err: any) {
-      if (err?.response?.status === 403 && err?.response?.data?.error?.includes('setup token')) {
-        setTokenInvalid(true);
+      if ([403, 410, 426].includes(Number(err?.response?.status))) {
+        invalidateSetupSession(friendlyError(err, 'This setup session is no longer valid. Re-run the installer with --reinstall for a new protected link.'));
         return;
       }
       setSystemInfoState('error');
       setError(friendlyError(err, 'Could not load server details right now.'));
     }
-  }, [api]);
+  }, [api, bootstrapState, invalidateSetupSession]);
 
   const loadMailStatus = useCallback(async () => {
     setMailStatusState('loading');
@@ -437,11 +814,11 @@ export default function SetupWizardPage() {
         setDomain(data.domain);
         setConfiguredDomainUrl(`https://${data.domain}`);
       }
-    } catch (err) {
+    } catch {
       setMailStatusState('error');
       setMailStatus(null);
     }
-  }, []);
+  }, [api]);
 
   const loadAiStatus = useCallback(async () => {
     setOllamaState('loading');
@@ -458,7 +835,7 @@ export default function SetupWizardPage() {
       setCodingToolsStatus(codingTools);
       setOllamaState('success');
       setOpenClawState('success');
-    } catch (err) {
+    } catch {
       try {
         const { data } = await api.get<OllamaStatusResponse>('/setup/ollama-status');
         setOllamaStatus(data);
@@ -490,25 +867,50 @@ export default function SetupWizardPage() {
   const [reinstallSubmitting, setReinstallSubmitting] = useState(false);
 
   useEffect(() => {
-    api.get('/setup/status').then(({ data }) => {
+    let cancelled = false;
+    const lifecycleGeneration = setupLifecycleGenerationRef.current;
+    withSetupDeadline(
+      api.get('/setup/status', { timeout: SETUP_STATUS_TIMEOUT_MS }),
+      SETUP_STATUS_TIMEOUT_MS,
+      'The setup status check timed out.',
+    ).then(({ data }) => {
+      if (
+        cancelled
+        || lifecycleGeneration !== setupLifecycleGenerationRef.current
+        || wizardActionRef.current
+      ) return;
+      const persistedTailnetRequest = data?.tailnetOnboarding?.phase === 'REQUESTED';
+      setTailnetRequested(persistedTailnetRequest);
       if (data.isReinstall) {
         setIsReinstall(true);
         if (data.ownerHint) setOwnerHint(data.ownerHint);
       } else if (!data.needsSetup) {
-        navigate('/login', { replace: true });
+        const destination = getPostSetupDestination({
+          quickSetup: false,
+          aiRuntimeReady: true,
+          tailnetRequested: persistedTailnetRequest,
+        });
+        navigateAfterSetupRecovery(
+          persistedTailnetRequest
+            ? `/login?setup=complete&redirect=${encodeURIComponent(destination)}`
+            : '/login',
+        );
       }
     }).catch(() => undefined);
-  }, [navigate]);
+    return () => { cancelled = true; };
+  }, [api, navigateAfterSetupRecovery]);
 
+  const clearRedirectTimer = useCallback(() => {
+    if (redirectTimerRef.current) {
+      clearTimeout(redirectTimerRef.current);
+      redirectTimerRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
-    loadSystemInfo();
-    return () => {
-      if (redirectTimerRef.current) clearTimeout(redirectTimerRef.current);
-      // Clean up setup token interceptor
-      api.interceptors.request.eject(setupClient.interceptorId);
-    };
-  }, [loadSystemInfo, api, setupClient.interceptorId]);
+    if (bootstrapState === 'ready') void loadSystemInfo();
+    return () => clearRedirectTimer();
+  }, [bootstrapState, loadSystemInfo, clearRedirectTimer]);
 
   const loadMailPreflight = useCallback(async () => {
     setPreflightState('loading');
@@ -522,12 +924,13 @@ export default function SetupWizardPage() {
   }, [api]);
 
   useEffect(() => {
-    if (step === 5 && mailStatusState === 'idle') {
+    if (bootstrapState !== 'ready') return;
+    if (step === 5 && systemInfo && setupMailAvailable && mailStatusState === 'idle') {
       loadMailStatus();
       if (preflightState === 'idle') loadMailPreflight();
     }
     if (step === 6 && (ollamaState === 'idle' || openClawState === 'idle')) loadAiStatus();
-  }, [step, mailStatusState, ollamaState, openClawState, preflightState, loadMailStatus, loadMailPreflight, loadAiStatus]);
+  }, [bootstrapState, step, systemInfo, setupMailAvailable, mailStatusState, ollamaState, openClawState, preflightState, loadMailStatus, loadMailPreflight, loadAiStatus]);
 
   const reinstallPasswordPolicy = useMemo(() => validatePasswordPolicy(reinstallPassword), [reinstallPassword]);
   const reinstallFormValid = useMemo(
@@ -538,40 +941,85 @@ export default function SetupWizardPage() {
   const handleLogoChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
+    const validationError = getSetupLogoValidationError(file);
+    if (validationError) {
+      setLogoFile(null);
+      setLogoPreview('');
+      setError(validationError);
+      event.target.value = '';
+      return;
+    }
+    setError('');
     setLogoFile(file);
-    const reader = new FileReader();
-    reader.onload = () => setLogoPreview(String(reader.result || ''));
-    reader.readAsDataURL(file);
   };
 
+  useEffect(() => {
+    if (!logoFile) {
+      setLogoPreview('');
+      return;
+    }
+    const previewUrl = URL.createObjectURL(logoFile);
+    setLogoPreview(previewUrl);
+    return () => URL.revokeObjectURL(previewUrl);
+  }, [logoFile]);
+
   const handleCheckDns = async () => {
-    if (!domain.trim()) return;
-    setDnsState('loading');
+    const domainSnapshot = domain.trim();
+    if (!domainSnapshot) return;
+    const owner = claimWizardAction({
+      kind: 'check-dns',
+      step,
+      label: 'Checking DNS…',
+      subject: domainSnapshot,
+    });
+    if (!owner) return;
     setDomainMessage('');
     setDnsStatus(null);
     try {
-      const { data } = await api.post<DnsCheckResponse>('/setup/check-dns', { domain: domain.trim() });
+      const { data } = await api.post<DnsCheckResponse>('/setup/check-dns', { domain: domainSnapshot });
       setDnsStatus(data);
-      setDnsState('success');
       setDomainMessage(data.message);
       if (data.pointsToUs) sounds.success();
     } catch (err) {
-      setDnsState('error');
       setDomainMessage(friendlyError(err, 'DNS lookup failed. Double-check your domain and try again.'));
       sounds.error();
+    } finally {
+      releaseWizardAction(owner);
     }
   };
 
   const handleConfigureDomain = async () => {
-    if (!domain.trim()) return;
+    const domainSnapshot = domain.trim();
+    if (!domainSnapshot) return;
+    const owner = claimWizardAction({
+      kind: 'configure-domain',
+      step,
+      label: 'Configuring HTTPS…',
+      subject: domainSnapshot,
+    });
+    if (!owner) return;
     setDomainConfigState('loading');
     setDomainMessage('');
+    setConfiguredDomainUrl('');
+    setDomainHandoffToken('');
     try {
-      const { data } = await api.post<{ success: boolean; url: string; message: string; httpsReady?: boolean }>('/setup/configure-domain', { domain: domain.trim() });
-      setConfiguredDomainUrl(data.url);
-      setDomainConfigState('success');
-      setDomainMessage(data.httpsReady === false ? `${data.message} (HTTPS certificate is still being provisioned — it may take a moment)` : data.message);
-      sounds.success();
+      const { data } = await api.post<{
+        success: boolean;
+        url: string;
+        message: string;
+        httpsReady: boolean;
+        handoffToken?: string;
+      }>('/setup/configure-domain', { domain: domainSnapshot });
+      if (data.httpsReady && data.url && data.handoffToken) {
+        setConfiguredDomainUrl(data.url);
+        setDomainHandoffToken(data.handoffToken);
+        setDomainConfigState('success');
+        setDomainMessage(data.message);
+        sounds.success();
+      } else {
+        setDomainConfigState('idle');
+        setDomainMessage(data.message || 'HTTPS is not proven yet. Keep the SSH tunnel open and retry.');
+      }
 
       // Do NOT auto-redirect. The DNS/TLS handoff can race the first browser
       // navigation even when the cert is basically ready. Show a clear CTA and
@@ -583,10 +1031,14 @@ export default function SetupWizardPage() {
       setDomainConfigState('error');
       setDomainMessage(friendlyError(err, 'HTTPS setup failed. Please confirm DNS is pointed here and try again.'));
       sounds.error();
+    } finally {
+      releaseWizardAction(owner);
     }
   };
 
   const handleInstallMail = async () => {
+    const owner = claimWizardAction({ kind: 'install-mail', step, label: 'Setting up email…' });
+    if (!owner) return;
     setInstallMailState('loading');
     setInstallMailMessage('Pulling the mail server image and preparing security features...');
     try {
@@ -600,20 +1052,32 @@ export default function SetupWizardPage() {
       setInstallMailState('error');
       setInstallMailMessage(friendlyError(err, 'Email setup failed. You can skip this for now and come back later.'));
       sounds.error();
+    } finally {
+      releaseWizardAction(owner);
     }
   };
 
   const handleTestEmail = async () => {
-    if (!emailLooksValid) {
+    if (wizardActionRef.current) return;
+    const emailSnapshot = email.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailSnapshot)) {
       setTestEmailState('error');
       setTestEmailMessage('Enter a valid admin email first so we know where to send the test message.');
       return;
     }
 
+    const owner = claimWizardAction({
+      kind: 'test-email',
+      step,
+      label: 'Sending test email…',
+      subject: emailSnapshot,
+    });
+    if (!owner) return;
+
     setTestEmailState('loading');
     setTestEmailMessage('Sending a test email...');
     try {
-      const { data } = await api.post<{ success: boolean; message: string }>('/setup/test-email', { email });
+      const { data } = await api.post<{ success: boolean; message: string }>('/setup/test-email', { email: emailSnapshot });
       setTestEmailState('success');
       setTestEmailMessage(data.message || 'Test email sent.');
       sounds.success();
@@ -621,67 +1085,194 @@ export default function SetupWizardPage() {
       setTestEmailState('error');
       setTestEmailMessage(friendlyError(err, 'The test email did not send. Check your DNS records and try again later.'));
       sounds.error();
+    } finally {
+      releaseWizardAction(owner);
     }
   };
 
   const handlePullModel = async (model: string) => {
-    setPullingModel(model);
+    const modelSnapshot = model.trim();
+    if (!modelSnapshot) return;
+    const owner = claimWizardAction({
+      kind: 'pull-model',
+      step,
+      label: `Pulling ${modelSnapshot}…`,
+      subject: modelSnapshot,
+    });
+    if (!owner) return;
+    setError('');
+    setPullingModel(modelSnapshot);
     try {
-      await api.post('/setup/ollama-pull', { model });
+      await api.post('/setup/ollama-pull', { model: modelSnapshot });
       sounds.success();
       await loadAiStatus();
     } catch (err) {
-      setError(friendlyError(err, `Could not pull ${model}. Try again in a minute.`));
+      setError(friendlyError(err, `Could not pull ${modelSnapshot}. Try again in a minute.`));
       sounds.error();
     } finally {
       setPullingModel('');
+      releaseWizardAction(owner);
+    }
+  };
+
+  const handleInstallCodingTool = async (tool: CodingToolStatusResponse['tools'][number]) => {
+    const toolSnapshot = { id: tool.id, name: tool.name };
+    const owner = claimWizardAction({
+      kind: 'install-coding-tool',
+      step,
+      label: `Installing ${toolSnapshot.name}…`,
+      subject: toolSnapshot.id,
+    });
+    if (!owner) return;
+    setError('');
+    try {
+      await api.post('/setup/install-coding-tool', { toolId: toolSnapshot.id });
+      await loadAiStatus();
+      sounds.success();
+    } catch (err: any) {
+      setError(friendlyError(err, `Failed to install ${toolSnapshot.name}`));
+      sounds.error();
+    } finally {
+      releaseWizardAction(owner);
+    }
+  };
+
+  const handleRdSetup = async () => {
+    const owner = claimWizardAction({ kind: 'install-rd', step, label: 'Setting up Remote Desktop…' });
+    if (!owner) return;
+    setRdSetupState('loading');
+    setRdSetupMessage('Installing packages and configuring services… this can take 1–2 minutes.');
+    setRdSetupSteps([]);
+    try {
+      const res = await api.post('/setup/install-rd');
+      setRdSetupState(res.data.ok ? 'success' : 'error');
+      setRdSetupMessage(res.data.message || '');
+      setRdSetupSteps(res.data.steps || []);
+      if (res.data.ok) sounds.success();
+      else sounds.error();
+    } catch (err: any) {
+      setRdSetupState('error');
+      setRdSetupMessage(err?.response?.data?.message || err?.message || 'Setup failed');
+      setRdSetupSteps([]);
+      sounds.error();
+    } finally {
+      releaseWizardAction(owner);
+    }
+  };
+
+  const handleTailnetOnboardingToggle = async () => {
+    const requested = !tailnetRequested;
+    const owner = claimWizardAction({
+      kind: 'tailnet-onboarding',
+      step,
+      label: requested
+        ? 'Saving Remote GPU handoff…'
+        : 'Removing Remote GPU handoff…',
+    });
+    if (!owner) return;
+    setError('');
+    try {
+      const { data } = await api.post('/setup/tailnet-onboarding', {
+        requested,
+      });
+      setTailnetRequested(data?.phase === 'REQUESTED');
+      sounds.success();
+    } catch (err) {
+      setError(friendlyError(
+        err,
+        'The Remote GPU handoff choice could not be saved. Retry before leaving setup.',
+      ));
+      sounds.error();
+    } finally {
+      releaseWizardAction(owner);
     }
   };
 
   const handleComplete = async () => {
-    if (name.trim().length < 2 || !emailLooksValid) {
+    if (wizardActionRef.current) return;
+    const snapshot = {
+      name: name.trim(),
+      email: email.trim(),
+      password,
+      confirmPassword,
+      portalName: portalName.trim() || 'My AI Portal',
+      theme,
+      accentColor,
+      logoFile,
+      registrationMode,
+      allowTelemetry,
+      searchEngineVisibility,
+      quickSetup,
+      aiRuntimeReady,
+      tailnetRequested,
+    };
+    const snapshotPasswordPolicy = validatePasswordPolicy(snapshot.password);
+
+    if (snapshot.name.length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(snapshot.email)) {
       setError('Finish the admin account step before launching the portal.');
       return;
     }
 
-    if (!passwordPolicy.valid) {
+    if (!snapshotPasswordPolicy.valid) {
       setError(PASSWORD_POLICY_HINT);
       return;
     }
 
-    if (password !== confirmPassword) {
+    if (snapshot.password !== snapshot.confirmPassword) {
       setError('Passwords must match before launching the portal.');
       return;
     }
 
+    const owner = claimWizardAction({ kind: 'complete', step, label: 'Completing setup…' });
+    if (!owner) return;
+
     setSubmitting(true);
     setError('');
+    setSetupRecoveryError('');
+    let completionRequestStarted = false;
+    let completionRequestConfirmed = false;
     try {
       let logoUrl = '';
-      if (logoFile) {
+      if (snapshot.logoFile) {
         const formData = new FormData();
-        formData.append('file', logoFile);
-        const { data } = await api.post<{ url: string }>('/setup/upload-logo', formData, {
-          headers: { 'Content-Type': 'multipart/form-data' },
-        });
+        formData.append('file', snapshot.logoFile);
+        const { data } = await withSetupDeadline(
+          api.post<{ url: string }>('/setup/upload-logo', formData, {
+            headers: { 'Content-Type': 'multipart/form-data' },
+            timeout: SETUP_COMPLETION_TIMEOUT_MS,
+          }),
+          SETUP_COMPLETION_TIMEOUT_MS,
+          'The logo upload timed out before setup was submitted.',
+        );
         logoUrl = data.url;
       }
 
-      await api.post('/setup/complete', {
-        name,
-        email,
-        password,
-        portalName: portalName || 'My AI Portal',
-        theme,
-        accentColor,
-        logoUrl: logoUrl || undefined,
-        registrationMode,
-        allowTelemetry,
-        searchEngineVisibility,
-      });
+      completionRequestStarted = true;
+      await withSetupDeadline(
+        api.post('/setup/complete', {
+          name: snapshot.name,
+          email: snapshot.email,
+          password: snapshot.password,
+          portalName: snapshot.portalName,
+          theme: snapshot.theme,
+          accentColor: snapshot.accentColor,
+          logoUrl: logoUrl || undefined,
+          registrationMode: snapshot.registrationMode,
+          allowTelemetry: snapshot.allowTelemetry,
+          searchEngineVisibility: snapshot.searchEngineVisibility,
+          tailnetRequested: snapshot.tailnetRequested,
+        }, { timeout: SETUP_COMPLETION_TIMEOUT_MS }),
+        SETUP_COMPLETION_TIMEOUT_MS,
+        'The setup completion request timed out. Portal is checking whether it committed before allowing a retry.',
+      );
+      completionRequestConfirmed = true;
 
-      localStorage.setItem('theme', theme);
-      localStorage.setItem('accentColor', accentColor);
+      try { window.sessionStorage.removeItem(SETUP_SESSION_STORAGE_KEY); } catch {}
+      setupSessionTokenRef.current = '';
+      setSetupSessionToken('');
+
+      localStorage.setItem('theme', snapshot.theme);
+      localStorage.setItem('accentColor', snapshot.accentColor);
       sounds.success();
       setSetupComplete(true);
 
@@ -702,42 +1293,120 @@ export default function SetupWizardPage() {
         return false;
       };
 
-      await waitForServer();
-      const restored = await restoreSession();
+      const serverReady = await waitForServer();
+      if (!serverReady) throw new Error('Portal did not become healthy before the restart deadline.');
+      await withSetupDeadline(
+        refreshPublicSettings(),
+        SETUP_STATUS_TIMEOUT_MS,
+        'Public settings did not refresh before the recovery deadline.',
+      );
+      const restored = await withSetupDeadline(
+        restoreSession(),
+        SETUP_STATUS_TIMEOUT_MS,
+        'Session recovery did not finish before the recovery deadline.',
+      );
       if (restored) {
-        navigate('/dashboard', { replace: true });
+        navigateAfterWizardAction(owner, getPostSetupDestination({
+          quickSetup: snapshot.quickSetup,
+          aiRuntimeReady: snapshot.aiRuntimeReady,
+          tailnetRequested: snapshot.tailnetRequested,
+        }));
+      } else {
+        const destination = getPostSetupDestination({
+          quickSetup: snapshot.quickSetup,
+          aiRuntimeReady: snapshot.aiRuntimeReady,
+          tailnetRequested: snapshot.tailnetRequested,
+        });
+        navigateAfterWizardAction(
+          owner,
+          `/login?setup=complete&redirect=${encodeURIComponent(destination)}`,
+        );
       }
     } catch (err) {
-      setError(friendlyError(err, 'Setup could not be completed. Please review the details and try again.'));
+      // A response can be lost while the service restarts after a successful
+      // atomic commit. Reconcile status before telling the user to repeat setup.
+      let authoritativeStatus: {
+        needsSetup?: boolean;
+        isReinstall?: boolean;
+        tailnetOnboarding?: { phase?: string };
+      } | null = null;
+      try {
+        const { data: status } = await withSetupDeadline(
+          api.get('/setup/status', {
+            params: { _t: Date.now() },
+            timeout: SETUP_STATUS_TIMEOUT_MS,
+          }),
+          SETUP_STATUS_TIMEOUT_MS,
+          'The setup reconciliation request timed out.',
+        );
+        authoritativeStatus = status;
+        if (status && status.needsSetup === false && status.isReinstall !== true) {
+          const tailnetOnboardingRequested =
+            status.tailnetOnboarding?.phase === 'REQUESTED';
+          const destination = getPostSetupDestination({
+            quickSetup: snapshot.quickSetup,
+            aiRuntimeReady: snapshot.aiRuntimeReady,
+            tailnetRequested: tailnetOnboardingRequested,
+          });
+          navigateAfterWizardAction(
+            owner,
+            `/login?setup=complete&redirect=${encodeURIComponent(destination)}`,
+          );
+          return;
+        }
+      } catch {}
+      const rejectionStatus = Number((err as any)?.response?.status);
+      const definitelyRejectedBeforeCommit = rejectionStatus === 400 || rejectionStatus === 422;
+      const authoritativelyPending = authoritativeStatus?.needsSetup === true && !completionRequestConfirmed;
+      if (authoritativelyPending || !completionRequestStarted || definitelyRejectedBeforeCommit) {
+        setSetupComplete(false);
+        setError(friendlyError(err, 'Setup could not be completed. Review the details and retry.'));
+      } else {
+        setSetupComplete(false);
+        setSetupRecoveryError('Portal setup may already be committed, but the restart could not be confirmed. Do not submit setup again. Reload to re-check the service, or continue to sign in.');
+      }
       sounds.error();
     } finally {
       setSubmitting(false);
+      releaseWizardAction(owner);
     }
   };
 
   const handleReinstallReset = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (wizardActionRef.current) return;
     setReinstallError('');
 
-    if (reinstallPassword !== reinstallConfirmPassword) {
+    const passwordSnapshot = reinstallPassword;
+    const confirmationSnapshot = reinstallConfirmPassword;
+    const passwordPolicySnapshot = validatePasswordPolicy(passwordSnapshot);
+
+    if (passwordSnapshot !== confirmationSnapshot) {
       setReinstallError('Passwords must match.');
       return;
     }
 
-    if (!reinstallPasswordPolicy.valid) {
+    if (!passwordPolicySnapshot.valid) {
       setReinstallError(PASSWORD_POLICY_HINT);
       return;
     }
 
+    const owner = claimWizardAction({ kind: 'reinstall-reset', step, label: 'Resetting password…' });
+    if (!owner) return;
+
     setReinstallSubmitting(true);
     try {
-      const { data } = await api.post('/setup/reinstall-reset', { password: reinstallPassword });
+      const { data } = await api.post('/setup/reinstall-reset', { password: passwordSnapshot });
+      try { window.sessionStorage.removeItem(SETUP_SESSION_STORAGE_KEY); } catch {}
+      setupSessionTokenRef.current = '';
+      setSetupSessionToken('');
       alert(`Password reset! Log in with: ${data.email || data.username}`);
-      navigate('/login', { replace: true });
+      navigateAfterWizardAction(owner, '/login');
     } catch (err: any) {
-      setReinstallError(err?.response?.data?.error || 'Reset failed');
+      setReinstallError(friendlyError(err, 'Reset failed'));
     } finally {
       setReinstallSubmitting(false);
+      releaseWizardAction(owner);
     }
   };
 
@@ -748,7 +1417,7 @@ export default function SetupWizardPage() {
           <Rocket className="h-10 w-10 text-white" />
         </div>
         <h2 className="mt-5 text-3xl font-bold text-white">Your portal is installed!</h2>
-        <p className="mt-2 text-slate-400">Let&apos;s finish setting it up. This takes about 5 minutes.</p>
+        <p className="mt-2 text-slate-400">Create the owner account now, then configure only the services you actually need.</p>
       </div>
 
       <div className={`${cardClass} p-5`}>
@@ -757,7 +1426,7 @@ export default function SetupWizardPage() {
             <h3 className="text-sm font-semibold text-white">Server snapshot</h3>
             <p className="text-sm text-slate-400">What the installer found on this machine.</p>
           </div>
-          <button type="button" onClick={loadSystemInfo} className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-slate-300 transition hover:bg-slate-800">
+          <button type="button" aria-label="Refresh server snapshot" onClick={loadSystemInfo} className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-slate-300 transition hover:bg-slate-800">
             <RefreshCw className={`h-4 w-4 ${systemInfoState === 'loading' ? 'animate-spin' : ''}`} />
           </button>
         </div>
@@ -766,6 +1435,19 @@ export default function SetupWizardPage() {
           <div className="flex items-center justify-center py-8 text-slate-400"><Loader2 className="mr-2 h-5 w-5 animate-spin" /> Loading system info...</div>
         ) : systemInfo ? (
           <div className="space-y-5">
+            {systemInfo.originMode === 'tailnet' && (
+              <div className="rounded-2xl border border-cyan-400/30 bg-cyan-400/10 p-4 text-left">
+                <div className="flex items-start gap-3">
+                  <Lock className="mt-0.5 h-5 w-5 flex-shrink-0 text-cyan-300" />
+                  <div>
+                    <p className="font-semibold text-cyan-100">Experimental private Tailnet install</p>
+                    <p className="mt-1 text-sm text-cyan-50/80">
+                      This Portal is reachable only from devices signed into your Tailscale network. No public domain or open web ports are required.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
             <div className="grid gap-3 md:grid-cols-4">
               {[
                 { label: 'OS', value: systemInfo.osName },
@@ -811,9 +1493,31 @@ export default function SetupWizardPage() {
         )}
       </div>
 
-      <button type="button" onClick={goNext} className="w-full rounded-2xl bg-emerald-500 px-6 py-4 text-lg font-semibold text-white transition hover:bg-emerald-600">
-        Let&apos;s Go
-      </button>
+      <div className="grid gap-3 md:grid-cols-2">
+        <button
+          type="button"
+          onClick={() => {
+            sounds.click();
+            setQuickSetup(true);
+            setStep(2);
+          }}
+          className="rounded-2xl bg-emerald-500 px-6 py-4 text-left text-white transition hover:bg-emerald-600"
+        >
+          <span className="block text-lg font-semibold">Quick setup</span>
+          <span className="mt-1 block text-sm text-emerald-50/90">Create the owner, launch the runtime, then connect AI from the authenticated portal.</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setQuickSetup(false);
+            goNext();
+          }}
+          className="rounded-2xl border border-slate-700 bg-slate-900 px-6 py-4 text-left text-white transition hover:border-slate-600 hover:bg-slate-800"
+        >
+          <span className="block text-lg font-semibold">Guided setup</span>
+          <span className="mt-1 block text-sm text-slate-400">Configure domain, branding, security, email, and optional services before launch.</span>
+        </button>
+      </div>
     </StepShell>
   );
 
@@ -823,20 +1527,25 @@ export default function SetupWizardPage() {
         <h2 className="text-2xl font-bold text-white">Create your admin account</h2>
         <p className="mt-2 text-slate-400">This is YOUR account — the portal owner.</p>
       </div>
+      {quickSetup && (
+        <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-4 text-sm text-emerald-100">
+          After this account is created, the portal will restart and take you directly to AI Providers. OpenClaw sign-in happens there, after its gateway is ready to save credentials.
+        </div>
+      )}
       <div className="grid gap-4 md:grid-cols-2">
         <div className="md:col-span-2">
-          <label className="mb-2 block text-sm font-medium text-slate-300">Full name</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Your name" className={inputClass} />
+          <label htmlFor="setup-owner-name" className="mb-2 block text-sm font-medium text-slate-300">Full name</label>
+          <input id="setup-owner-name" value={name} onChange={(e) => { if (!wizardActionRef.current) setName(e.target.value); }} disabled={wizardActionActive} placeholder="Your name" aria-label="Full name" className={inputClass} />
           {name.length > 0 && name.trim().length < 2 && <p className="mt-2 text-xs text-amber-400">Use at least 2 characters.</p>}
         </div>
         <div className="md:col-span-2">
-          <label className="mb-2 block text-sm font-medium text-slate-300">Email address</label>
-          <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" className={inputClass} />
+          <label htmlFor="setup-owner-email" className="mb-2 block text-sm font-medium text-slate-300">Email address</label>
+          <input id="setup-owner-email" value={email} onChange={(e) => { if (!wizardActionRef.current) setEmail(e.target.value); }} disabled={wizardActionActive} placeholder="you@example.com" aria-label="Email address" className={inputClass} />
           {email.length > 0 && !emailLooksValid && <p className="mt-2 text-xs text-amber-400">Enter a valid email address.</p>}
         </div>
         <div>
-          <label className="mb-2 block text-sm font-medium text-slate-300">Password</label>
-          <PasswordInput value={password} onChange={setPassword} placeholder="Min 8 chars, upper/lower/number" />
+          <label htmlFor="setup-owner-password" className="mb-2 block text-sm font-medium text-slate-300">Password</label>
+          <PasswordInput id="setup-owner-password" value={password} onChange={(value) => { if (!wizardActionRef.current) setPassword(value); }} disabled={wizardActionActive} ariaLabel="Password" placeholder="Min 8 chars, upper/lower/number" />
           <p className={`mt-2 text-xs ${password.length > 0 && !passwordPolicy.valid ? 'text-amber-400' : 'text-slate-500'}`}>{PASSWORD_POLICY_HINT}</p>
           {password.length > 0 && !passwordPolicy.valid && (
             <ul className="mt-2 space-y-1 text-xs text-amber-300">
@@ -845,8 +1554,8 @@ export default function SetupWizardPage() {
           )}
         </div>
         <div>
-          <label className="mb-2 block text-sm font-medium text-slate-300">Confirm password</label>
-          <PasswordInput value={confirmPassword} onChange={setConfirmPassword} placeholder="Repeat your password" />
+          <label htmlFor="setup-owner-password-confirmation" className="mb-2 block text-sm font-medium text-slate-300">Confirm password</label>
+          <PasswordInput id="setup-owner-password-confirmation" value={confirmPassword} onChange={(value) => { if (!wizardActionRef.current) setConfirmPassword(value); }} disabled={wizardActionActive} ariaLabel="Confirm password" placeholder="Repeat your password" />
           {confirmPassword.length > 0 && password !== confirmPassword && <p className="mt-2 text-xs text-amber-400">Passwords must match.</p>}
         </div>
       </div>
@@ -861,34 +1570,37 @@ export default function SetupWizardPage() {
       </div>
       <div className="space-y-5">
         <div>
-          <label className="mb-2 block text-sm font-medium text-slate-300">Portal name</label>
-          <input value={portalName} onChange={(e) => setPortalName(e.target.value)} placeholder="My AI Portal" className={inputClass} />
+          <label htmlFor="setup-portal-name" className="mb-2 block text-sm font-medium text-slate-300">Portal name</label>
+          <input id="setup-portal-name" value={portalName} onChange={(e) => setPortalName(e.target.value)} placeholder="My AI Portal" aria-label="Portal name" className={inputClass} />
         </div>
 
-        <div>
-          <label className="mb-2 block text-sm font-medium text-slate-300">Theme</label>
+        <fieldset>
+          <legend className="mb-2 block text-sm font-medium text-slate-300">Theme</legend>
           <div className="grid gap-3 md:grid-cols-3">
             {(['dark', 'light', 'system'] as const).map((choice) => (
               <button
                 key={choice}
                 type="button"
                 onClick={() => setTheme(choice)}
-                className={`rounded-xl border px-4 py-3 text-sm font-medium capitalize transition ${theme === choice ? 'border-emerald-500 bg-emerald-500/10 text-emerald-300' : 'border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-600'}`}
+                aria-pressed={theme === choice}
+                className={`rounded-xl border px-4 py-3 text-sm font-medium capitalize transition ${theme === choice ? 'accent-active' : 'border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-600'}`}
               >
                 {choice}
               </button>
             ))}
           </div>
-        </div>
+        </fieldset>
 
-        <div>
-          <label className="mb-2 block text-sm font-medium text-slate-300">Accent color</label>
+        <fieldset>
+          <legend className="mb-2 block text-sm font-medium text-slate-300">Accent color</legend>
           <div className="flex flex-wrap gap-3">
             {ACCENT_PRESETS.map((preset) => (
               <button
                 key={preset.color}
                 type="button"
                 title={preset.name}
+                aria-label={`${preset.name} accent color`}
+                aria-pressed={accentColor === preset.color}
                 onClick={() => setAccentColor(preset.color)}
                 className={`h-11 w-11 rounded-xl border transition ${accentColor === preset.color ? 'scale-110 border-white ring-2 ring-white/60 ring-offset-2 ring-offset-slate-950' : 'border-slate-700 hover:scale-105'}`}
                 style={{ backgroundColor: preset.color }}
@@ -896,13 +1608,13 @@ export default function SetupWizardPage() {
             ))}
             <label className="flex h-11 w-24 cursor-pointer items-center justify-center rounded-xl border border-dashed border-slate-600 bg-slate-900 text-sm text-slate-300 transition hover:border-slate-500">
               Custom
-              <input type="color" value={accentColor} onChange={(e) => setAccentColor(e.target.value)} className="sr-only" />
+              <input type="color" value={accentColor} onChange={(e) => setAccentColor(e.target.value)} aria-label="Custom accent color" className="sr-only" />
             </label>
           </div>
-        </div>
+        </fieldset>
 
         <div className={`${cardClass} p-4`}>
-          <label className="mb-3 block text-sm font-medium text-slate-300">Logo upload (optional)</label>
+          <p className="mb-3 block text-sm font-medium text-slate-300">Logo upload (optional)</p>
           <div className="flex flex-col gap-4 md:flex-row md:items-center">
             <div className="flex h-20 w-20 items-center justify-center overflow-hidden rounded-2xl border border-slate-800 bg-slate-950">
               {logoPreview ? <img src={logoPreview} alt="Logo preview" className="h-full w-full object-contain" /> : <Upload className="h-6 w-6 text-slate-500" />}
@@ -910,7 +1622,7 @@ export default function SetupWizardPage() {
             <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-slate-200 transition hover:border-slate-600 hover:bg-slate-800">
               <Upload className="h-4 w-4" />
               {logoFile ? 'Replace logo' : 'Upload logo'}
-              <input type="file" accept="image/*" className="sr-only" onChange={handleLogoChange} />
+              <input type="file" accept={SETUP_LOGO_MIME_TYPES.join(',')} aria-label="Upload portal logo" className="sr-only" onChange={handleLogoChange} />
             </label>
           </div>
         </div>
@@ -958,6 +1670,7 @@ export default function SetupWizardPage() {
           </div>
           <button
             type="button"
+            aria-label="Allow search engine indexing"
             onClick={() => setSearchEngineVisibility((current) => current === 'visible' ? 'hidden' : 'visible')}
             className={`relative inline-flex h-7 w-12 flex-shrink-0 rounded-full border transition-colors duration-200 ${searchEngineVisibility === 'visible' ? 'border-emerald-400/40 bg-emerald-500' : 'border-slate-700 bg-slate-800'}`}
             aria-pressed={searchEngineVisibility === 'visible'}
@@ -980,7 +1693,36 @@ export default function SetupWizardPage() {
 
     return (
     <StepShell stepKey={step}>
-      {isLocalInstall ? (
+      {!systemInfo ? (
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 text-sm text-slate-300">
+          <Loader2 className="mr-2 inline h-4 w-4 animate-spin" /> Checking this Portal&apos;s access mode…
+        </div>
+      ) : isTailnetOrigin ? (
+        <div className="space-y-4">
+          <div>
+            <h2 className="text-2xl font-bold text-white">Private Tailnet access</h2>
+            <p className="mt-2 text-slate-400">Tailscale is providing the private HTTPS address for this Portal.</p>
+          </div>
+          <div className="rounded-2xl border border-cyan-400/30 bg-cyan-400/10 p-5">
+            <div className="flex items-start gap-3">
+              <Lock className="mt-0.5 h-5 w-5 flex-shrink-0 text-cyan-300" />
+              <div>
+                <p className="font-semibold text-cyan-100">Experimental private mode</p>
+                <p className="mt-2 break-all font-mono text-sm text-cyan-50">{window.location.origin}</p>
+                <p className="mt-3 text-sm text-cyan-50/80">
+                  Only devices joined to this same tailnet can open the Portal. You do not need to buy a domain, edit public DNS, or expose ports 80 and 443.
+                </p>
+              </div>
+            </div>
+          </div>
+          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-100">
+            <p className="font-semibold text-amber-200">Private-mode limitations in 4.0</p>
+            <p className="mt-2">{setupMailCapability?.reason || 'Portal mail requires a public domain and is unavailable in this mode.'}</p>
+            <p className="mt-2">{systemInfo?.featureCapabilities?.appHosting.reason || 'Hosted apps and public share links require a separate isolated origin and are unavailable in this mode.'}</p>
+            <p className="mt-2 text-amber-200/90">For a public production portal with mail and hosted sharing, use the recommended domain install mode.</p>
+          </div>
+        </div>
+      ) : isLocalInstall ? (
         <div className="space-y-4">
           <div>
             <h2 className="text-2xl font-bold text-white">Domain &amp; HTTPS</h2>
@@ -1012,21 +1754,21 @@ export default function SetupWizardPage() {
       </div>
 
       <div className="grid gap-4 md:grid-cols-2">
-        <button type="button" onClick={() => setDomainPath('domain')} className={`rounded-2xl border p-5 text-left transition ${domainPath === 'domain' ? 'border-emerald-500 bg-emerald-500/10' : 'border-slate-800 bg-slate-900/70 hover:border-slate-700'}`}>
+        <button type="button" onClick={() => { if (!wizardActionRef.current) setDomainPath('domain'); }} disabled={wizardActionActive} aria-pressed={domainPath === 'domain'} className={`rounded-2xl border p-5 text-left transition disabled:cursor-not-allowed disabled:opacity-60 ${domainPath === 'domain' ? 'accent-active' : 'border-slate-800 bg-slate-900/70 hover:border-slate-700'}`}>
           <p className="font-semibold text-white">I have a domain</p>
           <p className="mt-2 text-sm text-slate-400">We&apos;ll verify DNS and turn on HTTPS for you.</p>
         </button>
-        <button type="button" onClick={() => setDomainPath('skip')} className={`rounded-2xl border p-5 text-left transition ${domainPath === 'skip' ? 'border-emerald-500 bg-emerald-500/10' : 'border-slate-800 bg-slate-900/70 hover:border-slate-700'}`}>
+        <button type="button" onClick={() => { if (!wizardActionRef.current) setDomainPath('skip'); }} disabled={wizardActionActive} aria-pressed={domainPath === 'skip'} className={`rounded-2xl border p-5 text-left transition disabled:cursor-not-allowed disabled:opacity-60 ${domainPath === 'skip' ? 'accent-active' : 'border-slate-800 bg-slate-900/70 hover:border-slate-700'}`}>
           <p className="font-semibold text-white">Not yet, skip for now</p>
-          <p className="mt-2 text-sm text-slate-400">You can add a domain anytime in Settings → Domain.</p>
+          <p className="mt-2 text-sm text-slate-400">You can add a domain anytime in Settings → General.</p>
         </button>
       </div>
 
       {domainPath === 'domain' ? (
         <div className="space-y-4">
           <div>
-            <label className="mb-2 block text-sm font-medium text-slate-300">Domain name</label>
-            <input value={domain} onChange={(e) => setDomain(e.target.value)} placeholder="portal.example.com" className={inputClass} />
+            <label htmlFor="setup-domain-name" className="mb-2 block text-sm font-medium text-slate-300">Domain name</label>
+            <input id="setup-domain-name" value={domain} onChange={(e) => { if (!wizardActionRef.current) setDomain(e.target.value); }} disabled={wizardActionActive} placeholder="portal.example.com" aria-label="Domain name" className={inputClass} />
           </div>
 
           {(() => {
@@ -1080,11 +1822,11 @@ export default function SetupWizardPage() {
           })()}
 
           <div className="flex flex-wrap gap-3">
-            <button type="button" onClick={handleCheckDns} disabled={!domain.trim() || dnsState === 'loading'} className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-white transition hover:border-slate-600 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
-              {dnsState === 'loading' ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Check DNS
+            <button type="button" onClick={handleCheckDns} aria-busy={ownsWizardAction('check-dns')} disabled={wizardActionActive || !domain.trim()} className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-white transition hover:border-slate-600 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
+              {ownsWizardAction('check-dns') ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} {ownsWizardAction('check-dns') ? 'Checking DNS…' : 'Check DNS'}
             </button>
-            <button type="button" onClick={handleConfigureDomain} disabled={!dnsStatus?.pointsToUs || domainConfigState === 'loading'} className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-3 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60">
-              {domainConfigState === 'loading' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Globe className="h-4 w-4" />} Configure HTTPS
+            <button type="button" onClick={handleConfigureDomain} aria-busy={ownsWizardAction('configure-domain')} disabled={wizardActionActive || !dnsStatus?.pointsToUs} className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-3 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60">
+              {ownsWizardAction('configure-domain') ? <Loader2 className="h-4 w-4 animate-spin" /> : <Globe className="h-4 w-4" />} {ownsWizardAction('configure-domain') ? 'Configuring HTTPS…' : 'Configure HTTPS'}
             </button>
           </div>
 
@@ -1125,7 +1867,7 @@ export default function SetupWizardPage() {
         </div>
       ) : (
         <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 text-slate-300">
-          You can add a domain anytime in Settings → Domain. For now the portal will stay on HTTP.
+          You can add a domain anytime in Settings → General. For now the portal will stay on HTTP.
         </div>
       )}
       </>
@@ -1138,24 +1880,51 @@ export default function SetupWizardPage() {
     <StepShell stepKey={step}>
       <div>
         <h2 className="text-2xl font-bold text-white">Secure Your Portal</h2>
-        <p className="mt-2 text-slate-400">Email powers these security features. If you already added the optional mail DNS records on the previous step, you only have a small final DNS step left here.</p>
+        <p className="mt-2 text-slate-400">
+          {setupMailAvailable
+            ? 'Email powers these security features. If you already added the optional mail DNS records on the previous step, you only have a small final DNS step left here.'
+            : 'Email-based security features require a public domain and are not part of this install mode.'}
+        </p>
       </div>
 
-      <div className="grid gap-3 md:grid-cols-2">
-        {SECURITY_FEATURES.map((feature) => (
-          <div key={feature.title} className={`${cardClass} p-4`}>
-            <p className="text-2xl">{feature.icon}</p>
-            <p className="mt-3 font-semibold text-white">{feature.title}</p>
-            <p className="mt-1 text-sm text-slate-400">{feature.description}</p>
+      {!systemInfo ? (
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 text-sm text-slate-300">
+          <Loader2 className="mr-2 inline h-4 w-4 animate-spin" /> Checking whether mail is available…
+        </div>
+      ) : !setupMailAvailable ? (
+        <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-5">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-300" />
+            <div>
+              <p className="font-semibold text-amber-100">Mail is unavailable in this install mode</p>
+              <p className="mt-2 text-sm text-amber-100/80">
+                {setupMailCapability?.reason || 'Mail requires a public domain.'}
+              </p>
+              {isTailnetOrigin && (
+                <p className="mt-2 text-sm text-amber-200/90">
+                  Your private Tailnet Portal remains usable without mail. Password reset and email-code security options will stay unavailable until the Portal is migrated to a public domain.
+                </p>
+              )}
+            </div>
           </div>
-        ))}
-      </div>
+        </div>
+      ) : (
+        <>
+          <div className="grid gap-3 md:grid-cols-2">
+            {SECURITY_FEATURES.map((feature) => (
+              <div key={feature.title} className={`${cardClass} p-4`}>
+                <p className="text-2xl">{feature.icon}</p>
+                <p className="mt-3 font-semibold text-white">{feature.title}</p>
+                <p className="mt-1 text-sm text-slate-400">{feature.description}</p>
+              </div>
+            ))}
+          </div>
 
-      <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-100">
-        Without email, these features won&apos;t be available.
-      </div>
+          <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-100">
+            Without email, these features won&apos;t be available.
+          </div>
 
-      {!domainConfigured && !mailStatus?.hasDomain ? (
+          {!domainConfigured && !mailStatus?.hasDomain ? (
         <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
           <p className="font-semibold text-white">Email requires a domain.</p>
           <p className="mt-2 text-sm text-slate-400">Complete the Domain step first to enable email. You can set this up later in Settings.</p>
@@ -1213,15 +1982,16 @@ export default function SetupWizardPage() {
                 <p className="font-semibold text-white">Email security stack</p>
                 <p className="mt-1 text-sm text-slate-400">Domain: {mailStatus?.domain || domain}</p>
               </div>
-              <button type="button" onClick={loadMailStatus} className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-slate-300 transition hover:bg-slate-800">
+              <button type="button" aria-label="Refresh email status" onClick={loadMailStatus} disabled={wizardActionActive} className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-slate-300 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
                 <RefreshCw className={`h-4 w-4 ${mailStatusState === 'loading' ? 'animate-spin' : ''}`} />
               </button>
             </div>
             {mailStatus && (
-              <div className="mt-4 grid gap-3 md:grid-cols-3">
+              <div className="mt-4 grid gap-3 md:grid-cols-4">
                 {[
                   { label: 'Mail server', value: mailStatus.available ? 'Detected' : 'Not installed' },
                   { label: 'Configured', value: mailStatus.configured ? 'Yes' : 'No' },
+                  { label: 'DKIM signing', value: mailStatus.dkimConfigured ? 'Verified' : 'Needs setup' },
                   { label: 'Can send', value: mailStatus.canSend ? 'Yes' : 'Not yet' },
                 ].map((item) => (
                   <div key={item.label} className="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
@@ -1234,11 +2004,11 @@ export default function SetupWizardPage() {
           </div>
 
           <div className="flex flex-wrap gap-3">
-            <button type="button" onClick={handleInstallMail} disabled={installMailState === 'loading'} className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-3 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60">
-              {installMailState === 'loading' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Shield className="h-4 w-4" />} Set Up Email
+            <button type="button" onClick={handleInstallMail} aria-busy={ownsWizardAction('install-mail')} disabled={wizardActionActive} className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-3 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60">
+              {ownsWizardAction('install-mail') ? <Loader2 className="h-4 w-4 animate-spin" /> : <Shield className="h-4 w-4" />} {ownsWizardAction('install-mail') ? 'Setting up email…' : installMailState === 'error' ? 'Retry email setup' : 'Set Up Email'}
             </button>
-            <button type="button" onClick={handleTestEmail} disabled={testEmailState === 'loading' || !(mailStatus?.configured || installMailState === 'success')} className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-white transition hover:border-slate-600 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
-              {testEmailState === 'loading' ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Send Test Email
+            <button type="button" onClick={handleTestEmail} aria-busy={ownsWizardAction('test-email')} disabled={wizardActionActive || !(mailStatus?.configured || installMailState === 'success')} className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-white transition hover:border-slate-600 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
+              {ownsWizardAction('test-email') ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} {ownsWizardAction('test-email') ? 'Sending test email…' : testEmailState === 'error' ? 'Retry test email' : 'Send Test Email'}
             </button>
           </div>
 
@@ -1280,11 +2050,13 @@ export default function SetupWizardPage() {
                 ))}
               </div>
               <div className="border-t border-slate-800 px-4 py-3 text-xs text-slate-400">
-                <p><strong className="text-slate-300">Registrar tip:</strong> Most providers auto-append your domain — enter just <code className="bg-slate-800 px-1 rounded">default._domainkey</code> and <code className="bg-slate-800 px-1 rounded">_dmarc</code>, not the full domain.</p>
+                <p><strong className="text-slate-300">Registrar tip:</strong> Most providers auto-append your domain — enter the exact names shown above (such as <code className="bg-slate-800 px-1 rounded">portal-rsa._domainkey</code>) rather than adding the full domain yourself.</p>
               </div>
             </div>
           )}
         </div>
+      )}
+        </>
       )}
     </StepShell>
   );
@@ -1305,7 +2077,7 @@ export default function SetupWizardPage() {
                 Install the CLI tools that connect to cloud AI providers. These must be installed before you can sign in to a provider below.
               </p>
             </div>
-            <button type="button" onClick={loadAiStatus} className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-slate-300 transition hover:bg-slate-800">
+            <button type="button" aria-label="Refresh AI coding tools" onClick={loadAiStatus} disabled={wizardActionActive} className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-slate-300 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
               <RefreshCw className={`h-4 w-4 ${!codingToolsStatus ? 'animate-spin' : ''}`} />
             </button>
           </div>
@@ -1332,22 +2104,13 @@ export default function SetupWizardPage() {
                   ) : (
                     <button
                       type="button"
-                      onClick={async () => {
-                        setInstallingTool(tool.id);
-                        try {
-                          await api.post('/setup/install-coding-tool', { toolId: tool.id });
-                          await loadAiStatus();
-                        } catch (err: any) {
-                          setError(friendlyError(err, `Failed to install ${tool.name}`));
-                        } finally {
-                          setInstallingTool('');
-                        }
-                      }}
-                      disabled={installingTool.length > 0}
+                      onClick={() => handleInstallCodingTool(tool)}
+                      aria-busy={ownsWizardAction('install-coding-tool', tool.id)}
+                      disabled={wizardActionActive}
                       className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60"
                     >
-                      {installingTool === tool.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                      Install
+                      {ownsWizardAction('install-coding-tool', tool.id) ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                      {ownsWizardAction('install-coding-tool', tool.id) ? 'Installing…' : 'Install'}
                     </button>
                   )}
                 </div>
@@ -1359,15 +2122,26 @@ export default function SetupWizardPage() {
           )}
         </div>
 
-        <AiProviderSetup mode="wizard" apiBase="/setup/ai" onComplete={() => goNext()} />
+        {aiRuntimeReady ? (
+          <fieldset disabled={wizardActionActive} className="min-w-0 border-0 p-0 disabled:opacity-60">
+            <AiProviderSetup mode="wizard" apiBase="/setup/ai" onComplete={() => goNext()} />
+          </fieldset>
+        ) : (
+          <div className="rounded-2xl border border-sky-500/20 bg-sky-500/10 p-5">
+            <h3 className="font-semibold text-sky-100">Cloud provider sign-in moves to after launch</h3>
+            <p className="mt-2 text-sm leading-relaxed text-slate-300">
+              OpenClaw and its credential store are not ready for a durable sign-in yet. The wizard will not start an OAuth or token flow that cannot persist its credentials. After the portal restarts, you will land on AI Providers and continue there with the tested runtime online.
+            </p>
+          </div>
+        )}
 
         <div className={`${cardClass} p-5`}>
           <div className="flex items-start justify-between gap-3">
             <div>
-              <h3 className="text-lg font-semibold text-white">Ollama (Local AI)</h3>
-              <p className="mt-1 text-sm text-slate-400">Ollama runs AI models directly on your server. No data leaves your machine.</p>
+              <h3 className="text-lg font-semibold text-white">Ollama</h3>
+              <p className="mt-1 text-sm text-slate-400">Local Ollama runs model inference on this server. If you configure a remote or Tailnet Ollama host, requests are sent to that selected host.</p>
             </div>
-            <button type="button" onClick={loadAiStatus} className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-slate-300 transition hover:bg-slate-800">
+            <button type="button" aria-label="Refresh Ollama status" onClick={loadAiStatus} disabled={wizardActionActive} className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-slate-300 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
               <RefreshCw className={`h-4 w-4 ${ollamaState === 'loading' ? 'animate-spin' : ''}`} />
             </button>
           </div>
@@ -1391,8 +2165,9 @@ export default function SetupWizardPage() {
                   <p className="mt-1 text-sm font-medium text-white">{ollamaStatus.ramTier}</p>
                 </div>
                 <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
-                  <p className="text-xs uppercase tracking-wide text-slate-500">Server RAM</p>
-                  <p className="mt-1 text-sm font-medium text-white">{ollamaStatus.ramGb} GB</p>
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Available now</p>
+                  <p className="mt-1 text-sm font-medium text-white">{ollamaStatus.availableRamGb} GB</p>
+                  <p className="mt-1 text-xs text-slate-500">{ollamaStatus.ramGb} GB total</p>
                 </div>
               </div>
 
@@ -1423,7 +2198,14 @@ export default function SetupWizardPage() {
                           <div>
                             <p className="font-medium text-white">{model.name}</p>
                             <p className="text-sm text-slate-400">{model.description}</p>
-                            <p className="mt-1 text-xs text-slate-500">Size: {model.size}</p>
+                            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+                              <span>Download: {model.size}</span>
+                              <span>Context: {model.contextWindow}</span>
+                              <span className="capitalize">Use: {model.useCase}</span>
+                              <a href={model.sourceUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-emerald-400 hover:text-emerald-300">
+                                Official catalog <ExternalLink className="h-3 w-3" />
+                              </a>
+                            </div>
                           </div>
                         </div>
                         {installed ? (
@@ -1431,8 +2213,8 @@ export default function SetupWizardPage() {
                             <CheckCircle2 className="h-4 w-4" /> Installed
                           </span>
                         ) : (
-                          <button type="button" onClick={() => handlePullModel(model.name)} disabled={pullingModel.length > 0} className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60">
-                            {pullingModel === model.name ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />} Pull
+                          <button type="button" onClick={() => handlePullModel(model.name)} aria-busy={ownsWizardAction('pull-model', model.name)} disabled={wizardActionActive} className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60">
+                            {ownsWizardAction('pull-model', model.name) ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />} {ownsWizardAction('pull-model', model.name) ? 'Pulling…' : 'Pull'}
                           </button>
                         )}
                       </div>
@@ -1448,6 +2230,38 @@ export default function SetupWizardPage() {
         </div>
 
         <div className={`${cardClass} p-5`}>
+          <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+            <div className="max-w-2xl">
+              <h3 className="text-lg font-semibold text-white">Remote GPU over your Tailnet</h3>
+              <p className="mt-1 text-sm leading-relaxed text-slate-400">
+                After launch, the Owner can choose a Windows PC already on this tailnet and connect its loopback Ollama through one private, identity-bound Tailscale Serve rule.
+              </p>
+              <p className="mt-2 text-xs text-slate-500">
+                Run one Windows setup, acknowledge the narrow Tailscale Grant, then pull or select a model. Portal never asks for a raw Ollama URL or browser secret, and connecting does not require a preinstalled model.
+              </p>
+            </div>
+            <button
+              type="button"
+              aria-pressed={tailnetRequested}
+              aria-busy={ownsWizardAction('tailnet-onboarding')}
+              onClick={() => { void handleTailnetOnboardingToggle(); }}
+              disabled={wizardActionActive}
+              className={`min-h-11 rounded-xl border px-4 py-2.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                tailnetRequested
+                  ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200'
+                  : 'border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800'
+              }`}
+            >
+              {ownsWizardAction('tailnet-onboarding')
+                ? 'Saving handoff…'
+                : tailnetRequested
+                  ? 'Remote GPU queued after launch'
+                  : 'Connect after launch'}
+            </button>
+          </div>
+        </div>
+
+        <div className={`${cardClass} p-5`}>
           <div className="flex items-start justify-between gap-3">
             <div>
               <h3 className="text-lg font-semibold text-white">OpenClaw (AI Agent)</h3>
@@ -1459,7 +2273,8 @@ export default function SetupWizardPage() {
           {openClawState === 'loading' && !openClawStatus ? (
             <div className="mt-6 flex items-center justify-center py-8 text-slate-400"><Loader2 className="mr-2 h-5 w-5 animate-spin" /> Checking OpenClaw...</div>
           ) : openClawStatus ? (
-            <div className="mt-5 grid gap-3 md:grid-cols-3">
+            <div className="mt-5 space-y-3">
+              <div className="grid gap-3 md:grid-cols-4">
               <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
                 <p className="text-xs uppercase tracking-wide text-slate-500">Installed</p>
                 <p className={`mt-1 text-sm font-medium ${openClawStatus.installed ? 'text-emerald-300' : 'text-amber-300'}`}>{openClawStatus.installed ? '✓ Yes' : '✗ No'}</p>
@@ -1472,6 +2287,19 @@ export default function SetupWizardPage() {
                 <p className="text-xs uppercase tracking-wide text-slate-500">Version</p>
                 <p className="mt-1 text-sm font-medium text-white">{openClawStatus.version || 'Unknown'}</p>
               </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Ready for sign-in</p>
+                <p className={`mt-1 text-sm font-medium ${openClawStatus.ready ? 'text-emerald-300' : 'text-amber-300'}`}>{openClawStatus.ready ? '✓ Yes' : '✗ Not yet'}</p>
+              </div>
+              </div>
+              {!openClawStatus.ready && (openClawStatus.blockers || []).length > 0 && (
+                <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-3">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-amber-200">Readiness checks</p>
+                  <ul className="mt-2 space-y-1 text-sm text-slate-300">
+                    {(openClawStatus.blockers || []).map((blocker) => <li key={blocker.code}>• {blocker.message}</li>)}
+                  </ul>
+                </div>
+              )}
             </div>
           ) : (
             <div className="mt-5 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm text-slate-300">OpenClaw status is unavailable right now. If it is not installed yet, you can add it later.</div>
@@ -1483,22 +2311,6 @@ export default function SetupWizardPage() {
   );
 
   const renderRemoteDesktop = () => {
-    const handleRdSetup = async () => {
-      setRdSetupState('loading');
-      setRdSetupMessage('');
-      setRdSetupSteps([]);
-      try {
-        const res = await api.post('/setup/install-rd');
-        setRdSetupState(res.data.ok ? 'success' : 'error');
-        setRdSetupMessage(res.data.message || '');
-        setRdSetupSteps(res.data.steps || []);
-      } catch (err: any) {
-        setRdSetupState('error');
-        setRdSetupMessage(err?.response?.data?.message || err?.message || 'Setup failed');
-        setRdSetupSteps([]);
-      }
-    };
-
     return (
       <StepShell stepKey={step}>
         <div>
@@ -1528,20 +2340,20 @@ export default function SetupWizardPage() {
           </div>
 
           <div className="mt-5">
-            {rdSetupState === 'idle' && (
+            {rdSetupState !== 'success' && (
               <button
                 type="button"
                 onClick={handleRdSetup}
-                className="inline-flex items-center gap-2 rounded-xl bg-blue-500/20 border border-blue-500/30 px-4 py-3 text-sm font-medium text-blue-300 transition hover:bg-blue-500/30"
+                aria-busy={ownsWizardAction('install-rd')}
+                disabled={wizardActionActive}
+                className="inline-flex items-center gap-2 rounded-xl bg-blue-500/20 border border-blue-500/30 px-4 py-3 text-sm font-medium text-blue-300 transition hover:bg-blue-500/30 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                <Monitor className="h-4 w-4" /> Set Up Remote Desktop
+                {ownsWizardAction('install-rd') ? <Loader2 className="h-4 w-4 animate-spin" /> : <Monitor className="h-4 w-4" />}
+                {ownsWizardAction('install-rd') ? 'Setting up Remote Desktop…' : rdSetupState === 'error' ? 'Retry Remote Desktop Setup' : 'Set Up Remote Desktop'}
               </button>
             )}
             {rdSetupState === 'loading' && (
-              <div className="flex items-center gap-3 rounded-xl bg-blue-500/10 border border-blue-500/20 px-4 py-3">
-                <Loader2 className="h-4 w-4 animate-spin text-blue-400" />
-                <span className="text-sm text-blue-300">Installing packages and configuring services… this can take 1–2 minutes</span>
-              </div>
+              <p role="status" className="mt-3 text-sm text-blue-300">Installing packages and configuring services… this can take 1–2 minutes.</p>
             )}
             {(rdSetupState === 'success' || rdSetupState === 'error') && (
               <div className={`rounded-xl border p-4 ${rdSetupState === 'success' ? 'border-emerald-500/20 bg-emerald-500/5' : 'border-amber-500/20 bg-amber-500/5'}`}>
@@ -1560,18 +2372,13 @@ export default function SetupWizardPage() {
                     ))}
                   </div>
                 )}
-                {rdSetupState === 'error' && (
-                  <button type="button" onClick={handleRdSetup} className="mt-3 text-xs text-blue-400 hover:text-blue-300 underline">
-                    Retry
-                  </button>
-                )}
               </div>
             )}
           </div>
         </div>
 
         <div className="text-sm text-slate-500 text-center">
-          You can also set up Remote Desktop later from Settings → System → Feature Readiness.
+          You can also set up Remote Desktop later from Settings → Feature Readiness.
         </div>
       </StepShell>
     );
@@ -1591,9 +2398,26 @@ export default function SetupWizardPage() {
           { title: 'Security', content: `${registrationMode} registration
 Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}` },
           { title: 'Telemetry', content: allowTelemetry ? 'Enabled' : 'Disabled' },
-          { title: 'Domain', content: configuredDomainUrl ? configuredDomainUrl : 'Not configured (HTTP)' },
-          { title: 'Email', content: mailStatus?.configured || installMailState === 'success' ? 'Configured' : 'Not configured' },
-          { title: 'AI', content: `Ollama: ${ollamaStatus?.running ? `${ollamaStatus.models.length} model(s)` : 'Not ready'}\nOpenClaw: ${openClawStatus?.installed ? (openClawStatus.gatewayRunning ? 'Installed + running' : 'Installed') : 'Not detected'}` },
+          {
+            title: 'Access',
+            content: !systemInfo
+              ? 'Checking access mode…'
+              : isTailnetOrigin
+              ? `Private Tailnet (experimental)\n${window.location.origin}`
+              : configuredDomainUrl || 'No public domain (HTTP)',
+          },
+          {
+            title: 'Email',
+            content: !systemInfo
+              ? 'Checking availability…'
+              : setupMailAvailable
+              ? mailStatus?.configured || installMailState === 'success' ? 'Configured' : 'Not configured'
+              : `Unavailable\n${setupMailCapability?.reason || 'Requires a public domain'}`,
+          },
+          {
+            title: 'AI',
+            content: `Ollama on Portal host: ${ollamaStatus?.running ? `${ollamaStatus.models.length} model(s)` : 'Not ready'}${tailnetRequested ? '\nRemote GPU: Setup queued after launch' : ''}\nOpenClaw: ${openClawStatus?.installed ? (openClawStatus.gatewayRunning ? 'Installed + running' : 'Installed') : 'Not detected'}`,
+          },
         ].map((section) => (
           <div key={section.title} className={`${cardClass} p-4`}>
             <p className="text-sm font-semibold text-slate-300">{section.title}</p>
@@ -1608,16 +2432,18 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
       <div className={`${cardClass} p-5`}>
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h3 className="text-sm font-semibold text-white">Help improve BridgesLLM</h3>
+            <h3 className="text-sm font-semibold text-white">Share limited operational telemetry</h3>
             <p className="mt-1 text-sm text-slate-400">
-              Sends anonymous usage stats (install ID, version, user count) once daily. No personal data, messages, or files are ever collected. Keeping this on helps us track active installs and notifies you when updates are available.
+              Enabled by default and optional. The Portal sends a report shortly after startup and then about every 24 hours while it remains running. That report contains a random install ID, Portal and dependency versions, Portal user count, uptime, Node version, operating system, and architecture. Messages, prompts, project files, credentials, usernames, and email addresses are not included. You can turn this off now or later in Settings. Installer lifecycle tracking is separate: install and update milestones include the event type, Portal version, operating system name and version, and the random install ID. This switch controls Portal operational telemetry, not those installer events.
             </p>
-            {!allowTelemetry && <p className="mt-2 text-xs text-amber-300/90">Update notifications will be disabled.</p>}
+            {!allowTelemetry && <p className="mt-2 text-xs text-amber-300/90">Portal operational reports are off. Dashboard version checks and manual refreshes still work.</p>}
           </div>
           <button
             type="button"
-            onClick={() => setAllowTelemetry((current) => !current)}
-            className={`relative inline-flex h-7 w-12 flex-shrink-0 rounded-full border transition-colors duration-200 ${allowTelemetry ? 'border-emerald-400/40 bg-emerald-500' : 'border-slate-700 bg-slate-800'}`}
+            aria-label="Share limited operational telemetry"
+            onClick={() => { if (!wizardActionRef.current) setAllowTelemetry((current) => !current); }}
+            disabled={wizardActionActive}
+            className={`relative inline-flex h-7 w-12 flex-shrink-0 rounded-full border transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-60 ${allowTelemetry ? 'border-emerald-400/40 bg-emerald-500' : 'border-slate-700 bg-slate-800'}`}
             aria-pressed={allowTelemetry}
           >
             <span
@@ -1627,9 +2453,82 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
         </div>
       </div>
 
-      {error && <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-100">{error}</div>}
     </StepShell>
   );
+
+  if (bootstrapState === 'blocked') {
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-slate-950 px-4 text-slate-100">
+        <div className="max-w-lg rounded-3xl border border-amber-500/30 bg-slate-900/90 p-8 shadow-2xl">
+          <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-full bg-amber-500/10">
+            <Lock className="h-8 w-8 text-amber-300" />
+          </div>
+          <h1 className="text-center text-2xl font-semibold text-white">Setup is blocked on public HTTP</h1>
+          <p className="mt-3 text-sm leading-relaxed text-slate-300">
+            This page will not collect a bootstrap bearer, owner password, or provider credential on an unencrypted public origin.
+          </p>
+          {bootstrapError && <p className="mt-3 text-sm text-amber-200">{bootstrapError}</p>}
+          <div className="mt-5 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+            <p className="text-sm font-medium text-white">Use the protected path printed by the installer</p>
+            <p className="mt-2 text-sm text-slate-400">Without a TLS domain, keep this SSH tunnel running on your computer:</p>
+            <code className="mt-3 block break-all rounded-lg bg-slate-900 p-3 text-xs text-emerald-300">ssh -N -L 4001:127.0.0.1:4001 &lt;ssh-user&gt;@{window.location.hostname}</code>
+            <p className="mt-3 text-sm text-slate-400">Then open the full <span className="font-mono text-slate-200">http://localhost:4001/setup#bootstrap=…</span> link from that installer output. If you supplied a domain, use only its installer-verified HTTPS link.</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (bootstrapState !== 'ready') {
+    const loading = bootstrapState === 'loading';
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-slate-950 px-4 text-slate-100">
+        <div className="max-w-md rounded-3xl border border-slate-800 bg-slate-900/90 p-8 text-center shadow-2xl">
+          <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-full bg-emerald-500/10">
+            {loading ? <Loader2 className="h-8 w-8 animate-spin text-emerald-300" /> : <Lock className="h-8 w-8 text-emerald-300" />}
+          </div>
+          <h1 className="text-xl font-semibold text-white">{loading ? 'Securing setup…' : 'Protected setup link required'}</h1>
+          <p className="mt-3 text-sm leading-relaxed text-slate-400">
+            {loading
+              ? 'Exchanging the one-time bootstrap for an origin-bound setup session.'
+              : bootstrapError || 'Open the full loopback or verified-HTTPS setup link printed by the installer.'}
+          </p>
+          {!loading && (
+            <div className="mt-5 rounded-xl bg-slate-950/70 p-4 text-left text-xs text-slate-400">
+              <p>Accepted examples:</p>
+              <code className="mt-2 block break-all text-emerald-300">http://localhost:4001/setup#bootstrap=…</code>
+              <code className="mt-2 block break-all text-emerald-300">https://portal.example.com/setup#bootstrap=…</code>
+              <p className="mt-3">The fragment is exchanged once, removed from the address bar, and cannot be replayed.</p>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (setupRecoveryError) {
+    return (
+      <div className="min-h-dvh bg-slate-950 px-4 py-10 text-slate-100">
+        <div className="mx-auto flex min-h-[80vh] max-w-2xl items-center justify-center">
+          <div className="w-full rounded-3xl border border-amber-500/25 bg-slate-900/90 p-8 text-center shadow-2xl shadow-black/30 backdrop-blur">
+            <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-amber-500/10 ring-8 ring-amber-500/5">
+              <AlertTriangle className="h-10 w-10 text-amber-300" />
+            </div>
+            <h2 className="mt-6 text-2xl font-bold text-white">Setup status needs confirmation</h2>
+            <p role="alert" className="mt-3 text-sm leading-6 text-amber-100">{setupRecoveryError}</p>
+            <div className="mt-6 flex flex-col justify-center gap-3 sm:flex-row">
+              <button type="button" onClick={() => window.location.reload()} className="rounded-xl border border-slate-700 bg-slate-800 px-5 py-3 text-sm font-medium text-white transition hover:bg-slate-700">
+                Reload and re-check
+              </button>
+              <button type="button" onClick={() => navigateAfterSetupRecovery('/login?setup=complete')} className="rounded-xl bg-emerald-500 px-5 py-3 text-sm font-medium text-slate-950 transition hover:bg-emerald-400">
+                Continue to sign in
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (setupComplete) {
     return (
@@ -1664,12 +2563,13 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
           </div>
           <h1 className="mb-2 text-xl font-semibold text-white">Setup Token Required</h1>
           <p className="mb-4 text-sm text-slate-400">
-            This setup page requires the security token from your terminal.
-            Copy the full URL printed after installation — it includes a one-time token.
+            This origin-bound setup session is missing, expired, or no longer valid.
+            Re-run the installer with <span className="font-mono">--reinstall</span> if the original browser tab cannot be resumed.
           </p>
+          {bootstrapError && <p className="mb-4 text-sm text-amber-200">{bootstrapError}</p>}
           <div className="rounded-lg bg-slate-800/60 p-3 text-left">
-            <p className="text-xs text-slate-500 mb-1">Your URL should look like:</p>
-            <code className="text-xs text-emerald-400 break-all">http://your-ip/setup?token=abc123...</code>
+            <p className="text-xs text-slate-500 mb-1">Use a protected installer URL:</p>
+            <code className="text-xs text-emerald-400 break-all">http://localhost:4001/setup#bootstrap=…</code>
           </div>
         </div>
       </div>
@@ -1701,10 +2601,10 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
                 <p className="text-sm font-medium text-white">{ownerHint}</p>
               </div>
             )}
-            <form onSubmit={handleReinstallReset}>
+            <form onSubmit={handleReinstallReset} aria-busy={ownsWizardAction('reinstall-reset')}>
               <div className="mb-4">
-                <label className="mb-1 block text-sm font-medium text-slate-300">New Password</label>
-                <PasswordInput value={reinstallPassword} onChange={setReinstallPassword} placeholder="Min 8 chars, upper/lower/number" />
+                <label htmlFor="reinstall-password" className="mb-1 block text-sm font-medium text-slate-300">New Password</label>
+                <PasswordInput id="reinstall-password" value={reinstallPassword} onChange={(value) => { if (!wizardActionRef.current) setReinstallPassword(value); }} disabled={wizardActionActive} ariaLabel="New password" placeholder="Min 8 chars, upper/lower/number" />
                 <p className={`mt-2 text-xs ${reinstallPassword.length > 0 && !reinstallPasswordPolicy.valid ? 'text-amber-400' : 'text-slate-500'}`}>{PASSWORD_POLICY_HINT}</p>
                 {reinstallPassword.length > 0 && !reinstallPasswordPolicy.valid && (
                   <ul className="mt-2 space-y-1 text-xs text-amber-300">
@@ -1713,14 +2613,14 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
                 )}
               </div>
               <div className="mb-6">
-                <label className="mb-1 block text-sm font-medium text-slate-300">Confirm Password</label>
-                <PasswordInput value={reinstallConfirmPassword} onChange={setReinstallConfirmPassword} placeholder="Repeat your password" />
+                <label htmlFor="reinstall-password-confirmation" className="mb-1 block text-sm font-medium text-slate-300">Confirm Password</label>
+                <PasswordInput id="reinstall-password-confirmation" value={reinstallConfirmPassword} onChange={(value) => { if (!wizardActionRef.current) setReinstallConfirmPassword(value); }} disabled={wizardActionActive} ariaLabel="Confirm new password" placeholder="Repeat your password" />
                 {reinstallConfirmPassword.length > 0 && reinstallPassword !== reinstallConfirmPassword && <p className="mt-2 text-xs text-amber-400">Passwords must match.</p>}
               </div>
               {reinstallError && <div className="mb-4 rounded-lg border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">{reinstallError}</div>}
-              <button type="submit" disabled={reinstallSubmitting || !reinstallFormValid}
+              <button type="submit" aria-busy={ownsWizardAction('reinstall-reset')} disabled={wizardActionActive || !reinstallFormValid}
                 className="w-full rounded-lg bg-emerald-600 px-4 py-2.5 font-medium text-white transition-colors hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-60">
-                {reinstallSubmitting ? 'Resetting…' : 'Reset Password & Continue'}
+                {ownsWizardAction('reinstall-reset') ? 'Resetting password…' : reinstallSubmitting ? 'Resetting…' : 'Reset Password & Continue'}
               </button>
             </form>
           </div>
@@ -1739,7 +2639,7 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
             </div>
             <div>
               <h1 className="text-2xl font-semibold text-white">Setup Wizard</h1>
-              <p className="text-sm text-slate-400">Step {step + 1} of {STEPS.length}</p>
+              <p className="text-sm text-slate-400">{quickSetup ? 'Quick setup' : `Step ${step + 1} of ${STEPS.length}`}</p>
             </div>
           </div>
 
@@ -1747,9 +2647,11 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
             <motion.div className="h-full bg-emerald-500" animate={{ width: `${progress}%` }} transition={{ duration: 0.25 }} />
           </div>
 
-          <div className="mb-8">
-            <StepIndicator currentStep={step} />
-          </div>
+          {!quickSetup && (
+            <div className="mb-8">
+              <StepIndicator currentStep={step} />
+            </div>
+          )}
 
           <AnimatePresence mode="wait" initial={false}>
             <div key={STEPS[step].id}>
@@ -1765,28 +2667,42 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
             </div>
           </AnimatePresence>
 
+          {activeWizardAction && (
+            <p role="status" className="sr-only">{activeWizardAction.label}</p>
+          )}
+
+          {error && (
+            <div role="alert" className="mt-6 rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-100">
+              {error}
+            </div>
+          )}
+
           {step !== 0 && (
             <div className="mt-8 border-t border-slate-800 pt-5">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <button type="button" onClick={goBack} disabled={step === 0 || submitting} className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-slate-200 transition hover:border-slate-600 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
+                <button type="button" onClick={goBack} disabled={step === 0 || wizardActionActive || submitting} className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-slate-200 transition hover:border-slate-600 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
                   <ChevronLeft className="h-4 w-4" /> Back
                 </button>
 
                 <div className="flex flex-col-reverse gap-3 sm:flex-row">
-                  {/* Skip button: hide on domain (step 1 — has its own skip option) and admin (step 2 — required) */}
-                  {step < STEPS.length - 1 && step !== 1 && step !== 2 && (
-                    <button type="button" onClick={goNext} className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-slate-200 transition hover:border-slate-600 hover:bg-slate-800">
+                  {/* Domain has its own skip control; the owner account is required. */}
+                  {step < STEPS.length - 1 && step !== 1 && step !== 2 && !quickSetup && (
+                    <button type="button" onClick={goNext} disabled={wizardActionActive} className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-slate-200 transition hover:border-slate-600 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
                       Skip for now <ChevronRight className="h-4 w-4" />
                     </button>
                   )}
 
-                  {step < STEPS.length - 1 ? (
-                    <button type="button" onClick={goNext} disabled={step === 2 && !adminStepValid} className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-500 px-4 py-3 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60">
+                  {quickSetup && step === 2 ? (
+                    <button type="button" onClick={handleComplete} aria-busy={ownsWizardAction('complete')} disabled={wizardActionActive || submitting || !adminStepValid} className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-500 px-5 py-3 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60">
+                      {ownsWizardAction('complete') ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />} {ownsWizardAction('complete') ? 'Launching Portal…' : 'Launch Portal'}
+                    </button>
+                  ) : step < STEPS.length - 1 ? (
+                    <button type="button" onClick={goNext} disabled={wizardActionActive || (step === 2 && !adminStepValid)} className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-500 px-4 py-3 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60">
                       {step === 1 && configuredDomainUrl && window.location.protocol === 'http:' ? 'Continue on secure portal' : 'Next'} <ChevronRight className="h-4 w-4" />
                     </button>
                   ) : (
-                    <button type="button" onClick={handleComplete} disabled={submitting || !adminStepValid} className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-500 px-5 py-3 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60">
-                      {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />} Complete Setup
+                    <button type="button" onClick={handleComplete} aria-busy={ownsWizardAction('complete')} disabled={wizardActionActive || submitting || !adminStepValid} className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-500 px-5 py-3 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60">
+                      {ownsWizardAction('complete') ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />} {ownsWizardAction('complete') ? 'Completing Setup…' : 'Complete Setup'}
                     </button>
                   )}
                 </div>

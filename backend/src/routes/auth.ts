@@ -1,12 +1,12 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import crypto from 'crypto';
-import jwt from 'jsonwebtoken';
-import { config } from '../config/env';
-import { SECURITY_DEFAULTS } from '../config/settings.schema';
+import { Prisma } from '@prisma/client';
 import rateLimit from 'express-rate-limit';
 import { prisma } from '../config/database';
 import { hashPassword, comparePassword, validatePasswordStrength } from '../utils/password';
+import { normalizeRegistrationMode } from '../utils/registrationMode';
+import { buildPasswordResetPath } from '../utils/passwordResetLink';
 import { generateAccessToken, generateRefreshToken, verifyAccessToken, verifyRefreshToken } from '../utils/jwt';
 import { authenticateToken } from '../middleware/auth';
 import { AppError } from '../middleware/errorHandler';
@@ -36,6 +36,20 @@ import { clearAuthCookies, setAuthCookies } from '../utils/authCookies';
 import { isReservedSystemMailboxUsername } from '../utils/reservedMailboxUsernames';
 import { generateSecret as otpGenerateSecret, generateURI as otpGenerateURI, verify as otpVerify, NobleCryptoPlugin, ScureBase32Plugin } from 'otplib';
 import * as QRCode from 'qrcode';
+import { decryptSecret, digestAuthToken, encryptSecret } from '../utils/authSecrets';
+import { canonicalEmail, canonicalUsername } from '../utils/identity';
+import {
+  assertPortalFeatureAvailable,
+  getPortalFeatureCapabilities,
+  PortalFeatureUnavailableError,
+  portalFeatureUnavailableResponse,
+  privateRecoveryOriginIsAllowed,
+} from '../utils/portalFeatureCapabilities';
+import {
+  assertNoProjectAuthorizationTransitionActive,
+  projectAuthorizationTransitionCoordinator,
+} from '../services/projectAuthorizationTransition';
+import { effectiveRequestOrigin } from '../utils/appContentSecurity';
 
 // Shared plugins for TOTP operations (otplib v13 functional API)
 const otpCrypto = new NobleCryptoPlugin();
@@ -51,7 +65,7 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   // Skip rate limiting in development to avoid friction during testing
-  skip: (req) => process.env.NODE_ENV === 'development',
+  skip: (_req) => process.env.NODE_ENV === 'development',
 });
 
 // Stricter rate limiting for forgot-password (3 attempts per 15 minutes per IP)
@@ -61,7 +75,7 @@ const forgotPasswordLimiter = rateLimit({
   message: 'Too many password reset requests. Please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => process.env.NODE_ENV === 'development',
+  skip: (_req) => process.env.NODE_ENV === 'development',
 });
 
 // Stricter rate limiting for 2FA validate (5 attempts per 15 min per IP)
@@ -71,7 +85,7 @@ const twoFactorValidateLimiter = rateLimit({
   message: 'Too many two-factor authentication attempts. Please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => process.env.NODE_ENV === 'development',
+  skip: (_req) => process.env.NODE_ENV === 'development',
 });
 
 // Rate limiting for 2FA email send (3 per 15 min per IP)
@@ -81,61 +95,364 @@ const twoFactorEmailLimiter = rateLimit({
   message: 'Too many verification code requests. Please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => process.env.NODE_ENV === 'development',
+  skip: (_req) => process.env.NODE_ENV === 'development',
 });
+
+// A separate limiter protects authenticated backup-code attempts. Keeping it
+// distinct from email delivery means a mail outage cannot consume the resend
+// budget while an owner is trying to migrate away from legacy Email Code 2FA.
+const twoFactorDisableLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: 'Too many two-factor disable attempts. Please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (_req) => process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test',
+});
+
+// Emergency recovery is deliberately narrower and more aggressively bounded
+// than ordinary 2FA validation. The IP budget prevents random-token database
+// floods; the challenge budget follows a stolen bearer across distributed IPs.
+// Recovery never creates a session.
+const twoFactorEmailRecoveryIpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: 'Too many Email Code recovery attempts. Please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (_req) => process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test',
+});
+
+const twoFactorEmailRecoveryLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 3,
+  message: 'Too many Email Code recovery attempts. Please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const pendingToken = typeof req.body?.pendingToken === 'string'
+      ? req.body.pendingToken
+      : '';
+    return /^[A-Za-z0-9_-]{43}$/.test(pendingToken)
+      ? `challenge:${digestAuthToken('2fa-recovery-rate-limit', pendingToken)}`
+      : `ip:${req.ip || 'unknown'}`;
+  },
+  skip: (_req) => process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test',
+});
+
+const EMAIL_2FA_RECOVERY_CONFIRMATION = 'DISABLE EMAIL 2FA';
+const AUTHORIZATION_ARTIFACT_CONFLICT_CODE = 'AUTHORIZATION_ARTIFACT_ADMISSION_CONFLICT';
+
+function respondWithUnavailableMail(res: Response): boolean {
+  const unavailable = portalFeatureUnavailableResponse('mail');
+  if (!unavailable) return false;
+  res.status(409).json(unavailable);
+  return true;
+}
+
+function rejectUnavailableMailRequest(
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  if (!respondWithUnavailableMail(res)) next();
+}
+
+function rejectUnavailableEmailMethodRequest(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  if (req.body?.method === 'email' && respondWithUnavailableMail(res)) return;
+  next();
+}
+
+function parseBackupCodeHashes(serialized: string | null): string[] | null {
+  if (serialized === null) return [];
+  try {
+    const parsed: unknown = JSON.parse(serialized);
+    if (!Array.isArray(parsed) || !parsed.every((value) => typeof value === 'string')) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function hasStoredBackupCodes(serialized: string | null): boolean {
+  const parsed = parseBackupCodeHashes(serialized);
+  // Malformed legacy state fails closed: recovery must not become a bypass
+  // merely because the stored backup-code record cannot be interpreted.
+  return parsed === null || parsed.length > 0;
+}
+
+async function matchesBackupCode(token: string, serialized: string | null): Promise<boolean> {
+  if (!/^[A-Za-z0-9]{8}$/.test(token)) return false;
+  const hashes = parseBackupCodeHashes(serialized);
+  if (!hashes?.length) return false;
+  for (const hash of hashes) {
+    if (await comparePassword(token, hash)) return true;
+  }
+  return false;
+}
+
+function privateRecoveryRequestMatchesConfiguredOrigin(req: Request): boolean {
+  return privateRecoveryOriginIsAllowed(effectiveRequestOrigin(req));
+}
+
+async function mapAuthorizationArtifactAdmissionConflicts<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (
+      !isAuthorizationTransitionActiveError(error)
+      && !isSerializableTransactionConflict(error)
+    ) {
+      throw error;
+    }
+    const code = isAuthorizationTransitionActiveError(error)
+      ? 'PROJECT_AUTHORIZATION_TRANSITION_ACTIVE'
+      : AUTHORIZATION_ARTIFACT_CONFLICT_CODE;
+    throw Object.assign(
+      new AppError(409, 'Authentication is temporarily paused while account access is being updated. Please try again.'),
+      { code },
+    );
+  }
+}
+
+async function withAuthorizationArtifactAdmission<T>(
+  operation: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
+  return mapAuthorizationArtifactAdmissionConflicts(() => (
+    prisma.$transaction(async (tx) => {
+      await assertNoProjectAuthorizationTransitionActive(tx);
+      return operation(tx);
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable })
+  ));
+}
+
+function isAuthorizationTransitionActiveError(error: unknown): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && error.code === 'PROJECT_AUTHORIZATION_TRANSITION_ACTIVE';
+}
+
+function isSerializableTransactionConflict(error: unknown): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && error.code === 'P2034';
+}
+
+function isAuthorizationArtifactAdmissionConflict(error: unknown): boolean {
+  return isAuthorizationTransitionActiveError(error)
+    || (
+      typeof error === 'object'
+      && error !== null
+      && 'code' in error
+      && error.code === AUTHORIZATION_ARTIFACT_CONFLICT_CODE
+    );
+}
+
+function respondAuthorizationArtifactAdmissionConflict(
+  res: Response,
+  error: unknown,
+): boolean {
+  if (!isAuthorizationArtifactAdmissionConflict(error)) return false;
+  const conflict = error as AppError & { code: string };
+  res.status(409).json({
+    error: conflict.message,
+    code: conflict.code,
+    retryable: true,
+  });
+  return true;
+}
+
+function authorizationUserSnapshotCas(user: any): Prisma.UserWhereInput {
+  return {
+    id: user.id,
+    email: user.email,
+    username: user.username,
+    firstName: user.firstName ?? null,
+    lastName: user.lastName ?? null,
+    role: user.role,
+    accountStatus: user.accountStatus,
+    isActive: user.isActive,
+    sandboxEnabled: user.sandboxEnabled,
+    authorizationVersion: Number(user.authorizationVersion ?? 1),
+  };
+}
+
+function authorizationCredentialSnapshotCas(user: any): Prisma.UserWhereInput {
+  return {
+    ...authorizationUserSnapshotCas(user),
+    passwordHash: user.passwordHash,
+    twoFactorEnabled: user.twoFactorEnabled,
+    twoFactorMethod: user.twoFactorMethod,
+    twoFactorSecret: user.twoFactorSecret,
+    twoFactorBackupCodes: user.twoFactorBackupCodes,
+    twoFactorLastUsedStep: user.twoFactorLastUsedStep,
+  };
+}
+
+async function assertAuthorizationCredentialSnapshotCurrent(
+  tx: Prisma.TransactionClient,
+  user: any,
+  expectedAuthorizationVersion = Number(user.authorizationVersion ?? 1),
+): Promise<void> {
+  const current = await tx.user.findFirst({
+    where: {
+      ...authorizationCredentialSnapshotCas(user),
+      authorizationVersion: expectedAuthorizationVersion,
+    },
+    select: { id: true },
+  });
+  if (!current) {
+    throw new AppError(409, 'Account or credential state changed. Authenticate again.');
+  }
+}
 
 /**
  * Generate a 6-digit email verification code, store hashed, send to user.
  * Cleans up old codes for the user first.
  */
-async function generateAndSendEmailCode(userId: string, userEmail: string): Promise<void> {
-  // Clean up old codes for this user (older than 1 hour or already used)
-  await prisma.emailVerificationCode.deleteMany({
-    where: {
-      userId,
-      OR: [
-        { createdAt: { lt: new Date(Date.now() - 60 * 60 * 1000) } },
-        { usedAt: { not: null } },
-      ],
-    },
-  });
+async function generateAndSendEmailCode(
+  user: any,
+  purpose: string,
+  expectedAuthorizationVersion = Number(user.authorizationVersion ?? 1),
+): Promise<void> {
+  assertPortalFeatureAvailable('mail');
 
   // Generate 6-digit code
   const code = crypto.randomInt(100000, 999999).toString();
 
   // Hash with bcrypt and store
   const codeHash = await hashPassword(code);
-  await prisma.emailVerificationCode.create({
-    data: {
-      userId,
-      code: codeHash,
-      expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 minutes
-    },
+  const verification = await withAuthorizationArtifactAdmission(async (tx) => {
+    await assertAuthorizationCredentialSnapshotCurrent(
+      tx,
+      user,
+      expectedAuthorizationVersion,
+    );
+    // Retire stale proofs only after the same admitted snapshot that creates
+    // the replacement has been re-attested.
+    await tx.emailVerificationCode.deleteMany({
+      where: {
+        userId: user.id,
+        purpose,
+        OR: [
+          { createdAt: { lt: new Date(Date.now() - 60 * 60 * 1000) } },
+          { usedAt: { not: null } },
+        ],
+      },
+    });
+    return tx.emailVerificationCode.create({
+      data: {
+        userId: user.id,
+        code: codeHash,
+        purpose,
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 minutes
+      },
+    });
   });
 
-  // Send email
-  await sendTwoFactorCodeEmail({ email: userEmail }, code);
+  try {
+    await sendTwoFactorCodeEmail({ email: user.email }, code);
+  } catch (error) {
+    // Remove exactly the proof whose delivery failed. Do not consume or delete
+    // a previously delivered code that the user may still be entering.
+    await prisma.emailVerificationCode.deleteMany({ where: { id: verification.id } });
+    throw error;
+  }
+
+  // The successfully delivered code supersedes only older codes for the same
+  // purpose. Never delete a concurrently-created newer code: doing so could
+  // leave both senders deleting each other's rows and no usable proof.
+  await prisma.emailVerificationCode.deleteMany({
+    where: {
+      userId: user.id,
+      purpose,
+      OR: [
+        { createdAt: { lt: verification.createdAt } },
+        { createdAt: verification.createdAt, id: { lt: verification.id } },
+      ],
+    },
+  });
 }
 
 // TOTP window: ±1 step (30 second tolerance) — passed to each verify call
 
 /**
- * Generate a short-lived 2FA pending token (5 min expiry).
- * Encodes the userId so the /2fa/validate endpoint can identify the user
- * without exposing raw userId (prevents enumeration).
+ * Generate a short-lived, database-backed 2FA challenge. Its keyed digest is
+ * indexed and the raw token is returned only to the browser.
  */
-function generate2FAPendingToken(userId: string): string {
-  return jwt.sign({ userId, purpose: '2fa_pending' }, config.jwtSecret, { expiresIn: '5m' });
+async function generate2FAPendingToken(user: any): Promise<{ id: string; token: string }> {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const tokenHash = digestAuthToken('2fa-challenge', token);
+  const challenge = await withAuthorizationArtifactAdmission(async (tx) => {
+    await assertAuthorizationCredentialSnapshotCurrent(tx, user);
+    return tx.twoFactorChallenge.create({
+      data: {
+        userId: user.id,
+        tokenHash,
+        expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+      },
+      select: { id: true },
+    });
+  });
+  void prisma.twoFactorChallenge.deleteMany({
+    where: { expiresAt: { lt: new Date() } },
+  }).catch(() => {});
+  return { id: challenge.id, token };
 }
 
-function verify2FAPendingToken(token: string): { userId: string } | null {
-  try {
-    const payload = jwt.verify(token, config.jwtSecret) as any;
-    if (payload.purpose !== '2fa_pending') return null;
-    return { userId: payload.userId };
-  } catch {
-    return null;
-  }
+async function verify2FAPendingToken(token: string) {
+  return prisma.twoFactorChallenge.findUnique({
+    where: { tokenHash: digestAuthToken('2fa-challenge', token) },
+    include: { user: true },
+  }).then((challenge) => (
+    challenge && !challenge.consumedAt && challenge.expiresAt > new Date()
+      ? challenge
+      : null
+  ));
+}
+
+async function findVerifiedEmailCode(userId: string, purpose: string, token: string) {
+  const code = await prisma.emailVerificationCode.findFirst({
+    where: {
+      userId,
+      purpose,
+      usedAt: null,
+      expiresAt: { gt: new Date() },
+    },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+  });
+  if (!code || !await comparePassword(token, code.code)) return null;
+  return code;
+}
+
+async function verifyTotpStep(user: {
+  twoFactorSecret: string | null;
+  twoFactorLastUsedStep: number | null;
+}, token: string): Promise<number | null> {
+  if (!user.twoFactorSecret) return null;
+  const result = await otpVerify({
+    token,
+    secret: decryptSecret(user.twoFactorSecret),
+    crypto: otpCrypto,
+    base32: otpBase32,
+    epochTolerance: 30,
+    afterTimeStep: user.twoFactorLastUsedStep ?? undefined,
+  });
+  return result.valid && 'timeStep' in result ? result.timeStep : null;
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
 }
 
 /**
@@ -156,18 +473,20 @@ function generateBackupCodes(count = 8, length = 8): string[] {
 }
 
 function normalizeEmail(email: string): string {
-  return email.trim().toLowerCase();
+  return canonicalEmail(email);
 }
 
 // Validation schemas
 const signupSchema = z.object({
-  email: z.string().email('Invalid email').transform(normalizeEmail),
-  username: z.string().min(3, 'Username must be at least 3 characters').max(50),
+  email: z.string().transform(normalizeEmail).pipe(z.string().email('Invalid email')),
+  username: z.string().transform(canonicalUsername).pipe(
+    z.string().min(3, 'Username must be at least 3 characters').max(50),
+  ),
   password: z.string().min(8, 'Password must be at least 8 characters'),
 });
 
 const loginSchema = z.object({
-  email: z.string().email('Invalid email').transform(normalizeEmail),
+  email: z.string().transform(normalizeEmail).pipe(z.string().email('Invalid email')),
   password: z.string(),
 });
 
@@ -189,10 +508,7 @@ async function getSettingValue(key: string): Promise<string | null> {
 async function getRegistrationMode(): Promise<'open' | 'approval' | 'closed'> {
   const scoped = await getSettingValue('security.registrationMode');
   const legacy = await getSettingValue('registrationMode');
-  const fallback = SECURITY_DEFAULTS.registrationMode;
-  const mode = (scoped || legacy || fallback).toLowerCase();
-  if (mode === 'open' || mode === 'approval' || mode === 'closed') return mode;
-  return fallback;
+  return normalizeRegistrationMode(scoped || legacy);
 }
 
 async function getSessionDurationHours(): Promise<number> {
@@ -219,7 +535,7 @@ async function getSandboxDefaultEnabled(): Promise<boolean> {
  */
 router.post('/signup', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { email, username, password } = signupSchema.parse(req.body);
+    const { email, username, password: _password } = signupSchema.parse(req.body);
     const meta = extractTrackingMetadata(req);
 
     // Block the IP
@@ -284,9 +600,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response, next: Nex
     }
 
     // Find user
-    const user = await prisma.user.findFirst({
-      where: { email: { equals: email, mode: 'insensitive' } },
-    });
+    const user = await prisma.user.findUnique({ where: { email } });
 
     if (!user) {
       const { blocked } = recordFailedAttempt(meta.ip, maxLoginAttempts);
@@ -375,31 +689,66 @@ router.post('/login', authLimiter, async (req: Request, res: Response, next: Nex
       }).catch(() => {});
 
       // Return a short-lived pending token instead of raw userId
-      const pendingToken = generate2FAPendingToken(user.id);
-
-      // If the browser is carrying stale auth cookies from an older session,
-      // clear them before the 2FA step. Otherwise mobile browsers can race a
-      // bad refresh request immediately after a successful password check.
-      clearAuthCookies(req, res);
+      const pending = await generate2FAPendingToken(user);
 
       // If email 2FA, auto-send the code so the user doesn't have to click separately
+      let emailDelivery: {
+        state: 'sent' | 'unavailable' | 'failed';
+        message: string;
+        recoveryAvailable?: boolean;
+      } | undefined;
       if (user.twoFactorMethod === 'email') {
-        try {
-          await generateAndSendEmailCode(user.id, user.email);
-        } catch (err) {
-          console.error('[auth] Failed to auto-send 2FA email code:', err);
+        const unavailable = portalFeatureUnavailableResponse('mail');
+        if (unavailable) {
+          emailDelivery = {
+            state: 'unavailable',
+            message: unavailable.error,
+            recoveryAvailable: !hasStoredBackupCodes(user.twoFactorBackupCodes),
+          };
+        } else {
+          try {
+            await generateAndSendEmailCode(user, `login:${pending.id}`);
+            emailDelivery = {
+              state: 'sent',
+              message: 'A verification code was sent to your email address.',
+            };
+          } catch (error) {
+            if (isAuthorizationArtifactAdmissionConflict(error)) throw error;
+            const becameUnavailable = error instanceof PortalFeatureUnavailableError
+              ? portalFeatureUnavailableResponse('mail')
+              : null;
+            if (becameUnavailable) {
+              emailDelivery = {
+                state: 'unavailable',
+                message: becameUnavailable.error,
+                recoveryAvailable: !hasStoredBackupCodes(user.twoFactorBackupCodes),
+              };
+            } else {
+              // Do not return SMTP/JMAP exceptions, hostnames, credentials, or
+              // provider details to an unauthenticated browser.
+              console.error('[auth] Failed to auto-send a 2FA email code');
+              emailDelivery = {
+                state: 'failed',
+                message: 'The verification email could not be delivered. Try again or use a backup code.',
+              };
+            }
+          }
         }
       }
 
-      res.json({ requiresTwoFactor: true, pendingToken, method: user.twoFactorMethod || 'totp' });
+      // Clear stale browser credentials only after every admitted artifact
+      // required for this response has committed. A transition conflict must
+      // leave the caller's existing cookies untouched so it can retry.
+      clearAuthCookies(req, res);
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        requiresTwoFactor: true,
+        pendingToken: pending.token,
+        method: user.twoFactorMethod || 'totp',
+        ...(emailDelivery ? { emailDelivery } : {}),
+      });
       return;
     }
-
-    // Update last login
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { lastLoginAt: new Date() },
-    });
 
     // Generate tokens
     const accessToken = generateAccessToken({
@@ -407,19 +756,30 @@ router.post('/login', authLimiter, async (req: Request, res: Response, next: Nex
       email: user.email,
       role: user.role,
       accountStatus: (user as any).accountStatus,
+      authorizationVersion: Number((user as any).authorizationVersion ?? 1),
     });
     const refreshToken = generateRefreshToken({ userId: user.id });
-    const refreshTokenHash = await hashPassword(refreshToken);
+    const refreshTokenHash = digestAuthToken('refresh', refreshToken);
+    const sessionExpiresAt = new Date(Date.now() + (await getSessionDurationHours()) * 60 * 60 * 1000);
 
-    // Store session with tracking data
-    await prisma.session.create({
-      data: {
-        userId: user.id,
-        refreshTokenHash,
-        ipAddress: meta.ip,
-        userAgent: meta.rawUserAgent,
-        expiresAt: new Date(Date.now() + (await getSessionDurationHours()) * 60 * 60 * 1000),
-      },
+    // Last-login state and the corresponding session are one DB commit.
+    await withAuthorizationArtifactAdmission(async (tx) => {
+      const current = await tx.user.updateMany({
+        where: authorizationCredentialSnapshotCas(user),
+        data: { lastLoginAt: new Date() },
+      });
+      if (current.count !== 1) {
+        throw new AppError(409, 'Account or credential state changed. Sign in again.');
+      }
+      await tx.session.create({
+        data: {
+          userId: user.id,
+          refreshTokenHash,
+          ipAddress: meta.ip,
+          userAgent: meta.rawUserAgent,
+          expiresAt: sessionExpiresAt,
+        },
+      });
     });
 
     // Log success
@@ -467,9 +827,11 @@ router.post('/login', authLimiter, async (req: Request, res: Response, next: Nex
         role: user.role,
         accountStatus: (user as any).accountStatus,
         sandboxEnabled: user.sandboxEnabled,
+        authorizationVersion: Number((user as any).authorizationVersion ?? 1),
       },
     });
   } catch (error) {
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
     next(error);
   }
 });
@@ -492,54 +854,111 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
       throw new AppError(401, 'Invalid refresh token');
     }
 
-    const sessions = await prisma.session.findMany({
-      where: { userId: payload.userId },
-      orderBy: { createdAt: 'desc' },
+    const refreshTokenHash = digestAuthToken('refresh', refreshToken);
+    const outcome = await withAuthorizationArtifactAdmission(async (tx) => {
+      const session = await tx.session.findUnique({
+        where: { refreshTokenHash },
+        include: { user: true },
+      });
+      if (!session || session.userId !== payload.userId) {
+        return { state: 'missing' } as const;
+      }
+
+      const now = new Date();
+      if (session.expiresAt < now) {
+        await tx.session.deleteMany({
+          where: { id: session.id, refreshTokenHash },
+        });
+        return { state: 'expired' } as const;
+      }
+
+      const user = session.user;
+      if (!canAccessPortal((user as any).accountStatus, user.isActive)) {
+        await tx.session.deleteMany({
+          where: { id: session.id, refreshTokenHash },
+        });
+        return {
+          state: 'blocked',
+          accountStatus: (user as any).accountStatus,
+        } as const;
+      }
+
+      // Claim the exact old digest before minting a replacement. The temporary
+      // digest is never committed independently: any later error rolls this
+      // whole admitted transaction back to the still-usable old token.
+      const rotationClaimHash = digestAuthToken(
+        'refresh',
+        crypto.randomBytes(32).toString('base64url'),
+      );
+      const claimed = await tx.session.updateMany({
+        where: {
+          id: session.id,
+          refreshTokenHash,
+          expiresAt: { gt: now },
+        },
+        data: { refreshTokenHash: rotationClaimHash },
+      });
+      if (claimed.count !== 1) {
+        return { state: 'raced' } as const;
+      }
+
+      const newRefreshToken = generateRefreshToken({ userId: user.id });
+      const newRefreshTokenHash = digestAuthToken('refresh', newRefreshToken);
+      const finalized = await tx.session.updateMany({
+        where: {
+          id: session.id,
+          refreshTokenHash: rotationClaimHash,
+          expiresAt: { gt: now },
+        },
+        data: { refreshTokenHash: newRefreshTokenHash },
+      });
+      if (finalized.count !== 1) {
+        throw new AppError(503, 'Refresh token rotation could not be finalized');
+      }
+
+      return {
+        state: 'rotated',
+        newRefreshToken,
+        user: {
+          id: user.id,
+          email: user.email,
+          role: user.role,
+          accountStatus: (user as any).accountStatus,
+          authorizationVersion: Number((user as any).authorizationVersion ?? 1),
+        },
+      } as const;
     });
-    if (!sessions.length) {
+
+    if (outcome.state === 'missing') {
       clearAuthCookies(req, res);
       throw new AppError(401, 'Session not found');
     }
-
-    let session: any = null;
-    for (const candidate of sessions) {
-      const tokenMatch = await comparePassword(refreshToken, candidate.refreshTokenHash);
-      if (tokenMatch) {
-        session = candidate;
-        break;
-      }
-    }
-
-    if (!session) {
-      clearAuthCookies(req, res);
-      throw new AppError(401, 'Invalid refresh token');
-    }
-    if (session.expiresAt < new Date()) {
+    if (outcome.state === 'expired') {
       clearAuthCookies(req, res);
       throw new AppError(401, 'Refresh token expired');
     }
-
-    const user = await prisma.user.findUnique({ where: { id: payload.userId } });
-    if (!user) {
+    if (outcome.state === 'blocked') {
       clearAuthCookies(req, res);
-      throw new AppError(401, 'User not found');
+      throw new AppError(403, describeBlockedAccountStatus(outcome.accountStatus));
     }
-    if (!canAccessPortal((user as any).accountStatus, user.isActive)) {
+    if (outcome.state === 'raced') {
       clearAuthCookies(req, res);
-      throw new AppError(403, describeBlockedAccountStatus((user as any).accountStatus));
+      throw new AppError(401, 'Refresh token was already used');
     }
 
     const newAccessToken = generateAccessToken({
-      userId: user.id,
-      email: user.email,
-      role: user.role,
-      accountStatus: (user as any).accountStatus,
+      userId: outcome.user.id,
+      email: outcome.user.email,
+      role: outcome.user.role,
+      accountStatus: outcome.user.accountStatus,
+      authorizationVersion: outcome.user.authorizationVersion,
     });
 
-    await applyAuthCookies(req, res, newAccessToken, refreshToken);
+    await applyAuthCookies(req, res, newAccessToken, outcome.newRefreshToken);
 
     res.json({ accessToken: newAccessToken });
   } catch (error) {
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
     next(error);
   }
 });
@@ -575,19 +994,13 @@ router.post('/logout', async (req: Request, res: Response, next: NextFunction) =
       }).catch(() => {});
 
       if (refreshToken) {
-        const sessions = await prisma.session.findMany({ where: { userId } });
-        let matchedSessionId: string | null = null;
-        for (const session of sessions) {
-          const tokenMatch = await comparePassword(refreshToken, session.refreshTokenHash);
-          if (tokenMatch) {
-            matchedSessionId = session.id;
-            break;
-          }
-        }
-
-        if (matchedSessionId) {
-          await prisma.session.delete({ where: { id: matchedSessionId } });
-        } else if (accessPayload) {
+        const deleted = await prisma.session.deleteMany({
+          where: {
+            userId,
+            refreshTokenHash: digestAuthToken('refresh', refreshToken),
+          },
+        });
+        if (deleted.count === 0 && accessPayload) {
           // Preserve the old authenticated logout behavior as a fallback.
           await prisma.session.deleteMany({ where: { userId } });
         }
@@ -607,7 +1020,7 @@ router.post('/logout', async (req: Request, res: Response, next: NextFunction) =
 // ── Forgot Password ─────────────────────────────────────────────────────
 
 const forgotPasswordSchema = z.object({
-  email: z.string().email('Invalid email').transform(normalizeEmail),
+  email: z.string().transform(normalizeEmail).pipe(z.string().email('Invalid email')),
 });
 
 /**
@@ -616,45 +1029,83 @@ const forgotPasswordSchema = z.object({
  */
 router.post('/forgot-password', forgotPasswordLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { email } = forgotPasswordSchema.parse(req.body);
-    const meta = extractTrackingMetadata(req);
-
     // Always respond with the same message regardless of whether user exists
     const successMessage = 'If an account exists with that email, you will receive a password reset link.';
 
-    const user = await prisma.user.findFirst({
-      where: { email: { equals: email, mode: 'insensitive' } },
-    });
+    // Private-origin profiles cannot deliver recovery mail. Return the same
+    // enumeration-resistant response before parsing identity data or touching
+    // users/tokens, while keeping already-issued reset tokens usable through
+    // the separate reset-password route.
+    if (!getPortalFeatureCapabilities().mail.available) {
+      res.json({ message: successMessage });
+      return;
+    }
+
+    const { email } = forgotPasswordSchema.parse(req.body);
+    const meta = extractTrackingMetadata(req);
+
+    const user = await prisma.user.findUnique({ where: { email } });
 
     if (user) {
       // Generate raw token and hash it for storage
       const rawToken = crypto.randomBytes(32).toString('hex');
-      const tokenHash = await hashPassword(rawToken);
+      const tokenHash = digestAuthToken('password-reset', rawToken);
 
-      const resetToken = await prisma.passwordResetToken.create({
-        data: {
-          userId: user.id,
-          token: tokenHash,
-          expiresAt: new Date(Date.now() + 60 * 60 * 1000), // 1 hour
-        },
-      });
+      let resetToken: { id: string } | null;
+      try {
+        resetToken = await withAuthorizationArtifactAdmission(async (tx) => {
+          const current = await tx.user.findFirst({
+            where: authorizationCredentialSnapshotCas(user),
+            select: { id: true },
+          });
+          if (!current) return null;
+          return tx.passwordResetToken.create({
+            data: {
+              userId: user.id,
+              token: tokenHash,
+              expiresAt: new Date(Date.now() + 60 * 60 * 1000), // 1 hour
+            },
+            select: { id: true },
+          });
+        });
+      } catch (error) {
+        if (isAuthorizationArtifactAdmissionConflict(error)) {
+          res.json({ message: successMessage });
+          return;
+        }
+        throw error;
+      }
+      if (!resetToken) {
+        res.json({ message: successMessage });
+        return;
+      }
 
+      let delivered = false;
       try {
         // Send reset email via Stalwart JMAP
-        const resetUrl = buildPortalUrl(`/reset-password?token=${encodeURIComponent(rawToken)}`, req);
+        // URL fragments are not sent in the HTTP request or Referer header, so
+        // reset bearer secrets stay out of proxy/server access logs.
+        const resetUrl = buildPortalUrl(buildPasswordResetPath(rawToken), req);
         await sendPasswordResetEmail({ email: user.email }, resetUrl);
+        delivered = true;
+      } catch (mailError) {
+        await prisma.passwordResetToken.delete({ where: { id: resetToken.id } }).catch(() => {});
+        console.error('[auth] Failed to send password reset email:', mailError);
+      }
 
-        // Only invalidate older unused links after the new email is successfully queued.
+      if (delivered) {
+        // The recipient now holds this exact bearer. Keep it valid even if
+        // best-effort retirement of older links fails; deleting the delivered
+        // candidate here would turn a successful email into a dead link.
         await prisma.passwordResetToken.deleteMany({
           where: {
             userId: user.id,
             usedAt: null,
             id: { not: resetToken.id },
           },
+        }).catch((cleanupError) => {
+          console.error('[auth] Failed to retire older password reset tokens:', cleanupError);
         });
-      } catch (mailError) {
-        await prisma.passwordResetToken.delete({ where: { id: resetToken.id } }).catch(() => {});
-        console.error('[auth] Failed to send password reset email:', mailError);
       }
 
       // Log to activity log
@@ -698,44 +1149,47 @@ router.post('/reset-password', authLimiter, async (req: Request, res: Response, 
       throw new AppError(400, strength.errors.join('. '));
     }
 
-    // Find all non-expired, unused tokens and compare hashes
-    const candidates = await prisma.passwordResetToken.findMany({
-      where: {
-        usedAt: null,
-        expiresAt: { gt: new Date() },
-      },
+    const tokenHash = digestAuthToken('password-reset', token);
+    const matchedToken = await prisma.passwordResetToken.findUnique({
+      where: { token: tokenHash },
       include: { user: true },
     });
-
-    let matchedToken: typeof candidates[0] | null = null;
-    for (const candidate of candidates) {
-      const isMatch = await comparePassword(token, candidate.token);
-      if (isMatch) {
-        matchedToken = candidate;
-        break;
-      }
-    }
-
-    if (!matchedToken) {
+    if (!matchedToken || matchedToken.usedAt || matchedToken.expiresAt <= new Date()) {
       throw new AppError(400, 'Invalid or expired reset link. Please request a new password reset.');
     }
 
-    // Update user's password
     const newHash = await hashPassword(newPassword);
-    await prisma.user.update({
-      where: { id: matchedToken.userId },
-      data: { passwordHash: newHash },
-    });
+    await withAuthorizationArtifactAdmission(async (tx) => {
+      const consumed = await tx.passwordResetToken.updateMany({
+        where: {
+          id: matchedToken.id,
+          token: tokenHash,
+          usedAt: null,
+          expiresAt: { gt: new Date() },
+        },
+        data: { usedAt: new Date() },
+      });
+      if (consumed.count !== 1) {
+        throw new AppError(400, 'Invalid or expired reset link. Please request a new password reset.');
+      }
 
-    // Mark token as used
-    await prisma.passwordResetToken.update({
-      where: { id: matchedToken.id },
-      data: { usedAt: new Date() },
-    });
-
-    // Invalidate all existing sessions for this user
-    await prisma.session.deleteMany({
-      where: { userId: matchedToken.userId },
+      const updated = await tx.user.updateMany({
+        where: {
+          ...authorizationUserSnapshotCas(matchedToken.user),
+          passwordHash: matchedToken.user.passwordHash,
+        },
+        data: { passwordHash: newHash },
+      });
+      if (updated.count !== 1) {
+        throw new AppError(409, 'Account or credential state changed. Request a new password reset.');
+      }
+      await tx.session.deleteMany({ where: { userId: matchedToken.userId } });
+      await tx.twoFactorChallenge.deleteMany({ where: { userId: matchedToken.userId } });
+      await tx.emailVerificationCode.deleteMany({ where: { userId: matchedToken.userId } });
+      await tx.passwordResetToken.updateMany({
+        where: { userId: matchedToken.userId, usedAt: null },
+        data: { usedAt: new Date() },
+      });
     });
 
     // If the reset link is opened in a browser that still carries old auth
@@ -765,6 +1219,7 @@ router.post('/reset-password', authLimiter, async (req: Request, res: Response, 
 
     res.json({ success: true, message: 'Password has been reset successfully. You can now sign in with your new password.' });
   } catch (error) {
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
     next(error);
   }
 });
@@ -773,7 +1228,7 @@ router.post('/reset-password', authLimiter, async (req: Request, res: Response, 
 
 const registerSchema = z.object({
   name: z.string().min(2, 'Name must be at least 2 characters').max(100),
-  email: z.string().email('Invalid email').transform(normalizeEmail),
+  email: z.string().transform(normalizeEmail).pipe(z.string().email('Invalid email')),
   password: z.string().min(8, 'Password must be at least 8 characters'),
   message: z.string().max(1000).optional(),
 });
@@ -788,7 +1243,7 @@ const registerSchema = z.object({
 router.post('/register', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, email, password, message } = registerSchema.parse(req.body);
-    const requestedUsername = name.toLowerCase().replace(/[^a-z0-9_-]/g, '') || email.split('@')[0];
+    const requestedUsername = canonicalUsername(name.replace(/[^a-z0-9_-]/gi, '') || email.split('@')[0]);
 
     if (isReservedSystemMailboxUsername(requestedUsername)) {
       throw new AppError(400, `Username '${requestedUsername}' is reserved for system use. Choose a different username.`);
@@ -842,17 +1297,20 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
       throw new AppError(403, 'Registration is closed. Contact an administrator for access.');
     }
 
+    const strength = validatePasswordStrength(password);
+    if (!strength.valid) {
+      throw new AppError(400, strength.errors.join('. '));
+    }
+
     // Check if email already in use
-    const existingUser = await prisma.user.findFirst({
-      where: { email: { equals: email, mode: 'insensitive' } },
-    });
+    const existingUser = await prisma.user.findUnique({ where: { email } });
     if (existingUser) {
       throw new AppError(409, 'An account with this email already exists');
     }
 
     const existingRequest = await prisma.registrationRequest.findFirst({
       where: {
-        email: { equals: email, mode: 'insensitive' },
+        email,
         status: 'PENDING',
       },
       orderBy: { requestedAt: 'desc' },
@@ -864,44 +1322,56 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
     if (mode === 'open') {
       // Create user immediately with USER role
       const passwordHash = await hashPassword(password);
-      const user = await prisma.user.create({
-        data: {
-          email,
-          username: requestedUsername,
-          passwordHash,
-          role: 'USER',
-          accountStatus: ACTIVE_STATUS,
-          isActive: true,
-          sandboxEnabled: await getSandboxDefaultEnabled(),
-        },
-      } as any);
-
+      const userId = crypto.randomUUID();
       const accessToken = generateAccessToken({
-        userId: user.id,
-        email: user.email,
-        role: user.role,
-        accountStatus: (user as any).accountStatus,
+        userId,
+        email,
+        role: 'USER',
+        accountStatus: ACTIVE_STATUS,
+        authorizationVersion: 1,
       });
-      const refreshToken = generateRefreshToken({ userId: user.id });
-      const refreshTokenHash = await hashPassword(refreshToken);
+      const refreshToken = generateRefreshToken({ userId });
+      const refreshTokenHash = digestAuthToken('refresh', refreshToken);
+      const sandboxEnabled = await getSandboxDefaultEnabled();
+      const expiresAt = new Date(Date.now() + (await getSessionDurationHours()) * 60 * 60 * 1000);
 
-      await prisma.session.create({
-        data: {
-          userId: user.id,
-          refreshTokenHash,
-          ipAddress: req.ip || 'unknown',
-          userAgent: req.headers['user-agent'] || 'unknown',
-          expiresAt: new Date(Date.now() + (await getSessionDurationHours()) * 60 * 60 * 1000),
-        },
-      });
+      const user = await mapAuthorizationArtifactAdmissionConflicts(() => (
+        prisma.$transaction(async (tx) => {
+          await assertNoProjectAuthorizationTransitionActive(tx);
+          const created = await tx.user.create({
+            data: {
+              id: userId,
+              email,
+              username: requestedUsername,
+              passwordHash,
+              role: 'USER',
+              accountStatus: ACTIVE_STATUS,
+              isActive: true,
+              sandboxEnabled,
+            },
+          } as any);
+          await tx.session.create({
+            data: {
+              userId: created.id,
+              refreshTokenHash,
+              ipAddress: req.ip || 'unknown',
+              userAgent: req.headers['user-agent'] || 'unknown',
+              expiresAt,
+            },
+          });
+          return created;
+        }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable })
+      ));
 
-      // Provision personal mailbox (non-blocking, but immediate if possible)
-      provisionUserMailbox(user.username, user.id, { makePrimary: true }).catch((err) => {
-        console.error('[auth] Failed to auto-provision mailbox on open registration:', err);
-      });
+      if (getPortalFeatureCapabilities().mail.available) {
+        // Provision personal mailbox (non-blocking, but immediate if possible)
+        provisionUserMailbox(user.username, user.id, { makePrimary: true }).catch((err) => {
+          console.error('[auth] Failed to auto-provision mailbox on open registration:', err);
+        });
 
-      // Send welcome email via Stalwart (non-blocking)
-      sendWelcomeEmail({ email: user.email, username: user.username }).catch(() => {});
+        // Send welcome email via Stalwart (non-blocking)
+        sendWelcomeEmail({ email: user.email, username: user.username }).catch(() => {});
+      }
 
       await applyAuthCookies(req, res, accessToken, refreshToken);
 
@@ -913,6 +1383,7 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
           role: user.role,
           accountStatus: (user as any).accountStatus,
           sandboxEnabled: user.sandboxEnabled,
+          authorizationVersion: Number((user as any).authorizationVersion ?? 1),
         },
       });
     } else if (mode === 'approval') {
@@ -940,7 +1411,10 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
       throw new AppError(403, 'Registration is closed');
     }
   } catch (error) {
-    next(error);
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
+    next(isUniqueConstraintError(error)
+      ? new AppError(409, 'That email or username is already registered or pending review')
+      : error);
   }
 });
 
@@ -965,6 +1439,7 @@ router.get('/me', authenticateToken, async (req: Request, res: Response, next: N
         role: true,
         accountStatus: true,
         sandboxEnabled: true,
+        authorizationVersion: true,
         avatarPath: true,
         createdAt: true,
         lastLoginAt: true,
@@ -992,8 +1467,12 @@ router.get('/registration-mode', async (_req: Request, res: Response) => {
 // ── Profile Update ──────────────────────────────────────────────────────
 
 const updateProfileSchema = z.object({
-  username: z.string().min(2).max(100).optional(),
-  email: z.string().email().transform(normalizeEmail).optional(),
+  username: z.string().transform(canonicalUsername).pipe(z.string().min(2).max(100)).optional(),
+  email: z.string().transform(normalizeEmail).pipe(z.string().email()).optional(),
+  currentPassword: z.string().min(1, 'Current password is required'),
+  twoFactorToken: z.string().min(6).max(8).optional(),
+}).strict().refine((value) => value.username !== undefined || value.email !== undefined, {
+  message: 'Username or email is required',
 });
 
 /**
@@ -1003,43 +1482,112 @@ const updateProfileSchema = z.object({
 router.put('/me', authenticateToken, async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) throw new AppError(401, 'Not authenticated');
-    const data = updateProfileSchema.parse(req.body);
+    const requestAuthorizationVersion = Number(req.user.authorizationVersion ?? 1);
+    const { currentPassword, twoFactorToken, ...data } = updateProfileSchema.parse(req.body);
 
     if (data.username && isReservedSystemMailboxUsername(data.username)) {
       throw new AppError(400, `Username '${data.username}' is reserved for system use. Choose a different username.`);
     }
 
-    // Check email uniqueness if changing
-    if (data.email) {
-      const existing = await prisma.user.findFirst({
-        where: { email: { equals: data.email, mode: 'insensitive' } },
-      });
-      if (existing && existing.id !== req.user.userId) {
-        throw new AppError(409, 'Email already in use');
-      }
-    }
-
-    // Get current user data before update (for mailbox provisioning)
     const currentUser = await prisma.user.findUnique({
       where: { id: req.user.userId },
-      select: { username: true, mailPassword: true },
-    });
-
-    const user = await prisma.user.update({
-      where: { id: req.user.userId },
-      data,
       select: {
         id: true,
         email: true,
         username: true,
+        firstName: true,
+        lastName: true,
         role: true,
         accountStatus: true,
+        isActive: true,
         sandboxEnabled: true,
+        authorizationVersion: true,
+        passwordHash: true,
+        twoFactorEnabled: true,
+        twoFactorMethod: true,
+        twoFactorSecret: true,
+        twoFactorBackupCodes: true,
+        twoFactorLastUsedStep: true,
       },
-    } as any);
+    });
+    if (!currentUser) throw new AppError(404, 'Invalid request');
+    if (!await comparePassword(currentPassword, currentUser.passwordHash)) {
+      throw new AppError(401, 'Current password is incorrect');
+    }
+
+    let totpStep: number | null = null;
+    let emailCodeId: string | null = null;
+    if (currentUser.twoFactorEnabled) {
+      if (!twoFactorToken) {
+        throw new AppError(401, 'A current two-factor code is required to change account identity');
+      }
+      if (currentUser.twoFactorMethod === 'email') {
+        const code = await findVerifiedEmailCode(currentUser.id, 'reauth', twoFactorToken);
+        if (!code) throw new AppError(401, 'Invalid or expired verification code');
+        emailCodeId = code.id;
+      } else {
+        totpStep = await verifyTotpStep(currentUser, twoFactorToken);
+        if (totpStep === null) throw new AppError(401, 'Invalid or already-used verification code');
+      }
+    }
+
+    const user = await withAuthorizationArtifactAdmission(async (tx) => {
+      if (emailCodeId) {
+        const consumed = await tx.emailVerificationCode.updateMany({
+          where: { id: emailCodeId, userId: currentUser.id, purpose: 'reauth', usedAt: null, expiresAt: { gt: new Date() } },
+          data: { usedAt: new Date() },
+        });
+        if (consumed.count !== 1) throw new AppError(401, 'Verification code was already used');
+      }
+
+      const updated = await tx.user.updateMany({
+        where: {
+          ...authorizationUserSnapshotCas(currentUser),
+          authorizationVersion: requestAuthorizationVersion,
+          passwordHash: currentUser.passwordHash,
+          twoFactorEnabled: currentUser.twoFactorEnabled,
+          twoFactorMethod: currentUser.twoFactorMethod,
+          twoFactorSecret: currentUser.twoFactorSecret,
+          twoFactorBackupCodes: currentUser.twoFactorBackupCodes,
+          ...(totpStep === null
+            ? { twoFactorLastUsedStep: currentUser.twoFactorLastUsedStep }
+            : {}),
+          ...(totpStep === null ? {} : {
+            OR: [
+              { twoFactorLastUsedStep: null },
+              { twoFactorLastUsedStep: { lt: totpStep } },
+            ],
+          }),
+        },
+        data: {
+          ...data,
+          ...(totpStep === null ? {} : { twoFactorLastUsedStep: totpStep }),
+        },
+      });
+      if (updated.count !== 1) {
+        throw new AppError(409, 'Credentials or two-factor state changed; authenticate again');
+      }
+
+      await tx.session.deleteMany({ where: { userId: currentUser.id } });
+      return tx.user.findUniqueOrThrow({
+        where: { id: currentUser.id },
+        select: {
+          id: true,
+          email: true,
+          username: true,
+          role: true,
+          accountStatus: true,
+          sandboxEnabled: true,
+        },
+      } as any);
+    });
 
     // Provision mailbox if username changed, but keep prior mailboxes accessible
-    if (data.username && currentUser && data.username !== currentUser.username) {
+    if (
+      data.username
+      && data.username !== currentUser.username
+      && getPortalFeatureCapabilities().mail.available
+    ) {
       try {
         await provisionUserMailbox(data.username, req.user.userId, { makePrimary: true });
         console.log(`[auth] Provisioned mailbox for user ${data.username}`);
@@ -1049,9 +1597,11 @@ router.put('/me', authenticateToken, async (req: Request, res: Response, next: N
       }
     }
 
+    clearAuthCookies(req, res);
     res.json(user);
   } catch (error) {
-    next(error);
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
+    next(isUniqueConstraintError(error) ? new AppError(409, 'Email or username already in use') : error);
   }
 });
 
@@ -1069,6 +1619,7 @@ const changePasswordSchema = z.object({
 router.post('/change-password', authenticateToken, async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) throw new AppError(401, 'Not authenticated');
+    const requestAuthorizationVersion = Number(req.user.authorizationVersion ?? 1);
     const { currentPassword, newPassword } = changePasswordSchema.parse(req.body);
 
     const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
@@ -1083,16 +1634,25 @@ router.post('/change-password', authenticateToken, async (req: Request, res: Res
     }
 
     const newHash = await hashPassword(newPassword);
-    await prisma.user.update({
-      where: { id: req.user.userId },
-      data: { passwordHash: newHash },
-    });
-
-    // A password change should invalidate all existing sessions immediately,
-    // including the current browser session, so stale refresh tokens cannot
-    // keep running on other devices after the credential change.
-    await prisma.session.deleteMany({
-      where: { userId: req.user.userId },
+    await withAuthorizationArtifactAdmission(async (tx) => {
+      const updated = await tx.user.updateMany({
+        where: {
+          ...authorizationUserSnapshotCas(user),
+          authorizationVersion: requestAuthorizationVersion,
+          passwordHash: user.passwordHash,
+        },
+        data: { passwordHash: newHash },
+      });
+      if (updated.count !== 1) {
+        throw new AppError(409, 'Password changed in another session; authenticate again');
+      }
+      await tx.session.deleteMany({ where: { userId: req.user!.userId } });
+      await tx.twoFactorChallenge.deleteMany({ where: { userId: req.user!.userId } });
+      await tx.emailVerificationCode.deleteMany({ where: { userId: req.user!.userId } });
+      await tx.passwordResetToken.updateMany({
+        where: { userId: req.user!.userId, usedAt: null },
+        data: { usedAt: new Date() },
+      });
     });
     clearAuthCookies(req, res);
 
@@ -1101,6 +1661,7 @@ router.post('/change-password', authenticateToken, async (req: Request, res: Res
 
     res.json({ success: true, message: 'Password changed successfully. Please sign in again.' });
   } catch (error) {
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
     next(error);
   }
 });
@@ -1114,22 +1675,25 @@ router.post('/change-password', authenticateToken, async (req: Request, res: Res
  */
 router.post('/2fa/send-email', twoFactorEmailLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    if (respondWithUnavailableMail(res)) return;
+
     const { pendingToken } = z.object({ pendingToken: z.string() }).parse(req.body);
 
-    const pending = verify2FAPendingToken(pendingToken);
+    const pending = await verify2FAPendingToken(pendingToken);
     if (!pending) {
       throw new AppError(401, 'Invalid or expired verification session. Please log in again.');
     }
 
-    const user = await prisma.user.findUnique({ where: { id: pending.userId } });
-    if (!user || !user.twoFactorEnabled) {
+    const user = pending.user;
+    if (!user.twoFactorEnabled || user.twoFactorMethod !== 'email') {
       throw new AppError(401, 'Invalid verification session');
     }
 
-    await generateAndSendEmailCode(user.id, user.email);
+    await generateAndSendEmailCode(user, `login:${pending.id}`);
 
     res.json({ message: 'Verification code sent' });
   } catch (error) {
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
     next(error);
   }
 });
@@ -1139,11 +1703,13 @@ router.post('/2fa/send-email', twoFactorEmailLimiter, async (req: Request, res: 
  * Generate TOTP secret and QR code for setup, or initiate email 2FA setup.
  * Authenticated only.
  */
-router.post('/2fa/setup', authenticateToken, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/2fa/setup', rejectUnavailableEmailMethodRequest, authenticateToken, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    if (!req.user) throw new AppError(401, 'Not authenticated');
-
     const { method } = z.object({ method: z.enum(['totp', 'email']).default('totp') }).parse(req.body || {});
+    if (method === 'email' && respondWithUnavailableMail(res)) return;
+
+    if (!req.user) throw new AppError(401, 'Not authenticated');
+    const requestAuthorizationVersion = Number(req.user.authorizationVersion ?? 1);
 
     const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
     if (!user) throw new AppError(404, 'Invalid request');
@@ -1154,7 +1720,7 @@ router.post('/2fa/setup', authenticateToken, async (req: Request, res: Response,
 
     if (method === 'email') {
       // Email-based 2FA setup: send a verification code to confirm
-      await generateAndSendEmailCode(user.id, user.email);
+      await generateAndSendEmailCode(user, 'setup', requestAuthorizationVersion);
 
       await prisma.activityLog.create({
         data: {
@@ -1174,10 +1740,22 @@ router.post('/2fa/setup', authenticateToken, async (req: Request, res: Response,
     const secret = otpGenerateSecret({ crypto: otpCrypto, base32: otpBase32 });
 
     // Store the secret temporarily (2FA not enabled yet)
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { twoFactorSecret: secret },
-    });
+    const stored = await withAuthorizationArtifactAdmission((tx) => tx.user.updateMany({
+      where: {
+        ...authorizationUserSnapshotCas(user),
+        authorizationVersion: requestAuthorizationVersion,
+        passwordHash: user.passwordHash,
+        twoFactorEnabled: false,
+        twoFactorMethod: user.twoFactorMethod,
+        twoFactorSecret: user.twoFactorSecret,
+        twoFactorBackupCodes: user.twoFactorBackupCodes,
+        twoFactorLastUsedStep: user.twoFactorLastUsedStep,
+      },
+      data: { twoFactorSecret: encryptSecret(secret), twoFactorLastUsedStep: null },
+    }));
+    if (stored.count !== 1) {
+      throw new AppError(409, 'Account or two-factor state changed. Start setup again.');
+    }
 
     // Generate otpauth URL and QR code
     const otpauthUrl = otpGenerateURI({ secret, label: user.email, issuer: 'BridgesLLM' });
@@ -1195,6 +1773,7 @@ router.post('/2fa/setup', authenticateToken, async (req: Request, res: Response,
 
     res.json({ method: 'totp', secret, qrCodeDataUrl, otpauthUrl });
   } catch (error) {
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
     next(error);
   }
 });
@@ -1203,66 +1782,74 @@ router.post('/2fa/setup', authenticateToken, async (req: Request, res: Response,
  * POST /api/auth/2fa/verify-setup
  * Verify TOTP or email code during setup, enable 2FA, return backup codes.
  */
-router.post('/2fa/verify-setup', authenticateToken, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/2fa/verify-setup', rejectUnavailableEmailMethodRequest, authenticateToken, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    if (!req.user) throw new AppError(401, 'Not authenticated');
     const { token, method } = z.object({
       token: z.string().min(6).max(6),
       method: z.enum(['totp', 'email']).default('totp'),
     }).parse(req.body);
+    if (method === 'email' && respondWithUnavailableMail(res)) return;
+
+    if (!req.user) throw new AppError(401, 'Not authenticated');
+    const requestAuthorizationVersion = Number(req.user.authorizationVersion ?? 1);
 
     const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
     if (!user) throw new AppError(404, 'Invalid request');
     if (user.twoFactorEnabled) throw new AppError(400, 'Two-factor authentication is already enabled');
 
-    if (method === 'email') {
-      // Validate email verification code
-      const recentCode = await prisma.emailVerificationCode.findFirst({
-        where: {
-          userId: user.id,
-          usedAt: null,
-          expiresAt: { gt: new Date() },
-        },
-        orderBy: { createdAt: 'desc' },
-      });
-
-      if (!recentCode) {
-        throw new AppError(400, 'No valid verification code found. Please request a new one.');
-      }
-
-      const codeMatch = await comparePassword(token, recentCode.code);
-      if (!codeMatch) {
-        throw new AppError(400, 'Invalid verification code. Please try again.');
-      }
-
-      // Mark code as used
-      await prisma.emailVerificationCode.update({
-        where: { id: recentCode.id },
-        data: { usedAt: new Date() },
-      });
-    } else {
-      // TOTP validation (existing flow)
-      if (!user.twoFactorSecret) throw new AppError(400, 'No 2FA setup in progress. Call /2fa/setup first.');
-
-      const otpResult = await otpVerify({ token, secret: user.twoFactorSecret, crypto: otpCrypto, base32: otpBase32, epochTolerance: 30 });
-      const isValid = otpResult.valid;
-      if (!isValid) {
-        throw new AppError(400, 'Invalid verification code. Please try again.');
-      }
+    const verifiedCode = method === 'email'
+      ? await findVerifiedEmailCode(user.id, 'setup', token)
+      : null;
+    const totpStep = method === 'totp' ? await verifyTotpStep(user, token) : null;
+    if (method === 'email' && !verifiedCode) {
+      throw new AppError(400, 'Invalid or expired verification code. Please request a new one.');
+    }
+    if (method === 'totp' && totpStep === null) {
+      throw new AppError(400, 'Invalid or already-used verification code. Please try again.');
     }
 
     // Generate backup codes
     const plainBackupCodes = generateBackupCodes();
     const hashedCodes = await Promise.all(plainBackupCodes.map(code => hashPassword(code)));
 
-    // Enable 2FA with the chosen method
-    await prisma.user.update({
-      where: { id: user.id },
-      data: {
-        twoFactorEnabled: true,
-        twoFactorMethod: method,
-        twoFactorBackupCodes: JSON.stringify(hashedCodes),
-      },
+    // Consume the setup proof and enable 2FA in one transaction.
+    await withAuthorizationArtifactAdmission(async (tx) => {
+      if (verifiedCode) {
+        const consumed = await tx.emailVerificationCode.updateMany({
+          where: { id: verifiedCode.id, userId: user.id, purpose: 'setup', usedAt: null, expiresAt: { gt: new Date() } },
+          data: { usedAt: new Date() },
+        });
+        if (consumed.count !== 1) throw new AppError(409, 'Verification code was already used');
+      }
+
+      const enabled = await tx.user.updateMany({
+        where: {
+          ...authorizationUserSnapshotCas(user),
+          authorizationVersion: requestAuthorizationVersion,
+          passwordHash: user.passwordHash,
+          twoFactorEnabled: false,
+          twoFactorMethod: user.twoFactorMethod,
+          twoFactorSecret: user.twoFactorSecret,
+          twoFactorBackupCodes: user.twoFactorBackupCodes,
+          ...(method === 'email'
+            ? { twoFactorLastUsedStep: user.twoFactorLastUsedStep }
+            : {}),
+          ...(method === 'totp' ? {
+            OR: [
+              { twoFactorLastUsedStep: null },
+              { twoFactorLastUsedStep: { lt: totpStep! } },
+            ],
+          } : {}),
+        },
+        data: {
+          twoFactorEnabled: true,
+          twoFactorMethod: method,
+          twoFactorBackupCodes: JSON.stringify(hashedCodes),
+          twoFactorSecret: method === 'email' ? null : user.twoFactorSecret,
+          twoFactorLastUsedStep: method === 'totp' ? totpStep : null,
+        },
+      });
+      if (enabled.count !== 1) throw new AppError(409, 'Two-factor setup changed or was already completed');
     });
 
     await prisma.activityLog.create({
@@ -1280,6 +1867,7 @@ router.post('/2fa/verify-setup', authenticateToken, async (req: Request, res: Re
 
     res.json({ backupCodes: plainBackupCodes });
   } catch (error) {
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
     next(error);
   }
 });
@@ -1289,8 +1877,10 @@ router.post('/2fa/verify-setup', authenticateToken, async (req: Request, res: Re
  * Send an email verification code for authenticated users (e.g., for disabling 2FA).
  * Rate-limited: 3 per 15 min per IP.
  */
-router.post('/2fa/send-email-authenticated', authenticateToken, twoFactorEmailLimiter, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/2fa/send-email-authenticated', rejectUnavailableMailRequest, authenticateToken, twoFactorEmailLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    if (respondWithUnavailableMail(res)) return;
+
     if (!req.user) throw new AppError(401, 'Not authenticated');
 
     const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
@@ -1298,9 +1888,14 @@ router.post('/2fa/send-email-authenticated', authenticateToken, twoFactorEmailLi
       throw new AppError(400, 'Email 2FA is not enabled');
     }
 
-    await generateAndSendEmailCode(user.id, user.email);
+    await generateAndSendEmailCode(
+      user,
+      'reauth',
+      Number(req.user.authorizationVersion ?? 1),
+    );
     res.json({ message: 'Verification code sent' });
   } catch (error) {
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
     next(error);
   }
 });
@@ -1309,7 +1904,7 @@ router.post('/2fa/send-email-authenticated', authenticateToken, twoFactorEmailLi
  * POST /api/auth/2fa/disable
  * Disable 2FA. Requires current TOTP or email verification code.
  */
-router.post('/2fa/disable', authenticateToken, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/2fa/disable', authenticateToken, twoFactorDisableLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) throw new AppError(401, 'Not authenticated');
     const { token } = z.object({ token: z.string().min(6).max(8) }).parse(req.body);
@@ -1317,58 +1912,69 @@ router.post('/2fa/disable', authenticateToken, async (req: Request, res: Respons
     const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
     if (!user) throw new AppError(404, 'Invalid request');
     if (!user.twoFactorEnabled) throw new AppError(400, 'Two-factor authentication is not enabled');
+    const requestAuthorizationVersion = Number(req.user.authorizationVersion ?? 1);
 
-    if (user.twoFactorMethod === 'email') {
-      // Validate email verification code
-      const recentCode = await prisma.emailVerificationCode.findFirst({
-        where: {
-          userId: user.id,
-          usedAt: null,
-          expiresAt: { gt: new Date() },
-        },
-        orderBy: { createdAt: 'desc' },
-      });
-
-      if (!recentCode) {
-        throw new AppError(400, 'No valid verification code found. Please request a new one.');
-      }
-
-      const codeMatch = await comparePassword(token, recentCode.code);
-      if (!codeMatch) {
-        throw new AppError(400, 'Invalid verification code');
-      }
-
-      // Mark code as used
-      await prisma.emailVerificationCode.update({
-        where: { id: recentCode.id },
-        data: { usedAt: new Date() },
-      });
-    } else {
-      // TOTP validation
-      if (!user.twoFactorSecret) throw new AppError(400, 'No 2FA secret found');
-
-      const otpResult = await otpVerify({ token, secret: user.twoFactorSecret, crypto: otpCrypto, base32: otpBase32, epochTolerance: 30 });
-      const isValid = otpResult.valid;
-      if (!isValid) {
-        throw new AppError(400, 'Invalid verification code');
-      }
+    const mailUnavailable = Boolean(portalFeatureUnavailableResponse('mail'));
+    const useBackupCode = user.twoFactorMethod === 'email' && mailUnavailable;
+    const verifiedCode = user.twoFactorMethod === 'email' && !useBackupCode
+      ? await findVerifiedEmailCode(user.id, 'reauth', token)
+      : null;
+    const totpStep = user.twoFactorMethod === 'email' ? null : await verifyTotpStep(user, token);
+    const backupCodeValid = useBackupCode
+      ? await matchesBackupCode(token, user.twoFactorBackupCodes)
+      : false;
+    if (useBackupCode && !backupCodeValid) {
+      throw new AppError(400, 'Invalid backup code');
+    }
+    if (user.twoFactorMethod === 'email' && !useBackupCode && !verifiedCode) {
+      throw new AppError(400, 'Invalid or expired verification code');
+    }
+    if (user.twoFactorMethod !== 'email' && totpStep === null) {
+      throw new AppError(400, 'Invalid or already-used verification code');
     }
 
-    // Disable 2FA
-    await prisma.user.update({
-      where: { id: user.id },
-      data: {
-        twoFactorEnabled: false,
-        twoFactorSecret: null,
-        twoFactorBackupCodes: null,
-        twoFactorMethod: null,
-      },
-    });
+    await withAuthorizationArtifactAdmission(async (tx) => {
+      if (verifiedCode) {
+        const consumed = await tx.emailVerificationCode.updateMany({
+          where: { id: verifiedCode.id, userId: user.id, purpose: 'reauth', usedAt: null, expiresAt: { gt: new Date() } },
+          data: { usedAt: new Date() },
+        });
+        if (consumed.count !== 1) throw new AppError(409, 'Verification code was already used');
+      }
 
-    // Clean up any remaining email verification codes
-    await prisma.emailVerificationCode.deleteMany({
-      where: { userId: user.id },
-    }).catch(() => {});
+      const disabled = await tx.user.updateMany({
+        where: {
+          ...authorizationUserSnapshotCas(user),
+          authorizationVersion: requestAuthorizationVersion,
+          passwordHash: user.passwordHash,
+          twoFactorEnabled: true,
+          twoFactorMethod: user.twoFactorMethod,
+          twoFactorSecret: user.twoFactorSecret,
+          twoFactorBackupCodes: user.twoFactorBackupCodes,
+          ...(totpStep === null
+            ? { twoFactorLastUsedStep: user.twoFactorLastUsedStep }
+            : {}),
+          ...(totpStep === null ? {} : {
+            OR: [
+              { twoFactorLastUsedStep: null },
+              { twoFactorLastUsedStep: { lt: totpStep } },
+            ],
+          }),
+        },
+        data: {
+          twoFactorEnabled: false,
+          twoFactorSecret: null,
+          twoFactorBackupCodes: null,
+          twoFactorMethod: null,
+          twoFactorLastUsedStep: null,
+        },
+      });
+      if (disabled.count !== 1) throw new AppError(409, 'Two-factor state changed; authenticate again');
+      await tx.emailVerificationCode.deleteMany({ where: { userId: user.id } });
+      if (useBackupCode) {
+        await tx.twoFactorChallenge.deleteMany({ where: { userId: user.id } });
+      }
+    });
 
     await prisma.activityLog.create({
       data: {
@@ -1377,6 +1983,13 @@ router.post('/2fa/disable', authenticateToken, async (req: Request, res: Respons
         resource: 'auth',
         severity: 'WARNING',
         translatedMessage: 'Two-factor authentication disabled',
+        metadata: {
+          verifiedVia: useBackupCode
+            ? 'backup_code'
+            : user.twoFactorMethod === 'email'
+              ? 'email_code'
+              : 'totp',
+        },
       },
     }).catch(() => {});
 
@@ -1384,6 +1997,86 @@ router.post('/2fa/disable', authenticateToken, async (req: Request, res: Respons
     sendTwoFactorDisabledEmail({ email: user.email, username: user.username }).catch(() => {});
 
     res.json({ success: true, message: 'Two-factor authentication has been disabled' });
+  } catch (error) {
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
+    next(error);
+  }
+});
+
+/**
+ * POST /api/auth/2fa/recover-email
+ *
+ * Last-resort migration for an account holder who has legacy Email Code 2FA,
+ * no backup codes, and a private Portal origin where mail cannot operate. This is intentionally
+ * a last-resort password-only downgrade: the pending challenge, repeated
+ * password, and typed phrase provide bounded intent/replay friction, not an
+ * independent authentication factor.
+ *
+ * This endpoint invalidates every existing session and issues no replacement.
+ */
+router.post('/2fa/recover-email', twoFactorEmailRecoveryIpLimiter, twoFactorEmailRecoveryLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    res.setHeader('Cache-Control', 'no-store');
+    const capabilities = getPortalFeatureCapabilities();
+    if (
+      capabilities.mail.available
+      || (capabilities.originMode !== 'tailnet' && capabilities.originMode !== 'local')
+    ) {
+      res.status(409).json({
+        error: 'Email Code recovery is only available when Portal mail is unavailable.',
+        code: 'EMAIL_2FA_RECOVERY_NOT_AVAILABLE',
+        retryable: false,
+      });
+      return;
+    }
+    if (!privateRecoveryRequestMatchesConfiguredOrigin(req)) {
+      throw new AppError(403, 'Recovery must be completed through this Portal private origin.');
+    }
+
+    const { pendingToken, currentPassword } = z.object({
+      pendingToken: z.string().regex(/^[A-Za-z0-9_-]{43}$/, 'Invalid verification session'),
+      currentPassword: z.string().min(1).max(1024),
+      confirmation: z.literal(EMAIL_2FA_RECOVERY_CONFIRMATION),
+    }).strict().parse(req.body);
+
+    const pending = await verify2FAPendingToken(pendingToken);
+    if (!pending) {
+      throw new AppError(401, 'Invalid or expired verification session. Please sign in again.');
+    }
+
+    const user = pending.user;
+    if (
+      !user.twoFactorEnabled
+      || user.twoFactorMethod !== 'email'
+      || !canAccessPortal((user as any).accountStatus, user.isActive)
+    ) {
+      throw new AppError(401, 'Recovery is unavailable or the verification session is invalid');
+    }
+    if (!await comparePassword(currentPassword, user.passwordHash)) {
+      throw new AppError(401, 'Recovery is unavailable or the verification session is invalid');
+    }
+    if (hasStoredBackupCodes(user.twoFactorBackupCodes)) {
+      throw new AppError(409, 'A backup code is still available. Use it to finish signing in.');
+    }
+
+    const tracking = extractTrackingMetadata(req);
+    await projectAuthorizationTransitionCoordinator.recoverEmailTwoFactor({
+      targetUserId: user.id,
+      challengeId: pending.id,
+      challengeTokenHash: pending.tokenHash,
+      expectedPasswordHash: user.passwordHash,
+      expectedBackupCodes: user.twoFactorBackupCodes,
+      ipAddress: tracking.ip,
+      userAgent: req.get('user-agent') || null,
+    });
+    clearAuthCookies(req, res);
+
+    res.json({
+      success: true,
+      code: 'EMAIL_2FA_RECOVERED',
+      requiresFreshLogin: true,
+      message: 'Email Code 2FA was disabled and all sessions were signed out. Sign in again, then enable Authenticator App 2FA.',
+    });
   } catch (error) {
     next(error);
   }
@@ -1404,49 +2097,23 @@ router.post('/2fa/validate', twoFactorValidateLimiter, async (req: Request, res:
     const meta = extractTrackingMetadata(req);
 
     // Verify the pending token
-    const pending = verify2FAPendingToken(pendingToken);
+    const pending = await verify2FAPendingToken(pendingToken);
     if (!pending) {
       throw new AppError(401, 'Invalid or expired verification session. Please log in again.');
     }
 
-    const user = await prisma.user.findUnique({ where: { id: pending.userId } });
-    if (!user || !user.twoFactorEnabled) {
+    const user = pending.user;
+    if (!user.twoFactorEnabled || !canAccessPortal((user as any).accountStatus, user.isActive)) {
       throw new AppError(401, 'Invalid verification session');
     }
 
     let validatedViaBackupCode = false;
-    let primaryValid = false;
-
-    if (user.twoFactorMethod === 'email') {
-      // Email 2FA: check the EmailVerificationCode table
-      const recentCode = await prisma.emailVerificationCode.findFirst({
-        where: {
-          userId: user.id,
-          usedAt: null,
-          expiresAt: { gt: new Date() },
-        },
-        orderBy: { createdAt: 'desc' },
-      });
-
-      if (recentCode) {
-        const codeMatch = await comparePassword(token, recentCode.code);
-        if (codeMatch) {
-          primaryValid = true;
-          // Mark code as used
-          await prisma.emailVerificationCode.update({
-            where: { id: recentCode.id },
-            data: { usedAt: new Date() },
-          });
-        }
-      }
-    } else {
-      // TOTP: existing flow
-      if (!user.twoFactorSecret) {
-        throw new AppError(401, 'Invalid verification session');
-      }
-      const otpResult = await otpVerify({ token, secret: user.twoFactorSecret, crypto: otpCrypto, base32: otpBase32, epochTolerance: 30 });
-      primaryValid = otpResult.valid;
-    }
+    const verifiedEmailCode = user.twoFactorMethod === 'email'
+      ? await findVerifiedEmailCode(user.id, `login:${pending.id}`, token)
+      : null;
+    const totpStep = user.twoFactorMethod === 'email' ? null : await verifyTotpStep(user, token);
+    const primaryValid = Boolean(verifiedEmailCode) || totpStep !== null;
+    let backupCodesAfter: string | null = null;
 
     if (!primaryValid) {
       // Try backup codes as fallback (works for both methods)
@@ -1464,12 +2131,8 @@ router.post('/2fa/validate', twoFactorValidateLimiter, async (req: Request, res:
 
         if (matchIndex >= 0) {
           validatedViaBackupCode = true;
-          // Remove the used backup code (one-time use)
           hashedCodes.splice(matchIndex, 1);
-          await prisma.user.update({
-            where: { id: user.id },
-            data: { twoFactorBackupCodes: JSON.stringify(hashedCodes) },
-          });
+          backupCodesAfter = JSON.stringify(hashedCodes);
         } else {
           throw new AppError(401, 'Invalid verification code');
         }
@@ -1478,29 +2141,80 @@ router.post('/2fa/validate', twoFactorValidateLimiter, async (req: Request, res:
       }
     }
 
-    // 2FA validated — complete login flow
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { lastLoginAt: new Date() },
-    });
-
     const accessToken = generateAccessToken({
       userId: user.id,
       email: user.email,
       role: user.role,
       accountStatus: (user as any).accountStatus,
+      authorizationVersion: Number((user as any).authorizationVersion ?? 1),
     });
     const refreshToken = generateRefreshToken({ userId: user.id });
-    const refreshTokenHash = await hashPassword(refreshToken);
+    const refreshTokenHash = digestAuthToken('refresh', refreshToken);
+    const sessionExpiresAt = new Date(Date.now() + (await getSessionDurationHours()) * 60 * 60 * 1000);
 
-    await prisma.session.create({
-      data: {
-        userId: user.id,
-        refreshTokenHash,
-        ipAddress: meta.ip,
-        userAgent: meta.rawUserAgent,
-        expiresAt: new Date(Date.now() + (await getSessionDurationHours()) * 60 * 60 * 1000),
-      },
+    // The challenge, second-factor proof, replay state, and new session commit
+    // together. Any racing replay loses a compare-and-swap and rolls back.
+    await withAuthorizationArtifactAdmission(async (tx) => {
+      const challengeConsumed = await tx.twoFactorChallenge.updateMany({
+        where: {
+          id: pending.id,
+          tokenHash: pending.tokenHash,
+          consumedAt: null,
+          expiresAt: { gt: new Date() },
+        },
+        data: { consumedAt: new Date() },
+      });
+      if (challengeConsumed.count !== 1) throw new AppError(401, 'Verification session was already used');
+
+      if (verifiedEmailCode) {
+        const codeConsumed = await tx.emailVerificationCode.updateMany({
+          where: {
+            id: verifiedEmailCode.id,
+            userId: user.id,
+            purpose: `login:${pending.id}`,
+            usedAt: null,
+            expiresAt: { gt: new Date() },
+          },
+          data: { usedAt: new Date() },
+        });
+        if (codeConsumed.count !== 1) throw new AppError(401, 'Verification code was already used');
+      }
+
+      const userUpdated = await tx.user.updateMany({
+        where: {
+          ...authorizationUserSnapshotCas(user),
+          passwordHash: user.passwordHash,
+          twoFactorEnabled: true,
+          twoFactorMethod: user.twoFactorMethod,
+          twoFactorSecret: user.twoFactorSecret,
+          twoFactorBackupCodes: user.twoFactorBackupCodes,
+          ...(totpStep === null
+            ? { twoFactorLastUsedStep: user.twoFactorLastUsedStep }
+            : {}),
+          ...(totpStep === null ? {} : {
+            OR: [
+              { twoFactorLastUsedStep: null },
+              { twoFactorLastUsedStep: { lt: totpStep } },
+            ],
+          }),
+        },
+        data: {
+          lastLoginAt: new Date(),
+          ...(totpStep === null ? {} : { twoFactorLastUsedStep: totpStep }),
+          ...(backupCodesAfter === null ? {} : { twoFactorBackupCodes: backupCodesAfter }),
+        },
+      });
+      if (userUpdated.count !== 1) throw new AppError(401, 'Verification code was already used');
+
+      await tx.session.create({
+        data: {
+          userId: user.id,
+          refreshTokenHash,
+          ipAddress: meta.ip,
+          userAgent: meta.rawUserAgent,
+          expiresAt: sessionExpiresAt,
+        },
+      });
     });
 
     // Log success
@@ -1548,9 +2262,11 @@ router.post('/2fa/validate', twoFactorValidateLimiter, async (req: Request, res:
         role: user.role,
         accountStatus: (user as any).accountStatus,
         sandboxEnabled: user.sandboxEnabled,
+        authorizationVersion: Number((user as any).authorizationVersion ?? 1),
       },
     });
   } catch (error) {
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
     next(error);
   }
 });
@@ -1593,27 +2309,50 @@ router.get('/2fa/status', authenticateToken, async (req: Request, res: Response,
 router.post('/2fa/regenerate-backup-codes', authenticateToken, async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) throw new AppError(401, 'Not authenticated');
+    const requestAuthorizationVersion = Number(req.user.authorizationVersion ?? 1);
     const { token } = z.object({ token: z.string().min(6).max(6) }).parse(req.body);
 
     const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
     if (!user) throw new AppError(404, 'Invalid request');
-    if (!user.twoFactorEnabled || !user.twoFactorSecret) {
+    if (!user.twoFactorEnabled) {
       throw new AppError(400, 'Two-factor authentication is not enabled');
     }
-
-    const otpResult = await otpVerify({ token, secret: user.twoFactorSecret, crypto: otpCrypto, base32: otpBase32, epochTolerance: 30 });
-    const isValid = otpResult.valid;
-    if (!isValid) {
-      throw new AppError(400, 'Invalid verification code');
+    if (user.twoFactorMethod === 'email') {
+      throw new AppError(
+        400,
+        'Backup codes can only be regenerated with Authenticator App 2FA. Switch from Email Code to Authenticator App first.',
+      );
     }
+    if (!user.twoFactorSecret) throw new AppError(400, 'Authenticator App 2FA is not configured');
+
+    const totpStep = await verifyTotpStep(user, token);
+    if (totpStep === null) throw new AppError(400, 'Invalid or already-used verification code');
 
     const plainBackupCodes = generateBackupCodes();
     const hashedCodes = await Promise.all(plainBackupCodes.map(code => hashPassword(code)));
 
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { twoFactorBackupCodes: JSON.stringify(hashedCodes) },
-    });
+    const updated = await withAuthorizationArtifactAdmission((tx) => (
+      tx.user.updateMany({
+        where: {
+          ...authorizationUserSnapshotCas(user),
+          authorizationVersion: requestAuthorizationVersion,
+          passwordHash: user.passwordHash,
+          twoFactorEnabled: true,
+          twoFactorMethod: user.twoFactorMethod,
+          twoFactorSecret: user.twoFactorSecret,
+          twoFactorBackupCodes: user.twoFactorBackupCodes,
+          OR: [
+            { twoFactorLastUsedStep: null },
+            { twoFactorLastUsedStep: { lt: totpStep } },
+          ],
+        },
+        data: {
+          twoFactorBackupCodes: JSON.stringify(hashedCodes),
+          twoFactorLastUsedStep: totpStep,
+        },
+      })
+    ));
+    if (updated.count !== 1) throw new AppError(409, 'Verification code was already used');
 
     await prisma.activityLog.create({
       data: {
@@ -1627,6 +2366,7 @@ router.post('/2fa/regenerate-backup-codes', authenticateToken, async (req: Reque
 
     res.json({ backupCodes: plainBackupCodes });
   } catch (error) {
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
     next(error);
   }
 });

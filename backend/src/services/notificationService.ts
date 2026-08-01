@@ -20,6 +20,10 @@ import { twoFactorEnabledHtml, twoFactorEnabledText } from '../templates/twoFact
 import { twoFactorDisabledHtml, twoFactorDisabledText } from '../templates/twoFactorDisabled';
 import { twoFactorCodeHtml, twoFactorCodeText } from '../templates/twoFactorCode';
 import { shareLinkHtml, shareLinkText, type ShareLinkEmailParams } from '../templates/shareLink';
+import {
+  assertPortalFeatureAvailable,
+  getPortalFeatureCapabilities,
+} from '../utils/portalFeatureCapabilities';
 
 const MAIL_DOMAIN = process.env.MAIL_DOMAIN || 'localhost';
 
@@ -37,6 +41,7 @@ async function isNotificationEnabled(key: string, defaultValue = false): Promise
  * Send a welcome email to a newly registered user
  */
 export async function sendWelcomeEmail(user: { email: string; username: string }): Promise<void> {
+  if (!getPortalFeatureCapabilities().mail.available) return;
   try {
     const branding = await getCachedBranding();
     await sendEmail({
@@ -56,6 +61,7 @@ export async function sendWelcomeEmail(user: { email: string; username: string }
  * Send password changed confirmation email
  */
 export async function sendPasswordChangedEmail(user: { email: string; username: string }): Promise<void> {
+  if (!getPortalFeatureCapabilities().mail.available) return;
   try {
     if (!(await isNotificationEnabled('notifications.passwordChange'))) return;
     const branding = await getCachedBranding();
@@ -94,6 +100,7 @@ export async function sendLoginAlertEmail(
   user: { email: string; username: string },
   meta: { ip: string; geo: string; device: string; timestamp: Date }
 ): Promise<void> {
+  if (!getPortalFeatureCapabilities().mail.available) return;
   try {
     if (!(await isNotificationEnabled('notifications.newDeviceLogin'))) return;
     const branding = await getCachedBranding();
@@ -114,6 +121,7 @@ export async function sendLoginAlertEmail(
  * Send 2FA enabled confirmation email
  */
 export async function sendTwoFactorEnabledEmail(user: { email: string; username: string }, method?: string): Promise<void> {
+  if (!getPortalFeatureCapabilities().mail.available) return;
   try {
     const branding = await getCachedBranding();
     await sendEmail({
@@ -133,6 +141,7 @@ export async function sendTwoFactorEnabledEmail(user: { email: string; username:
  * Send 2FA disabled warning email
  */
 export async function sendTwoFactorDisabledEmail(user: { email: string; username: string }): Promise<void> {
+  if (!getPortalFeatureCapabilities().mail.available) return;
   try {
     const branding = await getCachedBranding();
     await sendEmail({
@@ -152,6 +161,10 @@ export async function sendTwoFactorDisabledEmail(user: { email: string; username
  * Send a two-factor verification code email
  */
 export async function sendTwoFactorCodeEmail(user: { email: string }, code: string): Promise<void> {
+  // Verification delivery is part of the authentication proof, not an
+  // optional notification. Fail before branding/database work so callers can
+  // report the unavailable capability truthfully and never claim a send.
+  assertPortalFeatureAvailable('mail');
   try {
     const branding = await getCachedBranding();
     await sendEmail({
@@ -164,6 +177,9 @@ export async function sendTwoFactorCodeEmail(user: { email: string }, code: stri
     });
   } catch (err) {
     console.error('[notificationService] Failed to send 2FA code email:', err);
+    // Login and re-authentication must never claim a code was delivered when
+    // the mail capability is unavailable (or delivery otherwise failed).
+    throw err;
   }
 }
 
@@ -213,6 +229,7 @@ export async function sendShareLinkEmail(
  * Send admin alert email — wraps sendSystemAlert for admin notifications
  */
 export async function sendAdminAlertEmail(admins: string[], subject: string, body: string): Promise<void> {
+  if (!getPortalFeatureCapabilities().mail.available) return;
   try {
     await sendSystemAlert(admins, subject, body);
   } catch (err) {

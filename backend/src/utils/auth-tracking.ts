@@ -1,6 +1,6 @@
 import Bowser from 'bowser';
-import geoip from 'geoip-lite';
 import { Request } from 'express';
+import net from 'net';
 import { prisma } from '../config/database';
 
 // ─── In-memory blocked IP set (loaded from DB on startup) ───
@@ -20,7 +20,7 @@ export async function loadBlockedIPs(): Promise<void> {
       if (b.ipAddress) blockedIPs.add(b.ipAddress);
     });
     console.log(`🛡️  Loaded ${blockedIPs.size} blocked IPs`);
-  } catch (e) {
+  } catch {
     // metadata JSON query may not work on older schemas — fallback
     try {
       const blocked = await prisma.activityLog.findMany({
@@ -42,14 +42,12 @@ export async function loadBlockedIPs(): Promise<void> {
 
 // ─── Extract real IP ───
 export function extractIP(req: Request): string {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (forwarded) {
-    const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded).split(',')[0].trim();
-    return first;
-  }
-  const cfIp = req.headers['cf-connecting-ip'];
-  if (cfIp) return Array.isArray(cfIp) ? cfIp[0] : cfIp;
-  return req.ip || req.socket.remoteAddress || 'unknown';
+  // Express is the single proxy-trust authority. Reading forwarding headers
+  // again here would bypass that policy and let direct clients spoof the key
+  // used by blocking, login throttling, and security activity records.
+  const candidate = String(req.ip || req.socket.remoteAddress || '').trim();
+  const normalized = candidate.replace(/^::ffff:/i, '');
+  return net.isIP(normalized) ? normalized : 'unknown';
 }
 
 // ─── Parse user agent ───
@@ -94,18 +92,54 @@ export interface GeoInfo {
   summary: string; // e.g. "New York, NY, US"
 }
 
-export function lookupGeo(ip: string): GeoInfo {
+function firstHeader(value: string | string[] | undefined): string {
+  return (Array.isArray(value) ? value[0] : value || '').trim();
+}
+
+function cleanGeoHeader(value: string | string[] | undefined, maxLength: number): string {
+  const raw = firstHeader(value);
+  if (!raw || raw.length > maxLength * 3) return '';
+  let decoded = raw;
+  try { decoded = decodeURIComponent(raw); } catch {}
+  return decoded
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function isLocalAddress(ip: string): boolean {
+  const normalized = ip.toLowerCase().replace(/^::ffff:/, '');
+  if (normalized === '::1' || normalized === 'localhost') return true;
+  if (/^127\./.test(normalized) || /^10\./.test(normalized) || /^192\.168\./.test(normalized)) return true;
+  const match172 = normalized.match(/^172\.(\d{1,3})\./);
+  if (match172 && Number(match172[1]) >= 16 && Number(match172[1]) <= 31) return true;
+  return normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe80:');
+}
+
+/**
+ * Uses reverse-proxy metadata already supplied by Cloudflare instead of a
+ * bundled, stale GeoIP database. Location is display-only and never feeds an
+ * authorization or blocking decision.
+ */
+export function lookupGeo(ip: string, headers?: Request['headers']): GeoInfo {
   const empty: GeoInfo = { city: '', region: '', country: '', summary: '' };
-  if (!ip || ip === 'unknown' || ip === '::1' || ip.startsWith('127.') || ip.startsWith('192.168.') || ip.startsWith('10.')) {
+  if (!ip || ip === 'unknown' || isLocalAddress(ip)) {
     return { ...empty, summary: 'Local Network' };
   }
-  const geo = geoip.lookup(ip);
-  if (!geo) return { ...empty, summary: 'Unknown location' };
-  const parts = [geo.city, geo.region, geo.country].filter(Boolean);
+
+  const hasCloudflareContext = Boolean(firstHeader(headers?.['cf-ray']) || firstHeader(headers?.['cf-connecting-ip']));
+  if (!headers || !hasCloudflareContext) return { ...empty, summary: 'Unknown location' };
+
+  const city = cleanGeoHeader(headers['cf-ipcity'], 100);
+  const region = cleanGeoHeader(headers['cf-region-code'] || headers['cf-region'], 100);
+  const rawCountry = cleanGeoHeader(headers['cf-ipcountry'], 2).toUpperCase();
+  const country = /^[A-Z]{2}$/.test(rawCountry) && !['XX', 'T1'].includes(rawCountry) ? rawCountry : '';
+  const parts = [city, region, country].filter(Boolean);
   return {
-    city: geo.city || '',
-    region: geo.region || '',
-    country: geo.country || '',
+    city,
+    region,
+    country,
     summary: parts.join(', ') || 'Unknown location',
   };
 }
@@ -154,7 +188,7 @@ export function extractTrackingMetadata(req: Request): TrackingMetadata {
   const ip = extractIP(req);
   const ua = req.get('user-agent') || '';
   const device = parseUserAgent(ua);
-  const geo = lookupGeo(ip);
+  const geo = lookupGeo(ip, req.headers);
   return {
     ip,
     device: { ...device },

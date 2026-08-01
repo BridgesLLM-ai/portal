@@ -1,5 +1,5 @@
 import {
-  Mail, Inbox, Send, Trash2, Star, Archive, AlertTriangle,
+  Mail, Inbox, Send, Trash2, Archive, AlertTriangle,
 } from 'lucide-react';
 import { createElement } from 'react';
 

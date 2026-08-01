@@ -5,9 +5,10 @@ import {
 } from 'recharts';
 import { usageAPI } from '../api/endpoints';
 import {
-  Users, Activity, Timer, Zap, RefreshCw, Loader2, AlertTriangle, Copy, Check,
+  Users, Activity, Timer, Zap, RefreshCw, AlertTriangle, Copy, Check,
 } from 'lucide-react';
 import { getShortModelLabel, normalizeModelId } from '../utils/modelId';
+import { formatUsageRelativeTime } from '../utils/usage';
 
 /* ─── types ─────────────────────────────────────────────── */
 
@@ -21,21 +22,12 @@ interface UsageStats {
     key: string;
     agent: string;
     model: string;
-    lastActivity: number;
-    turns: number;
+    lastActivity: number | null;
+    turns: number | null;
   }>;
 }
 
 /* ─── helpers ───────────────────────────────────────────── */
-
-function formatRelativeTime(ms: number): string {
-  const now = Date.now();
-  const diff = now - ms;
-  if (diff < 60000) return 'just now';
-  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
-  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
-  return `${Math.floor(diff / 86400000)}d ago`;
-}
 
 function truncateSessionKey(key: string, maxLen = 24): string {
   if (!key) return '';
@@ -206,11 +198,27 @@ interface RecentSessionsProps {
 
 function RecentSessions({ sessions, loading }: RecentSessionsProps) {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [copyErrorKey, setCopyErrorKey] = useState<string | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
 
-  const handleCopy = useCallback((key: string) => {
-    navigator.clipboard.writeText(key);
-    setCopiedKey(key);
-    setTimeout(() => setCopiedKey(null), 2000);
+  useEffect(() => () => {
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+  }, []);
+
+  const handleCopy = useCallback(async (key: string) => {
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    setCopyErrorKey(null);
+    try {
+      await navigator.clipboard.writeText(key);
+      setCopiedKey(key);
+      copyTimerRef.current = window.setTimeout(() => {
+        setCopiedKey(null);
+        copyTimerRef.current = null;
+      }, 2000);
+    } catch {
+      setCopiedKey(null);
+      setCopyErrorKey(key);
+    }
   }, []);
 
   if (loading) {
@@ -231,6 +239,9 @@ function RecentSessions({ sessions, loading }: RecentSessionsProps) {
       className="rounded-2xl border border-white/[0.06] bg-gradient-to-br from-white/[0.04] to-transparent backdrop-blur-xl p-6"
     >
       <h3 className="text-lg font-semibold text-white mb-4">Recent Sessions</h3>
+      <p className="sr-only" aria-live="polite">
+        {copiedKey ? 'Session key copied.' : copyErrorKey ? 'Could not copy the session key.' : ''}
+      </p>
       {sessions.length === 0 ? (
         <p className="text-slate-500 text-sm">No sessions found</p>
       ) : (
@@ -249,23 +260,29 @@ function RecentSessions({ sessions, loading }: RecentSessionsProps) {
               {sessions.map((session, idx) => (
                 <tr
                   key={session.key}
-                  className={`border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors cursor-pointer ${
+                  className={`group border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors ${
                     idx % 2 === 0 ? 'bg-white/[0.01]' : ''
                   }`}
-                  onClick={() => handleCopy(session.key)}
-                  title="Click to copy session key"
                 >
                   <td className="py-3 pr-4">
-                    <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleCopy(session.key)}
+                      aria-label={`Copy session key ${session.key}`}
+                      title="Copy session key"
+                      className="flex min-h-9 items-center gap-2 rounded-lg px-1 text-left hover:bg-white/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/70"
+                    >
                       <span className="text-slate-300 font-mono text-xs">
                         {truncateSessionKey(session.key)}
                       </span>
                       {copiedKey === session.key ? (
                         <Check size={14} className="text-emerald-400" />
+                      ) : copyErrorKey === session.key ? (
+                        <span className="text-[11px] font-sans text-red-400">Copy failed</span>
                       ) : (
                         <Copy size={14} className="text-slate-500 opacity-0 group-hover:opacity-100" />
                       )}
-                    </div>
+                    </button>
                   </td>
                   <td className="py-3 pr-4">
                     <span className="text-slate-400">{session.agent}</span>
@@ -277,11 +294,11 @@ function RecentSessions({ sessions, loading }: RecentSessionsProps) {
                   </td>
                   <td className="py-3 pr-4 text-right">
                     <span className="text-slate-500 text-xs">
-                      {session.lastActivity ? formatRelativeTime(session.lastActivity) : '—'}
+                      {formatUsageRelativeTime(session.lastActivity)}
                     </span>
                   </td>
                   <td className="py-3 text-right">
-                    <span className="text-slate-400">{session.turns}</span>
+                    <span className="text-slate-400">{session.turns ?? '—'}</span>
                   </td>
                 </tr>
               ))}
@@ -303,12 +320,14 @@ interface UsageContentProps {
 /* ─── Embeddable Content Component ──────────────────────── */
 
 export function UsageContent({ agentId, showHeader = false }: UsageContentProps) {
-  const [stats, setStats] = useState<UsageStats | null>(null);
+  const scopeKey = agentId?.trim() || '__all__';
+  const [statsSnapshot, setStatsSnapshot] = useState<{ scopeKey: string; data: UsageStats } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const inFlightRef = useRef<AbortController | null>(null);
   const refreshTimerRef = useRef<number | null>(null);
+  const stats = statsSnapshot?.scopeKey === scopeKey ? statsSnapshot.data : null;
 
   const fetchStats = useCallback(async (isRefresh = false, force = false) => {
     if (!force && inFlightRef.current) return;
@@ -324,19 +343,19 @@ export function UsageContent({ agentId, showHeader = false }: UsageContentProps)
 
       const data = await usageAPI.stats(agentId, { signal: controller.signal });
       if (inFlightRef.current !== controller) return;
-      setStats(data);
+      setStatsSnapshot({ scopeKey, data });
     } catch (err: any) {
       if (controller.signal.aborted) return;
       console.error('[UsagePage] Failed to fetch stats:', err);
-      setError(err.message || 'Failed to load usage statistics');
+      setError(err?.response?.data?.error || err?.message || 'Failed to load usage statistics');
     } finally {
       if (inFlightRef.current === controller) {
         inFlightRef.current = null;
+        setLoading(false);
+        setRefreshing(false);
       }
-      setLoading(false);
-      setRefreshing(false);
     }
-  }, [agentId]);
+  }, [agentId, scopeKey]);
 
   useEffect(() => {
     void fetchStats(false, true);
@@ -360,7 +379,7 @@ export function UsageContent({ agentId, showHeader = false }: UsageContentProps)
   }, [fetchStats]);
 
   return (
-    <div className="h-full overflow-auto p-6 md:p-8">
+    <div className="h-full overflow-auto p-4 sm:p-6 md:p-8">
       <motion.div
         variants={container}
         initial="hidden"
@@ -375,6 +394,7 @@ export function UsageContent({ agentId, showHeader = false }: UsageContentProps)
               <p className="text-slate-400 text-sm mt-1">Session counts, model usage, and automation statistics</p>
             </div>
             <button
+              type="button"
               onClick={() => fetchStats(true)}
               disabled={refreshing || loading}
               className="flex items-center gap-2 px-4 py-2 rounded-xl bg-white/[0.05] hover:bg-white/[0.08] border border-white/[0.06] text-slate-300 text-sm font-medium transition-colors disabled:opacity-50"
@@ -389,6 +409,7 @@ export function UsageContent({ agentId, showHeader = false }: UsageContentProps)
         {!showHeader && (
           <div className="flex justify-end">
             <button
+              type="button"
               onClick={() => fetchStats(true)}
               disabled={refreshing || loading}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.05] hover:bg-white/[0.08] border border-white/[0.06] text-slate-400 text-sm transition-colors disabled:opacity-50"
@@ -403,15 +424,21 @@ export function UsageContent({ agentId, showHeader = false }: UsageContentProps)
         <AnimatePresence>
           {error && (
             <motion.div
+              role="alert"
+              aria-live="assertive"
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
               className="flex items-center gap-3 p-4 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400"
             >
               <AlertTriangle size={20} />
-              <span className="flex-1">{error}</span>
+              <span className="flex-1">
+                {error}
+                {stats ? ' Showing the last successfully loaded data.' : ''}
+              </span>
               <button
-                onClick={() => fetchStats()}
+                type="button"
+                onClick={() => fetchStats(false, true)}
                 className="px-3 py-1 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-sm font-medium transition-colors"
               >
                 Retry
@@ -421,7 +448,7 @@ export function UsageContent({ agentId, showHeader = false }: UsageContentProps)
         </AnimatePresence>
 
         {/* Summary Cards */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        {(loading || stats) && <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           {loading ? (
             <>
               <SkeletonCard />
@@ -457,13 +484,13 @@ export function UsageContent({ agentId, showHeader = false }: UsageContentProps)
               />
             </>
           )}
-        </div>
+        </div>}
 
         {/* Model Breakdown & Recent Sessions */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {(loading || stats) && <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <ModelBreakdown data={stats?.modelBreakdown || []} loading={loading} />
           <RecentSessions sessions={stats?.recentSessions || []} loading={loading} />
-        </div>
+        </div>}
       </motion.div>
     </div>
   );

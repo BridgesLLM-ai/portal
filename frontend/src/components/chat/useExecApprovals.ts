@@ -158,7 +158,7 @@ export function useExecApprovals(options?: { enabled?: boolean }): UseExecApprov
           }
           return;
         }
-      } catch (err) {
+      } catch {
         // Ignore parse errors (might be keepalive comments)
       }
     };

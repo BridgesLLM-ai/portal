@@ -1,5 +1,19 @@
 import type { NativeCliProviderAdapter } from '../types';
 import { firstAbsolutePathDir, looksLikePermissionFailure } from '../approvalScope';
+import {
+  CODEX_PROJECT_RUNTIME,
+  buildCodexProjectInvocation,
+} from '../projectSandbox/CodexProjectSandbox';
+
+/**
+ * Codex produces no summarisable reasoning unless an effort is requested, and
+ * no readable summary unless one is asked for. Both are sent on every managed
+ * host-operator turn so Agent Chat can show thinking at all. Kept as
+ * named constants because they are the seam a user-facing reasoning control
+ * will bind to.
+ */
+const CODEX_REASONING_EFFORT = 'medium';
+const CODEX_REASONING_SUMMARY = 'auto';
 
 function markCodexApprovalCandidate(ctx: Parameters<NativeCliProviderAdapter['handleStdoutLine']>[1], detail: {
   command?: string;
@@ -23,11 +37,32 @@ export const codexAdapter: NativeCliProviderAdapter = {
   messageIdPrefix: 'codex-msg',
   initialStatus: 'Codex is working…',
   spawnErrorPrefix: 'Failed to spawn codex CLI',
+  configureSession: (_userId, config) => {
+    if (config.executionContext.scope !== 'PROJECT_SANDBOX') return config;
+    return {
+      ...config,
+      metadata: {
+        ...(config.metadata || {}),
+        cwd: config.executionContext.canonicalRoot,
+        projectRuntime: CODEX_PROJECT_RUNTIME,
+        sandboxPolicyFingerprint: config.executionContext.policyFingerprint,
+      },
+    };
+  },
   buildInvocation: (ctx) => {
     const nativeSessionId = typeof ctx.session.metadata?.nativeSessionId === 'string' && ctx.session.metadata.nativeSessionId.trim()
       ? String(ctx.session.metadata.nativeSessionId).trim()
       : null;
     ctx.state.nativeSessionId = nativeSessionId;
+    if (ctx.session.executionContext?.scope === 'PROJECT_SANDBOX') {
+      return buildCodexProjectInvocation({
+        executionContext: ctx.session.executionContext,
+        turnId: String(ctx.state.portalRunId || ''),
+        nativeSessionId,
+        model: ctx.session.model,
+        message: ctx.message,
+      });
+    }
     const approvedBypass = ctx.state.codexApprovedExecution === true;
     const args = nativeSessionId
       ? ['exec', 'resume', nativeSessionId, '--skip-git-repo-check', '--json']
@@ -38,6 +73,14 @@ export const codexAdapter: NativeCliProviderAdapter = {
       args.push('--sandbox', 'workspace-write');
     }
     if (ctx.session.model) args.push('--model', ctx.session.model);
+    // Portal never asked Codex for a reasoning effort, so every turn
+    // ran with `reasoning_effort: null`. Codex still emitted `reasoning` items,
+    // but with an empty summary -- nothing to render -- which is why Agent Chat
+    // showed no thinking at all while the Session Controls advertised
+    // "Stream when supported". The handler below already consumes reasoning
+    // text; it was simply never produced.
+    args.push('-c', `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`);
+    args.push('-c', `model_reasoning_summary="${CODEX_REASONING_SUMMARY}"`);
     args.push(ctx.message);
     return { command: 'codex', args };
   },
@@ -59,10 +102,17 @@ ${plain}` : plain);
     const type = parsed?.type;
     if (type === 'thread.started' && typeof parsed?.thread_id === 'string' && parsed.thread_id.trim()) {
       const resolvedThreadId = parsed.thread_id.trim();
-      ctx.rekeySession(resolvedThreadId);
+      // The Portal session ID is the immutable local identity for every scope.
+      // Codex's thread UUID is provider resume metadata, never a Portal rekey.
       ctx.state.nativeSessionId = resolvedThreadId;
       ctx.updateSessionMetadata({ nativeSessionId: resolvedThreadId });
-      ctx.onStatus?.({ type: 'session', sessionId: resolvedThreadId });
+      if (ctx.session.executionContext?.scope !== 'PROJECT_SANDBOX') {
+        ctx.onStatus?.({
+          type: 'session',
+          sessionId: ctx.session.sessionId,
+          nativeSessionId: resolvedThreadId,
+        });
+      }
       return;
     }
 
@@ -80,15 +130,27 @@ ${plain}` : plain);
       return;
     }
 
-    if ((type === 'item.started' || type === 'item.completed') && parsed?.item?.type === 'command_execution') {
+    if ((type === 'item.started' || type === 'item.updated' || type === 'item.completed') && parsed?.item?.type === 'command_execution') {
       const command = typeof parsed.item.command === 'string' ? parsed.item.command : 'shell command';
       const output = typeof parsed.item.aggregated_output === 'string' ? parsed.item.aggregated_output : '';
+      const toolCallId = typeof parsed.item.id === 'string' && parsed.item.id.trim()
+        ? parsed.item.id.trim()
+        : undefined;
       if (type === 'item.started') {
         ctx.onStatus?.({
           type: 'tool_start',
           content: `Codex is running ${command}`,
           toolName: 'shell',
           toolArgs: { command },
+          toolCallId,
+        });
+      } else if (type === 'item.updated') {
+        ctx.onStatus?.({
+          type: 'tool_update',
+          content: output || `Codex is running ${command}`,
+          toolName: 'shell',
+          toolResult: output,
+          toolCallId,
         });
       } else {
         markCodexApprovalCandidate(ctx, { command, text: output, toolName: 'shell' });
@@ -99,18 +161,47 @@ ${plain}` : plain);
           toolResult: output,
           status: parsed.item.status,
           exitCode: parsed.item.exit_code,
+          toolCallId,
         });
       }
       return;
     }
 
-    if (type === 'item.completed' && parsed?.item?.type === 'reasoning' && parsed?.item?.text) {
-      ctx.emitStatus(String(parsed.item.text));
+    if (type === 'item.completed' && parsed?.item?.type === 'reasoning') {
+      // Codex reports a reasoning item either as plain `text` or as a
+      // `summary` array of `summary_text` entries. Only the first shape was
+      // read, so a turn that produced a real summary — the common case once an
+      // effort is in play — rendered no thinking at all.
+      const summaryText = Array.isArray(parsed.item.summary)
+        ? parsed.item.summary
+          .map((entry: any) => (typeof entry?.text === 'string' ? entry.text : ''))
+          .filter((entry: string) => entry.trim().length > 0)
+          .join('\n')
+        : '';
+      const reasoningText = typeof parsed.item.text === 'string' && parsed.item.text.trim()
+        ? parsed.item.text
+        : summaryText;
+      if (reasoningText.trim()) {
+        ctx.onStatus?.({ type: 'thinking', content: String(reasoningText) });
+      }
       return;
     }
   },
   finalizeTurn: async (ctx) => {
     const candidate = ctx.state.codexApprovalCandidate;
+    if (ctx.session.executionContext?.scope === 'PROJECT_SANDBOX') {
+      if (candidate) {
+        const denialText = String(
+          ctx.state.codexSuppressedApprovalText
+          || 'Codex could not complete that operation because the Project Sandbox blocked access outside this project.',
+        );
+        ctx.emitStatus('Codex Project Sandbox blocked an operation outside the project boundary.', {
+          permissionDenials: [candidate],
+        });
+        ctx.setFullText(denialText);
+      }
+      return;
+    }
     if (!candidate || ctx.state.retryStarted || ctx.state.codexApprovedExecution) return;
 
     ctx.emitStatus('Codex is waiting for command approval…', { permissionDenials: [candidate] });
@@ -137,7 +228,22 @@ ${plain}` : plain);
     provider: 'codex-cli',
     exitCode: ctx.exitCode,
     model: ctx.session.model || null,
+    executionScope: ctx.session.executionContext?.scope || null,
+    runtime: ctx.session.executionContext?.scope === 'PROJECT_SANDBOX' ? CODEX_PROJECT_RUNTIME : 'codex-cli',
     resolvedSessionId: ctx.session.sessionId,
     nativeSessionId: ctx.state.nativeSessionId || ctx.session.metadata?.nativeSessionId || null,
   }),
+  getErrorMessage: (ctx) => {
+    if (ctx.session.executionContext?.scope !== 'PROJECT_SANDBOX') {
+      return ctx.stderr || `Codex CLI exited with code ${ctx.exitCode}`;
+    }
+    const detail = String(ctx.stderr || '').toLowerCase();
+    if (/auth|oauth|token|login|unauthori[sz]ed/.test(detail)) {
+      return 'Codex authentication is unavailable. Reconnect Codex in AI Settings and retry.';
+    }
+    if (/model|entitlement|not found|unsupported/.test(detail)) {
+      return 'Codex rejected the configured Project model. Choose an available Codex model and retry.';
+    }
+    return 'The confined Codex Project runtime ended before completing the turn.';
+  },
 };

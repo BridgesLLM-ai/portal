@@ -16,7 +16,6 @@ import {
   Zap,
 } from 'lucide-react';
 import { agentJobsAPI, AgentJob, TranscriptEntry } from '../api/agentJobs';
-import { agentRuntimeAPI, AgentRuntimeStatus } from '../api/agentRuntime';
 
 /* ─── Constants ─────────────────────────────────────────────────────────── */
 
@@ -37,6 +36,7 @@ const ADAPTER_MODEL_FLAGS: Record<string, string> = {
 };
 
 const MODEL_STORAGE_PREFIX = 'agentChats.lastModel.';
+const MAX_RENDERED_TRANSCRIPT_ENTRIES = 2000;
 
 const TOOL_META: Record<string, { emoji: string; label: string; color: string; accent: string }> = {
   codex: { emoji: '\u26a1', label: 'Codex', color: 'text-amber-400', accent: 'border-l-amber-400' },
@@ -83,6 +83,18 @@ function formatDuration(ms: number): string {
 
 function toolMeta(toolId: string) {
   return TOOL_META[toolId] || { emoji: '\ud83d\udd27', label: toolId, color: 'text-slate-400', accent: 'border-l-slate-500' };
+}
+
+export function mergeBoundedTranscript(...groups: TranscriptEntry[][]): TranscriptEntry[] {
+  const seen = new Set<string>();
+  const merged: TranscriptEntry[] = [];
+  for (const entry of groups.flat()) {
+    const key = `${entry.timestamp}\u0000${entry.type}\u0000${entry.stream || ''}\u0000${entry.text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(entry);
+  }
+  return merged.slice(-MAX_RENDERED_TRANSCRIPT_ENTRIES);
 }
 
 
@@ -329,7 +341,6 @@ export default function AgentChatsPage() {
   const [command, setCommand] = useState(ADAPTER_DEFAULTS.codex);
   const [cwd, setCwd] = useState('');
   const [model, setModel] = useState(localStorage.getItem(`${MODEL_STORAGE_PREFIX}codex`) || '');
-  const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
   const [isStartingJob, setIsStartingJob] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
   const [socketState, setSocketState] = useState<'connecting' | 'connected' | 'error'>('connecting');
@@ -388,7 +399,7 @@ export default function AgentChatsPage() {
       .then((job) => {
         // Only apply if this is still the selected job
         if (job.id === jobId) {
-          setTranscript(job.transcript || []);
+          setTranscript(mergeBoundedTranscript(job.transcript || []));
           setJobs((prev) => prev.map((j) => 
             j.id === jobId 
               ? { ...j, status: job.status, updatedAt: job.updatedAt, finishedAt: job.finishedAt, exitCode: job.exitCode } 
@@ -407,25 +418,9 @@ export default function AgentChatsPage() {
     if (!selectedJobId) return;
     setIsThinking(false);
     agentJobsAPI.get(selectedJobId)
-      .then((job) => setTranscript(job.transcript || []))
+      .then((job) => setTranscript(mergeBoundedTranscript(job.transcript || [])))
       .catch(() => setTranscript([]));
   }, [selectedJobId]);
-
-  // Runtime status
-  useEffect(() => {
-    let cancelled = false;
-    const loadRuntime = async () => {
-      try {
-        const status = await agentRuntimeAPI.status();
-        if (!cancelled) setRuntimeStatus(status);
-      } catch {
-        if (!cancelled) setRuntimeStatus(null);
-      }
-    };
-    loadRuntime();
-    const interval = setInterval(loadRuntime, 15000);
-    return () => { cancelled = true; clearInterval(interval); };
-  }, []);
 
   // Auto-start from Agent Tools (deduped)
   useEffect(() => {
@@ -505,7 +500,7 @@ export default function AgentChatsPage() {
       socket.emit('subscribe', { jobId: selectedJobId });
       // Reload transcript to catch any missed events during disconnect
       agentJobsAPI.get(selectedJobId).then((job) => {
-        setTranscript(job.transcript || []);
+        setTranscript(mergeBoundedTranscript(job.transcript || []));
         setJobs((prev) => prev.map((j) => 
           j.id === selectedJobId 
             ? { ...j, status: job.status, updatedAt: job.updatedAt, finishedAt: job.finishedAt, exitCode: job.exitCode } 
@@ -547,14 +542,14 @@ export default function AgentChatsPage() {
       lastEntryTimestamp = entry.timestamp || null;
       
       setIsThinking(false);
-      setTranscript((prev) => {
-        // Additional deduplication: check if this exact entry already exists
-        const exists = prev.some(
-          (e) => e.timestamp === entry.timestamp && e.text === entry.text && e.type === entry.type
-        );
-        if (exists) return prev;
-        return [...prev, entry];
-      });
+      setTranscript((prev) => mergeBoundedTranscript(prev, [entry]));
+    });
+
+    socket.on('snapshot', ({ jobId, transcript: snapshot }: { jobId: string; transcript: TranscriptEntry[] }) => {
+      if (jobId !== selectedJobId || !Array.isArray(snapshot)) return;
+      // Merge rather than replace: live output may arrive after the server
+      // joins the room but before its bounded disk snapshot reaches us.
+      setTranscript((prev) => mergeBoundedTranscript(snapshot, prev));
     });
 
     socket.on('status', ({ jobId, status }: { jobId: string; status: string }) => {
@@ -585,7 +580,7 @@ export default function AgentChatsPage() {
       try {
         const job = await agentJobsAPI.get(selectedJobId);
         if (cancelled) return;
-        setTranscript(job.transcript || []);
+        setTranscript(mergeBoundedTranscript(job.transcript || []));
         setJobs((prev) => prev.map((j) => (j.id === selectedJobId ? { ...j, status: job.status, updatedAt: job.updatedAt, finishedAt: job.finishedAt, exitCode: job.exitCode } : j)));
       } catch {
         // no-op
@@ -668,8 +663,6 @@ export default function AgentChatsPage() {
     } catch { /* no-op */ }
   }, []);
 
-  const activeAdapters = runtimeStatus?.adapters?.filter((a: any) => a.id !== 'shell' && a.available).length || 0;
-
   // Manual refresh: reload transcript and reconnect socket
   const handleRefresh = useCallback(async () => {
     if (!selectedJobId || isRefreshing) return;
@@ -678,7 +671,7 @@ export default function AgentChatsPage() {
     try {
       // Reload transcript from server
       const job = await agentJobsAPI.get(selectedJobId);
-      setTranscript(job.transcript || []);
+      setTranscript(mergeBoundedTranscript(job.transcript || []));
       setJobs((prev) => prev.map((j) => 
         j.id === selectedJobId 
           ? { ...j, status: job.status, updatedAt: job.updatedAt, finishedAt: job.finishedAt, exitCode: job.exitCode } 
@@ -698,17 +691,17 @@ export default function AgentChatsPage() {
   /* ── Render ────────────────────────────────────────────────────────── */
 
   return (
-    <div className="h-full flex bg-slate-950 text-slate-100">
+    <div className="h-full flex bg-theme-bg text-theme-text">
 
       {/* ── Sidebar ─────────────────────────────────────────────────── */}
-      <aside className="w-80 border-r border-white/[0.06] flex flex-col bg-[#080c21] shrink-0">
+      <aside className="w-80 border-r border-theme-border flex flex-col bg-theme-surface shrink-0">
         <div className="p-4 border-b border-white/[0.06] flex items-center justify-between">
           <div className="flex items-center gap-2">
             <MessageSquare size={16} className="text-violet-400" />
             <h2 className="font-semibold text-sm tracking-tight">Agent Chats</h2>
           </div>
           <button
-            className="px-3 py-1.5 text-xs rounded-lg bg-violet-600 hover:bg-violet-500 font-medium transition-colors duration-150 flex items-center gap-1.5 shadow-md shadow-violet-600/20"
+            className="px-3 py-1.5 text-xs rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-medium transition-colors duration-150 flex items-center gap-1.5 shadow-md shadow-violet-600/20"
             onClick={() => setShowModal(true)}
           >
             <PlayCircle size={12} /> New Run
@@ -777,7 +770,7 @@ export default function AgentChatsPage() {
       <section className="flex-1 flex flex-col min-w-0">
 
         {/* Header */}
-        <div className="px-4 py-3 border-b border-white/[0.06] flex items-center justify-between gap-3 bg-[#0b1028]/80 backdrop-blur-sm shrink-0">
+        <div className="px-4 py-3 border-b border-theme-border flex items-center justify-between gap-3 bg-theme-surface/90 backdrop-blur-sm shrink-0">
           {selectedJob ? (
             <>
               <div className="flex items-center gap-3 min-w-0">
@@ -879,7 +872,7 @@ export default function AgentChatsPage() {
         </div>
 
         {/* Input area */}
-        <div className="p-3 border-t border-white/[0.06] bg-[#080c21]">
+        <div className="p-3 border-t border-theme-border bg-theme-surface">
           <form onSubmit={sendInput} className="flex items-end gap-2">
             <div className="flex-1 relative">
               <textarea
@@ -890,6 +883,7 @@ export default function AgentChatsPage() {
                     : 'border-white/[0.06] text-slate-500 placeholder:text-slate-600 cursor-not-allowed'
                 }`}
                 placeholder={isRunning ? 'Send input to agent\u2026' : 'No running job'}
+                aria-label="Agent job input"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
@@ -903,6 +897,7 @@ export default function AgentChatsPage() {
             </div>
             <button
               type="submit"
+              aria-label="Send input to agent job"
               className={`p-2.5 rounded-xl transition-all duration-150 ${
                 isRunning && input.trim()
                   ? 'bg-violet-600 hover:bg-violet-500 text-white shadow-md shadow-violet-600/20'
@@ -916,6 +911,7 @@ export default function AgentChatsPage() {
               <button
                 type="button"
                 onClick={() => agentJobsAPI.kill(selectedJob.id)}
+                aria-label="Stop agent job"
                 className="p-2.5 rounded-xl bg-red-700/80 hover:bg-red-600 text-white transition-colors"
                 title="Stop job"
               >
@@ -928,22 +924,24 @@ export default function AgentChatsPage() {
 
       {/* Start Job Modal */}
       {showModal && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-40" onClick={() => setShowModal(false)}>
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center overflow-y-auto p-4 z-40">
           <form
             onSubmit={startJob}
-            className="w-full max-w-lg bg-slate-900 border border-white/10 rounded-2xl p-6 space-y-4 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
+            className="max-h-[calc(100dvh-2rem)] w-full max-w-lg overflow-y-auto bg-theme-surface text-theme-text border border-theme-border rounded-2xl p-6 space-y-4 shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="start-agent-run-title"
           >
             <div className="flex items-center justify-between">
-              <h3 className="font-semibold text-lg">Start Agent Run</h3>
-              <button type="button" onClick={() => setShowModal(false)} className="p-1 rounded-lg hover:bg-white/[0.05] text-slate-400 hover:text-slate-200 transition-colors">
+              <h3 id="start-agent-run-title" className="font-semibold text-lg">Start Agent Run</h3>
+              <button type="button" onClick={() => setShowModal(false)} aria-label="Close start agent run dialog" className="p-1 rounded-lg hover:bg-white/[0.05] text-slate-400 hover:text-slate-200 transition-colors">
                 <X size={18} />
               </button>
             </div>
             <div className="space-y-3">
               <div>
-                <label className="text-xs text-slate-400 font-medium mb-1 block">Agent</label>
-                <select className="w-full bg-slate-950 border border-white/10 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-violet-500/40" value={toolId} onChange={(e) => setToolId(e.target.value)}>
+                <label htmlFor="agent-run-adapter" className="text-xs text-slate-400 font-medium mb-1 block">Agent</label>
+                <select id="agent-run-adapter" aria-label="Agent" className="w-full bg-slate-950 border border-white/10 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-violet-500/40" value={toolId} onChange={(e) => setToolId(e.target.value)}>
                   <option value="codex">{'\u26a1'} Codex</option>
                   <option value="claude-code">{'\ud83e\udde0'} Claude Code</option>
                   <option value="openclaw">{'\ud83e\udd9e'} OpenClaw</option>
@@ -954,27 +952,29 @@ export default function AgentChatsPage() {
               </div>
               {adapterSupportsModel && (
                 <div>
-                  <label className="text-xs text-slate-400 font-medium mb-1 block">Model (optional)</label>
+                  <label htmlFor="agent-run-model" className="text-xs text-slate-400 font-medium mb-1 block">Model (optional)</label>
                   <input
+                    id="agent-run-model"
                     className="w-full bg-slate-950 border border-white/10 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-violet-500/40"
                     value={model}
                     onChange={(e) => setModel(e.target.value)}
+                    aria-label="Model"
                     placeholder="Remembered per adapter"
                   />
                 </div>
               )}
               <div>
-                <label className="text-xs text-slate-400 font-medium mb-1 block">Command</label>
-                <input className="w-full bg-slate-950 border border-white/10 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-violet-500/40" value={command} onChange={(e) => setCommand(e.target.value)} placeholder="Command" />
+                <label htmlFor="agent-run-command" className="text-xs text-slate-400 font-medium mb-1 block">Command</label>
+                <input id="agent-run-command" aria-label="Command" className="w-full bg-slate-950 border border-white/10 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-violet-500/40" value={command} onChange={(e) => setCommand(e.target.value)} placeholder="Command" />
               </div>
               <div>
-                <label className="text-xs text-slate-400 font-medium mb-1 block">Working Directory (optional)</label>
-                <input className="w-full bg-slate-950 border border-white/10 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-violet-500/40" value={cwd} onChange={(e) => setCwd(e.target.value)} placeholder="/path/to/project" />
+                <label htmlFor="agent-run-cwd" className="text-xs text-slate-400 font-medium mb-1 block">Working Directory (optional)</label>
+                <input id="agent-run-cwd" aria-label="Working directory" className="w-full bg-slate-950 border border-white/10 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-violet-500/40" value={cwd} onChange={(e) => setCwd(e.target.value)} placeholder="/path/to/project" />
               </div>
             </div>
             <div className="flex justify-end gap-2 pt-2">
               <button type="button" className="px-4 py-2 text-sm rounded-xl border border-white/10 hover:bg-white/[0.05] transition-colors" onClick={() => setShowModal(false)}>Cancel</button>
-              <button type="submit" disabled={isStartingJob} className={`px-4 py-2 text-sm rounded-xl font-medium transition-colors ${isStartingJob ? 'bg-violet-800 cursor-not-allowed opacity-70' : 'bg-violet-600 hover:bg-violet-500 shadow-md shadow-violet-600/20'}`}>{isStartingJob ? 'Starting\u2026' : 'Start Run'}</button>
+              <button type="submit" disabled={isStartingJob} className={`px-4 py-2 text-sm rounded-xl font-medium text-white transition-colors ${isStartingJob ? 'bg-violet-800 cursor-not-allowed opacity-70' : 'bg-violet-600 hover:bg-violet-500 shadow-md shadow-violet-600/20'}`}>{isStartingJob ? 'Starting\u2026' : 'Start Run'}</button>
             </div>
           </form>
         </div>

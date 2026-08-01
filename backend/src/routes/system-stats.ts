@@ -1,8 +1,8 @@
 import { Router, Request, Response } from 'express';
 import os from 'os';
 import fs from 'fs';
-import { execSync } from 'child_process';
 import { authenticateToken, requireAdmin } from '../middleware/auth';
+import { calculateCpuUsage, parseCpuStat } from '../utils/cpuStat';
 
 const router = Router();
 
@@ -12,14 +12,6 @@ router.use(authenticateToken, requireAdmin);
 // Use host proc if mounted, otherwise container proc
 const PROC = fs.existsSync('/host/proc/meminfo') ? '/host/proc' : '/proc';
 
-function safeExec(cmd: string): string {
-  try {
-    return execSync(cmd, { timeout: 5000, encoding: 'utf-8' }).trim();
-  } catch {
-    return '';
-  }
-}
-
 function readProc(file: string): string {
   try {
     return fs.readFileSync(`${PROC}/${file}`, 'utf-8');
@@ -28,32 +20,10 @@ function readProc(file: string): string {
   }
 }
 
-function getCpuUsage(): { overall: number; perCore: { core: number; usage: number }[] } {
-  const stat = readProc('stat');
-  const lines = stat.split('\n').filter(l => l.startsWith('cpu'));
-
-  const parseLine = (line: string) => {
-    const parts = line.split(/\s+/).slice(1).map(Number);
-    const idle = parts[3] + (parts[4] || 0);
-    const total = parts.reduce((a, b) => a + b, 0);
-    return { idle, total };
-  };
-
-  let overall = 0;
-  const perCore: { core: number; usage: number }[] = [];
-
-  for (const line of lines) {
-    const { idle, total } = parseLine(line);
-    const usage = total > 0 ? Math.round(((total - idle) / total) * 100 * 10) / 10 : 0;
-    if (line.startsWith('cpu ')) {
-      overall = usage;
-    } else {
-      const coreNum = parseInt(line.replace('cpu', ''));
-      perCore.push({ core: coreNum, usage });
-    }
-  }
-
-  return { overall, perCore };
+async function getCpuUsage(): Promise<{ overall: number; perCore: { core: number; usage: number }[] }> {
+  const previous = parseCpuStat(readProc('stat'));
+  await new Promise((resolve) => setTimeout(resolve, 125));
+  return calculateCpuUsage(previous, parseCpuStat(readProc('stat')));
 }
 
 function getMemory() {
@@ -68,8 +38,7 @@ function getMemory() {
   const available = parse('MemAvailable');
   const buffers = parse('Buffers');
   const cached = parse('Cached');
-  const slab = parse('Slab');
-  const used = total - free - buffers - cached - slab;
+  const used = Math.max(0, total - (available || free + buffers + cached));
 
   return {
     total,
@@ -79,7 +48,7 @@ function getMemory() {
     buffers,
     cached,
     buffCache: buffers + cached,
-    usagePercent: Math.round((used / total) * 100 * 10) / 10,
+    usagePercent: total > 0 ? Math.round((used / total) * 100 * 10) / 10 : 0,
   };
 }
 
@@ -98,37 +67,73 @@ function getLoadAverages() {
 }
 
 function getDisk() {
-  const dfOutput = safeExec('df -B1 --output=target,size,used,avail,pcent 2>/dev/null || df -k');
-  const lines = dfOutput.split('\n').slice(1).filter(l => l.trim());
-  
-  return lines
-    .filter(l => l.startsWith('/') && !l.includes('/proc') && !l.includes('/sys'))
-    .map(line => {
-      const parts = line.split(/\s+/);
-      return {
-        mount: parts[0],
-        total: parseInt(parts[1]) || 0,
-        used: parseInt(parts[2]) || 0,
-        available: parseInt(parts[3]) || 0,
-        usagePercent: parseFloat((parts[4] || '0').replace('%', '')),
-      };
-    });
+  try {
+    const stats = (fs as any).statfsSync('/');
+    const blockSize = Number(stats.bsize || stats.frsize || 0);
+    const total = Number(stats.blocks || 0) * blockSize;
+    const free = Number(stats.bfree || 0) * blockSize;
+    const available = Number(stats.bavail ?? stats.bfree ?? 0) * blockSize;
+    const used = Math.max(0, total - free);
+    return [{
+      mount: '/',
+      total,
+      used,
+      available,
+      usagePercent: total > 0 ? Math.round((used / total) * 1000) / 10 : 0,
+    }];
+  } catch {
+    return [];
+  }
 }
 
 function getProcessCount(): number {
-  const raw = safeExec(`ls -1d ${PROC}/[0-9]* 2>/dev/null | wc -l`);
-  return parseInt(raw) || 0;
+  try {
+    return fs.readdirSync(PROC).filter((entry) => /^\d+$/.test(entry)).length;
+  } catch {
+    return 0;
+  }
 }
 
 import http from 'http';
 
+const MAX_DOCKER_RESPONSE_BYTES = 2 * 1024 * 1024;
+const MAX_DOCKER_CONTAINERS = 500;
+
 function dockerApiGet(path: string): Promise<any> {
   return new Promise((resolve, reject) => {
     const req = http.get({ socketPath: '/var/run/docker.sock', path }, (res) => {
-      let data = '';
-      res.on('data', (chunk: Buffer) => { data += chunk; });
+      let settled = false;
+      let received = 0;
+      const chunks: Buffer[] = [];
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+      if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        fail(new Error(`Docker API returned HTTP ${res.statusCode || 0}`));
+        return;
+      }
+      res.on('data', (chunk: Buffer) => {
+        received += chunk.length;
+        if (received > MAX_DOCKER_RESPONSE_BYTES) {
+          res.destroy();
+          fail(new Error('Docker API response exceeded the safe size limit'));
+          return;
+        }
+        chunks.push(Buffer.from(chunk));
+      });
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch { reject(new Error('Invalid JSON')); }
+        if (settled) return;
+        try {
+          const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          settled = true;
+          resolve(parsed);
+        } catch {
+          settled = true;
+          reject(new Error('Invalid JSON'));
+        }
       });
     });
     req.on('error', reject);
@@ -141,12 +146,12 @@ async function getDockerStats(): Promise<{ available: boolean; containers: any[]
     const containers = await dockerApiGet('/containers/json');
     if (!Array.isArray(containers)) return { available: false, containers: [] };
 
-    const result = containers.map((c: any) => ({
+    const result = containers.slice(0, MAX_DOCKER_CONTAINERS).map((c: any) => ({
       id: c.Id?.substring(0, 12),
-      name: (c.Names?.[0] || '').replace(/^\//, ''),
-      image: c.Image,
-      status: c.Status,
-      state: c.State,
+      name: String(c.Names?.[0] || '').replace(/^\//, '').slice(0, 256),
+      image: String(c.Image || '').slice(0, 512),
+      status: String(c.Status || '').slice(0, 512),
+      state: String(c.State || '').slice(0, 100),
     }));
 
     return { available: true, containers: result };
@@ -155,44 +160,21 @@ async function getDockerStats(): Promise<{ available: boolean; containers: any[]
   }
 }
 
-// GET /api/system/stats/tailscale-peers - Tailscale network peers for Ollama setup
-router.get('/tailscale-peers', async (_req: Request, res: Response) => {
-  try {
-    const { execSync } = await import('child_process');
-    let status = '';
-    let available = false;
-    try {
-      status = execSync('tailscale status --json 2>/dev/null', { encoding: 'utf-8', timeout: 5000 });
-      available = true;
-    } catch {
-      res.json({ available: false, peers: [], self: null });
-      return;
-    }
-    const data = JSON.parse(status);
-    const self = data.Self ? {
-      hostname: data.Self.HostName || data.Self.DNSName?.split('.')[0] || '',
-      ip: data.Self.TailscaleIPs?.[0] || '',
-      os: data.Self.OS || '',
-      online: data.Self.Online ?? true,
-    } : null;
-    const peers = Object.values(data.Peer || {}).map((p: any) => ({
-      hostname: p.HostName || p.DNSName?.split('.')[0] || '',
-      ip: p.TailscaleIPs?.[0] || '',
-      os: p.OS || '',
-      online: p.Online ?? false,
-      lastSeen: p.LastSeen || null,
-    }));
-    res.json({ available, self, peers });
-  } catch (error: any) {
-    res.json({ available: false, peers: [], self: null, error: error.message });
-  }
+// Retired: raw peer/IP discovery was never an authorization boundary. The
+// owner-only identity-bound Ollama Tailnet API replaces this endpoint.
+router.get('/tailscale-peers', (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.status(410).json({
+    error: 'Raw Tailscale peer discovery is retired. Use the owner-only identity-bound Ollama setup flow.',
+    code: 'TAILSCALE_PEER_PICKER_RETIRED',
+  });
 });
 
 // GET /api/system/stats - real-time system metrics (no DB dependency)
 router.get('/', async (_req: Request, res: Response) => {
   try {
     const [cpu, memory, docker] = await Promise.all([
-      Promise.resolve(getCpuUsage()),
+      getCpuUsage(),
       Promise.resolve(getMemory()),
       Promise.resolve(getDockerStats()),
     ]);
@@ -200,7 +182,7 @@ router.get('/', async (_req: Request, res: Response) => {
     // Read host uptime from /proc/uptime
     const uptimeStr = readProc('uptime');
     const hostUptime = uptimeStr ? parseFloat(uptimeStr.split(/\s+/)[0]) : os.uptime();
-    const hostHostname = safeExec(`cat ${PROC}/sys/kernel/hostname 2>/dev/null`).trim() || os.hostname();
+    const hostHostname = readProc('sys/kernel/hostname').trim() || os.hostname();
 
     res.json({
       timestamp: new Date().toISOString(),
@@ -217,7 +199,7 @@ router.get('/', async (_req: Request, res: Response) => {
     });
   } catch (error: any) {
     console.error('System stats error:', error);
-    res.status(500).json({ error: 'Failed to collect system stats', message: error.message });
+    res.status(500).json({ error: 'Failed to collect system stats' });
   }
 });
 

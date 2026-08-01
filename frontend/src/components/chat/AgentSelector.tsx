@@ -2,118 +2,94 @@
  * AgentSelector — polished dropdown for switching between agent providers
  * and OpenClaw sub-agents. Sessions appear in a separate dropdown button
  * for any provider that supports session listing.
- * Uses real avatar images from /api/settings/public.
+ * Uses provider avatars from public appearance settings and sub-agent avatars
+ * from authenticated operator settings or the authenticated agent catalog.
  */
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { createPortal } from 'react-dom';
 import { ChevronDown, Check, Users, Radio, Loader2, History, X } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
 import client from '../../api/client';
 import { useAuthStore } from '../../contexts/AuthContext';
 import { getShortModelLabel } from '../../utils/modelId';
+import {
+  formatAgentChatProviderCatalogLoadError,
+  isAgentChatProviderCatalogAbortError,
+  loadAgentChatProviderCatalog,
+  type AgentChatProviderCatalogEntry,
+} from '../../utils/agentChatProviderCatalog';
+import { sanitizeThinkingSubject } from '../../utils/thinkingSubject';
+import AnchoredPopover from '../AnchoredPopover';
 
 /* ─── Mobile Bottom Sheet wrapper ───────────────────────────────────────── */
-/** Renders children in a portal as a bottom-sheet on mobile, inline absolute on desktop */
+/** Shared viewport-aware popover: anchored on desktop and modal bottom-sheet on mobile. */
 function DropdownSheet({
   open,
   onClose,
   children,
-  desktopClass,
+  anchorRef,
+  width,
+  align,
+  title,
+  ariaLabel,
+  closeLabel,
 }: {
   open: boolean;
   onClose: () => void;
   children: React.ReactNode;
-  desktopClass: string;
+  anchorRef: React.RefObject<HTMLButtonElement>;
+  width: number;
+  align: 'start' | 'end';
+  title: string;
+  ariaLabel: string;
+  closeLabel: string;
 }) {
-  // Detect mobile via matchMedia (< 640px = Tailwind sm breakpoint)
   const [isMobile, setIsMobile] = useState(false);
   useEffect(() => {
-    const mq = window.matchMedia('(max-width: 639px)');
-    setIsMobile(mq.matches);
-    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
-    mq.addEventListener('change', handler);
-    return () => mq.removeEventListener('change', handler);
+    const update = () => setIsMobile((window.visualViewport?.width || window.innerWidth) <= 767);
+    update();
+    window.addEventListener('resize', update);
+    window.addEventListener('orientationchange', update);
+    window.visualViewport?.addEventListener('resize', update);
+    return () => {
+      window.removeEventListener('resize', update);
+      window.removeEventListener('orientationchange', update);
+      window.visualViewport?.removeEventListener('resize', update);
+    };
   }, []);
 
-  if (!open) return null;
-
-  if (isMobile) {
-    // Portal to body — escapes all overflow:hidden ancestors
-    return createPortal(
-      <AnimatePresence>
-        <motion.div
-          key="backdrop"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          className="fixed inset-0 bg-black/60 z-[9998]"
-          onClick={onClose}
-        />
-        <motion.div
-          key="sheet"
-          initial={{ opacity: 0, y: 100 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: 100 }}
-          transition={{ type: 'spring', damping: 25, stiffness: 300 }}
-          className="fixed inset-x-0 bottom-0 z-[9999] px-3 pb-3"
-        >
-          <div className="rounded-xl bg-[#1A1F3A] border border-white/[0.08] shadow-2xl shadow-black/50 overflow-hidden max-h-[70vh]">
-            <div className="flex items-center justify-between px-3 pt-2.5 pb-1.5 border-b border-white/[0.06]">
-              <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Select</span>
-              <button onClick={onClose} className="p-1 rounded-lg text-slate-500 hover:text-slate-300">
-                <X size={14} />
-              </button>
-            </div>
-            <div className="overflow-y-auto max-h-[60vh] overscroll-contain">
-              {children}
-            </div>
-          </div>
-        </motion.div>
-      </AnimatePresence>,
-      document.body,
-    );
-  }
-
-  // Desktop — render inline with absolute positioning
   return (
-    <AnimatePresence>
-      <motion.div
-        initial={{ opacity: 0, y: -6, scale: 0.97 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        exit={{ opacity: 0, y: -6, scale: 0.97 }}
-        transition={{ duration: 0.15, ease: 'easeOut' }}
-        className={desktopClass}
-      >
+    <AnchoredPopover
+      open={open}
+      anchorRef={anchorRef}
+      onDismiss={(reason) => {
+        onClose();
+        if (reason === 'escape') anchorRef.current?.focus();
+      }}
+      width={width}
+      align={align}
+      margin={12}
+      mobileBreakpoint={767}
+      zIndex={1300}
+      ariaLabel={ariaLabel}
+      className="max-h-[70dvh] overflow-hidden rounded-xl border border-white/[0.08] bg-[#1A1F3A] shadow-2xl shadow-black/50"
+    >
+      <div role="dialog" aria-label={ariaLabel} className="flex min-h-0 max-h-full flex-col overflow-hidden">
+        {isMobile && (
+          <div className="flex items-center justify-between border-b border-white/[0.06] px-3 pb-1.5 pt-2.5">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">{title}</span>
+            <button type="button" aria-label={closeLabel} onClick={onClose} className="min-h-[36px] min-w-[36px] rounded-lg text-slate-500 hover:text-slate-300">
+              <X size={14} className="mx-auto" />
+            </button>
+          </div>
+        )}
         {children}
-      </motion.div>
-    </AnimatePresence>
+      </div>
+    </AnchoredPopover>
   );
 }
 
 /* ─── Types ─────────────────────────────────────────────────────────────── */
 
-interface ProviderInfo {
-  name: string;
-  displayName: string;
-  installed?: boolean;
-  implemented?: boolean;
-  usable?: boolean;
-  command?: string;
-  version?: string;
-  native?: boolean;
-  reason?: string;
-  nativeAuthStatus?: 'not_applicable' | 'authenticated' | 'needs_login' | 'unknown';
-  nativeAuthMessage?: string;
-  nativeAuthLoginCommand?: string;
-  capabilities?: {
-    implemented?: boolean;
-    requiresGateway?: boolean;
-    supportsHistory?: boolean;
-    supportsModelSelection?: boolean;
-    supportsSessionList?: boolean;
-    supportsExecApproval?: boolean;
-  };
-}
+type ProviderInfo = AgentChatProviderCatalogEntry;
 
 interface OpenClawAgent {
   id: string;
@@ -147,9 +123,11 @@ interface AgentSelectorProps {
   value: string;
   agentId?: string;
   onChange: (selection: AgentSelection) => void;
+  disabled?: boolean;
   onViewSession?: (sessionKey: string) => void;
   currentSessionKey?: string;
   currentSessionLabel?: string;
+  activityTitles?: Readonly<Record<string, string>>;
   agentAvatars?: Record<string, string>;
   subAgentAvatars?: Record<string, string>;
   assistantName?: string;
@@ -167,6 +145,7 @@ const PROVIDER_META: Record<string, { emoji: string; color: string; label: strin
   OPENCLAW:    { emoji: '🟢', color: 'text-emerald-400', label: 'OpenClaw', initials: 'OC', avatarBg: 'bg-emerald-600/20', avatarText: 'text-emerald-300' },
   CLAUDE_CODE: { emoji: '🟣', color: 'text-violet-400',  label: 'Claude Code', initials: 'CL', avatarBg: 'bg-violet-600/20', avatarText: 'text-violet-300' },
   CODEX:       { emoji: '🔵', color: 'text-sky-400',     label: 'Codex', initials: 'CX', avatarBg: 'bg-sky-600/20', avatarText: 'text-sky-300' },
+  GROK:        { emoji: '⚫', color: 'text-orange-300',  label: 'Grok Build', initials: 'GR', avatarBg: 'bg-orange-600/20', avatarText: 'text-orange-300' },
   AGENT_ZERO:  { emoji: '🟡', color: 'text-amber-400',   label: 'Agent Zero', initials: 'A0', avatarBg: 'bg-amber-600/20', avatarText: 'text-amber-300' },
   GEMINI:      { emoji: '🔷', color: 'text-cyan-400',    label: 'Antigravity', initials: 'AG', avatarBg: 'bg-cyan-600/20', avatarText: 'text-cyan-300' },
   OLLAMA:      { emoji: '🔴', color: 'text-rose-400',    label: 'Ollama', initials: 'OL', avatarBg: 'bg-rose-600/20', avatarText: 'text-rose-300' },
@@ -213,6 +192,18 @@ function formatTime(dateStr?: string): string {
   }
 }
 
+function getProviderStatusLabel(provider: ProviderInfo): string {
+  if (provider.availabilityState === 'checking') return 'Checking';
+  if (provider.availabilityState === 'stale') {
+    return provider.checking ? 'Rechecking' : 'Stale';
+  }
+  if (provider.availabilityState === 'error') return 'Unavailable';
+  if (!provider.implemented) return 'Not implemented';
+  if (!provider.installed) return 'Not installed';
+  if (provider.native && provider.nativeAuthStatus === 'needs_login') return 'Needs login';
+  return provider.native ? 'Native' : 'Gateway';
+}
+
 function formatNewSessionSlug(slug: string): string | null {
   const match = slug.match(/^(?:portal-)?new-(\d{13,})$/i);
   if (!match) return null;
@@ -222,7 +213,14 @@ function formatNewSessionSlug(slug: string): string | null {
   return `New chat · ${date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}`;
 }
 
-function getSessionLabel(s: GatewaySession): string {
+function getSessionKey(s: GatewaySession): string {
+  return s.key || s.sessionId || s.id || '';
+}
+
+function getSessionLabel(s: GatewaySession, rawActivityTitle?: unknown): string {
+  const activityTitle = sanitizeThinkingSubject(rawActivityTitle);
+  if (activityTitle) return activityTitle;
+
   const title = typeof (s as any).title === 'string' ? (s as any).title.trim() : '';
   if (title) return title;
 
@@ -289,59 +287,62 @@ function SessionDropdown({
   sessions,
   loading = false,
   hasLoaded = false,
+  error = null,
+  onRetry,
   open,
   onOpenChange,
   onViewSession,
   providerLabel,
   currentSessionKey,
   currentSessionLabel,
+  activityTitles = {},
+  disabled = false,
 }: {
   sessions: GatewaySession[];
   loading?: boolean;
   hasLoaded?: boolean;
+  error?: string | null;
+  onRetry?: () => void;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onViewSession: (sessionKey: string) => void;
   providerLabel: string;
   currentSessionKey?: string;
   currentSessionLabel?: string;
+  activityTitles?: Readonly<Record<string, string>>;
+  disabled?: boolean;
 }) {
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    // On mobile, portal renders to document.body — click-outside would
-    // immediately close the dropdown. Backdrop onClick handles dismissal instead.
-    const isMobile = window.matchMedia('(max-width: 639px)').matches;
-    if (isMobile) return;
-    function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        onOpenChange(false);
-      }
-    }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [open, onOpenChange]);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   const activeSessions = sessions.filter(s => s.status === 'active');
   const otherSessions = sessions.filter(s => s.status !== 'active');
   const countLabel = loading && sessions.length === 0 ? '…' : hasLoaded ? String(sessions.length) : '—';
   const matchedCurrentSession = currentSessionKey
-    ? sessions.find((session) => (session.key || session.sessionId || session.id || '') === currentSessionKey)
+    ? sessions.find((session) => getSessionKey(session) === currentSessionKey)
     : null;
+  const currentActivityTitle = currentSessionKey
+    ? activityTitles[currentSessionKey]
+    : undefined;
   const fallbackCurrentLabel = currentSessionKey
-    ? getSessionLabel({ key: currentSessionKey })
+    ? getSessionLabel({ key: currentSessionKey }, currentActivityTitle)
     : '';
-  const headerLabel = typeof currentSessionLabel === 'string' && currentSessionLabel.trim()
-    ? currentSessionLabel.trim()
-    : matchedCurrentSession
-      ? getSessionLabel(matchedCurrentSession)
+  const headerLabel = currentActivityTitle
+    ? getSessionLabel(matchedCurrentSession || { key: currentSessionKey }, currentActivityTitle)
+    : typeof currentSessionLabel === 'string' && currentSessionLabel.trim()
+      ? currentSessionLabel.trim()
+      : matchedCurrentSession
+        ? getSessionLabel(matchedCurrentSession)
       : (fallbackCurrentLabel || (hasLoaded ? 'History' : 'Chat history'));
 
   return (
-    <div ref={ref} className="relative">
+    <div className="relative">
       <button
-        onClick={() => onOpenChange(!open)}
-        className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] text-xs text-slate-500 hover:text-slate-300 transition-colors min-w-0 max-w-[180px]"
+        ref={triggerRef}
+        onClick={() => { if (!disabled) onOpenChange(!open); }}
+        disabled={disabled}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] text-xs text-slate-500 hover:text-slate-300 transition-colors min-w-0 max-w-[180px] disabled:cursor-wait disabled:opacity-50"
         title={`${providerLabel} sessions`}
       >
         <History size={12} />
@@ -364,7 +365,12 @@ function SessionDropdown({
       <DropdownSheet
         open={open}
         onClose={() => onOpenChange(false)}
-        desktopClass="absolute top-full right-0 mt-1.5 w-64 rounded-xl bg-[#1A1F3A] border border-white/[0.08] shadow-2xl shadow-black/50 overflow-hidden z-50"
+        anchorRef={triggerRef}
+        width={256}
+        align="end"
+        title="Select session"
+        ariaLabel={`${providerLabel} sessions`}
+        closeLabel="Close session selector"
       >
         <div className="max-h-[320px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
           <div className="px-3 pt-2.5 pb-1.5">
@@ -384,7 +390,18 @@ function SessionDropdown({
             </div>
           )}
 
-          {!loading && sessions.length === 0 && (
+          {!loading && error && (
+            <div className="mx-3 mb-2 rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100" role="alert">
+              <div>{error}</div>
+              {onRetry && (
+                <button type="button" onClick={onRetry} className="mt-2 min-h-[34px] rounded-lg border border-amber-300/20 bg-amber-500/10 px-2.5 text-[11px] font-medium text-amber-50 hover:bg-amber-500/20">
+                  Retry session history
+                </button>
+              )}
+            </div>
+          )}
+
+          {!loading && !error && sessions.length === 0 && (
             <div className="px-4 py-6 text-xs text-slate-500">
               No recent sessions yet.
             </div>
@@ -393,7 +410,7 @@ function SessionDropdown({
           {activeSessions.length > 0 && (
             <div>
               {activeSessions.map((s, idx) => {
-                const key = s.key || s.sessionId || s.id || '';
+                const key = getSessionKey(s);
                 return (
                   <button
                     key={key || `active-${idx}`}
@@ -402,7 +419,7 @@ function SessionDropdown({
                   >
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
                     <span className="flex-1 text-left truncate text-[12px] font-medium">
-                      {getSessionLabel(s)}
+                      {getSessionLabel(s, activityTitles[key])}
                     </span>
                     <span className="text-[10px] text-slate-600 flex-shrink-0">
                       {formatTime(s.lastActivityAt || s.createdAt)}
@@ -418,7 +435,7 @@ function SessionDropdown({
           )}
 
           {otherSessions.slice(0, 10).map((s, idx) => {
-            const key = s.key || s.sessionId || s.id || '';
+            const key = getSessionKey(s);
             return (
               <button
                 key={key || `other-${idx}`}
@@ -427,7 +444,7 @@ function SessionDropdown({
               >
                 <span className="w-1.5 h-1.5 rounded-full bg-slate-600 flex-shrink-0" />
                 <span className="flex-1 text-left truncate text-[12px]">
-                  {getSessionLabel(s)}
+                  {getSessionLabel(s, activityTitles[key])}
                 </span>
                 <span className="text-[10px] text-slate-600 flex-shrink-0">
                   {formatTime(s.lastActivityAt || s.createdAt)}
@@ -452,10 +469,11 @@ export default function AgentSelector({
   onViewSession,
   currentSessionKey,
   currentSessionLabel,
+  activityTitles = {},
   agentAvatars = {},
   subAgentAvatars = {},
   assistantName,
-  defaultOpenClawAgentId,
+  disabled = false,
 }: AgentSelectorProps) {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
@@ -466,43 +484,67 @@ export default function AgentSelector({
   const [loading, setLoading] = useState(false);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
+  const [sessionsLoadError, setSessionsLoadError] = useState<string | null>(null);
+  const [sessionsRefreshNonce, setSessionsRefreshNonce] = useState(0);
   const [agentsLoading, setAgentsLoading] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
+  const [providerLoadError, setProviderLoadError] = useState<string | null>(null);
+  const [providerRefreshNonce, setProviderRefreshNonce] = useState(0);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const sessionCacheRef = useRef(new Map<string, GatewaySession[]>());
+  const lastProviderRetryRef = useRef(0);
+  const selectedProviderSessionCapability = value === 'OPENCLAW'
+    ? true
+    : providers.find((provider) => provider.name === value)?.capabilities?.supportsSessionList;
+  // The catalog is advisory while absent, loading, or failed. Only an explicit
+  // false suppresses history; otherwise the sessions endpoint is authoritative.
+  const canAttemptSessionList = selectedProviderSessionCapability !== false;
 
-  // Fetch providers lazily when the selector opens. The current provider/agent is
-  // already known from parent state, so Agent Chats should not spend startup budget
-  // populating dropdown options before the user asks for them.
   useEffect(() => {
-    if (!open) return;
+    if (!disabled) return;
+    setOpen(false);
+    setSessionsOpen(false);
+  }, [disabled]);
+
+  // Fetch providers when the selector opens. A selected native provider also
+  // needs its capability row on first paint so session history is not hidden
+  // until the user happens to open the unrelated provider selector.
+  useEffect(() => {
+    const needsSelectedProviderCapabilities = Boolean(onViewSession) && value !== 'OPENCLAW';
+    if ((!open && !needsSelectedProviderCapabilities) || disabled) return;
+    const controller = new AbortController();
     let cancelled = false;
+    const force = providerRefreshNonce > lastProviderRetryRef.current;
+    if (force) lastProviderRetryRef.current = providerRefreshNonce;
     setLoading(true);
     async function fetchProviders() {
       try {
-        const { data } = await client.get('/gateway/providers');
-        if (!cancelled && data.providers) {
-          setProviders(data.providers);
-          const saved = localStorage.getItem(STORAGE_KEY);
-          const savedAgent = normalizeOpenClawAgentId(localStorage.getItem(AGENT_STORAGE_KEY));
-          const defaultAgent = normalizeOpenClawAgentId(defaultOpenClawAgentId);
-          const preferredOpenClawAgent = savedAgent || defaultAgent;
-          const usableProviders = data.providers.filter((p: ProviderInfo) => p.usable !== false);
-          const currentProviderUsable = value && usableProviders.some((p: ProviderInfo) => p.name === value);
-          if (!currentProviderUsable && usableProviders.length > 0) {
-            const fallback = saved && usableProviders.some((p: ProviderInfo) => p.name === saved)
-              ? saved
-              : usableProviders[0].name;
-            onChange({ provider: fallback, agentId: fallback === 'OPENCLAW' ? preferredOpenClawAgent : undefined });
-          }
+        const providerRows = await loadAgentChatProviderCatalog({
+          force,
+          signal: controller.signal,
+          onSnapshot: (snapshot) => {
+            if (!cancelled) {
+              setProviders(snapshot);
+              setProviderLoadError(null);
+            }
+          },
+        });
+        if (!cancelled) {
+          setProviders(providerRows);
         }
-      } catch {
-        if (!cancelled) setProviders([{ name: 'OPENCLAW', displayName: 'OpenClaw' }]);
+      } catch (error) {
+        if (!cancelled && !isAgentChatProviderCatalogAbortError(error)) {
+          setProviderLoadError(formatAgentChatProviderCatalogLoadError(error));
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
     }
     void fetchProviders();
-    return () => { cancelled = true; };
-  }, [open, defaultOpenClawAgentId, onChange, value]);
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [disabled, open, onViewSession, providerRefreshNonce, value]);
 
   // Fetch OpenClaw sub-agents lazily when the selector opens. Cache still seeds the
   // UI immediately, but we do not spend first-load bandwidth on hidden dropdown data.
@@ -549,27 +591,33 @@ export default function AgentSelector({
 
     const cached = loadCachedAgents();
     if (cached) setAgents(cached);
-    if (!open) return () => { cancelled = true; };
+    if (!open || disabled) return () => { cancelled = true; };
 
     void fetchAgents();
     return () => { cancelled = true; };
-  }, [open]);
+  }, [disabled, open]);
 
   // Fetch session lists only when the session picker is opened.
   // The chat header stays usable without this metadata, so we avoid paying
   // for hidden session-list requests on every Agent Chat page open.
   useEffect(() => {
-    const selectedProvider = providers.find((p) => p.name === value);
-    const supportsSessionList = value === 'OPENCLAW' || selectedProvider?.capabilities?.supportsSessionList === true;
-    if (!supportsSessionList || !isAuthenticated) {
+    if (!canAttemptSessionList || !isAuthenticated) {
       setSessions([]);
       setSessionsLoading(false);
       setSessionsLoaded(false);
+      setSessionsLoadError(null);
       return;
     }
     const shouldFetchSessions = sessionsOpen || Boolean(currentSessionKey);
     if (!shouldFetchSessions) return;
     let cancelled = false;
+    const scopeKey = value === 'OPENCLAW'
+      ? `OPENCLAW:${normalizeOpenClawAgentId(agentId) || 'main'}`
+      : value;
+    const cached = sessionCacheRef.current.get(scopeKey);
+    setSessions(cached || []);
+    setSessionsLoaded(Boolean(cached));
+    setSessionsLoadError(null);
     async function fetchSessions() {
       if (!cancelled) setSessionsLoading(true);
       try {
@@ -585,13 +633,16 @@ export default function AgentSelector({
         } as any);
         const list = data.sessions || [];
         if (!cancelled) {
-          setSessions(Array.isArray(list) ? list : Object.values(list));
+          const normalized = (Array.isArray(list) ? list : Object.values(list)) as GatewaySession[];
+          sessionCacheRef.current.set(scopeKey, normalized);
+          setSessions(normalized);
           setSessionsLoaded(true);
+          setSessionsLoadError(null);
         }
       } catch {
         if (!cancelled) {
-          setSessions([]);
           setSessionsLoaded(true);
+          setSessionsLoadError('Session history could not be refreshed. Previously loaded sessions remain available.');
         }
       } finally {
         if (!cancelled) setSessionsLoading(false);
@@ -600,22 +651,10 @@ export default function AgentSelector({
     void fetchSessions();
     const interval = setInterval(fetchSessions, 30000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [value, agentId, providers, sessionsOpen, currentSessionKey, isAuthenticated]);
-
-  // Close on click outside (desktop only — mobile uses backdrop onClick)
-  useEffect(() => {
-    const isMobile = window.matchMedia('(max-width: 639px)').matches;
-    if (isMobile) return;
-    function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [open]);
+  }, [value, agentId, canAttemptSessionList, sessionsOpen, currentSessionKey, isAuthenticated, sessionsRefreshNonce]);
 
   const handleSelect = useCallback((provider: string, selectedAgentId?: string) => {
+    if (disabled) return;
     const normalizedAgentId = provider === 'OPENCLAW'
       ? normalizeOpenClawAgentId(selectedAgentId)
       : undefined;
@@ -627,13 +666,14 @@ export default function AgentSelector({
       localStorage.removeItem(AGENT_STORAGE_KEY);
     }
     setOpen(false);
-  }, [onChange]);
+  }, [disabled, onChange]);
 
   const handleSessionClick = useCallback((sessionKey: string) => {
+    if (disabled) return;
     if (onViewSession) {
       onViewSession(sessionKey);
     }
-  }, [onViewSession]);
+  }, [disabled, onViewSession]);
 
   // Resolve avatar URL for a given agent
   function getSubAgentAvatarUrl(agent: OpenClawAgent): string | undefined {
@@ -651,6 +691,8 @@ export default function AgentSelector({
   let displayTextClass: string;
 
   const effectiveAgentId = value === 'OPENCLAW' ? normalizeOpenClawAgentId(agentId) : undefined;
+  const openClawAgents = agents.filter((agent) => agent.id !== 'main');
+  const hasOpenClawProvider = providers.some((provider) => provider.name === 'OPENCLAW');
 
   if (value === 'OPENCLAW' && effectiveAgentId) {
     const matchedAgent = agents.find(a => a.id === effectiveAgentId);
@@ -670,10 +712,15 @@ export default function AgentSelector({
   return (
     <div className="flex items-center gap-1.5">
       {/* ── Agent Dropdown ──────────────────────────────────────── */}
-      <div ref={ref} className="relative">
+      <div className="relative">
         <button
-          onClick={() => setOpen(!open)}
-          className="flex items-center gap-1.5 sm:gap-2 px-2 sm:px-3 py-1.5 rounded-lg bg-white/[0.06] hover:bg-white/[0.10] border border-white/[0.08] text-sm text-slate-300 transition-colors"
+          ref={triggerRef}
+          onClick={() => { if (!disabled) setOpen(!open); }}
+          disabled={disabled}
+          aria-label="Select agent provider"
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          className="flex items-center gap-1.5 sm:gap-2 px-2 sm:px-3 py-1.5 rounded-lg bg-white/[0.06] hover:bg-white/[0.10] border border-white/[0.08] text-sm text-slate-300 transition-colors disabled:cursor-wait disabled:opacity-50"
         >
           <AvatarCircle
             src={displayAvatarUrl}
@@ -697,14 +744,19 @@ export default function AgentSelector({
         <DropdownSheet
           open={open}
           onClose={() => setOpen(false)}
-          desktopClass="absolute top-full left-0 mt-1.5 w-72 rounded-xl bg-[#1A1F3A] border border-white/[0.08] shadow-2xl shadow-black/50 overflow-hidden z-50"
+          anchorRef={triggerRef}
+          width={288}
+          align="start"
+          title="Select agent"
+          ariaLabel="Available agent providers"
+          closeLabel="Close agent selector"
         >
           <div className="max-h-[420px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
-            {/* ── AGENTS Section ────────────────────────────────── */}
+            {/* ── PROVIDERS Section ────────────────────────────────── */}
             <div className="px-3 pt-3 pb-1">
               <div className="flex items-center gap-1.5 text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1.5">
                 <Users size={10} />
-                Agents
+                Providers
               </div>
             </div>
 
@@ -715,7 +767,28 @@ export default function AgentSelector({
               </div>
             )}
 
-            {!loading && providers.length === 0 && (
+            {!loading && providerLoadError && (
+              <div
+                role="alert"
+                className="mx-3 mb-2 rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100"
+              >
+                <div>
+                  {providers.length > 0
+                    ? `Couldn’t refresh providers. Showing the last available list. ${providerLoadError}`
+                    : `Couldn’t load providers. Your current selection is unchanged. ${providerLoadError}`}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setProviderRefreshNonce((nonce) => nonce + 1)}
+                  disabled={disabled}
+                  className="mt-2 rounded-md border border-amber-300/30 bg-amber-400/10 px-2 py-1 font-medium text-amber-100 transition-colors hover:bg-amber-400/20 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Retry loading providers
+                </button>
+              </div>
+            )}
+
+            {!loading && !providerLoadError && providers.length === 0 && (
               <div className="px-4 py-4 text-xs text-slate-500">
                 No providers returned yet. Try refresh if this stays empty.
               </div>
@@ -726,16 +799,13 @@ export default function AgentSelector({
               const isOpenClaw = p.name === 'OPENCLAW';
               const isSelectedProvider = p.name === value;
               const providerAvatarUrl = agentAvatars[p.name] || undefined;
-              const isUsable = p.usable !== false;
-              const statusLabel = !p.implemented
-                ? 'Not implemented'
-                : !p.installed
-                  ? 'Not installed'
-                  : p.native && p.nativeAuthStatus === 'needs_login'
-                    ? 'Needs login'
-                    : p.native
-                      ? 'Native'
-                      : 'Gateway';
+              const availabilityUnsettled = p.checking === true
+                || p.stale === true
+                || p.availabilityState === 'checking'
+                || p.availabilityState === 'stale'
+                || p.availabilityState === 'error';
+              const isUsable = !providerLoadError && !availabilityUnsettled && p.usable === true;
+              const statusLabel = getProviderStatusLabel(p);
               const detailLabel = p.nativeAuthMessage || p.reason || (p.version ? `Detected ${p.version}` : undefined);
 
               return (
@@ -743,12 +813,12 @@ export default function AgentSelector({
                   {isOpenClaw ? (
                     <button
                       onClick={() => isUsable && handleSelect('OPENCLAW', undefined)}
-                      disabled={!isUsable}
+                      disabled={disabled || !isUsable}
                       className={`w-full flex items-center gap-2.5 px-4 py-2.5 text-sm transition-colors ${
                         !isUsable
                           ? 'text-slate-500 cursor-not-allowed opacity-60'
                           : isSelectedProvider && !effectiveAgentId
-                            ? 'bg-emerald-500/10 text-emerald-300'
+                            ? 'accent-active'
                             : 'text-slate-300 hover:bg-white/[0.04] hover:text-white'
                       }`}
                     >
@@ -770,18 +840,18 @@ export default function AgentSelector({
                         <Loader2 size={11} className="text-slate-600 animate-spin ml-auto flex-shrink-0" />
                       )}
                       {isSelectedProvider && !effectiveAgentId && isUsable && (
-                        <Check size={14} className="text-emerald-400 flex-shrink-0" />
+                        <Check size={14} className="accent-text flex-shrink-0" />
                       )}
                     </button>
                   ) : (
                     <button
                       onClick={() => isUsable && handleSelect(p.name)}
-                      disabled={!isUsable}
+                      disabled={disabled || !isUsable}
                       className={`w-full flex items-center gap-2.5 px-4 py-2.5 text-sm transition-colors ${
                         !isUsable
                           ? 'text-slate-500 cursor-not-allowed opacity-60'
                           : isSelectedProvider && !effectiveAgentId
-                            ? 'bg-emerald-500/10 text-emerald-300'
+                            ? 'accent-active'
                             : 'text-slate-300 hover:bg-white/[0.04] hover:text-white'
                       }`}
                     >
@@ -800,51 +870,58 @@ export default function AgentSelector({
                         {detailLabel && <div className="text-[10px] text-slate-500 truncate">{detailLabel}</div>}
                       </div>
                       {isSelectedProvider && !effectiveAgentId && isUsable && (
-                        <Check size={14} className="text-emerald-400" />
+                        <Check size={14} className="accent-text" />
                       )}
                     </button>
                   )}
 
-                  {isOpenClaw && agents.filter(a => a.id !== 'main').length > 0 && (
-                    <div className="pb-1">
-                      {agents.filter(a => a.id !== 'main').map((agent) => {
-                        const isSelected = value === 'OPENCLAW' && effectiveAgentId === agent.id;
-                        const agentAvUrl = getSubAgentAvatarUrl(agent);
-                        const resolvedAvUrl = agent.id === 'main' ? (agentAvUrl || agentAvatars.OPENCLAW || undefined) : agentAvUrl;
-                        return (
-                          <button
-                            key={agent.id}
-                            onClick={() => handleSelect('OPENCLAW', agent.id)}
-                            className={`w-full flex items-center gap-2.5 pl-9 pr-4 py-2.5 text-sm transition-colors ${
-                              isSelected
-                                ? 'bg-emerald-500/10 text-emerald-300'
-                                : 'text-slate-400 hover:bg-white/[0.04] hover:text-slate-200'
-                            }`}
-                          >
-                            <AvatarCircle
-                              src={resolvedAvUrl}
-                              fallback={getAgentEmoji(agent)}
-                              size="sm"
-                              bgClass="bg-white/[0.06]"
-                              textClass="text-slate-300"
-                            />
-                            <span className="flex-1 text-left">{getAgentLabel(agent, assistantName)}</span>
-                            {agent.model && (
-                              <span className="text-[10px] text-slate-600 font-mono truncate max-w-[80px]">
-                                {getShortModelLabel(agent.model)}
-                              </span>
-                            )}
-                            {isSelected && (
-                              <Check size={13} className="text-emerald-400 flex-shrink-0" />
-                            )}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  )}
                 </div>
               );
             })}
+
+            {hasOpenClawProvider && openClawAgents.length > 0 && (
+              <div role="group" aria-label="OpenClaw agents" className="border-t border-white/[0.06] pb-1">
+                <div className="px-3 pb-1 pt-2.5">
+                  <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                    <Users size={10} />
+                    OpenClaw agents
+                  </div>
+                </div>
+                {openClawAgents.map((agent) => {
+                  const isSelected = value === 'OPENCLAW' && effectiveAgentId === agent.id;
+                  const agentAvUrl = getSubAgentAvatarUrl(agent);
+                  return (
+                    <button
+                      key={agent.id}
+                      onClick={() => handleSelect('OPENCLAW', agent.id)}
+                      disabled={disabled}
+                      className={`w-full flex items-center gap-2.5 pl-9 pr-4 py-2.5 text-sm transition-colors ${
+                        isSelected
+                          ? 'accent-active'
+                          : 'text-slate-400 hover:bg-white/[0.04] hover:text-slate-200'
+                      }`}
+                    >
+                      <AvatarCircle
+                        src={agentAvUrl}
+                        fallback={getAgentEmoji(agent)}
+                        size="sm"
+                        bgClass="bg-white/[0.06]"
+                        textClass="text-slate-300"
+                      />
+                      <span className="flex-1 text-left">{getAgentLabel(agent, assistantName)}</span>
+                      {agent.model && (
+                        <span className="text-[10px] text-slate-600 font-mono truncate max-w-[80px]">
+                          {getShortModelLabel(agent.model)}
+                        </span>
+                      )}
+                      {isSelected && (
+                        <Check size={13} className="accent-text flex-shrink-0" />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
 
             <div className="h-1.5" />
           </div>
@@ -852,17 +929,21 @@ export default function AgentSelector({
       </div>
 
       {/* ── Sessions Dropdown (providers with session history) ───── */}
-      {(value === 'OPENCLAW' || providers.find((p) => p.name === value)?.capabilities?.supportsSessionList) && onViewSession && (
+      {canAttemptSessionList && onViewSession && (
         <SessionDropdown
           sessions={sessions}
           loading={sessionsLoading}
           hasLoaded={sessionsLoaded}
+          error={sessionsLoadError}
+          onRetry={() => setSessionsRefreshNonce((current) => current + 1)}
           open={sessionsOpen}
           onOpenChange={setSessionsOpen}
           onViewSession={handleSessionClick}
           providerLabel={displayLabel}
           currentSessionKey={currentSessionKey}
           currentSessionLabel={currentSessionLabel}
+          activityTitles={activityTitles}
+          disabled={disabled}
         />
       )}
     </div>

@@ -3,22 +3,32 @@ import {
   Terminal, FolderTree, LayoutDashboard, MessageSquare, Wrench,
   Cpu, MemoryStick, HardDrive, GitBranch, GitCommit, Share2,
   Upload, Download, Eye, Code2, Rocket, Shield, Users, Settings,
-  ChevronRight, Copy, Check, ArrowRight, Zap,
-  Monitor, Globe, Lock, Server,
+  ArrowRight, Zap,
+  Globe, Lock, Server,
 } from 'lucide-react';
 
-const installCommand = 'Coming soon';
+const installCommand = 'curl -fsSL https://bridgesllm.ai/install.sh | sudo bash';
 
 /* ─── Helpers ──────────────────────────────────────────── */
 
 function useReveal() {
   useEffect(() => {
     const els = Array.from(document.querySelectorAll<HTMLElement>('[data-reveal]'));
+    const reveal = (element: HTMLElement) => {
+      element.classList.add('opacity-100', 'translate-y-0');
+      element.classList.remove('opacity-0', 'translate-y-6');
+    };
+    if (
+      typeof IntersectionObserver === 'undefined'
+      || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    ) {
+      els.forEach(reveal);
+      return;
+    }
     const obs = new IntersectionObserver(
       (entries) => entries.forEach((e) => {
         if (e.isIntersecting) {
-          e.target.classList.add('opacity-100', 'translate-y-0');
-          e.target.classList.remove('opacity-0', 'translate-y-6');
+          reveal(e.target as HTMLElement);
           obs.unobserve(e.target);
         }
       }),
@@ -40,15 +50,17 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 /* ─── Main Landing ─────────────────────────────────────── */
 
 export default function LandingPage() {
-  const [copied, setCopied] = useState(false);
   useReveal();
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
 
-  const handleCopy = async () => {
+  const copyInstaller = async () => {
     try {
       await navigator.clipboard.writeText(installCommand);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch { /* noop */ }
+      setCopyState('copied');
+      window.setTimeout(() => setCopyState('idle'), 2000);
+    } catch {
+      setCopyState('failed');
+    }
   };
 
   return (
@@ -94,7 +106,7 @@ export default function LandingPage() {
               <span className="bg-gradient-to-r from-emerald-300 to-violet-300 bg-clip-text text-transparent">Your Server. Your Rules.</span>
             </h1>
             <p className="mx-auto mt-6 max-w-2xl text-base leading-relaxed text-slate-300 sm:text-lg">
-              A full web workspace for Claude Code, Codex, and OpenClaw — with a real terminal, file manager, code editor, project management, and AI chat. All running on your VPS.
+              A self-hosted control plane for OpenClaw and capability-proven coding agents — with a real terminal, file manager, project workspace, remote desktop, mail, and durable agent chat on your VPS.
             </p>
             <div className="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row">
               <a href="#install" className="inline-flex w-full items-center justify-center rounded-xl bg-emerald-500 px-6 py-3 text-sm font-semibold text-slate-950 transition hover:bg-emerald-400 sm:w-auto">
@@ -169,7 +181,7 @@ export default function LandingPage() {
             <FeatureBlock
               label="Dashboard"
               title="Live system metrics at a glance"
-              description="CPU, memory, disk, and network — all in real-time with sparkline charts. Activity feed shows everything your agents are doing. Know your server's health without touching a terminal."
+              description="CPU, memory, disk, processes, and load with bounded history charts. Network panels report when throughput telemetry is unavailable instead of inventing a zero. Your activity feed remains scoped to what your account may see."
               visual={<DashboardMockup />}
               reverse={false}
             />
@@ -178,7 +190,7 @@ export default function LandingPage() {
             <FeatureBlock
               label="Web Terminal"
               title="A real terminal in your browser"
-              description="Full xterm.js terminal with multiple tabs, built-in autocomplete, command history, and an AI assistant panel that can explain errors and suggest fixes. Open as many shells as you need — all in one view."
+              description="An Owner and Sub-Admin host-operator terminal with multiple tabs, live capability discovery, command history, AI assist, and explicit review for destructive commands or multiline paste."
               visual={<TerminalMockup />}
               reverse
             />
@@ -187,7 +199,7 @@ export default function LandingPage() {
             <FeatureBlock
               label="File Manager"
               title="Browse, upload, and edit — no SCP required"
-              description="Full file tree with drag-and-drop upload, download, preview for images and media, and inline code editing. Resumable uploads with progress tracking. Manage your entire server filesystem from the browser."
+              description="A permission-aware file tree with drag-and-drop upload, bounded previews, resumable transfers, antivirus checks, and inline editing for the server or project paths your account is allowed to use."
               visual={<FilesMockup />}
               reverse={false}
             />
@@ -196,7 +208,7 @@ export default function LandingPage() {
             <FeatureBlock
               label="Projects"
               title="A web IDE with git, deploy, and share"
-              description="Monaco code editor with syntax highlighting. Full git integration — branches, commits, diffs, push/pull. One-click deploy. Generate share links for others to view your projects. AI-powered code analysis."
+              description="Monaco editing, branches, commits, diffs, controlled-network push/pull, one-click deploy, and permission-bound share links. Project-agent help appears only after its workspace sandbox passes live qualification."
               visual={<ProjectsMockup />}
               reverse
             />
@@ -205,7 +217,7 @@ export default function LandingPage() {
             <FeatureBlock
               label="Agent Chat"
               title="Talk to your coding agents like teammates"
-              description="Multi-session chat with Claude Code, Codex, and OpenClaw. See streamed output as it happens. Full conversation history. Switch between agents or run them in parallel."
+              description="Durable multi-session chat with streamed text, thoughts, tools, approvals, reconnect, and provider-specific capability gates. Main Agent Chat is the elevated server-repair control plane; Project Chat is exposed only through its workspace sandbox after runtime verification succeeds."
               visual={<AgentChatMockup />}
               reverse={false}
             />
@@ -213,8 +225,8 @@ export default function LandingPage() {
             {/* Feature 6: Agent Tools */}
             <FeatureBlock
               label="Agent Tools"
-              title="Install coding agents with one click"
-              description="Browse available agents — Claude Code, Codex, OpenClaw — and install them directly from the UI. The portal handles dependencies, configuration, and updates."
+              title="Know what is installed and what is actually ready"
+              description="Inspect tested runtime versions, authentication, models, services, and remediation actions. Portal updates keep unrelated tools unchanged unless you explicitly request tool maintenance."
               visual={<AgentToolsMockup />}
               reverse
             />
@@ -228,19 +240,17 @@ export default function LandingPage() {
               <div>
                 <SectionLabel>First Run</SectionLabel>
                 <h2 className="text-3xl font-semibold tracking-[-0.02em] text-white sm:text-4xl">
-                  Guided setup in 6 steps
+                  Quick when it can be. Guided when it needs to be.
                 </h2>
                 <p className="mt-4 text-slate-300 leading-relaxed">
-                  The setup wizard walks you through account creation, portal branding, theme customization, registration settings, and Ollama model installation. It detects your RAM and recommends the right models for your hardware.
+                  Quick Start creates the Owner, launches the Portal, verifies the exact OpenClaw core/plugin pair and authenticated gateway, then hands AI sign-in to Settings. Guided setup keeps branding, access policy, mail, domain, and local-model choices available without making them launch blockers.
                 </p>
                 <ul className="mt-6 space-y-3 text-sm text-slate-300">
                   {[
-                    'Create your admin account',
-                    'Name and brand your portal',
-                    'Choose dark or light theme + accent color',
-                    'Set registration mode (open, approval, or closed)',
-                    'Auto-detect hardware and recommend AI models',
-                    'Install Ollama models with one click',
+                    'Create the Owner through one atomic, resumable launch transaction',
+                    'Verify runtime readiness before offering OAuth or provider credentials',
+                    'Configure branding, registration, domain, mail, and local models when useful',
+                    'Recommend Ollama models from currently available memory, with OS and context headroom',
                   ].map((item, i) => (
                     <li key={i} className="flex items-center gap-3">
                       <span className="flex items-center justify-center w-6 h-6 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-bold">{i + 1}</span>
@@ -259,15 +269,15 @@ export default function LandingPage() {
           <div className="text-center mb-10" data-reveal>
             <SectionLabel>Security</SectionLabel>
             <h2 className="text-3xl font-semibold tracking-[-0.02em] text-white sm:text-4xl">
-              Your data never leaves your machine
+              Self-hosted does not mean pretending the network does not exist
             </h2>
           </div>
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4" data-reveal>
             {[
-              { icon: Server, title: 'Self-Hosted', desc: 'Runs 100% on your VPS. No cloud dependency.' },
-              { icon: Lock, title: 'HTTPS by Default', desc: 'Caddy handles SSL automatically — for IPs and domains.' },
-              { icon: Users, title: 'Multi-User Auth', desc: 'Role-based access with admin approval workflows.' },
-              { icon: Shield, title: 'Your Keys, Your Data', desc: 'API keys and conversations stay on your hardware.' },
+              { icon: Server, title: 'Portal-Owned State', desc: 'Accounts, projects, files, settings, and transcripts live on your server.' },
+              { icon: Lock, title: 'HTTPS and Isolation', desc: 'Caddy, strict cookies, scoped content origins, and fail-closed path boundaries.' },
+              { icon: Users, title: 'Explicit Authority', desc: 'OWNER/SUB_ADMIN host operation stays separate from project sandboxes.' },
+              { icon: Shield, title: 'Honest Provider Boundary', desc: 'Prompts reach only providers you configure; protected credentials use scope-appropriate storage and are never shown back in normal settings.' },
             ].map((item) => (
               <div key={item.title} className="rounded-2xl border border-white/10 bg-white/[0.03] p-5 text-center">
                 <div className="mx-auto w-12 h-12 rounded-xl bg-emerald-500/15 flex items-center justify-center mb-4">
@@ -285,15 +295,15 @@ export default function LandingPage() {
           <div className="text-center mb-10" data-reveal>
             <SectionLabel>Installation</SectionLabel>
             <h2 className="text-3xl font-semibold tracking-[-0.02em] text-white sm:text-4xl">
-              From zero to running in under 10 minutes
+              One installer, with compatibility checks and rollback
             </h2>
           </div>
 
           <div className="grid gap-4 md:grid-cols-3" data-reveal>
             {[
-              { num: '01', title: 'Get a VPS', desc: 'Any Ubuntu 22.04+ or Debian 12 VPS with 1GB+ RAM. DigitalOcean, Vultr, Hostinger — whatever you prefer.', icon: Server },
-              { num: '02', title: 'Run one command', desc: 'The installer handles Docker, Caddy, SSL, and all dependencies. Optionally pass your domain for automatic HTTPS.', icon: Terminal, code: installCommand },
-              { num: '03', title: 'Open your portal', desc: "Access via your server's IP or your domain. Run the setup wizard, install your agents, and start building.", icon: Rocket },
+              { num: '01', title: 'Prepare a supported host', desc: 'Ubuntu 22.04/24.04 or Debian 12/13 with at least 3.5 GB RAM, 35 GB disk, root access, and two CPUs recommended.', icon: Server },
+              { num: '02', title: 'Run the installer', desc: 'The installer verifies the signed, version-bound Portal artifact, converges tested runtime pairs, performs migrations, and rolls back failed updates.', icon: Terminal, code: installCommand },
+              { num: '03', title: 'Launch, then connect providers', desc: 'Create the Owner first. Provider sign-in becomes available only after the Portal proves the credential target and authenticated runtime are ready.', icon: Rocket },
             ].map((step) => (
               <div key={step.num} className="rounded-2xl border border-white/10 bg-white/[0.03] p-5">
                 <div className="flex items-center gap-3 mb-3">
@@ -320,10 +330,10 @@ export default function LandingPage() {
                 <div className="w-10 h-10 rounded-xl bg-emerald-500/20 flex items-center justify-center">
                   <Globe size={20} className="text-emerald-300" />
                 </div>
-                <h3 className="text-lg font-semibold text-white">Access via IP</h3>
+                <h3 className="text-lg font-semibold text-white">Start through localhost</h3>
               </div>
               <p className="text-sm text-slate-300 leading-relaxed">
-                No domain needed. The installer configures HTTPS on your server&apos;s IP address. Open <code className="text-emerald-200 bg-emerald-500/10 px-1.5 py-0.5 rounded text-xs">https://your.server.ip</code> and you&apos;re in.
+                Domainless setup uses the installer&apos;s explicit SSH-tunnel flow to a loopback-only URL. Internet-facing setup requires a domain and verified HTTPS before credentials are accepted.
               </p>
             </div>
             <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
@@ -347,14 +357,14 @@ export default function LandingPage() {
             <h2 className="text-3xl font-semibold tracking-[-0.02em] text-white sm:text-4xl">
               Works with the tools you already use
             </h2>
-            <p className="mt-4 text-slate-300">More agents coming based on demand.</p>
+            <p className="mt-4 text-slate-300">Availability is capability-driven. A provider stays disabled until its auth, lifecycle, streaming, and execution scope are proven.</p>
           </div>
 
           <div className="grid gap-4 md:grid-cols-3" data-reveal>
             {[
-              { name: 'Claude Code', vendor: 'Anthropic', desc: 'Pair-program with Claude in a guided, chat-first workflow. Real code changes, explained step by step.', color: 'violet' },
-              { name: 'Codex', vendor: 'OpenAI', desc: 'Run planning, implementation, and iteration cycles from a modern web workspace. Full-auto or guided mode.', color: 'emerald' },
-              { name: 'OpenClaw', vendor: 'OpenClaw', desc: 'Orchestrate tools, automations, and multi-step tasks. Connect to your services and let it work.', color: 'amber' },
+              { name: 'OpenClaw', vendor: 'OpenClaw', desc: 'The primary orchestration runtime, installed as an exact tested core/plugin pair with authenticated health checks.', color: 'amber' },
+              { name: 'Codex', vendor: 'OpenAI', desc: 'Native Agent Chat plus a separately confined Project adapter when the pinned runtime and sandbox contract pass.', color: 'emerald' },
+              { name: 'Claude Code', vendor: 'Anthropic', desc: 'Authenticated CLI reuse and native sessions, with Project access exposed only through a proven sandbox adapter.', color: 'violet' },
             ].map((agent) => {
               const borderColor = agent.color === 'violet' ? 'border-violet-300/20' : agent.color === 'emerald' ? 'border-emerald-300/20' : 'border-amber-300/20';
               const badgeBg = agent.color === 'violet' ? 'bg-violet-500/10 text-violet-200' : agent.color === 'emerald' ? 'bg-emerald-500/10 text-emerald-200' : 'bg-amber-500/10 text-amber-200';
@@ -363,7 +373,7 @@ export default function LandingPage() {
                   <div className="flex items-center justify-between gap-3">
                     <h3 className="text-xl font-semibold text-white">{agent.name}</h3>
                     <span className={`rounded-full border border-white/10 ${badgeBg} px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.12em]`}>
-                      Supported
+                      Capability gated
                     </span>
                   </div>
                   <p className="mt-2 text-sm text-slate-400">{agent.vendor}</p>
@@ -380,23 +390,26 @@ export default function LandingPage() {
             <h2 className="text-3xl font-semibold tracking-[-0.02em] text-white sm:text-4xl">
               Ready to own your AI workspace?
             </h2>
-            <p className="mt-4 text-slate-300">Install once. Keep ownership forever. No accounts, no subscriptions, no cloud lock-in.</p>
+            <p className="mt-4 text-slate-300">The Portal is self-hosted. Provider accounts, subscriptions, and network boundaries remain exactly what their vendors require.</p>
 
             <div className="mt-8 rounded-2xl border border-white/10 bg-[#040814] p-4 text-left sm:p-5">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <code className="block overflow-x-auto text-sm text-slate-100">{installCommand}</code>
                 <button
                   type="button"
-                  disabled
-                  className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-slate-700 px-4 py-2 text-sm font-semibold text-slate-300 cursor-not-allowed"
+                  onClick={copyInstaller}
+                  className="inline-flex min-h-11 shrink-0 items-center justify-center gap-2 rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300"
                 >
-                  Coming Soon
+                  {copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed' : 'Copy'}
                 </button>
               </div>
+              <p role="status" aria-live="polite" className="sr-only">
+                {copyState === 'copied' ? 'Installer command copied.' : copyState === 'failed' ? 'Could not copy the installer command. Select it manually.' : ''}
+              </p>
             </div>
 
             <p className="mt-6 text-sm text-slate-400">
-              Requires: Ubuntu 22.04/24.04 or Debian 12 · 1GB+ RAM · Root access
+              Requires: Ubuntu 22.04/24.04 or Debian 12/13 · 3.5 GB+ RAM · 35 GB+ disk · Root access
             </p>
           </div>
         </section>
@@ -406,7 +419,7 @@ export default function LandingPage() {
           <div className="rounded-2xl border border-white/10 bg-gradient-to-br from-white/[0.04] to-white/[0.01] p-7 text-center sm:p-10" data-reveal>
             <h2 className="text-2xl font-semibold tracking-[-0.02em] text-white sm:text-3xl">Support the project</h2>
             <p className="mx-auto mt-4 max-w-2xl text-slate-300">
-              BridgesLLM is free forever. If it saves you hours, consider buying us a coffee.
+              BridgesLLM Portal is free and open source. If it saves you hours, consider buying us a coffee.
             </p>
             <a
               href="https://www.paypal.com/ncp/payment/Z7DN57NBDVJLC"
@@ -466,7 +479,11 @@ function FeatureBlock({ label, title, description, visual, reverse }: {
 
 function MockupWindow({ title, badge, children }: { title?: string; badge?: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-xl border border-white/10 bg-[#060b15]/90 overflow-hidden">
+    <div
+      role="img"
+      aria-label={`${title || 'Portal'} interface preview`}
+      className="rounded-xl border border-white/10 bg-[#060b15]/90 overflow-hidden"
+    >
       <div className="flex items-center justify-between border-b border-white/10 px-3 py-2 text-xs text-slate-400">
         <div className="flex items-center gap-1.5">
           <span className="h-2 w-2 rounded-full bg-rose-400/80" />
@@ -489,7 +506,7 @@ function MockupWindow({ title, badge, children }: { title?: string; badge?: stri
 
 function HeroPortalMockup() {
   return (
-    <div className="mx-auto max-w-6xl overflow-hidden rounded-2xl border border-white/10 bg-[#060b15]/80 shadow-[0_24px_70px_-30px_rgba(0,0,0,0.7)] backdrop-blur">
+    <div aria-hidden="true" className="mx-auto max-w-6xl overflow-hidden rounded-2xl border border-white/10 bg-[#060b15]/80 shadow-[0_24px_70px_-30px_rgba(0,0,0,0.7)] backdrop-blur">
       <div className="flex items-center justify-between border-b border-white/10 px-4 py-3 text-xs text-slate-400 sm:px-6">
         <div className="flex items-center gap-2">
           <span className="h-2.5 w-2.5 rounded-full bg-rose-400" />
@@ -641,7 +658,7 @@ function TerminalMockup() {
         {/* Tab bar */}
         <div className="flex items-center gap-0 border-b border-white/10 bg-slate-950/40 px-2">
           {['bash 1', 'bash 2', 'bash 3'].map((tab, i) => (
-            <button
+            <span
               key={tab}
               className={`px-3 py-2 text-xs border-b-2 transition ${
                 i === 0
@@ -650,16 +667,17 @@ function TerminalMockup() {
               }`}
             >
               {tab}
-            </button>
+            </span>
           ))}
         </div>
         {/* Terminal content */}
         <div className="p-4 font-mono text-xs leading-relaxed bg-[#0a0e1a]" style={{ minHeight: '180px' }}>
-          <p><span className="text-emerald-400">user@vps</span><span className="text-slate-500">:</span><span className="text-blue-400">~/project</span><span className="text-slate-500">$</span> <span className="text-slate-200">docker ps</span></p>
-          <p className="text-slate-400 mt-1">CONTAINER ID   IMAGE            STATUS         PORTS</p>
-          <p className="text-slate-300">a1b2c3d4e5f6   bridgesllm-app   Up 3 hours     0.0.0.0:4001-&gt;4001/tcp</p>
-          <p className="text-slate-300">f6e5d4c3b2a1   postgres:16      Up 3 hours     5432/tcp</p>
-          <p className="text-slate-300">1a2b3c4d5e6f   caddy:latest     Up 3 hours     80/tcp, 443/tcp</p>
+          <p><span className="text-emerald-400">user@vps</span><span className="text-slate-500">:</span><span className="text-blue-400">~/project</span><span className="text-slate-500">$</span> <span className="text-slate-200">systemctl is-active bridgesllm-product caddy postgresql</span></p>
+          <p className="text-slate-300 mt-1">active</p>
+          <p className="text-slate-300">active</p>
+          <p className="text-slate-300">active</p>
+          <p><span className="text-emerald-400">user@vps</span><span className="text-slate-500">:</span><span className="text-blue-400">~/project</span><span className="text-slate-500">$</span> <span className="text-slate-200">ss -ltn '( sport = :4001 )'</span></p>
+          <p className="text-slate-300">LISTEN 0 511 127.0.0.1:4001 0.0.0.0:*</p>
           <p className="mt-2"><span className="text-emerald-400">user@vps</span><span className="text-slate-500">:</span><span className="text-blue-400">~/project</span><span className="text-slate-500">$</span> <span className="text-slate-200 animate-pulse">_</span></p>
         </div>
       </div>
@@ -709,15 +727,15 @@ function FilesMockup() {
             <span className="text-xs text-slate-500">2.4 KB</span>
           </div>
           <div className="flex gap-2 mb-3">
-            <button className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1.5 text-xs text-slate-300">
+            <span className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1.5 text-xs text-slate-300">
               <Download size={12} /> Download
-            </button>
-            <button className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1.5 text-xs text-slate-300">
+            </span>
+            <span className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1.5 text-xs text-slate-300">
               <Eye size={12} /> Preview
-            </button>
-            <button className="inline-flex items-center gap-1 rounded-lg border border-emerald-300/20 bg-emerald-500/10 px-2.5 py-1.5 text-xs text-emerald-200">
+            </span>
+            <span className="inline-flex items-center gap-1 rounded-lg border border-emerald-300/20 bg-emerald-500/10 px-2.5 py-1.5 text-xs text-emerald-200">
               <Upload size={12} /> Upload
-            </button>
+            </span>
           </div>
           <div className="rounded-lg border border-white/10 bg-black/30 p-3 font-mono text-[11px] text-slate-300 leading-relaxed">
             <p><span className="text-violet-300">import</span> express <span className="text-violet-300">from</span> <span className="text-emerald-300">{`'express'`}</span>;</p>
@@ -750,12 +768,12 @@ function ProjectsMockup() {
             </div>
           </div>
           <div className="flex gap-2">
-            <button className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1.5 text-xs text-slate-300">
+            <span className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1.5 text-xs text-slate-300">
               <Share2 size={12} /> Share
-            </button>
-            <button className="inline-flex items-center gap-1 rounded-lg border border-emerald-300/20 bg-emerald-500/15 px-2.5 py-1.5 text-xs text-emerald-200">
+            </span>
+            <span className="inline-flex items-center gap-1 rounded-lg border border-emerald-300/20 bg-emerald-500/15 px-2.5 py-1.5 text-xs text-emerald-200">
               <Rocket size={12} /> Deploy
-            </button>
+            </span>
           </div>
         </div>
         {/* Monaco-like editor */}
@@ -846,9 +864,9 @@ function AgentToolsMockup() {
     <MockupWindow title="Agent Tools">
       <div className="p-4 space-y-3">
         {[
-          { name: 'Claude Code', vendor: 'Anthropic', status: 'installed', version: 'v2.1.61' },
-          { name: 'Codex CLI', vendor: 'OpenAI', status: 'installed', version: 'v1.0.9' },
-          { name: 'OpenClaw', vendor: 'OpenClaw', status: 'available', version: 'latest' },
+          { name: 'Claude Code', vendor: 'Anthropic', status: 'installed', version: 'tested pin' },
+          { name: 'Codex CLI', vendor: 'OpenAI', status: 'installed', version: 'tested pin' },
+          { name: 'Agent Zero', vendor: 'Agent Zero', status: 'available', version: 'optional provider' },
         ].map((tool) => (
           <div key={tool.name} className="flex items-center justify-between rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3">
             <div className="flex items-center gap-3">
@@ -867,9 +885,9 @@ function AgentToolsMockup() {
                 Installed
               </span>
             ) : (
-              <button className="rounded-lg border border-violet-300/25 bg-violet-500/15 px-3 py-1.5 text-xs font-semibold text-violet-200 hover:bg-violet-500/25 transition">
-                Install
-              </button>
+              <span className="rounded-lg border border-violet-300/25 bg-violet-500/15 px-3 py-1.5 text-xs font-semibold text-violet-200">
+                Not ready
+              </span>
             )}
           </div>
         ))}
@@ -883,22 +901,22 @@ function SetupWizardMockup() {
   return (
     <MockupWindow title="Setup Wizard">
       <div className="p-5">
-        {/* Progress bar */}
+        {/* Readiness bar */}
         <div className="flex items-center gap-2 mb-5">
           <div className="flex-1 h-1.5 bg-white/5 rounded-full overflow-hidden">
-            <div className="h-full w-4/6 bg-gradient-to-r from-emerald-500 to-emerald-400 rounded-full" />
+            <div className="h-full w-2/3 bg-gradient-to-r from-emerald-500 to-emerald-400 rounded-full" />
           </div>
-          <span className="text-xs text-slate-400">Step 4 of 6</span>
+          <span className="text-xs text-slate-400">Launch readiness</span>
         </div>
 
-        <h4 className="text-base font-semibold text-white mb-1">Registration Mode</h4>
-        <p className="text-xs text-slate-400 mb-4">Control who can create accounts on your portal.</p>
+        <h4 className="text-base font-semibold text-white mb-1">Quick Start</h4>
+        <p className="text-xs text-slate-400 mb-4">Finish the launch contract before connecting an AI provider.</p>
 
         <div className="space-y-2">
           {[
-            { mode: 'Open', desc: 'Anyone can register', active: false },
-            { mode: 'Approval', desc: 'Admin must approve new users', active: true },
-            { mode: 'Closed', desc: 'Only admin can create accounts', active: false },
+            { mode: 'Owner account', desc: 'Saved atomically', active: true },
+            { mode: 'Portal runtime', desc: 'Health and version verified', active: true },
+            { mode: 'AI providers', desc: 'Available after launch', active: false },
           ].map((opt) => (
             <div
               key={opt.mode}
@@ -922,8 +940,8 @@ function SetupWizardMockup() {
         </div>
 
         <div className="mt-5 flex justify-end gap-2">
-          <button className="rounded-lg border border-white/10 px-4 py-2 text-xs text-slate-300">Back</button>
-          <button className="rounded-lg bg-emerald-500 px-4 py-2 text-xs font-semibold text-slate-950">Continue</button>
+          <span className="rounded-lg border border-white/10 px-4 py-2 text-xs text-slate-300">Guided setup</span>
+          <span className="rounded-lg bg-emerald-500 px-4 py-2 text-xs font-semibold text-slate-950">Launch Portal</span>
         </div>
       </div>
     </MockupWindow>

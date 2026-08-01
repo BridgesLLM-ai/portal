@@ -99,29 +99,45 @@
         let lastRequestedW = 0;
         let lastRequestedH = 0;
         let parentViewport = null;
+        let reconnectTimer = null;
+        let postConnectTimer = null;
+        let shuttingDown = false;
 
-        function status(text, cls) {
+        function notifyParent(state, message) {
+            if (window.parent === window) return;
+            window.parent.postMessage({
+                type: 'bridgesllm.remoteDesktopStatus',
+                state,
+                message,
+            }, window.location.origin);
+        }
+
+        function status(text, cls, state = 'connecting') {
             statusEl.textContent = text;
             statusEl.className = cls || '';
+            notifyParent(state, text);
         }
 
         function readParam(name, def) {
-            const re = new RegExp('[?&#]' + name + '=([^&#]*)');
-            const m = (location.href + location.hash).match(re);
-            return m ? decodeURIComponent(m[1]) : def;
+            return new URLSearchParams(location.search).get(name) || def;
         }
 
-        const host = readParam('host', location.hostname);
-        const port = readParam('port', location.port || (location.protocol === 'https:' ? '443' : '80'));
-        const path = readParam('path', 'websockify');
-        const resize = readParam('resize', 'scale');
+        function boundedInteger(value, fallback, minimum, maximum) {
+            const parsed = Number.parseInt(value, 10);
+            return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+        }
+
+        const resizeParam = readParam('resize', 'scale');
+        const resize = ['off', 'scale', 'remote', 'smart'].includes(resizeParam) ? resizeParam : 'scale';
         const viewOnly = readParam('view_only', 'false') === 'true';
         const reconnect = readParam('reconnect', '1') === '1';
-        const reconnectDelay = parseInt(readParam('reconnect_delay', '3000'), 10);
-        const smartMaxEdge = parseInt(readParam('smart_max', '1600'), 10);
+        const reconnectDelay = boundedInteger(readParam('reconnect_delay', '3000'), 3000, 1000, 30000);
+        const smartMaxEdge = boundedInteger(readParam('smart_max', '1600'), 1600, 640, 4096);
 
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const url = `${proto}://${host}${port ? ':' + port : ''}/${path}`;
+        // Never let query parameters redirect an authenticated operator's
+        // browser to another WebSocket endpoint.
+        const url = `${proto}://${location.host}/novnc/websockify`;
 
         function snapEven(value) {
             return Math.max(2, Math.round(value / 2) * 2);
@@ -174,8 +190,38 @@
             resizeTimer = setTimeout(() => requestSmartResize(reason), delay);
         }
 
+        const onWindowResize = () => {
+            if (!parentViewport) scheduleSmartResize('window-fallback');
+        };
+        const onOrientationChange = () => scheduleSmartResize('orientation', 900);
+        const onVisibilityChange = () => {
+            if (!document.hidden) scheduleSmartResize('visible', 900);
+        };
+        const onParentMessage = (event) => {
+            if (event.origin !== window.location.origin || event.source !== window.parent) return;
+            const data = event.data || {};
+            if (data.type !== 'bridgesllm.remoteDesktopViewport') return;
+            parentViewport = {
+                width: Math.max(1, Math.floor(Number(data.width) || 0)),
+                height: Math.max(1, Math.floor(Number(data.height) || 0)),
+            };
+            scheduleSmartResize(data.reason || 'parent-message', 500);
+        };
+
+        function cleanupSmartResizeHooks() {
+            clearTimeout(resizeTimer);
+            resizeTimer = null;
+            resizeObserver?.disconnect();
+            resizeObserver = null;
+            window.removeEventListener('resize', onWindowResize);
+            window.removeEventListener('orientationchange', onOrientationChange);
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+            window.removeEventListener('message', onParentMessage);
+        }
+
         function installSmartResizeHooks() {
             if (resize !== 'smart') return;
+            cleanupSmartResizeHooks();
             const screenEl = document.getElementById('screen');
 
             if (typeof ResizeObserver !== 'undefined') {
@@ -191,32 +237,33 @@
                 resizeObserver.observe(screenEl);
             }
 
-            window.addEventListener('resize', () => {
-                if (!parentViewport) scheduleSmartResize('window-fallback');
-            });
-            window.addEventListener('orientationchange', () => scheduleSmartResize('orientation', 900));
-            document.addEventListener('visibilitychange', () => {
-                if (!document.hidden) scheduleSmartResize('visible', 900);
-            });
-            window.addEventListener('message', (event) => {
-                if (event.origin !== window.location.origin) return;
-                const data = event.data || {};
-                if (data.type !== 'bridgesllm.remoteDesktopViewport') return;
-                parentViewport = {
-                    width: Math.max(1, Math.floor(Number(data.width) || 0)),
-                    height: Math.max(1, Math.floor(Number(data.height) || 0)),
-                };
-                scheduleSmartResize(data.reason || 'parent-message', 500);
-            });
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('orientationchange', onOrientationChange);
+            document.addEventListener('visibilitychange', onVisibilityChange);
+            window.addEventListener('message', onParentMessage);
+        }
+
+        function scheduleReconnect(message) {
+            if (!reconnect || shuttingDown) return;
+            clearTimeout(reconnectTimer);
+            status(message || 'Reconnecting…', 'error', 'reconnecting');
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                connect();
+            }, reconnectDelay);
         }
 
         function connect() {
-            status('Connecting…');
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+            cleanupSmartResizeHooks();
+            status('Connecting…', '', 'connecting');
             try {
-                rfb = new RFB(document.getElementById('screen'), url, {
+                const session = new RFB(document.getElementById('screen'), url, {
                     credentials: {},
                     wsProtocols: ['binary'],
                 });
+                rfb = session;
                 // Expose for clipboard/keyboard toolbar
                 window._rfb = rfb;
                 window.dispatchEvent(new CustomEvent('bridgesllm.rfb.ready', { detail: { rfb } }));
@@ -232,23 +279,25 @@
                 installSmartResizeHooks();
 
                 rfb.addEventListener('connect', () => {
-                    status('Connected', 'connected');
+                    if (rfb !== session) return;
+                    status('Connected', 'connected', 'connected');
                     scheduleSmartResize('connect', 900);
-                    setTimeout(() => scheduleSmartResize('post-connect', 0), 1800);
+                    clearTimeout(postConnectTimer);
+                    postConnectTimer = setTimeout(() => scheduleSmartResize('post-connect', 0), 1800);
                 });
 
                 rfb.addEventListener('disconnect', (e) => {
+                    if (rfb !== session) return;
                     rfb = undefined;
                     window._rfb = undefined;
-                    clearTimeout(resizeTimer);
+                    cleanupSmartResizeHooks();
+                    clearTimeout(postConnectTimer);
                     if (e.detail.clean) {
-                        status('Disconnected');
+                        status('Disconnected', '', 'disconnected');
                     } else {
-                        status('Connection lost', 'error');
+                        status('Connection lost', 'error', 'error');
                     }
-                    if (reconnect) {
-                        setTimeout(connect, reconnectDelay);
-                    }
+                    scheduleReconnect('Connection lost — reconnecting…');
                 });
 
                 rfb.addEventListener('credentialsrequired', () => {
@@ -260,25 +309,35 @@
                 });
 
             } catch (err) {
-                status('Connection error: ' + err.message, 'error');
-                if (reconnect) setTimeout(connect, reconnectDelay);
+                status('Connection error: ' + err.message, 'error', 'error');
+                scheduleReconnect('Connection error — reconnecting…');
             }
         }
+
+        window.addEventListener('pagehide', () => {
+            shuttingDown = true;
+            clearTimeout(reconnectTimer);
+            clearTimeout(postConnectTimer);
+            cleanupSmartResizeHooks();
+            try { rfb?.disconnect(); } catch {}
+            rfb = undefined;
+            window._rfb = undefined;
+        }, { once: true });
 
         connect();
     </script>
 </head>
 <body>
-    <div id="status">Connecting…</div>
-    <div id="screen"></div>
+    <div id="status" role="status" aria-live="polite">Connecting…</div>
+    <div id="screen" role="application" aria-label="Remote desktop canvas"></div>
 
     <!-- Hidden input for mobile keyboard -->
-    <input id="mobileInput" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+    <input id="mobileInput" type="text" aria-label="Remote desktop mobile keyboard input" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
 
     <!-- Clipboard panel -->
-    <div id="clipPanel">
-        <label>Copy / Paste</label>
-        <textarea id="clipText" placeholder="Text to move between this device and the Remote Desktop…" rows="4"></textarea>
+    <div id="clipPanel" role="region" aria-label="Remote desktop clipboard" aria-hidden="true">
+        <label for="clipText">Copy / Paste</label>
+        <textarea id="clipText" maxlength="262144" placeholder="Text to move between this device and the Remote Desktop…" rows="4"></textarea>
         <div class="clip-actions">
             <button class="clip-btn pull" id="clipPullBtn" title="Bring the current Remote Desktop clipboard into this text box">⬇ Get Remote</button>
             <button class="clip-btn copy" id="clipCopyOutBtn" title="Copy this text box to your phone/computer clipboard">⬆ Copy to Me</button>
@@ -292,13 +351,13 @@
     </div>
 
     <!-- Floating toolbar -->
-    <div id="toolbar">
-        <button class="tb-btn" id="tbKeyboard" title="Show mobile keyboard">
+    <div id="toolbar" role="toolbar" aria-label="Remote desktop controls">
+        <button class="tb-btn" id="tbKeyboard" title="Show mobile keyboard" aria-label="Show mobile keyboard" aria-pressed="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <rect x="2" y="4" width="20" height="16" rx="2" ry="2"/><line x1="6" y1="8" x2="6" y2="8"/><line x1="10" y1="8" x2="10" y2="8"/><line x1="14" y1="8" x2="14" y2="8"/><line x1="18" y1="8" x2="18" y2="8"/><line x1="6" y1="12" x2="6" y2="12"/><line x1="10" y1="12" x2="10" y2="12"/><line x1="14" y1="12" x2="14" y2="12"/><line x1="18" y1="12" x2="18" y2="12"/><line x1="8" y1="16" x2="16" y2="16"/>
             </svg>
         </button>
-        <button class="tb-btn" id="tbClipboard" title="Clipboard / text input panel">
+        <button class="tb-btn" id="tbClipboard" title="Clipboard / text input panel" aria-label="Toggle clipboard panel" aria-pressed="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
             </svg>
@@ -324,6 +383,7 @@
 
         let keyboardActive = false;
         let clipboardListenerAttachedTo = null;
+        const MAX_TYPED_CHARACTERS = 10000;
 
         function setClipStatus(text, tone = '') {
             clipStatus.textContent = text;
@@ -360,7 +420,7 @@
                 const data = await requestDesktopClipboard('GET');
                 clipText.value = data.text || '';
                 setClipStatus(data.text ? 'Pulled from Remote Desktop clipboard.' : 'Remote Desktop clipboard is empty.', data.text ? 'ok' : 'warn');
-                setTemporaryButtonText(clipPullBtn, '✓ Pulled', '⬇ Pull Desktop');
+                setTemporaryButtonText(clipPullBtn, '✓ Pulled', '⬇ Get Remote');
             } catch (err) {
                 setClipStatus(err.message || 'Could not read Remote Desktop clipboard.', 'error');
             } finally {
@@ -411,13 +471,16 @@
             });
         }
 
-        window.addEventListener('bridgesllm.rfb.ready', (event) => attachClipboardListener(event.detail?.rfb));
-        setInterval(() => attachClipboardListener(window._rfb), 1000);
+        const onRfbReady = (event) => attachClipboardListener(event.detail?.rfb);
+        window.addEventListener('bridgesllm.rfb.ready', onRfbReady);
+        const clipboardProbeTimer = setInterval(() => attachClipboardListener(window._rfb), 1000);
 
         // Toggle clipboard panel
         tbClipboard.addEventListener('click', () => {
             clipPanel.classList.toggle('open');
             tbClipboard.classList.toggle('active', clipPanel.classList.contains('open'));
+            tbClipboard.setAttribute('aria-pressed', String(clipPanel.classList.contains('open')));
+            clipPanel.setAttribute('aria-hidden', String(!clipPanel.classList.contains('open')));
             if (clipPanel.classList.contains('open')) clipText.focus();
         });
 
@@ -496,16 +559,21 @@
             const text = currentText();
             if (!rfb || !text) return;
 
+            const characters = Array.from(text);
+            if (characters.length > MAX_TYPED_CHARACTERS) {
+                setClipStatus(`Typing is limited to ${MAX_TYPED_CHARACTERS.toLocaleString()} characters. Use Set Remote or Paste Remote for larger text.`, 'warn');
+                return;
+            }
             let i = 0;
             const typeNext = () => {
-                if (i >= text.length) {
+                if (i >= characters.length) {
                     setClipStatus('Typed into Remote Desktop.', 'ok');
                     clipTypeBtn.textContent = '✓ Done';
                     setTimeout(() => { clipTypeBtn.textContent = '⌨ Type'; }, 1500);
                     return;
                 }
-                const char = text[i];
-                const code = char.charCodeAt(0);
+                const char = characters[i];
+                const code = char.codePointAt(0);
                 // For basic ASCII, use the charCode as keysym
                 if (code === 10 || code === 13) {
                     rfb.sendKey(0xff0d, 'Enter', true);
@@ -536,6 +604,7 @@
         tbKeyboard.addEventListener('click', () => {
             keyboardActive = !keyboardActive;
             tbKeyboard.classList.toggle('active', keyboardActive);
+            tbKeyboard.setAttribute('aria-pressed', String(keyboardActive));
             if (keyboardActive) {
                 mobileInput.focus();
                 mobileInput.click(); // Force keyboard on iOS
@@ -549,8 +618,8 @@
             const rfb = window._rfb;
             if (!rfb) return;
             const data = e.data || '';
-            for (let i = 0; i < data.length; i++) {
-                const code = data.charCodeAt(i);
+            for (const char of Array.from(data)) {
+                const code = char.codePointAt(0);
                 if (code >= 32 && code <= 126) {
                     rfb.sendKey(code, '', true);
                     rfb.sendKey(code, '', false);
@@ -590,6 +659,11 @@
                 }, 100);
             }
         });
+
+        window.addEventListener('pagehide', () => {
+            clearInterval(clipboardProbeTimer);
+            window.removeEventListener('bridgesllm.rfb.ready', onRfbReady);
+        }, { once: true });
     </script>
 </body>
 </html>

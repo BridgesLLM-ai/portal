@@ -1,23 +1,48 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import { authenticateToken } from '../middleware/auth';
 import { requireApproved } from '../middleware/requireApproved';
 import { scanFile } from '../services/virusScan';
 import { prisma } from '../config/database';
 import { config } from '../config/env';
 import { getWorkspaceOwnerId } from '../utils/workspaceScope';
+import { canAccessPortal } from '../utils/authz';
+import {
+  ContainedPathError,
+  ensureContainedDirectory,
+  isPathContained,
+  resolveContainedPath,
+  safeRelativePath,
+} from '../services/containedPath';
+import { generateBoundedThumbnail, ThumbnailError } from '../services/fileThumbnail';
+import { issueFileCapabilityToken, verifyFileCapabilityToken } from '../services/fileCapabilityToken';
+import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
+import {
+  FILE_LIBRARY_MAX_BATCH_DELETE,
+  FILE_LIBRARY_MAX_SYNC_ENTRIES,
+  FILE_LIBRARY_PAGE_SIZE,
+  normalizeFileRename,
+} from '../services/fileLibraryPolicy';
+import {
+  admitWorkspaceAuthorizationRequest,
+  settleWorkspaceAuthorizationRequestIfResponseEnded,
+} from '../services/workspaceAuthorizationBarrier';
 
 const router = Router();
 
 // New storage path structure
-const BASE_UPLOAD_DIR = '/var/portal-files';
+const BASE_UPLOAD_DIR = path.resolve(process.env.PORTAL_FILES_ROOT || '/var/portal-files');
 
 function getUserUploadDir(userId: string): string {
-  return path.join(BASE_UPLOAD_DIR, `user-${userId}`, 'uploads');
+  if (!/^[a-zA-Z0-9_-]+$/.test(userId)) throw new ContainedPathError('Invalid upload owner');
+  initializeFileStorage();
+  const directory = ensureContainedDirectory(BASE_UPLOAD_DIR, `user-${userId}/uploads`);
+  fs.chmodSync(directory, 0o700);
+  return directory;
 }
 
 function resolveOpenClawMediaMirrorBase(): string {
@@ -37,27 +62,59 @@ function resolveOpenClawMediaMirrorBase(): string {
   return path.join(path.join(os.homedir(), '.openclaw'), 'media', 'portal-files');
 }
 
-const OPENCLAW_MEDIA_MIRROR_BASE = resolveOpenClawMediaMirrorBase();
-const FILE_DIRECT_CONTENT_PURPOSE = 'file-direct-content';
+export const OPENCLAW_MEDIA_MIRROR_BASE = path.resolve(
+  process.env.PORTAL_OPENCLAW_MEDIA_MIRROR_ROOT || resolveOpenClawMediaMirrorBase(),
+);
+
+export interface FileStorageOptions {
+  baseUploadDir?: string;
+  mediaMirrorDir?: string;
+}
+
+export function initializeFileStorage(options: FileStorageOptions = {}): { baseUploadDir: string; mediaMirrorDir: string } {
+  const baseUploadDir = path.resolve(options.baseUploadDir || BASE_UPLOAD_DIR);
+  const mediaMirrorDir = path.resolve(options.mediaMirrorDir || OPENCLAW_MEDIA_MIRROR_BASE);
+  ensureRuntimeDirectory(baseUploadDir, { mode: 0o700, enforceMode: true });
+  ensureRuntimeDirectory(mediaMirrorDir, { mode: 0o700, enforceMode: true });
+  return { baseUploadDir, mediaMirrorDir };
+}
 
 function getToolMirrorPath(userId: string, fileName: string): string {
-  return path.join(OPENCLAW_MEDIA_MIRROR_BASE, `user-${userId}`, 'uploads', path.basename(fileName));
+  if (!/^[a-zA-Z0-9_-]+$/.test(userId)) throw new Error('Invalid mirror owner');
+  initializeFileStorage();
+  const mirrorRoot = fs.realpathSync(OPENCLAW_MEDIA_MIRROR_BASE);
+  const uploadsDir = path.join(mirrorRoot, `user-${userId}`, 'uploads');
+  fs.mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
+  const uploadsStat = fs.lstatSync(uploadsDir);
+  if (uploadsStat.isSymbolicLink() || !uploadsStat.isDirectory()) throw new Error('Tool mirror directory is unsafe');
+  const canonicalUploads = fs.realpathSync(uploadsDir);
+  if (!isPathContained(mirrorRoot, canonicalUploads)) throw new Error('Tool mirror directory escaped its root');
+  return path.join(canonicalUploads, path.basename(fileName));
 }
 
 function ensureToolMirror(userId: string, sourcePath: string, fileName?: string): string {
+  const sourceStat = fs.lstatSync(sourcePath);
+  if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) throw new Error('Tool mirror source must be a regular file');
   const mirrorPath = getToolMirrorPath(userId, fileName || path.basename(sourcePath));
-  fs.mkdirSync(path.dirname(mirrorPath), { recursive: true });
-  try {
-    if (fs.existsSync(mirrorPath)) fs.unlinkSync(mirrorPath);
-  } catch {}
+  if (fs.existsSync(mirrorPath)) {
+    const existing = fs.lstatSync(mirrorPath);
+    if (existing.isDirectory()) throw new Error('Tool mirror destination is a directory');
+  }
 
+  const temp = path.join(path.dirname(mirrorPath), `.${path.basename(mirrorPath)}-${crypto.randomBytes(6).toString('hex')}.tmp`);
   try {
-    fs.linkSync(sourcePath, mirrorPath);
-  } catch (error: any) {
-    if (!['EXDEV', 'EPERM', 'EMLINK', 'EEXIST'].includes(error?.code || '')) {
-      throw error;
+    try {
+      fs.linkSync(sourcePath, temp);
+    } catch (error: any) {
+      if (!['EXDEV', 'EPERM', 'EMLINK'].includes(error?.code || '')) {
+        throw error;
+      }
+      fs.copyFileSync(sourcePath, temp, fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(temp, 0o600);
     }
-    fs.copyFileSync(sourcePath, mirrorPath);
+    fs.renameSync(temp, mirrorPath);
+  } finally {
+    try { fs.unlinkSync(temp); } catch {}
   }
 
   return mirrorPath;
@@ -66,8 +123,49 @@ function ensureToolMirror(userId: string, sourcePath: string, fileName?: string)
 function removeToolMirror(userId: string, fileName: string) {
   const mirrorPath = getToolMirrorPath(userId, fileName);
   try {
-    if (fs.existsSync(mirrorPath)) fs.unlinkSync(mirrorPath);
+    if (fs.existsSync(mirrorPath) && !fs.lstatSync(mirrorPath).isDirectory()) fs.unlinkSync(mirrorPath);
   } catch {}
+}
+
+interface QuarantinedFilePath {
+  original: string;
+  quarantine: string;
+}
+
+function quarantineRegularFile(original: string, label: string): QuarantinedFilePath | null {
+  if (!fs.existsSync(original)) return null;
+  const stat = fs.lstatSync(original);
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`${label} is not a regular file`);
+  const quarantine = path.join(
+    path.dirname(original),
+    `.portal-delete-${crypto.randomBytes(12).toString('hex')}.part`,
+  );
+  fs.renameSync(original, quarantine);
+  return { original, quarantine };
+}
+
+function quarantineToolMirror(userId: string, fileName: string): QuarantinedFilePath | null {
+  return quarantineRegularFile(getToolMirrorPath(userId, fileName), 'Tool mirror');
+}
+
+function restoreQuarantinedFiles(entries: QuarantinedFilePath[]): void {
+  for (const entry of [...entries].reverse()) {
+    try {
+      if (fs.existsSync(entry.quarantine) && !fs.existsSync(entry.original)) {
+        fs.renameSync(entry.quarantine, entry.original);
+      }
+    } catch (error) {
+      console.error('Failed to restore quarantined Portal file:', error);
+    }
+  }
+}
+
+function purgeQuarantinedFiles(entries: QuarantinedFilePath[]): void {
+  for (const entry of entries) {
+    try { fs.unlinkSync(entry.quarantine); } catch (error: any) {
+      if (error?.code !== 'ENOENT') console.error('Failed to purge quarantined Portal file:', error);
+    }
+  }
 }
 
 function renameToolMirror(userId: string, oldFileName: string, newFileName: string, sourcePathForFallback?: string) {
@@ -75,23 +173,20 @@ function renameToolMirror(userId: string, oldFileName: string, newFileName: stri
   const newMirrorPath = getToolMirrorPath(userId, newFileName);
   fs.mkdirSync(path.dirname(newMirrorPath), { recursive: true });
 
-  try {
-    if (fs.existsSync(oldMirrorPath)) {
-      if (fs.existsSync(newMirrorPath)) fs.unlinkSync(newMirrorPath);
-      fs.renameSync(oldMirrorPath, newMirrorPath);
-      return newMirrorPath;
+  if (fs.existsSync(oldMirrorPath)) {
+    if (fs.lstatSync(oldMirrorPath).isDirectory()) throw new Error('Tool mirror source is a directory');
+    if (fs.existsSync(newMirrorPath)) {
+      if (fs.lstatSync(newMirrorPath).isDirectory()) throw new Error('Tool mirror destination is a directory');
     }
-  } catch {}
+    fs.renameSync(oldMirrorPath, newMirrorPath);
+    return newMirrorPath;
+  }
 
   if (sourcePathForFallback && fs.existsSync(sourcePathForFallback)) {
     return ensureToolMirror(userId, sourcePathForFallback, newFileName);
   }
 
   return newMirrorPath;
-}
-
-function createDirectFileToken(fileId: string, ownerId: string): string {
-  return jwt.sign({ fileId, ownerId, purpose: FILE_DIRECT_CONTENT_PURPOSE }, config.jwtSecret, { expiresIn: '24h' });
 }
 
 function normalizeOrigin(raw: string): string | null {
@@ -122,69 +217,87 @@ function getTrustedRequestOrigin(req?: Request): string | null {
   return configuredOrigins.includes(candidate) ? candidate : null;
 }
 
-function buildDirectFileUrl(fileId: string, ownerId: string, req?: Request): string {
-  const token = createDirectFileToken(fileId, ownerId);
+function buildDirectFileUrl(fileId: string, req: Request): string {
+  const token = issueFileCapabilityToken(
+    fileId,
+    req.user!.userId,
+    Number(req.user!.authorizationVersion ?? 1),
+    config.jwtSecret,
+  );
   const relativePath = `/api/files/${encodeURIComponent(fileId)}/direct-content?token=${encodeURIComponent(token)}`;
   const trustedOrigin = getTrustedRequestOrigin(req);
   const fallbackOrigin = getConfiguredPortalOrigins()[0] || '';
   return `${trustedOrigin || fallbackOrigin}${relativePath}`;
 }
 
-// Ensure base directories exist
-fs.mkdirSync(BASE_UPLOAD_DIR, { recursive: true });
-fs.mkdirSync(OPENCLAW_MEDIA_MIRROR_BASE, { recursive: true });
-
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const userDir = getUserUploadDir(req.user!.userId);
-    fs.mkdirSync(userDir, { recursive: true });
-    cb(null, userDir);
+    try {
+      cb(null, getUserUploadDir(req.user!.userId));
+    } catch (error: any) {
+      cb(error, BASE_UPLOAD_DIR);
+    }
   },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    const ext = path.extname(file.originalname);
-    const base = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+  filename: (_req, file, cb) => {
+    const uniqueSuffix = crypto.randomBytes(16).toString('hex');
+    const ext = path.extname(file.originalname).replace(/[^a-zA-Z0-9.]/g, '').slice(0, 24);
+    const base = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 180) || 'file';
     cb(null, `${base}-${uniqueSuffix}${ext}`);
   },
 });
 
+const DIRECT_UPLOAD_MAX_BYTES = 500 * 1024 * 1024;
+
 const upload = multer({
   storage,
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB
+  limits: { fileSize: DIRECT_UPLOAD_MAX_BYTES },
 });
 
-function preventTraversal(filePath: string, baseDir: string): boolean {
-  const resolved = path.resolve(filePath);
-  return resolved.startsWith(path.resolve(baseDir));
-}
-
-function isPathWithin(baseDir: string, candidatePath: string): boolean {
-  const resolvedBase = path.resolve(baseDir);
-  const resolvedCandidate = path.resolve(candidatePath);
-  return resolvedCandidate === resolvedBase || resolvedCandidate.startsWith(`${resolvedBase}${path.sep}`);
+function parseFileUpload(req: Request, res: Response, next: NextFunction): void {
+  upload.single('file')(req, res, (error: any) => {
+    if (!error) {
+      next();
+      return;
+    }
+    if (req.file?.path) {
+      try { fs.unlinkSync(req.file.path); } catch {}
+    }
+    if (error instanceof multer.MulterError) {
+      if (error.code === 'LIMIT_FILE_SIZE') {
+        res.status(413).json({
+          error: 'File exceeds the 500 MB direct-upload limit. Use the chunked uploader for files up to 2 GB.',
+        });
+        return;
+      }
+      if (error.code === 'LIMIT_UNEXPECTED_FILE') {
+        res.status(400).json({ error: 'Upload must contain exactly one file field named "file"' });
+        return;
+      }
+      res.status(413).json({ error: 'Upload exceeds the allowed multipart request limits' });
+      return;
+    }
+    next(error);
+  });
 }
 
 function getContainedProjectPath(ownerId: string, projectName: string): string {
-  const projectsRoot = path.join(process.env.PORTAL_ROOT || '/portal', 'projects', ownerId);
-  const resolvedProjectPath = path.resolve(path.join(projectsRoot, projectName));
-
-  if (!isPathWithin(projectsRoot, resolvedProjectPath)) {
-    throw new Error('Project path traversal detected');
+  if (!/^[a-zA-Z0-9_-]+$/.test(ownerId)) throw new ContainedPathError('Invalid project owner');
+  const projectsRoot = path.resolve(
+    process.env.PORTAL_PROJECTS_ROOT
+      || path.join(process.env.PORTAL_DATA_ROOT || process.env.PORTAL_ROOT || '/portal', 'projects'),
+  );
+  if (!projectName || path.basename(projectName) !== projectName || projectName.includes('\\')) {
+    throw new ContainedPathError('Invalid project name');
   }
-
-  return resolvedProjectPath;
+  const ownerRoot = resolveContainedPath(projectsRoot, ownerId, { mustExist: true, kind: 'directory' });
+  return resolveContainedPath(ownerRoot, projectName, { mustExist: true, kind: 'directory' });
 }
 
 function getContainedProjectDestination(projectDir: string, destinationPath: unknown, fileName: string): string {
   const safeFileName = path.basename(fileName);
   const relativeDestination = typeof destinationPath === 'string' ? destinationPath : '';
-  const resolvedDestination = path.resolve(projectDir, relativeDestination, safeFileName);
-
-  if (!isPathWithin(projectDir, resolvedDestination)) {
-    throw new Error('Destination path traversal detected');
-  }
-
-  return resolvedDestination;
+  const requested = [relativeDestination.replace(/\/$/, ''), safeFileName].filter(Boolean).join('/');
+  return resolveContainedPath(projectDir, requested, { mustExist: false });
 }
 
 async function logActivity(userId: string, action: string, resource: string, resourceId?: string, req?: Request) {
@@ -203,13 +316,42 @@ async function logActivity(userId: string, action: string, resource: string, res
 
 // Helper to resolve file on disk (checks both new and legacy paths)
 function resolveFilePath(userId: string, filePath: string): string | null {
-  // New path
-  const newPath = path.join(getUserUploadDir(userId), filePath);
-  if (fs.existsSync(newPath)) return newPath;
-  // Legacy path
-  const legacyPath = path.join('/portal/files', userId, filePath);
-  if (fs.existsSync(legacyPath)) return legacyPath;
+  try {
+    return resolveContainedPath(getUserUploadDir(userId), filePath, { mustExist: true, kind: 'file' });
+  } catch {}
+
+  const legacyRoot = '/portal/files';
+  if (fs.existsSync(legacyRoot)) {
+    try {
+      const legacyOwnerDir = resolveContainedPath(legacyRoot, userId, { mustExist: true, kind: 'directory' });
+      return resolveContainedPath(legacyOwnerDir, filePath, { mustExist: true, kind: 'file' });
+    } catch {}
+  }
   return null;
+}
+
+function setSafeFileResponseHeaders(res: Response, mimeType: string | null, displayName: string, disposition: 'inline' | 'attachment') {
+  const safeName = String(displayName || 'file').replace(/[\r\n]/g, '').replace(/["\\]/g, '_').slice(0, 255) || 'file';
+  const encodedName = encodeURIComponent(safeName).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+  const activeContent = /^(text\/(html|css|javascript|xml)|image\/svg\+xml|application\/(javascript|xhtml\+xml|xml))/i.test(mimeType || '');
+  res.setHeader('Content-Type', activeContent ? 'application/octet-stream' : (mimeType || 'application/octet-stream'));
+  res.setHeader('Content-Disposition', `${activeContent ? 'attachment' : disposition}; filename="${safeName}"; filename*=UTF-8''${encodedName}`);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
+}
+
+function streamFileResponse(req: Request, res: Response, filePath: string, label: string): void {
+  const stream = fs.createReadStream(filePath);
+  const close = () => stream.destroy();
+  req.once('aborted', close);
+  res.once('close', close);
+  stream.once('error', (error) => {
+    console.error(`${label} stream error:`, error);
+    if (!res.headersSent) res.status(500).json({ error: `Failed to stream ${label}` });
+    else res.destroy(error);
+  });
+  stream.pipe(res);
 }
 
 async function getScopedOwnerId(req: Request): Promise<string> {
@@ -220,11 +362,21 @@ async function getScopedOwnerId(req: Request): Promise<string> {
 router.get('/', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const ownerId = await getScopedOwnerId(req);
-    const page = Math.max(1, parseInt(req.query.page as string) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
+    const requestedPage = Number(req.query.page || 1);
+    const requestedLimit = Number(req.query.limit || 50);
+    const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 && requestedPage <= 1_000_000
+      ? requestedPage
+      : 1;
+    const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(FILE_LIBRARY_PAGE_SIZE, requestedLimit)
+      : 50;
     const skip = (page - 1) * limit;
-    const search = (req.query.search as string) || '';
-    const mimeFilter = (req.query.mime as string) || '';
+    const search = String(req.query.search || '').trim();
+    const mimeFilter = String(req.query.mime || '').trim();
+    if (search.length > 200 || mimeFilter.length > 100) {
+      res.status(400).json({ error: 'File filter is too long' });
+      return;
+    }
 
     const where: any = { userId: ownerId };
     if (search) {
@@ -237,7 +389,7 @@ router.get('/', authenticateToken, requireApproved, async (req: Request, res: Re
       where.mimeType = { startsWith: mimeFilter };
     }
 
-    const [files, total] = await Promise.all([
+    const [files, total, sizeAggregate] = await Promise.all([
       prisma.file.findMany({
         where,
         orderBy: { createdAt: 'desc' },
@@ -245,6 +397,7 @@ router.get('/', authenticateToken, requireApproved, async (req: Request, res: Re
         take: limit,
       }),
       prisma.file.count({ where }),
+      prisma.file.aggregate({ where, _sum: { size: true } }),
     ]);
 
     const serialized = files.map(f => ({
@@ -252,7 +405,14 @@ router.get('/', authenticateToken, requireApproved, async (req: Request, res: Re
       size: f.size.toString(),
     }));
 
-    res.json({ files: serialized, total, page, limit, pages: Math.ceil(total / limit) });
+    res.json({
+      files: serialized,
+      total,
+      totalSize: (sizeAggregate._sum.size || BigInt(0)).toString(),
+      page,
+      limit,
+      pages: Math.ceil(total / limit),
+    });
   } catch (error) {
     console.error('List files error:', error);
     res.status(500).json({ error: 'Failed to list files' });
@@ -267,6 +427,10 @@ router.get('/resolve', authenticateToken, requireApproved, async (req: Request, 
     const rawPath = String(req.query.path || '').trim();
     if (!id && !rawPath) {
       res.status(400).json({ error: 'id or path required' });
+      return;
+    }
+    if (id.length > 512 || rawPath.length > 2048 || /[\u0000-\u001f\u007f]/.test(id + rawPath)) {
+      res.status(400).json({ error: 'File selector is invalid or too long' });
       return;
     }
 
@@ -300,7 +464,10 @@ router.get('/resolve', authenticateToken, requireApproved, async (req: Request, 
 });
 
 // POST /api/files - upload file
-router.post('/', authenticateToken, requireApproved, upload.single('file'), async (req: Request, res: Response) => {
+router.post('/', authenticateToken, requireApproved, parseFileUpload, async (req: Request, res: Response) => {
+  let retainedPath: string | undefined = req.file?.path;
+  let createdFileId: string | undefined;
+  let createdMirror: { ownerId: string; fileName: string } | undefined;
   try {
     const ownerId = await getScopedOwnerId(req);
     if (!req.file) {
@@ -309,24 +476,35 @@ router.post('/', authenticateToken, requireApproved, upload.single('file'), asyn
     }
 
     const requestUserDir = getUserUploadDir(req.user!.userId);
-    if (!preventTraversal(req.file.path, requestUserDir)) {
-      fs.unlinkSync(req.file.path);
+    let requestUploadPath: string;
+    try {
+      requestUploadPath = resolveContainedPath(
+        requestUserDir,
+        safeRelativePath(requestUserDir, req.file.path),
+        { mustExist: true, kind: 'file' },
+      );
+    } catch {
+      try { fs.unlinkSync(req.file.path); } catch {}
+      retainedPath = undefined;
       res.status(400).json({ error: 'Invalid file path' });
       return;
     }
+    req.file.path = requestUploadPath;
 
     if (ownerId !== req.user!.userId) {
       const ownerDir = getUserUploadDir(ownerId);
-      fs.mkdirSync(ownerDir, { recursive: true });
-      const movedPath = path.join(ownerDir, path.basename(req.file.path));
+      const movedPath = resolveContainedPath(ownerDir, path.basename(req.file.path), { mustExist: false });
+      if (fs.existsSync(movedPath)) throw new Error('Upload destination collision');
       fs.renameSync(req.file.path, movedPath);
       req.file.path = movedPath;
+      retainedPath = movedPath;
     }
 
     // Virus scan uploaded file
     const scanResult = await scanFile(req.file.path);
     if (!scanResult.clean) {
-      fs.unlinkSync(req.file.path);
+      try { fs.unlinkSync(req.file.path); } catch {}
+      retainedPath = undefined;
       await prisma.activityLog.create({
         data: {
           userId: req.user!.userId,
@@ -339,7 +517,11 @@ router.post('/', authenticateToken, requireApproved, upload.single('file'), asyn
           metadata: { filename: req.file.originalname, threat: scanResult.threat },
         },
       }).catch(() => {});
-      res.status(400).json({ error: `File rejected: malware detected (${scanResult.threat})` });
+      res.status(scanResult.scannerAvailable ? 400 : 503).json({
+        error: scanResult.scannerAvailable
+          ? `File rejected: malware detected (${scanResult.threat})`
+          : 'File upload is temporarily unavailable because malware scanning could not complete',
+      });
       return;
     }
 
@@ -352,21 +534,30 @@ router.post('/', authenticateToken, requireApproved, upload.single('file'), asyn
         mimeType: req.file.mimetype,
       },
     });
-
-    await logActivity(req.user!.userId, 'FILE_UPLOAD', 'file', file.id, req);
-
-    // Ensure symlink exists for user
-    ensureUserSymlink(ownerId);
+    createdFileId = file.id;
 
     // Mirror uploads into an OpenClaw-readable media root so image/pdf tools
     // can access them directly even though the canonical upload storage lives
     // outside the default allowed local media directories.
-    const originalDiskPath = path.join(getUserUploadDir(ownerId), req.file.filename);
+    const originalDiskPath = req.file.path;
     const diskPath = ensureToolMirror(ownerId, originalDiskPath, req.file.filename);
-    const toolUrl = buildDirectFileUrl(file.id, ownerId, req);
+    createdMirror = { ownerId, fileName: req.file.filename };
+    await logActivity(req.user!.userId, 'FILE_UPLOAD', 'file', file.id, req).catch(() => {});
+
+    const toolUrl = buildDirectFileUrl(file.id, req);
+    retainedPath = undefined;
+    createdFileId = undefined;
+    createdMirror = undefined;
     res.status(201).json({ ...file, size: file.size.toString(), diskPath, originalDiskPath, toolUrl });
   } catch (error) {
     console.error('Upload error:', error);
+    if (createdFileId) {
+      try { await prisma.file.delete({ where: { id: createdFileId } }); } catch {}
+    }
+    if (createdMirror) removeToolMirror(createdMirror.ownerId, createdMirror.fileName);
+    if (retainedPath) {
+      try { fs.unlinkSync(retainedPath); } catch {}
+    }
     res.status(500).json({ error: 'Failed to upload file' });
   }
 });
@@ -375,26 +566,47 @@ router.post('/', authenticateToken, requireApproved, upload.single('file'), asyn
 router.get('/:id/direct-content', async (req: Request, res: Response) => {
   try {
     const token = String(req.query.token || '').trim();
-    if (!token) {
+    if (!token || token.length > 4096) {
       res.status(401).json({ error: 'Token required' });
       return;
     }
 
-    let payload: any;
-    try {
-      payload = jwt.verify(token, config.jwtSecret);
-    } catch {
+    const capability = verifyFileCapabilityToken(token, req.params.id, config.jwtSecret);
+    if (!capability) {
       res.status(401).json({ error: 'Invalid or expired token' });
       return;
     }
 
-    if (payload?.purpose !== FILE_DIRECT_CONTENT_PURPOSE || payload?.fileId !== req.params.id || typeof payload?.ownerId !== 'string') {
-      res.status(403).json({ error: 'Token mismatch' });
+    if (!admitWorkspaceAuthorizationRequest(req, res, capability.actorUserId)) return;
+    const actor = await prisma.user.findUnique({
+      where: { id: capability.actorUserId },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        accountStatus: true,
+        isActive: true,
+        sandboxEnabled: true,
+        authorizationVersion: true,
+      },
+    });
+    if (!actor
+      || !canAccessPortal(actor.accountStatus, actor.isActive)
+      || Number((actor as any).authorizationVersion ?? 1) !== capability.authorizationVersion) {
+      res.status(401).json({ error: 'Invalid or expired token' });
       return;
     }
-
+    if (settleWorkspaceAuthorizationRequestIfResponseEnded(req, res)) return;
+    const currentOwnerId = await getWorkspaceOwnerId({
+      userId: actor.id,
+      email: actor.email,
+      role: actor.role,
+      accountStatus: actor.accountStatus,
+      sandboxEnabled: actor.sandboxEnabled,
+      authorizationVersion: Number((actor as any).authorizationVersion ?? 1),
+    });
     const file = await prisma.file.findFirst({
-      where: { id: req.params.id, userId: payload.ownerId },
+      where: { id: req.params.id, userId: currentOwnerId },
     });
 
     if (!file) {
@@ -402,21 +614,23 @@ router.get('/:id/direct-content', async (req: Request, res: Response) => {
       return;
     }
 
-    const filePath = resolveFilePath(payload.ownerId, file.path);
+    const filePath = resolveFilePath(file.userId, file.path);
     if (!filePath) {
       res.status(404).json({ error: 'File not found on disk' });
       return;
     }
 
-    res.setHeader('Content-Type', file.mimeType || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename="${file.originalName || path.basename(file.path)}"`);
-    res.setHeader('Cache-Control', 'private, max-age=86400');
+    setSafeFileResponseHeaders(res, file.mimeType, file.originalName || path.basename(file.path), 'inline');
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
 
-    const stat = fs.statSync(filePath);
+    const stat = fs.lstatSync(filePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      res.status(404).json({ error: 'File not found on disk' });
+      return;
+    }
     res.setHeader('Content-Length', stat.size.toString());
 
-    const stream = fs.createReadStream(filePath);
-    stream.pipe(res);
+    streamFileResponse(req, res, filePath, 'file');
   } catch (error) {
     console.error('Direct content error:', error);
     res.status(500).json({ error: 'Failed to read file' });
@@ -442,14 +656,16 @@ router.get('/:id/content', authenticateToken, requireApproved, async (req: Reque
       return;
     }
 
-    res.setHeader('Content-Type', file.mimeType || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename="${file.originalName || path.basename(file.path)}"`);
+    setSafeFileResponseHeaders(res, file.mimeType, file.originalName || path.basename(file.path), 'inline');
+    res.setHeader('Cache-Control', 'private, no-store');
     
-    const stat = fs.statSync(filePath);
-    res.setHeader('Content-Length', stat.size);
-    
-    const stream = fs.createReadStream(filePath);
-    stream.pipe(res);
+    const stat = fs.lstatSync(filePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      res.status(404).json({ error: 'File not found on disk' });
+      return;
+    }
+    res.setHeader('Content-Length', stat.size.toString());
+    streamFileResponse(req, res, filePath, 'file');
   } catch (error) {
     console.error('Content error:', error);
     res.status(500).json({ error: 'Failed to read file' });
@@ -478,10 +694,15 @@ router.get('/:id/download', authenticateToken, requireApproved, async (req: Requ
     await logActivity(req.user!.userId, 'FILE_DOWNLOAD', 'file', file.id, req);
 
     const displayName = file.originalName || path.basename(file.path);
-    res.setHeader('Content-Type', file.mimeType || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${displayName}"`);
-    const stream = fs.createReadStream(filePath);
-    stream.pipe(res);
+    setSafeFileResponseHeaders(res, file.mimeType, displayName, 'attachment');
+    res.setHeader('Cache-Control', 'private, no-store');
+    const stat = fs.lstatSync(filePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      res.status(404).json({ error: 'File not found on disk' });
+      return;
+    }
+    res.setHeader('Content-Length', stat.size.toString());
+    streamFileResponse(req, res, filePath, 'file');
   } catch (error) {
     console.error('Download error:', error);
     res.status(500).json({ error: 'Failed to download file' });
@@ -507,14 +728,19 @@ router.get('/:id/thumbnail', authenticateToken, requireApproved, async (req: Req
       return;
     }
 
-    // Serve full image (could add sharp resizing later)
-    res.setHeader('Content-Type', file.mimeType);
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    const stream = fs.createReadStream(filePath);
-    stream.pipe(res);
+    const thumbnailPath = await generateBoundedThumbnail(
+      filePath,
+      path.join(getUserUploadDir(ownerId), '.thumbnails'),
+    );
+    const thumbnailStat = fs.lstatSync(thumbnailPath);
+    res.setHeader('Content-Type', 'image/webp');
+    res.setHeader('Content-Length', thumbnailStat.size.toString());
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    streamFileResponse(req, res, thumbnailPath, 'thumbnail');
   } catch (error) {
     console.error('Thumbnail error:', error);
-    res.status(500).json({ error: 'Failed to generate thumbnail' });
+    res.status(error instanceof ThumbnailError ? error.statusCode : 500).json({ error: 'Failed to generate thumbnail' });
   }
 });
 
@@ -531,15 +757,25 @@ router.delete('/:id', authenticateToken, requireApproved, async (req: Request, r
       return;
     }
 
-    // Try both paths
     const filePath = resolveFilePath(ownerId, file.path);
-    if (filePath) {
-      fs.unlinkSync(filePath);
+    const quarantined: QuarantinedFilePath[] = [];
+    try {
+      const canonical = filePath ? quarantineRegularFile(filePath, 'Canonical file') : null;
+      if (canonical) quarantined.push(canonical);
+      const mirror = quarantineToolMirror(ownerId, file.path);
+      if (mirror) quarantined.push(mirror);
+    } catch (error) {
+      restoreQuarantinedFiles(quarantined);
+      throw error;
     }
-    removeToolMirror(ownerId, file.path);
-
-    await prisma.file.delete({ where: { id: file.id } });
-    await logActivity(req.user!.userId, 'FILE_DELETE', 'file', file.id, req);
+    try {
+      await prisma.file.delete({ where: { id: file.id } });
+    } catch (error) {
+      restoreQuarantinedFiles(quarantined);
+      throw error;
+    }
+    purgeQuarantinedFiles(quarantined);
+    await logActivity(req.user!.userId, 'FILE_DELETE', 'file', file.id, req).catch(() => {});
 
     res.json({ message: 'File deleted' });
   } catch (error) {
@@ -557,22 +793,44 @@ router.post('/batch-delete', authenticateToken, requireApproved, async (req: Req
       res.status(400).json({ error: 'ids array required' });
       return;
     }
-
-    const files = await prisma.file.findMany({
-      where: { id: { in: ids }, userId: ownerId },
-    });
-
-    for (const file of files) {
-      const filePath = resolveFilePath(ownerId, file.path);
-      if (filePath) {
-        try { fs.unlinkSync(filePath); } catch {}
-      }
-      removeToolMirror(ownerId, file.path);
+    const uniqueIds = Array.from(new Set(ids.filter((id): id is string => (
+      typeof id === 'string'
+      && id.length > 0
+      && id.length <= 512
+      && !/[\u0000-\u001f\u007f]/.test(id)
+    ))));
+    if (uniqueIds.length !== ids.length || uniqueIds.length > FILE_LIBRARY_MAX_BATCH_DELETE) {
+      res.status(400).json({ error: `ids must contain 1-${FILE_LIBRARY_MAX_BATCH_DELETE} unique file IDs` });
+      return;
     }
 
-    await prisma.file.deleteMany({
-      where: { id: { in: files.map(f => f.id) }, userId: ownerId },
+    const files = await prisma.file.findMany({
+      where: { id: { in: uniqueIds }, userId: ownerId },
     });
+
+    const quarantined: QuarantinedFilePath[] = [];
+    try {
+      for (const file of files) {
+        const filePath = resolveFilePath(ownerId, file.path);
+        const canonical = filePath ? quarantineRegularFile(filePath, 'Canonical file') : null;
+        if (canonical) quarantined.push(canonical);
+        const mirror = quarantineToolMirror(ownerId, file.path);
+        if (mirror) quarantined.push(mirror);
+      }
+    } catch (error) {
+      restoreQuarantinedFiles(quarantined);
+      throw error;
+    }
+
+    try {
+      await prisma.file.deleteMany({
+        where: { id: { in: files.map(f => f.id) }, userId: ownerId },
+      });
+    } catch (error) {
+      restoreQuarantinedFiles(quarantined);
+      throw error;
+    }
+    purgeQuarantinedFiles(quarantined);
 
     res.json({ deleted: files.length });
   } catch (error) {
@@ -587,11 +845,6 @@ router.patch('/:id/rename', authenticateToken, requireApproved, async (req: Requ
     const ownerId = await getScopedOwnerId(req);
     const { id } = req.params;
     const { newName } = req.body;
-
-    if (!newName || typeof newName !== 'string' || newName.trim().length === 0) {
-      res.status(400).json({ error: 'newName required' });
-      return;
-    }
 
     const file = await prisma.file.findFirst({
       where: { id, userId: ownerId },
@@ -608,17 +861,21 @@ router.patch('/:id/rename', authenticateToken, requireApproved, async (req: Requ
       return;
     }
 
-    // Generate new path with sanitized name
-    const ext = path.extname(file.path);
-    const sanitized = newName.trim().replace(/[^a-zA-Z0-9_\-. ]/g, '_');
-    const newPath = path.join(path.dirname(file.path), `${sanitized}${ext}`);
+    let normalizedRename;
+    try {
+      normalizedRename = normalizeFileRename(file.path, newName);
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Invalid file name' });
+      return;
+    }
+    const newPath = normalizedRename.storedPath;
     
     // Construct new full path directly (don't use resolveFilePath since new file doesn't exist yet)
-    const newFullPath = path.join(getUserUploadDir(ownerId), newPath);
-
-    // Validate the new path is within user's directory (prevent path traversal)
     const userDir = getUserUploadDir(ownerId);
-    if (!newFullPath.startsWith(userDir)) {
+    let newFullPath: string;
+    try {
+      newFullPath = resolveContainedPath(userDir, newPath.split(path.sep).join('/'), { mustExist: false });
+    } catch {
       res.status(400).json({ error: 'Invalid file path' });
       return;
     }
@@ -630,16 +887,24 @@ router.patch('/:id/rename', authenticateToken, requireApproved, async (req: Requ
 
     // Rename on filesystem
     fs.renameSync(oldPath, newFullPath);
-    renameToolMirror(ownerId, file.path, newPath, newFullPath);
-
-    // Update database
-    const updated = await prisma.file.update({
-      where: { id },
-      data: {
-        path: newPath,
-        originalName: sanitized,
-      },
-    });
+    let updated;
+    try {
+      updated = await prisma.file.update({
+        where: { id },
+        data: {
+          path: newPath,
+          originalName: normalizedRename.displayName,
+        },
+      });
+      renameToolMirror(ownerId, file.path, newPath, newFullPath);
+    } catch (error) {
+      try { fs.renameSync(newFullPath, oldPath); } catch {}
+      try {
+        await prisma.file.update({ where: { id }, data: { path: file.path, originalName: file.originalName } });
+      } catch {}
+      try { ensureToolMirror(ownerId, oldPath, file.path); } catch {}
+      throw error;
+    }
 
     res.json(updated);
   } catch (error) {
@@ -655,8 +920,24 @@ router.post('/:id/copy-to-project', authenticateToken, requireApproved, async (r
     const { id } = req.params;
     const { projectName, destinationPath, moveFile } = req.body;
 
-    if (!projectName || typeof projectName !== 'string') {
+    if (
+      !projectName
+      || typeof projectName !== 'string'
+      || projectName.length > 255
+      || /[\u0000-\u001f\u007f]/.test(projectName)
+    ) {
       res.status(400).json({ error: 'projectName required' });
+      return;
+    }
+    if (
+      (destinationPath !== undefined && (
+        typeof destinationPath !== 'string'
+        || destinationPath.length > 2048
+        || /[\u0000-\u001f\u007f]/.test(destinationPath)
+      ))
+      || (moveFile !== undefined && typeof moveFile !== 'boolean')
+    ) {
+      res.status(400).json({ error: 'Copy destination or move option is invalid' });
       return;
     }
 
@@ -701,7 +982,8 @@ router.post('/:id/copy-to-project', authenticateToken, requireApproved, async (r
 
     // Ensure destination directory exists
     const destDir = path.dirname(destPath);
-    fs.mkdirSync(destDir, { recursive: true });
+    const relativeDestDir = path.relative(projectDir, destDir).split(path.sep).join('/');
+    if (relativeDestDir) ensureContainedDirectory(projectDir, relativeDestDir);
 
     // Check if file already exists
     if (fs.existsSync(destPath)) {
@@ -709,14 +991,28 @@ router.post('/:id/copy-to-project', authenticateToken, requireApproved, async (r
       return;
     }
 
-    // Copy or move the file
+    fs.copyFileSync(sourcePath, destPath, fs.constants.COPYFILE_EXCL);
+
     if (moveFile) {
-      fs.renameSync(sourcePath, destPath);
-      removeToolMirror(ownerId, file.path);
-      // Delete from database
-      await prisma.file.delete({ where: { id } });
-    } else {
-      fs.copyFileSync(sourcePath, destPath);
+      const quarantined: QuarantinedFilePath[] = [];
+      try {
+        const canonical = quarantineRegularFile(sourcePath, 'Canonical file');
+        if (canonical) quarantined.push(canonical);
+        const mirror = quarantineToolMirror(ownerId, file.path);
+        if (mirror) quarantined.push(mirror);
+      } catch (error) {
+        restoreQuarantinedFiles(quarantined);
+        try { fs.unlinkSync(destPath); } catch {}
+        throw error;
+      }
+      try {
+        await prisma.file.delete({ where: { id } });
+      } catch (error) {
+        restoreQuarantinedFiles(quarantined);
+        try { fs.unlinkSync(destPath); } catch {}
+        throw error;
+      }
+      purgeQuarantinedFiles(quarantined);
     }
 
     res.json({ 
@@ -729,17 +1025,6 @@ router.post('/:id/copy-to-project', authenticateToken, requireApproved, async (r
     res.status(500).json({ error: 'Failed to copy file to project' });
   }
 });
-
-// Helper: ensure ~/portal-files symlink for user
-function ensureUserSymlink(userId: string) {
-  const userDir = getUserUploadDir(userId);
-  const symlinkPath = path.join('/root', 'portal-files');
-  try {
-    if (!fs.existsSync(symlinkPath)) {
-      fs.symlinkSync(BASE_UPLOAD_DIR, symlinkPath);
-    }
-  } catch {}
-}
 
 // POST /api/files/sync — reconcile filesystem with database (auto-register untracked files, flag missing)
 router.post('/sync', authenticateToken, requireApproved, async (req: Request, res: Response) => {
@@ -755,6 +1040,12 @@ router.post('/sync', authenticateToken, requireApproved, async (req: Request, re
     // Get all files currently on disk
     const diskFiles = new Set<string>();
     const entries = fs.readdirSync(userDir, { withFileTypes: true });
+    if (entries.length > FILE_LIBRARY_MAX_SYNC_ENTRIES) {
+      res.status(413).json({
+        error: `File reconciliation is limited to ${FILE_LIBRARY_MAX_SYNC_ENTRIES} directory entries per run`,
+      });
+      return;
+    }
     for (const entry of entries) {
       if (entry.isFile()) {
         diskFiles.add(entry.name);
@@ -765,7 +1056,14 @@ router.post('/sync', authenticateToken, requireApproved, async (req: Request, re
     const dbFiles = await prisma.file.findMany({
       where: { userId: ownerId },
       select: { id: true, path: true },
+      take: FILE_LIBRARY_MAX_SYNC_ENTRIES + 1,
     });
+    if (dbFiles.length > FILE_LIBRARY_MAX_SYNC_ENTRIES) {
+      res.status(413).json({
+        error: `File reconciliation is limited to ${FILE_LIBRARY_MAX_SYNC_ENTRIES} database entries per run`,
+      });
+      return;
+    }
     const dbPaths = new Set(dbFiles.map(f => f.path));
 
     // Find untracked files on disk (on disk but not in DB)
@@ -794,12 +1092,26 @@ router.post('/sync', authenticateToken, requireApproved, async (req: Request, re
       }
 
       try {
-        const fullPath = path.join(userDir, filename);
-        const stat = fs.statSync(fullPath);
+        const fullPath = resolveContainedPath(userDir, filename, { mustExist: true, kind: 'file' });
+        const stat = fs.lstatSync(fullPath);
+        const scanResult = await scanFile(fullPath);
+        if (!scanResult.clean) {
+          skipped++;
+          await prisma.activityLog.create({
+            data: {
+              userId: req.user!.userId,
+              action: 'FILE_SYNC_BLOCKED',
+              resource: 'file',
+              severity: scanResult.scannerAvailable ? 'CRITICAL' : 'WARNING',
+              metadata: { filename, reason: scanResult.scannerAvailable ? scanResult.threat : 'scanner-unavailable' },
+            },
+          }).catch(() => {});
+          continue;
+        }
         const ext = path.extname(filename).toLowerCase();
         const mime = mimeMap[ext] || 'application/octet-stream';
 
-        await prisma.file.create({
+        const created = await prisma.file.create({
           data: {
             userId: ownerId,
             path: filename,
@@ -808,6 +1120,12 @@ router.post('/sync', authenticateToken, requireApproved, async (req: Request, re
             mimeType: mime,
           },
         });
+        try {
+          ensureToolMirror(ownerId, fullPath, filename);
+        } catch (error) {
+          await prisma.file.delete({ where: { id: created.id } }).catch(() => {});
+          throw error;
+        }
         added++;
       } catch (err: any) {
         // Unique constraint = race condition, skip
@@ -821,9 +1139,17 @@ router.post('/sync', authenticateToken, requireApproved, async (req: Request, re
     for (const dbFile of dbFiles) {
       if (!diskFiles.has(dbFile.path)) {
         // Check legacy path too before flagging
-        const legacyPath = path.join('/portal/files', ownerId, dbFile.path);
-        if (!fs.existsSync(legacyPath)) {
-          await prisma.file.delete({ where: { id: dbFile.id } });
+        if (!resolveFilePath(ownerId, dbFile.path)) {
+          const quarantined: QuarantinedFilePath[] = [];
+          try {
+            const mirror = quarantineToolMirror(ownerId, dbFile.path);
+            if (mirror) quarantined.push(mirror);
+            await prisma.file.delete({ where: { id: dbFile.id } });
+          } catch (error) {
+            restoreQuarantinedFiles(quarantined);
+            throw error;
+          }
+          purgeQuarantinedFiles(quarantined);
           removed++;
         }
       }
@@ -837,23 +1163,33 @@ router.post('/sync', authenticateToken, requireApproved, async (req: Request, re
 });
 
 // GET /api/files/upload-config — returns upload limits based on whether Cloudflare is in front
-router.get('/upload-config', authenticateToken, (req: Request, res: Response) => {
+router.get('/upload-config', authenticateToken, requireApproved, (req: Request, res: Response) => {
   // Cloudflare adds these headers when proxying
   const behindCloudflare = !!(req.headers['cf-connecting-ip'] || req.headers['cf-ray'] || req.headers['cf-ipcountry']);
   
   // Cloudflare free/pro plan limit: ~100MB per request
-  // Without Cloudflare: limited only by server memory/disk and Express body-parser (default 100mb multer)
-  const singleUploadLimit = behindCloudflare ? 95 * 1024 * 1024 : 2 * 1024 * 1024 * 1024; // 95MB vs 2GB
-  const chunkSize = behindCloudflare ? 5 * 1024 * 1024 : 50 * 1024 * 1024; // 5MB vs 50MB chunks
+  // Direct uploads are capped by Multer at 500MB. Chunked uploads use one
+  // server-enforced 5MB contract on every network path and allow up to 2GB.
+  const singleUploadLimit = behindCloudflare ? 95 * 1024 * 1024 : DIRECT_UPLOAD_MAX_BYTES;
+  const chunkSize = 5 * 1024 * 1024;
+  const maxChunkedUploadSize = 2 * 1024 * 1024 * 1024;
   
   res.json({
     behindCloudflare,
     singleUploadLimit,
     chunkSize,
+    maxChunkedUploadSize,
     singleUploadLimitMB: Math.round(singleUploadLimit / (1024 * 1024)),
     chunkSizeMB: Math.round(chunkSize / (1024 * 1024)),
   });
 });
 
 export default router;
-export { BASE_UPLOAD_DIR, getUserUploadDir };
+export {
+  BASE_UPLOAD_DIR,
+  buildDirectFileUrl,
+  ensureToolMirror,
+  getUserUploadDir,
+  removeToolMirror,
+  resolveFilePath,
+};

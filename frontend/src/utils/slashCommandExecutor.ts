@@ -35,7 +35,10 @@ export async function executeSlashCommand(
   command: SlashCommand,
   args: string,
   chatState: ChatStateContextValue,
-  helpers?: { onNewSession?: () => Promise<void> | void },
+  helpers?: {
+    onNewSession?: () => Promise<void> | void;
+    onModelChange?: (model: string) => Promise<boolean | void> | boolean | void;
+  },
 ): Promise<void> {
   switch (command.command) {
     case '/new':
@@ -54,7 +57,12 @@ export async function executeSlashCommand(
         addSystemMessage(chatState, 'Usage: /model <model-id>');
         return;
       }
-      await chatState.switchModel(args.trim());
+      if (helpers?.onModelChange) {
+        const changed = await helpers.onModelChange(args.trim());
+        if (changed === false) return;
+      } else {
+        await chatState.switchModel(args.trim());
+      }
       addSystemMessage(chatState, `Switched model to \`${args.trim()}\`.`);
       return;
     case '/models': {

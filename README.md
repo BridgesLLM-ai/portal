@@ -5,7 +5,7 @@
 <h1 align="center">BridgesLLM Portal</h1>
 
 <p align="center">
-  <strong>Your entire AI workflow in one self-hosted web UI. One command to install.</strong>
+  <strong>A self-hosted OpenClaw workstation for a VPS you control.</strong>
 </p>
 
 <p align="center">
@@ -18,383 +18,185 @@
 
 ---
 
-BridgesLLM Portal runs on [OpenClaw](https://github.com/openclaw/openclaw) and turns a supported Ubuntu or Debian VPS into a complete browser-based AI workstation — multi-provider agent chat, sandboxed code execution, a shared browser your agent controls while you watch, remote desktop, project management, file manager, email, and more. If OpenClaw is already installed, the portal installer detects it and uses the existing installation.
+BridgesLLM Portal runs on [OpenClaw](https://github.com/openclaw/openclaw) and turns a supported Ubuntu or Debian VPS into a browser-based AI workstation: agent chat, project-bound workspaces, hosted apps, files, a shared browser, Remote Desktop, mail, and operator tools. If OpenClaw is already installed, the Portal installer detects and validates the existing installation instead of creating a second one.
 
-**Stop bouncing between tools.** Chat with Claude, Codex, Gemini, or local models. Have your agent browse the web, write code, manage files, send email — all from one tab, on a server you own.
-
-**One command. Five minutes.**
+Connect the provider paths available to your accounts and host, including Claude, Codex, Gemini, API-key providers, and local or Tailnet-connected Ollama models. Availability still depends on provider credentials, entitlements, and the runtime qualification shown by the Portal.
 
 ```bash
 curl -fsSL https://bridgesllm.ai/install.sh | sudo bash
 ```
 
-### Requirements
+## Requirements
 
 - Ubuntu 22.04+ or Debian 12+
 - 3.5 GB RAM minimum (4 GB+ recommended)
 - 35 GB free disk space
 - Root or sudo access
+- A domain is recommended for the full HTTPS, mail, and public-sharing experience
 
-### Windows test drive (WSL 2 beta)
+## What changed in 4.0
 
-BridgesLLM Portal is still **VPS-first**, but Windows users can now test it locally through **WSL 2** before renting a server.
+Portal 4.0 is a foundation release: chat, projects, providers, updates, backups, and host-management paths now share stricter ownership and recovery contracts.
 
-**Important:** this Windows / WSL path is still **experimental, currently untested in the field, and under active development**. Treat it as a local product preview, not a production deployment target.
+- **Answer an agent without changing pages.** Pending Agent Chat and Project Chat questions appear as persistent, expandable notifications. Reply in place or skip deliberately; a distinct sound can alert you after the browser has granted audio permission.
+- **Long turns survive normal browser disruption.** Bounded durable history, reconnect replay, exact-run steering, cancellation, tool/thought rendering, and transcript windowing keep active work usable without unbounded browser growth.
+- **Current Projects are isolated by default.** Project-bound runtimes created by 4.0, or admitted after safe reconciliation, use immutable user/project identity, one writable workspace, live attestation, and controlled public egress. Host, metadata, private-network, and sibling-project access fail closed.
+- **Older Projects and Apps are preserved without inventing 4.0 authority.** An upgrade retains 3.x Project files, their exactly associated Apps, and App running/stopped intent. Startup enrolls each exact old Project root in the fail-closed legacy `NONE` state rather than calling it current. A Project with preserved 3.x OpenClaw lineage remains visible, but Project Chat and destructive Project-level operations stay unavailable until that lineage can be reconciled safely.
+- **Provider setup tells the truth.** Backend-owned catalogs, exact model checks, runtime qualification, Agent Zero setup, current Claude/Codex/Google/xAI paths, and local or Tailnet Ollama management replace broad provider promises.
+- **Updates are signed and transactional.** The Dashboard shows verified release details, requires backup preflight, serializes maintenance, applies database migrations, checks service/runtime health, and rolls back failed candidates.
+- **The rest of the workstation caught up.** Setup, Files, Mail, Terminal, Remote Desktop, Apps, Tasks, Skills, Settings, Admin, light mode, accessibility, and bounded background operations all received reliability and clarity work.
 
-Recommended Windows Terminal bootstrapper (PowerShell profile), it checks for WSL/Ubuntu first and installs Ubuntu if missing:
+Read the complete [4.0.0 changelog](CHANGELOG.md#400---2026-08-01) and [release history](https://github.com/BridgesLLM-ai/portal/releases).
 
-```powershell
-irm https://raw.githubusercontent.com/BridgesLLM-ai/portal/main/installer/install-windows.ps1 | iex
-```
-
-If Ubuntu WSL is already ready and you want to skip the bootstrapper, use the direct installer path:
-
-```powershell
-wsl -u root -- bash -lc "curl -fsSL https://bridgesllm.ai/install.sh | bash -s -- --local"
-```
-
-Then open `http://localhost:4001` in Windows and skip domain + HTTPS in the setup wizard. Public hosting, custom domains, and internet-facing share links remain VPS features in this beta path.
-
-See [docs/WINDOWS_WSL_BETA.md](docs/WINDOWS_WSL_BETA.md) for the full reasoning, caveats, and references.
-
-## 📺 See It in Action
-
-Visit [bridgesllm.ai](https://bridgesllm.ai) for live video demos of every feature.
-
-## 🎯 What You Get
+## What you get
 
 ### Agent Chat
-Talk to Claude, Codex, Gemini, or Ollama through the provider path that fits each one — account sign-in where supported, Claude setup-token flow, API keys, or local models. Switch models mid-conversation. Powered by [OpenClaw](https://github.com/openclaw/openclaw).
 
-### Shared Browser
-Your agent controls a real Chrome browser via CDP — navigating, clicking, filling forms, extracting data — while you watch live on the remote desktop. Ask it to research something, check a page for bugs, or automate a web workflow.
+Use OpenClaw and supported native harnesses from one conversation surface. Switch among available providers and models, watch tool activity, approve guarded operations, steer a running turn, reconnect after a browser interruption, and answer agent questions from anywhere in the Portal.
 
-### Projects & Code Sandbox
-Create projects, edit code in-browser with Monaco Editor, and assign AI agents to tasks. Each project runs in an isolated Docker container. Git integration, live preview, autonomous background agents.
+### Projects and code sandbox
 
-### Remote Desktop
-Full graphical desktop via NoVNC — accessible from any device. Run GUI apps, browser automation, or visual workflows without SSH.
+Create or import projects, edit code with Monaco, use Git, install dependencies, preview or deploy apps, and work with a project-bound agent. Project Chat is separate from host-operator Agent Chat: it gets one project workspace and controlled public egress while host, private-network, sibling-project, and credential access remain blocked. A provider stays unavailable in Projects until its adapter proves that boundary. Preserved 3.x Projects with unresolved OpenClaw lineage remain available as files and through exactly associated Apps, but are not admitted to Project Chat, rename, delete, or other destructive Project-level operations until safe reconciliation succeeds.
 
-### Terminal
-Full xterm.js terminal in the browser. Run commands, manage packages, monitor your server — no SSH client needed.
+### Apps
 
-### File Manager
-Browse, upload, edit, and manage server files. Drag-and-drop, in-browser editing, archive extraction.
+Deploy static or full-stack project apps, manage their processes, and create password-, expiry-, or use-limited share links. Update and restore paths preserve standalone app sources and reconcile the apps that were running before maintenance.
 
-### Email
-Built-in Stalwart mail server. Read, compose, and send email with rich HTML rendering and attachments — from your own domain.
+### Shared browser and Remote Desktop
 
-### Automations
-Schedule recurring AI tasks with cron from the browser. Monitoring, reports, maintenance — runs while you sleep.
+Use a real Chrome browser that an agent can control while you watch, or open the full Xfce desktop through noVNC. Remote Desktop includes audio, clipboard controls, resize recovery, keep-awake handling, and readiness checks. It remains an optional host capability and may require setup or repair from Settings.
 
-### Skills Marketplace
-Browse and install agent skills from [ClawHub](https://clawhub.ai) with one click. Configure MCP tools and extend your agent's capabilities.
+### Files
 
-### Setup Wizard
-Everything configured in-browser. Domain, SSL, providers, users — no CLI expertise needed. Codex and Gemini support account sign-in, Claude uses the guided setup-token flow, and key-based providers use API keys.
+Browse, search, upload, preview, edit, download, archive, and copy files into projects. Large uploads are resumable and bounded; path containment, active-content handling, and malware-scan failures are enforced server-side.
 
-### Self-Updating Dashboard
-One-click updates from the browser. Admin dashboard with user management, storage monitoring, and session controls.
+### Mail
 
-## 🆕 Recent Changes
+Connect the bundled Stalwart mail service to use accounts, folders, search, attachments, signatures, and forwarding from the Portal. Mail is optional and needs a correctly configured domain, DNS, and public mail protocols.
 
-### v3.26.1 (July 15, 2026)
-- **Safe upgrades for older OpenClaw installs**: the updater handles legacy state and plugin metadata that can block the first OpenClaw 2026.7.1 gateway start, while preserving every changed artifact in a recoverable backup.
-- **Automatic OpenClaw rollback**: if the package upgrade or new gateway fails validation, the exact prior package and preserved state are restored and verified before the updater exits.
-- **Real readiness gates**: update success now requires HTTP and RPC health, pinned version parity, a stable process with no restart-loop activity, a clean startup journal, and the expected migration checkpoint. Custom or ambiguous state layouts fail closed instead of being guessed at.
+### Terminal, tasks, automations, and skills
 
-### v3.26.0 (July 15, 2026)
-- **New recommended models**: Claude Fable 5 for Anthropic; the GPT-5.6 suite (Sol, Terra, Luna) for ChatGPT/Codex subscriptions, with GPT-5.5 as the compatibility fallback.
-- **OpenClaw runtime updated to 2026.7.1**: reasoning-streaming Claude models show live thinking natively; the canonical Codex model route moves to `openai/*` with automatic migration of legacy references.
-- **Agent Chat reliability overhaul**: reconnecting mid-turn re-attaches to the live stream instead of reporting a false interruption, long quiet turns no longer die to a CLI no-output watchdog, pre-tool text survives reloads, tool calls pair with their results, approval popups can no longer lock the page, and updates no longer erase chat runtime history.
-- **Remote Desktop copy/paste**: one-click "Send clipboard"/"Get clipboard" buttons plus an always-on VNC clipboard bridge; screen blanking and window-fit fixes ride along.
-- **Faster everywhere**: session switching, Session Controls, Agent Tools, and dashboard checks drop from multi-second stalls to milliseconds.
-- **Security hardening**: loopback-by-default portal bind behind the HTTPS proxy, root-only chat runtime data, and a sweep of dependency security updates.
+Operate the host from a browser terminal, schedule recurring agent work, inspect durable background jobs, and install reviewed skills from [ClawHub](https://clawhub.ai). Host-changing actions are role-gated, serialized where needed, and surfaced with explicit status instead of fire-and-forget responses.
 
-### v3.25.27 (July 8, 2026)
-- **Mail auto-forwarding now happens as mail arrives**: forwarding settings install a Stalwart Sieve `redirect :copy` rule instead of waiting for the Mail UI to check the inbox.
-- **Long OpenClaw chats are less fragile**: whitespace-preserving stream history, longer stale windows, and safer recovery keep thinking/tool bubbles and final text intact during long turns.
-- **Update safety is tightened around OpenClaw and app hosting**: the installer pins OpenClaw/Codex to `2026.6.11`, release artifacts rebuild from clean output directories, and various security improvements tighten public/private boundaries.
+### Setup and administration
 
-### v3.25.26 (June 22, 2026)
-- **Agent Chat reconnects recover visibly**: dead live-stream states now clear stale running/tool UI, reload durable history, and show an interruption notice instead of sitting forever on reconnect.
-- **Project Agent Chat works behind real HTTPS domains**: same-origin websocket upgrades are accepted by request host, fixing 403 failures on installs whose `CORS_ORIGIN` still points at an old IP.
-- **Project chat history catch-up no longer hides the active prompt**: local user/assistant bubbles are preserved while durable history catches up after reconnects.
+Fresh setup creates a secure Owner first. Optional readiness cards then guide domain/TLS, mail, providers, local models, Remote Desktop, and other capabilities. Admin surfaces cover accounts, approvals, storage, alerts, backups, maintenance, update status, and scoped diagnostics.
 
-### v3.25.25 (June 21, 2026)
-- **Dashboard updates recover the Portal before exiting**: if OpenClaw prep fails after the updater stops the service, the installer now restarts `bridgesllm-product` and waits for `/health` before exiting.
-- **Agent switching no longer kills active runs**: changing OpenClaw agents or providers detaches the visible chat instead of sending an abort; only explicit Stop/New Chat cancels a run.
-
-### v3.25.24 (June 21, 2026)
-- **OpenClaw update recovery is stricter**: compatibility hotfixes now repair duplicate Gemini stream helpers, validate OpenClaw bundles as ES modules, and fail the update if the gateway cannot boot cleanly.
-- **Agent Chat stays responsive during model discovery**: OpenClaw model lists now use the gateway catalog first with a short async CLI fallback, avoiding backend freezes when the OpenClaw CLI is slow.
-- **Codex routing remains explicit**: OpenClaw gateway model rows are normalized to provider-qualified IDs so Codex, Claude, Gemini CLI, and Antigravity selections do not collapse into ambiguous bare model names.
-
-### v3.25.23 (June 21, 2026)
-- **The public installer is safe to rerun on existing installs**: the standard one-line install command now detects an existing Portal and performs an update instead of a no-op copy over itself.
-- **Caddy HTTPS config is protected**: updates do not rewrite Caddy, and forced reinstalls recover the existing domain before writing proxy config.
-- **OpenClaw 2026.6.9 support is wired through the Portal**: the installer pins the matching OpenClaw/Codex versions, verifies gateway parity after package changes, and Agent Chat lists the live OpenClaw model catalog, including Codex, Gemini CLI, and Antigravity rows.
-- **Gemini CLI setup is more truthful**: empty OAuth profiles no longer show as configured, and setup includes a smoke check for usable credentials.
-
-### v3.25.22 (June 20, 2026)
-- **Codex compatibility repair now includes the plugin layer**: updates remove stale legacy `@openclaw/codex` install metadata, quarantine old global plugin copies, and enforce the compatible `2026.6.8` Codex plugin before restarting OpenClaw.
-- **Regression coverage catches the stale-plugin failure mode**: tests now cover the exact state that made OpenClaw reject valid `openai:codex-cli` auth as the wrong profile type.
-
-### v3.25.21 (June 20, 2026)
-- **Dashboard updates now repair existing Codex auth drift**: during update, the installer bridges a valid native Codex CLI OAuth file into OpenClaw's current `openai:codex-cli` profile and removes stale `openai-codex:*` auth-order entries.
-- **The OpenClaw repair path stays narrow**: updates still avoid broad `openclaw doctor --fix` mutations and still leave Caddy upgrades behind manual review.
-
-### v3.25.20 (June 20, 2026)
-- **Portal updates are safer around host infrastructure**: the installer no longer runs `openclaw doctor --fix` during normal updates and no longer auto-upgrades Caddy.
-- **Codex subscription setup uses the reliable device-login path**: Codex login now bridges the native Codex CLI credential store into OpenClaw's current `openai` auth slot without overwriting OpenAI API-key profiles.
-- **Provider status is more truthful**: OpenAI API keys and ChatGPT/Codex subscription OAuth are tracked separately, reducing false "configured" states after provider changes.
-
-### v3.25.19 (June 20, 2026)
-- **OpenClaw OAuth model suggestions are current and smaller**: Codex uses the current `codex/gpt-5.5` runtime, while Claude highlights Opus 4.8, Sonnet 4.6, and Haiku 4.5.
-- **Google Antigravity replaces the old Gemini CLI subscription path**: the Portal guides users toward the native Antigravity flow and labels OpenClaw-native Antigravity OAuth as not fully supported for now.
-
-### v3.25.18 (May 31, 2026)
-- **OpenClaw compatibility checks are quieter on current runtimes**: updater hotfix detection no longer reports a failed legacy relay patch when the installed OpenClaw bundle has already moved past that patch shape.
-
-### v3.25.17 (May 31, 2026)
-- **Portal backups are installed and scheduled again**: daily, weekly comprehensive, and monthly backups now use systemd timers, and stale cron entries from older source-checkout installs are cleaned up during update.
-- **Normal and comprehensive manual backups work again**: Settings now calls the installed backup runner directly and keeps the `comprehensive` backup type intact.
-- **Codex “stopped before confirming” false failures are handled better**: visible assistant replies are completed cleanly when OpenClaw misses the final Codex `turn/completed` event.
-- **Maintenance status is quieter after real maintenance**: held apt packages no longer make the dashboard report actionable package drift after updates/reboot are finished.
-- **Backup schedule reporting shows the real timers**: the backups endpoint now reports current `bridgesllm-backup*` systemd timer/unit state alongside legacy cron data.
-
-### v3.25.16 (May 31, 2026)
-- **Server maintenance drift is visible and actionable**: the Dashboard now shows dismissible maintenance/security alerts, while Admin Maintenance provides the full status, guardrails, job history, and action confirmations.
-- **Maintenance automation is guarded by compatibility policy**: security-only updates are allowed through a controlled path, but protected Portal-managed packages like OpenClaw, Stalwart, Caddy, and BridgesLLM components require a maintenance plan/review first.
-- **Full-stack app stops are reliable**: deployed full-stack apps now stop their whole process group and wait for the port to close, preventing child server processes from staying alive after the portal reports the app stopped.
-- **Agent Chat refresh and Codex timeout handling are sturdier**: status/thought events persist through reloads, and delayed Codex completion timeouts no longer strand turns when visible output has already arrived.
-- **Release validation includes live test-box coverage**: this release was checked against the real Admin Maintenance UI, Dashboard alert flow, background maintenance jobs, app-process start/stop/start behavior, and targeted backend regressions.
-
-### v3.25.15 (May 30, 2026)
-- **Current OpenClaw runtime compatibility is restored**: Agent Chat and project agents keep live progress, tool activity, final replies, and refresh history aligned on newer OpenClaw releases.
-- **CLI-backed providers are usable out of the box again**: Claude Code, Codex CLI, and Gemini CLI now surface browser approval prompts when tool execution needs permission, with provider-specific retry behavior after approval.
-- **Provider setup is tougher across Claude, Codex, and Gemini**: OAuth/setup-token handoffs, provider model registration, stale auth cleanup, and runtime model patching handle newer CLI/config formats more reliably.
-- **Long-running and tool-heavy chats survive reloads better**: runtime turn-event recovery preserves thinking/tool segments and prevents duplicate tool-only records from hiding the real prompt and final answer.
-- **Release validation now exercises real browser chat flows**: the shipped validation harnesses cover normal Agent Chat and project Agent panel sends, including live status, reload persistence, enhanced history, and artifact filtering.
-
-### v3.25.14 (May 11, 2026)
-- **Existing Remote Desktop installs repair missing clipboard tools during update**: the updater now runs the Remote Desktop package check before reconfiguring services, so `xclip`/`xsel` are installed on already-deployed servers instead of only on fresh installs.
-
-### v3.25.13 (May 11, 2026)
-- **Remote Desktop copy/paste is easier to trust**: fresh installs now include the required desktop clipboard tools, and the clipboard panel uses clearer direction-based labels for moving text between your device and the remote desktop.
-- **Mobile app-mode navigation behaves like an address bar**: shared browser and OpenClaw UI URL fields now preserve what you are typing instead of overwriting focused edits during automatic URL sync.
-
-### v3.25.12 (May 10, 2026)
-- **Refresh/reconnect behavior is stable again**: Agent Chat and project chat now preserve OpenClaw maintenance markers across reloads, avoid stale active-stream status, and keep finished runs from turning into reconnect loops.
-- **Compaction notices are stricter and cleaner**: runtime maintenance markers render as status/compaction rails only when they are actual standalone notices, not ordinary assistant text.
-- **Provider setup and OpenClaw restarts are safer**: setup no longer persists unsupported model metadata, OAuth prompt detection is more tolerant of current CLI output, and the Dashboard can flag/restart stale gateway listeners for admins.
-- **Installer and Remote Desktop polish shipped together**: installs now verify Node.js 22.16+, while shared-browser/OpenClaw UI launchers resize more reliably and the release archive carries the current icon and branding assets.
-
-### v3.25.11 (May 8, 2026)
-- **Gateway reconnect fallback is safer**: project chat no longer retries accepted persistent gateway RPC failures through a throwaway `gateway-client` socket, avoiding duplicate sends and live-stream eviction.
-- **Project model switching is more truthful**: explicit model changes now patch the gateway whenever the live session model differs, even if local session metadata already contains the requested model.
-
-### v3.25.10 (May 8, 2026)
-- **Gemini-backed project chat replies are visible again**: project assistant polling now recovers replies from gateway history and Gemini CLI transcripts when OpenClaw does not create the expected session JSONL.
-- **Fresh project assistant sends are less fragile**: startup avoids the broken legacy warmup path, keeps selected models pinned locally, and does not let slow metadata refreshes block real sends.
-- **OpenClaw maintenance rails are explicit now**: heartbeat checks, memory flushes, context maintenance, and compaction show as runtime status rails instead of fake chat content or vague thinking state.
-- **Project-agent tool rails survive maintenance**: running tools stay visible while OpenClaw performs context maintenance, and completed maintenance resolves to a check state instead of a stuck spinner.
-- **Fresh email setup is protected from Stalwart `latest` drift**: the setup wizard and Settings mail installer now pin `stalwartlabs/stalwart:v0.15.5`, the version compatible with the portal’s current domain/account provisioning flow.
-- **Agent Chat history recovery is tougher**: reused `new-*` and `portal-new-*` OpenClaw session aliases can recover messages from matching trajectory snapshots when the session registry points at a stale stub.
-
-### v3.25.9 (May 6, 2026)
-- **Gemini/OpenClaw turns survive completion now**: when a local session file lags behind the imported Gemini transcript, Agent Chat merges the newer transcript tail instead of dropping the finished assistant reply, tool cards, or visible reasoning after the run ends.
-- **Fresh `new-*` session aliases resolve cleanly across reloads**: the portal now normalizes portal-created OpenClaw session aliases before history reloads and session lookups, which keeps completed turns attached to the right chat.
-- **AI setup is sturdier across Codex, Gemini, and Claude**: sign-in and setup flows now track callback state more carefully, normalize discovered model IDs consistently, and recover provider-auth handoffs more reliably.
-- **Compatibility Patch status keeps up with current OpenClaw bundles**: the checker and bundled helper now find the imported Gemini CLI backend plus newer heartbeat detector variants, so successful compatibility applies stop looking broken.
-
-### v3.25.8 (May 1, 2026)
-- **Hosted updates ship the current OpenClaw compatibility helper**: the public installer and tarball moved forward with the validated relay, reply-routing, and Gemini CLI compatibility fixes instead of relying on a manual follow-up repair.
-- **The public release path was revalidated against current OpenClaw builds**: portal-backed chat and provider discovery were rechecked before shipping the compatibility update so the hosted download stayed aligned with the current runtime.
-
-### v3.25.7 (April 28, 2026)
-- **The OpenClaw session sidebar stops choking busy portals**: Agent Chat no longer opens large session transcript/checkpoint files just to build the main-session sidebar, which fixes the event-loop stalls that made gateway chat, hosted pages, and shared pages lag or time out on installs with a large OpenClaw session store.
-- **Main-session polling is bounded now**: the portal briefly caches parsed main-session metadata by file stat, so routine session-list refreshes stop re-parsing the whole store over and over on active installs.
-
-### v3.25.6 (April 28, 2026)
-- **Claude account setup is truthful again**: the AI Setup flow now extracts the real Claude authorize URL instead of gluing the terminal prompt onto the `state` parameter, which fixes broken Anthropic sign-in links in the portal.
-- **OpenClaw compatibility checks keep up with newer upstream bundles**: the portal hotfix status and bundled helper now recognize `heartbeat-events-filter-*` and `claude-live-session-*` drift while still verifying the Gemini tool-wiring path.
-- **OpenClaw chat defaults are saner on non-Claude models**: main chat and project chat now fall back to `high` thinking where adaptive Claude-specific behavior does not apply, and Codex setup copy is clearer about the stable default vs fallback path.
-
-### v3.25.5 (April 22, 2026)
-- **Gemini account setup now lands on the right default model**: the Gemini OAuth flow and default-model picker stay aligned, so a successful sign-in produces a usable provider selection instead of a confusing mismatch.
-- **Compaction notices are reused and deduped more cleanly**: Agent Chat and project chat now share the same compaction notice block, and restored history keeps one truthful compaction notice instead of echoing duplicates.
-- **Windows / WSL local beta installs are easier to find**: the main install hero now gives separate Linux and Windows one-paste commands with dedicated copy buttons, keeping the public release path explicit without internal-only notes.
-- **The installer now has a proper local beta path on WSL**: Windows users can run the localhost profile without Caddy or UFW, which makes the test-drive flow a real first-class entrypoint instead of a hand-waved promise.
-
-### v3.25.4 (April 19, 2026)
-- **Installer/update compatibility is finally automatic**: normal install and update flows now auto-apply the validated OpenClaw relay + Gemini compatibility patch set when needed instead of burying that repair behind a manual Settings step.
-- **Agent Chat and project chat are more truthful during live OpenClaw runs**: capable runtimes now use real interrupt-and-steer behavior, running turns surface an immediate `Thinking…` state, async follow-ups can finish cleanly even if the browser disconnects, and hidden Portal Backend RPC / heartbeat artifact text is stripped out of restored history.
-- **Project chat works in a saner repo context**: project agents now run against `/workspace/project`, assistant auto-commit is back after successful runs, transient `.agent-*` scratch files are shelved out of git operations, and revert/auto-commit flows stop confusing portal-maintenance state with user work.
-- **AI setup and provider status got a big honesty pass**: Claude setup-token finishing no longer looks frozen, Codex/Gemini native CLI auth is sturdier, provider model IDs/fallbacks are normalized consistently, and provider cleanup removes stale auth/model config together.
-- **Windows / WSL beta messaging now tells the truth**: local installs are labeled as experimental localhost test drives, while public hosting, stable share links, and custom-domain HTTPS remain VPS-first. The release also bundles the Gemini-aware compatibility helper, new AI-setup/OpenClaw parsing tests, and Windows beta notes.
-
-### v3.25.3 (April 17, 2026)
-- **Live chat-state reconciliation is finally honest**: Agent Chat and project chat now preserve pending user turns and the active assistant bubble while history reloads, delay post-turn reconciliation until the gateway catches up, and restore separate thinking, tool, text, and compaction phases on refresh instead of flattening them into stale garbage.
-- **Tool activity is much clearer while a run is in flight**: the composer rail, main chat, and project chat now share tool-specific glyphs and status copy, and running tools stay visible during maintenance or compaction instead of being replaced by a fake generic thinking message.
-- **Fresh OpenClaw sessions and model controls are more reliable**: `new-*` portal sessions can be materialized on demand before model patching, session-control loading states are more truthful, and model discovery now reads the live OpenClaw config instead of relying on brittle CLI scraping.
-- **Projects regained richer public-safe preview coverage**: Markdown/HTML, PDF, spreadsheet, text, Monaco, and binary-file viewers are back in the public source tree, which fixes clean public builds and improves in-browser file previews.
-- **Ops and release hardening kept pace**: Remote Desktop is locked tighter behind elevated auth and loopback-only websockify, Gemini account OAuth is a first-class setup path, gateway restart fallback is safer on hosts without user-systemd, and the public export script now blocks dirty trees plus beta/staging contamination before a push can happen.
-
-
-### v3.25.2 (April 14, 2026)
-- **OpenClaw compatibility hotfix status works again on current installs**: the portal now inspects the real hashed `heartbeat-runner-*` and `get-reply-*` bundles, recognizes the newer upstream exec-completion detector, and stops falsely calling modern OpenClaw builds unsupported when the relay hotfix can still be applied safely.
-- **This patch release fixes public release parity, not just local production knowledge**: the source tree, installer artifacts, and hosted download now all ship the same compatibility behavior instead of depending on a private manual workaround, and the public source export again contains the lazy project viewer components needed for a clean frontend build.
-
-### v3.25.1 (April 13, 2026)
-- **Installer and updater users now get the OpenClaw compatibility helper fix too**: the bundled long-run relay hotfix script now resolves the real current hashed OpenClaw bundles, patches the right `get-reply` file, and keeps installer/update artifacts aligned with the live production compatibility fix instead of leaving the repair stranded in source only.
-- **This is a clean patch release for distribution parity**: public GitHub source, hosted installer, and hosted tarball now all ship the same helper refresh under a proper new version instead of silently changing bits behind `3.25.0`.
-
-### v3.25.0 (April 12, 2026)
-- **Agent Chat and project chat finally act like the same product**: both surfaces now share the same status rail, project chat lost the stray inline stop button, misleading thought-process pills are gone, live run status copy is clearer, and project chat gained proper run-resume, approval, reconnect, model-persistence, and live metadata handling.
-- **Auth, setup, reinstall, and password flows got a serious hardening pass**: protected deep links preserve their destination, password policy is enforced consistently across setup and recovery flows, reinstall/reset/password-change paths revoke old sessions correctly, and signed-out pollers stop hammering protected endpoints.
-- **Permission boundaries are more truthful**: non-admin users no longer get unusable exec-approval prompts, dashboard reconnect/update controls respect role boundaries, Feature Readiness is exposed to `SUB_ADMIN`, and Tasks, Files, Projects, Apps, and Terminal routes now align with the access the UI actually promises.
-- **Cold-open performance is materially better across the app**: Agent Chats, Dashboard, Projects, Files, Mail, and Settings all shed real startup work through route lazy-loading, deferred charts and history fetches, demand-driven direct-gateway bootstrap, and bounded thumbnail loading.
-- **Operational polish is much better**: gateway/auth restart noise is deduped, background task rows are less spammy, setup and admin copy are cleaner, and several empty states and settings controls now read like finished product instead of debug leftovers.
-- **OpenClaw compatibility and release packaging are tougher**: the bundled compatibility helper now patches current OpenClaw bundle shapes, the release tarball no longer risks shipping the placeholder Prisma DB, and the public release path is documented around the actual dev-container SOP.
-
-See the full [CHANGELOG](CHANGELOG.md) for all releases.
-
-## 🏗️ Architecture
+## Architecture
 
 ```mermaid
 flowchart TD
     Browser["Your Browser"] -->|HTTPS via Caddy| Portal
 
     subgraph Portal["BridgesLLM Portal"]
-      UI["React UI\n(Vite SPA)"]
-      API["Express API\n(Node.js)"]
+      UI["React UI\nVite SPA"]
+      API["Express API\nNode.js"]
       UI --> API
-      API --> Gateway["OpenClaw Gateway\nPersistent WebSocket runtime"]
+      API --> Gateway["OpenClaw Gateway\nPersistent runtime"]
       API --> DB["PostgreSQL\nPortal data"]
-      API --> Docker["Docker sandboxes\nProject isolation"]
-      API --> Mail["Stalwart Mail\nLoopback mail server"]
+      API --> Docker["Attested project runtimes\nControlled public egress"]
+      API --> Mail["Stalwart Mail\nOptional mail service"]
     end
 
-    Gateway --> Claude["Claude\nSetup-token / Extra Usage"]
-    Gateway --> Codex["Codex\nAccount sign-in"]
-    Gateway --> Gemini["Gemini\nAccount sign-in"]
-    Gateway --> Ollama["Ollama\nLocal models"]
+    Gateway --> Providers["Connected AI providers"]
+    Gateway --> Ollama["Ollama\nLocal or Tailnet GPU"]
 ```
 
-- **Caddy** terminates HTTPS (automatic Let's Encrypt) and reverse-proxies to the backend.
-- **OpenClaw Gateway** manages agent sessions, tool approvals, and provider communication over persistent WebSocket.
-- **Docker sandboxes** isolate each project's code execution from the host.
-- **Stalwart** provides email on the loopback interface — not exposed as an open relay.
+- **Caddy** terminates HTTPS and reverse-proxies to the loopback Portal backend.
+- **OpenClaw Gateway** manages agent sessions, approvals, provider communication, and runtime events.
+- **Project runtimes** are actor/project-bound, non-root, read-only except for one project mount, and synchronously attested before fresh or resumed turns.
+- **Controlled egress** permits supported public web, Git, package, and asset traffic while blocking loopback, private, metadata, host, and lateral networks.
+- **PostgreSQL and persistent data roots** hold Portal records, files, projects, app sources, and runtime state covered by the backup contract.
 
-## 💰 Cost Model
+## Cost model
 
-BridgesLLM Portal itself is **free**. Your cost is the combination of:
+BridgesLLM Portal itself is free and open source. Operating cost depends on the VPS, optional services, provider path, and usage you choose. Subscription/account sign-in, usage-based API keys, and local compute have different limits and billing; the Portal does not turn them into one universal flat-rate plan.
 
-- your VPS
-- the provider path you choose
-- your usage pattern
+## Updating
 
-Typical cost components:
-
-| Component | Typical cost model |
-|-----------|--------------------|
-| VPS | Usually ~$20–40/mo for a comfortably sized box |
-| Codex / Gemini | Account or subscription-style sign-in paths are available |
-| Claude | Claude plan **plus Anthropic Extra Usage** for OpenClaw-driven traffic |
-| API-key providers | Usage-based billing |
-| Ollama | Local compute on your own server |
-
-There is no single universal monthly total because provider billing differs by path.
-
-## 🔧 Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Frontend | React 19, Vite, Tailwind CSS, Monaco Editor |
-| Backend | Node.js, Express, Prisma, PostgreSQL |
-| Agent Framework | [OpenClaw](https://github.com/openclaw/openclaw) (open-source) |
-| AI Providers | Anthropic (Claude), OpenAI (Codex), Google (Gemini), Ollama (local) |
-| Reverse Proxy | Caddy (automatic HTTPS) |
-| Containers | Docker (per-project sandboxing) |
-| Remote Desktop | NoVNC + Xfce4 |
-| Email | Stalwart Mail Server |
-
-## 🔄 Updating
-
-Best path: click the **Update** button in the portal dashboard. Or from SSH:
+The recommended path is the Owner-only **Update** action in the Dashboard. From SSH:
 
 ```bash
 curl -fsSL https://bridgesllm.ai/install.sh | sudo bash -s -- --update
 ```
 
-The update flow updates the portal and checks installed dependencies, including OpenClaw, so you usually do **not** need to update OpenClaw separately first. On affected installs it also auto-reapplies the temporary portal compatibility hotfix, so the relay and Gemini compatibility markers do not stay stranded behind a buried Settings button.
+The operator-triggered update flow verifies one signed Portal artifact, checks a fresh backup, preserves deploy lineage, applies migrations, validates the tested OpenClaw core/plugin pair, runs authenticated postflight checks, and rolls back if the candidate cannot become healthy. Unrelated CLI and host-tool upgrades stay in explicit maintenance paths instead of hiding inside every Portal update.
 
-Updates preserve your data, projects, and configuration.
+### Read before upgrading to 4.0
 
-## ❓ Common Questions
+- Every user signs in again once after the 4.0 migration. Accounts and managed data are retained, subject to the legacy Project safety boundary below.
+- Existing 3.x Project files, exactly associated Apps, and App running/stopped intent are retained. Startup records old Project roots as legacy `NONE`, not 4.0-current. Projects whose 3.x OpenClaw lineage is still preserved remain visible, while Project Chat and destructive Project-level operations stay unavailable until that lineage can be reconciled safely.
+- Confined Project Chat runtimes require compatible kernel, Docker, and AppArmor support. Unsupported nested-container hosts can install with `--skip-project-runtimes`; Project Chat remains disabled there.
+- A Complete wipe verifies recorded managed paths. It cannot find a copy moved elsewhere before uninstall, so review the host directly when it held sensitive data.
+- Fresh 4.0 setup enables limited operational telemetry by default. The Owner can turn it off during setup or later in Settings, and existing telemetry choices are retained during update. The Portal reports shortly after startup and then about every 24 hours while it remains running. Turning it off stops that report only; Owner-Dashboard version lookups, manual refreshes, and limited installer lifecycle events remain separate.
+- Windows/WSL remains an experimental local preview, not a supported production profile.
 
-### Can I install BridgesLLM Portal on a VPS that already has OpenClaw?
-Yes. The installer detects an existing OpenClaw installation and uses it. If OpenClaw is not already present, the installer installs it for you.
+## Privacy and telemetry
 
-### Can I try it on Windows before buying a VPS?
-Yes, in beta form through WSL 2. The local beta path is experimental, currently untested in the field, and meant for hands-on testing on `http://localhost:4001`, not as the main production deployment model. See [docs/WINDOWS_WSL_BETA.md](docs/WINDOWS_WSL_BETA.md).
+Portal data, files, projects, credentials, and local services stay on the server you control. Requests sent to an external AI provider still leave the server under that provider's terms. Public shares and enabled mail protocols are also intentionally reachable outside the host.
 
-### Do I need API keys for every provider?
-No. Codex and Gemini support account sign-in flows. Claude uses the guided setup-token flow and currently requires Anthropic Extra Usage for OpenClaw-driven requests. Key-based providers still use API keys, and Ollama is local.
+Fresh 4.0 setup defaults limited operational telemetry to **on**, shows the choice before setup completes, and lets the Owner turn it off there or later in Settings. When enabled, the Portal sends a report shortly after startup and then about every 24 hours while it remains running. That report contains a random install ID, Portal and dependency versions, Portal user count, uptime, Node version, operating system, and architecture. It does not include messages, prompts, project files, credentials, usernames, or email addresses. Turning Portal telemetry off stops that operational report only. When an Owner opens Dashboard, the Portal separately checks the version endpoint for update availability; a manual refresh does the same. Those version lookups send no operational telemetry payload, although the endpoint receives normal request metadata. The installer independently reports install and update lifecycle milestones with the event type, Portal version, operating system name/version, and the random install ID. Normal download, package, provider, and other deliberately requested traffic also produces standard request metadata at the receiving service.
 
-### Does my data stay on my VPS?
-Yes. Your portal data, files, projects, and local services stay on your server. If you connect external AI providers, model requests still go to the provider you chose.
+## Windows test drive (WSL 2 beta)
 
-### What does the installer set up automatically?
-The installer sets up the portal app, OpenClaw, PostgreSQL, Caddy, and the main system services. The browser setup flow then handles your admin account, provider connection, and domain/SSL steps.
+BridgesLLM Portal is VPS-first. Windows users can test it locally through WSL 2, but this path is experimental, currently untested in the field, and not a production deployment target.
 
-## 🔒 Security
+Recommended Windows Terminal bootstrapper:
 
-- **HTTPS everywhere** — automatic Let's Encrypt SSL with HSTS, CSP, and strict security headers
-- **Sandboxed code execution** — each project runs in an isolated Docker container with filesystem restrictions
-- **Path traversal protection** — dedicated middleware blocks directory escapes, symlink attacks, and system path access
-- **Role-based access control** — Owner, Admin, User, and Viewer roles with account approval workflow
-- **JWT authentication** — short-lived access tokens, no query-parameter auth
-- **Firewall by default** — UFW configured during install; only SSH, HTTP, and HTTPS exposed
-- **Malware scanning** — uploaded files scanned with ClamAV before storage
-- **Mail server isolation** — Stalwart locked to loopback interface, not exposed as an open relay
-- **Shell-escape enforcement** — all user-influenced parameters are properly escaped before reaching shell commands
+```powershell
+irm https://raw.githubusercontent.com/BridgesLLM-ai/portal/main/installer/install-windows.ps1 | iex
+```
 
-For the full security policy, see [SECURITY.md](SECURITY.md).
+If Ubuntu WSL is already ready:
 
-## 📋 Roadmap
+```powershell
+wsl -u root -- bash -lc "curl -fsSL https://bridgesllm.ai/install.sh | bash -s -- --local"
+```
 
-- [ ] **Chat reliability hardening** — survive hard refresh, tab close, and reconnect without losing streamed content or showing stale state
-- [ ] **Clean chat output** — strip internal tool noise, approval artifacts, and system metadata from agent responses so conversations read like conversations
-- [ ] **Full OpenClaw feature parity** — surface all OpenClaw capabilities (FYI mode, tool approval workflows, new agent features) as they ship upstream
-- [ ] **Agent management UI** — create, edit, configure, and delete agents directly from the Agent Tools page
-- [ ] **GitHub integration** — push/pull from the project panel
-- [ ] **Team collaboration** — multi-user project sharing and permissions
-- [ ] **Email polish** — forwarding rules, HTML signatures, folder management
-- [ ] **Mobile-optimized UI** — responsive layouts for phone and tablet
+Then open `http://localhost:4001` in Windows. Public hosting, custom-domain HTTPS, and internet-facing share links remain VPS features. See [docs/WINDOWS_WSL_BETA.md](docs/WINDOWS_WSL_BETA.md) for caveats and setup details.
 
-## 🤝 Contributing
+## Security
 
-Contributions welcome! Please open an issue first to discuss significant changes.
+- **Secure bootstrap** — HTTPS or an explicit localhost tunnel, with single-use, expiring bootstrap credentials
+- **Attested Project isolation** — immutable actor/project identity, exact runtime policy, one writable mount, and no host fallback
+- **Controlled public egress** — supported public web/Git/package access without private, metadata, Docker, or host-network reachability
+- **Path and content protection** — canonical containment, bounded archives/uploads, isolated active app content, and fail-closed malware-scan errors
+- **Role-based access control** — Owner, root-equivalent Sub-Admin, User, and Viewer roles with account approval states
+- **Signed rollback-safe updates** — manifest/content binding, runtime inventory, migrations, postflight, and deploy provenance
+- **Least-exposed services** — internal APIs, database, browser control, Remote Desktop, and app backends stay loopback-only unless a documented public protocol requires exposure
 
-1. Fork the repo
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+Security boundaries depend on supported host capabilities and correct operator configuration. Review [SECURITY.md](SECURITY.md) for the security policy and reporting process.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for full details.
+## Roadmap
 
-## 📄 License
+- [ ] 4.1: retire multi-user accounts only after their sessions, projects, files, apps, shares, and runtime state can be removed or reassigned transactionally
+- [ ] 4.1: strengthen Complete wipe with positive residue proof beyond the recorded managed paths
+- [ ] Add exact-conversation navigation and a durable notification history for pending agent questions
+- [ ] Qualify more Project Chat providers against the same filesystem and public-egress escape matrix
+- [ ] Mature the Windows/WSL preview into a supported local-install profile
+- [ ] Expand reproducible browser, mobile, long-turn, and low-spec performance qualification
+
+## Contributing
+
+Contributions are welcome. Please open an issue before substantial changes so the design and security boundary can be discussed first.
+
+1. Fork the repository.
+2. Create a feature branch.
+3. Make and test the change.
+4. Push the branch to your fork.
+5. Open a pull request.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
+## License
 
 MIT License — see [LICENSE](LICENSE).
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-- [OpenClaw](https://github.com/openclaw/openclaw) — the agent framework powering intelligent features
-- [Anthropic](https://anthropic.com), [OpenAI](https://openai.com), [Google](https://ai.google.dev) — AI providers
-- [Caddy](https://caddyserver.com) — automatic HTTPS reverse proxy
+- [OpenClaw](https://github.com/openclaw/openclaw) — agent framework
+- [Anthropic](https://anthropic.com), [OpenAI](https://openai.com), and [Google](https://ai.google.dev) — AI providers
+- [Caddy](https://caddyserver.com) — HTTPS reverse proxy
 - [Stalwart](https://stalw.art) — mail server
 - [NoVNC](https://novnc.com) — browser-based VNC client
 

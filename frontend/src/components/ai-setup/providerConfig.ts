@@ -1,6 +1,13 @@
 export type ProviderTier = 1 | 2 | 3;
-export type ProviderAuthType = 'api_key' | 'oauth' | 'setup_token' | 'device_code' | 'native_cli';
+export type ProviderAuthType = 'api_key' | 'token' | 'oauth' | 'setup_token' | 'device_code' | 'native_cli' | 'aws_sdk';
 export type ModelTier = 'frontier' | 'balanced' | 'fast';
+
+export interface ProviderAuthOption {
+  type: ProviderAuthType;
+  label: string;
+  description: string;
+  recommended?: boolean;
+}
 
 export interface ProviderInstruction {
   stepNumber: number;
@@ -18,12 +25,25 @@ export interface ProviderModelPreset {
   description: string;
 }
 
+export type ProviderGuidedSetup =
+  | {
+    status: 'available';
+    authTypes: ProviderAuthType[];
+  }
+  | {
+    status: 'manual';
+    reason: string;
+    action: { url: string; label: string };
+  };
+
 export interface ProviderUIConfig {
   id: string;
   name: string;
   tier: ProviderTier;
   icon: string;
   primaryAuthType: ProviderAuthType;
+  guidedSetup: ProviderGuidedSetup;
+  authOptions?: ProviderAuthOption[];
   keyPlaceholder?: string;
   consoleUrl: string;
   signupUrl: string;
@@ -38,521 +58,112 @@ export interface ProviderUIConfig {
   };
   setupInstructions: ProviderInstruction[];
   defaultModels: ProviderModelPreset[];
-  onboardingNotes?: {
-    intro?: string;
-    exactGoal?: string;
-    expectedConfusions?: string[];
-    callbackLabel?: string;
-    callbackExample?: string;
-    afterLoginLabel?: string;
-  };
 }
 
-export const PROVIDERS: ProviderUIConfig[] = [
-  {
-    id: 'anthropic',
-    name: 'Claude (OpenClaw)',
-    tier: 1,
-    icon: 'sparkles',
-    primaryAuthType: 'setup_token',
-    keyPlaceholder: 'Paste Claude setup-token',
-    consoleUrl: 'https://docs.anthropic.com/en/docs/claude-code',
-    signupUrl: 'https://claude.ai/',
-    pricingNote: 'Requires a Claude plan plus Anthropic Extra Usage for OpenClaw-driven requests. Anthropic is currently advertising discounted Extra Usage bundles (about 30% off).',
-    freeTier: null,
-    description: 'Connect Claude to OpenClaw with the normal setup-token flow. Anthropic now bills OpenClaw traffic through Extra Usage instead of the included subscription pool.',
-    dangerNote: {
-      title: 'Extra Usage required',
-      detail: 'Anthropic now treats OpenClaw-driven Claude requests as Extra Usage. This path is only usable if Extra Usage is turned on for the Claude account, and you may need to purchase an Anthropic Extra Usage bundle first. Anthropic is currently advertising discounted bundles at roughly 30% off.',
-      compactDetail: 'Requires Anthropic Extra Usage + bundle purchase.',
-      link: { url: 'https://claude.ai/settings/usage', label: 'Open Claude Usage Settings' },
-    },
-    setupInstructions: [
-      { stepNumber: 1, title: 'Confirm your Claude plan', detail: 'You still need an active Claude plan on the Anthropic account you will use for setup.' },
-      { stepNumber: 2, title: 'Turn on Extra Usage', detail: 'Open Claude billing/usage settings and enable Extra Usage before connecting Claude to OpenClaw.', link: { url: 'https://claude.ai/settings/usage', label: 'Open Claude Usage Settings' } },
-      { stepNumber: 3, title: 'Buy the discounted bundle if Anthropic prompts for it', detail: 'Anthropic is currently advertising discounted Extra Usage bundles (about 30% off). If your account is capped, buy the bundle first so OpenClaw requests can run.' },
-      { stepNumber: 4, title: 'Start Claude setup through OpenClaw', detail: 'Use the portal flow below, or run Claude setup-token manually and paste the token back here. The direct OpenClaw path is the main setup path again.' },
-      { stepNumber: 5, title: 'Pick your default Claude model', detail: 'Choose Opus, Sonnet, or Haiku. OpenClaw will keep normal Anthropic model IDs for runtime use.' },
-    ],
-    defaultModels: [
-      { id: 'anthropic/claude-fable-5', name: 'Claude Fable 5', tier: 'frontier', description: 'Anthropic\'s most capable model. Always-on adaptive thinking; restricted requests may be served and billed as Opus 4.8.' },
-      { id: 'anthropic/claude-opus-4-8', name: 'Claude Opus 4.8', tier: 'frontier', description: 'Frontier Claude model for complex reasoning and difficult tasks.' },
-      { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6', tier: 'balanced', description: 'Proven all-round default for most users.' },
-      { id: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', tier: 'fast', description: 'Fastest and lowest-cost Claude model.' },
-    ],
-    onboardingNotes: {
-      intro: 'Best path here is the direct OpenClaw Claude setup flow again. It still works, but Anthropic treats OpenClaw-driven Claude requests as Extra Usage rather than included subscription-only usage.',
-      exactGoal: 'Enable Anthropic Extra Usage first, then connect Claude to OpenClaw and choose a default model.',
-      expectedConfusions: [
-        'Claude subscription alone is no longer enough for OpenClaw-driven Claude traffic.',
-        'OpenClaw Claude setup now means the direct setup-token flow, not a server Claude CLI bridge.',
-        'You can use the portal\'s automated Claude flow or paste a setup-token manually; both are still OpenClaw paths.'
-      ],
-      callbackLabel: 'Paste the full Claude setup-token',
-      callbackExample: 'Paste the entire token string exactly as Claude Code prints it',
-      afterLoginLabel: 'If you use the manual setup-token path, paste the whole token exactly as Claude Code prints it.'
-    },
-  },
-  {
-    id: 'openai',
-    name: 'OpenAI (GPT)',
-    tier: 1,
-    icon: 'cpu',
-    primaryAuthType: 'api_key',
-    keyPlaceholder: 'sk-proj-...',
-    consoleUrl: 'https://platform.openai.com/settings/organization/api-keys',
-    signupUrl: 'https://platform.openai.com/signup',
-    pricingNote: 'Pay-per-token pricing. Broad GPT model ecosystem.',
-    freeTier: '$5 trial credit for many new accounts',
-    description: 'GPT models for general-purpose chat, tools, and multimodal tasks.',
-    setupInstructions: [
-      { stepNumber: 1, title: 'Create an OpenAI account', detail: 'Sign in or create an account on the OpenAI Platform.' , link: { url: 'https://platform.openai.com/signup', label: 'Open OpenAI Platform' } },
-      { stepNumber: 2, title: 'Open API Keys', detail: 'In the left sidebar, open API Keys.' },
-      { stepNumber: 3, title: 'Create a secret key', detail: 'Click Create new secret key, name it, and leave permissions broad unless you have a reason to restrict them.' },
-      { stepNumber: 4, title: 'Copy the key', detail: 'Copy the new key immediately. OpenAI only shows it once.', note: 'Most OpenAI keys begin with sk- or sk-proj-' },
-      { stepNumber: 5, title: 'Paste it below', detail: 'Return here, paste the key, validate it, and select the GPT model you want as your default.' },
-    ],
-    defaultModels: [
-      { id: 'openai/gpt-4o', name: 'GPT-4o', tier: 'frontier', description: 'Most capable general OpenAI model.' },
-      { id: 'openai/gpt-4o-mini', name: 'GPT-4o Mini', tier: 'balanced', description: 'Fast and affordable default choice.' },
-    ],
-  },
-  {
-    id: 'openai-codex',
-    name: 'OpenAI Codex (ChatGPT Subscription)',
-    tier: 1,
-    icon: 'wand',
-    primaryAuthType: 'oauth',
-    consoleUrl: 'https://chatgpt.com/',
-    signupUrl: 'https://chatgpt.com/',
-    pricingNote: 'Uses your existing ChatGPT subscription instead of per-token billing.',
-    freeTier: 'Requires paid ChatGPT subscription',
-    description: 'Use ChatGPT Plus/Pro/Team credentials through OAuth.',
-    setupInstructions: [
-      { stepNumber: 1, title: 'Confirm your subscription', detail: 'You need ChatGPT Plus, Pro, or Team. Free accounts do not work.' },
-      { stepNumber: 2, title: 'Start sign-in', detail: 'Click the sign-in button here to open the OpenAI authorization page.' },
-      { stepNumber: 3, title: 'Complete the provider login', detail: 'Log in with the same OpenAI account you use for ChatGPT.' },
-      { stepNumber: 4, title: 'Copy the redirect URL', detail: 'After login, your browser will land on a localhost callback URL that may fail to load. Copy the full address bar URL.' },
-      { stepNumber: 5, title: 'Paste the redirect URL back here', detail: 'Return to the portal and paste the full callback URL to complete sign-in.' },
-    ],
-    defaultModels: [
-      { id: 'openai/gpt-5.6-sol', name: 'GPT-5.6 Sol', tier: 'frontier', description: 'Recommended GPT-5.6 tier and OpenClaw\'s fresh-setup default. Requires GPT-5.6 access on your ChatGPT account.' },
-      { id: 'openai/gpt-5.6-terra', name: 'GPT-5.6 Terra', tier: 'balanced', description: 'Alternate GPT-5.6 tier. Availability depends on your ChatGPT plan.' },
-      { id: 'openai/gpt-5.6-luna', name: 'GPT-5.6 Luna', tier: 'balanced', description: 'Alternate GPT-5.6 tier with maximum-effort thinking. Availability depends on your ChatGPT plan.' },
-      { id: 'openai/gpt-5.5', name: 'GPT-5.5', tier: 'fast', description: 'Proven Codex runtime model. Choose this if your account does not have GPT-5.6 access.' },
-    ],
-    onboardingNotes: {
-      intro: 'This connects the portal to your existing paid ChatGPT account. You are not creating an API key and you are not paying per-token through the developer platform.',
-      exactGoal: 'Log into OpenAI in a new tab, then copy the final localhost redirect URL back into the portal so the server can finish linking your subscription.',
-      expectedConfusions: [
-        'The localhost page may fail to load at the end. That is normal.',
-        'You must copy the full final URL from the address bar, not just part of it.',
-        'Free OpenAI accounts do not work for this subscription OAuth path.'
-      ],
-      callbackLabel: 'Paste the full OpenAI localhost redirect URL',
-      callbackExample: 'http://localhost:1455/auth/callback?code=...&state=...',
-      afterLoginLabel: 'After OpenAI login finishes, copy the entire address bar URL from the page that opens.'
-    },
-  },
-  {
-    id: 'google-gemini-cli',
-    name: 'Google Gemini CLI (OpenClaw)',
-    tier: 1,
-    icon: 'terminal',
-    primaryAuthType: 'oauth',
-    consoleUrl: 'https://gemini.google.com/',
-    signupUrl: 'https://gemini.google.com/',
-    pricingNote: 'Uses Gemini CLI OAuth through OpenClaw. This is an unofficial Google integration.',
-    freeTier: 'Depends on your Google Gemini plan/account',
-    description: 'Use OpenClaw\'s bundled Gemini CLI backend with Google OAuth. This is separate from the native Antigravity path.',
-    dangerNote: {
-      title: 'Unofficial Google OAuth path',
-      detail: 'OpenClaw docs warn that Gemini CLI OAuth is unofficial and some users have reported Google account restrictions after third-party clients. Use a non-critical Google account if you are risk-sensitive.',
-      compactDetail: 'Unofficial OAuth path; account risk is possible.',
-    },
-    setupInstructions: [
-      { stepNumber: 1, title: 'Confirm Gemini CLI is installed', detail: 'The server needs the gemini binary available on PATH before OpenClaw can run this backend.' },
-      { stepNumber: 2, title: 'Start Gemini CLI sign-in', detail: 'Click the sign-in button here to start OpenClaw\'s Gemini CLI OAuth flow.' },
-      { stepNumber: 3, title: 'Authorize with Google', detail: 'Use the Google account tied to the Gemini access you want the portal to use.' },
-      { stepNumber: 4, title: 'Copy the localhost callback URL', detail: 'After Google redirects to localhost, copy the full URL from the browser address bar and paste it back here.' },
-    ],
-    defaultModels: [
-      { id: 'google-gemini-cli/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', tier: 'frontier', description: 'Highest-capability Gemini CLI model currently normalized by OpenClaw.' },
-      { id: 'google-gemini-cli/gemini-3-flash-preview', name: 'Gemini 3 Flash Preview', tier: 'balanced', description: 'OpenClaw\'s default Gemini CLI model.' },
-      { id: 'google-gemini-cli/gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', tier: 'fast', description: 'Fastest Gemini CLI preset exposed by OpenClaw.' },
-    ],
-    onboardingNotes: {
-      intro: 'This uses Google Gemini through OpenClaw\'s Gemini CLI backend. It is the OpenClaw path, not the native Antigravity CLI flow.',
-      exactGoal: 'Authorize Gemini CLI with Google, then paste the final localhost callback URL so OpenClaw can store the provider auth profile.',
-      expectedConfusions: [
-        'This is separate from Google AI Studio API keys.',
-        'This is also separate from Antigravity, which keeps its own native CLI credentials.',
-        'The final localhost callback page may fail to load. Copy the full address bar URL anyway.',
-        'OpenClaw docs describe this OAuth route as unofficial, so avoid using a critical Google account if that risk matters.'
-      ],
-      callbackLabel: 'Paste the full Google localhost callback URL',
-      callbackExample: 'http://localhost:8085/oauth2callback?code=...&state=...',
-      afterLoginLabel: 'After Google login finishes, copy the entire localhost callback URL from the address bar.'
-    },
-  },
-  {
-    id: 'google-antigravity',
-    name: 'Google Antigravity',
-    tier: 1,
-    icon: 'globe',
-    primaryAuthType: 'native_cli',
-    consoleUrl: 'https://gemini.google.com/',
-    signupUrl: 'https://gemini.google.com/',
-    pricingNote: 'Uses your Google/Gemini subscription through the Antigravity CLI on the server.',
-    freeTier: 'Depends on your Google Gemini plan/account',
-    description: 'Use Google Antigravity as the native Gemini coding agent. This replaces the older Gemini CLI OAuth path.',
-    dangerNote: {
-      title: 'Not fully supported for now',
-      detail: 'OpenClaw Antigravity OAuth is not fully supported for now. Use the native Antigravity flow while upstream support comes downstream.',
-      compactDetail: 'Not fully supported for now.',
-    },
-    setupInstructions: [
-      { stepNumber: 1, title: 'Start Antigravity sign-in', detail: 'Click the sign-in button here to start the server-side Antigravity login flow.' },
-      { stepNumber: 2, title: 'Open the Google authorization link', detail: 'The portal will open Google sign-in in a new tab. Use the Google account tied to your Gemini plan.' },
-      { stepNumber: 3, title: 'Copy the authorization code', detail: 'After Google approves the request, copy the authorization code shown by the flow.' },
-      { stepNumber: 4, title: 'Paste the code back here', detail: 'Return to the portal and paste the authorization code so Antigravity can finish signing in on the server.' },
-    ],
-    defaultModels: [
-      { id: 'google-antigravity/gemini-3.1-pro-high', name: 'Gemini 3.1 Pro High', tier: 'frontier', description: 'Highest-capability Gemini model currently reported by Antigravity.' },
-      { id: 'google-antigravity/gemini-3.5-flash', name: 'Gemini 3.5 Flash', tier: 'balanced', description: 'Fast default Gemini model for most Antigravity tasks.' },
-      { id: 'google-antigravity/gemini-3.5-flash-low', name: 'Gemini 3.5 Flash Low', tier: 'fast', description: 'Fastest Antigravity Gemini option.' },
-    ],
-    onboardingNotes: {
-      intro: 'This uses your Google/Gemini account through Antigravity on the server. It is the subscription-style path, not the Google AI Studio API-key path.',
-      exactGoal: 'Authorize Antigravity with Google, then paste the authorization code back here so the server-side CLI can finish signing in.',
-      expectedConfusions: [
-        'You are not supposed to generate an API key for this flow.',
-        'This is separate from OpenClaw provider OAuth. Antigravity keeps its own server-side credentials.',
-        'The old Gemini CLI OAuth path is legacy and is not the supported setup path anymore.',
-        'If Google asks you to approve access, continue with the same Google account you want the portal to use.'
-      ],
-      callbackLabel: 'Paste the Google authorization code',
-      callbackExample: '4/0AfJohX...',
-      afterLoginLabel: 'When Google finishes, copy the authorization code and paste it back here.'
-    },
-  },
-  {
-    id: 'google',
-    name: 'Google Gemini API Key',
-    tier: 2,
-    icon: 'globe',
-    primaryAuthType: 'api_key',
-    keyPlaceholder: 'AIzaSy...',
-    consoleUrl: 'https://aistudio.google.com/apikey',
-    signupUrl: 'https://aistudio.google.com/',
-    pricingNote: 'Google AI Studio API key flow. Better for API/billing-based usage than subscription login.',
-    freeTier: 'Free requests daily for Gemini Flash/Pro tiers',
-    description: 'Advanced/API path using a Google AI Studio key instead of your subscription login.',
-    setupInstructions: [
-      { stepNumber: 1, title: 'Open Google AI Studio', detail: 'Go to the API keys page and sign in with a Google account.', link: { url: 'https://aistudio.google.com/apikey', label: 'Open Google AI Studio' } },
-      { stepNumber: 2, title: 'Create API key', detail: 'Click Create API key. If asked for a project, choose an existing project or let Google create one automatically.' },
-      { stepNumber: 3, title: 'Copy the key', detail: 'Copy the generated key. Gemini keys usually begin with AIza.' },
-      { stepNumber: 4, title: 'Paste and validate', detail: 'Paste the key here, validate it, then pick a Gemini model.' },
-    ],
-    defaultModels: [
-      { id: 'google/gemini-2.5-pro', name: 'Gemini 2.5 Pro', tier: 'frontier', description: 'Best capability and context window.' },
-      { id: 'google/gemini-2.5-flash', name: 'Gemini 2.5 Flash', tier: 'balanced', description: 'Fast and inexpensive/free-tier friendly.' },
-    ],
-  },
-  {
-    id: 'openrouter',
-    name: 'OpenRouter',
-    tier: 1,
-    icon: 'network',
-    primaryAuthType: 'api_key',
-    keyPlaceholder: 'sk-or-v1-...',
-    consoleUrl: 'https://openrouter.ai/settings/keys',
-    signupUrl: 'https://openrouter.ai/',
-    pricingNote: 'One key for many providers and models. Flexible, broad model access.',
-    freeTier: 'Some free models available',
-    description: 'Best flexibility if you want many model families through one API key.',
-    setupInstructions: [
-      { stepNumber: 1, title: 'Create an OpenRouter account', detail: 'Sign up with email, GitHub, or Google.', link: { url: 'https://openrouter.ai/', label: 'Open OpenRouter' } },
-      { stepNumber: 2, title: 'Open Keys', detail: 'In settings, open the Keys page.' },
-      { stepNumber: 3, title: 'Create a key', detail: 'Create a new key and copy it.', note: 'OpenRouter keys begin with sk-or-' },
-      { stepNumber: 4, title: 'Paste and validate', detail: 'Paste the key here and choose the model you want to default to.' },
-    ],
-    defaultModels: [
-      { id: 'openrouter/anthropic/claude-sonnet-4-6', name: 'Claude Sonnet via OpenRouter', tier: 'balanced', description: 'Good default if you want Claude through OpenRouter.' },
-      { id: 'openrouter/google/gemini-2.5-flash', name: 'Gemini Flash via OpenRouter', tier: 'fast', description: 'Fast OpenRouter fallback.' },
-      { id: 'openrouter/moonshotai/kimi-k2', name: 'Kimi K2 via OpenRouter', tier: 'frontier', description: 'Strong alternate frontier model.' },
-    ],
-  },
-  {
-    id: 'xai',
-    name: 'xAI (Grok)',
-    tier: 2,
-    icon: 'zap',
-    primaryAuthType: 'api_key',
-    keyPlaceholder: 'xai-...',
-    consoleUrl: 'https://console.x.ai/',
-    signupUrl: 'https://console.x.ai/',
-    pricingNote: 'API access to Grok/xAI models.',
-    freeTier: '$25 credit for some new accounts',
-    description: 'xAI provider path for Grok models.',
-    setupInstructions: [
-      { stepNumber: 1, title: 'Open xAI Console', detail: 'Sign in and open the API key section.', link: { url: 'https://console.x.ai/', label: 'Open xAI Console' } },
-      { stepNumber: 2, title: 'Create an API key', detail: 'Generate a key and copy it.' },
-      { stepNumber: 3, title: 'Paste and validate', detail: 'Paste the key here and validate it before saving.' },
-    ],
-    defaultModels: [],
-  },
-  {
-    id: 'mistral',
-    name: 'Mistral AI',
-    tier: 2,
-    icon: 'wind',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://console.mistral.ai/api-keys',
-    signupUrl: 'https://console.mistral.ai/',
-    pricingNote: 'Competitive token pricing for Mistral models.',
-    freeTier: null,
-    description: 'Direct Mistral API access.',
-    setupInstructions: [
-      { stepNumber: 1, title: 'Open Mistral Console', detail: 'Sign in, add billing if required, and open API keys.', link: { url: 'https://console.mistral.ai/api-keys', label: 'Open Mistral API Keys' } },
-      { stepNumber: 2, title: 'Create a key', detail: 'Generate and copy a new API key.' },
-      { stepNumber: 3, title: 'Paste and validate', detail: 'Paste the key here, validate it, and save it.' },
-    ],
-    defaultModels: [],
-  },
-  {
-    id: 'groq',
-    name: 'Groq',
-    tier: 2,
-    icon: 'rocket',
-    primaryAuthType: 'api_key',
-    keyPlaceholder: 'gsk_...',
-    consoleUrl: 'https://console.groq.com/keys',
-    signupUrl: 'https://console.groq.com/',
-    pricingNote: 'Very fast inference. Good for latency-sensitive tasks.',
-    freeTier: 'Free tier available',
-    description: 'Groq-hosted open-source and partner models.',
-    setupInstructions: [
-      { stepNumber: 1, title: 'Open Groq Console', detail: 'Sign in and go to API Keys.', link: { url: 'https://console.groq.com/keys', label: 'Open Groq Keys' } },
-      { stepNumber: 2, title: 'Create key', detail: 'Create a key and copy it.' },
-      { stepNumber: 3, title: 'Paste and validate', detail: 'Paste it here and validate before saving.' },
-    ],
-    defaultModels: [],
-  },
-  {
-    id: 'together',
-    name: 'Together AI',
-    tier: 2,
-    icon: 'boxes',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://api.together.ai/settings/api-keys',
-    signupUrl: 'https://api.together.ai/',
-    pricingNote: 'Affordable access to many open-source model families.',
-    freeTier: '$5 credit for new accounts',
-    description: 'Together AI API for hosted OSS model access.',
-    setupInstructions: [
-      { stepNumber: 1, title: 'Open Together AI', detail: 'Sign in and go to API keys.', link: { url: 'https://api.together.ai/settings/api-keys', label: 'Open Together AI Keys' } },
-      { stepNumber: 2, title: 'Create key', detail: 'Create and copy the key.' },
-      { stepNumber: 3, title: 'Paste and validate', detail: 'Paste it here and validate it.' },
-    ],
-    defaultModels: [],
-  },
-  {
-    id: 'deepseek',
-    name: 'DeepSeek',
-    tier: 2,
-    icon: 'brain',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://platform.deepseek.com/api_keys',
-    signupUrl: 'https://platform.deepseek.com/',
-    pricingNote: 'Strong low-cost reasoning models.',
-    freeTier: 'Small free credit for some new accounts',
-    description: 'Direct DeepSeek API access.',
-    setupInstructions: [
-      { stepNumber: 1, title: 'Open DeepSeek Platform', detail: 'Sign in and open the API keys page.', link: { url: 'https://platform.deepseek.com/api_keys', label: 'Open DeepSeek Keys' } },
-      { stepNumber: 2, title: 'Create key', detail: 'Create and copy a key.' },
-      { stepNumber: 3, title: 'Paste and validate', detail: 'Paste it here and validate it.' },
-    ],
-    defaultModels: [],
-  },
-  {
-    id: 'opencode',
-    name: 'OpenCode',
-    tier: 2,
-    icon: 'code',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://opencode.ai',
-    signupUrl: 'https://opencode.ai',
-    pricingNote: 'Multi-provider key path for OpenCode / Zen.',
-    freeTier: null,
-    description: 'OpenCode API key path.',
-    setupInstructions: [
-      { stepNumber: 1, title: 'Open OpenCode', detail: 'Create an account and generate an API key if available on your plan.', link: { url: 'https://opencode.ai', label: 'Open OpenCode' } },
-      { stepNumber: 2, title: 'Copy the key', detail: 'Copy your generated key.' },
-      { stepNumber: 3, title: 'Paste and validate', detail: 'Paste the key here and validate it.' },
-    ],
-    defaultModels: [],
-  },
-  {
-    id: 'ollama',
-    name: 'Ollama (Local Models)',
-    tier: 2,
-    icon: 'server',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'http://127.0.0.1:11434',
-    signupUrl: 'http://127.0.0.1:11434',
-    pricingNote: 'No API key needed. Runs models on your own server.',
-    freeTier: 'Local-only',
-    description: 'Already handled by the existing local model controls below the wizard AI section.',
-    setupInstructions: [
-      { stepNumber: 1, title: 'Use the local model controls', detail: 'Ollama does not use an API key here. Use the existing local model controls in the wizard/settings UI.' },
-    ],
-    defaultModels: [],
-  },
-  {
-    id: 'amazon-bedrock',
-    name: 'Amazon Bedrock',
-    tier: 3,
-    icon: 'cloud',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://console.aws.amazon.com/bedrock/',
-    signupUrl: 'https://aws.amazon.com/bedrock/',
-    pricingNote: 'AWS-managed provider access.',
-    freeTier: null,
-    description: 'Advanced provider setup requiring AWS credentials and extra configuration.',
-    setupInstructions: [{ stepNumber: 1, title: 'Advanced setup', detail: 'Use the advanced provider path and follow AWS credential setup instructions.' }],
-    defaultModels: [],
-  },
-  {
-    id: 'huggingface',
-    name: 'Hugging Face',
-    tier: 3,
-    icon: 'bot',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://huggingface.co/settings/tokens',
-    signupUrl: 'https://huggingface.co/',
-    pricingNote: 'Inference API / hosted endpoints.',
-    freeTier: 'Some limited free access',
-    description: 'Advanced provider path for Hugging Face tokens.',
-    setupInstructions: [{ stepNumber: 1, title: 'Advanced setup', detail: 'Create a Hugging Face token and use the advanced provider path.' }],
-    defaultModels: [],
-  },
-  {
-    id: 'moonshot',
-    name: 'Moonshot / Kimi',
-    tier: 3,
-    icon: 'moon',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://platform.moonshot.ai/',
-    signupUrl: 'https://platform.moonshot.ai/',
-    pricingNote: 'Kimi / Moonshot API path.',
-    freeTier: null,
-    description: 'Advanced provider path for Moonshot/Kimi.',
-    setupInstructions: [{ stepNumber: 1, title: 'Advanced setup', detail: 'Create a Moonshot API key and use the advanced provider flow.' }],
-    defaultModels: [],
-  },
-  {
-    id: 'venice',
-    name: 'Venice AI',
-    tier: 3,
-    icon: 'shield',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://venice.ai/',
-    signupUrl: 'https://venice.ai/',
-    pricingNote: 'Advanced provider path.',
-    freeTier: null,
-    description: 'Advanced provider path for Venice AI.',
-    setupInstructions: [{ stepNumber: 1, title: 'Advanced setup', detail: 'Use the advanced provider path and supply your Venice API credentials.' }],
-    defaultModels: [],
-  },
-  {
-    id: 'cerebras',
-    name: 'Cerebras',
-    tier: 3,
-    icon: 'activity',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://cloud.cerebras.ai/',
-    signupUrl: 'https://cloud.cerebras.ai/',
-    pricingNote: 'Advanced provider path.',
-    freeTier: null,
-    description: 'Advanced provider path for Cerebras-hosted inference.',
-    setupInstructions: [{ stepNumber: 1, title: 'Advanced setup', detail: 'Use the advanced provider path and supply Cerebras credentials.' }],
-    defaultModels: [],
-  },
-  {
-    id: 'kilocode',
-    name: 'Kilo Gateway',
-    tier: 3,
-    icon: 'waypoints',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://kilocode.ai/',
-    signupUrl: 'https://kilocode.ai/',
-    pricingNote: 'Advanced provider path.',
-    freeTier: null,
-    description: 'Advanced provider path for Kilo Gateway.',
-    setupInstructions: [{ stepNumber: 1, title: 'Advanced setup', detail: 'Use the advanced provider path and supply your Kilo Gateway API key.' }],
-    defaultModels: [],
-  },
-  {
-    id: 'cloudflare-ai-gateway',
-    name: 'Cloudflare AI Gateway',
-    tier: 3,
-    icon: 'cloud-lightning',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://dash.cloudflare.com/',
-    signupUrl: 'https://dash.cloudflare.com/',
-    pricingNote: 'Advanced provider path requiring additional account and gateway identifiers.',
-    freeTier: null,
-    description: 'Advanced provider path for Cloudflare AI Gateway.',
-    setupInstructions: [{ stepNumber: 1, title: 'Advanced setup', detail: 'Use the advanced provider path and supply your API key, account ID, and gateway ID.' }],
-    defaultModels: [],
-  },
-  {
-    id: 'byteplus',
-    name: 'BytePlus',
-    tier: 3,
-    icon: 'package',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://console.byteplus.com/',
-    signupUrl: 'https://console.byteplus.com/',
-    pricingNote: 'Advanced provider path.',
-    freeTier: null,
-    description: 'Advanced provider path for BytePlus.',
-    setupInstructions: [{ stepNumber: 1, title: 'Advanced setup', detail: 'Use the advanced provider path and provide BytePlus credentials.' }],
-    defaultModels: [],
-  },
-  {
-    id: 'volcengine',
-    name: 'Volcengine',
-    tier: 3,
-    icon: 'package-2',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://console.volcengine.com/',
-    signupUrl: 'https://console.volcengine.com/',
-    pricingNote: 'Advanced provider path.',
-    freeTier: null,
-    description: 'Advanced provider path for Volcengine.',
-    setupInstructions: [{ stepNumber: 1, title: 'Advanced setup', detail: 'Use the advanced provider path and provide Volcengine credentials.' }],
-    defaultModels: [],
-  },
-  {
-    id: 'custom',
-    name: 'Custom / Self-hosted',
-    tier: 3,
-    icon: 'settings',
-    primaryAuthType: 'api_key',
-    consoleUrl: 'https://docs.openclaw.ai',
-    signupUrl: 'https://docs.openclaw.ai',
-    pricingNote: 'Advanced provider path for custom OpenAI/Anthropic-compatible endpoints.',
-    freeTier: null,
-    description: 'Custom provider path for self-hosted or compatibility-layer endpoints.',
-    setupInstructions: [{ stepNumber: 1, title: 'Advanced setup', detail: 'Use the advanced provider path and provide the base URL, compatibility type, and model ID.' }],
-    defaultModels: [],
-  },
-];
+const AUTH_TYPES = new Set<ProviderAuthType>([
+  'api_key',
+  'token',
+  'oauth',
+  'setup_token',
+  'device_code',
+  'native_cli',
+  'aws_sdk',
+]);
+const MODEL_TIERS = new Set<ModelTier>(['frontier', 'balanced', 'fast']);
 
-export const PROVIDER_MAP = new Map(PROVIDERS.map((provider) => [provider.id, provider]));
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
 
-export function getProviderConfig(providerId: string) {
-  return PROVIDER_MAP.get(providerId) || null;
+function hasText(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isProviderModel(value: unknown): value is ProviderModelPreset {
+  return isRecord(value)
+    && hasText(value.id)
+    && value.id.includes('/')
+    && hasText(value.name)
+    && typeof value.tier === 'string'
+    && MODEL_TIERS.has(value.tier as ModelTier)
+    && hasText(value.description);
+}
+
+function isProviderInstruction(value: unknown): value is ProviderInstruction {
+  return isRecord(value)
+    && Number.isInteger(value.stepNumber)
+    && Number(value.stepNumber) > 0
+    && hasText(value.title)
+    && hasText(value.detail);
+}
+
+function isProviderGuidedSetup(value: unknown): value is ProviderGuidedSetup {
+  if (!isRecord(value) || typeof value.status !== 'string') return false;
+  if (value.status === 'available') {
+    return Array.isArray(value.authTypes)
+      && value.authTypes.length > 0
+      && new Set(value.authTypes).size === value.authTypes.length
+      && value.authTypes.every((authType) => (
+        typeof authType === 'string' && AUTH_TYPES.has(authType as ProviderAuthType)
+      ));
+  }
+  return value.status === 'manual'
+    && hasText(value.reason)
+    && isRecord(value.action)
+    && hasText(value.action.url)
+    && hasText(value.action.label);
+}
+
+function isProvider(value: unknown): value is ProviderUIConfig {
+  if (!isRecord(value)) return false;
+  if (!hasText(value.id) || !/^[a-z0-9-]+$/.test(value.id)) return false;
+  if (!hasText(value.name) || !hasText(value.icon)) return false;
+  if (value.tier !== 1 && value.tier !== 2 && value.tier !== 3) return false;
+  if (typeof value.primaryAuthType !== 'string' || !AUTH_TYPES.has(value.primaryAuthType as ProviderAuthType)) return false;
+  const guidedSetup = value.guidedSetup;
+  if (!isProviderGuidedSetup(guidedSetup)) return false;
+  if (
+    guidedSetup.status === 'available'
+    && !guidedSetup.authTypes.includes(value.primaryAuthType as ProviderAuthType)
+  ) return false;
+  if (!hasText(value.consoleUrl) || !hasText(value.signupUrl)) return false;
+  if (!hasText(value.pricingNote) || !hasText(value.description)) return false;
+  if (!(value.freeTier === null || typeof value.freeTier === 'string')) return false;
+  if (!Array.isArray(value.setupInstructions) || !value.setupInstructions.every(isProviderInstruction)) return false;
+  if (!Array.isArray(value.defaultModels) || !value.defaultModels.every(isProviderModel)) return false;
+  if (value.authOptions !== undefined) {
+    if (!Array.isArray(value.authOptions) || !value.authOptions.every((option) => (
+      isRecord(option)
+      && typeof option.type === 'string'
+      && AUTH_TYPES.has(option.type as ProviderAuthType)
+      && hasText(option.label)
+      && hasText(option.description)
+    ))) return false;
+    if (
+      guidedSetup.status !== 'available'
+      || !value.authOptions.every((option) => guidedSetup.authTypes.includes(option.type as ProviderAuthType))
+    ) return false;
+  }
+  return true;
+}
+
+/** Parse the server-owned catalog and fail loudly on drift or malformed rows. */
+export function parseProviderCatalog(payload: unknown): ProviderUIConfig[] {
+  if (!isRecord(payload) || payload.source !== 'backend' || !Array.isArray(payload.providers)) {
+    throw new Error('Provider catalog response is malformed');
+  }
+  const providers: ProviderUIConfig[] = [];
+  const seen = new Set<string>();
+  for (const row of payload.providers) {
+    if (!isProvider(row)) throw new Error('Provider catalog contains an invalid provider');
+    if (seen.has(row.id)) throw new Error(`Provider catalog contains duplicate provider ${row.id}`);
+    seen.add(row.id);
+    providers.push(row);
+  }
+  if (providers.length === 0) throw new Error('Provider catalog is empty');
+  return providers;
+}
+
+export function getProviderConfig(providers: readonly ProviderUIConfig[], providerId: string) {
+  return providers.find((provider) => provider.id === providerId) || null;
 }

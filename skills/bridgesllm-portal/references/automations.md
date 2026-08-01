@@ -1,64 +1,54 @@
-# Automations
+# Automations and durable Tasks
 
-Scheduled agent tasks via OpenClaw cron. Managed from Agent Tools → Automations tab.
+## Automations
 
-## How It Works
+Automations are OpenClaw cron jobs managed through /api/automations and Agent Tools. They run outside the current conversation, so each job needs complete instructions and an explicit delivery plan.
 
-Portal creates OpenClaw cron jobs that run agent prompts on a schedule. Each automation:
-1. Fires at the configured time/interval
-2. Sends a prompt to an isolated agent session
-3. Agent executes the task independently
-4. Results delivered via configured channel (or stored in run history)
+Before creating:
 
-## Backend API (`/api/automations/`)
+1. Read /api/automations/status and the current job list.
+2. Resolve the desired agent and exact model from live capability/catalog data.
+3. Confirm timezone and whether the schedule is interval, hourly, daily, weekly, one-shot, or custom cron.
+4. Make the prompt self-contained and idempotent.
+5. Decide where results should go and whether delivery failure is fatal.
 
-All routes require admin auth.
+Do not embed a hardcoded “cheap” model alias. Model availability and pricing change; use a currently supported exact ID or let the configured agent default apply.
 
-- `GET /` — List all automations (calls `openclaw cron list --json`)
-- `POST /` — Create automation
-- `PUT /<id>` — Update automation
-- `DELETE /<id>` — Delete automation
-- `POST /<id>/run` — Trigger immediately
-- `GET /<id>/runs` — Get run history
+Useful routes:
 
-### Create/Update Payload
+- GET /api/automations
+- POST /api/automations
+- GET /api/automations/:id
+- PUT /api/automations/:id
+- POST /api/automations/:id/toggle
+- POST /api/automations/:id/run
+- GET /api/automations/:id/runs
+- DELETE /api/automations/:id
 
-```json
-{
-  "name": "Daily email summary",
-  "message": "Check for new emails and summarize anything important",
-  "agent": "main",
-  "model": "haiku",
-  "thinking": "none",
-  "scheduleType": "daily",
-  "time": "09:00",
-  "tz": "America/New_York",
-  "disabled": false
-}
-```
+Creation/update validates schedule shape, timezone, prompt, delivery URL, timeout, model, and thinking fields. Re-read the stored job after mutation.
 
-**Schedule types:**
-- `interval` — Every N minutes/hours (`interval: "30m"` or `"2h"`)
-- `hourly` — Every hour at :00
-- `daily` — Once per day at specified `time`
-- `weekly` — Once per week at specified `time` + `dayOfWeek` (0=Sun)
-- `custom` — Raw cron expression (`schedule: "*/15 * * * *"`)
+A manual run is a real external action. Do not repeat it merely because the response or delivery is slow. Inspect run history first.
 
-## OpenClaw Cron Integration
+## Durable Tasks/jobs
 
-Portal wraps the OpenClaw cron system. Under the hood:
-- `scheduleType: "interval"` → `schedule.kind: "every"` with `everyMs`
-- `scheduleType: "daily"` → `schedule.kind: "cron"` with `expr: "0 9 * * *"`
-- `scheduleType: "custom"` → `schedule.kind: "cron"` with raw expression
-- All jobs use `sessionTarget: "isolated"` + `payload.kind: "agentTurn"`
+Operator jobs live under /api/agent-jobs. They back installs, maintenance, and long host commands.
 
-## Transient Error Handling
+- POST /api/agent-jobs starts an approved tool/command.
+- GET /api/agent-jobs lists visible jobs.
+- GET /api/agent-jobs/:id/status reads durable state.
+- GET /api/agent-jobs/:id/transcript reads bounded output.
+- POST /api/agent-jobs/:id/input sends input to that job only.
+- POST /api/agent-jobs/:id/kill requests termination.
 
-The backend retries OpenClaw cron commands up to 3 times on transient gateway errors (connect failures, socket hang up, ECONNREFUSED). This handles brief gateway restarts.
+Do not identify a job by display text alone. Keep its durable ID, verify toolId/owner/status, and avoid concurrent jobs for a serialized maintenance tool.
 
-## Tips
+A task may survive browser disconnect or Portal restart. Reconnect to the existing job before creating another. Kill is idempotent but still disruptive; request it once and verify descendant cleanup.
 
-- Use `model: "haiku"` for lightweight periodic checks (saves tokens)
-- Use specific, actionable prompts — the agent runs in isolation without conversation context
-- Check run history to verify automations are working
-- Automations appear in the OpenClaw cron list and can also be managed via `openclaw cron` CLI
+## Scheduling guidance
+
+- Use timezone-aware schedules; never assume the server timezone.
+- Prefer a one-shot test run before enabling a recurring external mutation.
+- Include deduplication keys or “check before acting” language for sends, deploys, deletes, and purchases.
+- Bound runtime and output.
+- Review run history after the first scheduled execution.
+- If the gateway is temporarily unavailable, preserve the job and expose the failure; do not silently claim success.

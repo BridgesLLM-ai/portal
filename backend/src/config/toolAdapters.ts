@@ -1,3 +1,5 @@
+import { ANTIGRAVITY_NO_UPDATE_ENV, PORTAL_TOOL_VERSIONS } from './toolVersions';
+
 export type ToolTier = 1 | 2;
 
 export type ToolCommandPreset = {
@@ -19,6 +21,7 @@ export type ToolAdapter = {
   description: string;
   detect?: {
     command: string;
+    timeoutMs?: number;
   };
   install: ToolInstallStep[];
   commands: ToolCommandPreset[];
@@ -27,14 +30,15 @@ export type ToolAdapter = {
   tier: ToolTier;
 };
 
+export const FFMPEG_INSTALL_COMMAND =
+  'command -v apt-get >/dev/null 2>&1 && apt-get -o DPkg::Lock::Timeout=300 update -qq && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq ffmpeg';
+
 export const SAFE_INSTALL_ALLOWLIST = new Set<string>([
-  'command -v npm >/dev/null 2>&1 || { echo "npm is required. Install Node.js/npm and retry."; exit 1; }',
-  'npm list -g --depth=0 openclaw >/dev/null 2>&1 && echo "openclaw already installed" || npm install -g openclaw',
-  'command -v npm >/dev/null 2>&1 && npm install -g @anthropic-ai/claude-code',
-  'command -v npm >/dev/null 2>&1 && npm install -g @openai/codex',
-  'curl -fsSL https://ollama.ai/install.sh | sh',
-  'docker pull agent0ai/agent-zero && docker run -d -p 50001:80 --name agent-zero --restart unless-stopped agent0ai/agent-zero',
-  'curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin',
+  `command -v npm >/dev/null 2>&1 && npm install -g --no-audit --no-fund @anthropic-ai/claude-code@${PORTAL_TOOL_VERSIONS.claudeCode}`,
+  `command -v npm >/dev/null 2>&1 && npm install -g --no-audit --no-fund @openai/codex@${PORTAL_TOOL_VERSIONS.codexCli}`,
+  'bash /opt/bridgesllm/portal/installer/grok-build-runtime.sh converge',
+  'bash /opt/bridgesllm/portal/installer/antigravity-runtime.sh converge',
+  FFMPEG_INSTALL_COMMAND,
 ]);
 
 export const TOOL_ADAPTERS: ToolAdapter[] = [
@@ -43,21 +47,15 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
     name: 'OpenClaw',
     description: 'Primary local orchestration CLI for agents, sessions, and gateway control.',
     detect: { command: 'openclaw --version' },
-    install: [
-      {
-        label: 'Verify npm is available',
-        command: 'command -v npm >/dev/null 2>&1 || { echo "npm is required. Install Node.js/npm and retry."; exit 1; }',
-      },
-      {
-        label: 'Install OpenClaw globally (or keep existing install)',
-        command: 'npm list -g --depth=0 openclaw >/dev/null 2>&1 && echo "openclaw already installed" || npm install -g openclaw',
-      },
-    ],
+    // OpenClaw is an atomic core/plugin compatibility pair owned by the Portal
+    // installer. Generic one-click installation would bypass rollback and the
+    // exact package/readiness gates.
+    install: [],
     commands: [
       { label: 'OpenClaw TUI', command: 'openclaw tui', description: 'Launch interactive OpenClaw TUI.' },
       { label: 'OpenClaw Status', command: 'openclaw status', description: 'Show gateway/health status.' },
-      { label: 'Gateway Status', command: 'openclaw gateway status', description: 'Check gateway daemon status.' },
-      { label: 'Start Gateway', command: 'openclaw gateway start', description: 'Start gateway daemon.' },
+      { label: 'Gateway Status', command: '/usr/bin/systemctl status --no-pager openclaw-gateway.service', description: 'Check the Portal-owned gateway service.' },
+      { label: 'Start Gateway', command: '/usr/bin/systemctl start openclaw-gateway.service', description: 'Start the Portal-owned gateway service.' },
       { label: 'Version Check', command: 'openclaw --version', description: 'Verify installed version.' },
     ],
     authRequired: false,
@@ -71,7 +69,8 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
     install: [
       {
         label: 'Install Claude Code globally',
-        command: 'command -v npm >/dev/null 2>&1 && npm install -g @anthropic-ai/claude-code',
+        command: `command -v npm >/dev/null 2>&1 && npm install -g --no-audit --no-fund @anthropic-ai/claude-code@${PORTAL_TOOL_VERSIONS.claudeCode}`,
+        description: `Install the Portal-tested Claude Code ${PORTAL_TOOL_VERSIONS.claudeCode} release.`,
       },
     ],
     commands: [
@@ -92,12 +91,14 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
     install: [
       {
         label: 'Install Codex globally',
-        command: 'command -v npm >/dev/null 2>&1 && npm install -g @openai/codex',
+        command: `command -v npm >/dev/null 2>&1 && npm install -g --no-audit --no-fund @openai/codex@${PORTAL_TOOL_VERSIONS.codexCli}`,
+        description: `Install the Portal-tested Codex CLI ${PORTAL_TOOL_VERSIONS.codexCli} release.`,
       },
     ],
     commands: [
       { label: 'Codex (interactive)', command: 'codex', description: 'Start Codex session.' },
-      { label: 'Codex Full Auto', command: 'codex --approval-mode full-auto', description: 'Run in full-auto approval mode.' },
+      { label: 'Codex Workspace Session', command: 'codex --sandbox workspace-write --ask-for-approval on-request', description: 'Run with workspace-only writes and supervised escalation.' },
+      { label: 'Codex Resume Latest', command: 'codex resume --last', description: 'Resume the most recent Codex session.' },
       { label: 'Version Check', command: 'codex --version', description: 'Verify installed version.' },
     ],
     authRequired: true,
@@ -106,20 +107,44 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
   },
 
   {
-    id: 'ollama',
-    name: 'Ollama',
-    description: 'Local LLM runtime for offline and remote (Tailscale) model serving.',
-    detect: { command: 'ollama --version' },
+    id: 'grok-build',
+    name: 'Grok Build',
+    description: 'xAI native coding agent with subscription OAuth and API-key support.',
+    detect: { command: 'GROK_DISABLE_AUTOUPDATER=1 grok --no-auto-update --version' },
     install: [
       {
-        label: 'Install Ollama',
-        command: 'curl -fsSL https://ollama.ai/install.sh | sh',
+        label: 'Install the Portal-tested Grok Build CLI',
+        command: 'bash /opt/bridgesllm/portal/installer/grok-build-runtime.sh converge',
+        description: 'Install the exact checksum-verified Portal release with automatic rollback on verification failure.',
       },
     ],
     commands: [
-      { label: 'List Models', command: 'ollama list', description: 'List installed Ollama models.' },
-      { label: 'Start Server', command: 'ollama serve', description: 'Start local Ollama API server.' },
-      { label: 'Pull Model', command: 'ollama pull <model>', description: 'Download a model by tag.' },
+      { label: 'Grok Build (interactive)', command: 'GROK_DISABLE_AUTOUPDATER=1 grok --no-auto-update', description: 'Start an interactive Grok Build session without changing the Portal-tested binary.' },
+      { label: 'Grok Build Device Login', command: 'GROK_DISABLE_AUTOUPDATER=1 grok --no-auto-update login --device-auth', description: 'Authenticate a headless server with xAI.' },
+      { label: 'List Models', command: 'GROK_DISABLE_AUTOUPDATER=1 grok --no-auto-update models', description: 'List models available to the signed-in account.' },
+      { label: 'Version Check', command: 'GROK_DISABLE_AUTOUPDATER=1 grok --no-auto-update --version', description: 'Verify the installed pinned version.' },
+    ],
+    authRequired: true,
+    authHint: "Run 'grok --no-auto-update login --device-auth' or use the Portal native Grok login flow. OpenClaw xAI auth is separate.",
+    tier: 1,
+  },
+  {
+    id: 'ollama',
+    name: 'Ollama',
+    description: 'Local Ollama runtime management. Pair an external GPU separately through the Owner-only Tailnet wizard.',
+    detect: {
+      // Ollama 0.32.3+ panics on a missing $HOME, so the isolated probe must
+      // still carry one alongside the fixed loopback endpoint.
+      command: '/usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME="${HOME:-/root}" LANG=C LC_ALL=C OLLAMA_HOST=http://127.0.0.1:11434 timeout 2s ollama --version',
+    },
+    // Ollama upgrades require service restart plus client/server version and
+    // model-readiness checks. Keep them in the dedicated setup/updater flow;
+    // the generic recipe runner cannot prove that transaction safely.
+    install: [],
+    commands: [
+      { label: 'List Models', command: 'env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy NO_PROXY="*" no_proxy="*" OLLAMA_HOST=http://127.0.0.1:11434 ollama list', description: 'List locally installed Ollama models without inherited proxy routing.' },
+      { label: 'Start Server', command: 'env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy NO_PROXY="*" no_proxy="*" OLLAMA_HOST=http://127.0.0.1:11434 ollama serve', description: 'Start the loopback-only local Ollama API server.' },
+      { label: 'Pull Model', command: 'env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy NO_PROXY="*" no_proxy="*" OLLAMA_HOST=http://127.0.0.1:11434 ollama pull <model>', description: 'Download a model to the local Ollama runtime by tag.' },
     ],
     authRequired: false,
     tier: 1,
@@ -127,42 +152,67 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
   {
     id: 'agent-zero',
     name: 'Agent Zero',
-    description: 'Autonomous AI agent framework running in Docker with web UI.',
-    detect: { command: 'docker ps --filter ancestor=agent0ai/agent-zero --format \'{{.Status}}\' 2>/dev/null | head -1' },
-    install: [
-      {
-        label: 'Pull and start Agent Zero container',
-        command: 'docker pull agent0ai/agent-zero && docker run -d -p 50001:80 --name agent-zero --restart unless-stopped agent0ai/agent-zero',
-      },
-    ],
+    description: 'Managed Agent Zero v2.5 runtime. The provider stays disabled until its host and project trust gates are proven.',
+    detect: {
+      command: 'bash /opt/bridgesllm/portal/installer/agent-zero-runtime.sh status',
+      timeoutMs: 20_000,
+    },
+    // Installation is intentionally unavailable from the generic one-click
+    // runner. Agent Zero requires a root-owned mode-600 authentication file
+    // and a supervised lifecycle transaction; setup UI will drive that path.
+    install: [],
     commands: [
-      { label: 'Open Web UI', command: 'echo "Agent Zero UI: http://localhost:50001"', description: 'Open Agent Zero web interface.' },
-      { label: 'Start Container', command: 'docker start agent-zero', description: 'Start the Agent Zero container.' },
-      { label: 'Stop Container', command: 'docker stop agent-zero', description: 'Stop the Agent Zero container.' },
-      { label: 'Container Status', command: 'docker ps --filter name=agent-zero --format "table {{.Status}}\t{{.Ports}}"', description: 'Check container status.' },
+      { label: 'Managed Runtime Status', command: 'bash /opt/bridgesllm/portal/installer/agent-zero-runtime.sh status', description: 'Verify image pin, loopback binding, storage, authentication, and connector readiness.' },
+      { label: 'Container Logs', command: 'docker logs --tail 100 bridgesllm-agent-zero', description: 'Inspect recent managed Agent Zero logs.' },
     ],
-    authRequired: false,
+    authRequired: true,
+    authHint: 'Agent Zero setup requires protected server-side credentials before the managed runtime can be installed.',
     tier: 1,
   },
   {
     id: 'gemini',
     name: 'Google Antigravity',
     description: 'Google Antigravity CLI for native AI coding and generation sessions.',
-    detect: { command: 'agy --version' },
+    detect: { command: `${ANTIGRAVITY_NO_UPDATE_ENV} agy --version` },
     install: [
       {
-        label: 'Install Google Antigravity CLI',
-        command: 'curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin',
+        label: 'Install the Portal-tested Google Antigravity CLI',
+        command: 'bash /opt/bridgesllm/portal/installer/antigravity-runtime.sh converge',
+        description: `Install checksum-verified Antigravity ${PORTAL_TOOL_VERSIONS.antigravity} with automatic rollback.`,
       },
     ],
     commands: [
-      { label: 'Antigravity (interactive)', command: 'agy', description: 'Start interactive Antigravity session.' },
-      { label: 'Antigravity Print', command: 'agy --print "Say hello briefly"', description: 'Run a one-shot Antigravity task.' },
-      { label: 'List Models', command: 'agy models', description: 'Verify Google sign-in and list available models.' },
-      { label: 'Version Check', command: 'agy --version', description: 'Verify installed version.' },
+      { label: 'Antigravity (interactive)', command: `${ANTIGRAVITY_NO_UPDATE_ENV} agy`, description: 'Start interactive Antigravity without replacing the Portal-tested binary.' },
+      { label: 'Antigravity Print', command: `${ANTIGRAVITY_NO_UPDATE_ENV} agy --print "Say hello briefly"`, description: 'Run a one-shot Antigravity task.' },
+      { label: 'List Models', command: `${ANTIGRAVITY_NO_UPDATE_ENV} agy models`, description: 'Verify Google sign-in and list available models.' },
+      { label: 'Version Check', command: `${ANTIGRAVITY_NO_UPDATE_ENV} agy --version`, description: 'Verify the installed pinned version.' },
     ],
     authRequired: true,
     authHint: "Run 'agy' first time to authenticate with Google, or use the portal native Antigravity login flow.",
+    tier: 1,
+  },
+  {
+    id: 'ffmpeg',
+    name: 'Media Processing (FFmpeg)',
+    description: 'Required host media tools for validating, cropping, and preserving animated GIF uploads.',
+    detect: {
+      command: 'ffmpeg -version >/dev/null 2>&1 && ffprobe -version | head -n 1',
+    },
+    install: [
+      {
+        label: 'Install FFmpeg and FFprobe',
+        command: FFMPEG_INSTALL_COMMAND,
+        description: 'Install the Ubuntu/Debian FFmpeg package used by every animated GIF upload surface.',
+      },
+    ],
+    commands: [
+      {
+        label: 'Verify FFmpeg',
+        command: 'ffmpeg -version && ffprobe -version',
+        description: 'Verify both required media executables.',
+      },
+    ],
+    authRequired: false,
     tier: 1,
   },
   {

@@ -2,20 +2,29 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { prisma } from '../config/database';
 import { ingestAlert } from '../utils/logWatcher';
+import { requireAdmin } from '../middleware/requireAdmin';
 
 const router = Router();
+router.use(authenticateToken, requireAdmin);
 
 // GET /api/alerts - Get system alerts (activity logs with SYSTEM_ALERT action)
-router.get('/', authenticateToken, async (req: Request, res: Response) => {
+router.get('/', async (req: Request, res: Response) => {
   try {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
-    const offset = parseInt(req.query.offset as string) || 0;
+    const offset = Math.max(0, parseInt(req.query.offset as string) || 0);
     const severity = req.query.severity as string | undefined;
     const since = req.query.since as string | undefined; // ISO timestamp for polling
 
     const where: any = { action: 'SYSTEM_ALERT' };
-    if (severity) where.severity = severity;
-    if (since) where.createdAt = { gt: new Date(since) };
+    if (severity && ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'].includes(severity)) where.severity = severity;
+    if (since) {
+      const sinceDate = new Date(since);
+      if (Number.isNaN(sinceDate.getTime())) {
+        res.status(400).json({ error: 'Invalid since timestamp' });
+        return;
+      }
+      where.createdAt = { gt: sinceDate };
+    }
 
     const [alerts, total] = await Promise.all([
       prisma.activityLog.findMany({
@@ -35,11 +44,23 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
 });
 
 // POST /api/alerts - Manually ingest an alert
-router.post('/', authenticateToken, async (req: Request, res: Response) => {
+router.post('/', async (req: Request, res: Response) => {
   try {
     const { severity, component, message, metadata } = req.body;
-    if (!severity || !component || !message) {
-      res.status(400).json({ error: 'severity, component, and message required' });
+    if (
+      !['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'].includes(severity)
+      || typeof component !== 'string'
+      || component.length < 1
+      || component.length > 120
+      || typeof message !== 'string'
+      || message.length < 1
+      || message.length > 4000
+    ) {
+      res.status(400).json({ error: 'Valid severity, component, and message are required' });
+      return;
+    }
+    if (metadata !== undefined && Buffer.byteLength(JSON.stringify(metadata), 'utf8') > 16 * 1024) {
+      res.status(400).json({ error: 'Alert metadata is too large' });
       return;
     }
 
@@ -56,20 +77,32 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
 });
 
 // POST /api/alerts/:id/dismiss - Dismiss an alert
-router.post('/:id/dismiss', authenticateToken, async (req: Request, res: Response) => {
+router.post('/:id/dismiss', async (req: Request, res: Response) => {
   try {
+    if (!req.params.id || req.params.id.length > 100) {
+      res.status(400).json({ error: 'Invalid alert ID' });
+      return;
+    }
+    const existing = await prisma.activityLog.findFirst({
+      where: { id: req.params.id, action: 'SYSTEM_ALERT' },
+      select: { id: true, metadata: true },
+    });
+    if (!existing) {
+      res.status(404).json({ error: 'Alert not found' });
+      return;
+    }
     const alert = await prisma.activityLog.update({
-      where: { id: req.params.id },
+      where: { id: existing.id },
       data: {
         metadata: {
-          ...(await prisma.activityLog.findUnique({ where: { id: req.params.id } }).then(a => (a?.metadata as any) || {})),
+          ...((existing.metadata as any) || {}),
           dismissedAt: new Date().toISOString(),
           dismissedBy: req.user?.userId,
         },
       },
     });
     res.json({ alert });
-  } catch (error) {
+  } catch {
     res.status(500).json({ error: 'Failed to dismiss alert' });
   }
 });

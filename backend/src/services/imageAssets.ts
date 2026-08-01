@@ -4,23 +4,124 @@ import fs from 'fs';
 import sharp from 'sharp';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
 
 const execFileAsync = promisify(execFile);
 
-// Assets live at INSTALL_ROOT/assets (e.g. /opt/bridgesllm/assets), NOT inside the portal dir.
-export const ASSETS_ROOT = path.join(
-  process.env.INSTALL_ROOT || process.env.PORTAL_ROOT || '/opt/bridgesllm/portal',
-  'assets'
-);
-export const AVATARS_DIR = path.join(ASSETS_ROOT, 'avatars');
-export const BRANDING_DIR = path.join(ASSETS_ROOT, 'branding');
+export type ImageMediaCommandResult = { stdout: string };
+export type ImageMediaCommandRunner = (
+  executable: string,
+  args: string[],
+  options?: { timeout?: number },
+) => Promise<ImageMediaCommandResult>;
+
+const runImageMediaCommand: ImageMediaCommandRunner = async (executable, args, options) => {
+  const result = await execFileAsync(executable, args, options);
+  return { stdout: String(result.stdout || '') };
+};
+
+export interface ImageAssetStorageOptions {
+  assetsRoot?: string;
+  avatarsDir?: string;
+  brandingDir?: string;
+}
+
+export function resolveImageAssetPaths(options: ImageAssetStorageOptions = {}) {
+  // Assets live at INSTALL_ROOT/assets, not in an imported module's cwd.
+  const assetsRoot = path.resolve(
+    options.assetsRoot
+      || process.env.PORTAL_ASSETS_ROOT
+      || path.join(process.env.INSTALL_ROOT || process.env.PORTAL_ROOT || '/opt/bridgesllm/portal', 'assets'),
+  );
+  return {
+    assetsRoot,
+    avatarsDir: path.resolve(options.avatarsDir || process.env.PORTAL_AVATARS_ROOT || path.join(assetsRoot, 'avatars')),
+    brandingDir: path.resolve(options.brandingDir || process.env.PORTAL_BRANDING_ROOT || path.join(assetsRoot, 'branding')),
+  };
+}
+
+const imageAssetPaths = resolveImageAssetPaths();
+export const ASSETS_ROOT = imageAssetPaths.assetsRoot;
+export const AVATARS_DIR = imageAssetPaths.avatarsDir;
+export const BRANDING_DIR = imageAssetPaths.brandingDir;
 export const MAX_IMAGE_UPLOAD_BYTES = 50 * 1024 * 1024; // 50MB — large animated GIFs
 
-for (const dir of [AVATARS_DIR, BRANDING_DIR]) {
-  fs.mkdirSync(dir, { recursive: true });
+export function initializeImageAssetStorage(options: ImageAssetStorageOptions = {}): ReturnType<typeof resolveImageAssetPaths> {
+  const paths = Object.keys(options).length > 0 ? resolveImageAssetPaths(options) : imageAssetPaths;
+  ensureRuntimeDirectory(paths.avatarsDir, { mode: 0o755 });
+  ensureRuntimeDirectory(paths.brandingDir, { mode: 0o755 });
+  return paths;
 }
 
 const ALLOWED_MIME_TYPES = ['image/gif', 'image/png', 'image/jpeg', 'image/webp'];
+const SAFE_RASTER_FORMATS = new Set(['gif', 'jpeg', 'png', 'webp']);
+const MAX_BRANDING_INPUT_PIXELS = 4096 * 4096;
+
+export class UnsafeImageUploadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UnsafeImageUploadError';
+  }
+}
+
+export const IMAGE_MEDIA_TOOLCHAIN_ERROR_CODE = 'IMAGE_MEDIA_TOOLCHAIN_UNAVAILABLE';
+export const IMAGE_MEDIA_TOOLCHAIN_REPAIR_TOOL_ID = 'ffmpeg';
+export const IMAGE_MEDIA_TOOLCHAIN_REPAIR_URL = '/agent-tools?tool=ffmpeg';
+export const IMAGE_MEDIA_TOOLCHAIN_ERROR_MESSAGE =
+  'Animated GIF processing requires FFmpeg, but this Portal host does not have a working ffmpeg/ffprobe toolchain. An administrator can install Media Processing (FFmpeg) from Agent Tools, then retry.';
+
+export class ImageMediaToolchainUnavailableError extends Error {
+  readonly code = IMAGE_MEDIA_TOOLCHAIN_ERROR_CODE;
+
+  constructor() {
+    super(IMAGE_MEDIA_TOOLCHAIN_ERROR_MESSAGE);
+    this.name = 'ImageMediaToolchainUnavailableError';
+  }
+}
+
+export type ImageUploadFailure = {
+  statusCode: number;
+  error: string;
+  code: string;
+  retryable: boolean;
+  repairToolId?: string;
+  repairUrl?: string;
+};
+
+export function classifyImageUploadFailure(error: unknown): ImageUploadFailure | null {
+  if (error instanceof ImageMediaToolchainUnavailableError) {
+    return {
+      statusCode: 503,
+      error: error.message,
+      code: error.code,
+      retryable: true,
+      repairToolId: IMAGE_MEDIA_TOOLCHAIN_REPAIR_TOOL_ID,
+      repairUrl: IMAGE_MEDIA_TOOLCHAIN_REPAIR_URL,
+    };
+  }
+  if (error instanceof UnsafeImageUploadError) {
+    return {
+      statusCode: 400,
+      error: error.message,
+      code: 'INVALID_IMAGE_UPLOAD',
+      retryable: false,
+    };
+  }
+  return null;
+}
+
+export function isSafeMutableImageAssetPath(requestPath: string): boolean {
+  const normalized = String(requestPath || '').replace(/\\/g, '/');
+  if (normalized.includes('\0') || normalized.split('/').some((part) => part === '..')) return false;
+  const parts = normalized.split('/').filter(Boolean);
+  if (parts.length !== 2) return false;
+  const [bucket, filename] = parts;
+  const ext = path.extname(filename).toLowerCase();
+  const rasterExts = new Set(['.gif', '.jpeg', '.jpg', '.png', '.webp']);
+  if (bucket === 'branding') return rasterExts.has(ext);
+  if (bucket === 'avatars') return rasterExts.has(ext) || ext === '.webm';
+  return false;
+}
 
 export type CropParams = {
   zoom: number;
@@ -32,7 +133,14 @@ export type CropParams = {
 export function createImageUpload(fieldName = 'image') {
   return multer({
     storage: multer.diskStorage({
-      destination: (_req: any, _file: any, cb: any) => cb(null, AVATARS_DIR),
+      destination: (_req: any, _file: any, cb: any) => {
+        try {
+          initializeImageAssetStorage();
+          cb(null, AVATARS_DIR);
+        } catch (error) {
+          cb(error, AVATARS_DIR);
+        }
+      },
       filename: (_req: any, file: any, cb: any) => {
         const ext = path.extname(file.originalname).toLowerCase() || '.png';
         cb(null, `tmp-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
@@ -104,14 +212,40 @@ async function cropStaticImage(filePath: string, outputPath: string, cropParams?
   await sharp(filePath).resize(outSize, outSize, { fit: 'cover' }).png().toFile(outputPath);
 }
 
-async function cropGifImage(filePath: string, outputPath: string, cropParams?: CropParams, outSize = 256): Promise<void> {
-  const { stdout } = await execFileAsync('ffprobe', [
-    '-v', 'error', '-select_streams', 'v:0',
-    '-show_entries', 'stream=width,height',
-    '-of', 'csv=p=0', filePath,
-  ]);
+function isMissingImageMediaExecutable(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ENOENT');
+}
+
+async function cropGifImage(
+  filePath: string,
+  outputPath: string,
+  cropParams?: CropParams,
+  outSize = 256,
+  commandRunner: ImageMediaCommandRunner = runImageMediaCommand,
+): Promise<void> {
+  let stdout = '';
+  try {
+    ({ stdout } = await commandRunner('ffprobe', [
+      '-v', 'error', '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height',
+      '-of', 'csv=p=0', filePath,
+    ]));
+  } catch (error) {
+    if (isMissingImageMediaExecutable(error)) {
+      throw new ImageMediaToolchainUnavailableError();
+    }
+    throw new UnsafeImageUploadError('The uploaded GIF is corrupt or could not be inspected safely.');
+  }
   const [srcW, srcH] = stdout.trim().split(',').map(Number);
-  if (!srcW || !srcH) throw new Error('Cannot read GIF dimensions');
+  if (
+    !Number.isInteger(srcW)
+    || !Number.isInteger(srcH)
+    || srcW <= 0
+    || srcH <= 0
+    || srcW * srcH > MAX_BRANDING_INPUT_PIXELS
+  ) {
+    throw new UnsafeImageUploadError('The uploaded GIF dimensions are invalid or too large.');
+  }
 
   let filterChain: string;
   if (cropParams && cropParams.previewSize > 0) {
@@ -123,11 +257,31 @@ async function cropGifImage(filePath: string, outputPath: string, cropParams?: C
   }
 
   const tmpPath = outputPath + '.tmp.gif';
-  await execFileAsync('ffmpeg', ['-y', '-i', filePath, '-filter_complex', filterChain, '-loop', '0', tmpPath], { timeout: 30000 });
-  fs.renameSync(tmpPath, outputPath);
+  try {
+    await commandRunner(
+      'ffmpeg',
+      ['-y', '-i', filePath, '-filter_complex', filterChain, '-loop', '0', tmpPath],
+      { timeout: 30000 },
+    );
+    fs.renameSync(tmpPath, outputPath);
+  } catch (error) {
+    if (isMissingImageMediaExecutable(error)) {
+      throw new ImageMediaToolchainUnavailableError();
+    }
+    throw new UnsafeImageUploadError('The uploaded GIF could not be processed safely.');
+  } finally {
+    cleanupFile(tmpPath);
+  }
 }
 
-export async function processImageToTarget(tempFilePath: string, mimeType: string, targetPathNoExt: string, cropParams?: CropParams, sizes?: { staticSize?: number; gifSize?: number; skipGifCrop?: boolean }) {
+export async function processImageToTarget(
+  tempFilePath: string,
+  mimeType: string,
+  targetPathNoExt: string,
+  cropParams?: CropParams,
+  sizes?: { staticSize?: number; gifSize?: number; skipGifCrop?: boolean },
+  dependencies?: { commandRunner?: ImageMediaCommandRunner },
+) {
   const isGif = mimeType === 'image/gif';
   const ext = isGif ? '.gif' : '.png';
   const outputPath = `${targetPathNoExt}${ext}`;
@@ -136,13 +290,83 @@ export async function processImageToTarget(tempFilePath: string, mimeType: strin
     if (sizes?.skipGifCrop) {
       fs.copyFileSync(tempFilePath, outputPath);
     } else {
-      await cropGifImage(tempFilePath, outputPath, cropParams, sizes?.gifSize ?? 256);
+      await cropGifImage(
+        tempFilePath,
+        outputPath,
+        cropParams,
+        sizes?.gifSize ?? 256,
+        dependencies?.commandRunner,
+      );
     }
   } else {
     await cropStaticImage(tempFilePath, outputPath, cropParams, sizes?.staticSize ?? 512);
   }
 
   return { outputPath, ext, isGif };
+}
+
+/**
+ * Decode an untrusted branding upload and emit one static PNG. The decoder's
+ * discovered format is authoritative; client MIME and filename are ignored.
+ * SVG and other active/document formats are rejected even when mislabeled as
+ * image/png.
+ */
+export async function normalizeBrandingLogoToPng(
+  input: Buffer,
+  outputPath: string,
+  size = 512,
+): Promise<void> {
+  if (!Buffer.isBuffer(input) || input.length === 0) {
+    throw new UnsafeImageUploadError('The uploaded logo is empty.');
+  }
+  if (!Number.isInteger(size) || size < 64 || size > 1024) {
+    throw new UnsafeImageUploadError('The requested logo size is invalid.');
+  }
+  if (path.extname(outputPath).toLowerCase() !== '.png') {
+    throw new UnsafeImageUploadError('Branding output must use the PNG format.');
+  }
+
+  const createDecoder = () => sharp(input, {
+    animated: false,
+    failOn: 'warning',
+    limitInputPixels: MAX_BRANDING_INPUT_PIXELS,
+    sequentialRead: true,
+  });
+
+  let metadata: Awaited<ReturnType<ReturnType<typeof sharp>['metadata']>>;
+  try {
+    metadata = await createDecoder().metadata();
+  } catch {
+    throw new UnsafeImageUploadError('The uploaded logo is not a valid raster image.');
+  }
+
+  if (!metadata.format || !SAFE_RASTER_FORMATS.has(metadata.format)) {
+    throw new UnsafeImageUploadError('Only PNG, JPEG, WebP, and GIF raster images are supported.');
+  }
+  if (!metadata.width || !metadata.height || metadata.width * metadata.height > MAX_BRANDING_INPUT_PIXELS) {
+    throw new UnsafeImageUploadError('The uploaded logo dimensions are invalid or too large.');
+  }
+
+  const outputDir = path.dirname(outputPath);
+  fs.mkdirSync(outputDir, { recursive: true });
+  const tempPath = path.join(outputDir, `.${path.basename(outputPath)}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    await createDecoder()
+      .rotate()
+      .resize(size, size, {
+        fit: 'contain',
+        background: { r: 0, g: 0, b: 0, alpha: 0 },
+        withoutEnlargement: true,
+      })
+      .png({ compressionLevel: 9, adaptiveFiltering: true, force: true })
+      .toFile(tempPath);
+    fs.chmodSync(tempPath, 0o644);
+    fs.renameSync(tempPath, outputPath);
+  } catch (error) {
+    cleanupFile(tempPath);
+    if (error instanceof UnsafeImageUploadError) throw error;
+    throw new UnsafeImageUploadError('The uploaded logo could not be normalized safely.');
+  }
 }
 
 export function cleanupFile(filePath?: string | null) {

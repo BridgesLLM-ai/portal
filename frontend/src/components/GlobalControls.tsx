@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useCallback, useState, useEffect, useMemo } from 'react';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import CommandPalette from './CommandPalette';
 import KeyboardShortcutsHelp from './KeyboardShortcutsHelp';
 import ViewportOverlay from './ViewportOverlay';
+import { isRouteOperationOwned, useRouteOperationGuard } from '../contexts/RouteOperationContext';
 
 interface GlobalControlsProps {
   children: React.ReactNode;
@@ -13,49 +14,60 @@ interface GlobalControlsProps {
 export default function GlobalControls({ children, onToggleSidebar, onToggleAssistantAI }: GlobalControlsProps) {
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [shortcutsHelpOpen, setShortcutsHelpOpen] = useState(false);
+  const { active: routeOperationActive } = useRouteOperationGuard();
+
+  const openCommandPalette = useCallback(() => {
+    if (isRouteOperationOwned()) return;
+    setShortcutsHelpOpen(false);
+    setCommandPaletteOpen(true);
+  }, []);
+
+  const openShortcutsHelp = useCallback(() => {
+    if (isRouteOperationOwned()) return;
+    setCommandPaletteOpen(false);
+    setShortcutsHelpOpen(true);
+  }, []);
+
+  useEffect(() => {
+    if (!routeOperationActive) return;
+    setCommandPaletteOpen(false);
+    setShortcutsHelpOpen(false);
+  }, [routeOperationActive]);
 
   // Global keyboard shortcuts
-  useKeyboardShortcuts([
+  const shortcuts = useMemo(() => [
     {
       key: 'k',
       ctrl: true,
-      handler: () => setCommandPaletteOpen(true),
+      handler: openCommandPalette,
       description: 'Open command palette',
     },
-    {
+    ...(onToggleSidebar ? [{
       key: 'b',
       ctrl: true,
-      handler: () => onToggleSidebar?.(),
+      handler: onToggleSidebar,
       description: 'Toggle sidebar',
-    },
-    {
+    }] : []),
+    ...(onToggleAssistantAI ? [{
       key: '/',
       ctrl: true,
-      handler: () => onToggleAssistantAI?.(),
+      handler: onToggleAssistantAI,
       description: 'Toggle Assistant AI',
-    },
+    }] : []),
     {
       key: '?',
       shift: true,
-      handler: (e) => {
+      handler: (e: KeyboardEvent) => {
         // Only open if shift+? pressed (not just ?)
         if (e.shiftKey && e.key === '?') {
-          setShortcutsHelpOpen(true);
+          openShortcutsHelp();
         }
       },
       description: 'Show keyboard shortcuts',
       preventDefault: false, // Allow normal ? in inputs
     },
-    {
-      key: 'Escape',
-      handler: () => {
-        if (commandPaletteOpen) setCommandPaletteOpen(false);
-        if (shortcutsHelpOpen) setShortcutsHelpOpen(false);
-      },
-      description: 'Close modals',
-      preventDefault: false, // Let components handle their own escape
-    },
-  ]);
+  ], [onToggleAssistantAI, onToggleSidebar, openCommandPalette, openShortcutsHelp]);
+  useKeyboardShortcuts(shortcuts);
 
   // Add keyboard hint overlay (subtle, dismissible)
   const [showKeyboardHint, setShowKeyboardHint] = useState(false);
@@ -63,8 +75,13 @@ export default function GlobalControls({ children, onToggleSidebar, onToggleAssi
   useEffect(() => {
     // Show hint after 5 seconds if user hasn't opened palette
     const timer = setTimeout(() => {
-      const hasSeenHint = localStorage.getItem('portalKeyboardHintSeen');
-      if (!hasSeenHint) {
+      let hasSeenHint = true;
+      try {
+        hasSeenHint = localStorage.getItem('portalKeyboardHintSeen') === 'true';
+      } catch {
+        // Storage can be unavailable in hardened/private browser modes.
+      }
+      if (!hasSeenHint && !isRouteOperationOwned()) {
         setShowKeyboardHint(true);
       }
     }, 5000);
@@ -72,10 +89,18 @@ export default function GlobalControls({ children, onToggleSidebar, onToggleAssi
     return () => clearTimeout(timer);
   }, []);
 
+  useEffect(() => {
+    if (routeOperationActive) setShowKeyboardHint(false);
+  }, [routeOperationActive]);
+
   const dismissKeyboardHint = () => {
     setShowKeyboardHint(false);
-    localStorage.setItem('portalKeyboardHintSeen', 'true');
+    try { localStorage.setItem('portalKeyboardHintSeen', 'true'); } catch { /* non-fatal */ }
   };
+
+  const commandKey = typeof navigator !== 'undefined' && /Mac|iPod|iPhone|iPad/.test(navigator.platform)
+    ? '⌘ K'
+    : 'Ctrl K';
 
   return (
     <>
@@ -92,8 +117,8 @@ export default function GlobalControls({ children, onToggleSidebar, onToggleAssi
       />
 
       {/* Keyboard hint overlay */}
-      {showKeyboardHint && (
-        <ViewportOverlay anchor="bottom-right" zIndex={1100} margin="1.5rem" className="max-w-[min(20rem,calc(100vw-3rem))]">
+      {showKeyboardHint && !routeOperationActive && (
+        <ViewportOverlay anchor="bottom-left" zIndex={1100} margin="1.5rem" className="max-w-[min(20rem,calc(100vw-3rem))]">
           <div className="bg-[#0A0E27]/95 border border-emerald-500/30 rounded-xl p-4 shadow-2xl backdrop-blur-xl animate-fade-in">
             <div className="flex items-start justify-between gap-3 mb-2">
               <div className="flex-1">
@@ -101,7 +126,7 @@ export default function GlobalControls({ children, onToggleSidebar, onToggleAssi
                   💡 Pro Tip
                 </div>
                 <div className="text-xs text-slate-300">
-                  Press <kbd className="px-1.5 py-0.5 rounded bg-slate-800 text-emerald-400 font-mono">⌘ K</kbd> for quick navigation
+                  Press <kbd className="px-1.5 py-0.5 rounded bg-slate-800 text-emerald-400 font-mono">{commandKey}</kbd> for quick navigation
                 </div>
               </div>
               <button

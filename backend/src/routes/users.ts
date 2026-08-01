@@ -11,6 +11,7 @@ import {
   processImageToTarget,
   cleanupBasenameVariants,
   cleanupFile,
+  classifyImageUploadFailure,
 } from '../services/imageAssets';
 
 const router = Router();
@@ -26,14 +27,20 @@ router.post('/me/avatar', authenticateToken, uploadAvatar, async (req: Request, 
 
     const { ext } = await processImageToTarget(req.file.path, req.file.mimetype, path.join(AVATARS_DIR, basename), cropParams);
     cleanupBasenameVariants(AVATARS_DIR, basename, ext);
-    cleanupFile(req.file.path);
 
     const outputFilename = `${basename}${ext}`;
     await prisma.user.update({ where: { id: req.user!.userId }, data: { avatarPath: outputFilename } });
     res.json({ success: true, avatarUrl: `/static-assets/avatars/${outputFilename}` });
   } catch (error) {
     console.error('Avatar upload error:', error);
+    const failure = classifyImageUploadFailure(error);
+    if (failure) {
+      res.status(failure.statusCode).json(failure);
+      return;
+    }
     res.status(500).json({ error: 'Failed to upload avatar' });
+  } finally {
+    cleanupFile(req.file?.path);
   }
 });
 
@@ -86,12 +93,18 @@ router.post('/assistant-avatar', authenticateToken, uploadAvatar, async (req: Re
     const basename = 'assistant-custom';
     const { ext } = await processImageToTarget(req.file.path, req.file.mimetype, path.join(AVATARS_DIR, basename), cropParams, { gifSize: 512 });
     cleanupBasenameVariants(AVATARS_DIR, basename, ext);
-    cleanupFile(req.file.path);
 
     res.json({ success: true, avatarUrl: `/static-assets/avatars/${basename}${ext}` });
   } catch (error) {
     console.error('Assistant avatar upload error:', error);
+    const failure = classifyImageUploadFailure(error);
+    if (failure) {
+      res.status(failure.statusCode).json(failure);
+      return;
+    }
     res.status(500).json({ error: 'Failed to upload avatar' });
+  } finally {
+    cleanupFile(req.file?.path);
   }
 });
 

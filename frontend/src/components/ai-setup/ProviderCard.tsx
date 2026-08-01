@@ -1,9 +1,10 @@
 import { AlertTriangle, CheckCircle2, ChevronRight, Cpu, ExternalLink, Globe, Network, Rocket, Server, Sparkles, Wind, Zap } from 'lucide-react';
 import type { ProviderUIConfig } from './providerConfig';
+import { canRemoveProviderStatus, type ProviderRemovalCapability } from './providerRemovalContract';
 
 export interface ProviderStatus {
   id: string;
-  status: 'configured' | 'unconfigured' | 'error' | 'expired' | 'cooldown';
+  status: 'configured' | 'unconfigured' | 'error' | 'expired' | 'cooldown' | 'manual';
   authType: string | null;
   profileId: string | null;
   currentModel: string | null;
@@ -18,6 +19,14 @@ export interface ProviderStatus {
   nativeCliAuthMessage?: string | null;
   nativeCliLoginCommand?: string | null;
   requiresSeparateNativeLogin?: boolean;
+  removal?: ProviderRemovalCapability;
+  readiness?: {
+    state: 'missing_plugin' | 'plugin_unavailable' | 'needs_setup' | 'ready' | 'probe_error';
+    checkedAt: string;
+    cached: boolean;
+    availableModelCount: number;
+    message: string;
+  } | null;
 }
 
 interface ProviderCardProps {
@@ -65,6 +74,8 @@ function statusStyles(status: ProviderStatus['status'] | undefined) {
       return { label: 'Expired', className: 'border-amber-500/30 bg-amber-500/10 text-amber-300', icon: AlertTriangle };
     case 'cooldown':
       return { label: 'Cooldown', className: 'border-amber-500/30 bg-amber-500/10 text-amber-300', icon: AlertTriangle };
+    case 'manual':
+      return { label: 'Manual setup', className: 'border-sky-500/30 bg-sky-500/10 text-sky-300', icon: Server };
     default:
       return { label: 'Not set up', className: 'border-slate-700 bg-slate-800/70 text-slate-300', icon: ChevronRight };
   }
@@ -76,15 +87,21 @@ function authLabel(provider: ProviderUIConfig, status?: ProviderStatus | null) {
   if (status?.authType === 'token') return provider.id === 'anthropic' ? 'Setup Token' : 'Token';
   if (status?.authType === 'api_key') return provider.id === 'ollama' ? 'Local' : 'API Key';
 
+  if (provider.authOptions?.length) {
+    return provider.authOptions.map((option) => option.type === 'api_key' ? 'API Key' : 'Subscription OAuth').join(' / ');
+  }
+
   switch (provider.primaryAuthType) {
     case 'oauth':
       return 'OAuth';
     case 'setup_token':
-      return 'Setup Token';
+      return provider.id === 'anthropic' ? 'Claude CLI / Setup Token' : 'Setup Token';
     case 'device_code':
       return 'Device Code';
     case 'native_cli':
       return 'Native CLI';
+    case 'aws_sdk':
+      return 'AWS SDK credentials (manual)';
     default:
       return provider.id === 'ollama' ? 'Local' : 'API Key';
   }
@@ -109,6 +126,7 @@ export default function ProviderCard({ provider, status, onConfigure, onRemove, 
   const Icon = iconMap[provider.icon as keyof typeof iconMap] || Cpu;
   const tone = statusStyles(status?.status);
   const isConfigured = status?.status === 'configured';
+  const canRemove = canRemoveProviderStatus(status?.status, status?.removal);
 
   if (compact) {
     return (
@@ -164,7 +182,7 @@ export default function ProviderCard({ provider, status, onConfigure, onRemove, 
             {isConfigured ? 'Reconfigure' : 'Set Up'}
             <ChevronRight className="h-3 w-3" />
           </button>
-          {isConfigured && onRemove ? (
+          {canRemove && onRemove ? (
             <button
               type="button"
               onClick={() => onRemove(provider.id)}
@@ -287,7 +305,7 @@ export default function ProviderCard({ provider, status, onConfigure, onRemove, 
           <ChevronRight className="h-4 w-4" />
         </button>
 
-        {isConfigured && onRemove ? (
+        {canRemove && onRemove ? (
           <button
             type="button"
             onClick={() => onRemove(provider.id)}

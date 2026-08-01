@@ -1,0 +1,47 @@
+# Codex-only Project-container profile derived from the shared Portal runtime
+# policy. The outer container remains non-root, capability-free, read-only,
+# and proxy-confined; these three permissions exist only so Codex 0.144.6 can
+# build its inner unprivileged bubblewrap sandbox.
+#include <tunables/global>
+
+profile bridgesllm-codex-project-runtime-v1 flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  deny network alg,
+  capability,
+  file,
+  umount,
+
+  # Bubblewrap creates an unprivileged user/mount/pid namespace, assembles its
+  # inner root, pivots into it, then detaches the construction root. The outer
+  # Docker runtime still has CapDrop=ALL and no writable host paths beyond the
+  # exact Project bind.
+  userns create,
+  mount,
+  pivot_root,
+
+  # Container lifecycle signals and same-profile child coordination.
+  signal (receive) peer=unconfined,
+  signal (receive) peer=runc,
+  signal (receive) peer=crun,
+  signal (send,receive) peer=bridgesllm-codex-project-runtime-v1,
+
+  deny @{PROC}/* w,
+  deny @{PROC}/{[^1-9/],[^1-9/][^0-9/],[^1-9s/][^0-9y/][^0-9s/],[^1-9/][^0-9/][^0-9/][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^k]** w,
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  ptrace (trace,tracedby,read,readby) peer=bridgesllm-codex-project-runtime-v1,
+}

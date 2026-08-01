@@ -1,11 +1,22 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
+import { requireApproved } from '../middleware/requireApproved';
 import { execFile } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import { AgentJobRequestError, startAgentJob } from '../services/agentJobs';
+import {
+  confirmationForPluginInstall,
+  confirmationForSkillInstall,
+  confirmationForSkillUninstall,
+  isTypedConfirmationMatch,
+} from '../utils/privilegedConfirmation';
 
 const router = Router();
+const EXTENSION_MUTATION_TIMEOUT = '15m';
 
-router.use(authenticateToken, requireAdmin);
+router.use(authenticateToken, requireApproved, requireAdmin);
 
 /* ─── Helpers ────────────────────────────────────────────── */
 
@@ -57,12 +68,89 @@ function bustSkillsCache(): void {
   skillsListCache.clear();
 }
 
-async function cachedListing<T>(key: string, loader: () => Promise<T>): Promise<T> {
+async function cachedListing<T>(key: string, loader: () => Promise<T>, force = false): Promise<T> {
   const cached = skillsListCache.get(key);
-  if (cached && Date.now() - cached.at < SKILLS_CACHE_TTL_MS) return cached.payload as T;
+  if (!force && cached && Date.now() - cached.at < SKILLS_CACHE_TTL_MS) return cached.payload as T;
   const payload = await loader();
   skillsListCache.set(key, { at: Date.now(), payload });
   return payload;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function resolveOpenClawWorkspace(): string {
+  return path.resolve(
+    process.env.OPENCLAW_WORKSPACE
+      || path.join(process.env.HOME || '/root', '.openclaw', 'workspace-main'),
+  );
+}
+
+function readManagedSkillNames(): Set<string> {
+  try {
+    const lockPath = path.join(resolveOpenClawWorkspace(), '.clawhub', 'lock.json');
+    const stat = fs.lstatSync(lockPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) return new Set();
+    const parsed = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    const skills = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as { skills?: unknown }).skills
+      : null;
+    if (!skills || typeof skills !== 'object' || Array.isArray(skills)) return new Set();
+    return new Set(Object.keys(skills as Record<string, unknown>));
+  } catch {
+    return new Set();
+  }
+}
+
+function isSafeSkillName(value: string): boolean {
+  return /^[a-z0-9][a-z0-9_-]{0,127}$/i.test(value)
+    || /^@[a-z0-9][a-z0-9_-]{0,62}\/[a-z0-9][a-z0-9_-]{0,62}$/i.test(value);
+}
+
+function isSafeMutationValue(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string'
+    && value.trim().length > 0
+    && value.trim().length <= maxLength
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+async function startSkillsMutation(input: {
+  userId: string;
+  actorAuthorizationVersion: number;
+  toolId: string;
+  title: string;
+  executable: string;
+  args: string[];
+}) {
+  bustSkillsCache();
+  const operation = [input.executable, ...input.args].map(shellQuote).join(' ');
+  const script = ['set -euo pipefail', operation].join('\n');
+  const serializedCommand = [
+    'flock',
+    '--nonblock',
+    '/run/bridgesllm-agent-mutation.lock',
+    '--',
+    'timeout',
+    '--foreground',
+    '--kill-after=30s',
+    EXTENSION_MUTATION_TIMEOUT,
+    '/bin/bash',
+    '-lc',
+    script,
+  ];
+  return startAgentJob({
+    userId: input.userId,
+    actorAuthorizationVersion: input.actorAuthorizationVersion,
+    toolId: input.toolId,
+    title: input.title,
+    command: serializedCommand.map(shellQuote).join(' '),
+    cwd: resolveOpenClawWorkspace(),
+  });
+}
+
+function mutationErrorStatus(error: unknown): number {
+  return error instanceof AgentJobRequestError ? error.statusCode : 500;
 }
 
 function isMissingClawHubError(err: unknown): boolean {
@@ -127,8 +215,26 @@ function normalizeMarketplaceItem(item: any) {
   };
 }
 
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(Math.max(concurrency, 1), items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function enrichMarketplaceResults(results: any[], inspectLimit = 8) {
-  const enrichedItems = await Promise.all(results.map(async (item, index) => {
+  const enrichedItems = await mapWithConcurrency(results, 3, async (item, index) => {
     const normalized = normalizeMarketplaceItem(item);
     if ((normalized.description && normalized.author) || !normalized.slug || index >= inspectLimit) {
       return normalized;
@@ -145,18 +251,28 @@ async function enrichMarketplaceResults(results: any[], inspectLimit = 8) {
     } catch {
       return normalized;
     }
-  }));
+  });
   return enrichedItems.filter(item => item.name);
 }
 
 /* ─── Routes ─────────────────────────────────────────────── */
 
 /** GET /api/skills — list all locally available skills (openclaw skills list --json) */
-router.get('/', async (_req: Request, res: Response) => {
+router.get('/', async (req: Request, res: Response) => {
   try {
-    const raw = await cachedListing('skills', () => runOpenClaw(['skills', 'list', '--json']));
+    const raw = await cachedListing(
+      'skills',
+      () => runOpenClaw(['skills', 'list', '--json']),
+      req.query.refresh === '1',
+    );
     const parsed = parseJson(raw);
-    const skills = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.skills) ? parsed.skills : []);
+    const listedSkills = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.skills) ? parsed.skills : []);
+    const managedNames = readManagedSkillNames();
+    const skills = listedSkills.map((skill: any) => (
+      managedNames.has(String(skill?.name || ''))
+        ? { ...skill, source: 'managed', managed: true }
+        : skill
+    ));
     res.json({ skills });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to list skills';
@@ -170,6 +286,10 @@ router.get('/search', async (req: Request, res: Response) => {
     const query = String(req.query.q || '').trim();
     if (!query) {
       res.status(400).json({ error: 'Query required' });
+      return;
+    }
+    if (query.length > 200) {
+      res.status(400).json({ error: 'Query exceeds 200 characters' });
       return;
     }
 
@@ -213,19 +333,22 @@ router.get('/explore', async (req: Request, res: Response) => {
     if (results.length === 0) {
       const fallbackQueries = ['automation', 'weather', 'github', 'docker', 'ai'];
       const seen = new Set<string>();
-      for (const q of fallbackQueries) {
-        if (results.length >= limit) break;
+      const fallbackResults = await mapWithConcurrency(fallbackQueries, 2, async (q) => {
         try {
           const raw = await runClawHub(['search', q, '--limit', '10']);
-          for (const item of parseSearchOutput(raw)) {
-            if (!seen.has(item.name)) {
-              seen.add(item.name);
-              results.push(item);
-            }
-          }
+          return parseSearchOutput(raw);
         } catch {
-          // skip failed queries
+          return [];
         }
+      });
+      for (const queryResults of fallbackResults) {
+        for (const item of queryResults) {
+          if (seen.has(item.name)) continue;
+          seen.add(item.name);
+          results.push(item);
+          if (results.length >= limit) break;
+        }
+        if (results.length >= limit) break;
       }
       results = results.slice(0, limit);
     }
@@ -241,7 +364,7 @@ router.get('/explore', async (req: Request, res: Response) => {
 router.get('/inspect/:slug', async (req: Request, res: Response) => {
   try {
     const slug = req.params.slug;
-    if (!slug || !/^[a-z0-9_-]+$/i.test(slug)) {
+    if (!slug || !isSafeSkillName(slug)) {
       res.status(400).json({ error: 'Invalid skill slug' });
       return;
     }
@@ -259,23 +382,33 @@ router.get('/inspect/:slug', async (req: Request, res: Response) => {
 router.post('/install', async (req: Request, res: Response) => {
   try {
     const { name } = req.body;
-    if (!name || typeof name !== 'string') {
+    if (!isSafeMutationValue(name, 128)) {
       res.status(400).json({ error: 'Skill name required' });
       return;
     }
 
-    // Sanitize: only allow slug-like names
-    if (!/^[a-z0-9_-]+$/i.test(name)) {
+    // Allow ClawHub's unscoped and @scope/name skill identifiers only.
+    if (!isSafeSkillName(name)) {
       res.status(400).json({ error: 'Invalid skill name' });
       return;
     }
-
-    const result = await runClawHub(['install', name], 60000);
-    bustSkillsCache();
-    res.json({ ok: true, output: result });
+    const confirmationPhrase = confirmationForSkillInstall(name);
+    if (!isTypedConfirmationMatch(confirmationPhrase, req.body?.confirmation)) {
+      res.status(400).json({ error: `Type ${confirmationPhrase} to confirm this host-wide skill installation.`, confirmationPhrase });
+      return;
+    }
+    const job = await startSkillsMutation({
+      userId: req.user!.userId,
+      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
+      toolId: `_skill:install:${name}`,
+      title: `Install skill ${name}`,
+      executable: 'clawhub',
+      args: ['--no-input', '--workdir', resolveOpenClawWorkspace(), 'install', name],
+    });
+    res.status(202).json({ ok: true, jobId: job.id, room: `job:${job.id}` });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Install failed';
-    res.status(500).json({ error: message });
+    res.status(mutationErrorStatus(err)).json({ error: message });
   }
 });
 
@@ -283,29 +416,49 @@ router.post('/install', async (req: Request, res: Response) => {
 router.post('/uninstall', async (req: Request, res: Response) => {
   try {
     const { name } = req.body;
-    if (!name || typeof name !== 'string') {
+    if (!isSafeMutationValue(name, 128)) {
       res.status(400).json({ error: 'Skill name required' });
       return;
     }
 
-    if (!/^[a-z0-9_-]+$/i.test(name)) {
+    if (!isSafeSkillName(name)) {
       res.status(400).json({ error: 'Invalid skill name' });
       return;
     }
-
-    const result = await runClawHub(['uninstall', name], 30000);
-    bustSkillsCache();
-    res.json({ ok: true, output: result });
+    if (!readManagedSkillNames().has(name)) {
+      res.status(409).json({
+        error: 'Only skills tracked as ClawHub-managed can be removed here. Bundled and workspace skills are protected.',
+      });
+      return;
+    }
+    const confirmationPhrase = confirmationForSkillUninstall(name);
+    if (!isTypedConfirmationMatch(confirmationPhrase, req.body?.confirmation)) {
+      res.status(400).json({ error: `Type ${confirmationPhrase} to confirm this host-wide skill removal.`, confirmationPhrase });
+      return;
+    }
+    const job = await startSkillsMutation({
+      userId: req.user!.userId,
+      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
+      toolId: `_skill:uninstall:${name}`,
+      title: `Uninstall skill ${name}`,
+      executable: 'clawhub',
+      args: ['--no-input', '--workdir', resolveOpenClawWorkspace(), 'uninstall', '--yes', name],
+    });
+    res.status(202).json({ ok: true, jobId: job.id, room: `job:${job.id}` });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Uninstall failed';
-    res.status(500).json({ error: message });
+    res.status(mutationErrorStatus(err)).json({ error: message });
   }
 });
 
 /** GET /api/skills/plugins — list installed plugins (openclaw plugins list --json) */
-router.get('/plugins', async (_req: Request, res: Response) => {
+router.get('/plugins', async (req: Request, res: Response) => {
   try {
-    const raw = await cachedListing('plugins', () => runOpenClaw(['plugins', 'list', '--json']));
+    const raw = await cachedListing(
+      'plugins',
+      () => runOpenClaw(['plugins', 'list', '--json']),
+      req.query.refresh === '1',
+    );
     const parsed = parseJson(raw);
     const plugins = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.plugins) ? parsed.plugins : []);
     res.json({ plugins });
@@ -319,17 +472,31 @@ router.get('/plugins', async (_req: Request, res: Response) => {
 router.post('/plugins/install', async (req: Request, res: Response) => {
   try {
     const { spec } = req.body;
-    if (!spec || typeof spec !== 'string') {
+    if (!isSafeMutationValue(spec, 512)) {
       res.status(400).json({ error: 'Plugin spec required' });
       return;
     }
-
-    const result = await runOpenClaw(['plugins', 'install', spec], 120000);
-    bustSkillsCache();
-    res.json({ ok: true, output: result });
+    if (spec.trim().startsWith('-')) {
+      res.status(400).json({ error: 'Plugin specifications cannot begin with an option prefix' });
+      return;
+    }
+    const confirmationPhrase = confirmationForPluginInstall(spec);
+    if (!isTypedConfirmationMatch(confirmationPhrase, req.body?.confirmation)) {
+      res.status(400).json({ error: `Type ${confirmationPhrase} to confirm this host-wide plugin installation.`, confirmationPhrase });
+      return;
+    }
+    const job = await startSkillsMutation({
+      userId: req.user!.userId,
+      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
+      toolId: '_plugin:install',
+      title: `Install OpenClaw plugin ${spec}`,
+      executable: 'openclaw',
+      args: ['--no-color', 'plugins', 'install', spec],
+    });
+    res.status(202).json({ ok: true, jobId: job.id, room: `job:${job.id}` });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Plugin install failed';
-    res.status(500).json({ error: message });
+    res.status(mutationErrorStatus(err)).json({ error: message });
   }
 });
 

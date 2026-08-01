@@ -75,7 +75,7 @@ export default defineConfig(({ mode }) => {
             if (matchesAny(id, ['react-markdown', 'remark-', 'rehype-', 'unified', 'micromark', 'mdast-', 'hast-', 'property-information', 'vfile', 'unist-', 'parse5', 'entities', 'lowlight', 'highlight.js', 'devlop', 'bail', 'space-separated-tokens', 'comma-separated-tokens', 'html-void-elements', 'web-namespaces', 'zwitch', 'trough'])) return 'markdown-vendor'
             if (matchesAny(id, ['dompurify', 'marked', 'highlight.js'])) return 'content-vendor'
             if (matchesAny(id, ['react-dropzone', 'file-selector', 'attr-accept', 'qrcode.react'])) return 'input-vendor'
-            if (matchesAny(id, ['xlsx'])) return 'xlsx-vendor'
+            if (matchesAny(id, ['read-excel-file'])) return 'spreadsheet-vendor'
             if (matchesAny(id, ['react-pdf', 'pdfjs-dist'])) return 'pdf-vendor'
 
             return undefined

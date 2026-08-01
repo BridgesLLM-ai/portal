@@ -6,10 +6,43 @@ export interface RegistrationPendingResponse {
   message: string;
 }
 
+export type TwoFactorEmailDeliveryState = 'sent' | 'unavailable' | 'failed';
+
+export interface TwoFactorEmailDelivery {
+  state: TwoFactorEmailDeliveryState;
+  message: string;
+  recoveryAvailable?: boolean;
+}
+
 export interface TwoFactorLoginResponse {
   requiresTwoFactor: true;
   pendingToken: string;
   method?: 'totp' | 'email';
+  emailDelivery?: TwoFactorEmailDelivery;
+}
+
+export interface TwoFactorEmailRecoveryResponse {
+  success: true;
+  code: 'EMAIL_2FA_RECOVERED';
+  requiresFreshLogin: true;
+  message: string;
+}
+
+export class TwoFactorEmailRecoveryIndeterminateError extends Error {
+  readonly requiresFreshLogin = true;
+
+  constructor(message = 'Portal could not confirm the recovery result. Sign in again to verify the account state before retrying.') {
+    super(message);
+    this.name = 'TwoFactorEmailRecoveryIndeterminateError';
+  }
+}
+
+function requireEmailDeliveryMessage(data: unknown, operation: string): { message: string } {
+  const message = (data as { message?: unknown } | null)?.message;
+  if (typeof message !== 'string' || message.trim().length === 0) {
+    throw new Error(`${operation} returned an invalid response`);
+  }
+  return { message: message.trim() };
 }
 
 export interface TwoFactorSetupResponse {
@@ -72,6 +105,7 @@ export const authAPI = {
   me: async (options?: { allowSessionRecovery?: boolean }) => {
     const { data } = await client.get('/auth/me', {
       _allowSessionRecovery: options?.allowSessionRecovery,
+      timeout: 12000,
     } as any);
     return data;
   },
@@ -94,11 +128,33 @@ export const authAPI = {
 
   twoFactorSendEmail: async (pendingToken: string): Promise<{ message: string }> => {
     const { data } = await client.post('/auth/2fa/send-email', { pendingToken });
-    return data;
+    return requireEmailDeliveryMessage(data, 'Email Code delivery');
   },
 
   twoFactorSendEmailAuthenticated: async (): Promise<{ message: string }> => {
     const { data } = await client.post('/auth/2fa/send-email-authenticated');
+    return requireEmailDeliveryMessage(data, 'Authenticated Email Code delivery');
+  },
+
+  twoFactorRecoverEmail: async (
+    pendingToken: string,
+    currentPassword: string,
+    confirmation: string,
+  ): Promise<TwoFactorEmailRecoveryResponse> => {
+    const { data } = await client.post('/auth/2fa/recover-email', {
+      pendingToken,
+      currentPassword,
+      confirmation,
+    });
+    if (
+      data?.success !== true
+      || data?.code !== 'EMAIL_2FA_RECOVERED'
+      || data?.requiresFreshLogin !== true
+      || typeof data?.message !== 'string'
+      || data.message.trim().length === 0
+    ) {
+      throw new TwoFactorEmailRecoveryIndeterminateError();
+    }
     return data;
   },
 

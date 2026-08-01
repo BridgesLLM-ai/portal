@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="OpenAI Codex terminal runtime launcher">
+  <defs><linearGradient id="g" x1="18" y1="12" x2="112" y2="118"><stop stop-color="#16c79a"/><stop offset="1" stop-color="#087f6f"/></linearGradient></defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="#071514" stroke="#7af7d5" stroke-width="4"/>
+  <path d="M28 64c0-20 16-36 36-36s36 16 36 36-16 36-36 36S28 84 28 64Z" fill="url(#g)" opacity=".92"/>
+  <text x="64" y="73" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="27" font-weight="800" fill="#fff">CX</text>
+</svg>

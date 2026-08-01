@@ -1,4 +1,5 @@
 import type { StreamEvent, StreamInfo, StreamToolCall } from './StreamEventBus';
+import { sanitizeThinkingSubject } from '../utils/thinkingSubject';
 
 export type RuntimeTurnEventType =
   | 'assistant_started'
@@ -28,6 +29,7 @@ export interface RuntimeTurnEvent {
   seq: number;
   ts: number;
   text?: string;
+  subject?: string;
   replace?: boolean;
   visible: boolean;
   terminal?: boolean;
@@ -53,8 +55,13 @@ function latestRunningTool(info?: StreamInfo | null): StreamToolCall | null {
   return null;
 }
 
-function normalizeToolStatus(value: unknown): RuntimeTurnToolSnapshot['status'] | undefined {
+function normalizeToolStatus(event: StreamEvent): RuntimeTurnToolSnapshot['status'] | undefined {
+  if (event.isError === true) return 'error';
+  if (typeof event.exitCode === 'number' && Number.isFinite(event.exitCode) && event.exitCode !== 0) return 'error';
+  const value = typeof event.status === 'string' ? event.status.trim().toLowerCase() : '';
   if (value === 'running' || value === 'done' || value === 'error') return value;
+  if (['failed', 'failure', 'cancelled', 'canceled', 'aborted', 'denied'].includes(value)) return 'error';
+  if (['complete', 'completed', 'success', 'succeeded', 'ok'].includes(value)) return 'done';
   return undefined;
 }
 
@@ -82,6 +89,7 @@ export function normalizeRuntimeTurnEvent(params: {
   const { sessionKey, event, info, seq } = params;
   const now = params.now ?? Date.now();
   const text = cleanText(event.content);
+  const subject = sanitizeThinkingSubject(event.subject);
   const runId = cleanText(event.runId) || cleanText(info?.runId) || undefined;
   const model = eventModel(event, info);
   const provenance = eventProvenance(event, info);
@@ -118,8 +126,12 @@ export function normalizeRuntimeTurnEvent(params: {
 
     case 'thinking': {
       const rawThinking = typeof event.content === 'string' ? event.content : '';
-      if (!rawThinking.trim()) return null;
-      return base('assistant_reasoning', { text: rawThinking, visible: true });
+      if (!rawThinking.trim() && !subject) return null;
+      return base('assistant_reasoning', {
+        ...(rawThinking ? { text: rawThinking } : {}),
+        ...(subject ? { subject } : {}),
+        visible: true,
+      });
     }
 
     case 'status':
@@ -155,7 +167,7 @@ export function normalizeRuntimeTurnEvent(params: {
         tool: {
           id: cleanText(event.toolCallId) || cleanText(latestRunningTool(info)?.id) || undefined,
           name,
-          status: event.type === 'tool_update' ? 'running' : (normalizeToolStatus(event.status) || 'done'),
+          status: event.type === 'tool_update' ? 'running' : (normalizeToolStatus(event) || 'done'),
           result: cleanText(event.toolResult) || text || undefined,
         },
       });
@@ -168,6 +180,12 @@ export function normalizeRuntimeTurnEvent(params: {
       return base('turn_done', { visible: false, terminal: true });
 
     case 'error':
+      if (event.terminal !== true) {
+        return base('assistant_status', {
+          ...(text ? { text } : {}),
+          visible: Boolean(text),
+        });
+      }
       return base('turn_error', {
         ...(text ? { text } : {}),
         visible: true,

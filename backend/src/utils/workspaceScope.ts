@@ -2,10 +2,11 @@ import { prisma } from '../config/database';
 import type { JwtPayload } from './jwt';
 import { isElevatedRole, isOwnerRole } from './authz';
 
-let cachedAdminId: string | null = null;
-
 async function getPrimaryAdminId(): Promise<string> {
-  if (cachedAdminId) return cachedAdminId;
+  // Ownership can move while the process stays up. This lookup is reached
+  // only for an unsandboxed elevated delegate, so prefer a current indexed
+  // read over a process-lifetime cache that could route requests into the
+  // former owner's workspace after a transfer.
   const admin = await prisma.user.findFirst({
     where: { role: 'OWNER' as any, isActive: true, accountStatus: 'ACTIVE' } as any,
     orderBy: { createdAt: 'asc' },
@@ -14,7 +15,6 @@ async function getPrimaryAdminId(): Promise<string> {
   if (!admin) {
     throw new Error('No active owner user found');
   }
-  cachedAdminId = admin.id;
   return admin.id;
 }
 

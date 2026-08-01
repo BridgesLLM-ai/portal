@@ -1,11 +1,20 @@
 import { Router, Request, Response } from 'express';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { exec as cpExec } from 'child_process';
 import { authenticateToken } from '../middleware/auth';
-import { requireAdmin, requireOwner } from '../middleware/requireAdmin';
+import { requireAdmin } from '../middleware/requireAdmin';
+import { prisma } from '../config/database';
 import { startAgentJob } from '../services/agentJobs';
+import { isOwnerRole } from '../utils/authz';
+import { isTypedConfirmationMatch } from '../utils/privilegedConfirmation';
+import { getConfiguredBackupRoot, listBackupFiles } from '../services/backup.service';
+import {
+  getOpenClawSetupReadiness,
+  type OpenClawSetupReadiness,
+} from '../services/openclawSetupReadiness';
 
 type MaintenanceSeverity = 'healthy' | 'info' | 'warning' | 'critical';
 type MaintenanceActionRisk = 'safe' | 'scheduled' | 'manual';
@@ -24,6 +33,7 @@ type MaintenanceAction = {
   automationLevel: 'read-only' | 'safe' | 'guarded' | 'manual';
   impact: string;
   recovery: string;
+  confirmationPhrase: string | null;
 };
 
 type MaintenanceCompatibilityComponent = {
@@ -69,6 +79,66 @@ type ServiceState = {
   healthy: boolean;
 };
 
+type CheckedService = {
+  name: string;
+  label: string;
+  required: boolean;
+  installedProbe?: string;
+};
+
+type PortalDeployStamp = {
+  kind: 'portal' | 'candidate';
+  schema: string | null;
+  releaseVersion: string | null;
+  sourceVersion: string | null;
+  artifactSha256: string | null;
+  manifestSha256: string | null;
+  manifestSchema: string | null;
+  installedAt: string | null;
+  sourceHead: string | null;
+  sourceDirty: string | null;
+  deployedAt: string | null;
+};
+
+type PortalCompatibilitySnapshot = {
+  packageVersion: string | null;
+  sourceVersion: string | null;
+  compiledVersion: string | null;
+  installerVersion: string | null;
+  deployStamp: PortalDeployStamp | null;
+};
+
+type ActiveMaintenanceJob = {
+  id: string;
+  title: string | null;
+  startedAt: Date | null;
+};
+
+type MaintenanceAdmissionOptions = {
+  lockPath?: string;
+  nowMs?: () => number;
+  activeJobLookup?: () => Promise<ActiveMaintenanceJob | null>;
+  processAlive?: (pid: number) => boolean;
+  staleMs?: number;
+};
+
+type MaintenanceBackupCandidate = {
+  filename: string;
+  fullPath: string;
+  size: number;
+  mtimeMs: number;
+  dev: number;
+  ino: number;
+};
+
+type VerifiedMaintenanceBackup = {
+  path: string;
+  filename: string;
+  createdAt: string;
+  ageHours: number;
+  size: number;
+};
+
 const router = Router();
 router.use(authenticateToken, requireAdmin);
 
@@ -79,21 +149,27 @@ const APT_LOCKS = [
   '/var/lib/apt/lists/lock',
 ];
 
-const BACKUP_DIRS = [
-  '/root/backups/daily',
-  '/root/backups/weekly',
-  '/root/backups/monthly',
-  '/root/backups/comprehensive',
-  '/opt/bridgesllm/backups',
-];
-
-const CHECKED_SERVICES = [
+const CHECKED_SERVICES: CheckedService[] = [
   { name: 'bridgesllm-product.service', label: 'Portal backend', required: true },
   { name: 'caddy.service', label: 'Caddy reverse proxy', required: true },
-  { name: 'docker.service', label: 'Docker engine', required: false },
+  { name: 'openclaw-gateway.service', label: 'OpenClaw gateway', required: false, installedProbe: 'command -v openclaw >/dev/null 2>&1' },
+  { name: 'postgresql.service', label: 'PostgreSQL', required: false, installedProbe: 'test -d /etc/postgresql' },
+  { name: 'stalwart-mail.service', label: 'Stalwart mail server', required: false, installedProbe: 'command -v stalwart-mail >/dev/null 2>&1 || command -v stalwart >/dev/null 2>&1' },
+  { name: 'clamav-daemon.service', label: 'ClamAV scanner', required: true },
+  { name: 'clamav-freshclam.service', label: 'ClamAV signature updater', required: true },
+  { name: 'monarx-agent.service', label: 'Monarx malware agent', required: false, installedProbe: 'command -v monarx-agent >/dev/null 2>&1 || test -d /opt/monarx' },
+  { name: 'bridgesllm-backup-daily.timer', label: 'Daily backup timer', required: true },
+  { name: 'bridgesllm-backup-comprehensive.timer', label: 'Comprehensive backup timer', required: true },
+  { name: 'bridgesllm-backup-monthly.timer', label: 'Monthly backup timer', required: true },
+  { name: 'docker.service', label: 'Docker engine', required: false, installedProbe: 'command -v docker >/dev/null 2>&1' },
   { name: 'bridges-rd-xtigervnc.service', label: 'Remote Desktop VNC', required: false },
   { name: 'bridges-rd-websockify.service', label: 'Remote Desktop WebSocket bridge', required: false },
 ];
+
+export const MAINTENANCE_BACKUP_MAX_AGE_HOURS = 24;
+const MAINTENANCE_BACKUP_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
+const MAINTENANCE_ADMISSION_STALE_MS = 10 * 60 * 1000;
+const MAINTENANCE_TOOL_ID = 'system-maintenance';
 
 const PROTECTED_PACKAGE_REGEX = /^(?:bridgesllm(?:-.+)?|openclaw(?:-.+)?|stalwart(?:-.+)?|stalwart-mail|caddy)$/i;
 
@@ -168,7 +244,11 @@ else
 fi
 
 section "Service state"
-for service in bridgesllm-product.service caddy.service docker.service bridges-rd-xtigervnc.service bridges-rd-websockify.service; do
+for service in \
+  bridgesllm-product.service caddy.service openclaw-gateway.service postgresql.service \
+  stalwart-mail.service clamav-daemon.service clamav-freshclam.service monarx-agent.service \
+  bridgesllm-backup-daily.timer bridgesllm-backup-comprehensive.timer bridgesllm-backup-monthly.timer \
+  docker.service bridges-rd-xtigervnc.service bridges-rd-websockify.service; do
   printf '%s: ' "$service"
   systemctl is-active "$service" 2>/dev/null || true
 done
@@ -203,12 +283,24 @@ else
 fi
 
 section "Latest backups"
-find /opt/bridgesllm/backups /root/backups/daily /root/backups/weekly /root/backups/monthly /root/backups/comprehensive \\
+backup_base="/root/backups"
+backup_config="\${portal_root}/backend/.data/backups/backup-base-path"
+if [ -r "\${backup_config}" ]; then
+  IFS= read -r configured_backup_base < "\${backup_config}" || true
+  case "\${configured_backup_base:-}" in
+    /*) backup_base="\${configured_backup_base}" ;;
+  esac
+fi
+find "\${backup_base}/daily" "\${backup_base}/weekly" "\${backup_base}/monthly" "\${backup_base}/comprehensive" \\
   -maxdepth 1 -type f \\( -name '*.tgz' -o -name '*.tar.gz' \\) -printf '%T@ %TY-%Tm-%Td %TH:%TM %p\\n' 2>/dev/null \\
   | sort -nr | head -n 10 || true
 
 section "Services that should come back after reboot"
-for service in bridgesllm-product.service caddy.service docker.service bridges-rd-xtigervnc.service bridges-rd-websockify.service; do
+for service in \
+  bridgesllm-product.service caddy.service openclaw-gateway.service postgresql.service \
+  stalwart-mail.service clamav-daemon.service clamav-freshclam.service monarx-agent.service \
+  bridgesllm-backup-daily.timer bridgesllm-backup-comprehensive.timer bridgesllm-backup-monthly.timer \
+  docker.service bridges-rd-xtigervnc.service bridges-rd-websockify.service; do
   printf '%s: ' "$service"
   systemctl is-active "$service" 2>/dev/null || true
 done
@@ -257,7 +349,7 @@ const ACTIONS: Record<string, MaintenanceAction & { command: string; title: stri
     description: 'Creates a read-only compatibility and package drift report. No updates are applied.',
     risk: 'safe',
     downtimeExpected: false,
-    requiresOwner: true,
+    requiresOwner: false,
     changesSystem: false,
     destructive: false,
     requiresBackup: false,
@@ -265,6 +357,7 @@ const ACTIONS: Record<string, MaintenanceAction & { command: string; title: stri
     automationLevel: 'read-only',
     impact: 'Reads package, service, reboot, backup, and compatibility state. It does not modify the server.',
     recovery: 'No rollback needed; this action only writes a background-task transcript.',
+    confirmationPhrase: null,
     command: MAINTENANCE_PLAN_COMMAND,
   },
   'prepare-reboot-checklist': {
@@ -274,7 +367,7 @@ const ACTIONS: Record<string, MaintenanceAction & { command: string; title: stri
     description: 'Creates a read-only reboot readiness checklist with backup, service, and package context. It does not reboot the server.',
     risk: 'scheduled',
     downtimeExpected: false,
-    requiresOwner: true,
+    requiresOwner: false,
     changesSystem: false,
     destructive: false,
     requiresBackup: false,
@@ -282,6 +375,7 @@ const ACTIONS: Record<string, MaintenanceAction & { command: string; title: stri
     automationLevel: 'read-only',
     impact: 'Reads reboot-required state and service health so an admin can schedule downtime deliberately.',
     recovery: 'No rollback needed; this action only writes a background-task transcript.',
+    confirmationPhrase: null,
     command: REBOOT_CHECKLIST_COMMAND,
   },
   'refresh-package-cache': {
@@ -299,6 +393,7 @@ const ACTIONS: Record<string, MaintenanceAction & { command: string; title: stri
     automationLevel: 'safe',
     impact: 'Updates local apt metadata only. It does not install or remove packages.',
     recovery: 'Usually no rollback needed; rerun package checks if the cache refresh fails.',
+    confirmationPhrase: 'REFRESH PACKAGE CACHE',
     command: 'set -euo pipefail\nexport DEBIAN_FRONTEND=noninteractive\napt-get update',
   },
   'apply-security-updates': {
@@ -316,6 +411,7 @@ const ACTIONS: Record<string, MaintenanceAction & { command: string; title: stri
     automationLevel: 'guarded',
     impact: 'Installs security updates through unattended-upgrade. It does not intentionally run broad upgrades or reboot automatically.',
     recovery: 'Use the latest Portal backup and package logs if a security update causes a regression; reboot still requires a separate scheduled action.',
+    confirmationPhrase: 'APPLY SECURITY UPDATES',
     command: SECURITY_UPDATE_COMMAND,
   },
   'create-maintenance-backup': {
@@ -333,7 +429,8 @@ const ACTIONS: Record<string, MaintenanceAction & { command: string; title: stri
     automationLevel: 'safe',
     impact: 'Creates a Portal backup archive. It writes backup files but should not change running services.',
     recovery: 'Delete the failed or unwanted backup archive if storage cleanup is needed.',
-    command: 'set -euo pipefail\nportal_root="${PORTAL_ROOT:-/opt/bridgesllm/portal}"\nbash "$portal_root/backup-full.sh" daily',
+    confirmationPhrase: 'CREATE MAINTENANCE BACKUP',
+    command: 'set -euo pipefail\nsystemctl start bridgesllm-backup@daily.service',
   },
 };
 
@@ -343,7 +440,12 @@ function shellQuote(value: string): string {
 
 function runShell(command: string, timeoutMs = 8000): Promise<CommandResult> {
   return new Promise((resolve) => {
-    cpExec(command, { timeout: timeoutMs, shell: '/bin/bash', maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+    cpExec(command, {
+      env: process.env,
+      timeout: timeoutMs,
+      shell: '/bin/bash',
+      maxBuffer: 1024 * 1024,
+    }, (error, stdout, stderr) => {
       resolve({
         ok: !error,
         stdout: String(stdout || '').trim(),
@@ -393,16 +495,235 @@ function readJsonVersion(filePath: string): string | null {
   }
 }
 
+function readVersionLiteral(filePath: string, expression: RegExp): string | null {
+  try {
+    const content = fs.readFileSync(filePath, 'utf8');
+    return content.match(expression)?.[1]?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function emptyDeployStamp(kind: PortalDeployStamp['kind']): PortalDeployStamp {
+  return {
+    kind,
+    schema: null,
+    releaseVersion: null,
+    sourceVersion: null,
+    artifactSha256: null,
+    manifestSha256: null,
+    manifestSchema: null,
+    installedAt: null,
+    sourceHead: null,
+    sourceDirty: null,
+    deployedAt: null,
+  };
+}
+
+function parseDeployStamp(raw: string, kind: PortalDeployStamp['kind']): PortalDeployStamp | null {
+  const values = new Map<string, string>();
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line) continue;
+    const separator = line.indexOf('=');
+    if (separator <= 0) return null;
+    const key = line.slice(0, separator).trim();
+    if (!key || values.has(key)) return null;
+    values.set(key, line.slice(separator + 1).trim());
+  }
+  const expectedKeys = kind === 'portal'
+    ? new Set(['schema', 'source_version', 'release_version', 'artifact_sha256', 'manifest_sha256', 'manifest_schema', 'installed_at'])
+    : new Set(['artifact_sha256', 'source_head', 'source_dirty', 'deployed_at']);
+  if (values.size !== expectedKeys.size || [...values.keys()].some((key) => !expectedKeys.has(key))) return null;
+  return {
+    ...emptyDeployStamp(kind),
+    schema: values.get('schema') || null,
+    releaseVersion: values.get('release_version') || null,
+    sourceVersion: values.get('source_version') || null,
+    artifactSha256: values.get('artifact_sha256') || null,
+    manifestSha256: values.get('manifest_sha256') || null,
+    manifestSchema: values.get('manifest_schema') || null,
+    installedAt: values.get('installed_at') || null,
+    sourceHead: values.get('source_head') || null,
+    sourceDirty: values.get('source_dirty') || null,
+    deployedAt: values.get('deployed_at') || null,
+  };
+}
+
+function readPortalDeployStamp(root: string): PortalDeployStamp | null {
+  const candidates = [
+    { path: path.join(path.dirname(root), '.last-portal-deploy'), kind: 'portal' as const },
+    { path: path.join(root, '.last-portal-deploy'), kind: 'portal' as const },
+    { path: path.join(path.dirname(root), '.last-candidate-deploy'), kind: 'candidate' as const },
+    { path: path.join(root, '.last-candidate-deploy'), kind: 'candidate' as const },
+  ];
+  for (const candidate of candidates) {
+    try {
+      const stat = fs.lstatSync(candidate.path);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16 * 1024) {
+        return emptyDeployStamp(candidate.kind);
+      }
+      return parseDeployStamp(fs.readFileSync(candidate.path, 'utf8'), candidate.kind)
+        || emptyDeployStamp(candidate.kind);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
+      return emptyDeployStamp(candidate.kind);
+    }
+  }
+  return null;
+}
+
+export function portalCompatibilitySnapshot(root: string): PortalCompatibilitySnapshot {
+  return {
+    packageVersion: readJsonVersion(path.join(root, 'backend/package.json')),
+    sourceVersion: readVersionLiteral(
+      path.join(root, 'backend/src/version.ts'),
+      /PORTAL_VERSION\s*=\s*['"]([^'"]+)['"]/,
+    ),
+    compiledVersion: readVersionLiteral(
+      path.join(root, 'backend/dist/version.js'),
+      /PORTAL_VERSION\s*=\s*['"]([^'"]+)['"]/,
+    ),
+    installerVersion: readVersionLiteral(
+      path.join(root, 'installer/install.sh'),
+      /readonly\s+VERSION\s*=\s*['"]([^'"]+)['"]/,
+    ),
+    deployStamp: readPortalDeployStamp(root),
+  };
+}
+
+function validDeployStamp(stamp: PortalDeployStamp | null, expectedVersion: string | null): boolean {
+  if (!stamp || !expectedVersion || !/^[a-f0-9]{64}$/i.test(stamp.artifactSha256 || '')) return false;
+  if (stamp.kind === 'portal') {
+    return Boolean(
+      stamp.schema === '1'
+      && (stamp.manifestSchema === '1' || stamp.manifestSchema === '2')
+      && stamp.releaseVersion === expectedVersion
+      && stamp.sourceVersion === expectedVersion
+      && /^[a-f0-9]{64}$/i.test(stamp.manifestSha256 || '')
+      && stamp.installedAt
+      && Number.isFinite(Date.parse(stamp.installedAt)),
+    );
+  }
+  // Candidate transport stamps predate the signed manifest identity and are
+  // useful diagnostics, but they are not installer-owned release provenance.
+  return false;
+}
+
+export function buildPortalMaintenanceComponent(
+  snapshot: PortalCompatibilitySnapshot,
+): MaintenanceCompatibilityComponent {
+  const requiredVersions = [
+    ['package', snapshot.packageVersion],
+    ['compiled runtime', snapshot.compiledVersion],
+    ['installer', snapshot.installerVersion],
+  ] as const;
+  const presentVersions = [
+    ...requiredVersions,
+    ...(snapshot.sourceVersion ? [['source', snapshot.sourceVersion] as const] : []),
+  ];
+  const missing = requiredVersions.filter(([, version]) => !version).map(([label]) => label);
+  const distinctVersions = new Set(presentVersions.map(([, version]) => version).filter(Boolean));
+  const versionMismatch = distinctVersions.size > 1;
+  const expectedVersion = distinctVersions.size === 1 ? [...distinctVersions][0] || null : null;
+  const stampValid = validDeployStamp(snapshot.deployStamp, expectedVersion);
+  const stampVersionMismatch = snapshot.deployStamp?.kind === 'portal'
+    && expectedVersion !== null
+    && (snapshot.deployStamp.releaseVersion !== expectedVersion || snapshot.deployStamp.sourceVersion !== expectedVersion);
+  const stampDescription = snapshot.deployStamp
+    ? snapshot.deployStamp.kind === 'portal'
+      ? `release ${snapshot.deployStamp.releaseVersion || 'unknown'} · artifact ${(snapshot.deployStamp.artifactSha256 || 'unknown').slice(0, 12)} · manifest ${(snapshot.deployStamp.manifestSha256 || 'unknown').slice(0, 12)}`
+      : `candidate artifact ${(snapshot.deployStamp.artifactSha256 || 'unknown').slice(0, 12)} · source ${snapshot.deployStamp.sourceHead || 'unknown'}`
+    : 'deployment stamp missing';
+
+  let status: MaintenanceCompatibilityComponent['status'] = 'ok';
+  let note = `Package, compiled runtime, installer${snapshot.sourceVersion ? ', and source' : ''} agree; ${stampDescription}.`;
+  if (versionMismatch) {
+    status = 'blocked';
+    note = `Portal version drift detected: ${presentVersions.map(([label, version]) => `${label} ${version || 'missing'}`).join(' · ')}.`;
+  } else if (missing.length > 0) {
+    status = 'unknown';
+    note = `Portal compatibility cannot be proven because ${missing.join(', ')} version evidence is missing.`;
+  } else if (stampVersionMismatch) {
+    status = 'blocked';
+    note = `Portal deploy provenance targets release ${snapshot.deployStamp?.releaseVersion || 'unknown'} / source ${snapshot.deployStamp?.sourceVersion || 'unknown'}, but the installed runtime is ${expectedVersion}.`;
+  } else if (!stampValid) {
+    status = 'review';
+    note = 'Portal versions agree, but clean source/artifact deployment provenance could not be verified from the deploy stamp.';
+  }
+
+  return {
+    id: 'portal',
+    label: 'BridgesLLM Portal',
+    installedVersion: presentVersions.map(([label, version]) => `${label} ${version || 'unknown'}`).join(' · '),
+    supportedVersion: 'Exact package/source/compiled/installer parity with a clean artifact deploy stamp',
+    policy: 'self-update-only',
+    status,
+    note,
+  };
+}
+
 async function firstCommandLine(command: string, timeoutMs = 4000): Promise<string | null> {
   const result = await runShell(command, timeoutMs);
   const line = `${result.stdout}\n${result.stderr}`.split(/\r?\n/).map((value) => value.trim()).find(Boolean);
   return line || null;
 }
 
+type OpenClawCompatibilitySnapshot = Pick<OpenClawSetupReadiness,
+  | 'installed'
+  | 'version'
+  | 'corePackageVersion'
+  | 'runningVersion'
+  | 'codexPluginVersion'
+  | 'testedCorePackageVersion'
+  | 'testedRuntimeVersion'
+  | 'testedCodexPluginVersion'
+  | 'testedPairReady'
+  | 'blockers'
+>;
+
+export function buildOpenClawMaintenanceComponent(
+  readiness: OpenClawCompatibilitySnapshot,
+): MaintenanceCompatibilityComponent {
+  const pairBlockerCodes = new Set([
+    'not-installed',
+    'core-package-mismatch',
+    'cli-runtime-mismatch',
+    'gateway-rpc-unavailable',
+    'gateway-runtime-mismatch',
+    'codex-plugin-mismatch',
+  ]);
+  const pairBlockers = readiness.blockers
+    .filter((blocker) => pairBlockerCodes.has(blocker.code))
+    .map((blocker) => blocker.message);
+  const installedSummary = [
+    `core ${readiness.corePackageVersion || 'unknown'}`,
+    `CLI ${readiness.version || 'unknown'}`,
+    `gateway ${readiness.runningVersion || 'unknown'}`,
+    `Codex ${readiness.codexPluginVersion || 'unknown'}`,
+  ].join(' · ');
+  const supportedSummary = [
+    `core ${readiness.testedCorePackageVersion}`,
+    `runtime ${readiness.testedRuntimeVersion}`,
+    `Codex ${readiness.testedCodexPluginVersion}`,
+  ].join(' · ');
+
+  return {
+    id: 'openclaw',
+    label: 'OpenClaw runtime',
+    installedVersion: readiness.installed ? installedSummary : null,
+    supportedVersion: supportedSummary,
+    policy: 'known-compatible',
+    status: !readiness.installed ? 'unknown' : (readiness.testedPairReady ? 'ok' : 'blocked'),
+    note: readiness.testedPairReady
+      ? 'Installed core, running gateway, and Codex plugin match the exact Portal-tested pair.'
+      : (pairBlockers.join(' ') || 'The installed OpenClaw pair could not be verified.'),
+  };
+}
+
 async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
   const root = portalRoot();
-  const [openClawVersion, caddyVersion, stalwartVersion, caddyCandidateRaw] = await Promise.all([
-    firstCommandLine('command -v openclaw >/dev/null 2>&1 && openclaw --version'),
+  const [openClawReadiness, caddyVersion, stalwartVersion, caddyCandidateRaw] = await Promise.all([
+    getOpenClawSetupReadiness(),
     firstCommandLine('command -v caddy >/dev/null 2>&1 && caddy version'),
     firstCommandLine('command -v stalwart-mail >/dev/null 2>&1 && stalwart-mail --version || command -v stalwart >/dev/null 2>&1 && stalwart --version'),
     firstCommandLine("apt-cache policy caddy 2>/dev/null | awk '/Candidate:/ {print $2}'"),
@@ -425,24 +746,8 @@ async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
     policy: 'guarded',
     summary: 'Automation is limited to known-safe maintenance. Broad package and managed-component upgrades require a generated plan before execution.',
     components: [
-      {
-        id: 'portal',
-        label: 'BridgesLLM Portal',
-        installedVersion: readJsonVersion(path.join(root, 'backend/package.json')),
-        supportedVersion: 'Current release channel',
-        policy: 'self-update-only',
-        status: 'ok',
-        note: 'Portal updates should use the Portal updater or installer artifact path, not a broad system upgrade.',
-      },
-      {
-        id: 'openclaw',
-        label: 'OpenClaw runtime',
-        installedVersion: openClawVersion,
-        supportedVersion: 'Portal-confirmed runtime versions',
-        policy: 'known-compatible',
-        status: openClawVersion ? 'ok' : 'unknown',
-        note: 'Runtime upgrades should be coordinated with Portal gateway compatibility checks.',
-      },
+      buildPortalMaintenanceComponent(portalCompatibilitySnapshot(root)),
+      buildOpenClawMaintenanceComponent(openClawReadiness),
       {
         id: 'stalwart',
         label: 'Mail server',
@@ -467,26 +772,262 @@ async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
   };
 }
 
-function latestBackup(): { path: string; createdAt: string; ageHours: number } | null {
-  let latest: { path: string; mtimeMs: number } | null = null;
-  for (const dir of BACKUP_DIRS) {
-    if (!fs.existsSync(dir)) continue;
-    for (const name of fs.readdirSync(dir)) {
-      if (!/\.(?:tar\.gz|tgz)$/i.test(name)) continue;
-      const fullPath = path.join(dir, name);
-      try {
-        const stat = fs.statSync(fullPath);
-        if (!stat.isFile()) continue;
-        if (!latest || stat.mtimeMs > latest.mtimeMs) latest = { path: fullPath, mtimeMs: stat.mtimeMs };
-      } catch {}
-    }
+async function latestBackup(): Promise<{ path: string; createdAt: string; ageHours: number } | null> {
+  let latest: { fullPath: string; mtimeMs: number } | null = null;
+  try {
+    const root = await getConfiguredBackupRoot();
+    latest = listBackupFiles(root).sort((a, b) => b.mtimeMs - a.mtimeMs)[0] || null;
+  } catch {
+    return null;
   }
   if (!latest) return null;
   return {
-    path: latest.path,
+    path: latest.fullPath,
     createdAt: new Date(latest.mtimeMs).toISOString(),
     ageHours: ageHoursSince(latest.mtimeMs),
   };
+}
+
+function maintenanceLockPath(): string {
+  return path.join(portalRoot(), 'backend', '.data', 'locks', 'system-maintenance.lock');
+}
+
+function defaultProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: any) {
+    return error?.code === 'EPERM';
+  }
+}
+
+function readMaintenanceLockOwner(lockPath: string): { pid: number; token: string } | null {
+  try {
+    const stat = fs.lstatSync(lockPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096) return null;
+    const parsed = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as { pid?: unknown; token?: unknown };
+    if (!Number.isSafeInteger(parsed.pid) || (parsed.pid as number) <= 1 || typeof parsed.token !== 'string') return null;
+    return { pid: parsed.pid as number, token: parsed.token };
+  } catch {
+    return null;
+  }
+}
+
+async function findActiveMaintenanceJob(): Promise<ActiveMaintenanceJob | null> {
+  return prisma.agentJob.findFirst({
+    where: { toolId: MAINTENANCE_TOOL_ID, status: 'running' },
+    orderBy: { createdAt: 'asc' },
+    select: { id: true, title: true, startedAt: true },
+  });
+}
+
+export class MaintenanceAdmissionError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode: 409 | 503,
+    public readonly code: 'MAINTENANCE_BUSY' | 'MAINTENANCE_ADMISSION_UNAVAILABLE',
+    public readonly activeJob: ActiveMaintenanceJob | null = null,
+  ) {
+    super(message);
+    this.name = 'MaintenanceAdmissionError';
+  }
+}
+
+function releaseOwnedMaintenanceLock(lockPath: string, token: string): void {
+  const owner = readMaintenanceLockOwner(lockPath);
+  if (!owner || owner.token !== token) return;
+  try {
+    fs.unlinkSync(lockPath);
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') console.warn('[system-maintenance] failed to release admission lock:', error);
+  }
+}
+
+/**
+ * Acquire a host-local atomic admission lock, then consult the durable AgentJob
+ * ledger before allowing a new maintenance process. The file closes the
+ * query/create race between concurrent requests; the DB row keeps the gate
+ * closed after admission is released and across Portal restarts.
+ */
+export async function acquireMaintenanceActionAdmission(
+  options: MaintenanceAdmissionOptions = {},
+): Promise<{ release: () => void }> {
+  const lockPath = options.lockPath || maintenanceLockPath();
+  const nowMs = options.nowMs || Date.now;
+  const activeJobLookup = options.activeJobLookup || findActiveMaintenanceJob;
+  const processAlive = options.processAlive || defaultProcessAlive;
+  const staleMs = options.staleMs ?? MAINTENANCE_ADMISSION_STALE_MS;
+  const token = crypto.randomUUID();
+
+  try {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+    const directory = fs.lstatSync(path.dirname(lockPath));
+    if (!directory.isDirectory() || directory.isSymbolicLink()) {
+      throw new Error('Maintenance lock directory is not a real directory');
+    }
+    fs.chmodSync(path.dirname(lockPath), 0o700);
+  } catch (error: any) {
+    throw new MaintenanceAdmissionError(
+      `Maintenance admission is unavailable: ${error?.message || 'lock directory validation failed'}`,
+      503,
+      'MAINTENANCE_ADMISSION_UNAVAILABLE',
+    );
+  }
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let descriptor: number | null = null;
+    let createdLock = false;
+    try {
+      descriptor = fs.openSync(lockPath, 'wx', 0o600);
+      createdLock = true;
+      fs.writeFileSync(descriptor, `${JSON.stringify({ pid: process.pid, token, createdAt: new Date(nowMs()).toISOString() })}\n`, 'utf8');
+      fs.closeSync(descriptor);
+      descriptor = null;
+
+      let activeJob: ActiveMaintenanceJob | null;
+      try {
+        activeJob = await activeJobLookup();
+      } catch (error: any) {
+        releaseOwnedMaintenanceLock(lockPath, token);
+        throw new MaintenanceAdmissionError(
+          `Maintenance admission is unavailable because active jobs could not be verified: ${error?.message || 'database query failed'}`,
+          503,
+          'MAINTENANCE_ADMISSION_UNAVAILABLE',
+        );
+      }
+      if (activeJob) {
+        releaseOwnedMaintenanceLock(lockPath, token);
+        throw new MaintenanceAdmissionError(
+          `A maintenance job is already running${activeJob.title ? `: ${activeJob.title}` : ''}.`,
+          409,
+          'MAINTENANCE_BUSY',
+          activeJob,
+        );
+      }
+
+      return { release: () => releaseOwnedMaintenanceLock(lockPath, token) };
+    } catch (error: any) {
+      if (descriptor !== null) {
+        try { fs.closeSync(descriptor); } catch {}
+      }
+      if (createdLock && !(error instanceof MaintenanceAdmissionError)) {
+        try { fs.unlinkSync(lockPath); } catch {}
+      }
+      if (error instanceof MaintenanceAdmissionError) throw error;
+      if (error?.code !== 'EEXIST') {
+        throw new MaintenanceAdmissionError(
+          `Maintenance admission is unavailable: ${error?.message || 'lock acquisition failed'}`,
+          503,
+          'MAINTENANCE_ADMISSION_UNAVAILABLE',
+        );
+      }
+
+      let activeJob: ActiveMaintenanceJob | null;
+      try {
+        activeJob = await activeJobLookup();
+      } catch (lookupError: any) {
+        throw new MaintenanceAdmissionError(
+          `Maintenance admission is unavailable because active jobs could not be verified: ${lookupError?.message || 'database query failed'}`,
+          503,
+          'MAINTENANCE_ADMISSION_UNAVAILABLE',
+        );
+      }
+      if (activeJob) {
+        throw new MaintenanceAdmissionError(
+          `A maintenance job is already running${activeJob.title ? `: ${activeJob.title}` : ''}.`,
+          409,
+          'MAINTENANCE_BUSY',
+          activeJob,
+        );
+      }
+
+      let stat: fs.Stats | null = null;
+      try { stat = fs.lstatSync(lockPath); } catch {}
+      const owner = readMaintenanceLockOwner(lockPath);
+      const stale = Boolean(stat && nowMs() - stat.mtimeMs >= staleMs);
+      const abandoned = owner ? !processAlive(owner.pid) : stale;
+      if (attempt === 0 && stale && abandoned) {
+        const quarantinePath = `${lockPath}.stale-${process.pid}-${crypto.randomUUID()}`;
+        try {
+          fs.renameSync(lockPath, quarantinePath);
+          fs.unlinkSync(quarantinePath);
+          continue;
+        } catch (reclaimError: any) {
+          if (reclaimError?.code === 'ENOENT') continue;
+        }
+      }
+      throw new MaintenanceAdmissionError(
+        'Another maintenance request is being admitted. Wait for it to finish before starting another action.',
+        409,
+        'MAINTENANCE_BUSY',
+      );
+    }
+  }
+
+  throw new MaintenanceAdmissionError(
+    'Maintenance admission could not be established safely.',
+    503,
+    'MAINTENANCE_ADMISSION_UNAVAILABLE',
+  );
+}
+
+export async function verifyMaintenanceBackupArchive(candidate: MaintenanceBackupCandidate): Promise<boolean> {
+  if (candidate.size <= 0) return false;
+  const backupScript = process.env.BACKUP_SCRIPT_PATH
+    || path.join(portalRoot(), 'backup-full.sh');
+  const verification = await runShell(
+    `/bin/bash ${shellQuote(backupScript)} --verify-archive ${shellQuote(candidate.fullPath)}`,
+    120_000,
+  );
+  if (!verification.ok) return false;
+  try {
+    const stat = fs.lstatSync(candidate.fullPath);
+    return stat.isFile()
+      && !stat.isSymbolicLink()
+      && stat.dev === candidate.dev
+      && stat.ino === candidate.ino
+      && stat.size === candidate.size
+      && stat.mtimeMs === candidate.mtimeMs;
+  } catch {
+    return false;
+  }
+}
+
+export async function findFreshVerifiedMaintenanceBackup(options: {
+  nowMs?: number;
+  candidates?: MaintenanceBackupCandidate[];
+  verifyArchive?: (candidate: MaintenanceBackupCandidate) => Promise<boolean>;
+} = {}): Promise<VerifiedMaintenanceBackup | null> {
+  const nowMs = options.nowMs ?? Date.now();
+  let candidates = options.candidates;
+  if (!candidates) {
+    try {
+      const root = await getConfiguredBackupRoot();
+      candidates = listBackupFiles(root);
+    } catch {
+      return null;
+    }
+  }
+  const verifyArchive = options.verifyArchive || verifyMaintenanceBackupArchive;
+  const maxAgeMs = MAINTENANCE_BACKUP_MAX_AGE_HOURS * 3_600_000;
+  const eligible = candidates
+    .filter((candidate) => candidate.size > 0)
+    .filter((candidate) => nowMs - candidate.mtimeMs <= maxAgeMs)
+    .filter((candidate) => candidate.mtimeMs - nowMs <= MAINTENANCE_BACKUP_MAX_FUTURE_SKEW_MS)
+    .sort((left, right) => right.mtimeMs - left.mtimeMs);
+
+  for (const candidate of eligible) {
+    if (!await verifyArchive(candidate)) continue;
+    return {
+      path: candidate.fullPath,
+      filename: candidate.filename,
+      createdAt: new Date(candidate.mtimeMs).toISOString(),
+      ageHours: Math.round(((nowMs - candidate.mtimeMs) / 3_600_000) * 10) / 10,
+      size: candidate.size,
+    };
+  }
+  return null;
 }
 
 async function getRootDisk() {
@@ -566,10 +1107,17 @@ async function getServiceStates(): Promise<ServiceState[]> {
   const states: ServiceState[] = [];
   for (const service of CHECKED_SERVICES) {
     const exists = await runShell(`systemctl cat ${shellQuote(service.name)} >/dev/null 2>&1`, 4000);
-    if (!exists.ok && !service.required) continue;
+    if (!exists.ok && !service.required) {
+      const installed = service.installedProbe
+        ? await runShell(service.installedProbe, 4000)
+        : null;
+      if (!installed?.ok) continue;
+    }
     const active = await runShell(`systemctl is-active ${shellQuote(service.name)} 2>/dev/null || true`, 4000);
     states.push({
-      ...service,
+      name: service.name,
+      label: service.label,
+      required: service.required,
       exists: exists.ok,
       active: active.stdout.trim() || 'unknown',
       healthy: exists.ok && active.stdout.trim() === 'active',
@@ -590,7 +1138,7 @@ async function collectMaintenanceStatus() {
     getCompatibilityState(),
   ]);
   const osRelease = readOsRelease();
-  const backup = latestBackup();
+  const backup = await latestBackup();
   const rebootRequired = fs.existsSync('/var/run/reboot-required');
   const rebootPackages = fs.existsSync('/var/run/reboot-required.pkgs')
     ? fs.readFileSync('/var/run/reboot-required.pkgs', 'utf8').split(/\r?\n/).filter(Boolean).slice(0, 20)
@@ -706,21 +1254,21 @@ async function collectMaintenanceStatus() {
     issues.push({
       id: 'backup-missing',
       title: 'No Portal backup found',
-      detail: 'No backup archive was found in the standard backup locations.',
+      detail: 'No backup archive was found in the configured backup storage.',
       severity: 'warning',
       category: 'backups',
       recommendation: 'Create a backup before maintenance.',
       actionId: 'create-maintenance-backup',
       automationSafe: true,
     });
-  } else if (backup.ageHours > 72) {
+  } else if (backup.ageHours > MAINTENANCE_BACKUP_MAX_AGE_HOURS) {
     issues.push({
       id: 'backup-stale',
       title: 'Latest backup is stale',
       detail: `Latest backup is about ${backup.ageHours} hours old.`,
-      severity: backup.ageHours > 168 ? 'warning' : 'info',
+      severity: backup.ageHours > 72 ? 'warning' : 'info',
       category: 'backups',
-      recommendation: 'Create a fresh backup before maintenance.',
+      recommendation: `Create a verified backup no more than ${MAINTENANCE_BACKUP_MAX_AGE_HOURS} hours before guarded maintenance.`,
       actionId: 'create-maintenance-backup',
       automationSafe: true,
     });
@@ -762,7 +1310,7 @@ async function collectMaintenanceStatus() {
     services,
     reboot: { required: rebootRequired, packages: rebootPackages },
     compatibility,
-    actions: Object.values(ACTIONS).map(({ command, title, ...action }) => action),
+    actions: Object.values(ACTIONS).map(({ command: _command, title: _title, ...action }) => action),
     issues,
   };
 }
@@ -771,48 +1319,202 @@ async function collectMaintenanceStatus() {
 // a cold or busy host. Serve a short-lived cache with stale-while-refresh
 // semantics so the dashboard's checks section renders instantly on revisit
 // while a background refresh keeps the data honest.
-const MAINTENANCE_CACHE_TTL_MS = 60_000;
-let maintenanceCache: { at: number; status: any } | null = null;
-let maintenanceRefreshInFlight: Promise<any> | null = null;
+const MAINTENANCE_CACHE_TTL_MS = 10 * 60_000;
+const MAINTENANCE_REFRESH_RETRY_BASE_MS = 5_000;
+const MAINTENANCE_REFRESH_RETRY_MAX_MS = 60_000;
 
-async function refreshMaintenanceStatus(): Promise<any> {
-  if (maintenanceRefreshInFlight) return maintenanceRefreshInFlight;
-  maintenanceRefreshInFlight = collectMaintenanceStatus()
-    .then((status) => {
-      maintenanceCache = { at: Date.now(), status };
-      return status;
-    })
-    .finally(() => {
-      maintenanceRefreshInFlight = null;
-    });
-  return maintenanceRefreshInFlight;
+type MaintenanceRefreshCache<T> = { at: number; status: T };
+
+type MaintenanceRefreshSnapshot<T> = {
+  cache: MaintenanceRefreshCache<T> | null;
+  refreshing: boolean;
+  refreshError: string | null;
+  retryAfterMs: number | null;
+};
+
+type MaintenanceRefreshAttempt<T> = {
+  started: boolean;
+  promise: Promise<T | null> | null;
+};
+
+type MaintenanceRefreshCoordinatorOptions = {
+  nowMs?: () => number;
+  retryBaseMs?: number;
+  retryMaxMs?: number;
+  onError?: (error: unknown) => void;
+};
+
+function boundedRefreshError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return message.trim().slice(0, 320) || 'Maintenance status refresh failed';
 }
 
-router.get('/', async (req: Request, res: Response) => {
+/**
+ * Owns the expensive host-status collector's cache, single-flight promise,
+ * and persistent-failure cooldown. Keeping the cooldown server-side means a
+ * remounted page, another browser tab, or a client that ignores retry hints
+ * still cannot hammer apt/systemd probes after a failure.
+ */
+export class MaintenanceRefreshCoordinator<T> {
+  private cache: MaintenanceRefreshCache<T> | null = null;
+  private refreshInFlight: Promise<T | null> | null = null;
+  private lastRefreshError: string | null = null;
+  private consecutiveFailures = 0;
+  private retryAtMs = 0;
+  private readonly nowMs: () => number;
+  private readonly retryBaseMs: number;
+  private readonly retryMaxMs: number;
+  private readonly onError: (error: unknown) => void;
+
+  constructor(
+    private readonly collect: () => Promise<T>,
+    options: MaintenanceRefreshCoordinatorOptions = {},
+  ) {
+    this.nowMs = options.nowMs || Date.now;
+    this.retryBaseMs = Math.max(1, options.retryBaseMs || MAINTENANCE_REFRESH_RETRY_BASE_MS);
+    this.retryMaxMs = Math.max(this.retryBaseMs, options.retryMaxMs || MAINTENANCE_REFRESH_RETRY_MAX_MS);
+    this.onError = options.onError || (() => undefined);
+  }
+
+  snapshot(): MaintenanceRefreshSnapshot<T> {
+    const retryAfterMs = Math.max(0, this.retryAtMs - this.nowMs());
+    return {
+      cache: this.cache,
+      refreshing: this.refreshInFlight !== null,
+      refreshError: this.lastRefreshError,
+      retryAfterMs: retryAfterMs > 0 ? retryAfterMs : null,
+    };
+  }
+
+  requestRefresh(): MaintenanceRefreshAttempt<T> {
+    if (this.refreshInFlight) {
+      return { started: false, promise: this.refreshInFlight };
+    }
+    if ((this.snapshot().retryAfterMs || 0) > 0) {
+      return { started: false, promise: null };
+    }
+
+    const refreshPromise: Promise<T | null> = Promise.resolve()
+      .then(() => this.collect())
+      .then((status) => {
+        this.cache = { at: this.nowMs(), status };
+        this.lastRefreshError = null;
+        this.consecutiveFailures = 0;
+        this.retryAtMs = 0;
+        return status;
+      })
+      .catch((error: unknown) => {
+        this.consecutiveFailures += 1;
+        const exponent = Math.min(30, this.consecutiveFailures - 1);
+        const retryDelayMs = Math.min(this.retryMaxMs, this.retryBaseMs * (2 ** exponent));
+        this.retryAtMs = this.nowMs() + retryDelayMs;
+        this.lastRefreshError = boundedRefreshError(error);
+        this.onError(error);
+        return null;
+      })
+      .finally(() => {
+        if (this.refreshInFlight === refreshPromise) this.refreshInFlight = null;
+      });
+    this.refreshInFlight = refreshPromise;
+    return { started: true, promise: refreshPromise };
+  }
+}
+
+const maintenanceRefreshCoordinator = new MaintenanceRefreshCoordinator(collectMaintenanceStatus, {
+  onError: (error) => console.error('[system-maintenance] background refresh failed:', error),
+});
+
+function publicMaintenanceActions(): MaintenanceAction[] {
+  return Object.values(ACTIONS).map(({ command: _command, title: _title, ...action }) => action);
+}
+
+export function maintenanceActionCanRun(role: string | null | undefined, action: Pick<MaintenanceAction, 'requiresOwner'>): boolean {
+  return !action.requiresOwner || isOwnerRole(role);
+}
+
+export function maintenanceActionConfirmationValid(
+  action: Pick<MaintenanceAction, 'confirmationPhrase'>,
+  confirmation: unknown,
+): boolean {
+  return isTypedConfirmationMatch(action.confirmationPhrase, confirmation);
+}
+
+export function maintenanceWindowAcknowledgementValid(
+  action: Pick<MaintenanceAction, 'requiresMaintenanceWindow'>,
+  acknowledgement: unknown,
+): boolean {
+  return !action.requiresMaintenanceWindow || acknowledgement === true;
+}
+
+export function checkedMaintenanceServiceUnits(): Array<{ name: string; required: boolean }> {
+  return CHECKED_SERVICES.map(({ name, required }) => ({ name, required }));
+}
+
+export function getMaintenanceActionContract(actionId: string): MaintenanceAction | null {
+  const action = ACTIONS[actionId];
+  if (!action) return null;
+  const { command: _command, title: _title, ...publicAction } = action;
+  return publicAction;
+}
+
+export function createMaintenanceStatusHandler(
+  refreshCoordinator: MaintenanceRefreshCoordinator<any> = maintenanceRefreshCoordinator,
+): (req: Request, res: Response) => void {
+  return (req: Request, res: Response) => {
   try {
     const force = ['1', 'true', 'yes'].includes(String(req.query.refresh || '').toLowerCase());
-    const cached = maintenanceCache;
-    if (!force && cached && Date.now() - cached.at < MAINTENANCE_CACHE_TTL_MS) {
-      res.json({ ...cached.status, checkedAt: cached.at, cached: true });
-      return;
-    }
-    if (!force && cached) {
-      // Stale: return immediately and refresh in the background.
-      void refreshMaintenanceStatus().catch((error) => {
-        console.error('[system-maintenance] background refresh failed:', error);
+    const beforeRefresh = refreshCoordinator.snapshot();
+    const cached = beforeRefresh.cache;
+    if (cached) {
+      const cacheAgeMs = Date.now() - cached.at;
+      const retryDue = beforeRefresh.refreshError !== null && beforeRefresh.retryAfterMs === null;
+      const shouldRefresh = force || retryDue || cacheAgeMs >= MAINTENANCE_CACHE_TTL_MS;
+      if (shouldRefresh) refreshCoordinator.requestRefresh();
+      const refresh = refreshCoordinator.snapshot();
+      if (refresh.retryAfterMs) {
+        res.setHeader('Retry-After', String(Math.max(1, Math.ceil(refresh.retryAfterMs / 1_000))));
+      }
+      res.json({
+        ...cached.status,
+        ready: true,
+        cached: true,
+        cacheAgeMs,
+        refreshing: refresh.refreshing,
+        refreshError: refresh.refreshError,
+        retryAfterMs: refresh.retryAfterMs,
       });
-      res.json({ ...cached.status, checkedAt: cached.at, cached: true, refreshing: true });
       return;
     }
-    const status = await refreshMaintenanceStatus();
-    res.json({ ...status, checkedAt: maintenanceCache?.at ?? Date.now(), cached: false });
+
+    refreshCoordinator.requestRefresh();
+    const refresh = refreshCoordinator.snapshot();
+    if (refresh.retryAfterMs) {
+      res.setHeader('Retry-After', String(Math.max(1, Math.ceil(refresh.retryAfterMs / 1_000))));
+    }
+    res.status(202).json({
+      ready: false,
+      cached: false,
+      refreshing: refresh.refreshing,
+      checkedAt: null,
+      refreshError: refresh.refreshError,
+      retryAfterMs: refresh.retryAfterMs,
+      status: refresh.refreshError ? 'warning' : 'info',
+      summary: refresh.refreshError
+        ? 'Server checks are paused after a failed refresh.'
+        : 'Server checks are running in the background.',
+      issues: [],
+      actions: publicMaintenanceActions(),
+    });
   } catch (error: any) {
     console.error('[system-maintenance] status failed:', error);
     res.status(500).json({ error: error?.message || 'Failed to collect maintenance status' });
   }
-});
+  };
+}
 
-router.post('/actions/:actionId', requireOwner, async (req: Request, res: Response) => {
+router.get('/', createMaintenanceStatusHandler());
+
+router.post('/actions/:actionId', async (req: Request, res: Response) => {
   try {
     const actionId = String(req.params.actionId || '').trim();
     const action = ACTIONS[actionId];
@@ -821,35 +1523,90 @@ router.post('/actions/:actionId', requireOwner, async (req: Request, res: Respon
       return;
     }
 
-    if ((actionId === 'refresh-package-cache' || actionId === 'apply-security-updates')) {
-      const apt = await getAptState();
-      if (!apt.available) {
-        res.status(400).json({ error: 'Apt is not available on this host.' });
-        return;
-      }
-      if (apt.locksActive) {
-        res.status(409).json({ error: 'Package manager is busy. Try again after apt/dpkg finishes.' });
-        return;
-      }
-      if (actionId === 'apply-security-updates' && !apt.unattendedUpgradeAvailable) {
-        res.status(400).json({ error: 'unattended-upgrade is not installed; security updates require manual review.' });
-        return;
-      }
+    if (!maintenanceActionCanRun(req.user?.role, action)) {
+      res.status(403).json({ error: 'Owner access is required for maintenance actions that change the server.' });
+      return;
     }
 
-    const job = await startAgentJob({
-      userId: req.user!.userId,
-      toolId: 'system-maintenance',
-      title: action.title,
-      command: action.command,
-      cwd: process.env.PORTAL_ROOT || '/opt/bridgesllm/portal',
-      env: { DEBIAN_FRONTEND: 'noninteractive' },
-    });
+    if (!maintenanceActionConfirmationValid(action, req.body?.confirmation)) {
+      res.status(400).json({
+        error: `Type ${action.confirmationPhrase} to confirm this server change.`,
+        confirmationPhrase: action.confirmationPhrase,
+      });
+      return;
+    }
 
-    const { command, title, ...publicAction } = action;
-    res.status(202).json({ job, action: publicAction });
+    if (!maintenanceWindowAcknowledgementValid(action, req.body?.maintenanceWindowAcknowledged)) {
+      res.status(400).json({
+        error: 'Acknowledge that an approved maintenance window is active before starting this action.',
+        code: 'MAINTENANCE_WINDOW_REQUIRED',
+        requiresMaintenanceWindow: true,
+      });
+      return;
+    }
+
+    const admission = await acquireMaintenanceActionAdmission();
+    try {
+      if ((actionId === 'refresh-package-cache' || actionId === 'apply-security-updates')) {
+        const apt = await getAptState();
+        if (!apt.available) {
+          res.status(400).json({ error: 'Apt is not available on this host.' });
+          return;
+        }
+        if (apt.locksActive) {
+          res.status(409).json({ error: 'Package manager is busy. Try again after apt/dpkg finishes.' });
+          return;
+        }
+        if (actionId === 'apply-security-updates' && !apt.unattendedUpgradeAvailable) {
+          res.status(400).json({ error: 'unattended-upgrade is not installed; security updates require manual review.' });
+          return;
+        }
+      }
+
+      const verifiedBackup = action.requiresBackup
+        ? await findFreshVerifiedMaintenanceBackup()
+        : null;
+      if (action.requiresBackup && !verifiedBackup) {
+        res.status(409).json({
+          error: `A verified Portal backup no older than ${MAINTENANCE_BACKUP_MAX_AGE_HOURS} hours is required before this action. Create a maintenance backup and wait for it to complete.`,
+          code: 'FRESH_VERIFIED_BACKUP_REQUIRED',
+          maxBackupAgeHours: MAINTENANCE_BACKUP_MAX_AGE_HOURS,
+        });
+        return;
+      }
+
+      const job = await startAgentJob({
+        userId: req.user!.userId,
+        actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
+        toolId: MAINTENANCE_TOOL_ID,
+        title: action.title,
+        command: action.command,
+        cwd: process.env.PORTAL_ROOT || '/opt/bridgesllm/portal',
+        env: { DEBIAN_FRONTEND: 'noninteractive' },
+      });
+
+      const { command: _command, title: _title, ...publicAction } = action;
+      res.status(202).json({
+        job,
+        action: publicAction,
+        preflight: {
+          maintenanceWindowAcknowledged: action.requiresMaintenanceWindow,
+          backup: verifiedBackup,
+        },
+      });
+    } finally {
+      admission.release();
+    }
   } catch (error: any) {
     console.error('[system-maintenance] action failed:', error);
+    if (error instanceof MaintenanceAdmissionError) {
+      res.status(error.statusCode).json({
+        error: error.message,
+        code: error.code,
+        activeJob: error.activeJob,
+      });
+      return;
+    }
     res.status(500).json({ error: error?.message || 'Failed to start maintenance action' });
   }
 });

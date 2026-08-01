@@ -1,6 +1,14 @@
 import axios, { AxiosInstance, AxiosError, InternalAxiosRequestConfig } from 'axios';
 import { useAuthStore } from '../contexts/AuthContext';
 import { captureError } from '../utils/errorHandler';
+import { diagnosticEndpoint } from '../utils/diagnosticEndpoint';
+import {
+  PORTAL_AUTHORIZATION_VERSION_HEADER,
+  StaleWorkspaceAuthorizationResponseError,
+  assertWorkspaceAuthorizationResponseIsCurrent,
+  observedWorkspaceAuthorizationVersion,
+  setWorkspaceAuthorizationBaseline,
+} from '../utils/workspaceAuthorization';
 
 const API_URL = import.meta.env.VITE_API_URL || '/api';
 const DEBUG_AUTH = import.meta.env.DEV;
@@ -24,6 +32,83 @@ const client: AxiosInstance = axios.create({
   },
   withCredentials: true,
 });
+
+type WorkspaceAuthorizationAxiosConfig = InternalAxiosRequestConfig & {
+  _workspaceAuthorizationActorId?: string;
+  _workspaceAuthorizationVersion?: number;
+};
+
+function assertAxiosRequestActorIsCurrent(
+  request: WorkspaceAuthorizationAxiosConfig,
+): void {
+  const actorUserId = request._workspaceAuthorizationActorId;
+  const actorVersion = request._workspaceAuthorizationVersion;
+  if (!actorUserId && actorVersion === undefined) return;
+  if (!actorUserId || !Number.isSafeInteger(actorVersion) || Number(actorVersion) < 1) {
+    throw new StaleWorkspaceAuthorizationResponseError();
+  }
+  const currentUser = useAuthStore.getState().user;
+  if (currentUser?.id !== actorUserId
+      || Number(currentUser.authorizationVersion ?? 1) !== actorVersion) {
+    throw new StaleWorkspaceAuthorizationResponseError();
+  }
+}
+
+client.interceptors.request.use((request) => {
+  const stampedRequest = request as WorkspaceAuthorizationAxiosConfig;
+  const user = useAuthStore.getState().user;
+  const capturedActorId = stampedRequest._workspaceAuthorizationActorId;
+  const capturedVersion = stampedRequest._workspaceAuthorizationVersion;
+  if (capturedActorId !== undefined || capturedVersion !== undefined) {
+    // Retries retain the original actor. Never re-stamp an old payload with
+    // whichever user happens to be signed in when refresh/backoff completes.
+    assertAxiosRequestActorIsCurrent(stampedRequest);
+  } else if (user?.id) {
+    const initialVersion = Number(user.authorizationVersion ?? 1);
+    if (!Number.isSafeInteger(initialVersion) || initialVersion < 1) {
+      throw new StaleWorkspaceAuthorizationResponseError();
+    }
+    stampedRequest._workspaceAuthorizationActorId = user.id;
+    stampedRequest._workspaceAuthorizationVersion = initialVersion;
+  }
+
+  const actorUserId = stampedRequest._workspaceAuthorizationActorId;
+  const version = stampedRequest._workspaceAuthorizationVersion;
+  const requestUrl = String(request.url || '');
+  const isAuthorizationBootstrap = requestUrl.includes('/auth/me')
+    || requestUrl.includes('/auth/refresh')
+    || requestUrl.includes('/auth/logout');
+  if (actorUserId && Number.isSafeInteger(version) && Number(version) > 0) {
+    const observedVersion = setWorkspaceAuthorizationBaseline(actorUserId, Number(version));
+    if (observedVersion !== version) {
+      throw new StaleWorkspaceAuthorizationResponseError();
+    }
+  }
+  if (actorUserId && Number.isSafeInteger(version) && Number(version) > 0 && !isAuthorizationBootstrap) {
+    request.headers.set(PORTAL_AUTHORIZATION_VERSION_HEADER, String(version));
+  }
+  return request;
+});
+
+function assertAxiosWorkspaceAuthorizationResponseIsCurrent(
+  config: WorkspaceAuthorizationAxiosConfig | undefined,
+  responseVersion: unknown,
+): void {
+  const actorUserId = config?._workspaceAuthorizationActorId;
+  const actorVersion = config?._workspaceAuthorizationVersion;
+  if (!actorUserId || !Number.isSafeInteger(actorVersion) || Number(actorVersion) < 1) return;
+
+  const currentUser = useAuthStore.getState().user;
+  const currentVersion = Number(currentUser?.authorizationVersion ?? 1);
+  if (currentUser?.id !== actorUserId
+      || currentVersion !== actorVersion) {
+    throw new StaleWorkspaceAuthorizationResponseError();
+  }
+  assertWorkspaceAuthorizationResponseIsCurrent(actorUserId, responseVersion);
+  if (observedWorkspaceAuthorizationVersion(actorUserId) !== actorVersion) {
+    throw new StaleWorkspaceAuthorizationResponseError();
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Session Stability: Token refresh management
@@ -145,6 +230,10 @@ client.interceptors.response.use(
   (response) => {
     // Successful response — reset failure counter
     consecutiveNetworkFailures = 0;
+    assertAxiosWorkspaceAuthorizationResponseIsCurrent(
+      response.config as WorkspaceAuthorizationAxiosConfig,
+      response.headers[String(PORTAL_AUTHORIZATION_VERSION_HEADER).toLowerCase()],
+    );
     return response;
   },
   async (error: AxiosError) => {
@@ -152,11 +241,19 @@ client.interceptors.response.use(
       _retry?: boolean;
       _retryCount?: number;
       _silent?: boolean;
+      _skipNetworkRetry?: boolean;
       _errorCaptured?: boolean;
       _errorReported?: boolean;
       _allowSessionRecovery?: boolean;
     };
     const status = error.response?.status;
+    assertAxiosWorkspaceAuthorizationResponseIsCurrent(
+      originalRequest,
+      error.response?.headers?.[String(PORTAL_AUTHORIZATION_VERSION_HEADER).toLowerCase()],
+    );
+    if (status === 409 && (error.response?.data as any)?.code === 'WORKSPACE_SCOPE_CHANGED') {
+      return Promise.reject(new StaleWorkspaceAuthorizationResponseError());
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Auth failure handling (401/403)
@@ -194,6 +291,7 @@ client.interceptors.response.use(
       try {
         const refreshed = await refreshSession();
         if (refreshed) {
+          assertAxiosRequestActorIsCurrent(originalRequest);
           // Retry the original request
           return client(originalRequest);
         }
@@ -218,7 +316,7 @@ client.interceptors.response.use(
     // Network error retry for non-auth requests
     // ─────────────────────────────────────────────────────────────────────────
     
-    if (isTransientNetworkError(error) && !originalRequest._retry) {
+    if (isTransientNetworkError(error) && !originalRequest._retry && !originalRequest._skipNetworkRetry) {
       const retryCount = originalRequest._retryCount || 0;
       if (retryCount < 2) {
         originalRequest._retryCount = retryCount + 1;
@@ -226,6 +324,7 @@ client.interceptors.response.use(
         const delay = 500 * Math.pow(2, retryCount);
         debugLog(`[Network] Retrying request after ${delay}ms (attempt ${retryCount + 1}/2)`);
         await new Promise(resolve => setTimeout(resolve, delay));
+        assertAxiosRequestActorIsCurrent(originalRequest);
         return client(originalRequest);
       }
     }
@@ -234,7 +333,7 @@ client.interceptors.response.use(
     // Error reporting and logging
     // ─────────────────────────────────────────────────────────────────────────
 
-    const endpoint = `${(originalRequest?.method || 'GET').toUpperCase()} ${originalRequest?.url || ''}`.trim();
+    const endpoint = diagnosticEndpoint(originalRequest?.method, originalRequest?.url);
 
     // Surface meaningful API/network failures in the ErrorPanel too (skip auth refresh/report loops)
     // Also skip capturing auth errors during auth failure handling to prevent error sound spam
@@ -244,7 +343,11 @@ client.interceptors.response.use(
       if (!status || status >= 400) {
         // Don't play error sounds for auth failures during logout - user already knows they're being logged out
         if (!(status === 401 || status === 403) || !originalRequest?.url?.includes('/auth/logout')) {
-          captureError(error, status === 401 || status === 403 ? 'auth' : 'api', endpoint);
+          captureError(
+            error,
+            status === 401 || status === 403 ? 'auth' : 'api',
+            { endpoint },
+          );
         }
       }
     }
@@ -299,7 +402,7 @@ export function startSessionHeartbeat() {
       debugLog('[Session] Proactive token refresh (last auth:', Math.round(timeSinceLastAuth / 60000), 'min ago)');
       try {
         await refreshSession();
-      } catch (err) {
+      } catch {
         debugLog('[Session] Proactive refresh failed, will retry on next heartbeat');
       }
     }

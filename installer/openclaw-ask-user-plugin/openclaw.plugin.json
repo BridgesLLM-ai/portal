@@ -1,0 +1,12 @@
+{
+  "id": "bridgesllm-ask-user",
+  "activation": {
+    "onStartup": true
+  },
+  "enabledByDefault": false,
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

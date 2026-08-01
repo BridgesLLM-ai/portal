@@ -1,182 +1,103 @@
-# Windows / WSL 2 Beta Install Notes
+# Windows / WSL 2 Experimental Preview
 
-Research snapshot: April 19, 2026.
+BridgesLLM Portal is designed and supported for compatible Ubuntu or Debian
+VPS hosts. Windows through WSL 2 is an experimental local preview: it is useful
+for trying the Portal on one computer, but it is not a production hosting
+profile and is not yet qualified for the full feature set.
 
-## Bottom line
+## What you need
 
-BridgesLLM Portal should stay **VPS-first**, and the Windows / WSL route should be treated as an **experimental test-drive path that is still untested in the field and under active development**:
+- Windows with WSL 2 available
+- An Ubuntu WSL distribution with `systemd` enabled
+- At least 3.5 GB RAM available to the environment
+- At least 35 GB free disk space
+- Administrator access for the initial WSL setup
+- Docker support if you want to try Project Chat runtimes
 
-- **Windows users test locally through WSL 2**
-- **Production installs still belong on Ubuntu/Debian VPSes**
-- We do **not** try to fake a native Windows server installer yet
+Microsoft's current WSL setup references are:
 
-That is the cleanest compromise between low friction and not shipping a cursed maintenance nightmare.
+- <https://learn.microsoft.com/windows/wsl/install>
+- <https://learn.microsoft.com/windows/wsl/systemd>
 
-## Product strategy
+## Recommended installation
 
-The best strategy is **one install experience, multiple entrypoints**.
-
-For now, the first working Windows path is:
-
-- install Ubuntu in WSL 2
-- run the normal Linux installer in a **local beta profile**
-- open the portal from Windows at `http://localhost:4001`
-- skip domain + HTTPS in the setup wizard
-
-That gives people a real hands-on trial before paying for a VPS.
-
-## Why this path won
-
-### Why not a native Windows installer first?
-
-Because the portal is still deeply Linux-shaped:
-
-- PostgreSQL
-- Docker sandboxes
-- OpenClaw gateway
-- VNC / noVNC remote desktop stack
-- Linux package assumptions
-- systemd-managed services
-
-A true Windows-native installer would mean a second ops matrix for:
-
-- service management
-- firewall rules
-- reverse proxy behavior
-- Docker/runtime differences
-- filesystem and permission differences
-- browser/desktop stack differences
-
-That is too much surface area for the current stage.
-
-### Why WSL 2 is good enough for beta
-
-Current Microsoft docs support the core pieces we need:
-
-- `wsl --install` is the standard entrypoint for Windows 10/11
-- current Ubuntu-on-WSL installs support `systemd`
-- Windows can reach services in WSL via `localhost`
-- Docker Desktop officially supports WSL 2 integration
-
-That means WSL 2 is a realistic low-friction bridge, not a hack.
-
-## What we implemented
-
-The installer now supports a **local beta profile** and auto-selects it on WSL.
-
-### Local beta behavior
-
-When WSL is detected, the installer now:
-
-- switches to `INSTALL_PROFILE=local`
-- requires `systemd` to be available
-- skips Caddy setup
-- skips UFW setup
-- serves the portal directly from the backend on `http://localhost:4001`
-- writes local-safe origins:
-  - `CORS_ORIGIN=http://localhost:4001,http://127.0.0.1:4001`
-- writes:
-  - `PORTAL_URL=http://localhost:4001`
-  - `INSTALL_PROFILE=local`
-- prints a localhost setup URL at the end of install
-
-This is intentionally a **test-drive profile**, not the main production path. It is experimental, not yet field-proven, and still being worked on.
-
-## Windows user flow
-
-### Recommended Windows entrypoint
-
-From **Windows Terminal** using the default PowerShell profile, use the bootstrapper. It checks for WSL/Ubuntu first, installs Ubuntu if missing, then launches the Linux installer in local beta mode:
+Open Windows Terminal with PowerShell and run:
 
 ```powershell
 irm https://raw.githubusercontent.com/BridgesLLM-ai/portal/main/installer/install-windows.ps1 | iex
 ```
 
-Microsoft reference:
-- https://learn.microsoft.com/en-us/windows/wsl/install
-- https://learn.microsoft.com/en-us/windows/wsl/systemd
+The bootstrapper checks for WSL and Ubuntu, starts the Ubuntu installation when
+needed, and then launches the normal Portal installer with the local profile.
+Windows or WSL can require a restart before the command can continue.
 
-### Direct command once WSL is already ready
-
-If Ubuntu WSL is already installed and configured, the direct path is still:
+If Ubuntu WSL is already configured, you can run the Linux installer directly:
 
 ```powershell
 wsl -u root -- bash -lc "curl -fsSL https://bridgesllm.ai/install.sh | bash -s -- --local"
 ```
 
-Then open:
+When installation finishes, open the exact localhost setup URL printed by the
+installer. It normally starts with:
 
 ```text
 http://localhost:4001
 ```
 
-If the installer prints a setup token URL, use that exact URL.
+The setup credential is carried in the URL fragment, exchanged once, and then
+removed from the address bar.
 
-### In the setup wizard
+## Local-profile behavior
 
-For local Windows testing:
+On WSL, the installer uses `INSTALL_PROFILE=local` and:
 
-- create the admin account
-- connect AI providers
-- **skip domain + HTTPS**
-- treat mail/domain features as VPS-only for now
-- treat public project share links and stable external URLs as VPS-only for now
+- requires `systemd` inside the distribution;
+- serves the Portal on localhost instead of configuring public Caddy HTTPS;
+- skips the host UFW configuration used by a VPS install;
+- writes localhost-only Portal and CORS origins; and
+- keeps public-domain readiness features unavailable.
 
-## Known limitations
+Create the Owner first, then use Settings readiness cards to connect only the
+providers and optional capabilities available in the local environment.
 
-This path is for testing, not the final polished Windows story.
+## Limitations
 
-### Expected limitations
+- No supported public HTTPS or custom-domain hosting profile
+- No production mail-domain workflow
+- No internet-facing app share links
+- No default LAN exposure
+- Remote Desktop and desktop-browser behavior can differ from a VPS
+- Project Chat requires compatible Docker, kernel, and isolation behavior and
+  can remain unavailable even when the rest of the Portal works
+- Sleep, shutdown, WSL networking, Docker, and Windows updates can interrupt
+  local services
 
-- no automatic public HTTPS in local mode
-- no domain-first setup flow in local mode
-- project share links generated in local mode are local-machine links, not public VPS links
-- mail/domain workflows are not the point of this path
-- LAN exposure is not the default WSL networking story
-- Windows users may still need Docker Desktop or a clean native Docker setup inside WSL
+Use a supported Ubuntu or Debian VPS for a stable public deployment.
 
-### Important Docker note
+## Docker note
 
-Docker Desktop documents WSL integration, but also warns against mixing Docker Desktop with a separate conflicting Docker Engine install inside the same distro.
+Docker Desktop supports WSL 2 integration, but running it alongside a separate
+Docker Engine inside the same distribution can create conflicting daemons and
+socket state. Choose one Docker setup for the distribution and verify it before
+enabling Project Chat. See:
 
-Reference:
-- https://docs.docker.com/desktop/features/wsl/
+- <https://docs.docker.com/desktop/features/wsl/>
 
-If we see Windows testers hitting Docker weirdness, this is one of the first places to look.
+## Troubleshooting
 
-## Why this still fits the product
+Check that WSL is version 2, Ubuntu is running, and `systemd` is active:
 
-This keeps the main message honest:
+```powershell
+wsl --list --verbose
+wsl -u root -- systemctl is-system-running
+```
 
-- **BridgesLLM Portal is VPS-targeted**
-- **Windows local installs are a beta test-drive path**
+Inside Ubuntu, verify the Portal service and local health endpoint:
 
-That is exactly what we want.
+```bash
+systemctl is-active bridgesllm-product
+curl -fsS http://127.0.0.1:4001/health
+```
 
-People get to try the real product on their home machine, but we do not pretend that a home Windows laptop is the canonical deployment target.
-
-## Open WebUI comparison
-
-Open WebUI’s public direction is basically the right shape to copy:
-
-- recommend the easiest supported path first
-- tolerate WSL / Docker for Windows users
-- avoid pretending a giant universal shell script solves everything
-- move toward desktop/native packaging later if demand justifies it
-
-References:
-- https://docs.openwebui.com/getting-started/quick-start/
-- https://docs.openwebui.com/roadmap/
-
-## PowerShell bootstrapper
-
-The repo now includes `installer/install-windows.ps1` as the Windows front door.
-
-Its job is intentionally small:
-
-- checks whether `wsl.exe` is available
-- checks whether an Ubuntu WSL distro exists
-- runs `wsl --install -d Ubuntu` when Ubuntu is missing
-- launches the Linux installer with `--local` once WSL is ready
-
-That gives Windows users a cleaner one-command entrypoint **without** pretending we have a real native Windows server installer yet.
+If the browser cannot reach localhost after WSL or Windows networking changes,
+restart the WSL distribution and recheck the service before reinstalling.

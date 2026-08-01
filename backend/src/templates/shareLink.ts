@@ -3,6 +3,7 @@
  * Sent when a portal user shares an app link with someone via email.
  */
 import { baseTemplate, type EmailBranding } from './baseTemplate';
+import { escapeHtml } from '../utils/appFileSecurity';
 
 export interface ShareLinkEmailParams {
   senderName: string;
@@ -11,36 +12,24 @@ export interface ShareLinkEmailParams {
   appName: string;
   shareUrl: string;
   isPasswordProtected: boolean;
-  password?: string;
 }
 
 export function shareLinkHtml(params: ShareLinkEmailParams, branding?: EmailBranding): string {
-  const portalName = branding?.portalName || 'BridgesLLM';
-  const accent = branding?.accentColor || '#6366f1';
-  const { senderName, appName, shareUrl, isPasswordProtected, password } = params;
+  const portalName = escapeHtml(branding?.portalName || 'BridgesLLM');
+  const accent = /^#[a-f\d]{6}$/i.test(branding?.accentColor || '') ? branding!.accentColor : '#6366f1';
+  const senderName = escapeHtml(params.senderName);
+  const appName = escapeHtml(params.appName);
+  const shareUrl = escapeHtml(params.shareUrl);
+  const { isPasswordProtected } = params;
 
-  const passwordBlock = isPasswordProtected && password
+  const passwordBlock = isPasswordProtected
     ? `
-    <!-- Password box -->
-    <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin:0 0 24px;">
-      <tr>
-        <td style="padding:16px 20px; border-radius:10px; background-color:#0a0f1e; border:1px solid #334155; border-left:3px solid ${accent};">
-          <p style="margin:0 0 6px; font-size:11px; font-weight:600; color:#94a3b8; text-transform:uppercase; letter-spacing:0.08em;">Password Required</p>
-          <p style="margin:0 0 8px; font-size:13px; color:#94a3b8; line-height:1.5;">
-            This app is password-protected. Use the password below to access it:
-          </p>
-          <p style="margin:0; font-size:18px; font-weight:700; color:#ffffff; letter-spacing:0.1em; font-family:'Courier New',Courier,monospace;">${password}</p>
-        </td>
-      </tr>
-    </table>`
-    : isPasswordProtected
-    ? `
-    <!-- Password note (no password provided) -->
+    <!-- Password note: credentials deliberately travel out of band. -->
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin:0 0 24px;">
       <tr>
         <td style="padding:14px 18px; border-radius:10px; background-color:#0a0f1e; border:1px solid #334155;">
           <p style="margin:0; font-size:13px; color:#94a3b8; line-height:1.5;">
-            &#128274; This app is <strong style="color:#fbbf24;">password-protected</strong>. Ask <strong style="color:#e2e8f0;">${senderName}</strong> for the password.
+            &#128274; This app is <strong style="color:#fbbf24;">password-protected</strong>. Ask <strong style="color:#e2e8f0;">${senderName}</strong> for the password through a separate channel.
           </p>
         </td>
       </tr>
@@ -121,12 +110,10 @@ export function shareLinkHtml(params: ShareLinkEmailParams, branding?: EmailBran
 
 export function shareLinkText(params: ShareLinkEmailParams, branding?: EmailBranding): string {
   const portalName = branding?.portalName || 'BridgesLLM';
-  const { senderName, appName, shareUrl, isPasswordProtected, password } = params;
+  const { senderName, appName, shareUrl, isPasswordProtected } = params;
 
-  const passwordLine = isPasswordProtected && password
-    ? `\nPassword: ${password}\n`
-    : isPasswordProtected
-    ? `\nThis app is password-protected. Ask ${senderName} for the password.\n`
+  const passwordLine = isPasswordProtected
+    ? `\nThis app is password-protected. Ask ${senderName} for the password through a separate channel.\n`
     : '';
 
   return `${senderName} shared "${appName}" with you via ${portalName}.

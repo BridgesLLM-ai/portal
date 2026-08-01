@@ -11,47 +11,60 @@ datasource db {
 }
 
 model User {
-  id             String    @id @default(uuid())
-  email          String    @unique
-  username       String    @unique
-  passwordHash   String
-  firstName      String?
-  lastName       String?
-  role           UserRole  @default(USER)
-  accountStatus  AccountStatus @default(ACTIVE)
-  isActive       Boolean   @default(true)
-  sandboxEnabled Boolean   @default(false)
-  lastLoginAt    DateTime?
-  approvedAt     DateTime?
-  approvedBy     String?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
-  metadata       Json?     @default("{}")
-  avatarPath     String?
-  mailPassword   String?   // Legacy generated password for Stalwart account, null if no mailbox provisioned
+  id                   String        @id @default(uuid())
+  email                String        @unique
+  username             String        @unique
+  passwordHash         String
+  firstName            String?
+  lastName             String?
+  role                 UserRole      @default(USER)
+  accountStatus        AccountStatus @default(ACTIVE)
+  isActive             Boolean       @default(true)
+  sandboxEnabled       Boolean       @default(false)
+  authorizationVersion Int           @default(1)
+  lastLoginAt          DateTime?
+  approvedAt           DateTime?
+  approvedBy           String?
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+  metadata             Json?         @default("{}")
+  avatarPath           String?
+  mailPassword         String? // Legacy generated password for Stalwart account, null if no mailbox provisioned
 
   // Two-Factor Authentication
-  twoFactorSecret      String?
-  twoFactorEnabled     Boolean   @default(false)
-  twoFactorBackupCodes String?   @db.Text
-  twoFactorMethod      String?   // 'totp' | 'email' | null
+  twoFactorSecret       String?
+  twoFactorEnabled      Boolean @default(false)
+  twoFactorBackupCodes  String? @db.Text
+  twoFactorMethod       String? // 'totp' | 'email' | null
+  twoFactorLastUsedStep Int?
 
   // Relations
-  sessions              Session[]
-  emailVerificationCodes EmailVerificationCode[]
-  files                 File[]
-  apps                  App[]
-  appShareLinks         AppShareLink[]
-  activityLogs          ActivityLog[]
-  chatMessages          ProjectChatMessage[]
-  chatSessions          ProjectChatSession[]
-  agentSessions         AgentSession[]
-  agentJobs             AgentJob[]
-  passwordResetTokens   PasswordResetToken[]
-  mailboxAccounts       MailboxAccount[]
-  reviewedRegistrations RegistrationRequest[] @relation("ReviewedBy")
-  approvedByUser        User?                 @relation("ApprovedByUser", fields: [approvedBy], references: [id], onDelete: SetNull)
-  approvedUsers         User[]                @relation("ApprovedByUser")
+  sessions                        Session[]
+  emailVerificationCodes          EmailVerificationCode[]
+  twoFactorChallenges             TwoFactorChallenge[]
+  files                           File[]
+  apps                            App[]
+  appShareLinks                   AppShareLink[]
+  activityLogs                    ActivityLog[]
+  chatMessages                    ProjectChatMessage[]
+  chatSessions                    ProjectChatSession[]
+  projectChatProviderBindings     ProjectChatProviderBinding[]
+  projectChatStates               ProjectChatState[]                    @relation("ProjectChatStateActor")
+  projectChatTurns                ProjectChatTurn[]                     @relation("ProjectChatTurnActor")
+  projectChatResetJournals        ProjectChatDestructiveResetJournal[]  @relation("ProjectChatResetActor")
+  ownedProjectIdentities          ProjectIdentity[]                     @relation("ProjectIdentityOwner")
+  legacyOpenClawImports           LegacyOpenClawProjectImport[]         @relation("LegacyOpenClawImportActor")
+  legacyOpenClawQuarantines       LegacyOpenClawProjectQuarantine[]     @relation("LegacyOpenClawQuarantineActor")
+  legacyOpenClawClearTombstones   LegacyOpenClawProjectClearTombstone[] @relation("LegacyOpenClawClearActor")
+  configuredOllamaBackendBindings OllamaBackendBinding[]                @relation("OllamaBackendBindingConfiguredBy")
+  configuredNativeOllamaBindings  NativeOllamaBackendBinding[]          @relation("NativeOllamaBackendBindingConfiguredBy")
+  agentSessions                   AgentSession[]
+  agentJobs                       AgentJob[]
+  passwordResetTokens             PasswordResetToken[]
+  mailboxAccounts                 MailboxAccount[]
+  reviewedRegistrations           RegistrationRequest[]                 @relation("ReviewedBy")
+  approvedByUser                  User?                                 @relation("ApprovedByUser", fields: [approvedBy], references: [id], onDelete: SetNull)
+  approvedUsers                   User[]                                @relation("ApprovedByUser")
 
   @@index([email])
   @@index([username])
@@ -64,16 +77,39 @@ model MailboxAccount {
   username      String   @unique
   mailPassword  String
   isPrimary     Boolean  @default(false)
-  signature     String?  @db.Text  // Plain text signature
-  signatureHtml String?  @db.Text  // HTML signature (rendered in emails)
-  autoForwardTo String?             // Email address to auto-forward incoming mail to
+  signature     String?  @db.Text // Plain text signature
+  signatureHtml String?  @db.Text // HTML signature (rendered in emails)
+  autoForwardTo String? // Email address to auto-forward incoming mail to
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // A partial unique index plus a deferred constraint trigger enforce exactly
+  // one primary row whenever a user has mailboxes (not expressible in Prisma).
 
   @@index([userId])
   @@index([userId, isPrimary])
+}
+
+// Durable desired-state reconciliation between Portal mailbox rows and
+// Stalwart principals. The username is the operation key; secrets remain only
+// on MailboxAccount in encrypted form and are never duplicated into this row.
+model MailboxReconciliationTask {
+  username       String    @id
+  generation     Int       @default(1)
+  status         String    @default("PENDING")
+  attempts       Int       @default(0)
+  nextAttemptAt  DateTime  @default(now())
+  leaseId        String?
+  leaseExpiresAt DateTime?
+  lastErrorCode  String?
+  lastErrorAt    DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @default(now()) @updatedAt
+
+  @@index([status, nextAttemptAt])
+  @@index([leaseExpiresAt])
 }
 
 model Session {
@@ -115,22 +151,24 @@ model File {
 }
 
 model App {
-  id          String   @id @default(uuid())
-  userId      String
-  name        String
-  description String?
-  zipPath     String
-  isPublic       Boolean  @default(false)
-  isActive       Boolean  @default(true)
-  deployType     String   @default("static")
-  port           Int?
-  processStatus  String   @default("stopped")
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  id                String   @id @default(uuid())
+  userId            String
+  projectIdentityId String?  @unique
+  name              String
+  description       String?
+  zipPath           String
+  isPublic          Boolean  @default(false)
+  isActive          Boolean  @default(true)
+  deployType        String   @default("static")
+  port              Int?
+  processStatus     String   @default("stopped")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 
   // Relations
-  user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
-  shareLinks AppShareLink[]
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectIdentity ProjectIdentity? @relation(fields: [projectIdentityId], references: [id], onDelete: Cascade)
+  shareLinks      AppShareLink[]
 
   @@index([userId])
   @@index([isPublic, isActive])
@@ -203,15 +241,15 @@ model Metrics {
 // ── Multi-User: Registration Requests ───────────────────────────────────────
 
 model RegistrationRequest {
-  id          String                    @id @default(uuid())
-  email       String
-  name        String
+  id           String                    @id @default(uuid())
+  email        String
+  name         String
   passwordHash String?
-  message     String?                   @db.Text
-  status      RegistrationRequestStatus @default(PENDING)
-  requestedAt DateTime                  @default(now())
-  reviewedAt  DateTime?
-  reviewedBy  String?
+  message      String?                   @db.Text
+  status       RegistrationRequestStatus @default(PENDING)
+  requestedAt  DateTime                  @default(now())
+  reviewedAt   DateTime?
+  reviewedBy   String?
 
   // Relations
   reviewer User? @relation("ReviewedBy", fields: [reviewedBy], references: [id], onDelete: SetNull)
@@ -240,22 +278,25 @@ model AgentSession {
   @@index([provider])
   @@index([status])
   @@index([lastActivityAt])
+  @@unique([provider, externalId])
 }
 
-
 model AgentJob {
-  id             String         @id @default(uuid())
-  userId         String
-  toolId         String
-  title          String?
-  status         AgentJobStatus @default(running)
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
-  startedAt      DateTime?
-  finishedAt     DateTime?
-  exitCode       Int?
-  transcriptPath String?
-  metadata       Json?          @default("{}")
+  id                        String         @id @default(uuid())
+  userId                    String
+  // Exact authorization generation admitted before the detached host process
+  // is spawned. Input and authorization-transition cleanup re-attest it.
+  actorAuthorizationVersion Int
+  toolId                    String
+  title                     String?
+  status                    AgentJobStatus @default(running)
+  createdAt                 DateTime       @default(now())
+  updatedAt                 DateTime       @updatedAt
+  startedAt                 DateTime?
+  finishedAt                DateTime?
+  exitCode                  Int?
+  transcriptPath            String?
+  metadata                  Json?          @default("{}")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -264,12 +305,169 @@ model AgentJob {
   @@index([createdAt])
 }
 
+// Crash-recoverable identity for a host-native CLI turn. The command is held
+// behind a parent-bound root-only activation socket until this row contains an
+// attested systemd scope invocation and a second authorization transaction has
+// committed DISPATCHED. The scope cgroup, not a launcher PID/process group, is
+// the durable termination authority for daemonizing CLIs.
+model HostAgentRun {
+  id                        String   @id
+  actorUserId               String
+  actorAuthorizationVersion Int
+  provider                  String
+  sessionId                 String
+  portalInstanceId          String
+  status                    String   @default("PREPARED")
+  attempt                   Int      @default(0)
+  scopeUnit                 String?  @unique
+  scopeTag                  String?
+  bootId                    String?
+  controlGroup              String?
+  gatePath                  String?
+  scopeInvocationId         String?
+  launcherPid               Int?
+  dispatchActivatedAt       DateTime?
+  settledAt                 DateTime?
+  terminalReason            String?
+  evidence                  Json?
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @default(now()) @updatedAt
+
+  @@index([actorUserId, status])
+  @@index([sessionId, status])
+  @@index([provider, status])
+}
+
+// Durable lifecycle for one Portal-owned OpenClaw host Agent Chat turn.
+// Visible settlement is deliberately non-terminal for authorization changes:
+// the exact provider session must be reset and re-attested before these rows
+// become QUIESCED.
+model OpenClawHostRun {
+  id                        String   @id
+  actorUserId               String
+  actorAuthorizationVersion Int
+  provider                  String   @default("OPENCLAW")
+  executionScope            String   @default("HOST_OPERATOR")
+  sessionKey                String
+  portalInstanceId          String
+  status                    String   @default("PREPARED")
+  upstreamRunId             String?
+  visibleSettledAt          DateTime?
+  quiescedAt                DateTime?
+  terminalReason            String?
+  evidence                  Json?
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @default(now()) @updatedAt
+
+  @@index([actorUserId, status])
+  @@index([sessionKey, status])
+  @@index([provider, status])
+}
 
 // ── System Settings (key-value) ─────────────────────────────────────────────
 model SystemSetting {
   key       String   @id
   value     String   @db.Text
   updatedAt DateTime @updatedAt
+}
+
+// Legacy helper-backed storage retained across the native Remote GPU acceptance
+// window. The current runtime can dispatch an already-ACTIVE helper authority
+// so upgrading never creates an outage, but it cannot create or activate a new
+// helper binding. Native ACTIVE/DISCONNECTED authority always takes priority.
+// Do not rewrite the applied migration; a later forward migration will scrub
+// and retire this compatibility storage after migration is complete.
+model OllamaBackendBinding {
+  id                       String                     @id @default(uuid())
+  purposeId                String                     @default("PRIMARY")
+  generation               Int
+  version                  Int                        @default(1)
+  state                    OllamaBackendBindingState  @default(PENDING)
+  tailnetName              String
+  stableNodeId             String
+  nodePublicKey            String
+  address                  String
+  addressFamily            OllamaBackendAddressFamily
+  helperPort               Int                        @default(11434)
+  protocolVersion          Int
+  helperId                 String
+  pairingSecretCiphertext  String?                    @db.Text
+  pairingSecretDigest      String
+  pairingSecretFingerprint String
+  bindingFingerprint       String
+  selectedModel            String?
+  selectedModelDigest      String?
+  attestationProofDigest   String?
+  protocolProofDigest      String?
+  configuredByUserId       String?
+  observedAt               DateTime
+  candidateExpiresAt       DateTime?
+  verifiedAt               DateTime?
+  activatedAt              DateTime?
+  createdAt                DateTime                   @default(now())
+  updatedAt                DateTime                   @default(now()) @updatedAt
+  removedAt                DateTime?
+
+  configuredBy User? @relation("OllamaBackendBindingConfiguredBy", fields: [configuredByUserId], references: [id], onDelete: SetNull)
+
+  @@unique([purposeId, generation], map: "OllamaBackendBinding_purpose_generation_key")
+  @@index([purposeId, state], map: "OllamaBackendBinding_purpose_state_idx")
+  @@index([state, candidateExpiresAt], map: "OllamaBackendBinding_candidate_expiry_idx")
+  @@index([stableNodeId, state], map: "OllamaBackendBinding_node_state_idx")
+  @@index([configuredByUserId], map: "OllamaBackendBinding_configured_by_idx")
+}
+
+// Additive, rollback-safe authority storage for native Ollama HTTP reached
+// through persistent Tailscale Serve TCP. The legacy helper-backed
+// OllamaBackendBinding table is deliberately unchanged. A native replacement
+// is inserted only after its external probe succeeds; the previous native
+// authority is retired atomically in the same Serializable transaction.
+model NativeOllamaBackendBinding {
+  id                              String                          @id @default(uuid())
+  purposeId                       String                          @default("PRIMARY")
+  generation                      Int
+  version                         Int                             @default(1)
+  state                           NativeOllamaBackendBindingState @default(ACTIVE)
+  tailnetName                     String
+  stableNodeId                    String
+  nodePublicKey                   String
+  observedAddress                 String
+  addressFamily                   OllamaBackendAddressFamily
+  servePort                       Int                             @default(11435)
+  bindingFingerprint              String
+  selectedModel                   String?
+  selectedModelDigest             String?
+  // Compatibility fence for binary downgrade. Native activation forces the
+  // legacy runtime's local-policy setting false, while these fields retain
+  // the exact policy that explicit native removal must restore.
+  localEnabledBeforeActivation    Boolean
+  localEnabledSettingExisted      Boolean
+  grantPeerAttestationFingerprint String
+  grantTemplateHash               String
+  grantAcknowledgedAt             DateTime
+  grantAcknowledgedBy             String
+  // Durable Owner acknowledgement that the separately downloaded Windows
+  // cleanup verified and removed (or found absent) only the exact legacy
+  // helper residue. Legacy rows remain unchanged for rollback compatibility.
+  legacyHelperRetirementAcknowledgedAt DateTime?
+  legacyHelperRetirementAcknowledgedBy String?
+  legacyHelperRetirementEvidence       String?
+  configuredByUserId              String?
+  observedAt                      DateTime
+  verifiedAt                      DateTime
+  activatedAt                     DateTime
+  disconnectedAt                  DateTime?
+  removedAt                       DateTime?
+  createdAt                       DateTime                        @default(now())
+  updatedAt                       DateTime                        @default(now()) @updatedAt
+
+  configuredBy User? @relation("NativeOllamaBackendBindingConfiguredBy", fields: [configuredByUserId], references: [id], onDelete: SetNull)
+
+  @@unique([purposeId, generation], map: "NativeOllamaBackendBinding_purpose_generation_key")
+  @@index([purposeId, state], map: "NativeOllamaBackendBinding_purpose_state_idx")
+  @@index([stableNodeId, state], map: "NativeOllamaBackendBinding_node_state_idx")
+  @@index([bindingFingerprint], map: "NativeOllamaBackendBinding_fingerprint_idx")
+  @@index([configuredByUserId], map: "NativeOllamaBackendBinding_configured_by_idx")
 }
 
 // ── Password Reset Tokens ───────────────────────────────────────────────────
@@ -326,7 +524,6 @@ enum RegistrationRequestStatus {
   DENIED
 }
 
-
 enum AgentJobStatus {
   running
   completed
@@ -339,15 +536,204 @@ enum AgentProviderType {
   CLAUDE_CODE
   CODEX
   AGENT_ZERO
+  GEMINI
+  OLLAMA
+  GROK_BUILD
+}
+
+enum OllamaBackendBindingState {
+  PENDING
+  ACTIVE
+  STALE
+  DISCONNECTED
+  REMOVED
+}
+
+enum NativeOllamaBackendBindingState {
+  ACTIVE
+  DISCONNECTED
+  REMOVED
+}
+
+enum OllamaBackendAddressFamily {
+  IPV4
+  IPV6
+}
+
+// Server-owned identity for a filesystem project. The project UUID and root
+// inode/device pair never live inside the writable project tree, so an agent
+// cannot forge or copy its way into another project's runtime/session binding.
+model ProjectIdentity {
+  id                            String    @id @default(uuid())
+  workspaceOwnerId              String
+  projectName                   String
+  canonicalRoot                 String
+  rootDevice                    String
+  rootInode                     String
+  rootBirthtimeNs               String
+  generation                    Int       @default(1)
+  // CREATING is a hidden server-owned staging fence, CREATION_CLEANUP is its
+  // crash-recoverable cleanup claim, and ACTIVE/RENAMING/DELETING are the
+  // published Project lifecycle states.
+  lifecycleStatus               String    @default("ACTIVE")
+  // NONE is legacy eligibility unknown, PENDING/COMPLETE belong to the
+  // reconciliation lifecycle, and CURRENT is reserved for authoritative
+  // Portal 4 project creation. The database CHECK enforces this closed set.
+  legacyOpenClawMigrationStatus String    @default("NONE")
+  deletionStartedAt             DateTime?
+  renameTargetName              String?
+  renameLeaseTokenHash          String?
+  renameLeaseExpiresAt          DateTime?
+  renameStartedAt               DateTime?
+  renameCleanupStartedAt        DateTime?
+  renameRuntimeCleanedAt        DateTime?
+  renameDeployPresent           Boolean?
+  renameDeployDevice            String?
+  renameDeployInode             String?
+  renameDeployBirthtimeNs       String?
+  lastRenameSourceName          String?
+  lastRenameCompletedAt         DateTime?
+  createdAt                     DateTime  @default(now())
+  updatedAt                     DateTime  @default(now()) @updatedAt
+
+  // User deletion must not erase the only durable attestation for a Project
+  // (especially a hidden CREATING root). Project retirement has to remove the
+  // identity deliberately before the owning account can be deleted.
+  workspaceOwner                User                                  @relation("ProjectIdentityOwner", fields: [workspaceOwnerId], references: [id], onDelete: Restrict)
+  chatStates                    ProjectChatState[]
+  chatTurns                     ProjectChatTurn[]
+  nameReservations              ProjectNameReservation[]
+  runtimeCleanupActors          ProjectRuntimeCleanupActor[]
+  destructiveResetJournals      ProjectChatDestructiveResetJournal[]  @relation("ProjectChatResetProject")
+  app                           App?
+  legacyOpenClawImports         LegacyOpenClawProjectImport[]         @relation("LegacyOpenClawImportProject")
+  legacyOpenClawQuarantines     LegacyOpenClawProjectQuarantine[]     @relation("LegacyOpenClawQuarantineProject")
+  legacyOpenClawClearTombstones LegacyOpenClawProjectClearTombstone[] @relation("LegacyOpenClawClearProject")
+
+  @@unique([workspaceOwnerId, projectName])
+  @@unique([workspaceOwnerId, canonicalRoot])
+  @@unique([workspaceOwnerId, renameTargetName])
+  @@index([workspaceOwnerId])
+  @@index([lifecycleStatus])
+}
+
+// One normalized namespace for both current names and in-flight rename
+// targets. Database triggers maintain these rows so independent Portal
+// processes cannot race create against rename across separate unique indexes.
+model ProjectNameReservation {
+  workspaceOwnerId  String
+  projectName       String
+  projectIdentityId String
+  kind              String
+
+  projectIdentity ProjectIdentity @relation(fields: [projectIdentityId], references: [id], onDelete: Cascade)
+
+  @@id([workspaceOwnerId, projectName])
+  @@unique([projectIdentityId, kind])
+  @@index([projectIdentityId])
+}
+
+// Durable provenance for actors discovered only from provider-owned runtime
+// resources. It survives a crash between external teardown and process-local
+// reservation convergence, then is cleared after final clean verification.
+model ProjectRuntimeCleanupActor {
+  projectIdentityId String
+  provider          String
+  actorUserId       String
+  sessionId         String   @default("")
+  createdAt         DateTime @default(now())
+
+  projectIdentity ProjectIdentity @relation(fields: [projectIdentityId], references: [id], onDelete: Cascade)
+
+  @@id([projectIdentityId, provider, actorUserId, sessionId])
+  @@index([projectIdentityId])
+}
+
+// Durable authorization-change journal. Authorization-changing admin
+// mutations do not commit until every Project provider runtime in the
+// immutable manifest has been authoritatively retired. A non-COMPLETE row is
+// also a database-backed admission fence after a Portal restart.
+model ProjectAuthorizationTransition {
+  id                 String    @id @default(uuid())
+  singletonKey       String    @default("GLOBAL")
+  kind               String
+  phase              String    @default("PREPARED")
+  initiatedByUserId  String
+  targetUserId       String?
+  sourceOwnerUserId  String?
+  payload            Json
+  result             Json?
+  gatewayWasActive   Boolean?
+  gatewayFenceProof  Json?
+  hostRuntimeQuiescenceProof Json?
+  leaseOwner         String?
+  leaseTokenHash     String?
+  leaseExpiresAt     DateTime?
+  lastErrorCode      String?
+  lastErrorMessage   String?   @db.Text
+  startedAt          DateTime  @default(now())
+  committedAt        DateTime?
+  completedAt        DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @default(now()) @updatedAt
+
+  projects ProjectAuthorizationTransitionProject[]
+
+  @@index([phase, createdAt])
+  @@index([targetUserId])
+  @@index([sourceOwnerUserId])
+}
+
+// Immutable ProjectIdentity snapshot owned by one authorization transition.
+// Deliberately no FK points back to ProjectIdentity: disappearance or mutation
+// is evidence that makes the final authorization commit fail closed, while the
+// original attestation remains available for recovery and audit.
+model ProjectAuthorizationTransitionProject {
+  transitionId      String
+  projectIdentityId String
+  workspaceOwnerId  String
+  projectName       String
+  canonicalRoot     String
+  rootDevice        String
+  rootInode         String
+  rootBirthtimeNs   String
+  projectGeneration Int
+  status            String   @default("PENDING")
+  quiescenceEvidence Json?
+  quiescedAt        DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @default(now()) @updatedAt
+
+  transition ProjectAuthorizationTransition @relation(fields: [transitionId], references: [id], onDelete: Cascade)
+
+  @@id([transitionId, projectIdentityId])
+  @@index([projectIdentityId])
+  @@index([transitionId, status])
 }
 
 model EmailVerificationCode {
   id        String    @id @default(uuid())
   userId    String
-  code      String    // 6-digit code, stored as bcrypt hash
-  expiresAt DateTime  // 10 minutes from creation
+  code      String // 6-digit code, stored as bcrypt hash
+  purpose   String    @default("legacy")
+  expiresAt DateTime // 10 minutes from creation
   usedAt    DateTime?
   createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, purpose, createdAt])
+  @@index([expiresAt])
+}
+
+model TwoFactorChallenge {
+  id         String    @id @default(uuid())
+  userId     String
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -356,34 +742,296 @@ model EmailVerificationCode {
 }
 
 model ProjectChatMessage {
-  id         String   @id @default(cuid())
-  projectId  String
-  userId     String
-  sessionKey String
-  role       String
-  content    String   @db.Text
-  timestamp  DateTime @default(now())
-  messageId  String?
+  id                    String   @id @default(cuid())
+  projectId             String
+  userId                String
+  sessionKey            String
+  role                  String
+  content               String   @db.Text
+  timestamp             DateTime @default(now())
+  messageId             String?
+  provider              String   @default("OPENCLAW")
+  runtime               String   @default("openclaw-dedicated-project-agent")
+  model                 String?
+  providerSessionId     String?
+  turnId                String?  @unique
+  presentation          Json?
+  sourceOrdinal         Int?
+  sourceKeyHash         String?
+  sourceEventId         String?
+  sourceEventSeq        Int?
+  sourceProjectionIndex Int?
+  sourceFingerprint     String?
+  sourceSortKey         String?
+  legacyImportStatus    String?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@unique([userId, projectId, messageId])
   @@index([userId, projectId])
+  @@index([userId, projectId, provider])
   @@index([sessionKey])
   @@index([timestamp])
+  @@index([userId, projectId, timestamp, sourceSortKey])
 }
 
 model ProjectChatSession {
-  id           String   @id @default(cuid())
-  userId       String
-  projectId    String
-  sessionKey   String   @unique
-  status       String   @default("active")
-  model        String?
-  lastActivity DateTime @default(now())
-  createdAt    DateTime @default(now())
+  id             String   @id @default(cuid())
+  userId         String
+  projectId      String
+  sessionKey     String   @unique
+  status         String   @default("active")
+  model          String?
+  activeProvider String   @default("OPENCLAW")
+  runtime        String   @default("openclaw-dedicated-project-agent")
+  lastActivity   DateTime @default(now())
+  createdAt      DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, projectId])
   @@index([sessionKey])
+}
+
+// Durable per-source proof for the Portal 3.x OpenClaw transcript migration.
+// Exact locators are intentionally retained so crash recovery can perform an
+// authoritative readback; hashes alone cannot prove that a source is absent.
+model LegacyOpenClawProjectImport {
+  id                           String    @id @default(cuid())
+  actorUserId                  String
+  projectIdentityId            String
+  projectGeneration            Int
+  candidateAgentId             String
+  candidateAgentHash           String
+  sourceAgentId                String
+  sourceAgentHash              String
+  sourceSessionKey             String
+  sessionKeyHash               String
+  sourceKind                   String
+  sourceStatus                 String
+  providerSessionId            String
+  providerSessionIdHash        String
+  sourceFingerprint            String
+  artifactInventoryFingerprint String
+  agentInventoryFingerprint    String
+  totalMessages                Int
+  importedMessages             Int
+  transcriptDigest             String
+  projectionDigest             String
+  completedAt                  DateTime
+  retiredAt                    DateTime?
+  clearedAt                    DateTime?
+  createdAt                    DateTime  @default(now())
+  updatedAt                    DateTime  @updatedAt
+
+  actor           User            @relation("LegacyOpenClawImportActor", fields: [actorUserId], references: [id], onDelete: Cascade)
+  projectIdentity ProjectIdentity @relation("LegacyOpenClawImportProject", fields: [projectIdentityId], references: [id], onDelete: Cascade)
+
+  @@unique([actorUserId, projectIdentityId, sessionKeyHash], map: "LegacyOpenClawProjectImport_actor_project_session_key")
+  @@unique([actorUserId, sourceAgentHash, sessionKeyHash], map: "LegacyOpenClawProjectImport_actor_source_session_key")
+  @@index([projectIdentityId, sourceStatus], map: "LegacyOpenClawProjectImport_projectIdentityId_sourceStatus_idx")
+  @@index([actorUserId, projectIdentityId, projectGeneration], map: "LegacyOpenClawProjectImport_actor_project_generation_idx")
+}
+
+// SQL rows left unmatched by the authoritative Gateway snapshot may be failed
+// sends or history explicitly cleared under Portal 3.x. Preserve them without
+// exposing them as chat history until a trustworthy reset provenance exists.
+model LegacyOpenClawProjectQuarantine {
+  id                String   @id @default(cuid())
+  originalMessageId String   @unique(map: "LegacyOpenClawProjectQuarantine_originalMessageId_key")
+  actorUserId       String
+  projectIdentityId String
+  projectGeneration Int
+  originalProjectId String
+  sessionKey        String
+  role              String
+  content           String   @db.Text
+  timestamp         DateTime
+  messageId         String?
+  provider          String
+  runtime           String
+  model             String?
+  providerSessionId String?
+  reason            String
+  payloadDigest     String
+  createdAt         DateTime @default(now())
+
+  actor           User            @relation("LegacyOpenClawQuarantineActor", fields: [actorUserId], references: [id], onDelete: Cascade)
+  projectIdentity ProjectIdentity @relation("LegacyOpenClawQuarantineProject", fields: [projectIdentityId], references: [id], onDelete: Cascade)
+
+  @@index([actorUserId, projectIdentityId], map: "LegacyOpenClawProjectQuarantine_actor_project_idx")
+  @@index([projectIdentityId, reason], map: "LegacyOpenClawProjectQuarantine_project_reason_idx")
+}
+
+// Permanent privacy intent recorded by Clear. Exact source locators remain in
+// CLEARED import proofs; this project-level ledger blocks any newly reappearing
+// legacy source from being imported after the user cleared history.
+model LegacyOpenClawProjectClearTombstone {
+  id                         String   @id @default(cuid())
+  actorUserId                String
+  projectIdentityId          String
+  projectGeneration          Int
+  admissionTurnId            String
+  sourceInventoryFingerprint String
+  clearedAt                  DateTime
+  createdAt                  DateTime @default(now())
+
+  actor           User            @relation("LegacyOpenClawClearActor", fields: [actorUserId], references: [id], onDelete: Cascade)
+  projectIdentity ProjectIdentity @relation("LegacyOpenClawClearProject", fields: [projectIdentityId], references: [id], onDelete: Cascade)
+
+  @@unique([actorUserId, projectIdentityId, projectGeneration], map: "LegacyOpenClawProjectClear_actor_project_generation_key")
+  @@index([projectIdentityId, clearedAt], map: "LegacyOpenClawProjectClear_project_cleared_idx")
+}
+
+// Serializes the one-time importer across overlapping backend processes while
+// allowing the normal Portal listener to start independently.
+model LegacyOpenClawProjectMigrationLease {
+  id             String   @id
+  leaseTokenHash String
+  leaseOwner     String
+  phase          String   @default("DISCOVERING")
+  leaseExpiresAt DateTime
+  heartbeatAt    DateTime
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([leaseExpiresAt])
+}
+
+model ProjectChatProviderBinding {
+  id                String   @id @default(cuid())
+  userId            String
+  projectId         String
+  provider          String
+  runtime           String
+  sessionKey        String?
+  externalSessionId String?
+  model             String?
+  status            String   @default("active")
+  sandboxRoot       String
+  policyFingerprint String
+  handoffCursor     Int      @default(0)
+  handoffVersion    Int      @default(1)
+  lastActivity      DateTime @default(now())
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @default(now()) @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, projectId, provider])
+  @@index([userId, projectId])
+  @@index([provider, status])
+}
+
+enum ProjectChatTurnStatus {
+  RUNNING
+  ABORTING
+  COMPLETED
+  ERROR
+  ABORTED
+  EXPIRED
+}
+
+// Portal-owned coordination record for one authenticated actor in one
+// immutable project. `version` is the compare-and-swap token used by both
+// sends and provider switches, so a switch cannot race a turn into a different
+// provider and no process-local lock is required for correctness.
+model ProjectChatState {
+  id                String            @id @default(uuid())
+  actorUserId       String
+  projectIdentityId String
+  selectedProvider  AgentProviderType
+  version           Int               @default(1)
+  activeTurnId      String?           @unique
+  transcriptCursor  Int               @default(0)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @default(now()) @updatedAt
+
+  actor           User              @relation("ProjectChatStateActor", fields: [actorUserId], references: [id], onDelete: Cascade)
+  projectIdentity ProjectIdentity   @relation(fields: [projectIdentityId], references: [id], onDelete: Cascade)
+  turns           ProjectChatTurn[]
+
+  @@unique([actorUserId, projectIdentityId])
+  @@index([projectIdentityId])
+  @@index([selectedProvider])
+}
+
+// Durable turn lease. The raw lease token is returned only to the owning
+// broker; only its SHA-256 digest is persisted. Terminal transitions are
+// monotonic and idempotent, and replay events survive Portal restarts.
+model ProjectChatTurn {
+  id                String                @id @default(uuid())
+  stateId           String
+  actorUserId       String
+  // Exact durable user authorization generation admitted before any provider
+  // runtime mutation or message dispatch. Provider delivery rechecks this
+  // generation transactionally before crossing the external boundary.
+  actorAuthorizationVersion Int
+  projectIdentityId String
+  activeProjectKey  String?               @unique
+  provider          AgentProviderType
+  runtime           String
+  requestId         String
+  status            ProjectChatTurnStatus @default(RUNNING)
+  leaseTokenHash    String                @unique
+  leaseOwner        String
+  leaseExpiresAt    DateTime
+  heartbeatAt       DateTime
+  providerSessionId String?
+  model             String?
+  lastEventSeq      Int                   @default(0)
+  resultMetadata    Json?
+  errorCode         String?
+  errorMessage      String?               @db.Text
+  startedAt         DateTime              @default(now())
+  completedAt       DateTime?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @default(now()) @updatedAt
+
+  state           ProjectChatState       @relation(fields: [stateId], references: [id], onDelete: Cascade)
+  actor           User                   @relation("ProjectChatTurnActor", fields: [actorUserId], references: [id], onDelete: Cascade)
+  projectIdentity ProjectIdentity        @relation(fields: [projectIdentityId], references: [id], onDelete: Cascade)
+  events          ProjectChatTurnEvent[]
+
+  @@unique([actorUserId, projectIdentityId, requestId])
+  @@index([actorUserId, projectIdentityId, status])
+  @@index([stateId, createdAt])
+  @@index([leaseExpiresAt, status])
+}
+
+// Durable privacy tombstone for Clear. It exists before any external provider
+// session is deleted and is removed only in the same transaction that deletes
+// the authoritative SQL transcript.
+model ProjectChatDestructiveResetJournal {
+  id                        String    @id @default(cuid())
+  actorUserId               String
+  projectIdentityId         String
+  projectGeneration         Int
+  admissionTurnId           String
+  legacyProjectId           String?
+  status                    String    @default("RESETTING")
+  externalMutationStartedAt DateTime
+  completedAt               DateTime?
+  createdAt                 DateTime  @default(now())
+  updatedAt                 DateTime  @updatedAt
+
+  actor           User            @relation("ProjectChatResetActor", fields: [actorUserId], references: [id], onDelete: Cascade)
+  projectIdentity ProjectIdentity @relation("ProjectChatResetProject", fields: [projectIdentityId], references: [id], onDelete: Cascade)
+
+  @@unique([actorUserId, projectIdentityId], map: "ProjectChatReset_actor_project_key")
+  @@index([projectIdentityId, status])
+}
+
+model ProjectChatTurnEvent {
+  id        String   @id @default(cuid())
+  turnId    String
+  seq       Int
+  eventType String
+  payload   Json
+  createdAt DateTime @default(now())
+
+  turn ProjectChatTurn @relation(fields: [turnId], references: [id], onDelete: Cascade)
+
+  @@unique([turnId, seq])
+  @@index([turnId, createdAt])
 }
