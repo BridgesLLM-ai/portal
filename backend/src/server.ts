@@ -1308,13 +1308,19 @@ export async function verifyUpdateValidationDatabaseReadiness(): Promise<UpdateV
     }
     appliedMigrations.push(migration);
   }
-  if (appliedMigrations.length !== expectedMigrations.length) {
-    throw new Error('Database migration inventory does not match the bundled Portal runtime');
-  }
+  // Databases created before the bundled baseline was squashed still carry
+  // their original pre-baseline rows. Those rows are legitimate history, so
+  // the inventory is proven by bundled coverage rather than row equality:
+  // every bundled migration must be applied, in bundled order, with a
+  // matching checksum, and nothing unknown may appear from the baseline
+  // onward. Pre-baseline rows are the only tolerated extras.
+  const expectedChecksumsByName = new Map(
+    expectedMigrations.map((migration) => [migration.name, migration.checksum]),
+  );
   const appliedNames = new Set<string>();
-  for (let index = 0; index < appliedMigrations.length; index += 1) {
-    const migration = appliedMigrations[index];
-    const expected = expectedMigrations[index];
+  const observedExpectedNames: string[] = [];
+  let baselineReached = false;
+  for (const migration of appliedMigrations) {
     if (
       !migration
       || !PORTAL_MIGRATION_NAME_PATTERN.test(migration.migration_name)
@@ -1324,10 +1330,24 @@ export async function verifyUpdateValidationDatabaseReadiness(): Promise<UpdateV
       throw new Error('Database migration history is malformed');
     }
     appliedNames.add(migration.migration_name);
-    if (
-      migration.migration_name !== expected.name
-      || migration.checksum !== expected.checksum
-    ) {
+    const expectedChecksum = expectedChecksumsByName.get(migration.migration_name);
+    if (expectedChecksum === undefined) {
+      if (baselineReached) {
+        throw new Error('Database contains migrations outside the bundled Portal runtime');
+      }
+      continue;
+    }
+    if (migration.checksum !== expectedChecksum) {
+      throw new Error('Database migration history does not match the bundled Portal runtime');
+    }
+    baselineReached = true;
+    observedExpectedNames.push(migration.migration_name);
+  }
+  if (observedExpectedNames.length !== expectedMigrations.length) {
+    throw new Error('Database migration inventory does not match the bundled Portal runtime');
+  }
+  for (let index = 0; index < expectedMigrations.length; index += 1) {
+    if (observedExpectedNames[index] !== expectedMigrations[index].name) {
       throw new Error('Database migration history does not match the bundled Portal runtime');
     }
   }

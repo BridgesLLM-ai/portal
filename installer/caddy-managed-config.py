@@ -363,8 +363,82 @@ def _normalize_managed_block(content: str, begin: str, end: str) -> str:
     return block if block.endswith("\n") else f"{block}\n"
 
 
+def _site_header_addresses(header: str) -> set[str]:
+    cleaned = _without_comments_and_strings(header).strip()
+    # Snippets and named matchers are not site definitions and cannot collide.
+    if not cleaned or cleaned.startswith("("):
+        return set()
+    addresses: set[str] = set()
+    for token in re.split(r"[,\s]+", cleaned):
+        if not token:
+            continue
+        candidate = token
+        for scheme in ("http://", "https://"):
+            if candidate.lower().startswith(scheme):
+                candidate = candidate[len(scheme):]
+                break
+        # A port-only listener such as :8443 claims no hostname.
+        if candidate.startswith(":"):
+            continue
+        if not candidate.endswith("]"):
+            candidate = re.sub(r":\d+$", "", candidate)
+        candidate = candidate.strip().rstrip(".").lower()
+        if candidate:
+            addresses.add(candidate)
+    return addresses
+
+
+def _top_level_sites(content: str) -> list[tuple[set[str], TextRange]]:
+    sites: list[tuple[set[str], TextRange]] = []
+    cursor = 0
+    while cursor < len(content):
+        block = _next_caddy_block(content, cursor)
+        if block is None:
+            break
+        addresses = _site_header_addresses(content[cursor:block.start])
+        if addresses:
+            sites.append((addresses, TextRange(cursor, block.end)))
+        cursor = block.end
+    return sites
+
+
+def _managed_site_addresses(block: str) -> set[str]:
+    claimed: set[str] = set()
+    for addresses, _ in _top_level_sites(block):
+        claimed |= addresses
+    return claimed
+
+
+def _unowned_site_claiming(
+    existing: str,
+    claimed: set[str],
+    owned: tuple[Optional[TextRange], ...],
+) -> Optional[TextRange]:
+    """Find a site block, outside every managed range, that already claims one of
+    the hostnames a managed block is about to define. Appending a second
+    definition for the same hostname makes Caddy reject the whole file with
+    'ambiguous site definition', so this has to be detected before we write."""
+    if not claimed:
+        return None
+    matches = [
+        span
+        for addresses, span in _top_level_sites(existing)
+        if addresses & claimed
+        and not any(
+            range_ is not None and span.start < range_.end and range_.start < span.end
+            for range_ in owned
+        )
+    ]
+    if len(matches) > 1:
+        raise ManagedConfigError(
+            "Caddyfile defines the same hostname in more than one site block; "
+            "resolve the duplicate definition before updating."
+        )
+    return matches[0] if matches else None
+
+
 def _replace_portal(existing: str, block: str) -> str:
-    owned, _ = _owned_ranges(existing)
+    owned, app_owned = _owned_ranges(existing)
     if owned is not None:
         return f"{existing[:owned.start]}{block}{existing[owned.end:]}"
     domain = recover_owned_domain(block)
@@ -372,16 +446,45 @@ def _replace_portal(existing: str, block: str) -> str:
         return existing
     if not existing:
         return block
+    conflict = _unowned_site_claiming(
+        existing, _managed_site_addresses(block), (owned, app_owned)
+    )
+    if conflict is not None:
+        # An operator-customised Portal vhost is common: hand-written routes for
+        # voice, webhooks, static assets, or CSP live alongside the Portal proxy.
+        # Replacing it would silently destroy that work, and appending beside it
+        # breaks Caddy outright, so adopt it in place and say so.
+        if not _has_portal_proxy(existing, conflict):
+            raise ManagedConfigError(
+                "The Portal hostname is already served by a site block that does not "
+                "proxy the Portal on 127.0.0.1:4001. Point that site at the Portal, "
+                "or remove it, then retry."
+            )
+        print(
+            "Existing operator-managed Portal site kept as-is; BridgesLLM will not "
+            "rewrite Portal routing on this host.",
+            file=sys.stderr,
+        )
+        return existing
     separator = "" if existing.endswith("\n\n") else "\n" if existing.endswith("\n") else "\n\n"
     return f"{existing}{separator}{block}"
 
 
 def _replace_app(existing: str, block: str) -> str:
-    _, owned = _owned_ranges(existing)
+    portal_owned, owned = _owned_ranges(existing)
     if owned is not None:
         return f"{existing[:owned.start]}{block}{existing[owned.end:]}"
     if not existing:
         return block
+    conflict = _unowned_site_claiming(
+        existing, _managed_site_addresses(block), (portal_owned, owned)
+    )
+    if conflict is not None:
+        raise ManagedConfigError(
+            "The isolated app-content hostname is already defined by another site "
+            "block. Choose a different --app-content-domain, or remove that site, "
+            "then retry."
+        )
     separator = "" if existing.endswith("\n") else "\n"
     return f"{existing}{separator}{block}"
 

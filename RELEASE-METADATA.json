@@ -1,13 +1,13 @@
 {
   "schema": 1,
-  "version": "4.0.0",
+  "version": "4.0.3",
   "releasedAt": "2026-08-01",
-  "releaseClass": "feature",
+  "releaseClass": "hotfix",
   "highlights": [
-    "Answer paused Agent Chat and Project Chat questions from persistent, expandable notifications anywhere in the Portal, with a distinct alert sound and no navigation.",
-    "Durable chat coordination keeps long turns, steering, tool history, pending input, and reconnect replay bounded and tied to the exact user, run, and conversation.",
-    "Project Chat runs in attested project-bound containers with controlled public egress; preserved 3.x Projects remain fail-closed until their lineage is reconciled safely.",
-    "Transactional App deployment, broader backups, Keep-Data reconnect, running-App restoration, and rollback protect working sources and recorded process intent across maintenance.",
-    "Signed Dashboard updates show verified release details, require backup preflight, bind source lineage to exact contents, and roll back candidates that fail migration or health checks."
+    "Portals installed before the 4.0 migration baseline can update again: the candidate proves bundled-migration coverage instead of requiring exact history equality.",
+    "HTTPS readiness probes every address Caddy actually listens on instead of assuming 127.0.0.1:443, which stalled updates and rollbacks for the full timeout.",
+    "A failed verification no longer stops a Portal that rollback had already restored and started.",
+    "A Caddy site customised by hand is adopted byte for byte instead of duplicated, so hosts with extra routes or headers no longer fail with 'ambiguous site definition'.",
+    "Withdraws 4.0.1 and 4.0.2, which were built from an incomplete source line and omitted code that shipped in 4.0.0."
   ]
 }

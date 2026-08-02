@@ -2,6 +2,56 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.3] - 2026-08-01
+
+### Fixed
+- **Portals installed before the 4.0 migration baseline can now update.** The
+  update candidate verified the database by requiring the applied migration
+  history to exactly equal the migrations bundled with the release. Databases
+  created before the baseline was squashed legitimately retain their original
+  pre-baseline rows, so that comparison could never balance and the update
+  aborted with `Database migration inventory does not match the bundled Portal
+  runtime`. The candidate now proves that every bundled migration is applied,
+  in order, with a matching checksum, and that nothing unknown was applied from
+  the baseline onward. Fresh installs are unaffected, and tampered, missing,
+  rolled-back, or drifted schemas are still rejected.
+- **HTTPS readiness now probes the addresses Caddy actually serves.** The
+  readiness probes pinned themselves to `127.0.0.1:443`. When Caddy is bound to
+  specific addresses, nothing listens on loopback, so the probe could never
+  connect and every update and rollback stalled for the full 90-second timeout
+  before failing. Probes now try loopback and each address Caddy is listening
+  on. Certificate and hostname validation are unchanged.
+- **A failed verification no longer stops a healthy Portal.** If verification
+  failed after a rollback had already restored and started the previous Portal,
+  recovery re-fenced the service and killed it, leaving the machine with no
+  Portal running at all. Recovery now leaves a Portal that is running and
+  serving the previous version in service, and only fences when nothing is
+  serving.
+- **Portals whose Caddy site was customised by hand can now update.** The
+  managed Caddy converger only recognised a Portal site that still carried its
+  installer ownership marker. On any host where that marker had been edited
+  away — commonly while adding webhook routes, static asset handling, or custom
+  security headers — the converger appended a *second* site block for the same
+  hostname, Caddy rejected the whole file with `ambiguous site definition`, and
+  the update aborted before it could start. The converger now detects that the
+  hostname is already served, and if that site already proxies the Portal on
+  `127.0.0.1:4001` it adopts the site untouched and reports that Portal routing
+  is operator-managed on that host. Hand-written routes, headers, and matchers
+  are preserved byte for byte. If the hostname is claimed by a site that does
+  *not* serve the Portal, or by more than one site, the update stops with an
+  explicit message instead of an opaque Caddy parse error.
+- The isolated app-content hostname is checked the same way, so a colliding
+  hostname is reported directly rather than producing an invalid Caddyfile.
+
+### Withdrawn
+- **4.0.1 and 4.0.2 are withdrawn and should not be installed.** Both carried
+  the update fixes above, but were built from a branch cut before the final
+  4.0.0 assembly, so their runtime omitted code that shipped in 4.0.0 —
+  including the ask-a-question broker and plugin route, Project Chat restart
+  recovery, and legacy Project continuity adoption. Installing either would
+  have moved a 4.0.0 Portal backwards. 4.0.3 carries the same fixes on top of
+  the complete 4.0.0 source and supersedes both.
+
 ## [4.0.0] - 2026-08-01
 
 Portal 4.0 is a foundation release. It replaces several loosely connected feature paths with explicit ownership, isolation, recovery, and verification contracts across Agent Chat, Projects, providers, updates, backups, and the host workstation.

@@ -14,7 +14,7 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="4.0.0"
+readonly VERSION="4.0.3"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -9340,23 +9340,60 @@ PY2
   rm -f "${rollback_copy}"
 }
 
+portal_https_resolve_targets() {
+  # curl --resolve pins an HTTPS probe to this machine's own Caddy while curl
+  # still performs normal hostname and certificate validation. Loopback is the
+  # common case, but Caddy can be bound to specific addresses (default_bind),
+  # in which case nothing listens on 127.0.0.1:443 and a loopback-only probe
+  # can never connect. Probe every address Caddy actually serves HTTPS on.
+  local host="$1" address
+  [[ -n "${host}" ]] || return 1
+  local -a addresses=(127.0.0.1)
+  while read -r address; do
+    case "${address}" in
+      ''|'*'|'0.0.0.0'|'::') continue ;;
+    esac
+    addresses+=("${address}")
+  done < <(
+    ss -H -ltnp 2>/dev/null \
+      | awk '/"caddy"/ && $4 ~ /:443$/ {print $4}' \
+      | sed -E 's/:443$//' \
+      | tr -d '[]' \
+      | sort -u
+  )
+  if [[ -n "${PUBLIC_IP:-}" ]]; then
+    addresses+=("${PUBLIC_IP}")
+  fi
+  printf '%s\n' "${addresses[@]}" \
+    | awk 'NF && !seen[$0]++' \
+    | while read -r address; do
+        if [[ "${address}" == *:* ]]; then
+          printf '%s:443:[%s]\n' "${host}" "${address}"
+        else
+          printf '%s:443:%s\n' "${host}" "${address}"
+        fi
+      done
+}
+
 verify_app_content_caddy_ready() {
   use_local_profile && return 0
   # Tailnet mode ships without isolated app-content hosting (one DNS name per
   # machine; alternate ports share cookies and are unsafe).
   use_tailnet_profile && return 0
-  local waited=0 status="" share_probe=""
+  local waited=0 status="" share_probe="" target
   while (( waited < 90 )); do
-    status="$(curl -sS --max-time 5 --resolve "${APP_CONTENT_DOMAIN}:443:127.0.0.1" \
-      -o /dev/null -w '%{http_code}' "https://${APP_CONTENT_DOMAIN}/__bridgesllm_isolation_probe" 2>/dev/null || true)"
-    share_probe="$(curl -sSI --max-time 5 --resolve "${APP_CONTENT_DOMAIN}:443:127.0.0.1" \
-      "https://${APP_CONTENT_DOMAIN}/share/__bridgesllm_invalid_probe__" 2>/dev/null || true)"
-    if [[ "${status}" == "404" ]] \
-      && grep -qi '^HTTP/.* 404' <<<"${share_probe}" \
-      && grep -qi '^x-robots-tag:.*noindex' <<<"${share_probe}"; then
-      ok "Isolated app-content TLS host is ready"
-      return 0
-    fi
+    while read -r target; do
+      status="$(curl -sS --max-time 5 --resolve "${target}" \
+        -o /dev/null -w '%{http_code}' "https://${APP_CONTENT_DOMAIN}/__bridgesllm_isolation_probe" 2>/dev/null || true)"
+      share_probe="$(curl -sSI --max-time 5 --resolve "${target}" \
+        "https://${APP_CONTENT_DOMAIN}/share/__bridgesllm_invalid_probe__" 2>/dev/null || true)"
+      if [[ "${status}" == "404" ]] \
+        && grep -qi '^HTTP/.* 404' <<<"${share_probe}" \
+        && grep -qi '^x-robots-tag:.*noindex' <<<"${share_probe}"; then
+        ok "Isolated app-content TLS host is ready"
+        return 0
+      fi
+    done < <(portal_https_resolve_targets "${APP_CONTENT_DOMAIN}")
     sleep 3
     waited=$((waited + 3))
   done
@@ -9365,16 +9402,18 @@ verify_app_content_caddy_ready() {
 
 verify_portal_tls_ready() {
   [[ -n "${DOMAIN}" ]] || return 1
-  local waited=0 status=""
+  local waited=0 status="" target
   while (( waited < 90 )); do
-    # --resolve pins the probe to this Caddy instance while curl still performs
-    # normal hostname and certificate validation. Never use -k here.
-    status="$(curl -sS --max-time 5 --resolve "${DOMAIN}:443:127.0.0.1" \
-      -o /dev/null -w '%{http_code}' "https://${DOMAIN}/api/setup/status" 2>/dev/null || true)"
-    if [[ "${status}" == "200" ]]; then
-      ok "Portal HTTPS identity is ready"
-      return 0
-    fi
+    while read -r target; do
+      # --resolve pins the probe to this Caddy instance while curl still
+      # performs normal hostname and certificate validation. Never use -k here.
+      status="$(curl -sS --max-time 5 --resolve "${target}" \
+        -o /dev/null -w '%{http_code}' "https://${DOMAIN}/api/setup/status" 2>/dev/null || true)"
+      if [[ "${status}" == "200" ]]; then
+        ok "Portal HTTPS identity is ready"
+        return 0
+      fi
+    done < <(portal_https_resolve_targets "${DOMAIN}")
     sleep 3
     waited=$((waited + 3))
   done
@@ -17052,6 +17091,19 @@ restore_and_verify_canonical_portal_state() {
       "${expected_version}" "${probe_token}" true
 }
 
+canonical_portal_is_serving_version() {
+  # Deliberately narrow: proves only that the canonical service is running and
+  # answering as the expected version. Used to decide whether a failed
+  # verification may safely tear the Portal back down.
+  local expected_version="$1"
+  [[ -n "${expected_version}" ]] || return 1
+  systemctl is-active --quiet bridgesllm-product || return 1
+  [[ "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+    http://127.0.0.1:4001/health 2>/dev/null || true)" == "200" ]] || return 1
+  [[ "$(attest_existing_portal_for_update "${PORTAL_DIR}" 2>/dev/null || true)" \
+    == "${expected_version}" ]]
+}
+
 update_transaction_helper_path() {
   update_transaction_state_path "${UPDATE_STATE_HELPER}"
 }
@@ -19809,6 +19861,15 @@ recover_active_update_transaction() {
               "PORTAL_UPDATE_PROBE_TOKEN" || true)"
             if ! restore_and_verify_canonical_portal_state \
                 "${UPDATE_TRANSACTION_PREVIOUS_VERSION}" "${probe_token}"; then
+              # The rollback target may already be restored and serving.
+              # Re-fencing then stops a healthy Portal and leaves the machine
+              # with no Portal at all, which is strictly worse than an
+              # unfinished journal entry. Only fence when nothing is serving.
+              if canonical_portal_is_serving_version \
+                  "${UPDATE_TRANSACTION_PREVIOUS_VERSION}"; then
+                warn "Rollback verification did not fully pass, but Portal ${UPDATE_TRANSACTION_PREVIOUS_VERSION} is running and healthy. Leaving it in service; the recovery journal and rollback artifacts were preserved."
+                return 1
+              fi
               refence_cutover_recovery || true
               return 1
             fi
