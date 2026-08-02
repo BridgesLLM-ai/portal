@@ -31,6 +31,15 @@ const PORTAL_SELF_UPDATE_SCRIPT = [
   'fi',
 ].join('\n');
 
+// systemd starts transient root units with USER set but HOME unset, and the
+// installer runs under `set -u` while reading ${HOME} for root-owned state
+// (~/.openclaw, ~/.codex). Hand HOME across explicitly rather than relying on
+// an environment systemd never promised to provide.
+const selfUpdateHomeDirectory = (): string => {
+  const home = process.env.HOME?.trim();
+  return home && path.isAbsolute(home) ? home : '/root';
+};
+
 let portalSelfUpdateRegistrationInFlight = false;
 
 export type UpdateBackupState = 'fresh' | 'stale' | 'missing' | 'running' | 'unavailable';
@@ -140,6 +149,7 @@ export async function launchPortalSelfUpdate(
       '--collect',
       '--no-block',
       '--quiet',
+      `--setenv=HOME=${selfUpdateHomeDirectory()}`,
       '/bin/bash',
       '-c',
       PORTAL_SELF_UPDATE_SCRIPT,

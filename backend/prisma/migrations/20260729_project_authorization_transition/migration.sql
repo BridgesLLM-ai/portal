@@ -210,7 +210,7 @@ ON "HostAgentRun" ("scopeUnit");
 
 -- Exercise the exact reservation and spawned constraint shapes during the
 -- migration itself. This leaves no fixture data behind, but prevents a path
--- slicing/regex mistake from installing a schema that rejects valid runs.
+-- slicing/regex mistake from installing a schema that rejects every real run.
 DO $host_run_scope_constraint$
 DECLARE
   fixture_id TEXT := '__bridgesllm_host_run_scope_constraint_fixture__';

@@ -14,7 +14,18 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="4.0.3"
+# The in-Portal updater launches this script as a systemd transient unit, and
+# systemd starts root units with USER set but HOME unset. Under `set -u` the
+# first bare ${HOME} reference aborts the whole update, so resolve HOME from
+# the password database once, before anything reads it. A piped shell install
+# already exports HOME and keeps it untouched.
+if [[ -z "${HOME:-}" ]]; then
+  HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "${HOME}" ]] || HOME="/root"
+  export HOME
+fi
+
+readonly VERSION="4.0.5"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -6816,6 +6827,34 @@ wait_for_openclaw_gateway_http_ready() {
   return 1
 }
 
+# The Portal restarts the OpenClaw gateway from its own boot path (visible
+# browser agent reconciliation, Remote Desktop recovery), so in the seconds
+# after the Portal runtime is replaced the gateway can legitimately be
+# stopping, starting, or up but not yet answering /readyz. Sampling that
+# instant as if it were steady state reported a perfectly healthy host as
+# "not stably ready" and aborted the update. Let the unit settle first; the
+# real baseline gates still judge whatever we settle on.
+settle_openclaw_gateway_before_converge() {
+  local timeout_secs="${1:-180}"
+  local waited=0 state=""
+  systemctl list-unit-files openclaw-gateway.service >/dev/null 2>&1 || return 0
+  systemctl is-enabled openclaw-gateway >/dev/null 2>&1 \
+    || systemctl is-active --quiet openclaw-gateway \
+    || return 0
+  while (( waited < timeout_secs )); do
+    state="$(systemctl show openclaw-gateway -p ActiveState --value 2>/dev/null || true)"
+    if [[ "${state}" == "active" ]] && openclaw_gateway_http_ready; then
+      return 0
+    fi
+    # A unit that has given up is a real fault, not a transient restart, and
+    # waiting the full window would only delay an accurate diagnosis.
+    [[ "${state}" == "failed" ]] && return 1
+    sleep 3
+    waited=$((waited + 3))
+  done
+  return 1
+}
+
 openclaw_startup_migration_lease_remaining_seconds() {
   NODE_NO_WARNINGS=1 node - <<'NODE' 2>> "$LOG_FILE"
 const { DatabaseSync } = require('node:sqlite');
@@ -7060,6 +7099,7 @@ converge_openclaw_core_package() {
     && OPENCLAW_STATE_EXISTED_BEFORE_UPDATE=true
   OPENCLAW_GATEWAY_WAS_ENABLED=false
   OPENCLAW_GATEWAY_WAS_ACTIVE=false
+  settle_openclaw_gateway_before_converge 180 || true
   systemctl is-enabled openclaw-gateway >/dev/null 2>&1 && OPENCLAW_GATEWAY_WAS_ENABLED=true
   systemctl is-active --quiet openclaw-gateway && OPENCLAW_GATEWAY_WAS_ACTIVE=true
 
@@ -7076,8 +7116,20 @@ converge_openclaw_core_package() {
       fail "The existing OpenClaw installation could not be identified precisely; refusing to overwrite it without a verifiable rollback package."
     fi
     if $OPENCLAW_GATEWAY_WAS_ACTIVE; then
-      if ! capture_openclaw_gateway_baseline "${current_runtime_version}" \
-        || ! openclaw_standard_state_is_confirmed; then
+      local baseline_attempt=0 baseline_confirmed=false
+      # The Portal can restart the gateway again between settling and probing,
+      # so a single miss is retried rather than treated as an unsafe host.
+      while (( baseline_attempt < 3 )); do
+        baseline_attempt=$((baseline_attempt + 1))
+        if capture_openclaw_gateway_baseline "${current_runtime_version}" \
+          && openclaw_standard_state_is_confirmed; then
+          baseline_confirmed=true
+          break
+        fi
+        (( baseline_attempt < 3 )) || break
+        settle_openclaw_gateway_before_converge 60 || true
+      done
+      if ! $baseline_confirmed; then
         fail "The existing OpenClaw gateway is not stably ready in the standard state layout; refusing to replace ${current_package_version} without a safe live rollback baseline."
       fi
     elif $OPENCLAW_GATEWAY_WAS_ENABLED; then

@@ -2,6 +2,40 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.5] - 2026-08-01
+
+### Fixed
+- **Updates no longer abort because the Portal restarted the OpenClaw gateway.**
+  Before replacing the pinned OpenClaw core package, the installer proves the
+  running gateway is healthy so it has a rollback baseline to return to. It
+  sampled that state instantly. The Portal, however, restarts the gateway from
+  its own startup path when it reconciles visible-browser agent defaults, and
+  the installer reaches this step seconds after it restarts the Portal — so on
+  any host with Remote Desktop or a visible-browser agent configured, the
+  gateway was reliably mid-restart at exactly the moment it was measured. A
+  healthy machine was reported as `The existing OpenClaw gateway is not stably
+  ready in the standard state layout` and the update failed after the Portal had
+  already been upgraded, leaving the Dashboard offering the same update again.
+  The installer now waits for the unit to settle before sampling it, and retries
+  the baseline probe rather than condemning the host on a single miss. A gateway
+  that has genuinely failed is still refused immediately, and an unstable one
+  still fails closed, so the rollback guarantee is unchanged.
+
+## [4.0.4] - 2026-08-01
+
+### Fixed
+- **The in-Portal update button can apply releases again.** The Dashboard runs
+  the signed installer as a systemd transient unit. systemd starts root units
+  with `USER` set but `HOME` unset, and the installer runs under `set -u` while
+  reading `${HOME}` to locate root-owned agent state. Every update started from
+  the Dashboard therefore aborted with `HOME: unbound variable` after building
+  the candidate but before it was ever swapped in, leaving the Portal running
+  its previous version. The installer now resolves `HOME` from the password
+  database before anything references it, and the updater passes `HOME` through
+  to the transient unit explicitly. Portals on 4.0.0, 4.0.1, 4.0.2, and 4.0.3
+  are unblocked by this release with no manual step, because the updater fetches
+  its installer from the release it is moving to.
+
 ## [4.0.3] - 2026-08-01
 
 ### Fixed
