@@ -104,7 +104,11 @@ import {
   stripEnvelope,
   stripOpenClawReplyTags,
 } from '../utils/chatText';
-import { canUseDirectGateway, canUseInteractivePortal, isElevatedRole } from '../utils/authz';
+import { canUseDirectGateway, canUseInteractivePortal, isElevatedRole, isOwnerRole } from '../utils/authz';
+import {
+  openClawSessionActorId,
+  isOpenClawSessionActorScopedTo,
+} from '../agents/openclawSessionOwnership';
 import { hasGatewayToken, getGatewayToken } from '../utils/gatewayToken';
 import { getOpenClawWsUrl } from '../config/openclaw';
 import { isAllowedWebSocketOrigin } from '../utils/websocketOrigin';
@@ -1171,24 +1175,9 @@ function openClawAgentChatSessionKey(
   return `agent:${agentId}:portal-${userId}${suffix}`;
 }
 
-function openClawSessionActorId(rawSessionKey: string): string | null {
-  const sessionKey = String(rawSessionKey || '').trim();
-  const match = /^agent:[^:]+:portal-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:-|$)/i.exec(sessionKey);
-  return match?.[1]?.toLowerCase() || null;
-}
+/** Agent that Agent Chat lists when the client has not selected one. */
+const DEFAULT_HOST_AGENT_ID = 'main';
 
-function isOpenClawSessionActorScopedTo(
-  rawSessionKey: string,
-  rawActorUserId: string,
-): boolean {
-  const sessionKey = String(rawSessionKey || '').trim();
-  const actorUserId = String(rawActorUserId || '').trim();
-  if (!sessionKey || !actorUserId) return false;
-  const match = /^agent:[^:]+:(.+)$/.exec(sessionKey);
-  const sessionName = match?.[1] || '';
-  return sessionName === `portal-${actorUserId}`
-    || sessionName.startsWith(`portal-${actorUserId}-`);
-}
 
 async function resolveOpenClawSessionKey(
   rawSession: unknown,
@@ -1207,6 +1196,13 @@ async function resolveOpenClawSessionKey(
       return openClawAgentChatSessionKey(user.userId, agentId);
     }
     if (sessionName.startsWith('new-')) {
+      // `new-<ts>` is the Portal's own alias for "start a chat", so it normally
+      // resolves into this user's namespace. But OpenClaw names host-created
+      // chats the same way, and those are real sessions with real transcripts.
+      // Redirecting an owned, already-existing key would silently open an empty
+      // room instead of the conversation the user asked for.
+      const owner = await findOpenClawAgentSessionOwner(session, database);
+      if (owner === user.userId) return session;
       return openClawAgentChatSessionKey(user.userId, agentId, sessionName);
     }
     return session;
@@ -1219,7 +1215,10 @@ async function resolveOpenClawSessionKey(
     return openClawAgentChatSessionKey(user.userId);
   }
   if (session.startsWith('new-')) {
-    return openClawAgentChatSessionKey(user.userId, 'main', session);
+    const canonical = `agent:${DEFAULT_HOST_AGENT_ID}:${session}`;
+    const owner = await findOpenClawAgentSessionOwner(canonical, database);
+    if (owner === user.userId) return canonical;
+    return openClawAgentChatSessionKey(user.userId, DEFAULT_HOST_AGENT_ID, session);
   }
   return session;
 }
@@ -1375,7 +1374,7 @@ async function assertGatewaySessionAccess(
   if (await isProjectChatActivitySession(sessionKey, database, user.userId)) {
     throw new Error('Admin access required');
   }
-  await claimOpenClawAgentSession(sessionKey, user.userId, database);
+  await claimOpenClawAgentSession(sessionKey, user.userId, database, user.role);
 }
 
 /**
@@ -1481,6 +1480,7 @@ async function claimOpenClawAgentSession(
   rawSessionKey: string,
   rawActorUserId: string,
   database: ProjectActivityScopeDatabase = prisma,
+  actorRole?: string | null,
 ): Promise<void> {
   const sessionKey = String(rawSessionKey || '').trim();
   const actorUserId = String(rawActorUserId || '').trim();
@@ -1490,7 +1490,11 @@ async function claimOpenClawAgentSession(
   if (embeddedActorId && embeddedActorId !== actorUserId.toLowerCase()) {
     throw new Error('Admin access required');
   }
-  const actorScopedToCurrentUser = isOpenClawSessionActorScopedTo(sessionKey, actorUserId);
+  // The OWNER is the host operator: sessions they created through the OpenClaw
+  // web UI or CLI carry no Portal scope, but they are still theirs. Keys scoped
+  // to another Portal user were already rejected above, for every role.
+  const actorScopedToCurrentUser = isOpenClawSessionActorScopedTo(sessionKey, actorUserId)
+    || isOwnerRole(actorRole);
 
   const touchOwned = async (row: { id: string; userId: string } | null): Promise<boolean> => {
     if (!row) return false;
@@ -1591,6 +1595,7 @@ async function attestAgentChatActivitySession(
   rawSessionKey: string,
   rawActorUserId: string,
   database: ProjectActivityScopeDatabase = prisma,
+  actorRole?: string | null,
 ): Promise<void> {
   const sessionKey = String(rawSessionKey || '').trim();
   const actorUserId = String(rawActorUserId || '').trim();
@@ -1598,7 +1603,7 @@ async function attestAgentChatActivitySession(
   // Registration is positive Agent-surface evidence, but it must never turn
   // an existing/current/legacy Project identity into an Agent title source.
   if (await isProjectChatActivitySession(sessionKey, database, actorUserId)) return;
-  await claimOpenClawAgentSession(sessionKey, actorUserId, database);
+  await claimOpenClawAgentSession(sessionKey, actorUserId, database, actorRole);
 }
 
 async function isProjectChatActivitySession(
@@ -5449,7 +5454,21 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
       return;
     }
     const openClawProvider = AgentRegistry.get('OPENCLAW');
-    const ownedSessions = await openClawProvider.listSessions(req.user!.userId);
+    // The OWNER runs this host, so Agent Chat shows the sessions that already
+    // exist on it — including ones OpenClaw itself created. Without this, any
+    // chat started outside the Portal is invisible here forever, because only
+    // Portal-created sessions ever get a claim row.
+    // Scoped to the agent actually being viewed. Sweeping every agent would
+    // pull in machine lanes such as `agent:api:*`, which are `direct` sessions
+    // by kind but are OpenAI-compatible API traffic, not anyone's chat history.
+    const includeHostSessions = isOwnerRole(req.user!.role);
+    const hostAgentIds = includeHostSessions
+      ? [agentId || DEFAULT_HOST_AGENT_ID]
+      : [];
+    const ownedSessions = await openClawProvider.listSessions(req.user!.userId, {
+      includeHostSessions,
+      hostAgentIds,
+    });
     const sessions = agentId
       ? ownedSessions.filter((session) => String(session.sessionId || '').startsWith(`agent:${agentId}:`))
       : ownedSessions;
@@ -6388,7 +6407,7 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
           // History is the authenticated Agent Chat bootstrap/reconnect path,
           // including the optional direct transport. Registering here covers
           // pre-upgrade and resumed sessions before their next send.
-          await attestAgentChatActivitySession(sessionKey, req.user!.userId);
+          await attestAgentChatActivitySession(sessionKey, req.user!.userId, undefined, req.user!.role);
         } catch (error) {
           console.warn('[gateway] Agent activity history attestation could not be persisted:', error);
         }

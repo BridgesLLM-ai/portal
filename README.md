@@ -40,7 +40,7 @@ Ubuntu 22.04+ or Debian 12+ · 3.5 GB RAM (4 GB+ recommended) · 35 GB disk · r
 - **Updates you can watch and undo.** One button in the Dashboard: signed release notes, backup check, migrations, health checks, automatic rollback if the new build won't come up healthy.
 - **Everything else got a pass.** Setup, Files, Mail, Terminal, Remote Desktop, Apps, Tasks, Skills, Settings, Admin, light mode, and accessibility all got reliability and clarity work.
 
-Read the complete [4.0.5 changelog](CHANGELOG.md#405---2026-08-01) and [release history](https://github.com/BridgesLLM-ai/portal/releases).
+Read the complete [4.0.6 changelog](CHANGELOG.md#406---2026-08-02) and [release history](https://github.com/BridgesLLM-ai/portal/releases).
 
 ## What you get
 

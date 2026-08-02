@@ -71,6 +71,28 @@ The helper targets loopback CDP 18801 for the browser visible in Remote Desktop.
 
 Do not hand-edit backend/dist, frontend/dist, the live database, OpenClaw config, Caddy, or systemd merely to make a product test pass.
 
+## Hosted apps that embed a third party
+
+Portal 4.0 serves `/hosted/*` and `/share/*` from the isolated app-content
+origin, and every response there inherits the Portal's global CSP and
+Permissions-Policy: `frame-src` allows only `'self'`, `blob:`, `data:` and
+YouTube, and camera/microphone are denied. An app that embeds a video agent,
+payment widget, map, or captcha therefore renders a blank frame or dead
+media while its own code is perfectly correct.
+
+Diagnose before touching the app: request the hosted URL on the app-content
+host and read the `content-security-policy` and `permissions-policy` response
+headers. A Portal-default policy on an app that needs a third-party frame is
+the bug; a console `Refused to frame …` violation confirms it.
+
+There is no per-app embed allowlist in Settings yet. Until that ships, an
+exception is operator-owned Caddy configuration, path-scoped to the one
+deploy id, and it must live **outside** the `BEGIN/END BridgesLLM App Content`
+markers — the Portal rewrites everything between those markers verbatim on
+every setup and update converge, so an edit inside them is silently dropped
+at the next update. Scope the exception to the narrowest origins the embed
+actually needs; never widen the shared Portal policy to fix one app.
+
 ## Load only the reference you need
 
 - references/agent-chat.md — Main vs Project Chat, providers, models, streaming, long turns, tools.

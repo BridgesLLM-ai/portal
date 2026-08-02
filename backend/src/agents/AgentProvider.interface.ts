@@ -118,6 +118,22 @@ export class AgentAbortError extends Error {
   }
 }
 
+/**
+ * Extra scoping for `listSessions`. Only the OpenClaw provider reads these;
+ * other providers own their own session inventory and ignore them.
+ */
+export interface ListOpenClawSessionsOptions {
+  /**
+   * Include sessions created outside the Portal on this host (OpenClaw web UI,
+   * CLI, `dashboard:` lanes). Callers must set this only for the Portal OWNER,
+   * who is the host operator. Sessions scoped to another Portal user stay
+   * hidden regardless.
+   */
+  includeHostSessions?: boolean;
+  /** Agents to sweep for host sessions — normally the Agent Chat selector set. */
+  hostAgentIds?: readonly string[];
+}
+
 /** Summary of one agent session, returned by listSessions. */
 export interface AgentSessionSummary {
   sessionId: AgentSessionId;
@@ -179,7 +195,10 @@ export interface AgentProvider {
   /**
    * List all sessions owned by a user.
    */
-  listSessions(userId: string): Promise<AgentSessionSummary[]>;
+  listSessions(
+    userId: string,
+    options?: ListOpenClawSessionsOptions,
+  ): Promise<AgentSessionSummary[]>;
 
   /**
    * Tear down a session and release resources.

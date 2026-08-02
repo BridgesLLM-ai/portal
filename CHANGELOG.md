@@ -2,6 +2,26 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.6] - 2026-08-02
+
+### Fixed
+- **Agent Chat shows the conversations that already exist on your server.**
+  Only sessions the Portal itself created were ever listed. A chat started from
+  the OpenClaw web UI, the command line, or any other lane on the same host had
+  no ownership record in the Portal database, so it was invisible in Agent Chat
+  — permanently, and with no way to recover it from the interface. The Portal
+  Owner is the operator of that host, so their own sessions are now listed
+  alongside Portal-created ones. Sessions scoped to a different Portal user are
+  still hidden from everybody, and automation lanes (cron runs, sub-agent runs)
+  stay out of the chat list.
+- **Opening one of those chats shows its transcript instead of an empty room.**
+  A session named `new-<timestamp>` is the Portal's own alias for "start a new
+  chat", so the server rewrote it into the requesting user's namespace. OpenClaw
+  names host-created chats exactly the same way, so opening a real conversation
+  silently redirected to an empty one that had never been used. The rewrite now
+  applies only when the key is not already an existing session belonging to the
+  caller. A key owned by another user still never resolves to their transcript.
+
 ## [4.0.5] - 2026-08-01
 
 ### Fixed

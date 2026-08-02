@@ -25,7 +25,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="4.0.5"
+readonly VERSION="4.0.6"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive

@@ -1823,3 +1823,92 @@ describe('Agent Chat execution boundary', () => {
     expect(retainLease).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('host-created OpenClaw sessions stay reachable', () => {
+  const OWNER = '11111111-2222-4333-8444-555555555555';
+  const OTHER = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+
+  test('an owned `new-<ts>` session opens itself, not an empty Portal-scoped room', async () => {
+    const { database } = createOwnershipDatabase([{
+      id: 'host-chat-claim',
+      userId: OWNER,
+      externalId: 'agent:main:new-1780000000000',
+    }]);
+
+    await expect(__gatewayExecutionScopeTest.resolveOpenClawSessionKey(
+      'agent:main:new-1780000000000',
+      { userId: OWNER, role: 'OWNER' } as any,
+      database,
+    )).resolves.toBe('agent:main:new-1780000000000');
+  });
+
+  test('an unclaimed `new-<ts>` alias still resolves into the caller namespace', async () => {
+    const { database } = createOwnershipDatabase();
+
+    await expect(__gatewayExecutionScopeTest.resolveOpenClawSessionKey(
+      'agent:main:new-1780000000000',
+      { userId: OWNER, role: 'OWNER' } as any,
+      database,
+    )).resolves.toBe(`agent:main:portal-${OWNER}-new-1780000000000`);
+  });
+
+  test('another user\'s claim never redirects this caller onto their transcript', async () => {
+    const { database } = createOwnershipDatabase([{
+      id: 'foreign-chat-claim',
+      userId: OTHER,
+      externalId: 'agent:main:new-1780000000000',
+    }]);
+
+    await expect(__gatewayExecutionScopeTest.resolveOpenClawSessionKey(
+      'agent:main:new-1780000000000',
+      { userId: OWNER, role: 'OWNER' } as any,
+      database,
+    )).resolves.toBe(`agent:main:portal-${OWNER}-new-1780000000000`);
+  });
+
+  test('the bare `new-<ts>` form follows the same rule', async () => {
+    const { database } = createOwnershipDatabase([{
+      id: 'host-chat-claim',
+      userId: OWNER,
+      externalId: 'agent:main:new-1780000000000',
+    }]);
+
+    await expect(__gatewayExecutionScopeTest.resolveOpenClawSessionKey(
+      'new-1780000000000',
+      { userId: OWNER, role: 'OWNER' } as any,
+      database,
+    )).resolves.toBe('agent:main:new-1780000000000');
+  });
+
+  test('the Owner may claim an unscoped host session; a sub-admin may not', async () => {
+    const owned = createOwnershipDatabase();
+    await __gatewayExecutionScopeTest.claimOpenClawAgentSession(
+      'agent:main:dashboard:0b3a4512-f580-4f3e-a573-f9363e26f5a5',
+      OWNER,
+      owned.database,
+      'OWNER',
+    );
+    expect(owned.agentSession.create).toHaveBeenCalledTimes(1);
+
+    const refused = createOwnershipDatabase();
+    await expect(__gatewayExecutionScopeTest.claimOpenClawAgentSession(
+      'agent:main:dashboard:0b3a4512-f580-4f3e-a573-f9363e26f5a5',
+      OTHER,
+      refused.database,
+      'SUB_ADMIN',
+    )).rejects.toThrow('Admin access required');
+    expect(refused.agentSession.create).not.toHaveBeenCalled();
+  });
+
+  test('not even the Owner may claim a session scoped to another Portal user', async () => {
+    const { database, agentSession } = createOwnershipDatabase();
+
+    await expect(__gatewayExecutionScopeTest.claimOpenClawAgentSession(
+      `agent:main:portal-${OTHER}-new-1785561330794`,
+      OWNER,
+      database,
+      'OWNER',
+    )).rejects.toThrow('Admin access required');
+    expect(agentSession.create).not.toHaveBeenCalled();
+  });
+});

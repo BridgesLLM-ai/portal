@@ -6,6 +6,7 @@ import {
   AgentMessage,
   AgentSendResult,
   AgentSessionSummary,
+  ListOpenClawSessionsOptions,
   OnChunkCallback,
   SenderIdentity,
 } from '../AgentProvider.interface';
@@ -18,6 +19,7 @@ import { hasGatewayToken } from '../../utils/gatewayToken';
 import { getProviderCapabilities } from '../providerAvailability';
 import { assertExecutionContextBinding, assertProviderSupportsExecutionScope } from '../executionScope';
 import { prisma } from '../../config/database';
+import { isHostAdoptableOpenClawSession } from '../openclawSessionOwnership';
 
 const DEBUG_GATEWAY_WS = process.env.DEBUG_GATEWAY_WS === '1';
 const debugLog = (...args: unknown[]) => {
@@ -499,7 +501,10 @@ export class OpenClawProvider implements AgentProvider {
     return readSessionMessages(fileId, 200, sessionsDir);
   }
 
-  async listSessions(userId: string): Promise<AgentSessionSummary[]> {
+  async listSessions(
+    userId: string,
+    options: ListOpenClawSessionsOptions = {},
+  ): Promise<AgentSessionSummary[]> {
     const claims = await prisma.agentSession.findMany({
       where: {
         userId,
@@ -512,7 +517,6 @@ export class OpenClawProvider implements AgentProvider {
         .map((claim) => String(claim.externalId || '').trim())
         .filter(Boolean),
     );
-    if (ownedKeys.size === 0) return [];
 
     const agentIds = new Set<string>();
     for (const key of ownedKeys) {
@@ -521,6 +525,16 @@ export class OpenClawProvider implements AgentProvider {
         agentIds.add(match[1]);
       }
     }
+    // The host operator's own sessions usually have no claim row yet — they
+    // were created outside the Portal — so the claim set cannot be the only
+    // source of agents to sweep.
+    if (options.includeHostSessions) {
+      for (const rawAgentId of options.hostAgentIds || []) {
+        const agentId = String(rawAgentId || '').trim();
+        if (/^[a-zA-Z0-9_-]{1,64}$/.test(agentId)) agentIds.add(agentId);
+      }
+    }
+    if (agentIds.size === 0) return [];
 
     const snapshots = await Promise.all(Array.from(agentIds).map(async (agentId) => {
       const result = await gatewayRpcCall('sessions.list', { agentId });
@@ -529,9 +543,18 @@ export class OpenClawProvider implements AgentProvider {
         : [];
     }));
 
+    const seen = new Set<string>();
     return snapshots
       .flat()
-      .filter((session: any) => ownedKeys.has(String(session.key || '').trim()))
+      .filter((session: any) => {
+        const key = String(session.key || '').trim();
+        if (!key || seen.has(key)) return false;
+        const visible = ownedKeys.has(key)
+          || (options.includeHostSessions && isHostAdoptableOpenClawSession(session, userId));
+        if (!visible) return false;
+        seen.add(key);
+        return true;
+      })
       .map((s: any) => ({
         sessionId: s.key,
         status: 'active' as const,
