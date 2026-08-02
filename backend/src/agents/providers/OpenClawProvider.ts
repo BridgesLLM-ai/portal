@@ -399,6 +399,46 @@ function sendMessageViaPersistentWs(
   });
 }
 
+const SESSION_TITLE_MAX_LENGTH = 120;
+
+/**
+ * Plain-text title for a session, as OpenClaw itself named it.
+ *
+ * `displayName` is an operator-set label and wins; `derivedTitle` is the one
+ * OpenClaw generates from the conversation. Both arrive with markdown emphasis
+ * intact (`**Portal update triage**`) because they are written for a markdown
+ * surface, and the session picker renders text — so strip it here rather than
+ * teaching every consumer to.
+ */
+function openClawSessionTitle(session: { displayName?: unknown; derivedTitle?: unknown }): string {
+  const raw = String(session?.displayName || session?.derivedTitle || '').trim();
+  if (!raw) return '';
+  const plain = raw
+    .replace(/[*_`]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!plain) return '';
+  return plain.length > SESSION_TITLE_MAX_LENGTH
+    ? `${plain.slice(0, SESSION_TITLE_MAX_LENGTH - 1).trimEnd()}…`
+    : plain;
+}
+
+/**
+ * The gateway reports activity as epoch milliseconds; AgentSessionSummary is
+ * declared as ISO strings and the frontend sorts on it. Passing the raw value
+ * through produced a mix of numbers and strings in one list.
+ */
+function normalizeSessionTimestamp(value: unknown): string {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return new Date(value).toISOString();
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = new Date(value.trim());
+    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+  }
+  return new Date().toISOString();
+}
+
 export class OpenClawProvider implements AgentProvider {
   readonly displayName = 'OpenClaw';
   readonly providerName: AgentProviderName = 'OPENCLAW';
@@ -555,13 +595,23 @@ export class OpenClawProvider implements AgentProvider {
         seen.add(key);
         return true;
       })
-      .map((s: any) => ({
-        sessionId: s.key,
-        status: 'active' as const,
-        createdAt: s.createdAt || new Date().toISOString(),
-        lastActivityAt: s.lastActivityAt || new Date().toISOString(),
-        metadata: { model: s.model },
-      }));
+      .map((s: any) => {
+        // OpenClaw already names every conversation from its own content and
+        // reports it as displayName/derivedTitle. Dropping those was why Agent
+        // Chat could only ever show `Session 0b3a4512` for a real chat.
+        const title = openClawSessionTitle(s);
+        return {
+          sessionId: s.key,
+          status: 'active' as const,
+          createdAt: normalizeSessionTimestamp(s.createdAt ?? s.startedAt ?? s.updatedAt),
+          // `updatedAt` is the field the gateway actually reports; without it
+          // every session claimed to have been touched at list time, so the
+          // list could not be ordered by recency.
+          lastActivityAt: normalizeSessionTimestamp(s.lastActivityAt ?? s.updatedAt),
+          ...(title ? { title } : {}),
+          metadata: { model: s.model },
+        };
+      });
   }
 
   async terminateSession(sessionId: AgentSessionId): Promise<void> {

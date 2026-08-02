@@ -419,6 +419,52 @@ describe('gateway history readers', () => {
     ]);
   });
 
+  test('best OpenClaw history follows usage-family session ids across restart recovery', () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-usage-family-history-'));
+    const sessionKey = 'agent:max_revenue:new-usage-family';
+    const firstSessionId = 'usage-family-first';
+    const currentSessionId = 'usage-family-current';
+
+    fs.writeFileSync(path.join(sessionsDir, 'sessions.json'), JSON.stringify({
+      [sessionKey]: {
+        sessionId: currentSessionId,
+        usageFamilySessionIds: [firstSessionId, currentSessionId],
+      },
+    }));
+    fs.writeFileSync(path.join(sessionsDir, `${firstSessionId}.jsonl`), [
+      JSON.stringify({
+        id: 'family-user-1',
+        type: 'message',
+        timestamp: '2026-08-02T03:40:00.000Z',
+        message: { role: 'user', content: 'Keep this earlier request.' },
+      }),
+      JSON.stringify({
+        id: 'family-assistant-1',
+        type: 'message',
+        timestamp: '2026-08-02T03:41:00.000Z',
+        message: { role: 'assistant', content: 'Keep this earlier answer.' },
+      }),
+    ].join('\n') + '\n');
+    fs.writeFileSync(path.join(sessionsDir, `${currentSessionId}.jsonl`), JSON.stringify({
+      id: 'family-user-2',
+      type: 'message',
+      timestamp: '2026-08-02T04:03:00.000Z',
+      message: { role: 'user', content: 'Continue after the restart.' },
+    }) + '\n');
+
+    const messages = __gatewayHistoryTest.readBestOpenClawSessionMessagesForSessionKey(
+      sessionKey,
+      20,
+      sessionsDir,
+    );
+
+    expect(messages.map((message: any) => message.id)).toEqual([
+      'family-user-1',
+      'family-assistant-1',
+      'family-user-2',
+    ]);
+  });
+
   test('best OpenClaw history filters stale trajectory snapshots around canonical transcript span', () => {
     const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-history-'));
     const sessionKey = 'agent:main:trajectory-window-test';
@@ -518,6 +564,40 @@ describe('gateway history readers', () => {
     } finally {
       if (previousEventDir === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
       else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previousEventDir;
+    }
+  });
+
+  test('collapses replace-style preamble statuses instead of persisting token floods', () => {
+    const eventDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-preamble-events-'));
+    const previousEventDir = process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+    process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = eventDir;
+
+    try {
+      const sessionKey = 'agent:main:preamble-collapse-test';
+      const base = (seq: number, text: string): RuntimeTurnEvent => ({
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type: 'assistant_status',
+        sessionKey,
+        runId: 'run-preamble-collapse',
+        seq,
+        ts: Date.parse('2026-08-02T04:00:00.000Z') + seq,
+        text,
+        replace: true,
+        visible: true,
+        source: { transport: 'portal-stream-event-bus', eventType: 'status' },
+      });
+      recordRuntimeTurnEvent(sessionKey, base(1, 'Inspect'));
+      recordRuntimeTurnEvent(sessionKey, base(2, 'Inspect every'));
+      recordRuntimeTurnEvent(sessionKey, base(3, 'Inspect every file'));
+
+      const replayed = readRuntimeTurnEvents(sessionKey, 50);
+      expect(replayed.filter((event) => event.type === 'assistant_status')).toEqual([
+        expect.objectContaining({ text: 'Inspect every file', replace: true }),
+      ]);
+    } finally {
+      if (previousEventDir === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+      else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previousEventDir;
+      fs.rmSync(eventDir, { recursive: true, force: true });
     }
   });
 
@@ -948,6 +1028,35 @@ describe('gateway history readers', () => {
     expect(toolCalls[0].arguments).toEqual({ command: 'echo RAIL_TOOL' });
     expect(toolCalls[0].result).toBe('RAIL_TOOL');
     expect(toolCalls[0].status).toBe('done');
+  });
+
+  test('runtime history anchors an exact terminal replay after late tool activity', () => {
+    const baseTs = Date.parse('2026-08-02T04:00:00.000Z');
+    const event = (seq: number, extra: Partial<RuntimeTurnEvent>): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_delta',
+      sessionKey: 'agent:main:late-tool-final',
+      runId: 'run-late-tool-final',
+      seq,
+      ts: baseTs + seq * 100,
+      visible: true,
+      source: { transport: 'portal-stream-event-bus', eventType: 'text' },
+      ...extra,
+    });
+
+    const messages = __gatewayHistoryTest.buildRuntimeHistoryMessages([
+      event(1, { text: 'The actual final answer.' }),
+      event(2, { type: 'tool_started', tool: { id: 'late-tool', name: 'sessions_yield', status: 'running' } }),
+      event(3, { type: 'tool_output', tool: { id: 'late-tool', name: 'sessions_yield', result: 'returned', status: 'done' } }),
+      event(4, { type: 'assistant_final', text: 'The actual final answer.', replace: true, terminal: true }),
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toBe('The actual final answer.');
+    expect(messages[0].segments).toBeUndefined();
+    expect(messages[0].toolCalls).toEqual([
+      expect.objectContaining({ id: 'late-tool', status: 'done' }),
+    ]);
   });
 
   test('runtime history drops placeholder status events but keeps substantive statuses', () => {

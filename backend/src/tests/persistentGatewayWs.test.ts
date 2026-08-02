@@ -664,7 +664,7 @@ describe('PersistentGatewayWs Codex idle timeout handling', () => {
     }
   });
 
-  it('publishes provider preamble progress as a safe subject instead of reasoning body text', () => {
+  it('publishes provider preamble progress as one replaceable status block', () => {
     const sessionKey = 'test-thinking-subject';
     const events: StreamEvent[] = [];
     const unsubscribe = streamEventBus.subscribe(sessionKey, (event) => events.push(event));
@@ -681,32 +681,27 @@ describe('PersistentGatewayWs Codex idle timeout handling', () => {
         },
       });
 
-      const thinking = events.find((event) => event.type === 'thinking');
-      expect(thinking).toMatchObject({
-        type: 'thinking',
-        content: '',
-        subject: 'Inspecting runtime [redacted]',
+      const progress = events.find((event) => event.type === 'status');
+      expect(progress).toMatchObject({
+        type: 'status',
+        content: '**Inspecting runtime** password=[redacted]',
+        replace: true,
+        preambleProgress: true,
         runId: 'run-thinking-subject',
       });
-      expect(thinking?.replace).toBeUndefined();
-      expect(thinking?.turnEvent).toMatchObject({
-        type: 'assistant_reasoning',
-        subject: 'Inspecting runtime [redacted]',
+      expect(progress?.turnEvent).toMatchObject({
+        type: 'assistant_status',
+        text: '**Inspecting runtime** password=[redacted]',
+        replace: true,
         visible: true,
       });
-      expect(thinking?.turnEvent?.text).toBeUndefined();
     } finally {
       unsubscribe();
       __persistentGatewayWsTest.resetSession(sessionKey);
     }
   });
 
-  it('splits cumulative Codex preamble snapshots instead of smearing titles together', () => {
-    // Codex repeats every earlier title on each preamble event and appends the
-    // new one with no separator. Taking the whole blob as the subject smears
-    // several titles into one, and makes every event look like a subject
-    // change -- which graduates a title-only thinking segment before its body
-    // has arrived. Only the newly appended tail may become the subject.
+  it('collapses tokenized cumulative Codex preambles into one growing thought', () => {
     const sessionKey = 'test-preamble-cumulative';
     const runId = 'run-preamble-cumulative';
     const events: StreamEvent[] = [];
@@ -737,15 +732,32 @@ describe('PersistentGatewayWs Codex idle timeout handling', () => {
       });
 
       expect(
-        events.filter((event) => event.type === 'thinking').map((event) => event.subject),
-      ).toEqual(['Inspecting files', 'Running tests', 'Summarizing results']);
+        events.filter((event) => event.type === 'status').map((event) => ({
+          content: event.content,
+          replace: event.replace,
+          subject: event.subject,
+        })),
+      ).toEqual([
+        { content: 'Inspecting files', replace: true, subject: undefined },
+        { content: 'Inspecting filesRunning tests', replace: true, subject: undefined },
+        { content: 'Inspecting filesRunning testsSummarizing results', replace: true, subject: undefined },
+      ]);
+      expect(
+        streamEventBus.getRecentTurnEvents(sessionKey)
+          .filter((event) => event.type === 'assistant_status'),
+      ).toEqual([
+        expect.objectContaining({
+          text: 'Inspecting filesRunning testsSummarizing results',
+          replace: true,
+        }),
+      ]);
     } finally {
       unsubscribe();
       __persistentGatewayWsTest.resetSession(sessionKey);
     }
   });
 
-  it('treats a non-extending preamble snapshot as an authoritative restart', () => {
+  it('treats a non-extending anonymous preamble snapshot as an authoritative replacement', () => {
     const sessionKey = 'test-preamble-restart';
     const runId = 'run-preamble-restart';
     const events: StreamEvent[] = [];
@@ -767,7 +779,7 @@ describe('PersistentGatewayWs Codex idle timeout handling', () => {
       });
 
       expect(
-        events.filter((event) => event.type === 'thinking').map((event) => event.subject),
+        events.filter((event) => event.type === 'status').map((event) => event.content),
       ).toEqual(['Inspecting filesRunning tests', 'Starting over']);
     } finally {
       unsubscribe();
@@ -812,20 +824,20 @@ describe('PersistentGatewayWs Codex idle timeout handling', () => {
         },
       });
 
-      expect(events.filter((event) => event.type === 'thinking').map((event) => ({
+      expect(events.filter((event) => event.type === 'thinking' || event.type === 'status').map((event) => ({
         subject: event.subject,
         content: event.content,
         replace: event.replace,
       }))).toEqual([
-        { subject: 'Inspecting files', content: '', replace: undefined },
+        { subject: undefined, content: 'Inspecting files', replace: true },
         { subject: undefined, content: 'Reading file A.', replace: undefined },
-        { subject: 'Running tests', content: '', replace: undefined },
+        { subject: undefined, content: 'Running tests', replace: true },
         { subject: undefined, content: 'Running test B.', replace: undefined },
       ]);
       expect(streamEventBus.getRecentTurnEvents(sessionKey)).toEqual([
-        expect.objectContaining({ type: 'assistant_reasoning', subject: 'Inspecting files' }),
+        expect.objectContaining({ type: 'assistant_status', text: 'Inspecting files', replace: true }),
         expect.objectContaining({ type: 'assistant_reasoning', text: 'Reading file A.' }),
-        expect.objectContaining({ type: 'assistant_reasoning', subject: 'Running tests' }),
+        expect.objectContaining({ type: 'assistant_status', text: 'Running tests', replace: true }),
         expect.objectContaining({ type: 'assistant_reasoning', text: 'Running test B.' }),
       ]);
     } finally {

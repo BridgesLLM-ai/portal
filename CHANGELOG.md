@@ -2,6 +2,38 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.7] - 2026-08-02
+
+### Fixed
+- **Codex progress no longer explodes into one thinking card per token.**
+  OpenClaw sends `item.preamble` progress as a growing cumulative snapshot.
+  Agent Chat treated every newly appended tail as a separate thinking title,
+  which turned a normal sentence into hundreds of durable cards and crowded
+  the real conversation out of the history window. Preamble snapshots now
+  replace one live status, and both the live cache and durable event journal
+  collapse the intermediate frames.
+- **Agent history survives OpenClaw and Fable session recovery.** OpenClaw can
+  rotate a conversation onto a new physical transcript after a CLI restart
+  while retaining the earlier transcript IDs in `usageFamilySessionIds`.
+  Agent Chat read only the newest file, so the conversation appeared to have
+  lost everything before the restart. History now follows and chronologically
+  merges the complete registry lineage.
+- **Final answers stay at the bottom of long turns.** If an agent emitted its
+  eventual answer before late tool or sub-agent activity and repeated it in the
+  terminal frame, replay classified the answer as an early activity segment.
+  The terminal frame is now authoritative and re-anchors that exact answer
+  after the activity timeline.
+- **Expired access cookies self-heal across every Agent Chat fetch path.** The
+  shared fetch wrapper stamped actor authorization correctly but, unlike the
+  Axios client, never refreshed an expired cookie. Session lists, history,
+  heartbeat, approvals, and streamed sends could all begin returning 401s
+  until a full login cycle. Authenticated requests now share one refresh and
+  retry once under the original actor-generation lease.
+- **Brief OpenClaw restart windows no longer cascade into Portal failures.**
+  Throwaway gateway RPC connections retry only when the method provably was
+  never written. A timeout or disconnect after dispatch is still never
+  repeated, preserving at-most-once behavior for `chat.send` and mutations.
+
 ## [4.0.6] - 2026-08-02
 
 ### Fixed

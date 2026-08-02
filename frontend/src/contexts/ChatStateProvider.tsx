@@ -80,6 +80,10 @@ import {
   classifyActivityTitleEvent,
   sanitizeThinkingSubject,
 } from '../utils/thinkingSubject';
+import {
+  createPreambleProgressAccumulator,
+  mergePreambleProgressSnapshot,
+} from '../utils/preambleProgress';
 
 const DEBUG_CHAT_STATE = import.meta.env.DEV;
 const BUILD_TIME_USE_DIRECT_GATEWAY = import.meta.env.VITE_USE_DIRECT_GATEWAY === 'true';
@@ -2454,6 +2458,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     model: string | null;
     timer: ReturnType<typeof setTimeout>;
   } | null>(null);
+  const directPreambleProgressRef = useRef(createPreambleProgressAccumulator());
   // Graduated streaming segments — when a tool call starts, current accumulated text
   // gets "graduated" into a segment so it renders as a finalized bubble. This matches
   // the OpenClaw web UI v2 pattern where thoughts don't disappear on tool transitions.
@@ -3440,6 +3445,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   const resetDirectSnapshotCursor = useCallback(() => {
     directSnapshotCursorRef.current = { ...EMPTY_CUMULATIVE_SNAPSHOT_CURSOR };
+    directPreambleProgressRef.current = createPreambleProgressAccumulator();
   }, []);
 
   const applyCompactionState = useCallback((update: {
@@ -4732,10 +4738,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         // combinations do not expose private reasoning deltas, so the status event
         // is the only honest in-turn signal before tools begin.
         const runningToolName = getRunningToolName();
-        if (!maintenanceRail.isMaintenanceStatus && !runningToolName) {
+        if (!maintenanceRail.isMaintenanceStatus && !runningToolName && data.preambleProgress !== true) {
           const statusThinkingChunk = extractThinkingChunk('status', data.content, assembledRef.current.length > 0);
           appendThinkingChunk(assistantId, statusThinkingChunk);
           if (statusThinkingChunk) resetStreamWatchdog({ visible: true });
+        }
+        if (data.preambleProgress === true && !runningToolName) {
+          setStatusText(sanitizeThinkingSubject(data.content) || null);
+          setStreamingPhase('thinking');
         }
         if (!assembledRef.current || runningToolName) {
           setLiveRunPhase('thinking', maintenanceRail.displayStatusText);
@@ -5631,8 +5641,19 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           : (typeof rawData?.text === 'string'
               ? sanitizeAssistantChunk(rawData.text)
               : (typeof rawData?.content === 'string' ? sanitizeAssistantChunk(rawData.content) : ''));
-        const subject = sanitizeThinkingSubject(preambleText);
-        if (!subject) return;
+        const cumulativePreamble = mergePreambleProgressSnapshot(
+          directPreambleProgressRef.current,
+          {
+            runId: incomingRunId,
+            itemId: typeof rawData?.itemId === 'string'
+              ? rawData.itemId
+              : (typeof rawData?.item_id === 'string'
+                  ? rawData.item_id
+                  : (typeof rawData?.id === 'string' ? rawData.id : null)),
+            text: preambleText,
+          },
+        );
+        if (!cumulativePreamble) return;
 
         let assistantId = streamingAssistantIdRef.current;
         if (!assistantId) {
@@ -5643,7 +5664,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setIsRunning(true);
         setSessionAvailability('present');
         directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
-        applyThinkingSubject(assistantId, subject);
+        setStatusText(sanitizeThinkingSubject(cumulativePreamble) || null);
+        setStreamingPhase('thinking');
         setLiveRunPhase('thinking', null);
         resetStreamWatchdog({ visible: true });
         return;

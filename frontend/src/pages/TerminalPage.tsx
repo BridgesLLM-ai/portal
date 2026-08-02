@@ -1358,7 +1358,7 @@ function OpenClawTUITab({ tabId, isActive, onConnectionChange }: {
   const [statusText, setStatusText] = useState('');
   const [streamingText, setStreamingText] = useState('');
   const [selectedSession, setSelectedSession] = useState('agent:main:main');
-  const [availableSessions, setAvailableSessions] = useState<Array<{ key: string; updatedAt?: number; label?: string; agentId?: string }>>([]);
+  const [availableSessions, setAvailableSessions] = useState<Array<{ sessionId?: string; key?: string; title?: string; lastActivityAt?: string; updatedAt?: number; label?: string; agentId?: string }>>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1423,23 +1423,35 @@ function OpenClawTUITab({ tabId, isActive, onConnectionChange }: {
     if (isActive) setTimeout(() => inputRef.current?.focus(), 100);
   }, [isActive]);
 
-  const humanizeSession = (session: { key: string; label?: string }) => {
-    if (session.label) return session.label;
-    if (session.key === 'agent:main:main') return 'Main session';
-    return session.key.split(':').slice(2).join(':') || session.key;
+  // `/gateway/sessions` returns AgentSessionSummary, which names the key
+  // `sessionId` and the title `title`. Reading `key`/`label` matched nothing,
+  // so every session was filtered out and this list was always empty.
+  const sessionKeyOf = (session: any): string =>
+    String(session?.sessionId || session?.key || session?.id || '').trim();
+
+  const humanizeSession = (session: { sessionId?: string; key?: string; title?: string; label?: string }) => {
+    const title = String(session.title || session.label || '').trim();
+    if (title) return title;
+    const key = sessionKeyOf(session);
+    if (key === 'agent:main:main') return 'Main session';
+    return key.split(':').slice(2).join(':') || key;
   };
 
   const loadSessions = async () => {
     try {
       const data = await gatewayAPI.sessions();
       const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+      const activityTime = (s: any): number => {
+        const parsed = Date.parse(String(s?.lastActivityAt ?? s?.updatedAt ?? ''));
+        return Number.isNaN(parsed) ? 0 : parsed;
+      };
       const filtered = sessions
-        .filter((s: any) => typeof s.key === 'string' && s.key.startsWith('agent:'))
-        .filter((s: any) => !s.key.includes(':run:'))
-        .sort((a: any, b: any) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        .filter((s: any) => sessionKeyOf(s).startsWith('agent:'))
+        .filter((s: any) => !sessionKeyOf(s).includes(':run:'))
+        .sort((a: any, b: any) => activityTime(b) - activityTime(a));
       setAvailableSessions(filtered);
-      if (!filtered.some((s: any) => s.key === selectedSessionRef.current)) {
-        const fallback = filtered[0]?.key || 'agent:main:main';
+      if (!filtered.some((s: any) => sessionKeyOf(s) === selectedSessionRef.current)) {
+        const fallback = sessionKeyOf(filtered[0]) || 'agent:main:main';
         selectedSessionRef.current = fallback;
         setSelectedSession(fallback);
       }
@@ -1653,9 +1665,10 @@ function OpenClawTUITab({ tabId, isActive, onConnectionChange }: {
             className="max-w-[220px] text-xs px-2 py-1 rounded-lg bg-white/5 text-slate-300 border border-white/10 hover:border-white/20 focus:outline-none"
             title="Switch session"
           >
-            {availableSessions.map((session) => (
-              <option key={session.key} value={session.key}>{humanizeSession(session as any)}</option>
-            ))}
+            {availableSessions.map((session) => {
+              const key = sessionKeyOf(session);
+              return <option key={key} value={key}>{humanizeSession(session as any)}</option>;
+            })}
           </select>
           <button
             onClick={handleNewSession}

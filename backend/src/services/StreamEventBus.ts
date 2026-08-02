@@ -439,7 +439,11 @@ export class StreamEventBus {
         && turnEvent.replace === true
         && previous?.type === 'assistant_reasoning'
         && (previous.runId || '') === (turnEvent.runId || '');
-      if (replacesSameLiveThought) {
+      const replacesSameLiveStatus = turnEvent.type === 'assistant_status'
+        && turnEvent.replace === true
+        && previous?.type === 'assistant_status'
+        && (previous.runId || '') === (turnEvent.runId || '');
+      if (replacesSameLiveThought || replacesSameLiveStatus) {
         recent[recent.length - 1] = turnEvent;
       } else {
         recent.push(turnEvent);

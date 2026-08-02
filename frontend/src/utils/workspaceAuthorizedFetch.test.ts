@@ -56,6 +56,23 @@ describe('workspaceAuthorizedFetch', () => {
     expect(init.signal?.aborted).toBe(false);
   });
 
+  it('refreshes and retries an authenticated request after an expired access cookie', async () => {
+    fetchMock
+      .mockResolvedValueOnce({ ...response(3), ok: false, status: 401 })
+      .mockResolvedValueOnce({ ok: true, status: 200, headers: new Headers() } as Response)
+      .mockResolvedValueOnce(response(3));
+
+    await expect(workspaceAuthorizedFetch('/api/gateway/sessions')).resolves.toMatchObject({
+      ok: true,
+      status: 200,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/gateway/sessions');
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/auth/refresh');
+    expect(fetchMock.mock.calls[2][0]).toBe('/api/gateway/sessions');
+  });
+
   it('rejects a delayed response after the signed-in actor changes', async () => {
     let resolveFetch!: (value: Response) => void;
     fetchMock.mockImplementation(() => new Promise<Response>((resolve) => {

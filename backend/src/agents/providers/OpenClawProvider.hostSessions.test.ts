@@ -1,3 +1,5 @@
+export {};
+
 const mockAgentSessionFindMany = jest.fn();
 
 jest.mock('../../config/database', () => ({
@@ -196,5 +198,79 @@ describe('OpenClawProvider host-session visibility', () => {
 
     expect(sessions).toEqual([]);
     expect(gatewayRpc.gatewayRpcCall).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The list was previously mapped to sessionId/status/model only. Agent Chat
+ * therefore rendered every real conversation as `Session 0b3a4512`, and sorted
+ * a list in which every row claimed to have been touched at list time.
+ */
+describe('OpenClawProvider session presentation', () => {
+  beforeEach(() => {
+    gatewayRpc.gatewayRpcCall.mockReset();
+    mockAgentSessionFindMany.mockReset();
+    mockAgentSessionFindMany.mockResolvedValue([]);
+  });
+
+  async function listOne(session: Record<string, unknown>) {
+    listReturns([session]);
+    const [result] = await new OpenClawProvider().listSessions(OWNER, {
+      includeHostSessions: true,
+      hostAgentIds: ['main'],
+    });
+    return result;
+  }
+
+  test('carries the title OpenClaw derived, stripped of markdown emphasis', async () => {
+    const session = await listOne({
+      key: 'agent:main:dashboard:aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb',
+      derivedTitle: '**4.0 Updater Bug Investigation**',
+    });
+
+    expect(session.title).toBe('4.0 Updater Bug Investigation');
+  });
+
+  test('an operator-set displayName wins over the derived title', async () => {
+    const session = await listOne({
+      key: 'agent:main:new-1781111111111',
+      displayName: 'Release war room',
+      derivedTitle: '**Something generated**',
+    });
+
+    expect(session.title).toBe('Release war room');
+  });
+
+  test('a session with no title of its own reports none, rather than an empty one', async () => {
+    const session = await listOne({ key: 'agent:main:new-1781111111111' });
+
+    expect(session.title).toBeUndefined();
+  });
+
+  test('an overlong title is clamped so it cannot break the picker layout', async () => {
+    const session = await listOne({
+      key: 'agent:main:new-1781111111111',
+      derivedTitle: 'x'.repeat(400),
+    });
+
+    expect(session.title!.length).toBe(120);
+    expect(session.title!.endsWith('…')).toBe(true);
+  });
+
+  test('gateway epoch-millisecond activity becomes a sortable ISO timestamp', async () => {
+    const session = await listOne({
+      key: 'agent:main:new-1781111111111',
+      updatedAt: 1785646745692,
+    });
+
+    expect(session.lastActivityAt).toBe('2026-08-02T04:59:05.692Z');
+    expect(session.createdAt).toBe('2026-08-02T04:59:05.692Z');
+  });
+
+  test('a session the gateway reports no activity for still yields a valid timestamp', async () => {
+    const before = Date.now();
+    const session = await listOne({ key: 'agent:main:new-1781111111111' });
+
+    expect(Date.parse(session.lastActivityAt)).toBeGreaterThanOrEqual(before);
   });
 });

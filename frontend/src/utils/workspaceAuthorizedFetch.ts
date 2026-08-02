@@ -72,6 +72,25 @@ function composeSignals(signals: Array<AbortSignal | null | undefined>): AbortSi
   return controller.signal;
 }
 
+let workspaceRefreshPromise: Promise<boolean> | null = null;
+
+function refreshWorkspaceSession(): Promise<boolean> {
+  if (workspaceRefreshPromise) return workspaceRefreshPromise;
+  const apiUrl = import.meta.env.VITE_API_URL || '/api';
+  workspaceRefreshPromise = fetch(`${apiUrl}/auth/refresh`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  })
+    .then((response) => response.ok)
+    .catch(() => false)
+    .finally(() => {
+      workspaceRefreshPromise = null;
+    });
+  return workspaceRefreshPromise;
+}
+
 /**
  * Fetch wrapper for actor-scoped Files, Projects, uploads, and Agent Chat.
  *
@@ -101,17 +120,37 @@ export async function workspaceAuthorizedFetch(
     );
   }
 
-  const response = await fetch(input, {
+  const retryInput = typeof Request !== 'undefined' && input instanceof Request
+    ? input.clone()
+    : input;
+  const requestInit: RequestInit = {
     ...init,
     headers,
     signal: composeSignals([init.signal, context?.signal]),
-  });
+  };
+  let response = await fetch(input, requestInit);
   assertWorkspaceAuthorizationRequestContextIsCurrent(
     context,
     context
       ? response.headers?.get?.(PORTAL_AUTHORIZATION_VERSION_HEADER) ?? undefined
       : undefined,
   );
+  const authState = useAuthStore.getState();
+  if (
+    context
+    && (response.status === 401 || response.status === 403)
+    && authState.isAuthenticated
+    && !authState.twoFactorPending
+    && !requestInit.signal?.aborted
+    && await refreshWorkspaceSession()
+  ) {
+    assertWorkspaceAuthorizationRequestContextIsCurrent(context);
+    response = await fetch(retryInput, requestInit);
+    assertWorkspaceAuthorizationRequestContextIsCurrent(
+      context,
+      response.headers?.get?.(PORTAL_AUTHORIZATION_VERSION_HEADER) ?? undefined,
+    );
+  }
   return response;
 }
 

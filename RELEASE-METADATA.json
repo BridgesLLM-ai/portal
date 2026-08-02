@@ -1,11 +1,13 @@
 {
   "schema": 1,
-  "version": "4.0.6",
+  "version": "4.0.7",
   "releasedAt": "2026-08-02",
   "releaseClass": "hotfix",
   "highlights": [
-    "Agent Chat lists the conversations that already exist on your server, including ones started from the OpenClaw web UI or the command line.",
-    "Opening one of those chats now shows its real transcript instead of an empty room.",
-    "Sessions belonging to a different Portal user stay private, and automation lanes such as cron and sub-agent runs stay out of the chat list."
+    "Agent Chat collapses cumulative Codex progress into one live status instead of hundreds of one-token thinking cards.",
+    "Restarted Fable and OpenClaw sessions keep their earlier transcript by following the complete session lineage.",
+    "Repeated terminal answers stay anchored at the bottom of long tool and sub-agent turns.",
+    "Expired browser sessions refresh and replay Agent Chat requests instead of silently losing history and stream calls.",
+    "Gateway-backed controls tolerate brief OpenClaw restart windows without retrying any request that may have been dispatched."
   ]
 }

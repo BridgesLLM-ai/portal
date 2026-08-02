@@ -3175,7 +3175,22 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
           representedText,
           event.text || '',
         );
-        finalText = mergeRuntimeText(finalText, terminalTail, event.replace === true);
+        if (!terminalTail && !finalText.trim() && representedText.length > 0 && String(event.text || '').trim()) {
+          // Some agents emit their eventual final response before late tool or
+          // sub-agent activity, then repeat that exact response in the terminal
+          // frame. Leaving it as an early timeline segment makes the answer look
+          // buried at the top of the turn. The terminal frame is authoritative:
+          // remove the duplicate text activity and anchor the answer at the end.
+          for (let index = timeline.length - 1; index >= 0; index -= 1) {
+            const item = timeline[index];
+            if (item.kind === 'segment' && item.segment.kind === 'text' && item.segment.source === 'text') {
+              timeline.splice(index, 1);
+            }
+          }
+          finalText = mergeRuntimeText(finalText, event.text || '', true);
+        } else {
+          finalText = mergeRuntimeText(finalText, terminalTail, event.replace === true);
+        }
       } else if (event.type === 'turn_error' && !finalText) {
         finalText = sanitizeHistoryText(event.text || '');
       }
@@ -3212,6 +3227,7 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
 function reconcileMergedRuntimeHistoryContent(existing: any, runtimeMessage: any): string {
   const existingContent = typeof existing?.content === 'string' ? existing.content : '';
   const runtimeContent = typeof runtimeMessage?.content === 'string' ? runtimeMessage.content : '';
+  if (!runtimeContent.trim()) return existingContent;
   const representedRuntimeText = (Array.isArray(runtimeMessage?.segments) ? runtimeMessage.segments : [])
     .filter((segment: any) => segment?.kind === 'text' && typeof segment?.text === 'string')
     .map((segment: any) => segment.text);
@@ -4527,6 +4543,12 @@ function findSessionFileIdsForSessionKey(sessionKey: string, sessionsDir = SESSI
 
   for (const entry of resolveSessionRegistryEntries(sessionKey, sessionsDir)) {
     addSessionFileCandidate(candidates, seen, entry?.sessionId || entry?.id, sessionsDir);
+    const usageFamilySessionIds = Array.isArray(entry?.usageFamilySessionIds)
+      ? entry.usageFamilySessionIds
+      : [];
+    for (const familySessionId of usageFamilySessionIds) {
+      addSessionFileCandidate(candidates, seen, familySessionId, sessionsDir);
+    }
   }
 
   for (const key of getSessionKeyLookupVariants(sessionKey)) {

@@ -1,3 +1,5 @@
+export {};
+
 const mockAgentSessionFindMany = jest.fn();
 
 jest.mock('../../config/database', () => ({

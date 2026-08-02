@@ -228,18 +228,20 @@ const thinkingSubjectBaselineMap: Map<string, string> = new Map();
 /** Thinking body already emitted under the current provider subject. */
 const thinkingSubjectSegmentTextMap: Map<string, string> = new Map();
 const thinkingSubjectMap: Map<string, string> = new Map();
+type PreambleProgressState = {
+  runId?: string;
+  order: string[];
+  textByItem: Map<string, string>;
+};
+
 /**
- * Cumulative preamble progress text already consumed as a subject.
- *
- * Codex emits preamble progress as a growing snapshot: each event repeats every
- * earlier title and appends the new one, with no separator between them. Taking
- * the whole blob as the subject therefore smears several titles into one, and
- * makes every event look like a subject change, which graduates a title-only
- * thinking segment before its body has arrived. Diff against the last snapshot
- * so only the newly appended title becomes the current subject -- the same
- * technique the thinking snapshot lane already uses.
+ * OpenClaw item.preamble frames are cumulative progress snapshots, not a stream
+ * of thinking titles. Keep one growing text block per item identity. Treating
+ * every appended tail as a new title turns tokenized Codex progress into
+ * hundreds of durable thought cards and can crowd the real answer out of the
+ * history window.
  */
-const preambleLastSeenTextMap: Map<string, string> = new Map();
+const preambleProgressBySession: Map<string, PreambleProgressState> = new Map();
 
 // Chat events carry cumulative assistant text on newer OpenClaw builds. Use them
 // as the fallback live-text source when assistant stream events are metadata-only.
@@ -363,7 +365,7 @@ function clearTextArbitration(sessionKey: string): void {
   thinkingSubjectBaselineMap.delete(sessionKey);
   thinkingSubjectSegmentTextMap.delete(sessionKey);
   thinkingSubjectMap.delete(sessionKey);
-  preambleLastSeenTextMap.delete(sessionKey);
+  preambleProgressBySession.delete(sessionKey);
   chatLastSeenTextMap.delete(sessionKey);
   textArbitrationBySession.delete(sessionKey);
   seenToolPhaseKeysBySession.delete(sessionKey);
@@ -1098,7 +1100,36 @@ function extractPreambleProgressText(data: Record<string, unknown>): string {
     : (typeof data.text === 'string'
         ? data.text
         : (typeof data.content === 'string' ? data.content : ''));
-  return sanitizeAssistantDelta(candidate);
+  return sanitizeAssistantDelta(redactNativeProviderText(candidate));
+}
+
+function mergePreambleProgress(
+  sessionKey: string,
+  runId: string,
+  data: Record<string, unknown>,
+): string {
+  const progressText = extractPreambleProgressText(data);
+  if (!progressText) return '';
+
+  let state = preambleProgressBySession.get(sessionKey);
+  if (!state || (state.runId && state.runId !== runId)) {
+    state = { runId, order: [], textByItem: new Map() };
+    preambleProgressBySession.set(sessionKey, state);
+  } else if (!state.runId) {
+    state.runId = runId;
+  }
+
+  const rawItemId = data.itemId ?? data.item_id ?? data.id;
+  const itemId = typeof rawItemId === 'string' && rawItemId.trim()
+    ? rawItemId.trim()
+    : '__current__';
+  if (!state.textByItem.has(itemId)) state.order.push(itemId);
+  state.textByItem.set(itemId, progressText);
+
+  return state.order
+    .map((id) => state!.textByItem.get(id) || '')
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 function extractMessageToolReplyText(message: any): string {
@@ -1249,45 +1280,31 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   }
 
   if (stream === 'item' && data.kind === 'preamble') {
-    const rawPreamble = extractPreambleProgressText(data);
-    // Codex repeats every prior title on each preamble event, concatenated
-    // without a separator. Emit only the newly appended tail; a snapshot that
-    // does not extend the previous one means the provider restarted the lane
-    // and is authoritative as-is.
-    const lastSeenPreamble = preambleLastSeenTextMap.get(sessionKey) || '';
-    let currentPreamble = rawPreamble;
-    if (lastSeenPreamble && rawPreamble.startsWith(lastSeenPreamble)) {
-      currentPreamble = rawPreamble.slice(lastSeenPreamble.length);
-    }
-    if (rawPreamble) preambleLastSeenTextMap.set(sessionKey, rawPreamble);
-    const subject = sanitizeThinkingSubject(currentPreamble);
-    if (subject) {
-      const previousSubject = thinkingSubjectMap.get(sessionKey) || '';
-      if (subject !== previousSubject) {
-        // OpenClaw thinking snapshots are cumulative across provider preambles.
-        // Freeze the raw body already represented by subject A so the first
-        // snapshot under subject B can publish only B's body.
-        thinkingSubjectBaselineMap.set(
-          sessionKey,
-          thinkingLastSeenTextMap.get(sessionKey) || '',
-        );
-        thinkingSubjectSegmentTextMap.set(sessionKey, '');
-        thinkingSubjectMap.set(sessionKey, subject);
-      }
-      if (!hasRunningToolCall(sessionKey)) {
-        streamEventBus.updateStreamPhase(sessionKey, {
-          phase: 'thinking',
-          runId: effectiveRunId,
-          statusText: subject,
-        });
-      }
-      streamEventBus.publish(sessionKey, {
-        type: 'thinking',
-        subject,
-        content: '',
+    const cumulativeProgress = mergePreambleProgress(sessionKey, effectiveRunId, data);
+    if (!cumulativeProgress) return;
+    // The provider's thinking lane can remain cumulative across progress-item
+    // boundaries. Freeze the raw reasoning represented before this preamble so
+    // the next thinking snapshot emits only its new tail.
+    thinkingSubjectBaselineMap.set(
+      sessionKey,
+      thinkingLastSeenTextMap.get(sessionKey) || '',
+    );
+    thinkingSubjectSegmentTextMap.set(sessionKey, '');
+    const statusText = sanitizeThinkingSubject(extractPreambleProgressText(data));
+    if (!hasRunningToolCall(sessionKey)) {
+      streamEventBus.updateStreamPhase(sessionKey, {
+        phase: 'thinking',
         runId: effectiveRunId,
+        ...(statusText ? { statusText } : {}),
       });
     }
+    streamEventBus.publish(sessionKey, {
+      type: 'status',
+      content: cumulativeProgress,
+      replace: true,
+      preambleProgress: true,
+      runId: effectiveRunId,
+    });
     return;
   }
 

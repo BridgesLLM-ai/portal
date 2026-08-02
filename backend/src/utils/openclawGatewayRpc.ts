@@ -33,6 +33,15 @@ interface RpcResponse {
   error?: any;
 }
 
+/** A throwaway connection attempt plus whether no method was dispatched. */
+interface RpcAttempt extends RpcResponse {
+  retriable: boolean;
+}
+
+const GATEWAY_CONNECT_RETRY_BUDGET_MS = 8000;
+const GATEWAY_CONNECT_RETRY_DELAYS_MS = [250, 500, 1000, 2000, 2000];
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 const sessionMutationTails = new Map<string, Promise<void>>();
 
 /**
@@ -99,9 +108,33 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
     }
   }
 
+  const deadline = Date.now() + GATEWAY_CONNECT_RETRY_BUDGET_MS;
+  let attempt = await openThrowawayGatewayRpc(method, params, timeoutMs);
+  for (let retry = 0; !attempt.ok && attempt.retriable; retry++) {
+    const delay = GATEWAY_CONNECT_RETRY_DELAYS_MS[
+      Math.min(retry, GATEWAY_CONNECT_RETRY_DELAYS_MS.length - 1)
+    ];
+    if (Date.now() + delay >= deadline) {
+      return {
+        ok: false,
+        error: `OpenClaw gateway is restarting and did not accept a connection within `
+          + `${Math.round(GATEWAY_CONNECT_RETRY_BUDGET_MS / 1000)}s (${attempt.error})`,
+      };
+    }
+    await sleep(delay);
+    attempt = await openThrowawayGatewayRpc(method, params, timeoutMs);
+  }
+  return { ok: attempt.ok, data: attempt.data, error: attempt.error };
+}
+
+function openThrowawayGatewayRpc(
+  method: string,
+  params: Record<string, any>,
+  timeoutMs: number,
+): Promise<RpcAttempt> {
   return new Promise((resolve) => {
     let resolved = false;
-    const done = (result: RpcResponse) => {
+    const done = (result: RpcAttempt) => {
       if (resolved) return;
       resolved = true;
       try { ws.close(); } catch {}
@@ -109,7 +142,7 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
     };
 
     const timeout = setTimeout(() => {
-      done({ ok: false, error: 'Gateway RPC timeout' });
+      done({ ok: false, retriable: false, error: 'Gateway RPC timeout' });
     }, timeoutMs);
 
     let ws: WebSocket;
@@ -117,7 +150,7 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
       ws = new WebSocket(GATEWAY_WS_URL);
     } catch (err: any) {
       clearTimeout(timeout);
-      resolve({ ok: false, error: `WebSocket creation failed: ${err.message}` });
+      resolve({ ok: false, retriable: true, error: `WebSocket creation failed: ${err.message}` });
       return;
     }
 
@@ -190,7 +223,11 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
             if (!msg.ok) {
               const connectError = msg.error?.message || 'Connect failed';
               console.error(`[Gateway RPC] Connect failed: ${connectError}`);
-              done({ ok: false, error: connectError });
+              done({
+                ok: false,
+                retriable: /starting|unavailable|not ready/i.test(connectError),
+                error: connectError,
+              });
               return;
             }
             // Step 2: Send the actual RPC method
@@ -206,23 +243,33 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
             // Method response
             clearTimeout(timeout);
             if (msg.ok) {
-              done({ ok: true, data: msg.payload || msg.result });
+              done({ ok: true, retriable: false, data: msg.payload || msg.result });
             } else {
-              done({ ok: false, error: msg.error?.message || 'Method call failed' });
+              done({ ok: false, retriable: false, error: msg.error?.message || 'Method call failed' });
             }
           }
         }
       } catch {}
     });
 
+    const failedBeforeDispatch = () => methodId === undefined;
+
     ws.on('error', (err: any) => {
       clearTimeout(timeout);
-      done({ ok: false, error: `WebSocket error: ${err.message}` });
+      done({
+        ok: false,
+        retriable: failedBeforeDispatch(),
+        error: `WebSocket error: ${err.message}`,
+      });
     });
 
     ws.on('close', () => {
       clearTimeout(timeout);
-      done({ ok: false, error: 'WebSocket closed unexpectedly' });
+      done({
+        ok: false,
+        retriable: failedBeforeDispatch(),
+        error: 'WebSocket closed unexpectedly',
+      });
     });
   });
 }
