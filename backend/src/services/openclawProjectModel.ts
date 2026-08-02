@@ -379,10 +379,15 @@ function listOpenClawProjectAgentModels(agentId: string): Promise<OpenClawModelC
       catalogResult.data,
     ).map((key) => ({ key, available: true, missing: false }));
     const result = { ok: true, models };
-    openClawProjectModelCatalogCache.set(agentId, {
-      expiresAt: Date.now() + OPENCLAW_PROJECT_MODEL_CATALOG_CACHE_MS,
-      result,
-    });
+    // Agent registration and credential copying converge asynchronously. An
+    // empty pre-convergence read is not a stable catalog and must never poison
+    // the exact-agent cache that qualification immediately reads next.
+    if (models.length > 0) {
+      openClawProjectModelCatalogCache.set(agentId, {
+        expiresAt: Date.now() + OPENCLAW_PROJECT_MODEL_CATALOG_CACHE_MS,
+        result,
+      });
+    }
     return result;
   })().finally(() => {
     if (openClawProjectModelCatalogFlights.get(agentId) === flight) {

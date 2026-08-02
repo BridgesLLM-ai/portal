@@ -1081,7 +1081,6 @@ def validate_pg_dump_custom(
             producer_major, producer_minor = map(int, producer_matches[0])
             if (
                 source_major != postgres_major
-                or source_minor < floors[source_major]
                 or producer_major != postgres_major
                 or producer_minor < floors[producer_major]
             ):

@@ -120,6 +120,7 @@ export class OpenClawGatewayClient {
   private challengeNonce: string | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private reconnecting = false;
+  private initialUpgradeAuthRecoveryAttempted = false;
   private currentSessionKey: string | null = null;
   private activeRunSessionKey: string | null = null;
   private sessionIdsByKey = new Map<string, string>();
@@ -203,12 +204,24 @@ export class OpenClawGatewayClient {
       this.cleanup();
 
       const reason = event.reason?.toLowerCase() || '';
-      const isAuthFailure = event.code === 4001 || event.code === 4003 ||
+      const isExplicitAuthFailure = event.code === 4001 || event.code === 4003 ||
         reason.includes('unauthorized') ||
         reason.includes('forbidden') ||
         reason.includes('expired');
+      // Browsers hide the HTTP status when the proxy rejects the WebSocket
+      // upgrade before the handshake. An expired Portal cookie therefore
+      // arrives as an unhelpful 1006 instead of the proxy's 4001/4003 close.
+      // Probe auth once per successful direct connection rather than letting
+      // an abandoned authenticated-looking tab reconnect forever.
+      const isInitialUpgradeAuthFailure = event.code === 1006
+        && !wasAuthenticated
+        && !this.initialUpgradeAuthRecoveryAttempted;
+      const isAuthFailure = isExplicitAuthFailure || isInitialUpgradeAuthFailure;
 
       if (isAuthFailure && !this.intentionallyClosed) {
+        if (isInitialUpgradeAuthFailure) {
+          this.initialUpgradeAuthRecoveryAttempted = true;
+        }
         if (wasAuthenticated) {
           this.onDisconnected();
         }
@@ -324,6 +337,7 @@ export class OpenClawGatewayClient {
       .then((result) => {
         debugGatewayClient('Connected with protocol:', result.protocol);
         this.authenticated = true;
+        this.initialUpgradeAuthRecoveryAttempted = false;
         void this.subscribeSessions().catch((error) => {
           debugGatewayClient('sessions.subscribe failed:', error);
         });

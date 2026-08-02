@@ -79,8 +79,23 @@ export function configuredAppApiTarget(
 }
 
 export function buildAppApiTargetUrl(baseTarget: string, proxiedPath: string, query = ''): string | undefined {
-  const cleanPath = String(proxiedPath || '').replace(/^\/+/, '');
-  if (!cleanPath || cleanPath.length > 2048 || cleanPath.includes('\\') || cleanPath.includes('\0')) {
+  const rawPath = String(proxiedPath || '');
+  if (rawPath.length > 2048 || rawPath.includes('\\') || rawPath.includes('\0')) {
+    return undefined;
+  }
+
+  // A directory-style request ("app/") is a legitimate upstream path, not an
+  // empty segment. Preserve the trailing slash for the upstream while keeping
+  // it out of segment validation; internal empty segments ("a//b") stay
+  // rejected so path traversal and namespace confusion remain impossible.
+  //
+  // Exactly one trailing slash is removed, never a run of them: collapsing
+  // "auth//" to "auth/" would silently rewrite one upstream path into a
+  // different one, which is the same namespace confusion the empty-segment
+  // check exists to prevent.
+  const hadTrailingSlash = /\/$/.test(rawPath);
+  const cleanPath = rawPath.replace(/^\/+/, '').replace(/\/$/, '');
+  if (!cleanPath) {
     return undefined;
   }
 
@@ -100,7 +115,7 @@ export function buildAppApiTargetUrl(baseTarget: string, proxiedPath: string, qu
   try {
     const target = new URL(baseTarget);
     const basePath = target.pathname.replace(/\/+$/, '');
-    target.pathname = `${basePath}/api/${encodedSegments.join('/')}`;
+    target.pathname = `${basePath}/api/${encodedSegments.join('/')}${hadTrailingSlash ? '/' : ''}`;
     target.search = query.startsWith('?') ? query.slice(1) : query;
     target.hash = '';
     return target.toString();

@@ -220,17 +220,39 @@ export class ProviderSetupInProgressError extends Error {
   readonly statusCode = 409;
 }
 
+/**
+ * How long a held xAI operation stays authoritative. The gate lives in process
+ * memory and is released only on paths a crashed, cancelled, or abandoned
+ * sign-in never reaches, so without an expiry one failed attempt locked xAI
+ * out until the Portal restarted — and because Cancel refused too, the
+ * operator had no way out from the UI. Any interactive sign-in finishes well
+ * inside this window, so reclaiming an older holder cannot interrupt real work.
+ */
+const XAI_OPERATION_STALE_MS = 20 * 60 * 1000;
+
 export class ExclusiveProviderOperationGate {
-  private active: { token: string; kind: string } | null = null;
+  private active: { token: string; kind: string; acquiredAt: number } | null = null;
+
+  constructor(private readonly staleAfterMs: number = XAI_OPERATION_STALE_MS) {}
 
   acquire(kind: string): string {
+    const now = Date.now();
+    if (this.active && now - this.active.acquiredAt >= this.staleAfterMs) {
+      console.warn(
+        `[AI-Setup] Reclaiming an abandoned xAI ${this.active.kind} operation held for ` +
+          `${Math.round((now - this.active.acquiredAt) / 1000)}s.`,
+      );
+      this.active = null;
+    }
     if (this.active) {
+      const heldSeconds = Math.round((now - this.active.acquiredAt) / 1000);
       throw new ProviderSetupInProgressError(
-        `Another xAI operation (${this.active.kind}) is already running. Finish it before starting ${kind}.`,
+        `An xAI ${this.active.kind} sign-in started ${heldSeconds}s ago is still open. ` +
+          `Finish or cancel it before starting ${kind}. If no sign-in is actually open, use Reset to clear it.`,
       );
     }
-    const token = `${kind}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-    this.active = { token, kind };
+    const token = `${kind}:${now}:${Math.random().toString(36).slice(2)}`;
+    this.active = { token, kind, acquiredAt: now };
     return token;
   }
 

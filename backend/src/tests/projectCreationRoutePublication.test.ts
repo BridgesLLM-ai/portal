@@ -138,9 +138,9 @@ describe('Project creation publication reconciliation', () => {
     error.mockRestore();
   });
 
-  test('all four creation routes reconcile publication before mapping an error response', () => {
+  test('all five creation routes reconcile publication before mapping an error response', () => {
     const source = fs.readFileSync(path.join(__dirname, '..', 'routes', 'projects.ts'), 'utf8');
-    expect(source.match(/const reconciliation = await reconcileFailedCurrentProjectCreation\(\{/g)).toHaveLength(4);
-    expect(source.match(/if \(reconciliation === 'published'\) \{/g)).toHaveLength(4);
+    expect(source.match(/const reconciliation = await reconcileFailedCurrentProjectCreation\(\{/g)).toHaveLength(5);
+    expect(source.match(/if \(reconciliation === 'published'(?: && successResponse)?\) \{/g)).toHaveLength(5);
   });
 });

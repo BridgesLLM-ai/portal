@@ -376,7 +376,29 @@ function walkNativeCredentialPath(
     return false;
   }
 
-  if (stat.isSymbolicLink()) return false;
+  if (stat.isSymbolicLink()) {
+    // An attested root path that is itself a symlink stays fail-closed: the
+    // credential file was swapped for a link to somewhere else, and Portal
+    // will not sign that off as a known state.
+    //
+    // A symlink *inside* an attested directory is different. Some providers
+    // attest a CLI's whole state directory, and those directories legitimately
+    // contain links — the Antigravity CLI rewrites
+    // ~/.gemini/antigravity-cli/cli.log as a symlink to the current log file on
+    // every run, which made every Google Gemini sign-in fail before it even
+    // started. Record the link by its target string and never follow it, so the
+    // walk still cannot escape the tree and a changed target still changes the
+    // fingerprint.
+    if (!relativePath) return false;
+    let linkTarget: string;
+    try {
+      linkTarget = fs.readlinkSync(currentPath);
+    } catch {
+      return false;
+    }
+    hash.update(`symlink\0${rootPath}\0${relativePath}\0${linkTarget}\0`);
+    return true;
+  }
   if (stat.isFile()) {
     budget.files += 1;
     budget.bytes += stat.size;
@@ -632,6 +654,51 @@ function profileStateLifecycleFingerprint(profileState: Record<string, string>):
   );
 }
 
+/**
+ * The CLI each native provider signs in through, so a failure can name the
+ * tool the operator actually has to install rather than talking about an
+ * "inventory" nobody outside this file has heard of.
+ */
+const NATIVE_PROVIDER_CLI: Record<NativeCredentialProvider, { command: string; label: string }> = {
+  CLAUDE_CODE: { command: 'claude', label: 'Claude Code' },
+  CODEX: { command: 'codex', label: 'the Codex CLI' },
+  GEMINI: { command: 'agy', label: 'the Antigravity CLI' },
+  GROK: { command: 'grok', label: 'the Grok CLI' },
+};
+
+function nativeCliIsInstalled(command: string): boolean {
+  try {
+    execFileSync('which', [command], { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Explain an indeterminate credential snapshot in terms the operator can act
+ * on. A missing CLI is by far the most common cause and used to surface as an
+ * opaque attestation error with no hint that anything needed installing.
+ */
+function describeNativeCredentialAttestationFailure(provider: NativeCredentialProvider): string {
+  const cli = NATIVE_PROVIDER_CLI[provider];
+  if (cli && !nativeCliIsInstalled(cli.command)) {
+    return `${cli.label} is not installed on this server, so its sign-in cannot run. Install it from Setup → AI tools (or run \`${cli.command}\` on the server), then connect this provider again.`;
+  }
+
+  const unreadable: string[] = [];
+  for (const credentialPath of resolveNativeCliCredentialPaths(provider)) {
+    if (captureNativeCredentialSnapshot([credentialPath]).state !== 'verified') {
+      unreadable.push(credentialPath);
+    }
+  }
+  if (unreadable.length > 0) {
+    return `Portal could not read this provider's credential files, so it will not start a sign-in that it cannot verify. Check permissions on: ${unreadable.join(', ')}.`;
+  }
+
+  return `Portal could not verify ${cli ? cli.label : 'this provider'}'s credential files, so the sign-in was stopped before it started. Retry, and if it keeps failing check the server logs for this provider.`;
+}
+
 async function readNativeCredentialLifecycleProof(
   provider: NativeCredentialProvider,
 ): Promise<{ fingerprint: string; absent: boolean }> {
@@ -641,7 +708,7 @@ async function readNativeCredentialLifecycleProof(
     getNativeCliAuthStatusAsync(provider),
   ]);
   if (snapshot.state !== 'verified' || !snapshot.fingerprint) {
-    throw new Error('Portal could not attest the native provider credential inventory.');
+    throw new Error(describeNativeCredentialAttestationFailure(provider));
   }
   return {
     fingerprint: credentialStartFingerprint(snapshot),
@@ -1385,11 +1452,28 @@ export function scheduleXaiExitProfileReconciliation(
   return reconciliation;
 }
 
+/**
+ * Cancel kills the sign-in process, but the exit callback that sets
+ * `processExited` lands on a later tick. Judging the credential before then
+ * always answered "indeterminate", which failed the cancel with HTTP 409 and
+ * left the operation gate held — so the next attempt was refused as "already
+ * running" and the operator had no way out of the loop. Give the exit a bounded
+ * moment to arrive before deciding.
+ */
+async function waitForProcessExit(session: OAuthSession, timeoutMs = 3_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (!session.processExited && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return Boolean(session.processExited);
+}
+
 async function waitForXaiExitProfileReconciliation(
   session: OAuthSession,
   timeoutMs = 11_000,
 ): Promise<'committed' | 'absent' | 'indeterminate'> {
-  if (session.provider !== 'xai' || !session.processExited) return 'indeterminate';
+  if (session.provider !== 'xai') return 'indeterminate';
+  if (!session.processExited && !(await waitForProcessExit(session))) return 'indeterminate';
   if (session.credentialResolution === 'committed') return 'committed';
   if (session.credentialResolution === 'absent' && !session.profileReconciliationPending) return 'absent';
 

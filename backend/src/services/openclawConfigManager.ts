@@ -1907,7 +1907,17 @@ export function getProviderStatuses(options: ProviderStatusOptions = {}): Provid
     const runtimeConfigIsCredentialEvidence = provider.id !== 'xai'
       && provider.authTypes.includes('api_key')
       && hasRuntimeProviderConfig;
-    const hasAnyProviderConfig = hasConfigProfile || hasOrderedProfile || runtimeConfigIsCredentialEvidence;
+    // OpenClaw 2026.7 keeps authorization profiles in its own auth store
+    // (~/.openclaw/agents/<agent>/agent/openclaw-agent.sqlite) and no longer
+    // mirrors them into openclaw.json's auth.profiles/auth.order. A profile the
+    // auth store owns IS this provider's configuration, so requiring a
+    // config-file entry reported every successful sign-in as
+    // "credentials exist but provider config is missing" — a working provider
+    // shown as broken, which reads to the operator as credentials not saving.
+    const hasAnyProviderConfig = hasConfigProfile
+      || hasOrderedProfile
+      || isOpenClawAuthStoreProfile
+      || runtimeConfigIsCredentialEvidence;
     const regularProfileConfigured = Boolean(profileId && hasAnyProviderConfig && hasStoredProfile);
     const providerOrder = authOrderKeys.map((key) => authOrder?.[key]).find((value) => Array.isArray(value));
     const excludedByAuthOrder = Array.isArray(providerOrder) && providerOrder.length === 0;

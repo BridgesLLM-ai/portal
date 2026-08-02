@@ -17,6 +17,7 @@ import client from '../api/client';
 import { gatewayAPI } from '../api/endpoints';
 import type { GatewayPendingQuestion } from '../api/endpoints';
 import { authAPI } from '../api/auth';
+import { useAuthStore } from './AuthContext';
 import {
   extractThinkingChunk,
   isControlOnlyAssistantContent,
@@ -2878,27 +2879,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }, Math.max(0, delayMs));
   }, [clearPostTurnHistorySync]);
 
-  useEffect(() => {
-    if (provider !== 'OPENCLAW' || !session || !session.startsWith('agent:') || !session.includes(':new-')) {
-      return;
-    }
-    let cancelled = false;
-    void (async () => {
-      try {
-        await gatewayAPI.createSession(session, 'OPENCLAW');
-        if (!cancelled) {
-          setSessionAvailability('present');
-          void refreshSessionTelemetry(session);
-        }
-      } catch (err) {
-        console.warn('[ChatState] Failed to materialize synthetic OpenClaw session:', err);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [provider, refreshSessionTelemetry, session]);
-
   const ensureSessionControlsMetadataLoaded = useCallback(async (options?: { force?: boolean }) => {
     if (!startupReady || provider !== 'OPENCLAW' || !session || !session.startsWith('agent:')) return;
     if (providerRef.current !== provider || sessionRef.current !== session) return;
@@ -2968,23 +2948,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         const preferredDefaultThinking = profileDefault && supportsLevel(profileDefault)
           ? profileDefault
           : (supportsLevel('high') ? 'high' : profileOptions.find((level) => level !== 'off') || '');
-
-        const defaultPatch: Record<string, string> = {};
-        if ((!sessionThinking || sessionThinking === 'none') && preferredDefaultThinking) {
-          defaultPatch.thinking = preferredDefaultThinking;
-        }
-        if (!sessionReasoning || sessionReasoning === 'none') defaultPatch.reasoning = 'stream';
-        if (Object.keys(defaultPatch).length > 0) {
-          try {
-            await gatewayAPI.patchSession(targetSession, defaultPatch, targetProvider);
-            if (!isCurrentLoad()) return;
-            if (defaultPatch.thinking) sessionThinking = defaultPatch.thinking;
-            if (defaultPatch.reasoning) sessionReasoning = defaultPatch.reasoning;
-          } catch (err) {
-            console.warn('[ChatState] Failed to backfill OpenClaw session defaults:', err);
-            if (!isCurrentLoad()) return;
-          }
-        }
 
         if (THINKING_LEVELS.includes(sessionThinking as ThinkingLevel)) {
           const nextThinking = sessionThinking as ThinkingLevel;
@@ -3306,25 +3269,32 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (provider !== 'OPENCLAW' || !session) return undefined;
 
     let cancelled = false;
-    let inFlight = false;
+    let timer: number | null = null;
+    let consecutiveFailures = 0;
+    const schedule = (delayMs: number) => {
+      if (cancelled) return;
+      timer = window.setTimeout(() => { void poll(); }, delayMs);
+    };
     const poll = async () => {
-      if (inFlight) return;
-      inFlight = true;
       try {
         await refreshPendingUserQuestions();
+        consecutiveFailures = 0;
       } catch {
-        // Keep the last confirmed card mounted. The next bounded poll retries.
+        // Keep the last confirmed card mounted and back off while the gateway
+        // is restarting. A fixed two-second poll turned a short outage into a
+        // wall of identical 503 activity records.
+        consecutiveFailures += 1;
       } finally {
-        inFlight = false;
+        const delay = consecutiveFailures === 0
+          ? 2_000
+          : Math.min(30_000, 2_000 * (2 ** Math.min(consecutiveFailures, 4)));
+        schedule(delay);
       }
     };
     void poll();
-    const timer = window.setInterval(() => {
-      if (!cancelled) void poll();
-    }, 2_000);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== null) window.clearTimeout(timer);
       pendingQuestionPollGenerationRef.current += 1;
     };
   }, [provider, refreshPendingUserQuestions, replacePendingUserQuestions, session]);
@@ -6110,6 +6080,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             return true;
           } catch (err) {
             console.warn('[ChatState] Direct gateway auth refresh failed:', err);
+            const status = Number((err as any)?.response?.status || 0);
+            if (status === 401 || status === 403) {
+              useAuthStore.getState().silentLogout();
+            }
             return false;
           }
         },

@@ -762,7 +762,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(projectMocks.clientPost).not.toHaveBeenCalled();
   });
 
-  it('offers a checked in-place preparation while keeping ZIP as an optional backup', async () => {
+  it('offers a verified Project Chat copy while keeping ZIP as an optional backup', async () => {
     const onClose = vi.fn();
     projectMocks.projectChatProviders.mockResolvedValue({
       migration: {
@@ -786,8 +786,8 @@ describe('ProjectChatPanel rendered provider contract', () => {
       'href',
       '/api/projects/older-project/download?mode=full',
     );
-    expect(within(panel).getByText(/if preparation is allowed, your project identity, share links, hosted apps, and deployment stay attached/i)).toBeVisible();
-    expect(within(panel).getByText(/if preserved 3\.x agent evidence remains, nothing changes/i)).toBeVisible();
+    expect(within(panel).getByText(/creates a manifest-verified Project Chat copy with a new name/i)).toBeVisible();
+    expect(within(panel).getByText(/legacy source, its share links, hosted apps, deployment, and older agent state stay untouched/i)).toBeVisible();
     expect(screen.queryByText('No Project Chat provider is verified')).not.toBeInTheDocument();
     expect(projectMocks.chatHistory).not.toHaveBeenCalled();
     expect(projectMocks.agentPoll).not.toHaveBeenCalled();
@@ -800,6 +800,45 @@ describe('ProjectChatPanel rendered provider contract', () => {
 
     await userEvent.click(within(panel).getByRole('button', { name: 'Close project chat' }));
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens the verified CURRENT copy without promoting the legacy source identity', async () => {
+    const onProjectPrepared = vi.fn().mockResolvedValue(undefined);
+    projectMocks.projectChatProviders.mockResolvedValue({
+      migration: {
+        required: true,
+        projectId: 'older-project-id',
+        title: 'Prepare this project for Project Chat',
+        message: 'Portal can make a safe copy.',
+      },
+    } as ProjectChatProviderCapabilitiesResponse);
+    projectMocks.migrateLegacyProjectInPlace.mockResolvedValue({
+      migrated: true,
+      projectId: 'current-copy-id',
+      projectName: 'older-project_Portal4_olderpro',
+      sourceProjectId: 'older-project-id',
+      sourceProjectName: 'older-project',
+      generation: 1,
+      alreadyCurrent: false,
+      integrity: {
+        fileCount: 4,
+        totalBytes: 100,
+        manifestSha256: 'manifest-sha',
+      },
+    });
+
+    render(
+      <ProjectChatPanel
+        projectName="older-project"
+        onClose={vi.fn()}
+        onProjectPrepared={onProjectPrepared}
+      />,
+    );
+    await userEvent.click(await screen.findByRole('button', { name: 'Check and prepare project' }));
+
+    await waitFor(() => expect(onProjectPrepared).toHaveBeenCalledWith(
+      'older-project_Portal4_olderpro',
+    ));
   });
 
   it('keeps the migration card and gives a plain recovery sentence after a gateway interruption', async () => {
@@ -1036,11 +1075,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     }>();
     const onClose = vi.fn();
     const onActivityChange = vi.fn((_activity: unknown, _active: boolean) => true);
-    projectMocks.projectChatModels
-      .mockRejectedValueOnce(
-        new Error('Project qualification is required before model discovery'),
-      )
-      .mockResolvedValue({
+    projectMocks.projectChatModels.mockResolvedValue({
         provider: 'OPENCLAW',
         models: [{
           id: 'xai/grok-4.20-beta-latest-reasoning',
@@ -1136,9 +1171,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(progress).toHaveTextContent('Connecting agent');
     expect(progress.textContent).not.toMatch(/\d+%/);
     expect(screen.getByRole('button', { name: 'Close project chat' })).toBeDisabled();
-    await waitFor(() => expect(projectMocks.projectChatModels).toHaveBeenCalledTimes(1), {
-      timeout: 2500,
-    });
+    expect(projectMocks.projectChatModels).not.toHaveBeenCalled();
     expect(screen.getByRole('textbox', { name: 'Message project agent' })).toBeEnabled();
 
     await act(async () => {
@@ -1151,7 +1184,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     });
 
     await waitFor(() => expect(projectMocks.projectChatProviders).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(projectMocks.projectChatModels).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(projectMocks.projectChatModels).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(
       screen.getByRole('button', { name: 'Select project chat model' }),
     ).toHaveAttribute('title', 'xai/grok-4.20-beta-latest-reasoning'));
@@ -1225,6 +1258,55 @@ describe('ProjectChatPanel rendered provider contract', () => {
     projectMocks.projectChatProviders.mockResolvedValue(unqualified);
     render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
     await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(3));
+  });
+
+  it('retries an automatic qualification that was interrupted before it could fail', async () => {
+    // A first qualification on a new project takes 27-90s server-side. The
+    // panel used to claim the 15-minute suppression up front, so reloading or
+    // switching away mid-flight left a block behind for an attempt that never
+    // returned a verdict: the project came back permanently unqualified, with
+    // no automatic retry and no failure to explain it. Only a real failure may
+    // suppress.
+    const unqualified = capabilities();
+    unqualified.providers = unqualified.providers.map((entry) => (
+      entry.provider === 'OPENCLAW'
+        ? {
+            ...entry,
+            selectable: false,
+            executionScope: null,
+            reason: 'OpenClaw is not verified for this project yet.',
+          }
+        : entry
+    ));
+    unqualified.supportedProviders = unqualified.supportedProviders.filter(
+      (entry) => entry.provider !== 'OPENCLAW',
+    );
+    unqualified.qualifications.OPENCLAW = {
+      provider: 'OPENCLAW',
+      status: 'UNQUALIFIED',
+      selectable: false,
+      reason: 'OpenClaw is not verified for this project yet.',
+      qualifiedAt: null,
+      expiresAt: null,
+      evidenceFingerprint: null,
+    };
+    const neverSettles = deferred<never>();
+    projectMocks.projectChatProviders.mockResolvedValue(unqualified);
+    projectMocks.qualifyProjectChatProvider
+      .mockReturnValueOnce(neverSettles.promise)
+      .mockResolvedValue({
+        provider: 'OPENCLAW',
+        qualification: capabilities().qualifications.OPENCLAW,
+        stateVersion: 2,
+      });
+
+    const first = render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+    await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1));
+    // The reload lands while the request is still outstanding.
+    first.unmount();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+    await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(2));
   });
 
   it('stops after one automatic attempt when the host contradicts its own qualification', async () => {

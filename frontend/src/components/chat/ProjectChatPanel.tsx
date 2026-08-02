@@ -152,6 +152,7 @@ export type ProjectChatActivity = Readonly<{
 interface ProjectChatPanelProps {
   projectName: string;
   onClose: () => void;
+  onProjectPrepared?: (projectName: string) => Promise<void> | void;
   onActivityChange?: (activity: Readonly<ProjectChatActivity>, active: boolean) => boolean;
 }
 
@@ -1480,7 +1481,7 @@ function ProjectModelPicker({
 
 /* ═══ Main Component ═══ */
 
-export default function ProjectChatPanel({ projectName, onClose, onActivityChange }: ProjectChatPanelProps) {
+export default function ProjectChatPanel({ projectName, onClose, onProjectPrepared, onActivityChange }: ProjectChatPanelProps) {
   const isMobile = useIsMobile();
   const actorUserId = useAuthStore((state) => state.user?.id || '');
   const actorRole = useAuthStore((state) => state.user?.role || '');
@@ -2549,6 +2550,14 @@ export default function ProjectChatPanel({ projectName, onClose, onActivityChang
       setModelCatalogError(null);
       return [];
     }
+    if (
+      requestedProvider === 'OPENCLAW'
+      && providerQualifications.OPENCLAW?.status !== 'QUALIFIED'
+    ) {
+      setAvailableModels([]);
+      setModelCatalogError(null);
+      return [];
+    }
     const models: string[] = requestedProvider === 'AGENT_ZERO'
       ? await loadAgentZeroProjectModels()
       : [];
@@ -2584,10 +2593,18 @@ export default function ProjectChatPanel({ projectName, onClose, onActivityChang
       return resolved || models[0] || '';
     });
     return models;
-  }, [loadAgentZeroProjectModels, projectName, selectedProvider]);
+  }, [loadAgentZeroProjectModels, projectName, providerQualifications.OPENCLAW?.status, selectedProvider]);
 
   useEffect(() => {
     if (!providerSupportsModelSelection) {
+      setAvailableModels([]);
+      setModelCatalogError(null);
+      return;
+    }
+    if (
+      selectedProvider === 'OPENCLAW'
+      && providerQualifications.OPENCLAW?.status !== 'QUALIFIED'
+    ) {
       setAvailableModels([]);
       setModelCatalogError(null);
       return;
@@ -2610,7 +2627,7 @@ export default function ProjectChatPanel({ projectName, onClose, onActivityChang
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [loadAvailableModels, providerSupportsModelSelection, selectedProvider]);
+  }, [loadAvailableModels, providerQualifications.OPENCLAW?.status, providerSupportsModelSelection, selectedProvider]);
 
   // Mark session as active for auto-restore
   useEffect(() => {
@@ -5557,9 +5574,14 @@ export default function ProjectChatPanel({ projectName, onClose, onActivityChang
       projectIdentityIdRef.current,
       provider,
     );
-    if (options.automatic && suppressionKey) {
-      suppressAutomaticQualification(suppressionKey);
-    }
+    // Suppression is a record of a *failed* attempt, so it must only be written
+    // once the attempt has actually failed. Claiming it up front persisted a
+    // 15-minute block into sessionStorage before the request was even sent, and
+    // a first qualification takes 27-90s on a new project. Anyone who reloaded
+    // the seemingly-frozen panel during that window came back to a project that
+    // would never auto-qualify again, with no retry and no explanation. Looping
+    // within a mount is already prevented by automaticQualificationAttemptsRef;
+    // the catch below records the real failure with its correct disposition.
     setQualificationPending(true);
     setQualificationProgress({
       projectName,
@@ -5977,13 +5999,17 @@ export default function ProjectChatPanel({ projectName, onClose, onActivityChang
       if (
         result?.migrated !== true
         || !result.projectId
-        || result.projectId !== projectMoveNotice?.projectId
+        || !result.projectName
+        || result.projectName === projectName
+        || result.sourceProjectId !== projectMoveNotice?.projectId
+        || result.sourceProjectName !== projectName
         || !Number.isSafeInteger(result.generation)
         || !result.integrity?.manifestSha256
       ) {
         throw new Error('Portal could not confirm the project migration.');
       }
       setProjectMoveNotice(null);
+      await onProjectPrepared?.(result.projectName);
       setConnectionNotice('Preparing sandbox → Connecting agent');
       setProviderRefreshNonce((value) => value + 1);
     } catch (error: any) {
@@ -5996,7 +6022,7 @@ export default function ProjectChatPanel({ projectName, onClose, onActivityChang
     } finally {
       setProjectMigrationPending(false);
     }
-  }, [projectMigrationPending, projectMoveNotice?.projectId, projectName]);
+  }, [onProjectPrepared, projectMigrationPending, projectMoveNotice?.projectId, projectName]);
 
   // ── Render ──
   const projectMovePanel = projectMoveNotice ? (
@@ -6072,7 +6098,7 @@ export default function ProjectChatPanel({ projectName, onClose, onActivityChang
             Download a backup (optional)
           </a>
           <p className="mt-3 text-[10px] leading-relaxed text-slate-400">
-            If preparation is allowed, your project identity, share links, hosted apps, and deployment stay attached while a verified source snapshot is parked. If preserved 3.x agent evidence remains, nothing changes.
+            Portal creates a manifest-verified Project Chat copy with a new name. The legacy source, its share links, hosted apps, deployment, and older agent state stay untouched.
           </p>
         </section>
       </div>

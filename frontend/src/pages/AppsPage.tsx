@@ -5235,6 +5235,10 @@ export default function AppsPage() {
                 key={`project-agent-chat:${selectedProject}`}
                 projectName={selectedProject}
                 onClose={closeAgentChat}
+                onProjectPrepared={async (preparedProjectName) => {
+                  await loadProjects();
+                  await selectProject(preparedProjectName);
+                }}
                 onActivityChange={handleProjectChatActivity}
               />
             </Suspense>

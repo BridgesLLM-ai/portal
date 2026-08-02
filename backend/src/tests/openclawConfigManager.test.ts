@@ -393,6 +393,44 @@ describe('openclawConfigManager OpenClaw auth store bridge', () => {
     }
   });
 
+  test('reports an auth-store-owned profile as configured without a config-file entry', () => {
+    // OpenClaw 2026.7 keeps authorization profiles in its own auth store and no
+    // longer mirrors them into openclaw.json. Requiring a config-file entry
+    // reported every successful sign-in as an error, which reads to the
+    // operator as credentials failing to save.
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-openclaw-authstore-'));
+    process.env.OPENCLAW_HOME = tempDir;
+    process.env.PORTAL_ENABLE_OPENCLAW_AUTH_STORE_PROBE = '1';
+    fs.writeFileSync(path.join(tempDir, 'openclaw.json'), JSON.stringify({}), { mode: 0o600 });
+
+    jest.resetModules();
+    jest.doMock('child_process', () => ({
+      execFileSync: jest.fn((_cmd: string, args: string[]) => {
+        if (args.includes('list')) {
+          return JSON.stringify({
+            profiles: [{
+              id: 'xai:portal-oauth-session',
+              provider: 'xai',
+              type: 'oauth',
+              access: 'live-access-token',
+            }],
+          });
+        }
+        return '';
+      }),
+    }));
+    const manager = require('../services/openclawConfigManager');
+    fs.mkdirSync(path.dirname(manager.MODELS_JSON_PATH), { recursive: true });
+    fs.writeFileSync(manager.MODELS_JSON_PATH, JSON.stringify({
+      providers: { xai: { models: [{ id: 'grok-4.3' }] } },
+    }), { mode: 0o600 });
+
+    expect(manager.getProviderStatuses().find((status: any) => status.id === 'xai')).toMatchObject({
+      status: 'configured',
+      error: null,
+    });
+  });
+
   test('keeps bundled xAI catalog metadata unconfigured after all credentials are removed', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-openclaw-xai-disconnected-'));
     process.env.OPENCLAW_HOME = tempDir;

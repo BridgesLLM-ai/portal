@@ -1,13 +1,13 @@
 {
   "schema": 1,
-  "version": "4.0.7",
+  "version": "4.0.8",
   "releasedAt": "2026-08-02",
   "releaseClass": "hotfix",
   "highlights": [
-    "Agent Chat collapses cumulative Codex progress into one live status instead of hundreds of one-token thinking cards.",
-    "Restarted Fable and OpenClaw sessions keep their earlier transcript by following the complete session lineage.",
-    "Repeated terminal answers stay anchored at the bottom of long tool and sub-agent turns.",
-    "Expired browser sessions refresh and replay Agent Chat requests instead of silently losing history and stream calls.",
-    "Gateway-backed controls tolerate brief OpenClaw restart windows without retrying any request that may have been dispatched."
+    "A new project can start Project Chat again: an interrupted first qualification no longer leaves the project permanently unable to connect.",
+    "Stop genuinely cancels an Agent Chat run instead of clearing the composer while the agent keeps working.",
+    "Legacy projects move into Project Chat through a verified copy that leaves the original project, its shares, apps, and deployment untouched.",
+    "Backups run again when the PostgreSQL server sits a patch behind the client security floor, which previously blocked every backup outright.",
+    "Native provider sign-in no longer fails its own attestation, a failed xAI attempt no longer locks the provider, and setup errors name the cause."
   ]
 }

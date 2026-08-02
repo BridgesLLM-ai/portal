@@ -236,6 +236,122 @@ describe('persistent backup runner', () => {
     expect(verification.stdout).toContain('  OK');
   }, 35_000);
 
+  it('backs up an older supported server patch with the security-floor client toolchain', () => {
+    const testRoot = makeTempRoot('backup-older-server-patch');
+    const portalRoot = path.join(testRoot, 'portal');
+    const stateDir = path.join(portalRoot, 'backend', '.data', 'backups');
+    const backupRoot = path.join(testRoot, 'configured-backups');
+    const fixture = createBackupRunnerFixture(testRoot, {
+      backupRoot,
+      portalRoot,
+      postgresServerVersion: '16.13',
+      stateDir,
+    });
+
+    const result = spawnSync('bash', [backupScript, 'daily'], {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ...fixture.env,
+      },
+      timeout: 30_000,
+    });
+
+    if (result.status !== 0) {
+      throw new Error(`older-server backup failed (${result.status})\n${result.stdout}\n${result.stderr}`);
+    }
+    const status = JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'));
+    expect(status).toMatchObject({ type: 'daily', status: 'completed', exitCode: 0 });
+    const verification = spawnSync('bash', [backupScript, '--verify-archive', status.archivePath], {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ...fixture.env,
+      },
+      timeout: 30_000,
+    });
+    expect(verification.status).toBe(0);
+  }, 35_000);
+
+  it('captures durable OpenClaw state without its reproducible npm runtime', () => {
+    const testRoot = makeTempRoot('backup-openclaw-state');
+    const portalRoot = path.join(testRoot, 'portal');
+    const stateDir = path.join(portalRoot, 'backend', '.data', 'backups');
+    const backupRoot = path.join(testRoot, 'configured-backups');
+    const openclawRoot = path.join(testRoot, '.openclaw');
+    const fixture = createBackupRunnerFixture(testRoot, {
+      backupRoot,
+      portalRoot,
+      stateDir,
+    });
+    fs.mkdirSync(path.join(openclawRoot, 'state'), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.join(openclawRoot, 'extensions', 'custom-plugin'), {
+      recursive: true,
+      mode: 0o700,
+    });
+    fs.mkdirSync(path.join(openclawRoot, 'npm', 'projects', 'managed-plugin'), {
+      recursive: true,
+      mode: 0o700,
+    });
+    fs.writeFileSync(path.join(openclawRoot, 'openclaw.json'), '{"plugins":{}}\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(openclawRoot, 'state', 'openclaw.sqlite'), 'durable-state\n', { mode: 0o600 });
+    fs.writeFileSync(
+      path.join(openclawRoot, 'extensions', 'custom-plugin', 'index.js'),
+      'export default {};\n',
+      { mode: 0o600 },
+    );
+    fs.writeFileSync(
+      path.join(openclawRoot, 'npm', 'projects', 'managed-plugin', 'package.json'),
+      '{"private":true}\n',
+      { mode: 0o600 },
+    );
+
+    const result = spawnSync('bash', [backupScript, 'daily'], {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ...fixture.env,
+        OPENCLAW_BACKUP_POLICY: 'required',
+        OPENCLAW_DIR: openclawRoot,
+      },
+      timeout: 30_000,
+    });
+    if (result.status !== 0) {
+      throw new Error(`OpenClaw-state backup failed (${result.status})\n${result.stdout}\n${result.stderr}`);
+    }
+
+    const status = JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'));
+    const extractionRoot = path.join(testRoot, 'extracted');
+    fs.mkdirSync(extractionRoot, { mode: 0o700 });
+    const outerExtraction = spawnSync(
+      'tar',
+      ['-xzf', status.archivePath, '-C', extractionRoot, './openclaw-state.tar.gz'],
+      { encoding: 'utf8' },
+    );
+    expect(outerExtraction.status).toBe(0);
+    const listing = spawnSync(
+      'tar',
+      ['-tzf', path.join(extractionRoot, 'openclaw-state.tar.gz')],
+      { encoding: 'utf8' },
+    );
+    expect(listing.status).toBe(0);
+    expect(listing.stdout).toContain('.openclaw/state/openclaw.sqlite');
+    expect(listing.stdout).toContain('.openclaw/extensions/custom-plugin/index.js');
+    const npmMembers = listing.stdout
+      .split('\n')
+      .filter((member) => member.startsWith('.openclaw/npm'));
+    expect(npmMembers).toEqual(['.openclaw/npm/']);
+
+    const recoveryManifest = JSON.parse(
+      spawnSync('tar', ['-xOzf', status.archivePath, './RECOVERY-MANIFEST.json'], { encoding: 'utf8' }).stdout,
+    );
+    const openclawComponent = recoveryManifest.components.find((entry: any) => entry.id === 'openclaw-state');
+    expect(openclawComponent).toMatchObject({ requirement: 'required', status: 'captured' });
+  }, 35_000);
+
   it('keeps backup database credentials anonymous and kills pg_dump with its parent', async () => {
     const testRoot = makeTempRoot('backup-pgpass-sigkill');
     const portalRoot = path.join(testRoot, 'portal');
@@ -398,7 +514,7 @@ describe('persistent backup runner', () => {
     expect(result.status).not.toBe(0);
     expect(fs.existsSync(pgDumpCalled)).toBe(false);
     expect(`${result.stdout}\n${result.stderr}`).toContain(
-      'PostgreSQL server/client major or supported security floor admission failed',
+      'PostgreSQL server major or client security floor admission failed',
     );
     expect(JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'))).toMatchObject({
       type: 'daily',

@@ -545,6 +545,24 @@ function copyDirectoryManifestEntry(source: string, destination: string, entry: 
 function copyManifest(sourceRoot: string, destinationRoot: string, manifest: ProjectLegacyAdoptionManifest): void {
   const rootMode = manifest.rootMode ?? 0o700;
   fs.mkdirSync(destinationRoot, { mode: rootMode });
+  copyManifestIntoEmptyRoot(sourceRoot, destinationRoot, manifest);
+}
+
+function copyManifestIntoEmptyRoot(
+  sourceRoot: string,
+  destinationRoot: string,
+  manifest: ProjectLegacyAdoptionManifest,
+): void {
+  const destinationStat = fs.lstatSync(destinationRoot);
+  if (
+    destinationStat.isSymbolicLink()
+    || !destinationStat.isDirectory()
+    || fs.realpathSync.native(destinationRoot) !== path.resolve(destinationRoot)
+    || fs.readdirSync(destinationRoot).length !== 0
+  ) {
+    throw migrationIntegrityFailure('The new Project staging root was not empty and private.');
+  }
+  const rootMode = manifest.rootMode ?? 0o700;
   fs.chmodSync(destinationRoot, rootMode);
   for (const entry of manifest.entries) {
     const segments = manifestPathSegments(entry.path);
@@ -563,6 +581,38 @@ function copyManifest(sourceRoot: string, destinationRoot: string, manifest: Pro
       throw migrationIntegrityFailure('The project migration manifest contained an unknown object type.');
     }
   }
+}
+
+/**
+ * Copy a legacy Project into a Portal-owned, still-hidden creation root.
+ *
+ * The source inode is never renamed, deleted, or promoted. The caller can
+ * therefore publish the verified copy under a new Project name without
+ * claiming that any older OpenClaw writer stopped targeting the source.
+ */
+export function copyLegacyProjectIntoCurrentStaging(input: {
+  sourceRoot: string;
+  stagingRoot: string;
+}, options: {
+  limits?: Partial<AdoptionLimits>;
+  readAvailableDiskBytes?: (directory: string) => bigint;
+} = {}): ProjectLegacyAdoptionManifest {
+  const limits = normalizeAdoptionLimits(options.limits);
+  const readAvailableBytes = options.readAvailableDiskBytes || availableDiskBytes;
+  const sourceRoot = fs.realpathSync.native(path.resolve(input.sourceRoot));
+  const stagingRoot = fs.realpathSync.native(path.resolve(input.stagingRoot));
+  if (sourceRoot === stagingRoot) {
+    throw migrationIntegrityFailure('The legacy Project source and new staging root must be different.');
+  }
+  const manifest = buildManifest(sourceRoot, 2, limits);
+  assertSnapshotDiskCapacity(path.dirname(stagingRoot), manifest, limits, readAvailableBytes);
+  copyManifestIntoEmptyRoot(sourceRoot, stagingRoot, manifest);
+  const copied = buildManifest(stagingRoot, 2, limits);
+  const sourceAfterCopy = buildManifest(sourceRoot, 2, limits);
+  if (!manifestsMatch(manifest, copied) || !manifestsMatch(manifest, sourceAfterCopy)) {
+    throw migrationIntegrityFailure('Project files changed while Portal copied them. The original Project remains unchanged.');
+  }
+  return manifest;
 }
 
 function availableDiskBytes(directory: string): bigint {

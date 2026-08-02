@@ -740,8 +740,11 @@ export const projectsAPI = {
     return data as {
       migrated: true;
       projectId: string;
+      projectName: string;
+      sourceProjectId: string;
+      sourceProjectName: string;
       generation: number;
-      alreadyCurrent: boolean;
+      alreadyCurrent: false;
       integrity: {
         fileCount: number;
         totalBytes: number;

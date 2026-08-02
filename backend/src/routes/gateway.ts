@@ -1175,6 +1175,79 @@ function openClawAgentChatSessionKey(
   return `agent:${agentId}:portal-${userId}${suffix}`;
 }
 
+const NEW_PORTAL_CHAT_LABEL_PREFIX = 'New Portal chat';
+
+function isPortalAgentChatSessionKeyForUser(
+  sessionKey: string,
+  user: Pick<JwtPayload, 'userId'>,
+): boolean {
+  const match = /^agent:([^:]+):portal-([0-9a-f-]{36})(?:-|$)/i.exec(String(sessionKey || '').trim());
+  return Boolean(match && match[2].toLowerCase() === String(user.userId || '').toLowerCase());
+}
+
+function buildPortalAgentChatLabel(sessionKey: string, message?: unknown): string {
+  const key = String(sessionKey || '').trim();
+  const keySuffix = createHash('sha256').update(key).digest('hex').slice(0, 6);
+  const prompt = typeof message === 'string'
+    ? message.replace(/\s+/g, ' ').trim()
+    : '';
+  if (prompt) {
+    const summary = prompt.length > 88
+      ? `${prompt.slice(0, 87).trimEnd()}…`
+      : prompt;
+    return `Portal · ${summary} · ${keySuffix}`;
+  }
+  const agentId = /^agent:([^:]+):/.exec(key)?.[1] || 'main';
+  return `${NEW_PORTAL_CHAT_LABEL_PREFIX} · ${agentId} · ${keySuffix}`;
+}
+
+/**
+ * A session is ours to name when its key is in this user's Portal namespace, or
+ * when Portal's own record says this user owns it.
+ *
+ * The namespace test alone missed every chat that was created outside Portal and
+ * later adopted — `agent:main:new-<ts>` never matches `portal-<uuid>`. Those are
+ * exactly the sessions that end up displaying the gateway client name, because
+ * OpenClaw falls back to the connecting client's displayName when a session has
+ * no label of its own, and Portal connects as "Portal Backend RPC". So the chats
+ * most in need of a name were the ones the guard refused to touch.
+ */
+async function canNamePortalAgentChatSession(
+  sessionKey: string,
+  user: Pick<JwtPayload, 'userId'>,
+): Promise<boolean> {
+  if (isPortalAgentChatSessionKeyForUser(sessionKey, user)) return true;
+  const userId = String(user.userId || '').trim();
+  if (!userId) return false;
+  try {
+    return (await findOpenClawAgentSessionOwner(sessionKey)) === userId;
+  } catch {
+    // Naming is cosmetic; never let a lookup failure break the send path.
+    return false;
+  }
+}
+
+async function ensurePortalAgentChatLabel(
+  sessionKey: string,
+  user: Pick<JwtPayload, 'userId'>,
+  message?: unknown,
+): Promise<void> {
+  if (!(await canNamePortalAgentChatSession(sessionKey, user))) return;
+  const info = await getSessionInfo(sessionKey);
+  if (!info.ok || !info.data) return;
+  const current = String(info.data.displayName || info.data.label || '').trim();
+  const replaceable = !current
+    || current === 'Portal Backend RPC'
+    || current.startsWith(`${NEW_PORTAL_CHAT_LABEL_PREFIX} ·`);
+  if (!replaceable) return;
+  const label = buildPortalAgentChatLabel(sessionKey, message);
+  if (label === current) return;
+  const patched = await gatewayRpcCall('sessions.patch', { key: sessionKey, label });
+  if (!patched.ok) {
+    console.warn(`[Gateway RPC] Could not label Portal session ${sessionKey}: ${patched.error || 'unknown error'}`);
+  }
+}
+
 /** Agent that Agent Chat lists when the client has not selected one. */
 const DEFAULT_HOST_AGENT_ID = 'main';
 
@@ -5800,6 +5873,7 @@ router.post('/session-create', authenticateToken, requireApproved, async (req: R
     }
 
     const createdKey = created.key || sessionKey;
+    await ensurePortalAgentChatLabel(createdKey, req.user!).catch(() => undefined);
     const info = await withOpenClawSessionMutation(createdKey, async () => {
       let current = await getSessionInfo(createdKey);
       if (current.ok && current.data) {
@@ -7421,13 +7495,32 @@ router.post('/chat/abort', authenticateToken, requireApproved, async (req: Reque
       });
       return;
     }
-    const aborted = result.data?.aborted !== false;
+    // Stop has to fail closed. The gateway always answers a successful
+    // chat.abort with a strict boolean `aborted` plus the `runIds` it actually
+    // cancelled, so anything else — a missing payload, a truthy non-boolean, an
+    // empty body — means we did not confirm a stop. Treating that as success is
+    // what made the button clear the UI while the agent kept running.
+    const abortedRunIds = Array.isArray(result.data?.runIds)
+      ? result.data.runIds.filter((value: unknown): value is string => typeof value === 'string' && value.length > 0)
+      : [];
+    const aborted = result.data?.aborted === true;
     if (!aborted) {
-      res.json({ ok: false, sessionKey, provider: providerName, runId: runId || null });
+      console.warn(
+        `[gateway] HTTP ABORT NOT CONFIRMED: session=${sessionKey} runId=${runId || 'none'} `
+        + `payload=${JSON.stringify(result.data ?? null)}`,
+      );
+      res.json({
+        ok: false,
+        sessionKey,
+        provider: providerName,
+        runId: runId || null,
+        runIds: abortedRunIds,
+        detail: 'The gateway did not confirm that a run was aborted. It may have already finished, or the run is still active.',
+      });
       return;
     }
     clearHostStreamIfCurrentRun(sessionKey, abortRunIdentity);
-    res.json({ ok: true, sessionKey, provider: providerName, runId: runId || null });
+    res.json({ ok: true, sessionKey, provider: providerName, runId: runId || null, runIds: abortedRunIds });
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 500;
     res.status(status).json({
@@ -8176,6 +8269,9 @@ async function handleWsSend(
     }
 
     await assertGatewaySessionAccess(sessionId, user, { providerName: provider.providerName });
+    if (isOpenClawProvider) {
+      await ensurePortalAgentChatLabel(sessionId, user, message).catch(() => undefined);
+    }
 
     if (requestedModel && isOpenClawProvider) {
       try {
@@ -9533,6 +9629,7 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
     let directReservationRunId: string | undefined;
     if (frameSessionKey && (frameMethod === 'chat.send' || frameMethod === 'sessions.steer')) {
       if (frameMethod === 'chat.send') {
+        await ensurePortalAgentChatLabel(frameSessionKey, user, frame.params?.message).catch(() => undefined);
         directReservationRunId = `direct-${randomUUID()}`;
         if (!reserveDirectGatewayChatRun(frameSessionKey, directReservationRunId)) {
           browserWs.send(JSON.stringify({
@@ -9820,6 +9917,8 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
 export const __gatewayExecutionScopeTest = {
   requireHostOperatorExecutionContext,
   openClawAgentChatSessionKey,
+  isPortalAgentChatSessionKeyForUser,
+  buildPortalAgentChatLabel,
   openClawSessionActorId,
   resolveOpenClawSessionKey,
   resolveOpenClawTurnSessionKey,

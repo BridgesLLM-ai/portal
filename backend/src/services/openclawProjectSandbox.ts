@@ -909,7 +909,11 @@ function findAgent(config: Record<string, any>, agentId: string): Record<string,
  */
 function withMainAgentDefaultRouting(agents: unknown[]): unknown[] {
   const hasMain = agents.some((entry) => isRecord(entry) && entry.id === 'main');
-  if (!hasMain) return agents;
+  // An empty explicit list still resolves to the implicit `main` agent. Keep
+  // that host agent explicit before adding the first Portal Project agent;
+  // otherwise the new p4oc entry becomes first and silently captures default
+  // routing on a clean installation.
+  if (!hasMain) return agents.length === 0 ? [{ id: 'main', default: true }] : agents;
   return agents.map((entry) => (
     isRecord(entry) && entry.id === 'main' && entry.default !== true
       ? { ...entry, default: true }
@@ -921,7 +925,10 @@ function mainAgentDefaultRoutingMissing(config: Record<string, any>): boolean {
   const agents = config?.agents?.list;
   if (!Array.isArray(agents)) return false;
   const main = agents.find((entry: unknown) => isRecord(entry) && (entry as Record<string, unknown>).id === 'main') as Record<string, unknown> | undefined;
-  return Boolean(main) && main?.default !== true;
+  if (main) return main.default !== true;
+  return agents.length === 1
+    && isRecord(agents[0])
+    && /^p4oc-[a-f0-9]{40}$/u.test(String(agents[0].id || ''));
 }
 
 async function ensureExactOpenClawAgentConfig(

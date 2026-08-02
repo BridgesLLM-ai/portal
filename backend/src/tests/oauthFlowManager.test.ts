@@ -80,6 +80,37 @@ describe('oauthFlowManager terminal parsing', () => {
   afterEach(() => {
     __resetCredentialLifecycleLeasesForTests();
   });
+  test('attests a CLI state directory that contains a symlink', () => {
+    // The Antigravity CLI rewrites ~/.gemini/antigravity-cli/cli.log as a
+    // symlink to the current log file on every run. Treating that as
+    // unverifiable made every Google Gemini sign-in fail before it started.
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-cli-state-'));
+    fs.mkdirSync(path.join(stateDir, 'log'));
+    fs.writeFileSync(path.join(stateDir, 'log', 'cli-1.log'), 'first');
+    fs.symlinkSync(path.join('log', 'cli-1.log'), path.join(stateDir, 'cli.log'));
+
+    const before = captureNativeCredentialSnapshot([stateDir]);
+    expect(before.state).toBe('verified');
+
+    // Repointing the link is a real change and must move the fingerprint.
+    fs.writeFileSync(path.join(stateDir, 'log', 'cli-2.log'), 'second');
+    fs.unlinkSync(path.join(stateDir, 'cli.log'));
+    fs.symlinkSync(path.join('log', 'cli-2.log'), path.join(stateDir, 'cli.log'));
+
+    const after = captureNativeCredentialSnapshot([stateDir]);
+    expect(after.state).toBe('verified');
+    expect(after.fingerprint).not.toBe(before.fingerprint);
+  });
+
+  test('stays fail-closed when the attested credential file itself is a symlink', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-cred-swap-'));
+    const credentialPath = path.join(dir, 'auth.json');
+    fs.writeFileSync(path.join(dir, 'elsewhere.json'), '{}');
+    fs.symlinkSync(path.join(dir, 'elsewhere.json'), credentialPath);
+
+    expect(captureNativeCredentialSnapshot([credentialPath]).state).toBe('indeterminate');
+  });
+
   test('fingerprints credential bytes and labels metadata-only profiles as opaque', () => {
     const first = authProfileStateFingerprint({
       provider: 'openai',

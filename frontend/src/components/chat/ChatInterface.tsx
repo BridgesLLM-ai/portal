@@ -4364,12 +4364,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   if (newSessionLeaseRef.current) return;
                   setSessionControlsLoading(true);
                   void ensureSessionControlsMetadataLoaded({ force: true }).finally(() => setSessionControlsLoading(false));
-                  void loadProviderCommands(provider);
                   void ensureProviderModelsLoaded(provider).catch(() => undefined);
                   void loadHeartbeatModel();
                   void loadCompatibilityHotfixStatus();
                 }}
-                disabled={newSessionPending || modelSwitching}
+                disabled={newSessionPending || modelSwitching || isRunning}
                 currentModel={selectedModel}
                 sessionKey={session}
               />

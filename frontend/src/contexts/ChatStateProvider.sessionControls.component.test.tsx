@@ -228,6 +228,44 @@ describe('ChatStateProvider session-control ownership', () => {
     vi.unstubAllGlobals();
   });
 
+  it('loads missing session-control metadata without mutating the session', async () => {
+    chatMocks.sessionInfo.mockResolvedValueOnce({
+      session: {
+        thinkingDefault: 'high',
+        thinkingOptions: ['off', 'high'],
+      },
+    });
+    const user = userEvent.setup();
+    await renderReadyHarness();
+
+    await user.click(screen.getByRole('button', { name: 'Load controls' }));
+
+    await waitFor(() => expect(chatMocks.sessionInfo).toHaveBeenCalledWith(
+      'agent:main:first',
+      { silent: true },
+    ));
+    expect(chatMocks.patchSession).not.toHaveBeenCalled();
+  });
+
+  it('does not create a session merely because an existing synthetic-key session is opened', async () => {
+    localStorage.setItem('agent-chat-session', 'agent:main:new-existing-session');
+    localStorage.setItem('agent-chat-session:OPENCLAW', 'agent:main:new-existing-session');
+
+    render(
+      <ChatStateProvider>
+        <SessionControlsHarness />
+      </ChatStateProvider>,
+    );
+
+    await waitFor(() => expect(chatMocks.clientGet).toHaveBeenCalledWith(
+      '/gateway/history',
+      expect.objectContaining({
+        params: expect.objectContaining({ session: 'agent:main:new-existing-session' }),
+      }),
+    ));
+    expect(chatMocks.createSession).not.toHaveBeenCalled();
+  });
+
   it('single-flights a same-frame fast toggle and rejects its stale response after a session switch', async () => {
     const user = userEvent.setup();
     await renderReadyHarness();

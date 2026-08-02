@@ -228,7 +228,7 @@ import {
   type ProjectQualificationRateLimitIdentity,
 } from '../services/projectQualificationRateLimit';
 import {
-  adoptLegacyProjectInPlace,
+  copyLegacyProjectIntoCurrentStaging,
   ProjectLegacyAdoptionError,
 } from '../services/projectLegacyAdoption';
 import {
@@ -1151,7 +1151,7 @@ const PROJECT_MOVE_REQUIRED_CODE = 'PROJECT_MOVE_REQUIRED';
 const PROJECT_DESTRUCTIVE_MOVE_REQUIRED_MESSAGE =
   'Move this older project into a new Portal project before renaming or deleting it.';
 const PROJECT_CHAT_MOVE_REQUIRED_MESSAGE =
-  'Portal will preserve this project, its links, and its files. Older agent history must be reconciled before Project Chat can be prepared; if that evidence is still present, nothing is changed.';
+  'Portal can make a verified Portal 4 copy for Project Chat while leaving this legacy project, its links, and older agent state untouched.';
 
 class ProjectMoveRequiredError extends Error {
   readonly code = PROJECT_MOVE_REQUIRED_CODE;
@@ -8133,8 +8133,26 @@ router.post('/:name/rename-file', authenticateToken, requireApproved, projectPat
 
 // --- Provider-neutral Project Chat kernel ---
 
-// POST /api/projects/:name/chat/migrate-legacy - adopt a legacy project in place
+// POST /api/projects/:name/chat/migrate-legacy - publish a verified CURRENT copy
 router.post('/:name/chat/migrate-legacy', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  let createdProjectDir: string | undefined;
+  let createdProjectRootIdentity: AttestedProjectRoot | undefined;
+  let createdProjectIdentityId: string | undefined;
+  let releaseProjectNameLock: (() => void) | null = null;
+  let successResponse: {
+    migrated: true;
+    projectId: string;
+    projectName: string;
+    sourceProjectId: string;
+    sourceProjectName: string;
+    generation: number;
+    alreadyCurrent: false;
+    integrity: {
+      fileCount: number;
+      totalBytes: number;
+      manifestSha256: string;
+    };
+  } | undefined;
   try {
     const { name } = req.params;
     const {
@@ -8150,52 +8168,157 @@ router.post('/:name/chat/migrate-legacy', authenticateToken, requireApproved, as
       projectName: name,
       projectRoot: projectDir,
     });
-    // A parked file snapshot cannot prove that name/path-keyed OpenClaw 3.x
-    // agents, sessions, or transcripts stopped targeting this old inode. Do
-    // not let the explicit adoption button mint CURRENT provenance while that
-    // evidence gate is active; the original Project and evidence stay intact.
-    await assertLegacyOpenClawProjectMigrationInactive(projectIdentity.id);
-    // The durable lease is the normal startup fence. Repeat the bounded
-    // read-only evidence inventory here as defense in depth so a missing or
-    // manually disturbed lease can never turn preserved 3.x state into a
-    // CURRENT collision.
-    await assertNoLegacyOpenClawProjectEvidence();
-    const result = await adoptLegacyProjectInPlace({
-      projectIdentity,
-      projectRoot: projectDir,
+    if (projectIdentity.legacyOpenClawMigrationStatus === 'CURRENT') {
+      res.status(409).json({
+        error: 'This Project is already prepared for Portal 4 Project Chat.',
+        code: 'PROJECT_ALREADY_CURRENT',
+        retryable: false,
+      });
+      return;
+    }
+
+    const safeSourceName = name.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 86) || 'project';
+    const sourceSuffix = projectIdentity.id.replace(/[^a-zA-Z0-9]/g, '').slice(0, 8) || 'legacy';
+    let targetName = '';
+    let targetRoot = '';
+    for (let attempt = 1; attempt <= 100; attempt += 1) {
+      const attemptSuffix = attempt === 1 ? '' : `_${attempt}`;
+      const candidate = `${safeSourceName}_Portal4_${sourceSuffix}${attemptSuffix}`.slice(0, 120);
+      const candidateRoot = getProjectPath(workspaceOwnerId, candidate);
+      const releaseCandidateLock = await acquireProjectDeletionLock(
+        projectDeletionLockKey(workspaceOwnerId, candidate),
+      );
+      let keepCandidateLock = false;
+      try {
+        if (fs.existsSync(candidateRoot)) continue;
+        try {
+          await assertProjectIdentityNameAvailable({
+            workspaceOwnerId,
+            projectName: candidate,
+          });
+        } catch (error) {
+          if (error instanceof ProjectIdentityLifecycleError) continue;
+          throw error;
+        }
+        targetName = candidate;
+        targetRoot = candidateRoot;
+        releaseProjectNameLock = releaseCandidateLock;
+        keepCandidateLock = true;
+        break;
+      } finally {
+        if (!keepCandidateLock) releaseCandidateLock();
+      }
+    }
+    if (!targetName || !targetRoot || !releaseProjectNameLock) {
+      throw new ProjectLegacyAdoptionError(
+        'Portal could not reserve a safe name for the Project Chat copy.',
+        'MIGRATION_BUSY',
+        true,
+      );
+    }
+
+    const stagingRoot = createProjectCreationStagingDirectory();
+    createdProjectDir = stagingRoot;
+    const manifest = copyLegacyProjectIntoCurrentStaging({
+      sourceRoot: projectDir,
+      stagingRoot,
     });
-    console.info('[ProjectLegacyAdoption]', JSON.stringify({
-      projectIdentityId: result.projectIdentityId,
-      generation: result.generation,
-      alreadyCurrent: result.alreadyCurrent,
-      fileCount: result.manifest.fileCount,
-      totalBytes: result.manifest.totalBytes,
-      manifestSha256: result.manifest.sha256,
-    }));
-    res.json({
+    createdProjectRootIdentity = attestProjectRoot(stagingRoot);
+    await assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId,
+      projectName: targetName,
+      projectRoot: stagingRoot,
+    });
+    const copiedIdentity = await createCurrentProjectIdentity({
+      workspaceOwnerId,
+      projectName: targetName,
+      projectRoot: stagingRoot,
+    });
+    createdProjectIdentityId = copiedIdentity.id;
+    await assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId,
+      projectName: targetName,
+      projectRoot: stagingRoot,
+    });
+    moveAttestedDirectoryNoReplace({
+      sourceRoot: stagingRoot,
+      targetRoot,
+      expectedIdentity: copiedIdentity,
+    });
+    createdProjectDir = targetRoot;
+    const currentIdentity = await finalizeCurrentProjectIdentityCreation({
+      projectIdentityId: copiedIdentity.id,
+      projectRoot: targetRoot,
+    });
+    successResponse = {
       migrated: true,
-      projectId: result.projectIdentityId,
-      generation: result.generation,
-      alreadyCurrent: result.alreadyCurrent,
+      projectId: currentIdentity.id,
+      projectName: targetName,
+      sourceProjectId: projectIdentity.id,
+      sourceProjectName: name,
+      generation: currentIdentity.generation,
+      alreadyCurrent: false,
       integrity: {
-        fileCount: result.manifest.fileCount,
-        totalBytes: result.manifest.totalBytes,
-        manifestSha256: result.manifest.sha256,
+        fileCount: manifest.fileCount,
+        totalBytes: manifest.totalBytes,
+        manifestSha256: manifest.sha256,
       },
+    };
+    console.info('[ProjectLegacyAdoption]', JSON.stringify({
+      sourceProjectIdentityId: projectIdentity.id,
+      projectIdentityId: currentIdentity.id,
+      projectName: targetName,
+      generation: currentIdentity.generation,
+      fileCount: manifest.fileCount,
+      totalBytes: manifest.totalBytes,
+      manifestSha256: manifest.sha256,
+    }));
+    await prisma.activityLog.create({
+      data: {
+        userId: workspaceOwnerId,
+        action: 'PROJECT_LEGACY_COPY',
+        resource: 'project',
+        resourceId: currentIdentity.id,
+        severity: 'INFO',
+        metadata: {
+          sourceProjectId: projectIdentity.id,
+          sourceProjectName: name,
+          projectName: targetName,
+          manifestSha256: manifest.sha256,
+        },
+      },
+    }).catch((error) => {
+      console.warn('[ProjectLegacyAdoption] Failed to record activity:', error);
     });
+    res.json(successResponse);
+    createdProjectDir = undefined;
+    createdProjectRootIdentity = undefined;
+    createdProjectIdentityId = undefined;
   } catch (error: any) {
+    const reconciliation = await reconcileFailedCurrentProjectCreation({
+      projectIdentityId: createdProjectIdentityId,
+      directory: createdProjectDir,
+      expectedDirectoryIdentity: createdProjectRootIdentity,
+    }, '[ProjectLegacyAdoption] Staging cleanup failed:');
+    if (reconciliation === 'published' && successResponse) {
+      if (!res.headersSent && !res.writableEnded && !res.destroyed) res.json(successResponse);
+      return;
+    }
     const adoptionError = error instanceof ProjectLegacyAdoptionError ? error : null;
-    const legacyGateError = error instanceof LegacyOpenClawProjectMigrationActiveError ? error : null;
-    const legacyEvidenceError = error instanceof LegacyOpenClawProjectRetirementError ? error : null;
-    const status = adoptionError?.code === 'MIGRATION_BUSY' || legacyGateError?.retryable ? 409 : 503;
+    const collisionError = error instanceof LegacyOpenClawProjectCreationCollisionError ? error : null;
+    const scanError = error instanceof LegacyOpenClawProjectCreationScanCapacityError ? error : null;
+    const lifecycleError = error instanceof ProjectIdentityLifecycleError ? error : null;
+    const status = adoptionError?.code === 'MIGRATION_BUSY' || collisionError || lifecycleError ? 409 : 503;
     const message = adoptionError?.message
-      || legacyGateError?.message
-      || (legacyEvidenceError ? LEGACY_OPENCLAW_RETIREMENT_PENDING_MESSAGE : null)
+      || collisionError?.message
+      || scanError?.message
+      || lifecycleError?.message
       || 'Portal could not finish preparing this project. Its original files remain unchanged.';
     const code = adoptionError?.code
-      || legacyGateError?.code
-      || (legacyEvidenceError ? 'LEGACY_OPENCLAW_PROJECT_RETIREMENT_PENDING' : 'MIGRATION_FAILED');
-    const retryable = adoptionError?.retryable ?? legacyGateError?.retryable ?? !legacyEvidenceError;
+      || collisionError?.code
+      || scanError?.code
+      || (lifecycleError ? 'PROJECT_COPY_NOT_ADMITTED' : 'MIGRATION_FAILED');
+    const retryable = adoptionError?.retryable ?? Boolean(scanError);
     console.error('[ProjectLegacyAdoption]', JSON.stringify({
       route: 'project-legacy-adoption',
       projectName: req.params.name,
@@ -8208,6 +8331,8 @@ router.post('/:name/chat/migrate-legacy', authenticateToken, requireApproved, as
       code,
       retryable,
     });
+  } finally {
+    releaseProjectNameLock?.();
   }
 });
 

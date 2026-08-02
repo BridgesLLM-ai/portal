@@ -65,6 +65,22 @@ function createOwnershipDatabase(
 }
 
 describe('Agent Chat execution boundary', () => {
+  test('names only Portal-owned sessions from their first prompt', () => {
+    const userId = '00000000-0000-4000-8000-000000000001';
+    const key = `agent:main:portal-${userId}-new-1785680000000`;
+    expect(__gatewayExecutionScopeTest.isPortalAgentChatSessionKeyForUser(key, { userId })).toBe(true);
+    expect(__gatewayExecutionScopeTest.isPortalAgentChatSessionKeyForUser(
+      'agent:main:new-1785680000000',
+      { userId },
+    )).toBe(false);
+    expect(__gatewayExecutionScopeTest.buildPortalAgentChatLabel(
+      key,
+      '  Fix   the session naming regression  ',
+    )).toMatch(/^Portal · Fix the session naming regression · [0-9a-f]{6}$/);
+    expect(__gatewayExecutionScopeTest.buildPortalAgentChatLabel(key)).toMatch(
+      /^New Portal chat · main · [0-9a-f]{6}$/,
+    );
+  });
   beforeEach(() => {
     const claims = new Map<string, { id: string; userId: string; externalId: string }>();
     const agentSessionDelegate = prisma.agentSession as any;

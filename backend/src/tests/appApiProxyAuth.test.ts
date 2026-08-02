@@ -64,4 +64,29 @@ describe('app API proxy authentication', () => {
     expect(buildAppApiTargetUrl('http://127.0.0.1:5005', 'auth%5Clogin')).toBeUndefined();
     expect(buildAppApiTargetUrl('http://127.0.0.1:5005', 'auth\\login')).toBeUndefined();
   });
+
+  it('forwards a directory-style path instead of rejecting it as an empty segment', () => {
+    // A hosted app can launch from a directory URL like `/api/<app>/app/`.
+    // Splitting on "/" and rejecting every empty segment made any trailing slash 502 with
+    // "App API backend is not configured" — a message about config for what was
+    // really a path-parsing rejection. The slash has to survive to the upstream,
+    // because the app resolves its asset base URL from it.
+    expect(buildAppApiTargetUrl('http://127.0.0.1:5005', 'app/', '?bridge=1'))
+      .toBe('http://127.0.0.1:5005/api/app/?bridge=1');
+    expect(buildAppApiTargetUrl('http://127.0.0.1:5005', '/app/'))
+      .toBe('http://127.0.0.1:5005/api/app/');
+    expect(buildAppApiTargetUrl('http://127.0.0.1:5005', 'app/index.html'))
+      .toBe('http://127.0.0.1:5005/api/app/index.html');
+  });
+
+  it('still rejects internal empty segments and traversal that ends in a slash', () => {
+    // Tolerating a trailing slash must not tolerate segment confusion.
+    expect(buildAppApiTargetUrl('http://127.0.0.1:5005', 'auth//login')).toBeUndefined();
+    expect(buildAppApiTargetUrl('http://127.0.0.1:5005', 'auth//')).toBeUndefined();
+    expect(buildAppApiTargetUrl('http://127.0.0.1:5005', '../admin/')).toBeUndefined();
+    expect(buildAppApiTargetUrl('http://127.0.0.1:5005', 'auth/../admin/')).toBeUndefined();
+    expect(buildAppApiTargetUrl('http://127.0.0.1:5005', '/')).toBeUndefined();
+    expect(buildAppApiTargetUrl('http://127.0.0.1:5005', '//')).toBeUndefined();
+    expect(buildAppApiTargetUrl('http://127.0.0.1:5005', 'auth\\login/')).toBeUndefined();
+  });
 });

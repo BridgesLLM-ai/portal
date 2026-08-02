@@ -149,6 +149,7 @@ const defaultDependencies: ProjectRuntimeCleanupAdapterDependencies = {
 
 const OPENCLAW_SESSION_DELETE_MAX_ATTEMPTS = 3;
 const OPENCLAW_SESSION_DELETE_RETRY_BASE_MS = 25;
+const OPENCLAW_CONFIG_RPC_TIMEOUT_MS = 15_000;
 
 function openClawSessionDeleteChanged(error: unknown): boolean {
   return /session .+ changed before deletion\. retry\./i.test(String(error || ''));
@@ -170,6 +171,201 @@ async function deleteOpenClawProjectSession(
     await new Promise((resolve) => {
       setTimeout(resolve, OPENCLAW_SESSION_DELETE_RETRY_BASE_MS * attempt);
     });
+  }
+}
+
+function openClawConfigSize(config: Record<string, any>): number {
+  return Buffer.byteLength(`${JSON.stringify(config, null, 2)}\n`, 'utf8');
+}
+
+function openClawConfigWithoutAgent(
+  config: Record<string, any>,
+  agentId: string,
+): Record<string, any> {
+  const next = structuredClone(config);
+  const agents = Array.isArray(next?.agents?.list) ? next.agents.list : [];
+  next.agents = { ...(next.agents || {}), list: agents.filter((entry: any) => entry?.id !== agentId) };
+  return next;
+}
+
+function openClawAgentDeletionWouldTripSizeGuard(
+  config: Record<string, any>,
+  agentId: string,
+): boolean {
+  const currentBytes = openClawConfigSize(config);
+  const nextBytes = openClawConfigSize(openClawConfigWithoutAgent(config, agentId));
+  return currentBytes >= 512 && nextBytes < Math.floor(currentBytes * 0.5);
+}
+
+function replaceOpenClawAgent(
+  config: Record<string, any>,
+  agentId: string,
+  replacement: Record<string, any>,
+): Record<string, any>[] {
+  const agents = Array.isArray(config?.agents?.list) ? config.agents.list : [];
+  const matches = agents.filter((entry: any) => entry?.id === agentId);
+  if (matches.length !== 1) throw new Error('OpenClaw Project agent changed before staged deletion');
+  return agents.map((entry: any) => entry?.id === agentId ? replacement : entry);
+}
+
+/**
+ * OpenClaw rejects a single config write that removes more than half of the
+ * file. A Project agent can legitimately own most of a clean install's config
+ * because its sandbox policy is intentionally verbose. After its container is
+ * gone, reduce only that exact agent through schema-valid stages, re-reading
+ * each committed hash, until the normal agents.delete RPC is below the guard.
+ */
+async function stageOpenClawProjectAgentDeletion(
+  dependencies: ProjectRuntimeCleanupAdapterDependencies,
+  agentId: string,
+): Promise<void> {
+  let response = await dependencies.rpc('config.get', {}, OPENCLAW_CONFIG_RPC_TIMEOUT_MS);
+  let config = response.data?.config || response.data?.parsed;
+  let hash = String(response.data?.hash || '').trim();
+  if (!response.ok || !config || typeof config !== 'object') {
+    throw new Error('OpenClaw Project agent config could not be read before deletion');
+  }
+  if (!openClawAgentDeletionWouldTripSizeGuard(config, agentId)) return;
+  if (!hash) throw new Error('OpenClaw Project agent config hash was unavailable before staged deletion');
+
+  const currentAgents = Array.isArray(config?.agents?.list) ? config.agents.list : [];
+  const initial = currentAgents.find((entry: any) => entry?.id === agentId);
+  if (!initial || typeof initial !== 'object') {
+    throw new Error('OpenClaw Project agent disappeared before staged deletion');
+  }
+  const keepIdentity = (entry: Record<string, any>): Record<string, any> => ({
+    id: agentId,
+    ...(typeof entry.workspace === 'string' ? { workspace: entry.workspace } : {}),
+    ...(typeof entry.agentDir === 'string' ? { agentDir: entry.agentDir } : {}),
+  });
+  const stages: Array<(entry: Record<string, any>) => Record<string, any>> = [
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.tools && typeof next.tools === 'object') delete next.tools.deny;
+      return next;
+    },
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.tools && typeof next.tools === 'object') delete next.tools.allow;
+      return next;
+    },
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.tools && typeof next.tools === 'object') delete next.tools.sandbox;
+      return next;
+    },
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.tools && typeof next.tools === 'object') delete next.tools.exec;
+      return next;
+    },
+    (entry) => { const next = structuredClone(entry); delete next.tools; return next; },
+    (entry) => { const next = structuredClone(entry); delete next.models; return next; },
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.sandbox && typeof next.sandbox === 'object') delete next.sandbox.browser;
+      return next;
+    },
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.sandbox?.docker && typeof next.sandbox.docker === 'object') delete next.sandbox.docker.env;
+      return next;
+    },
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.sandbox?.docker && typeof next.sandbox.docker === 'object') {
+        delete next.sandbox.docker.tmpfs;
+      }
+      return next;
+    },
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.sandbox?.docker && typeof next.sandbox.docker === 'object') delete next.sandbox.docker.binds;
+      return next;
+    },
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.sandbox?.docker && typeof next.sandbox.docker === 'object') delete next.sandbox.docker.ulimits;
+      return next;
+    },
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.sandbox?.docker && typeof next.sandbox.docker === 'object') {
+        delete next.sandbox.docker.image;
+        delete next.sandbox.docker.containerPrefix;
+        delete next.sandbox.docker.workdir;
+      }
+      return next;
+    },
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.sandbox?.docker && typeof next.sandbox.docker === 'object') {
+        delete next.sandbox.docker.network;
+        delete next.sandbox.docker.user;
+        delete next.sandbox.docker.capDrop;
+      }
+      return next;
+    },
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.sandbox?.docker && typeof next.sandbox.docker === 'object') {
+        for (const key of [
+          'readOnlyRoot',
+          'cpus',
+          'memory',
+          'memorySwap',
+          'pidsLimit',
+          'setupCommand',
+          'extraHosts',
+          'dns',
+          'seccompProfile',
+          'apparmorProfile',
+          'dangerouslyAllowReservedContainerTargets',
+          'dangerouslyAllowExternalBindSources',
+          'dangerouslyAllowContainerNamespaceJoin',
+        ]) delete next.sandbox.docker[key];
+      }
+      return next;
+    },
+    (entry) => {
+      const next = structuredClone(entry);
+      if (next.sandbox && typeof next.sandbox === 'object') delete next.sandbox.docker;
+      return next;
+    },
+    (entry) => { const next = structuredClone(entry); delete next.sandbox; return next; },
+    keepIdentity,
+  ];
+
+  let current = structuredClone(initial) as Record<string, any>;
+  for (const [stageIndex, stage] of stages.entries()) {
+    const replacement = stage(current);
+    if (JSON.stringify(replacement) === JSON.stringify(current)) continue;
+    const agents = replaceOpenClawAgent(config, agentId, replacement);
+    const predicted = structuredClone(config) as Record<string, any>;
+    predicted.agents = { ...(predicted.agents || {}), list: agents };
+    if (openClawConfigSize(predicted) < Math.floor(openClawConfigSize(config) * 0.5)) {
+      throw new Error(`OpenClaw Project agent could not be reduced within the config write guard at stage ${stageIndex + 1}`);
+    }
+    response = await dependencies.rpc('config.patch', {
+      raw: JSON.stringify({ agents: { list: agents } }),
+      baseHash: hash,
+    }, OPENCLAW_CONFIG_RPC_TIMEOUT_MS);
+    if (!response.ok) throw new Error('OpenClaw Project agent staged config reduction failed');
+    response = await dependencies.rpc('config.get', {}, OPENCLAW_CONFIG_RPC_TIMEOUT_MS);
+    config = response.data?.config || response.data?.parsed;
+    hash = String(response.data?.hash || '').trim();
+    if (!response.ok || !config || typeof config !== 'object' || !hash) {
+      throw new Error('OpenClaw Project agent staged config could not be verified');
+    }
+    const reread = (Array.isArray(config?.agents?.list) ? config.agents.list : [])
+      .filter((entry: any) => entry?.id === agentId);
+    if (reread.length !== 1 || JSON.stringify(reread[0]) !== JSON.stringify(replacement)) {
+      throw new Error('OpenClaw Project agent changed during staged deletion');
+    }
+    current = replacement;
+  }
+  if (openClawAgentDeletionWouldTripSizeGuard(config, agentId)) {
+    throw new Error('OpenClaw Project agent remained too large for safe deletion');
   }
 }
 
@@ -524,14 +720,9 @@ export function createOpenClawProjectRuntimeCleanupAdapter(
         if (!aborted.ok) throw new Error('OpenClaw Project session abort failed during cleanup');
         await deleteOpenClawProjectSession(dependencies, sessionKey);
       }
-      for (const resource of resources.filter((entry) => entry.kind === 'OPENCLAW_AGENT')) {
-        const agentId = resource.id.slice('openclaw-agent:'.length);
-        if (!/^p4oc-[a-f0-9]{40}$/.test(agentId)) throw new Error('Refusing to delete an unsafe OpenClaw agent identity');
-        const deleted = await dependencies.rpc('agents.delete', { agentId, deleteFiles: true }, 20_000);
-        if (!deleted.ok && !/not found/i.test(String(deleted.error || ''))) {
-          throw new Error('OpenClaw Project agent deletion failed');
-        }
-      }
+      // Remove the attested container before reducing its agent configuration.
+      // A deletion retry can never restart a workload from a deliberately
+      // minimized policy while the durable Project barrier is closed.
       const projectLabelValue = hashOpenClawProjectLabelIdentity(scope.projectIdentity.id);
       for (const resource of resources.filter((entry) => entry.kind === 'OPENCLAW_CONTAINER')) {
         await removeAttestedContainer({
@@ -541,6 +732,15 @@ export function createOpenClawProjectRuntimeCleanupAdapter(
           projectLabelValue,
           scope,
         });
+      }
+      for (const resource of resources.filter((entry) => entry.kind === 'OPENCLAW_AGENT')) {
+        const agentId = resource.id.slice('openclaw-agent:'.length);
+        if (!/^p4oc-[a-f0-9]{40}$/.test(agentId)) throw new Error('Refusing to delete an unsafe OpenClaw agent identity');
+        await stageOpenClawProjectAgentDeletion(dependencies, agentId);
+        const deleted = await dependencies.rpc('agents.delete', { agentId, deleteFiles: true }, 20_000);
+        if (!deleted.ok && !/not found/i.test(String(deleted.error || ''))) {
+          throw new Error('OpenClaw Project agent deletion failed');
+        }
       }
       for (const actorUserId of scope.knownActorIds) {
         clearProjectNativeRun({ userId: actorUserId, projectId: scope.projectIdentity.id, provider: 'OPENCLAW' });

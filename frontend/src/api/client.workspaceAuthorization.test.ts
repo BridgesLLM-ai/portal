@@ -144,4 +144,44 @@ describe('Axios workspace authorization request identity', () => {
     await rejected;
     expect(adapter).toHaveBeenCalledTimes(1);
   });
+
+  it('clears a falsely persisted login when the refresh cookie is missing', async () => {
+    vi.spyOn(axios, 'post').mockRejectedValue(new AxiosError(
+      'Refresh token required',
+      'ERR_BAD_REQUEST',
+      undefined,
+      undefined,
+      {
+        data: { error: 'Refresh token required' },
+        status: 401,
+        statusText: 'Unauthorized',
+        headers: {},
+        config: {} as InternalAxiosRequestConfig,
+      },
+    ));
+    client.defaults.adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+      throw new AxiosError(
+        'Access token required',
+        'ERR_BAD_REQUEST',
+        config,
+        undefined,
+        {
+          data: { error: 'Access token required' },
+          status: 401,
+          statusText: 'Unauthorized',
+          headers: {
+            [PORTAL_AUTHORIZATION_VERSION_HEADER.toLowerCase()]: '3',
+          },
+          config,
+        },
+      );
+    }) as AxiosAdapter;
+
+    await expect(client.get('/gateway/sessions')).rejects.toMatchObject({
+      response: { status: 401 },
+    });
+
+    expect(useAuthStore.getState().isAuthenticated).toBe(false);
+    expect(useAuthStore.getState().user).toBeNull();
+  });
 });

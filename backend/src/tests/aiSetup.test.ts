@@ -17,13 +17,31 @@ describe('xAI provider operation serialization', () => {
   test('prevents setup and disconnect from overlapping in either direction', () => {
     const gate = new ExclusiveProviderOperationGate();
     const setupToken = gate.acquire('oauth');
-    expect(() => gate.acquire('disconnect')).toThrow(/already running/i);
+    expect(() => gate.acquire('disconnect')).toThrow(/still open/i);
     gate.release(setupToken);
 
     const disconnectToken = gate.acquire('disconnect');
-    expect(() => gate.acquire('api-key')).toThrow(/already running/i);
+    expect(() => gate.acquire('api-key')).toThrow(/still open/i);
     gate.release(disconnectToken);
     expect(() => gate.acquire('oauth')).not.toThrow();
+  });
+
+  test('tells the operator how to recover instead of only refusing', () => {
+    const gate = new ExclusiveProviderOperationGate();
+    gate.acquire('oauth');
+    expect(() => gate.acquire('disconnect')).toThrow(/use Reset to clear it/i);
+  });
+
+  test('reclaims an abandoned operation whose release path never ran', () => {
+    // A crashed, cancelled, or abandoned sign-in never releases the gate.
+    // Without an expiry that locked xAI out until the Portal restarted.
+    const held = new ExclusiveProviderOperationGate(60_000);
+    held.acquire('oauth');
+    expect(() => held.acquire('disconnect')).toThrow(/still open/i);
+
+    const expired = new ExclusiveProviderOperationGate(0);
+    expired.acquire('oauth');
+    expect(() => expired.acquire('disconnect')).not.toThrow();
   });
 
   test('requires the selected xAI primary model in the post-save credential probe', () => {

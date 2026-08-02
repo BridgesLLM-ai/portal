@@ -314,7 +314,7 @@ describe('Portal 3.x Project/App startup continuity', () => {
     })).rejects.toBeInstanceOf(LegacyProjectContinuityAdoptionError);
   });
 
-  test('runs continuity enrollment and App backfill before legacy gating and running-App restore', () => {
+  test('runs continuity enrollment and App backfill before legacy gating and keeps legacy copy preparation non-destructive', () => {
     const serverSource = fs.readFileSync(path.resolve(__dirname, '../server.ts'), 'utf8');
     const continuity = serverSource.indexOf(
       'const projectContinuity = await initializeLegacyProjectContinuityAdoption();',
@@ -335,12 +335,13 @@ describe('Portal 3.x Project/App startup continuity', () => {
     const routeStart = routeSource.indexOf("router.post('/:name/chat/migrate-legacy'");
     const routeEnd = routeSource.indexOf("router.get('/:name/chat/providers'", routeStart);
     const route = routeSource.slice(routeStart, routeEnd);
-    expect(route.indexOf('await assertLegacyOpenClawProjectMigrationInactive(projectIdentity.id);'))
-      .toBeLessThan(route.indexOf('const result = await adoptLegacyProjectInPlace'));
-    expect(route.indexOf('await assertNoLegacyOpenClawProjectEvidence();'))
-      .toBeLessThan(route.indexOf('const result = await adoptLegacyProjectInPlace'));
-    expect(route).toContain('error instanceof LegacyOpenClawProjectRetirementError');
-    expect(route).toContain('LEGACY_OPENCLAW_RETIREMENT_PENDING_MESSAGE');
-    expect(route).not.toContain('legacyEvidenceError?.message');
+    expect(route).toContain('copyLegacyProjectIntoCurrentStaging({');
+    expect(route).toContain('await createCurrentProjectIdentity({');
+    expect(route).toContain('await finalizeCurrentProjectIdentityCreation({');
+    expect(route).toContain('sourceProjectId: projectIdentity.id');
+    expect(route.match(/assertNoLegacyOpenClawProjectCreationCollision\(\{/g)).toHaveLength(2);
+    expect(route).not.toContain('adoptLegacyProjectInPlace');
+    expect(route).not.toContain('assertNoLegacyOpenClawProjectEvidence');
+    expect(route).not.toContain('legacyOpenClawMigrationStatus: \'CURRENT\'');
   });
 });

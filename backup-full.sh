@@ -3308,7 +3308,7 @@ PY
 
 select_backup_postgresql_toolchain_for_authority() {
   local authority="$1" database_url libpq_url runner_source
-  local version_num major minor floor selected
+  local version_num major selected
   database_url="$(read_env_value "${authority}" DATABASE_URL)" || return 1
   libpq_url="$(libpq_database_url "${database_url}")" || return 1
   runner_source="$(backup_pg_dump_runner_python)" || return 1
@@ -3323,16 +3323,13 @@ select_backup_postgresql_toolchain_for_authority() {
   version_num="$(tr -d '\r\n' <<<"${version_num}")"
   [[ "${version_num}" =~ ^[0-9]{6}$ ]] || return 1
   major="$((10#${version_num} / 10000))"
-  minor="$((10#${version_num} % 10000))"
   case "${major}" in
-    14) floor=23 ;;
-    15) floor=18 ;;
-    16) floor=14 ;;
-    17) floor=10 ;;
-    18) floor=4 ;;
+    14|15|16|17|18) ;;
     *) return 1 ;;
   esac
-  (( minor >= floor )) || return 1
+  # The patched client toolchain below must satisfy the security floor, but
+  # an already-running server on an older patch must remain backup-able. That
+  # archive is the prerequisite for safely upgrading the server itself.
   set_backup_postgresql_client_toolchain "${major}" || return 1
   selected="$(
     runner_parent="${BASHPID}"
@@ -4384,6 +4381,29 @@ archive_required_component() {
     "$component_id" required captured "$(basename "$target")" "$source_dir" "$capture_method"
 }
 
+archive_required_component_with_retries() {
+  local component_id="$1"
+  local source_dir="$2"
+  local target="$3"
+  local max_attempts="$4"
+  local attempt=1
+  shift 4
+  [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] \
+    || die "Archive retry count must be a positive integer: ${component_id}"
+  while ! archive_dir "$source_dir" "$target" "$@"; do
+    if (( attempt >= max_attempts )); then
+      die "Required recovery source is missing or could not be archived after ${max_attempts} attempts: ${component_id} (${source_dir})"
+    fi
+    log "Recovery source changed during capture; retrying ${component_id} ($(( attempt + 1 ))/${max_attempts})"
+    (( attempt += 1 ))
+    sleep 1
+  done
+  local capture_method="live-filesystem-tar"
+  [[ "${RUN_TYPE:-}" == "comprehensive" ]] && capture_method="service-quiesced-tar"
+  record_recovery_component \
+    "$component_id" required captured "$(basename "$target")" "$source_dir" "$capture_method"
+}
+
 record_absent_component() {
   local component_id="$1"
   local source_dir="$2"
@@ -4899,7 +4919,6 @@ def validate_pg_dump_custom(path):
     producer_major, producer_minor = map(int, producer_matches[0])
     if (
         source_major != postgres_major
-        or source_minor < floors[source_major]
         or producer_major != postgres_major
         or producer_minor < floors[producer_major]
     ):
@@ -5717,7 +5736,7 @@ create_backup() {
 
   begin_run "$type"
   select_backup_postgresql_toolchain_for_authority "${PORTAL_ENV_FILE}" \
-    || die "PostgreSQL server/client major or supported security floor admission failed"
+    || die "PostgreSQL server major or client security floor admission failed"
   assert_backup_disk_admission \
     || die "Backup disk admission failed before any source was quiesced"
 
@@ -5934,8 +5953,15 @@ create_backup() {
     *) die "OPENCLAW_BACKUP_POLICY must be auto, required, or absent" ;;
   esac
   if $openclaw_configured; then
-    archive_required_component \
-      openclaw-state "$OPENCLAW_DIR" "${staging}/openclaw-state.tar.gz" \
+    # The managed npm project tree is a reproducible runtime cache. Including
+    # it adds hundreds of megabytes and stretches a live capture long enough
+    # for routine OpenClaw SQLite WAL writes to invalidate the archive. Keep
+    # the configuration, sessions, SQLite state, workspaces, skills, and
+    # locally installed extensions; the installer recreates managed npm
+    # projects from the pinned plugin configuration during restore/update.
+    archive_required_component_with_retries \
+      openclaw-state "$OPENCLAW_DIR" "${staging}/openclaw-state.tar.gz" 3 \
+      --exclude='npm/*' \
       --exclude='*/agent/codex-home/tmp' \
       --exclude='*/agent/codex-home/tmp/*'
   else

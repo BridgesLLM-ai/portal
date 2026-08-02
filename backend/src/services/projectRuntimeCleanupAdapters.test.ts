@@ -256,6 +256,86 @@ describe('concrete Project runtime cleanup adapters', () => {
     ]));
   });
 
+  test('OpenClaw safely stages deletion when a sandboxed Project agent owns most of the config file', async () => {
+    const agentId = deriveOpenClawProjectAgentId({ userId: ACTOR, projectId: PROJECT_ID });
+    const projectAgent = {
+      id: agentId,
+      workspace: '/root/.openclaw/project-agents/test',
+      model: { fallbacks: [] },
+      models: Object.fromEntries(Array.from({ length: 12 }, (_, index) => [
+        `provider-${index}/*`,
+        { agentRuntime: { id: 'openclaw' } },
+      ])),
+      tools: {
+        allow: Array.from({ length: 20 }, (_, index) => `allowed-tool-${index}`),
+        deny: Array.from({ length: 35 }, (_, index) => `denied-tool-${index}`),
+      },
+      sandbox: {
+        mode: 'all',
+        browser: { enabled: false, allowHostControl: false, autoStart: false, binds: [] },
+        docker: {
+          image: `sha256:${'a'.repeat(64)}`,
+          containerPrefix: 'p4oc-test-',
+          workdir: '/workspace/project',
+          readOnlyRoot: true,
+          tmpfs: Array.from({ length: 12 }, (_, index) => `/tmp-${index}:rw,noexec,size=1048576`),
+          env: Object.fromEntries(Array.from({ length: 18 }, (_, index) => [
+            `SAFE_ENV_${index}`,
+            `value-${index}-${'x'.repeat(18)}`,
+          ])),
+          ulimits: { nofile: { soft: 1024, hard: 1024 }, nproc: { soft: 256, hard: 256 } },
+          binds: Array.from({ length: 8 }, (_, index) => `/safe/source-${index}:/safe/target-${index}:ro`),
+          network: 'project-internal',
+          user: '1000:1000',
+          capDrop: ['ALL'],
+        },
+      },
+    };
+    let config: Record<string, any> = {
+      meta: { lastTouchedVersion: '2026.7.1-2' },
+      gateway: { mode: 'local' },
+      agents: { list: [projectAgent] },
+    };
+    let hashSequence = 1;
+    const rpc = jest.fn(async (method: string, params: Record<string, any> = {}) => {
+      if (method === 'config.get') {
+        return { ok: true, data: { config: structuredClone(config), hash: `hash-${hashSequence}` } };
+      }
+      if (method === 'config.patch') {
+        config = {
+          ...config,
+          agents: { ...config.agents, list: JSON.parse(params.raw).agents.list },
+        };
+        hashSequence += 1;
+        return { ok: true, data: { hash: `hash-${hashSequence}` } };
+      }
+      if (method === 'agents.delete') {
+        config = {
+          ...config,
+          agents: { ...config.agents, list: config.agents.list.filter((entry: any) => entry.id !== params.agentId) },
+        };
+        return { ok: true, data: { deleted: true } };
+      }
+      throw new Error(`Unexpected RPC ${method}`);
+    });
+    const adapter = createOpenClawProjectRuntimeCleanupAdapter({
+      executor: new FakeDocker(null),
+      rpc,
+    });
+
+    await adapter.cleanup(scope(), [{
+      id: `openclaw-agent:${agentId}`,
+      kind: 'OPENCLAW_AGENT',
+      projectIdentityId: PROJECT_ID,
+      actorUserId: ACTOR,
+      provider: 'OPENCLAW',
+    }]);
+
+    expect(config.agents.list).toEqual([]);
+    expect(rpc.mock.calls.filter(([method]) => method === 'config.patch').length).toBeGreaterThan(1);
+    expect(rpc).toHaveBeenCalledWith('agents.delete', { agentId, deleteFiles: true }, 20_000);
+  });
+
   test('OpenClaw retries the gateway session lifecycle CAS before failing cleanup', async () => {
     const sessionKey = deriveOpenClawProjectSessionKey({ userId: ACTOR, projectId: PROJECT_ID });
     let sessionPresent = true;

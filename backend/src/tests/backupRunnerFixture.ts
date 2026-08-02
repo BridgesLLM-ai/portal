@@ -46,6 +46,7 @@ export function createBackupRunnerFixture(
   options: {
     backupRoot?: string;
     databaseUrl?: string;
+    postgresServerVersion?: string;
     portalRoot?: string;
     stateDir?: string;
   } = {},
@@ -63,6 +64,10 @@ export function createBackupRunnerFixture(
   const installerStateRoot = path.join(testRoot, 'installer-state');
   const operationLock = path.join(testRoot, 'run', 'lock', 'portal-operation.lock');
   const installRoot = path.join(testRoot, 'install-root');
+  const postgresServerVersion = options.postgresServerVersion || '16.14';
+  const postgresServerMatch = postgresServerVersion.match(/^([0-9]+)\.([0-9]+)$/u);
+  if (!postgresServerMatch) throw new Error('Invalid PostgreSQL server fixture version');
+  const postgresServerVersionNum = `${postgresServerMatch[1]}${postgresServerMatch[2].padStart(4, '0')}`;
 
   for (const directory of [
     commandsRoot,
@@ -163,7 +168,7 @@ if not payload.startswith(b"PGDMP"):
     raise SystemExit(1)
 if "--list" in arguments:
     print(";")
-    print(";     Dumped from database version: 16.14")
+    print(";     Dumped from database version: ${postgresServerVersion}")
     print(";     Dumped by pg_dump version: 16.14")
     print(";")
     print("1; 0 0 TABLE public fixture_state portal")
@@ -190,7 +195,7 @@ command = next(
 )
 if command is not None:
     if "current_setting('server_version_num')" in command:
-        print("160014")
+        print("${postgresServerVersionNum}")
     elif "pg_database_size(current_database())" in command:
         if "FROM pg_class" in command and "relkind IN" in command:
             print("1048576|64")

@@ -5,6 +5,7 @@ import path from 'path';
 import {
   adoptLegacyProjectInPlace,
   buildProjectLegacyAdoptionManifest,
+  copyLegacyProjectIntoCurrentStaging,
 } from './projectLegacyAdoption';
 import {
   attestProjectRoot,
@@ -71,6 +72,23 @@ describe('in-place legacy Project adoption', () => {
       process.env.PORTAL_PROJECT_LEGACY_ADOPTION_ROOT = previousAdoptionRoot;
     }
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  });
+
+  test('builds a verified CURRENT-project copy without changing or promoting the legacy source', () => {
+    const stagingRoot = path.join(temporaryRoot, 'current-staging');
+    fs.mkdirSync(stagingRoot, { mode: 0o700 });
+    const sourceBefore = buildProjectLegacyAdoptionManifest(projectRoot);
+
+    const copied = copyLegacyProjectIntoCurrentStaging(
+      { sourceRoot: projectRoot, stagingRoot },
+      { limits: { minimumFreeBytesAfterCopy: 0 } },
+    );
+
+    expect(copied).toEqual(sourceBefore);
+    expect(buildProjectLegacyAdoptionManifest(stagingRoot)).toEqual(sourceBefore);
+    expect(buildProjectLegacyAdoptionManifest(projectRoot)).toEqual(sourceBefore);
+    expect(identity.legacyOpenClawMigrationStatus).toBe('NONE');
+    expect(database.projectIdentity.updateMany).not.toHaveBeenCalled();
   });
 
   test('preserves the identity, increments its generation, and parks a hash-identical source snapshot', async () => {

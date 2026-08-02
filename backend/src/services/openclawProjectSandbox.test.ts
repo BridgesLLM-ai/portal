@@ -713,14 +713,29 @@ describe('OpenClaw config convergence', () => {
     expect(raw.agents.list).toEqual([{ id: 'main', default: true }, fixture.plan.desiredAgent]);
   });
 
-  test('does not patch an already exact agent but still verifies effective defaults', async () => {
+  test('does not patch an already exact agent when the host main agent remains default', async () => {
     const fixture = makeFixture();
     const rpc = jest.fn().mockResolvedValue(rpcResult({
-      agents: { list: [fixture.plan.desiredAgent] },
+      agents: { list: [{ id: 'main', default: true }, fixture.plan.desiredAgent] },
     }));
     await __openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc);
     expect(rpc).toHaveBeenCalledTimes(1);
     expect(rpc).toHaveBeenCalledWith('config.get', {}, 15_000);
+  });
+
+  test('restores the implicit main agent before an exact lone Project agent can capture default routing', async () => {
+    const fixture = makeFixture();
+    const rpc = jest.fn()
+      .mockResolvedValueOnce(rpcResult({ agents: { list: [fixture.plan.desiredAgent] } }, 'before'))
+      .mockResolvedValueOnce({ ok: true, data: { hash: 'after' } })
+      .mockResolvedValueOnce(rpcResult({
+        agents: { list: [{ id: 'main', default: true }, fixture.plan.desiredAgent] },
+      }, 'after'));
+
+    await __openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc);
+
+    const raw = JSON.parse(rpc.mock.calls[1][1].raw);
+    expect(raw.agents.list).toEqual([{ id: 'main', default: true }, fixture.plan.desiredAgent]);
   });
 
   test.each([
@@ -797,7 +812,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
       }),
     };
     const rpc = jest.fn().mockResolvedValue(rpcResult({
-      agents: { list: [fixture.plan.desiredAgent] },
+      agents: { list: [{ id: 'main', default: true }, fixture.plan.desiredAgent] },
     }));
     const constrainRuntime = jest.fn(async () => undefined);
     const ensureEgressPlane = jest.fn(async () => fixture.handle);

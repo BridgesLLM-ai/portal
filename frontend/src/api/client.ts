@@ -143,8 +143,11 @@ async function refreshSession(): Promise<boolean> {
     try {
       await refreshPromise;
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      // The response interceptor owns the logout decision. Preserve the exact
+      // refresh failure so a missing/expired refresh cookie cannot leave the
+      // persisted UI in a permanently authenticated-looking 401 loop.
+      throw error;
     }
   }
 
@@ -164,8 +167,8 @@ async function refreshSession(): Promise<boolean> {
   try {
     await refreshPromise;
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    throw error;
   }
 }
 
