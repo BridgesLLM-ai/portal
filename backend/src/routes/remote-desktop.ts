@@ -896,10 +896,8 @@ function ensurePortalVisibleBrowserAgentConfig(): { changed: boolean; created: b
 }
 
 async function ensurePortalVisibleBrowserDefaults(): Promise<{ changed: boolean; note: string }> {
-  const skillResult = ensurePortalSkillInstalled();
   const agentResult = ensurePortalVisibleBrowserAgentConfig();
   const notes: string[] = [];
-  if (skillResult.note) notes.push(skillResult.note);
   if (agentResult.note) notes.push(agentResult.note);
   let dbChanged = false;
   try {
@@ -925,9 +923,24 @@ async function ensurePortalVisibleBrowserDefaults(): Promise<{ changed: boolean;
     }
   } catch {}
 
-  const changed = skillResult.changed || agentResult.changed || dbChanged;
+  const changed = agentResult.changed || dbChanged;
   notes.push(dbChanged ? 'DB defaults updated' : 'DB defaults already current');
   return { changed, note: notes.join('; ') };
+}
+
+// The managed skill is part of every signed Portal bundle, not a Remote
+// Desktop setup artifact. Converge it on every normal backend start so an
+// update refreshes the active OpenClaw copy even when Desktop was never set up
+// or its settings are currently empty. OpenClaw snapshots skills per session;
+// its default watcher refreshes an existing snapshot on the next turn, and a
+// new session always reads the current files. No Gateway restart is required.
+export function reconcilePortalManagedSkill(): void {
+  const result = ensurePortalSkillInstalled();
+  if (result.changed) {
+    console.log(`[managed-skill] ${result.note}`);
+  } else if (/^(?:Failed|Skill source not found)/.test(result.note)) {
+    console.warn(`[managed-skill] ${result.note}`);
+  }
 }
 
 export async function reconcileRemoteDesktopLauncherAssets(): Promise<void> {

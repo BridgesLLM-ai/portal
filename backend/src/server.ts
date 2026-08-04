@@ -48,7 +48,11 @@ import agentToolsRoutes from './routes/agent-tools';
 import agentRuntimeRoutes from './routes/agent-runtime';
 import ollamaRoutes from './routes/ollama';
 import askUserPluginRoutes from './routes/askUserPlugin';
-import remoteDesktopRoutes, { reconcilePortalVisibleBrowserDefaults, reconcileRemoteDesktopLauncherAssets } from './routes/remote-desktop';
+import remoteDesktopRoutes, {
+  reconcilePortalManagedSkill,
+  reconcilePortalVisibleBrowserDefaults,
+  reconcileRemoteDesktopLauncherAssets,
+} from './routes/remote-desktop';
 import { retireInternalProjectIdentityDebris } from './services/projectIdentity';
 import {
   startRemoteDesktopOpenPathCleanup,
@@ -2150,6 +2154,7 @@ export const startServer = async () => {
       if (process.env.PORTAL_DISABLE_OPENCLAW_BACKGROUND !== '1') {
         initializeProjectChatRestartRecoveryRuntime();
       }
+      reconcilePortalManagedSkill();
       void reconcilePortalVisibleBrowserDefaults();
       void reconcileRemoteDesktopLauncherAssets();
       // Per-boot capability secret the Remote Desktop Agent Zero launcher reads

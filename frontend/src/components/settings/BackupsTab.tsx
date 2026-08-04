@@ -47,6 +47,11 @@ interface BackupRunStatus {
   completedAt?: string;
   archivePath?: string;
   error?: string;
+  failureDetail?: string;
+  phase?: string;
+  phaseLabel?: string;
+  phaseIndex?: number;
+  phaseTotal?: number;
   output?: string;
 }
 
@@ -221,7 +226,7 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
           const settingsOwner = settingsMutationOwnerRef.current;
           if (settingsOwner?.startsWith('settings:backups:create:')) releaseSettingsMutation(settingsOwner);
           sounds.error();
-          showCreateStatus({ type: 'error', message: status.error || 'Backup failed' });
+          showCreateStatus({ type: 'error', message: status.failureDetail || status.error || 'Backup failed' });
           return;
         }
         pollTimerRef.current = window.setTimeout(poll, 3000);
@@ -242,6 +247,7 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
     void client.get('/backups/status').then(({ data }) => {
       if (mountedRef.current) setLastRun(data);
       if (mountedRef.current && (data.status === 'queued' || data.status === 'running')) {
+        if (data.type === 'daily' || data.type === 'comprehensive') setBackupType(data.type);
         setCreating(true);
         pollBackupStatus();
       }
@@ -280,6 +286,10 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
         showCreateStatus({ type: 'error', message: data.error || 'Backup failed to start' });
         return;
       }
+      // Admission is complete once systemd accepts the durable background job.
+      // Keep the local single-flight guard while polling, but let Settings
+      // navigation and unrelated configuration work continue immediately.
+      releaseSettingsMutation(settingsOwner);
       pollBackupStatus();
     } catch (e: any) {
       setCreating(false);
@@ -364,6 +374,16 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
   };
 
   const filtered = filter === 'all' ? backups : backups.filter(b => b.type === filter);
+  const hasRunProgress = Boolean(
+    lastRun
+    && typeof lastRun.phaseLabel === 'string'
+    && typeof lastRun.phaseIndex === 'number'
+    && Number.isInteger(lastRun.phaseIndex)
+    && typeof lastRun.phaseTotal === 'number'
+    && Number.isInteger(lastRun.phaseTotal)
+    && lastRun.phaseIndex >= 1
+    && lastRun.phaseTotal >= lastRun.phaseIndex,
+  );
 
   return (
     <div className="space-y-6">
@@ -443,6 +463,17 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
             <Plus size={16} className="text-emerald-400" />
             <h3 className="text-sm font-semibold text-white">Create Manual Backup</h3>
           </div>
+          {backupType === 'comprehensive' ? (
+            <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-200">
+              A comprehensive backup temporarily takes Portal and agent services offline while it fences recovery data.
+              Live progress pauses during that window and reconnects when services return. Start it only when you are ready
+              to wait for the Portal to come back.
+            </div>
+          ) : (
+            <p className="text-xs leading-relaxed text-slate-500">
+              Standard backups run in the background. You can navigate away safely and return here to reattach to the current run.
+            </p>
+          )}
           
           {/* Backup Type Selector */}
           <div className="flex gap-3">
@@ -509,7 +540,31 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
                 {lastRun.startedAt && <span className="text-slate-500">Started {formatDate(lastRun.startedAt)}</span>}
                 {lastRun.completedAt && <span className="text-slate-500">Finished {formatDate(lastRun.completedAt)}</span>}
               </div>
-              {lastRun.error && <p className="mt-2 text-xs text-red-400">{lastRun.error}</p>}
+              {hasRunProgress && (
+                <div className="mt-3">
+                  <div className="mb-1.5 flex items-center justify-between gap-3 text-xs">
+                    <span className="font-medium text-slate-300">{lastRun.phaseLabel}</span>
+                    <span className="shrink-0 text-slate-500">Phase {lastRun.phaseIndex} of {lastRun.phaseTotal}</span>
+                  </div>
+                  <div
+                    role="progressbar"
+                    aria-label="Backup progress"
+                    aria-valuemin={1}
+                    aria-valuemax={lastRun.phaseTotal}
+                    aria-valuenow={lastRun.phaseIndex}
+                    aria-valuetext={`Phase ${lastRun.phaseIndex} of ${lastRun.phaseTotal}: ${lastRun.phaseLabel}`}
+                    className="h-1.5 overflow-hidden rounded-full bg-white/[0.06]"
+                  >
+                    <div
+                      className="h-full rounded-full bg-blue-400 transition-[width] duration-300"
+                      style={{ width: `${Math.min(100, (lastRun.phaseIndex! / lastRun.phaseTotal!) * 100)}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+              {(lastRun.failureDetail || lastRun.error) && (
+                <p className="mt-2 text-xs text-red-400">{lastRun.failureDetail || lastRun.error}</p>
+              )}
               {lastRun.output && (
                 <details className="mt-2">
                   <summary className="cursor-pointer text-xs text-slate-500 hover:text-slate-400">Show bounded backup log</summary>

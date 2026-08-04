@@ -153,4 +153,100 @@ describe('BackupsTab mutation admission', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Create Backup Now' })).toBeEnabled());
     expect(screen.getByRole('button', { name: 'Leave Settings' })).toBeEnabled();
   });
+
+  it('releases Settings navigation after the background service accepts the backup', async () => {
+    const create = deferred<{ data: { status: string; id: string } }>();
+    mocks.post.mockReturnValueOnce(create.promise);
+    const { unmount } = render(
+      <SettingsOwnershipHarness>
+        <BackupsTab />
+      </SettingsOwnershipHarness>,
+    );
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Create Backup Now' }));
+    expect(screen.getByRole('button', { name: 'Leave Settings' })).toBeDisabled();
+
+    await act(async () => {
+      create.resolve({ data: { status: 'queued', id: 'daily-background-job' } });
+      await create.promise;
+    });
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Leave Settings' })).toBeEnabled());
+    expect(screen.getByRole('button', { name: 'Creating Backup...' })).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByText(/standard backups run in the background/i)).toBeVisible();
+    expect(mocks.get.mock.calls.some(([url]) => url === '/backups/status')).toBe(true);
+    unmount();
+  });
+
+  it('reattaches to a running backup and presents its structured progress', async () => {
+    mocks.get.mockImplementation((url: string) => {
+      if (url === '/backups/list') {
+        return Promise.resolve({
+          data: {
+            backups: [backup],
+            summary: {
+              total: 1,
+              totalSize: backup.size,
+              totalSizeHuman: backup.sizeHuman,
+              oldest: backup.created,
+              newest: backup.created,
+            },
+          },
+        });
+      }
+      if (url === '/backups/cron-info') {
+        return Promise.resolve({ data: { schedules: [], active: [], disabled: [] } });
+      }
+      if (url === '/backups/status') {
+        return Promise.resolve({
+          data: {
+            id: 'comprehensive-existing-job',
+            type: 'comprehensive',
+            status: 'running',
+            phase: 'database',
+            phaseLabel: 'Backing up PostgreSQL',
+            phaseIndex: 6,
+            phaseTotal: 12,
+          },
+        });
+      }
+      return Promise.reject(new Error(`Unexpected backup GET: ${url}`));
+    });
+    const { unmount } = render(<BackupsTab />);
+
+    expect(await screen.findByText('Phase 6 of 12')).toBeVisible();
+    expect(screen.getByText('Backing up PostgreSQL')).toBeVisible();
+    expect(screen.getByRole('progressbar', { name: 'Backup progress' })).toHaveAttribute('aria-valuenow', '6');
+    expect(screen.getByRole('button', { name: 'Creating Backup...' })).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByText(/temporarily takes portal and agent services offline/i)).toBeVisible();
+    expect(screen.getByText(/live progress pauses during that window/i)).toBeVisible();
+    unmount();
+  });
+
+  it('shows the sanitized exact failure detail reported by the backup service', async () => {
+    mocks.get.mockImplementation((url: string) => {
+      if (url === '/backups/list') {
+        return Promise.resolve({ data: { backups: [], summary: { total: 0, totalSize: 0, totalSizeHuman: '0 B', oldest: null, newest: null } } });
+      }
+      if (url === '/backups/cron-info') {
+        return Promise.resolve({ data: { schedules: [], active: [], disabled: [] } });
+      }
+      if (url === '/backups/status') {
+        return Promise.resolve({
+          data: {
+            id: 'failed-job',
+            type: 'comprehensive',
+            status: 'failed',
+            error: 'Backup process exited with code 1',
+            failureDetail: 'Container database PGDATA is not on persistent writable storage',
+          },
+        });
+      }
+      return Promise.reject(new Error(`Unexpected backup GET: ${url}`));
+    });
+    render(<BackupsTab />);
+
+    expect(await screen.findByText('Container database PGDATA is not on persistent writable storage')).toBeVisible();
+    expect(screen.queryByText('Backup process exited with code 1')).not.toBeInTheDocument();
+  });
 });

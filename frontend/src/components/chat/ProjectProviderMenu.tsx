@@ -30,6 +30,12 @@ export interface ProjectProviderQualificationFailure {
   recovery: 'HOST_MAINTENANCE' | null;
   retryAt: string | null;
   suppressionExpiresAt?: string | null;
+  operatorDiagnostic?: {
+    source: 'OPENCLAW_GATEWAY';
+    operation: 'config.get' | 'config.patch';
+    errorCode: string | null;
+    errorMessage: string;
+  } | null;
 }
 
 export type ProjectQualificationRecoveryRole = 'OWNER' | 'SUB_ADMIN' | 'USER';
@@ -416,6 +422,21 @@ export default function ProjectProviderMenu({
                           className="mt-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-[10px] leading-relaxed text-red-300"
                         >
                           {qualificationFailure.message}
+                        </p>
+                      )}
+                      {qualificationFailure?.operatorDiagnostic && hostRecoveryRole !== 'USER' && (
+                        <p
+                          role="note"
+                          className="mt-1.5 rounded-lg border border-amber-500/20 bg-amber-500/10 px-2 py-1.5 text-[10px] leading-relaxed text-amber-100"
+                        >
+                          <span className="font-semibold">OpenClaw gateway diagnostic:</span>{' '}
+                          <code>
+                            {qualificationFailure.operatorDiagnostic.operation}
+                            {qualificationFailure.operatorDiagnostic.errorCode
+                              ? ` ${qualificationFailure.operatorDiagnostic.errorCode}`
+                              : ''}
+                          </code>
+                          {' — '}{qualificationFailure.operatorDiagnostic.errorMessage}
                         </p>
                       )}
                       {qualificationFailure?.recovery === 'HOST_MAINTENANCE' && (

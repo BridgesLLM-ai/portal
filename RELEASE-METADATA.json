@@ -1,13 +1,12 @@
 {
   "schema": 1,
-  "version": "4.0.11",
-  "releasedAt": "2026-08-03",
-  "releaseClass": "feature",
+  "version": "4.0.12",
+  "releasedAt": "2026-08-04",
+  "releaseClass": "hotfix",
   "highlights": [
-    "Ask Questions now pauses and resumes a run through any embedded provider, not only native Codex, with each question bound to the exact user, session, run, and tool call.",
-    "Files an Agent links to open where they live: Portal uploads in Files, workspace files in a private, bounded Remote Desktop handoff that fails closed on unsafe paths.",
-    "The workspace refresh screen is now a branded Portal curtain using your uploaded logo, a restrained dot matrix, and glass status, opaque from the first frame.",
-    "Agent Chat recovers dropped provider streams, restores the correct provider and agent sessions, and reassembles a final reply split across frames.",
-    "OpenClaw backups omit volatile Codex runtime data, capture committed SQLite WAL state via the online backup API, and strip stale outbound deliveries so a restore cannot replay them."
+    "OpenClaw Project qualification now authorizes the intended agents.list replacement and gives Owners a redacted gateway diagnostic when host policy still refuses it.",
+    "Comprehensive backups can fence a uniquely attested loopback Docker PostgreSQL database through its internal peer socket and restore access after capture or failure.",
+    "Standard backups snapshot live Codex goal and memory SQLite databases, run in the background with phase progress, and distinguish comprehensive capture downtime.",
+    "The managed BridgesLLM skill refreshes on Portal startup and teaches agents to return verified clickable workspace, Project, and Portal Files links."
   ]
 }

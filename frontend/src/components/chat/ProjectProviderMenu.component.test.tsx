@@ -175,6 +175,12 @@ describe('ProjectProviderMenu', () => {
       retryable: false,
       recovery: 'HOST_MAINTENANCE' as const,
       retryAt: null,
+      operatorDiagnostic: {
+        source: 'OPENCLAW_GATEWAY' as const,
+        operation: 'config.patch' as const,
+        errorCode: 'INVALID_REQUEST',
+        errorMessage: 'config.patch rejected the agents.list replacement.',
+      },
     };
     const ownerView = renderMenu({
       providers: [brokenOpenClaw],
@@ -188,6 +194,7 @@ describe('ProjectProviderMenu', () => {
     await user.click(screen.getByRole('menuitem', { name: 'Review OpenClaw' }));
 
     expect(screen.getByText(failure.message)).toBeVisible();
+    expect(screen.getByText(/config\.patch rejected the agents\.list replacement/)).toBeVisible();
     expect(screen.queryByRole('button', { name: 'Qualify OpenClaw for this project' })).not.toBeInTheDocument();
     expect(screen.getByRole('menuitem', { name: 'Open Dashboard for signed update' })).toHaveAttribute(
       'href',
@@ -216,6 +223,7 @@ describe('ProjectProviderMenu', () => {
     });
     await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
     await user.click(screen.getByRole('menuitem', { name: 'Review OpenClaw' }));
+    expect(screen.getByText(/config\.patch rejected the agents\.list replacement/)).toBeVisible();
     expect(screen.getByRole('menuitem', {
       name: 'Open Agent Chat to repair host',
     })).toHaveAttribute('href', '/agent-chats');
@@ -234,6 +242,7 @@ describe('ProjectProviderMenu', () => {
     });
     await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
     await user.click(screen.getByRole('menuitem', { name: 'Review OpenClaw' }));
+    expect(screen.queryByText(/config\.patch rejected the agents\.list replacement/)).not.toBeInTheDocument();
     expect(screen.queryByRole('menuitem', { name: 'Open Dashboard for signed update' })).not.toBeInTheDocument();
     expect(screen.getByText(/Contact an Owner or Sub Admin/)).toBeVisible();
     expect(screen.getByRole('menuitem', {

@@ -240,6 +240,9 @@ router.post('/create', async (req: Request, res: Response) => {
       message: status?.status === 'failed'
         ? 'The backup service failed during startup'
         : 'Backup request accepted by the system service',
+      error: status?.status === 'failed'
+        ? (status.failureDetail || status.error || 'The backup service failed during startup')
+        : undefined,
     });
   } catch (error: any) {
     if (error?.code === 'EBUSY') {

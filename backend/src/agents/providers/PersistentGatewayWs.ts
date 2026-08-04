@@ -2139,7 +2139,14 @@ function connect(): void {
         if (msg.ok) {
           pending.resolve(msg.payload || msg.result);
         } else {
-          pending.reject(new Error(msg.error?.message || 'RPC failed'));
+          const errorMessage = msg.error?.message || 'RPC failed';
+          const rpcError = new Error(errorMessage) as Error & {
+            errorCode?: string;
+            errorMessage?: string;
+          };
+          if (typeof msg.error?.code === 'string') rpcError.errorCode = msg.error.code;
+          rpcError.errorMessage = errorMessage;
+          pending.reject(rpcError);
         }
       }
       return;

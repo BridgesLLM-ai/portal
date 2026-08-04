@@ -33,6 +33,17 @@ The public origin terminates HTTPS through Caddy. The Portal backend normally li
 - **Settings / Admin / Maintenance / Backups**: configuration and host operations with server-side role and safety gates.
 - **Remote Desktop**: authenticated same-origin noVNC plus the visible Shared Browser.
 
+## Make chat file references clickable
+
+When a user should be able to open a file, return a real Markdown link rather
+than a bare filename, relative path, or path in backticks. For a file in the
+current Agent workspace or Project, use the verified absolute path reported by
+the active file tool or workspace; never guess a host root or turn an unrelated
+host path into a link. For a Portal Files record, reuse its actual persisted
+`/api/files/<encoded-file-id>` reference instead of its storage path. These are
+different trust boundaries. Load references/files-and-projects.md for the exact
+forms, examples, role limits, and fail-closed behavior.
+
 ## Role model
 
 - **OWNER**: full product and host control; owner-only account, updater, backup, and high-risk settings operations.

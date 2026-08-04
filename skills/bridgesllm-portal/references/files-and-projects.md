@@ -24,6 +24,47 @@ The server currently advertises up to 2 GiB through upload-config, but trust the
 
 Use file IDs and Portal content/download routes. Do not guess /var paths, construct another user's directory, or hand a host path to an agent.
 
+## Clickable file links in chat
+
+A bare filename or path is only text. When the user should be able to open a
+file from Agent Chat or Project Chat, put the target in a standard Markdown
+link, outside code spans and fences: `[label](destination)`.
+
+For a file in the current Agent workspace:
+
+- Verify that it is an existing regular file and use the absolute path reported
+  by the current file tool or workspace. Do not derive a root from an agent
+  name or assume that every installation uses the default workspace path.
+- If the verified path is
+  `/root/.openclaw/workspace-main/audit/HANDOFF-project-chat-and-backups.md`,
+  return `[Open the handoff](/root/.openclaw/workspace-main/audit/HANDOFF-project-chat-and-backups.md)`.
+  A bare `audit/HANDOFF-project-chat-and-backups.md` is not a clickable handoff.
+- Percent-encode spaces in the Markdown destination as `%20`. An optional
+  existing-file location suffix such as `#L42C7` or `:42:7` is supported.
+
+For a file created inside Project Chat, use the provider-visible absolute
+Project path after verifying the file exists in that Project. For example:
+`[Open the Project handoff](/workspace/project/audit/HANDOFF-project-chat-and-backups.md)`.
+Do not expose or invent the Project's host storage path.
+
+Portal binds these links to the exact Agent or Project carried by the chat. On
+an ordinary same-tab click by an OWNER or SUB_ADMIN, Portal copies the regular
+file into a private, expiring, read-only Remote Desktop snapshot and opens the
+appropriate viewer. It refuses directories, symlinks, traversal, oversized
+files, changed authority, and paths outside that exact workspace or Project.
+Do not promise this Remote Desktop handoff to USER or VIEWER roles, and do not
+try to make a rejected path work by widening or disguising it.
+
+Portal Files records use a different link form. Reuse the exact `portal_url`
+already returned in attachment metadata or construct it only from an actual
+Portal File record ID. For example, if the metadata says
+`portal_url: /api/files/abc123`, return
+`[Open uploaded report](/api/files/abc123)`. That click opens the actor-owned
+Files record; it is not a workspace snapshot. Never substitute a signed
+`tool_url`, a `/var/portal-files` storage path, an OpenClaw media-mirror path,
+or an invented ID. If the record is not known, resolve it through the Files API
+first or state that no safe clickable Files reference is available.
+
 ## Projects
 
 Projects are actor-scoped working trees with server-owned immutable identities.

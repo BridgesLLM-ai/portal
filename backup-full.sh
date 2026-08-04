@@ -419,6 +419,11 @@ RUN_ID=""
 RUN_TYPE=""
 RUN_STARTED_AT=""
 RUN_ARCHIVE_PATH=""
+RUN_PHASE=""
+RUN_PHASE_LABEL=""
+RUN_PHASE_INDEX=""
+RUN_PHASE_TOTAL=""
+RUN_ERROR_DETAIL=""
 STAGING_DIR=""
 PARTIAL_ARCHIVE=""
 RECOVERY_COMPONENTS_FILE=""
@@ -431,6 +436,8 @@ BACKUP_STALWART_CONTAINER_WAS_RUNNING=false
 BACKUP_RUNNING_PROJECT_CONTAINERS_FILE=""
 QUIESCENCE_JOURNAL="${BACKUP_RECOVERY_STATE_DIR}/quiescence.json"
 BACKUP_DATABASE_TRANSACTIONS_ROOT="${BACKUP_RECOVERY_STATE_DIR}/database-transactions"
+BACKUP_CONTAINER_FENCE_HELPER="${PORTAL_DIR}/installer/backup-container-fence.py"
+BACKUP_DATABASE_FENCE_MODE=""
 BACKUP_LOCK_GUARD_PID=""
 BACKUP_LOCK_GUARD_STARTTIME=""
 BACKUP_FENCE_NAME="30-backup-quiescence-fence.conf"
@@ -459,9 +466,38 @@ log() {
   fi
 }
 
+sanitize_status_detail() {
+  python3 -c '
+import re
+import sys
+value = sys.stdin.read()
+value = re.sub(r"(?i)(postgres(?:ql)?://[^:@/\s]+:)[^@/\s]*(@)", r"\1***\2", value)
+value = re.sub(r"(?i)(password|sslpassword|passfile)=([^&\s]+)", r"\1=***", value)
+value = "".join(character if ord(character) >= 32 and ord(character) != 127 else " " for character in value)
+value = " ".join(value.split()) or "Backup failed without a diagnostic detail"
+encoded = value.encode("utf-8")
+print(encoded[:1000].decode("utf-8", errors="ignore"))
+'
+}
+
 die() {
-  log "ERROR: $*"
+  local detail="$*"
+  if $RUN_ACTIVE; then
+    RUN_ERROR_DETAIL="$(printf '%s' "${detail}" | sanitize_status_detail 2>/dev/null \
+      || printf '%s' 'Backup failed while sanitizing its diagnostic detail')"
+    detail="${RUN_ERROR_DETAIL}"
+  fi
+  log "ERROR: ${detail}"
   exit 1
+}
+
+capture_backup_error() {
+  local exit_code="$1"
+  local line_number="$2"
+  if $RUN_ACTIVE && [[ -z "${RUN_ERROR_DETAIL}" ]]; then
+    RUN_ERROR_DETAIL="Unexpected command failure during ${RUN_PHASE_LABEL:-backup processing} (exit ${exit_code}, line ${line_number})"
+  fi
+  return 0
 }
 
 fsync_regular_file() {
@@ -1215,6 +1251,10 @@ write_status() {
   STATUS_EXIT_CODE="$exit_code" \
   STATUS_ARCHIVE_PATH="$RUN_ARCHIVE_PATH" \
   STATUS_ERROR="$error_message" \
+  STATUS_PHASE="$RUN_PHASE" \
+  STATUS_PHASE_LABEL="$RUN_PHASE_LABEL" \
+  STATUS_PHASE_INDEX="$RUN_PHASE_INDEX" \
+  STATUS_PHASE_TOTAL="$RUN_PHASE_TOTAL" \
   python3 - "$STATUS_FILE" <<'PY'
 import json
 import os
@@ -1222,6 +1262,13 @@ import tempfile
 import sys
 
 target = sys.argv[1]
+
+def utf8_prefix(value, maximum):
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum:
+        return value
+    return encoded[:maximum].decode("utf-8", errors="ignore")
+
 payload = {
     "id": os.environ["STATUS_RUN_ID"],
     "type": os.environ["STATUS_RUN_TYPE"],
@@ -1236,7 +1283,16 @@ if os.environ.get("STATUS_EXIT_CODE"):
 if os.environ.get("STATUS_ARCHIVE_PATH"):
     payload["archivePath"] = os.environ["STATUS_ARCHIVE_PATH"]
 if os.environ.get("STATUS_ERROR"):
-    payload["error"] = os.environ["STATUS_ERROR"][:1000]
+    detail = utf8_prefix(os.environ["STATUS_ERROR"], 1000)
+    payload["error"] = detail
+    payload["failureDetail"] = detail
+if os.environ.get("STATUS_PHASE"):
+    payload["phase"] = os.environ["STATUS_PHASE"]
+if os.environ.get("STATUS_PHASE_LABEL"):
+    payload["phaseLabel"] = utf8_prefix(os.environ["STATUS_PHASE_LABEL"], 160)
+if os.environ.get("STATUS_PHASE_INDEX") and os.environ.get("STATUS_PHASE_TOTAL"):
+    payload["phaseIndex"] = int(os.environ["STATUS_PHASE_INDEX"])
+    payload["phaseTotal"] = int(os.environ["STATUS_PHASE_TOTAL"])
 
 directory = os.path.dirname(target)
 os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -1256,6 +1312,22 @@ finally:
     except FileNotFoundError:
         pass
 PY
+}
+
+set_backup_phase() {
+  local phase="$1"
+  local label="$2"
+  local index="$3"
+  [[ "${phase}" =~ ^[a-z0-9][a-z0-9-]{0,63}$ \
+    && -n "${label}" && "${#label}" -le 160 \
+    && "${index}" =~ ^[1-9][0-9]*$ \
+    && "${RUN_PHASE_TOTAL}" =~ ^[1-9][0-9]*$ \
+    && "${index}" -le "${RUN_PHASE_TOTAL}" ]] || return 1
+  RUN_PHASE="${phase}"
+  RUN_PHASE_LABEL="${label}"
+  RUN_PHASE_INDEX="${index}"
+  $RUN_ACTIVE && write_status running "" "" ""
+  return 0
 }
 
 sweep_stale_backup_artifacts() {
@@ -2404,10 +2476,35 @@ PY
 
 finish_run() {
   local exit_code="$?"
-  trap - EXIT HUP INT TERM
+  local failed_phase="${RUN_PHASE}"
+  local failed_phase_label="${RUN_PHASE_LABEL}"
+  local failed_phase_index="${RUN_PHASE_INDEX}"
+  local recovery_attempted=false
+  trap - EXIT HUP INT TERM ERR
+  if (( exit_code != 0 )) && [[ -z "${RUN_ERROR_DETAIL}" ]]; then
+    RUN_ERROR_DETAIL="Backup process exited unexpectedly with code ${exit_code} during ${RUN_PHASE_LABEL:-backup processing}"
+  fi
+  if $RUN_ACTIVE && [[ "${RUN_TYPE}" == "comprehensive" ]] \
+    && { $BACKUP_QUIESCE_ACTIVE \
+      || [[ -e "${QUIESCENCE_JOURNAL}" || -L "${QUIESCENCE_JOURNAL}" ]]; }; then
+    recovery_attempted=true
+    RUN_PHASE="restoring-services"
+    RUN_PHASE_LABEL="Restoring services"
+    RUN_PHASE_INDEX="${RUN_PHASE_TOTAL}"
+    write_status running "" "" ""
+  fi
   if ! restore_backup_quiescence; then
     log "ERROR: one or more services or managed Project containers did not return to their pre-backup running state"
+    if [[ -n "${RUN_ERROR_DETAIL}" ]]; then
+      RUN_ERROR_DETAIL="${RUN_ERROR_DETAIL}; service recovery also failed"
+    else
+      RUN_ERROR_DETAIL="One or more services, managed Project containers, or the database fence did not return to their pre-backup state"
+    fi
     exit_code=1
+  elif $recovery_attempted && (( exit_code != 0 )); then
+    RUN_PHASE="${failed_phase}"
+    RUN_PHASE_LABEL="${failed_phase_label}"
+    RUN_PHASE_INDEX="${failed_phase_index}"
   fi
   if [[ -n "$STAGING_DIR" && -d "$STAGING_DIR" ]]; then
     rm -rf -- "$STAGING_DIR"
@@ -2417,16 +2514,21 @@ finish_run() {
   fi
   if $RUN_ACTIVE; then
     if (( exit_code == 0 )); then
+      RUN_PHASE="completed"
+      RUN_PHASE_LABEL="Backup completed"
+      RUN_PHASE_INDEX="${RUN_PHASE_TOTAL}"
       write_status completed "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "0" ""
     else
-      write_status failed "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$exit_code" "Backup process exited with code ${exit_code}"
+      write_status failed "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$exit_code" \
+        "${RUN_ERROR_DETAIL:-Backup process exited with code ${exit_code}}"
     fi
   fi
   if ! release_backup_lock_guard; then
     exit_code=1
     if $RUN_ACTIVE; then
+      RUN_ERROR_DETAIL="Backup lock guard did not release cleanly"
       write_status failed "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$exit_code" \
-        "Backup lock guard did not release cleanly"
+        "${RUN_ERROR_DETAIL}"
     fi
   fi
   exit "$exit_code"
@@ -2789,11 +2891,20 @@ begin_run() {
   RUN_ID="${BACKUP_JOB_ID:-$(date -u '+%Y%m%dT%H%M%S')-$$}"
   [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || die "Invalid backup job id"
   RUN_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  if [[ "${RUN_TYPE}" == "comprehensive" ]]; then
+    RUN_PHASE_TOTAL=12
+  else
+    RUN_PHASE_TOTAL=8
+  fi
+  RUN_PHASE="preparing"
+  RUN_PHASE_LABEL="Preparing backup"
+  RUN_PHASE_INDEX=1
   : > "$OUTPUT_FILE"
   chmod 600 "$OUTPUT_FILE"
   RUN_ACTIVE=true
   write_status running "" "" ""
   trap finish_run EXIT
+  trap 'capture_backup_error "$?" "$LINENO"' ERR
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -2962,6 +3073,7 @@ if (
 allowed = {
     "database-authority.env",
     "database-exclusion.json",
+    "database-container.json",
     f".database-exclusion-{operation}",
 }
 entries = list(transaction.iterdir())
@@ -3023,6 +3135,39 @@ PY
 
 # Answers "can this host be fenced at all?" while every service is still
 # running, using a throwaway transaction so nothing is left behind either way.
+assert_backup_container_fence_helper() {
+  [[ -f "${BACKUP_CONTAINER_FENCE_HELPER}" \
+    && ! -L "${BACKUP_CONTAINER_FENCE_HELPER}" \
+    && "$(stat -c '%u:%g:%h' "${BACKUP_CONTAINER_FENCE_HELPER}" 2>/dev/null)" == "0:0:1" \
+    && $((8#$(stat -c '%a' "${BACKUP_CONTAINER_FENCE_HELPER}") & 0022)) -eq 0 ]]
+}
+
+run_backup_container_fence() {
+  local action="$1"
+  local authority="$2"
+  shift 2
+  assert_backup_container_fence_helper || return 1
+  /usr/bin/python3 "${BACKUP_CONTAINER_FENCE_HELPER}" \
+    --docker "${BACKUP_DOCKER_BIN}" "${action}" \
+    --authority "${authority}" "$@"
+}
+
+discover_backup_container_database() {
+  local operation="$1"
+  local authority_env="$2"
+  local target="${BACKUP_DATABASE_TRANSACTIONS_ROOT}/${operation}/database-container.json"
+  local database_url
+  assert_backup_container_fence_helper || return 1
+  database_url="$(read_env_value "${authority_env}" DATABASE_URL)" || return 1
+  /usr/bin/python3 "${BACKUP_CONTAINER_FENCE_HELPER}" \
+    --docker "${BACKUP_DOCKER_BIN}" discover \
+    --database-url-fd 3 \
+    --operation "${operation}" \
+    --output "${target}" \
+    --expected-major "${BACKUP_POSTGRESQL_CLIENT_MAJOR}" \
+    3< <(printf '%s' "${database_url}")
+}
+
 assert_backup_database_exclusion_admission() {
   [[ "${RUN_TYPE}" == "comprehensive" ]] || return 0
   local authority operation probe_status=0 cleanup_status=0
@@ -3035,7 +3180,32 @@ assert_backup_database_exclusion_admission() {
   # Clear it whether the probe passed or failed; a refusal must not leave
   # state behind that a later run would trip over.
   cleanup_backup_database_transaction "${operation}" || cleanup_status=$?
-  (( probe_status == 0 && cleanup_status == 0 ))
+  if (( probe_status == 0 && cleanup_status == 0 )); then
+    BACKUP_DATABASE_FENCE_MODE="local-peer"
+    return 0
+  fi
+  (( cleanup_status == 0 )) || return 1
+
+  # A loopback-published Docker PostgreSQL instance has no usable host peer
+  # socket. Bind its immutable container ID, persistent PGDATA mount, internal
+  # peer socket, database identity, and original role/database state before
+  # any Portal service is stopped.
+  probe_status=0
+  cleanup_status=0
+  prepare_backup_database_transaction "${operation}" || return 1
+  discover_backup_container_database "${operation}" "${authority}" \
+    || probe_status=$?
+  if (( probe_status == 0 )); then
+    run_backup_container_fence probe \
+      "${BACKUP_DATABASE_TRANSACTIONS_ROOT}/${operation}/database-container.json" \
+      || probe_status=$?
+  fi
+  cleanup_backup_database_transaction "${operation}" || cleanup_status=$?
+  if (( probe_status == 0 && cleanup_status == 0 )); then
+    BACKUP_DATABASE_FENCE_MODE="docker-peer"
+    return 0
+  fi
+  return 1
 }
 
 acquire_backup_database_exclusion() {
@@ -3043,6 +3213,14 @@ acquire_backup_database_exclusion() {
   local authority
   authority="$(backup_database_authority_environment)" || return 1
   prepare_backup_database_transaction "${RUN_ID}" || return 1
+  if [[ "${BACKUP_DATABASE_FENCE_MODE}" == "docker-peer" ]]; then
+    discover_backup_container_database "${RUN_ID}" "${authority}" \
+      || return 1
+    run_backup_container_fence acquire \
+      "${BACKUP_DATABASE_TRANSACTIONS_ROOT}/${RUN_ID}/database-container.json"
+    return
+  fi
+  [[ "${BACKUP_DATABASE_FENCE_MODE}" == "local-peer" ]] || return 1
   run_backup_database_guard_action acquire "${RUN_ID}" "${authority}" \
     || return 1
   run_backup_database_guard_action assert "${RUN_ID}" "${authority}"
@@ -3050,18 +3228,36 @@ acquire_backup_database_exclusion() {
 
 assert_backup_database_exclusion() {
   [[ "${RUN_TYPE}" == "comprehensive" ]] || return 0
+  local container_authority="${BACKUP_DATABASE_TRANSACTIONS_ROOT}/${RUN_ID}/database-container.json"
+  if [[ -e "${container_authority}" || -L "${container_authority}" ]]; then
+    [[ -f "${container_authority}" && ! -L "${container_authority}" ]] \
+      || return 1
+    run_backup_container_fence assert "${container_authority}"
+    return
+  fi
   local authority
   authority="$(backup_database_authority_environment)" || return 1
   run_backup_database_guard_action assert "${RUN_ID}" "${authority}"
 }
 
 run_backup_guard_peer_psql() {
+  local container_authority="${BACKUP_DATABASE_TRANSACTIONS_ROOT}/${RUN_ID}/database-container.json"
+  if [[ -f "${container_authority}" && ! -L "${container_authority}" ]]; then
+    run_backup_container_fence psql "${container_authority}" \
+      --target target "$@"
+    return
+  fi
   local authority="${BACKUP_DATABASE_TRANSACTIONS_ROOT}/${RUN_ID}/database-authority.env"
   run_backup_database_guard_action \
     peer-psql "${RUN_ID}" "${authority}" "$@"
 }
 
 backup_guard_peer_role_sql() {
+  local container_authority="${BACKUP_DATABASE_TRANSACTIONS_ROOT}/${RUN_ID}/database-container.json"
+  if [[ -f "${container_authority}" && ! -L "${container_authority}" ]]; then
+    run_backup_container_fence role-sql "${container_authority}"
+    return
+  fi
   local authority="${BACKUP_DATABASE_TRANSACTIONS_ROOT}/${RUN_ID}/database-authority.env"
   run_backup_database_guard_action \
     peer-role-sql "${RUN_ID}" "${authority}"
@@ -3070,6 +3266,12 @@ backup_guard_peer_role_sql() {
 run_backup_guard_peer_pg_dump() {
   local snapshot="$1"
   [[ "${snapshot}" =~ ^[A-Za-z0-9._:-]{1,256}$ ]] || return 1
+  local container_authority="${BACKUP_DATABASE_TRANSACTIONS_ROOT}/${RUN_ID}/database-container.json"
+  if [[ -f "${container_authority}" && ! -L "${container_authority}" ]]; then
+    run_backup_container_fence pg-dump "${container_authority}" \
+      --snapshot "${snapshot}"
+    return
+  fi
   local authority="${BACKUP_DATABASE_TRANSACTIONS_ROOT}/${RUN_ID}/database-authority.env"
   run_backup_database_guard_action \
     peer-pg-dump "${RUN_ID}" "${authority}" \
@@ -3096,6 +3298,14 @@ PY
   local transaction="${BACKUP_DATABASE_TRANSACTIONS_ROOT}/${operation_id}"
   [[ -e "${transaction}" || -L "${transaction}" ]] || return 0
   [[ -d "${transaction}" && ! -L "${transaction}" ]] || return 1
+  local container_authority="${transaction}/database-container.json"
+  if [[ -e "${container_authority}" || -L "${container_authority}" ]]; then
+    [[ -f "${container_authority}" && ! -L "${container_authority}" ]] \
+      || return 1
+    run_backup_container_fence release "${container_authority}" || return 1
+    cleanup_backup_database_transaction "${operation_id}"
+    return
+  fi
   run_backup_database_guard_action \
     release "${operation_id}" "${PORTAL_ENV_FILE}" || return 1
   cleanup_backup_database_transaction "${operation_id}"
@@ -3784,7 +3994,7 @@ raw_options = sys.argv[4:]
 patterns = []
 allow_external_hardlinks = False
 overlay_root_raw = None
-overlay_relative = None
+overlay_relatives = []
 for option in raw_options:
     if option == "--allow-external-hardlinks":
         allow_external_hardlinks = True
@@ -3795,9 +4005,9 @@ for option in raw_options:
         overlay_root_raw = option.removeprefix("--overlay-root=")
         continue
     if option.startswith("--overlay-relative="):
-        if overlay_relative is not None or len(option) <= len("--overlay-relative="):
-            raise SystemExit("duplicate or empty recovery archive overlay path")
-        overlay_relative = option.removeprefix("--overlay-relative=")
+        if len(option) <= len("--overlay-relative="):
+            raise SystemExit("empty recovery archive overlay path")
+        overlay_relatives.append(option.removeprefix("--overlay-relative="))
         continue
     if (
         not option.startswith("--exclude=")
@@ -3808,7 +4018,7 @@ for option in raw_options:
         raise SystemExit("unsupported recovery archive selection option")
     patterns.append(option.removeprefix("--exclude="))
 
-if (overlay_root_raw is None) != (overlay_relative is None):
+if (overlay_root_raw is None) != (not overlay_relatives):
     raise SystemExit("recovery archive overlay is incomplete")
 
 if (
@@ -3878,24 +4088,17 @@ def excluded(relative):
     return False
 
 overlay_root = None
-overlay_path = None
+overlay_paths = []
 overlay_root_info = None
 if overlay_root_raw is not None:
     overlay_root = pathlib.Path(overlay_root_raw)
-    relative_path = pathlib.PurePosixPath(overlay_relative)
-    relative_parts = relative_path.parts
     if (
         not overlay_root.is_absolute()
         or os.path.normpath(overlay_root) != str(overlay_root)
         or os.path.realpath(overlay_root) != str(overlay_root)
         or overlay_root.name != source.name
-        or not relative_parts
-        or relative_path.is_absolute()
-        or str(relative_path) != overlay_relative
-        or any(part in {"", ".", ".."} for part in relative_parts)
-        or "\\" in overlay_relative
-        or valid_text(overlay_relative, 4096) is None
-        or not excluded(overlay_relative)
+        or len(overlay_relatives) != len(set(overlay_relatives))
+        or len(overlay_relatives) > 4096
     ):
         raise SystemExit("recovery archive overlay authority is invalid")
     overlay_root_info = os.lstat(overlay_root)
@@ -3907,20 +4110,33 @@ if overlay_root_raw is not None:
         or overlay_root_info.st_mode & 0o022
     ):
         raise SystemExit("recovery archive overlay root is not trusted")
-    current = overlay_root
-    for part in relative_parts[:-1]:
-        current = current / part
-        info = os.lstat(current)
+    for overlay_relative in overlay_relatives:
+        relative_path = pathlib.PurePosixPath(overlay_relative)
+        relative_parts = relative_path.parts
         if (
-            not stat.S_ISDIR(info.st_mode)
-            or stat.S_ISLNK(info.st_mode)
-            or info.st_dev != overlay_root_info.st_dev
-            or info.st_uid != 0
-            or info.st_gid != 0
-            or info.st_mode & 0o022
+            not relative_parts
+            or relative_path.is_absolute()
+            or str(relative_path) != overlay_relative
+            or any(part in {"", ".", ".."} for part in relative_parts)
+            or "\\" in overlay_relative
+            or valid_text(overlay_relative, 4096) is None
+            or not excluded(overlay_relative)
         ):
-            raise SystemExit("recovery archive overlay path is not trusted")
-    overlay_path = current / relative_parts[-1]
+            raise SystemExit("recovery archive overlay authority is invalid")
+        current = overlay_root
+        for part in relative_parts[:-1]:
+            current = current / part
+            info = os.lstat(current)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_dev != overlay_root_info.st_dev
+                or info.st_uid != 0
+                or info.st_gid != 0
+                or info.st_mode & 0o022
+            ):
+                raise SystemExit("recovery archive overlay path is not trusted")
+        overlay_paths.append((current / relative_parts[-1], overlay_relative))
 
 FS_IOC_GETFLAGS = (
     (2 << 30)
@@ -4140,7 +4356,7 @@ def inspect_entry(path, relative, *, apply_exclusions=True, expected_device=None
             )
 
 inspect_entry(source, "")
-if overlay_path is not None:
+for overlay_path, overlay_relative in overlay_paths:
     overlay_info = os.lstat(overlay_path)
     if (
         not stat.S_ISREG(overlay_info.st_mode)
@@ -4381,20 +4597,25 @@ PY
 materialize_archive_list_without_overlay() {
   local full_list="$1"
   local source_list="$2"
-  local expected_overlay_member="$3"
-  python3 - "$full_list" "$source_list" "$expected_overlay_member" <<'PY'
+  shift 2
+  python3 - "$full_list" "$source_list" "$@" <<'PY'
 import os
 import pathlib
 import sys
 
 full_path = pathlib.Path(sys.argv[1])
 source_path = pathlib.Path(sys.argv[2])
-expected = sys.argv[3].encode("utf-8")
+expected = [value.encode("utf-8") for value in sys.argv[3:]]
 raw = full_path.read_bytes()
 if not raw or not raw.endswith(b"\0"):
     raise SystemExit(1)
 members = raw[:-1].split(b"\0")
-if len(members) < 2 or members[-1] != expected or len(members) != len(set(members)):
+if (
+    not expected
+    or len(members) <= len(expected)
+    or members[-len(expected):] != expected
+    or len(members) != len(set(members))
+):
     raise SystemExit(1)
 descriptor = os.open(
     source_path,
@@ -4402,7 +4623,7 @@ descriptor = os.open(
     0o600,
 )
 try:
-    payload = b"\0".join(members[:-1]) + b"\0"
+    payload = b"\0".join(members[:-len(expected)]) + b"\0"
     if os.write(descriptor, payload) != len(payload):
         raise SystemExit(1)
     os.fsync(descriptor)
@@ -4427,16 +4648,20 @@ archive_dir() {
   # are consumed by the source inventory only; tar itself is driven from the
   # generated file list, so this flag never reaches it.
   local -a hardlink_options=(--check-links)
-  local option overlay_root="" overlay_relative=""
+  local option overlay_root=""
+  local -a overlay_relatives=() overlay_members=()
   for option in "$@"; do
     case "${option}" in
       --allow-external-hardlinks) hardlink_options=() ;;
       --overlay-root=*) overlay_root="${option#--overlay-root=}" ;;
-      --overlay-relative=*) overlay_relative="${option#--overlay-relative=}" ;;
+      --overlay-relative=*) overlay_relatives+=("${option#--overlay-relative=}") ;;
     esac
   done
-  [[ -z "${overlay_root}" && -z "${overlay_relative}" \
-    || ( -n "${overlay_root}" && -n "${overlay_relative}" ) ]] || return 1
+  [[ -z "${overlay_root}" && "${#overlay_relatives[@]}" -eq 0 \
+    || ( -n "${overlay_root}" && "${#overlay_relatives[@]}" -gt 0 ) ]] || return 1
+  for option in "${overlay_relatives[@]}"; do
+    overlay_members+=("$(basename "$source_dir")/${option}")
+  done
   [[ "$source_dir" == /* && -d "$source_dir" && ! -L "$source_dir" ]] || return 1
   [[ ! -e "$target" && ! -L "$target" \
     && ! -e "$diagnostics" && ! -L "$diagnostics" \
@@ -4453,8 +4678,7 @@ archive_dir() {
   local archive_list="$before_list"
   if [[ -n "${overlay_root}" ]]; then
     if ! materialize_archive_list_without_overlay \
-        "$before_list" "$source_only_list" \
-        "$(basename "$source_dir")/${overlay_relative}"; then
+        "$before_list" "$source_only_list" "${overlay_members[@]}"; then
       rm -f -- "$before_list" "$before_digest" "$source_only_list"
       return 1
     fi
@@ -4467,8 +4691,7 @@ archive_dir() {
         --pax-option=delete=atime,delete=ctime \
         --atime-preserve=system --no-recursion --null --verbatim-files-from \
         -czf "$target" -C "$(dirname "$source_dir")" -T "$archive_list" \
-        -C "$(dirname "$overlay_root")" \
-        "$(basename "$source_dir")/${overlay_relative}" \
+        -C "$(dirname "$overlay_root")" "${overlay_members[@]}" \
         2>"${diagnostics}" || tar_status=$?
   else
     tar --format=pax --sparse --one-file-system "${hardlink_options[@]}" \
@@ -4503,7 +4726,7 @@ archive_dir() {
       --xattrs-include='*' --selinux \
       --atime-preserve=system --no-recursion \
       -zf "$target" -C "$(dirname "$overlay_root")" \
-      "$(basename "$source_dir")/${overlay_relative}" \
+      "${overlay_members[@]}" \
       >>"$diagnostics" 2>&1; then
     rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest" \
       "$source_only_list"
@@ -4826,6 +5049,77 @@ finally:
 PY
 }
 
+materialize_openclaw_codex_database_list() {
+  local source_dir="$1"
+  local target="$2"
+  python3 - "${source_dir}" "${target}" <<'PY'
+import os
+import pathlib
+import re
+import stat
+import sys
+
+source = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+if (
+    not source.is_absolute()
+    or os.path.normpath(source) != str(source)
+    or os.path.realpath(source) != str(source)
+    or not target.is_absolute()
+    or os.path.normpath(target) != str(target)
+    or os.path.lexists(target)
+):
+    raise SystemExit(1)
+pattern = re.compile(r"^(goals|memories)_[0-9]+\.sqlite(?:(-wal|-shm|-journal))?$")
+bases = set()
+sidecar_bases = set()
+for current_raw, directory_names, file_names in os.walk(source, followlinks=False):
+    current = pathlib.Path(current_raw)
+    # These trees are either globally excluded or cannot contain another
+    # Codex home. Pruning keeps discovery bounded on large plugin catalogues.
+    directory_names[:] = [
+        name for name in directory_names
+        if name not in {".tmp", "tmp", "cache", "sessions", "shell_snapshots", "node_modules", ".git"}
+    ]
+    if current.name != "codex-home" or current.parent.name != "agent":
+        continue
+    info = os.lstat(current)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_mode & 0o022
+    ):
+        raise SystemExit(1)
+    for name in file_names:
+        match = pattern.fullmatch(name)
+        if match is None:
+            continue
+        relative = (current / name).relative_to(source).as_posix()
+        base = relative.removesuffix(match.group(2) or "")
+        if match.group(2):
+            sidecar_bases.add(base)
+        else:
+            bases.add(base)
+if not sidecar_bases.issubset(bases) or len(bases) > 4096:
+    raise SystemExit(1)
+descriptor = os.open(
+    target,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+    0o600,
+)
+try:
+    payload = b"".join(value.encode("utf-8") + b"\0" for value in sorted(bases))
+    if payload and os.write(descriptor, payload) != len(payload):
+        raise SystemExit(1)
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+}
+
 archive_openclaw_state_component() {
   local component_id="$1"
   local source_dir="$2"
@@ -4838,12 +5132,15 @@ archive_openclaw_state_component() {
   local source_database="${source_dir}/state/openclaw.sqlite"
   while true; do
     local snapshot_parent overlay_root snapshot_database
+    local database_list_before database_list_after relative_database
     snapshot_parent="$(mktemp -d "${STAGING_DIR}/.openclaw-snapshot-XXXXXX")" \
       || die "OpenClaw SQLite snapshot staging could not be allocated"
     chmod 700 "${snapshot_parent}"
     overlay_root="${snapshot_parent}/$(basename "${source_dir}")"
     snapshot_database="${overlay_root}/state/openclaw.sqlite"
     mkdir -p -m 700 "$(dirname "${snapshot_database}")"
+    database_list_before="${snapshot_parent}/codex-databases.before"
+    database_list_after="${snapshot_parent}/codex-databases.after"
     local snapshot_present=false attempt_ok=false
     local -a overlay_options=()
     if [[ -e "${source_database}" || -L "${source_database}" ]]; then
@@ -4861,18 +5158,47 @@ archive_openclaw_state_component() {
       snapshot_present=false
     fi
 
-    if $snapshot_present || [[ ! -e "${source_database}" && ! -L "${source_database}" ]]; then
+    local codex_snapshots_ok=true
+    local -a codex_databases=()
+    if ! materialize_openclaw_codex_database_list \
+        "${source_dir}" "${database_list_before}"; then
+      codex_snapshots_ok=false
+    elif [[ -s "${database_list_before}" ]]; then
+      mapfile -d '' -t codex_databases < "${database_list_before}"
+    fi
+    if $codex_snapshots_ok; then
+      for relative_database in "${codex_databases[@]}"; do
+        mkdir -p -m 700 "$(dirname "${overlay_root}/${relative_database}")"
+        if ! snapshot_sqlite_database \
+            "${source_dir}/${relative_database}" \
+            "${overlay_root}/${relative_database}"; then
+          codex_snapshots_ok=false
+          break
+        fi
+        [[ -n "${overlay_options[*]:-}" ]] \
+          || overlay_options=("--overlay-root=${overlay_root}")
+        overlay_options+=("--overlay-relative=${relative_database}")
+      done
+    fi
+
+    if $codex_snapshots_ok \
+      && { $snapshot_present || [[ ! -e "${source_database}" && ! -L "${source_database}" ]]; }; then
       if archive_dir "$source_dir" "$target" \
           --exclude='state/openclaw.sqlite' \
           --exclude='state/openclaw.sqlite-wal' \
           --exclude='state/openclaw.sqlite-shm' \
           --exclude='state/openclaw.sqlite-journal' \
+          --exclude='*/agent/codex-home/goals_*.sqlite*' \
+          --exclude='*/agent/codex-home/memories_*.sqlite*' \
           "$@" "${overlay_options[@]}"; then
-        if $snapshot_present \
+        if materialize_openclaw_codex_database_list \
+            "${source_dir}" "${database_list_after}" \
+          && cmp -s -- "${database_list_before}" "${database_list_after}" \
+          && { $snapshot_present \
           || [[ ! -e "${source_database}" && ! -L "${source_database}" \
             && ! -e "${source_database}-wal" && ! -L "${source_database}-wal" \
             && ! -e "${source_database}-shm" && ! -L "${source_database}-shm" \
-            && ! -e "${source_database}-journal" && ! -L "${source_database}-journal" ]]; then
+            && ! -e "${source_database}-journal" && ! -L "${source_database}-journal" ]]; }; then
           attempt_ok=true
         else
           rm -f -- "$target"
@@ -6261,22 +6587,35 @@ create_backup() {
   log "Starting ${type} backup"
   log "Portal root: ${PORTAL_DIR}"
   if [[ "$type" == "comprehensive" ]]; then
+    set_backup_phase database-fence-admission "Checking database fence" 2 \
+      || die "Backup progress state could not be updated"
     # Nothing is stopped until the fence has been proven possible on this
     # host. A comprehensive backup that cannot fence the database cannot
     # succeed, and stopping the portal to discover that costs real downtime
     # for an archive that was never going to exist.
     assert_backup_database_exclusion_admission \
-      || die "A comprehensive backup must fence the Portal database through a local PostgreSQL peer socket, and that connection could not be opened on this host - most often because the database is reached over TCP, such as a container or a remote server. No services were stopped. Daily, weekly, and monthly backups do not use this fence and still run."
+      || die "A comprehensive backup could not establish a trusted local PostgreSQL fence through either the host peer socket or a uniquely matched loopback Docker container. No services were stopped. Verify the database endpoint, container health, persistent PGDATA mount, and internal PostgreSQL peer socket."
     assert_backup_lock_guard \
       || die "Backup lock guard was lost before source quiescence"
+    set_backup_phase quiescing-services "Quiescing Portal services" 3 \
+      || die "Backup progress state could not be updated"
     quiesce_comprehensive_backup_sources \
       || die "Comprehensive backup sources could not be quiesced safely"
     assert_backup_disk_admission \
       || die "Backup disk admission changed after sources were quiesced"
+    set_backup_phase fencing-database "Fencing database connections" 4 \
+      || die "Backup progress state could not be updated"
     acquire_backup_database_exclusion \
       || die "Portal database could not be fenced exclusively for comprehensive capture"
   fi
 
+  if [[ "$type" == "comprehensive" ]]; then
+    set_backup_phase database-snapshot "Capturing database snapshot" 5 \
+      || die "Backup progress state could not be updated"
+  else
+    set_backup_phase database-snapshot "Capturing database snapshot" 2 \
+      || die "Backup progress state could not be updated"
+  fi
   log "Dumping Portal database"
   local database_logical_bytes="" database_relation_count=""
   local database_contract_variant="" database_metadata=""
@@ -6311,6 +6650,13 @@ create_backup() {
     "" "${database_logical_bytes}" "${database_relation_count}" \
     "${database_contract_variant}"
 
+  if [[ "$type" == "comprehensive" ]]; then
+    set_backup_phase portal-data "Archiving Portal data" 6 \
+      || die "Backup progress state could not be updated"
+  else
+    set_backup_phase portal-data "Archiving Portal data" 3 \
+      || die "Backup progress state could not be updated"
+  fi
   log "Archiving app/runtime data"
   archive_required_component \
     portal-app-sources "${PORTAL_APP_SOURCES_DIR}" \
@@ -6378,6 +6724,13 @@ create_backup() {
   archive_required_component \
     portal-install "$PORTAL_DIR" "${staging}/portal-install.tar.gz" "${portal_excludes[@]}"
 
+  if [[ "$type" == "comprehensive" ]]; then
+    set_backup_phase mail-data "Archiving mail data" 7 \
+      || die "Backup progress state could not be updated"
+  else
+    set_backup_phase mail-data "Archiving mail data" 4 \
+      || die "Backup progress state could not be updated"
+  fi
   log "Archiving mail data and configuration"
   local stalwart_policy="${STALWART_BACKUP_POLICY:-auto}"
   local stalwart_configured=false
@@ -6439,6 +6792,13 @@ create_backup() {
       "No Stalwart credentials, service unit, install root, or data root were found"
   fi
 
+  if [[ "$type" == "comprehensive" ]]; then
+    set_backup_phase openclaw-state "Archiving OpenClaw state" 8 \
+      || die "Backup progress state could not be updated"
+  else
+    set_backup_phase openclaw-state "Archiving OpenClaw state" 5 \
+      || die "Backup progress state could not be updated"
+  fi
   log "Archiving OpenClaw state"
   local openclaw_policy="${OPENCLAW_BACKUP_POLICY:-auto}"
   local openclaw_configured=false
@@ -6483,8 +6843,10 @@ create_backup() {
     #   *.sqlite[-wal]  Codex state and log databases plus their WAL sidecars
     #
     # Configuration, installation identity, skills, plugins and the memory and
-    # goal databases stay in the archive: they are small, they are what a
-    # restore actually needs, and they are not written on a per-command basis.
+    # goal databases stay in the archive: they are recovery-critical. Current
+    # Codex runtimes do write the goal/memory SQLite WALs during normal work,
+    # so those databases are captured with SQLite's online backup API and
+    # overlaid exactly like the primary OpenClaw state database below.
     # The live state/openclaw.sqlite database is different: copying its main
     # file while SQLite is writing a WAL can produce a torn or incomplete
     # restore even if tar's metadata inventory happens to remain stable. Take
@@ -6515,6 +6877,13 @@ create_backup() {
       "No OpenClaw state root or gateway service unit was found"
   fi
 
+  if [[ "$type" == "comprehensive" ]]; then
+    set_backup_phase recovery-metadata "Capturing recovery metadata" 9 \
+      || die "Backup progress state could not be updated"
+  else
+    set_backup_phase recovery-metadata "Capturing recovery metadata" 6 \
+      || die "Backup progress state could not be updated"
+  fi
   mkdir -p "${staging}/configs" "${staging}/systemd"
   [[ "${BACKUP_AUTHORITY_ENV_FILE}" \
       == "${staging}/configs/portal-backend.env.production" \
@@ -6583,6 +6952,13 @@ create_backup() {
     || die "Authenticated backup staging directory was not committed durably"
   verify_staging_manifest "$staging" || die "Backup manifest checksum generation failed"
 
+  if [[ "$type" == "comprehensive" ]]; then
+    set_backup_phase creating-archive "Creating backup archive" 10 \
+      || die "Backup progress state could not be updated"
+  else
+    set_backup_phase creating-archive "Creating backup archive" 7 \
+      || die "Backup progress state could not be updated"
+  fi
   log "Creating archive ${archive_path}"
   [[ ! -e "$PARTIAL_ARCHIVE" && ! -L "$PARTIAL_ARCHIVE" ]] || die "Refusing unsafe partial archive path"
   tar --format=gnu --sort=name --mtime='@0' \
@@ -6590,6 +6966,13 @@ create_backup() {
     --mode='u+rwX,go-rwx' \
     -czf "$PARTIAL_ARCHIVE" -C "$staging" .
   chmod 600 "$PARTIAL_ARCHIVE"
+  if [[ "$type" == "comprehensive" ]]; then
+    set_backup_phase verifying-archive "Verifying and publishing archive" 11 \
+      || die "Backup progress state could not be updated"
+  else
+    set_backup_phase verifying-archive "Verifying and publishing archive" 8 \
+      || die "Backup progress state could not be updated"
+  fi
   if ! verify_archive "$PARTIAL_ARCHIVE"; then
     die "Published archive would not satisfy the recovery manifest contract"
   fi

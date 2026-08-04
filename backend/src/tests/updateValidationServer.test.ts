@@ -184,6 +184,7 @@ describe('transient Portal update-validation server', () => {
       startAudioProxy: jest.fn(),
       attachPortalWebSocket: jest.fn(),
       attachAgentBrowserWebSocket: jest.fn(),
+      reconcilePortalManagedSkill: jest.fn(),
       reconcilePortalVisibleBrowserDefaults: jest.fn(),
       reconcileRemoteDesktopLauncherAssets: jest.fn(),
       provisionAgentZeroDesktopLauncherSecret: jest.fn(),
@@ -248,6 +249,7 @@ describe('transient Portal update-validation server', () => {
       attachAgentBrowserWebSocket: startup.attachAgentBrowserWebSocket,
     });
     mockDefaultRoute('../routes/remote-desktop', {
+      reconcilePortalManagedSkill: startup.reconcilePortalManagedSkill,
       reconcilePortalVisibleBrowserDefaults: startup.reconcilePortalVisibleBrowserDefaults,
       reconcileRemoteDesktopLauncherAssets: startup.reconcileRemoteDesktopLauncherAssets,
     });

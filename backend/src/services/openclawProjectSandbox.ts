@@ -107,6 +107,8 @@ interface GatewayRpcResponse {
   ok: boolean;
   data?: any;
   error?: any;
+  errorCode?: string;
+  errorMessage?: string;
 }
 
 export interface OpenClawProjectSandboxInput {
@@ -290,16 +292,48 @@ function syntheticEgressHandle(
 
 export class OpenClawProjectSandboxError extends Error {
   readonly code: string;
+  readonly gatewayErrorCode: string | null;
+  readonly gatewayErrorMessage: string | null;
 
-  constructor(code: string, message: string) {
+  constructor(
+    code: string,
+    message: string,
+    gatewayError: { errorCode?: unknown; errorMessage?: unknown } = {},
+  ) {
     super(message);
     this.name = 'OpenClawProjectSandboxError';
     this.code = code;
+    const rawErrorCode = typeof gatewayError.errorCode === 'string'
+      ? gatewayError.errorCode.trim()
+      : '';
+    this.gatewayErrorCode = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/.test(rawErrorCode)
+      ? rawErrorCode
+      : null;
+    const rawErrorMessage = typeof gatewayError.errorMessage === 'string'
+      ? gatewayError.errorMessage.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').trim()
+      : '';
+    this.gatewayErrorMessage = rawErrorMessage
+      ? Buffer.from(rawErrorMessage, 'utf8').subarray(0, 4_096).toString('utf8').trim()
+      : null;
   }
 }
 
 function fail(code: string, message: string): never {
   throw new OpenClawProjectSandboxError(code, message);
+}
+
+function failGateway(
+  code: string,
+  message: string,
+  response: GatewayRpcResponse,
+): never {
+  const nestedError = isRecord(response.error) ? response.error : null;
+  throw new OpenClawProjectSandboxError(code, message, {
+    errorCode: response.errorCode ?? nestedError?.code,
+    errorMessage: response.errorMessage
+      ?? nestedError?.message
+      ?? (typeof response.error === 'string' ? response.error : undefined),
+  });
 }
 
 // Recent fingerprint → serialized inputs, kept small; consulted only when a
@@ -886,7 +920,9 @@ async function readOpenClawConfig(
   rpc: OpenClawProjectSandboxDependencies['rpc'],
 ): Promise<OpenClawConfigSnapshot> {
   const response = await rpc('config.get', {}, CONFIG_RPC_TIMEOUT_MS);
-  if (!response.ok) fail('CONFIG_GET_FAILED', 'OpenClaw Project config could not be read');
+  if (!response.ok) {
+    failGateway('CONFIG_GET_FAILED', 'OpenClaw Project config could not be read', response);
+  }
   const config = response.data?.config ?? response.data?.parsed;
   const hash = String(response.data?.hash || '').trim();
   if (!isRecord(config) || !hash) {
@@ -953,8 +989,18 @@ async function ensureExactOpenClawAgentConfig(
         agents: { list: [...withMainAgentDefaultRouting(agents), plan.desiredAgent] },
       }),
       baseHash: snapshot.hash,
+      // Replacing the canonical Project agent intentionally removes stale deny
+      // entries from these two nested arrays. OpenClaw 2026.7.1 requires each
+      // exact destructive array path; naming the parent agents.list is not an
+      // authorization for nested entry-array removal.
+      replacePaths: [
+        'agents.list[].tools.deny',
+        'agents.list[].tools.sandbox.tools.deny',
+      ],
     }, CONFIG_RPC_TIMEOUT_MS);
-    if (!response.ok) fail('CONFIG_PATCH_FAILED', 'OpenClaw Project config could not be patched');
+    if (!response.ok) {
+      failGateway('CONFIG_PATCH_FAILED', 'OpenClaw Project config could not be patched', response);
+    }
     snapshot = await readOpenClawConfig(rpc);
     current = findAgent(snapshot.config, plan.agentId);
   }

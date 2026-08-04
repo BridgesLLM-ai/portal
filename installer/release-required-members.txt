@@ -149,6 +149,7 @@ portal/installer/agent-zero-project-model-bridge.sh
 portal/installer/agent-zero-project-sandbox.Dockerfile
 portal/installer/agent-zero-runtime.sh
 portal/installer/antigravity-runtime.sh
+portal/installer/backup-container-fence.py
 portal/installer/bridgesllm-codex-project-runtime-v1.apparmor
 portal/installer/bridgesllm-codex-project-runtime-v1.seccomp.json
 portal/installer/bridgesllm-project-runtime-v1.apparmor

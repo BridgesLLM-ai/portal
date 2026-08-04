@@ -485,6 +485,34 @@ function safeProjectQualificationError(
   const explicitRetryable = typeof payload?.retryable === 'boolean'
     ? payload.retryable
     : null;
+  const rawDiagnostic = payload?.operatorDiagnostic;
+  const diagnosticOperation = rawDiagnostic?.operation === 'config.get'
+    || rawDiagnostic?.operation === 'config.patch'
+    ? rawDiagnostic.operation
+    : null;
+  const diagnosticCode = typeof rawDiagnostic?.errorCode === 'string'
+    && /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/.test(rawDiagnostic.errorCode)
+    ? rawDiagnostic.errorCode
+    : null;
+  const diagnosticMessage = typeof rawDiagnostic?.errorMessage === 'string'
+    ? rawDiagnostic.errorMessage.trim()
+    : '';
+  const containsUnredactedCredential = /\b(?:authorization|cookie|password|passphrase|api[-_ ]?key|secret|(?:access|refresh|auth|gateway|device|session)[-_ ]?token|private[-_ ]?key|jwt)\b\s*[:=]\s*(?!\[redacted\])/i
+    .test(diagnosticMessage);
+  const operatorDiagnostic = runtimePolicyFailure
+    && rawDiagnostic?.source === 'OPENCLAW_GATEWAY'
+    && diagnosticOperation
+    && diagnosticMessage.length > 0
+    && diagnosticMessage.length <= 1_024
+    && !/[\u0000-\u001F\u007F]/.test(diagnosticMessage)
+    && !containsUnredactedCredential
+    ? {
+        source: 'OPENCLAW_GATEWAY' as const,
+        operation: diagnosticOperation,
+        errorCode: diagnosticCode,
+        errorMessage: diagnosticMessage,
+      }
+    : null;
   return {
     message: safePayload
       ? safeMessage(label)
@@ -502,6 +530,7 @@ function safeProjectQualificationError(
           || new Date(Date.now() + AUTOMATIC_QUALIFICATION_SUPPRESSION_TTL_MS).toISOString()
         )
       : null,
+    operatorDiagnostic,
   };
 }
 
@@ -6451,6 +6480,18 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           <div className="min-w-0 flex-1">
             <div className="font-medium text-red-300">No Project Chat provider is verified</div>
             <div className="mt-0.5 truncate">{unavailableProviderDetail}</div>
+            {hostRecoveryRole !== 'USER' && directQualificationFailure?.operatorDiagnostic && (
+              <div className="mt-1 whitespace-pre-wrap break-words text-amber-200">
+                OpenClaw gateway{' '}
+                <code>
+                  {directQualificationFailure.operatorDiagnostic.operation}
+                  {directQualificationFailure.operatorDiagnostic.errorCode
+                    ? ` ${directQualificationFailure.operatorDiagnostic.errorCode}`
+                    : ''}
+                </code>
+                {' — '}{directQualificationFailure.operatorDiagnostic.errorMessage}
+              </div>
+            )}
           </div>
           {directQualificationProvider && !directQualificationRetryBlocked && (
             <button

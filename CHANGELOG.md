@@ -2,6 +2,18 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.12] - 2026-08-04
+
+### Fixed
+- **OpenClaw Project qualification can apply its confined agent policy again.** Portal intentionally replaces the complete id-keyed `agents.list` array so a stale Project agent cannot retain extra tools or sandbox policy, but OpenClaw 2026.7.1 refuses a patch that can remove array entries unless the caller names that exact array in `replacePaths`. Portal now sends `replacePaths: ['agents.list']`, preserves the gateway's structured failure through both RPC transports, and shows Owners and Sub Admins a bounded, credential-redacted diagnostic when a different host policy fault still blocks qualification. Regular users continue to receive only the safe maintenance message.
+- **Comprehensive backups support the Portal's containerized PostgreSQL topology.** If the existing host peer-socket fence is unavailable, the runner now admits exactly one Docker container published on the configured literal loopback endpoint, binds its immutable container and image identity, persistent writable `PGDATA` mount, internal PostgreSQL peer socket, server identity, database owner, and original connection policy, then fences Portal connections without persisting a database password. The fence is recorded in the existing crash-recovery transaction, asserted through capture, and restores the exact role and database access policy on success, failure, interruption, or the next guarded run.
+- **OpenClaw state backups no longer race live Codex goal and memory databases.** Each discovered `goals_*.sqlite` and `memories_*.sqlite` database is captured through SQLite's online backup API, checked independently, and overlaid at its original recovery path while the mutable live database and WAL sidecars stay out of the tar stream. Discovery is compared before and after capture, so a changing database set still fails closed instead of silently omitting state.
+- **Manual backups no longer pin the Settings page or hide what the job will do.** The global Settings mutation claim ends as soon as systemd accepts the durable background job; local polling continues, automatically reattaches after navigation or refresh, and now renders the runner's real phase and phase count. Standard capture can run while the Owner uses the rest of Portal. Comprehensive capture still has to quiesce Portal and agent services for recovery consistency, so its selector now warns that Portal will be temporarily unavailable and live progress will reconnect after services return. A failed run shows the bounded sanitized reason recorded by the backup service instead of only an exit code.
+- **The managed BridgesLLM skill stays current and produces usable file links.** Every normal Portal backend start reconciles the signed skill bundle into the active OpenClaw workspace, independent of Remote Desktop setup and without a Gateway restart. The skill now tells agents to use verified absolute Agent-workspace paths, provider-visible absolute Project paths, or an actual Portal Files `portal_url` in standard Markdown, and to fail closed rather than guess a root, storage path, or file ID.
+
+### Security
+- **Container database fencing fails closed on authority drift.** The Docker command boundary, container identity, endpoint binding, image, storage mount, PostgreSQL major, system identifier, database and role OIDs, privilege profile, prepared transactions, active clients, and guard token are re-attested before privileged actions. Ambiguity, a recreated container, unsafe storage, changed policy, or an incomplete service recovery prevents publication.
+
 ## [4.0.11] - 2026-08-03
 
 ### Added

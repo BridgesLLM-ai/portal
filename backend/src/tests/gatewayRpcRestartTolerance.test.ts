@@ -1,10 +1,12 @@
 import { EventEmitter } from 'events';
 
-const socketScripts: Array<'refuse' | 'serve' | 'drop-after-dispatch'> = [];
+type SocketScript = 'refuse' | 'serve' | 'drop-after-dispatch' | 'reject';
+
+const socketScripts: SocketScript[] = [];
 const socketsOpened: string[] = [];
 
 class FakeGatewaySocket extends EventEmitter {
-  private readonly script: 'refuse' | 'serve' | 'drop-after-dispatch';
+  private readonly script: SocketScript;
 
   constructor(url: string) {
     super();
@@ -37,6 +39,18 @@ class FakeGatewaySocket extends EventEmitter {
     setImmediate(() => {
       if (this.script === 'drop-after-dispatch') {
         this.emit('close');
+        return;
+      }
+      if (this.script === 'reject') {
+        this.emit('message', Buffer.from(JSON.stringify({
+          type: 'res',
+          id: frame.id,
+          ok: false,
+          error: {
+            code: 'INVALID_REQUEST',
+            message: 'config.patch rejected agents.list',
+          },
+        })));
         return;
       }
       this.emit('message', Buffer.from(JSON.stringify({
@@ -101,6 +115,18 @@ describe('gateway RPC tolerance for a restarting gateway', () => {
     socketScripts.push('serve');
     const result = await gatewayRpcCall('sessions.list', { agentId: 'main' });
     expect(result.ok).toBe(true);
+    expect(socketsOpened).toHaveLength(1);
+  }, 20000);
+
+  test('retains the gateway errorCode and errorMessage from a rejected method', async () => {
+    socketScripts.push('reject');
+    const result = await gatewayRpcCall('config.patch', { raw: '{}', baseHash: 'hash' });
+    expect(result).toMatchObject({
+      ok: false,
+      error: 'config.patch rejected agents.list',
+      errorCode: 'INVALID_REQUEST',
+      errorMessage: 'config.patch rejected agents.list',
+    });
     expect(socketsOpened).toHaveLength(1);
   }, 20000);
 });

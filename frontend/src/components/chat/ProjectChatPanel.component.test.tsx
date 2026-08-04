@@ -1547,6 +1547,12 @@ describe('ProjectChatPanel rendered provider contract', () => {
           retryable: false,
           recovery: 'HOST_MAINTENANCE',
           recoveryUrl: 'https://attacker.invalid/repair',
+          operatorDiagnostic: {
+            source: 'OPENCLAW_GATEWAY',
+            operation: 'config.patch',
+            errorCode: 'INVALID_REQUEST',
+            errorMessage: 'config.patch would remove entries from array path(s): agents.list[].tools.deny',
+          },
         },
       },
     });
@@ -1565,6 +1571,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(screen.getByRole('button', {
       name: 'Recheck OpenClaw after host repair',
     })).toBeEnabled();
+    expect(screen.getByText(/agents\.list\[\]\.tools\.deny/)).toBeVisible();
     expect(screen.getByRole('link', { name: 'Open Dashboard for signed update' })).toHaveAttribute(
       'href',
       '/dashboard',
@@ -1966,6 +1973,12 @@ describe('ProjectChatPanel rendered provider contract', () => {
           code: 'PROJECT_PROVIDER_AUTH_REQUIRED',
           error: 'refresh_token=must-not-render-from-error',
           detail: 'refresh_token=must-not-render',
+          operatorDiagnostic: {
+            source: 'OPENCLAW_GATEWAY',
+            operation: 'config.patch',
+            errorCode: 'INVALID_REQUEST',
+            errorMessage: 'password=must-not-render-diagnostic',
+          },
         },
       },
     };

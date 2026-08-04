@@ -7,8 +7,18 @@ import {
 } from './projectChatProviderRegistry';
 import { CodexProjectEgressRuntimeError } from '../agents/providers/native/projectSandbox/CodexProjectEgressRuntime';
 import { NativeCliProjectEgressRuntimeError } from '../agents/providers/native/projectSandbox/NativeCliProjectEgressRuntime';
-import { NativeProviderDiagnosticError } from '../agents/providers/native/NativeProviderDiagnostics';
+import {
+  NativeProviderDiagnosticError,
+  redactNativeProviderText,
+} from '../agents/providers/native/NativeProviderDiagnostics';
 import { OllamaProjectModelBridgeError } from '../agents/providers/ollama/OllamaProjectModelBridge';
+
+export interface ProjectQualificationOperatorDiagnostic {
+  source: 'OPENCLAW_GATEWAY';
+  operation: 'config.get' | 'config.patch';
+  errorCode: string | null;
+  errorMessage: string;
+}
 
 export interface PresentedProjectQualificationError {
   status: number;
@@ -17,7 +27,12 @@ export interface PresentedProjectQualificationError {
     code: string;
     retryable?: boolean;
     recovery?: 'HOST_MAINTENANCE';
+    operatorDiagnostic?: ProjectQualificationOperatorDiagnostic;
   };
+}
+
+export interface ProjectQualificationErrorPresentationOptions {
+  includeOperatorDiagnostic?: boolean;
 }
 
 function providerDisplayName(provider: QualifiableProjectProvider | null): string {
@@ -33,6 +48,27 @@ function hostSignInGuidance(provider: QualifiableProjectProvider | null): string
   return `${providerDisplayName(provider)} is not signed in on this server. Complete its CLI login on the host, then select the provider again.`;
 }
 
+function openClawGatewayOperatorDiagnostic(
+  error: OpenClawProjectSandboxError,
+): ProjectQualificationOperatorDiagnostic | null {
+  const operation = error.code === 'CONFIG_GET_FAILED'
+    ? 'config.get'
+    : error.code === 'CONFIG_PATCH_FAILED'
+      ? 'config.patch'
+      : null;
+  if (!operation || !error.gatewayErrorMessage) return null;
+  const errorMessage = redactNativeProviderText(error.gatewayErrorMessage, 1_024)
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!errorMessage) return null;
+  return {
+    source: 'OPENCLAW_GATEWAY',
+    operation,
+    errorCode: error.gatewayErrorCode,
+    errorMessage,
+  };
+}
+
 /**
  * Classify a Project provider qualification failure into an honest,
  * operator-actionable response. Environmental conditions (host sign-in,
@@ -43,12 +79,19 @@ function hostSignInGuidance(provider: QualifiableProjectProvider | null): string
 export function presentProjectQualificationError(
   error: unknown,
   provider: QualifiableProjectProvider | null = null,
+  options: ProjectQualificationErrorPresentationOptions = {},
 ): PresentedProjectQualificationError | null {
   if (error instanceof ProjectEgressAttestationError
     || error instanceof CodexProjectEgressRuntimeError
     || error instanceof NativeCliProjectEgressRuntimeError
     || error instanceof OpenClawProjectSandboxError) {
-    console.error(`[Project Provider Qualification] Runtime attestation failed (${error.code}):`, error.message);
+    const gatewayDiagnostic = error instanceof OpenClawProjectSandboxError
+      ? openClawGatewayOperatorDiagnostic(error)
+      : null;
+    console.error(
+      `[Project Provider Qualification] Runtime attestation failed (${error.code}):`,
+      gatewayDiagnostic?.errorMessage || error.message,
+    );
     return {
       status: 503,
       body: {
@@ -56,6 +99,9 @@ export function presentProjectQualificationError(
         code: 'PROJECT_RUNTIME_POLICY_FAILED',
         retryable: false,
         recovery: 'HOST_MAINTENANCE',
+        ...(options.includeOperatorDiagnostic && gatewayDiagnostic
+          ? { operatorDiagnostic: gatewayDiagnostic }
+          : {}),
       },
     };
   }

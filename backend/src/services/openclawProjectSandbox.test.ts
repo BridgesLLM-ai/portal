@@ -680,8 +680,11 @@ describe('OpenClaw Project runtime attestation', () => {
 describe('OpenClaw config convergence', () => {
   test('patches the entire agent, then synchronously re-reads and verifies effective global policy', async () => {
     const fixture = makeFixture();
+    const staleAgent = deepClone(fixture.plan.desiredAgent);
+    staleAgent.tools.deny.push('stale-deny-entry');
+    staleAgent.tools.sandbox.tools.deny.push('stale-sandbox-deny-entry');
     const rpc = jest.fn()
-      .mockResolvedValueOnce(rpcResult({ agents: { list: [{ id: 'main' }] } }, 'before'))
+      .mockResolvedValueOnce(rpcResult({ agents: { list: [{ id: 'main' }, staleAgent] } }, 'before'))
       .mockResolvedValueOnce({ ok: true, data: { hash: 'after' } })
       .mockResolvedValueOnce(rpcResult({ agents: { list: [{ id: 'main' }, fixture.plan.desiredAgent] } }, 'after'));
 
@@ -690,6 +693,10 @@ describe('OpenClaw config convergence', () => {
     expect(rpc).toHaveBeenCalledTimes(3);
     expect(rpc.mock.calls[1][0]).toBe('config.patch');
     expect(rpc.mock.calls[1][1].baseHash).toBe('before');
+    expect(rpc.mock.calls[1][1].replacePaths).toEqual([
+      'agents.list[].tools.deny',
+      'agents.list[].tools.sandbox.tools.deny',
+    ]);
     const raw = JSON.parse(rpc.mock.calls[1][1].raw);
     // `main` is pinned as the default agent so project agents joining the list
     // can never capture OpenClaw's default routing (probes, unscoped CLI ops).
@@ -750,6 +757,25 @@ describe('OpenClaw config convergence', () => {
     for (const response of responses) rpc.mockResolvedValueOnce(response);
     await expect(__openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc))
       .rejects.toMatchObject({ code });
+  });
+
+  test('retains bounded structured gateway detail when config.patch is rejected', async () => {
+    const fixture = makeFixture();
+    const rpc = jest.fn()
+      .mockResolvedValueOnce(rpcResult({ agents: { list: [] } }, 'before'))
+      .mockResolvedValueOnce({
+        ok: false,
+        error: 'legacy flattened message',
+        errorCode: 'INVALID_REQUEST',
+        errorMessage: 'config.patch would remove entries from array path(s): agents.list[].tools.deny',
+      });
+
+    await expect(__openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc))
+      .rejects.toMatchObject({
+        code: 'CONFIG_PATCH_FAILED',
+        gatewayErrorCode: 'INVALID_REQUEST',
+        gatewayErrorMessage: 'config.patch would remove entries from array path(s): agents.list[].tools.deny',
+      });
   });
 
   test('rejects global binds/env/ulimits that alter the effective agent container', async () => {

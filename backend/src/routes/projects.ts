@@ -2943,8 +2943,11 @@ function sendProjectChatQualificationError(
   error: unknown,
   provider: QualifiableProjectProvider | null = null,
   extra: Record<string, unknown> = {},
+  includeOperatorDiagnostic = false,
 ): boolean {
-  const presented = presentProjectQualificationError(error, provider);
+  const presented = presentProjectQualificationError(error, provider, {
+    includeOperatorDiagnostic,
+  });
   if (!presented) return false;
   res.status(presented.status).json({ ...presented.body, provider, ...extra });
   return true;
@@ -8916,7 +8919,13 @@ function qualifyProjectChatProviderRoute(provider: ProjectChatRouteProvider) {
         executionContext: serializeProjectSandboxContext(executionContext),
       });
     } catch (error) {
-      if (sendProjectChatQualificationError(res, error, provider)) return;
+      if (sendProjectChatQualificationError(
+        res,
+        error,
+        provider,
+        {},
+        req.user?.role === 'OWNER' || req.user?.role === 'SUB_ADMIN',
+      )) return;
       if (sendProjectChatProviderError(res, error)) return;
       if (sendProjectChatCoordinationError(res, error)) return;
       console.error(`[${provider} Project Qualification] Failed:`, error instanceof Error ? error.message : error);

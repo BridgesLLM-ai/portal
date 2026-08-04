@@ -273,4 +273,39 @@ describe('Remote Desktop release contract', () => {
     expect(server).toContain('await startRemoteDesktopOpenPathCleanup()');
     expect(server).toContain('stopRemoteDesktopOpenPathCleanup();');
   });
+
+  test('the managed Portal skill ships bounded file-link guidance and converges at startup', () => {
+    const skill = readRepo('skills/bridgesllm-portal/SKILL.md');
+    const guide = readRepo('skills/bridgesllm-portal/references/files-and-projects.md');
+    const inventory = readRepo('installer/release-required-members.txt').split('\n');
+    const route = readRepo('backend/src/routes/remote-desktop.ts');
+    const server = readRepo('backend/src/server.ts');
+    const managedSkillReconcile = route.slice(
+      route.indexOf('export function reconcilePortalManagedSkill'),
+      route.indexOf('export async function reconcileRemoteDesktopLauncherAssets'),
+    );
+    const visibleDefaults = route.slice(
+      route.indexOf('async function ensurePortalVisibleBrowserDefaults'),
+      route.indexOf('export function reconcilePortalManagedSkill'),
+    );
+
+    expect(skill).toContain('return a real Markdown link');
+    expect(skill).toContain('never guess a host root');
+    expect(skill).toContain('`/api/files/<encoded-file-id>`');
+    expect(skill).toContain('references/files-and-projects.md');
+    expect(guide).toContain(
+      '[Open the handoff](/root/.openclaw/workspace-main/audit/HANDOFF-project-chat-and-backups.md)',
+    );
+    expect(guide).toContain(
+      '[Open the Project handoff](/workspace/project/audit/HANDOFF-project-chat-and-backups.md)',
+    );
+    expect(guide).toContain('[Open uploaded report](/api/files/abc123)');
+    expect(guide).toContain('Never substitute a signed');
+    expect(inventory).toContain('portal/skills/bridgesllm-portal/SKILL.md');
+    expect(inventory).toContain('portal/skills/bridgesllm-portal/references/files-and-projects.md');
+    expect(server).toContain('reconcilePortalManagedSkill();');
+    expect(managedSkillReconcile).toContain('ensurePortalSkillInstalled()');
+    expect(managedSkillReconcile).not.toContain('restartOpenClawGatewaySystemUnit');
+    expect(visibleDefaults).not.toContain('ensurePortalSkillInstalled()');
+  });
 });

@@ -31,6 +31,9 @@ interface RpcResponse {
   ok: boolean;
   data?: any;
   error?: any;
+  /** Structured gateway failure fields retained for operator diagnostics. */
+  errorCode?: string;
+  errorMessage?: string;
 }
 
 /** A throwaway connection attempt plus whether no method was dispatched. */
@@ -104,7 +107,9 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
       const data = await PGW.callGatewayRpc(method, params, timeoutMs);
       return { ok: true, data };
     } catch (err: any) {
-      return { ok: false, error: err?.message || String(err || `${method} RPC failed`) };
+      const errorMessage = err?.errorMessage || err?.message || String(err || `${method} RPC failed`);
+      const errorCode = typeof err?.errorCode === 'string' ? err.errorCode : undefined;
+      return { ok: false, error: errorMessage, errorCode, errorMessage };
     }
   }
 
@@ -119,12 +124,20 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
         ok: false,
         error: `OpenClaw gateway is restarting and did not accept a connection within `
           + `${Math.round(GATEWAY_CONNECT_RETRY_BUDGET_MS / 1000)}s (${attempt.error})`,
+        errorCode: attempt.errorCode,
+        errorMessage: attempt.errorMessage,
       };
     }
     await sleep(delay);
     attempt = await openThrowawayGatewayRpc(method, params, timeoutMs);
   }
-  return { ok: attempt.ok, data: attempt.data, error: attempt.error };
+  return {
+    ok: attempt.ok,
+    data: attempt.data,
+    error: attempt.error,
+    errorCode: attempt.errorCode,
+    errorMessage: attempt.errorMessage,
+  };
 }
 
 function openThrowawayGatewayRpc(
@@ -222,11 +235,14 @@ function openThrowawayGatewayRpc(
             // Connect response
             if (!msg.ok) {
               const connectError = msg.error?.message || 'Connect failed';
+              const connectErrorCode = typeof msg.error?.code === 'string' ? msg.error.code : undefined;
               console.error(`[Gateway RPC] Connect failed: ${connectError}`);
               done({
                 ok: false,
                 retriable: /starting|unavailable|not ready/i.test(connectError),
                 error: connectError,
+                errorCode: connectErrorCode,
+                errorMessage: connectError,
               });
               return;
             }
@@ -245,7 +261,14 @@ function openThrowawayGatewayRpc(
             if (msg.ok) {
               done({ ok: true, retriable: false, data: msg.payload || msg.result });
             } else {
-              done({ ok: false, retriable: false, error: msg.error?.message || 'Method call failed' });
+              const errorMessage = msg.error?.message || 'Method call failed';
+              done({
+                ok: false,
+                retriable: false,
+                error: errorMessage,
+                errorCode: typeof msg.error?.code === 'string' ? msg.error.code : undefined,
+                errorMessage,
+              });
             }
           }
         }

@@ -56,4 +56,32 @@ describe('project qualification error presentation', () => {
     );
     log.mockRestore();
   });
+
+  test('reports a bounded redacted gateway config diagnostic only when the caller is an operator', () => {
+    const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const secret = 'gateway-secret-that-must-not-leak';
+    const error = new OpenClawProjectSandboxError(
+      'CONFIG_PATCH_FAILED',
+      'OpenClaw Project config could not be patched',
+      {
+        errorCode: 'INVALID_REQUEST',
+        errorMessage: `config.patch rejected agents.list; password=${secret}`,
+      },
+    );
+
+    const userPresentation = presentProjectQualificationError(error, 'OPENCLAW');
+    expect(userPresentation?.body).not.toHaveProperty('operatorDiagnostic');
+
+    const operatorPresentation = presentProjectQualificationError(error, 'OPENCLAW', {
+      includeOperatorDiagnostic: true,
+    });
+    expect(operatorPresentation?.body.operatorDiagnostic).toEqual({
+      source: 'OPENCLAW_GATEWAY',
+      operation: 'config.patch',
+      errorCode: 'INVALID_REQUEST',
+      errorMessage: 'config.patch rejected agents.list; password=[redacted]',
+    });
+    expect(JSON.stringify(operatorPresentation)).not.toContain(secret);
+    log.mockRestore();
+  });
 });

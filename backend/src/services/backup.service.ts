@@ -29,6 +29,11 @@ export interface BackupStatus {
   exitCode?: number;
   archivePath?: string;
   error?: string;
+  failureDetail?: string;
+  phase?: string;
+  phaseLabel?: string;
+  phaseIndex?: number;
+  phaseTotal?: number;
   output?: string;
 }
 
@@ -296,21 +301,63 @@ function readOutputTail(): string | undefined {
   }
 }
 
-function parseBackupStatus(raw: string): BackupStatus | null {
+export function parseBackupStatus(raw: string): BackupStatus | null {
   try {
     const parsed = JSON.parse(raw) as Partial<BackupStatus>;
     if (!parsed || typeof parsed.id !== 'string' || parsed.id.length > 128) return null;
     if (!BACKUP_TYPES.includes(parsed.type as BackupType)) return null;
     if (!['queued', 'running', 'completed', 'failed'].includes(String(parsed.status))) return null;
     if (typeof parsed.startedAt !== 'string' || !Number.isFinite(Date.parse(parsed.startedAt))) return null;
+    const boundedText = (value: unknown, maximum: number): value is string => (
+      typeof value === 'string'
+      && Buffer.byteLength(value, 'utf8') <= maximum
+      && !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value)
+    );
+    if (parsed.error !== undefined && !boundedText(parsed.error, 1000)) return null;
+    if (parsed.failureDetail !== undefined && !boundedText(parsed.failureDetail, 1000)) return null;
+    const progressFields = [parsed.phase, parsed.phaseLabel, parsed.phaseIndex, parsed.phaseTotal];
+    const hasProgress = progressFields.some((value) => value !== undefined);
+    if (hasProgress && (
+      typeof parsed.phase !== 'string'
+      || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(parsed.phase)
+      || !boundedText(parsed.phaseLabel, 160)
+      || !Number.isSafeInteger(parsed.phaseIndex)
+      || !Number.isSafeInteger(parsed.phaseTotal)
+      || (parsed.phaseIndex as number) < 1
+      || (parsed.phaseTotal as number) < 1
+      || (parsed.phaseTotal as number) > 1000
+      || (parsed.phaseIndex as number) > (parsed.phaseTotal as number)
+    )) return null;
     return parsed as BackupStatus;
   } catch {
     return null;
   }
 }
 
+function boundedStatusText(value: string, maximumBytes: number): string {
+  const clean = value.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (Buffer.byteLength(clean, 'utf8') <= maximumBytes) return clean;
+  let result = '';
+  let bytes = 0;
+  for (const character of clean) {
+    const characterBytes = Buffer.byteLength(character, 'utf8');
+    if (bytes + characterBytes > maximumBytes) break;
+    result += character;
+    bytes += characterBytes;
+  }
+  return result;
+}
+
 export function writeBackupStatus(status: BackupStatus): void {
-  atomicWrite(BACKUP_STATUS_FILE, `${JSON.stringify(status)}\n`);
+  const normalized = { ...status };
+  if (typeof normalized.error === 'string') normalized.error = boundedStatusText(normalized.error, 1000);
+  if (typeof normalized.failureDetail === 'string') {
+    normalized.failureDetail = boundedStatusText(normalized.failureDetail, 1000);
+  }
+  if (typeof normalized.phaseLabel === 'string') {
+    normalized.phaseLabel = boundedStatusText(normalized.phaseLabel, 160);
+  }
+  atomicWrite(BACKUP_STATUS_FILE, `${JSON.stringify(normalized)}\n`);
 }
 
 export function readBackupStatus(): BackupStatus | null {
@@ -330,6 +377,7 @@ export function readBackupStatus(): BackupStatus | null {
         ? 'Backup service did not start within two minutes'
         : 'Backup process stopped before recording completion',
     };
+    reconciled.failureDetail = reconciled.error;
     writeBackupStatus(reconciled);
     return { ...reconciled, output: readOutputTail() };
   }
@@ -364,11 +412,16 @@ export async function startBackupUnit(type: BackupType): Promise<BackupStatus | 
   } catch (error: any) {
     const current = readBackupStatus();
     if (current?.id === requestStatus.id) {
+      const failureDetail = boundedStatusText(
+        String(error?.message || 'The installed backup service could not be started'),
+        1000,
+      );
       writeBackupStatus({
         ...requestStatus,
         status: 'failed',
         completedAt: new Date().toISOString(),
-        error: String(error?.message || 'The installed backup service could not be started').slice(0, 1000),
+        error: failureDetail,
+        failureDetail,
       });
     }
     throw error;

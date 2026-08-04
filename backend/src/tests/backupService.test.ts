@@ -6,6 +6,7 @@ import {
   findBackupFile,
   listBackupFiles,
   normalizeBackupRoot,
+  parseBackupStatus,
   parseOnCalendar,
   parseSystemctlProperties,
 } from '../services/backup.service';
@@ -17,6 +18,27 @@ import {
 const repositoryRoot = path.resolve(__dirname, '../../..');
 const backupScript = path.join(repositoryRoot, 'backup-full.sh');
 const tempRoots: string[] = [];
+
+describe('backup status contract', () => {
+  it('accepts bounded structured progress and rejects contradictory progress', () => {
+    const status = {
+      id: 'comprehensive-20260804',
+      type: 'comprehensive',
+      status: 'running',
+      startedAt: '2026-08-04T12:00:00.000Z',
+      phase: 'database-snapshot',
+      phaseLabel: 'Capturing database snapshot',
+      phaseIndex: 5,
+      phaseTotal: 12,
+      failureDetail: 'Database fence was lost before the snapshot completed',
+    };
+    expect(parseBackupStatus(JSON.stringify(status))).toMatchObject(status);
+    expect(parseBackupStatus(JSON.stringify({ ...status, phaseIndex: 13 }))).toBeNull();
+    expect(parseBackupStatus(JSON.stringify({ ...status, phaseLabel: 'unsafe\u0000detail' }))).toBeNull();
+    expect(parseBackupStatus(JSON.stringify({ ...status, failureDetail: '🧰'.repeat(250) }))).not.toBeNull();
+    expect(parseBackupStatus(JSON.stringify({ ...status, failureDetail: '🧰'.repeat(251) }))).toBeNull();
+  });
+});
 
 function makeTempRoot(prefix: string): string {
   const { cleanupRoot, fixtureRoot } = createAttestedBackupRoot(prefix);
@@ -188,7 +210,15 @@ describe('persistent backup runner', () => {
       throw new Error(`backup runner failed (${result.status})\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
     }
     const status = JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'));
-    expect(status).toMatchObject({ type: 'daily', status: 'completed', exitCode: 0 });
+    expect(status).toMatchObject({
+      type: 'daily',
+      status: 'completed',
+      exitCode: 0,
+      phase: 'completed',
+      phaseLabel: 'Backup completed',
+      phaseIndex: 8,
+      phaseTotal: 8,
+    });
     expect(status.archivePath).toMatch(new RegExp(`^${backupRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/daily/portal-daily-`));
     expect(fs.statSync(status.archivePath).mode & 0o777).toBe(0o600);
     expect(fs.readFileSync(path.join(stateDir, 'current.log'), 'utf8').length).toBeLessThanOrEqual(65536);
@@ -332,8 +362,6 @@ describe('persistent backup runner', () => {
     );
     for (const [relative, contents] of [
       ['config.toml', 'model = "openai/gpt-5.6-sol"\n'],
-      ['memories_1.sqlite', 'durable memories\n'],
-      ['goals_1.sqlite', 'durable goals\n'],
       ['.tmp/plugin-cache', 'regenerable checkout\n'],
       ['sessions/rollout.jsonl', 'volatile rollout\n'],
       ['cache/models.json', 'regenerable cache\n'],
@@ -345,6 +373,20 @@ describe('persistent backup runner', () => {
     ] as const) {
       fs.writeFileSync(path.join(codexHome, relative), contents, { mode: 0o600 });
     }
+    const codexDatabaseFixtures = [
+      ['memories_1.sqlite', 'durable memory committed in wal'],
+      ['goals_1.sqlite', 'durable goal committed in wal'],
+    ] as const;
+    const liveCodexDatabases = codexDatabaseFixtures.map(([filename, value]) => {
+      const databasePath = path.join(codexHome, filename);
+      const database = new DatabaseSync(databasePath);
+      database.prepare('PRAGMA journal_mode=WAL').get();
+      database.exec('PRAGMA wal_autocheckpoint=0; CREATE TABLE durable_record (value TEXT NOT NULL);');
+      database.prepare('INSERT INTO durable_record (value) VALUES (?)').run(value);
+      fs.chmodSync(databasePath, 0o600);
+      expect(fs.existsSync(`${databasePath}-wal`)).toBe(true);
+      return database;
+    });
     fs.writeFileSync(path.join(openclawRoot, 'logs', 'gateway.log'), 'operational log\n', { mode: 0o600 });
 
     let result;
@@ -362,6 +404,7 @@ describe('persistent backup runner', () => {
       });
     } finally {
       liveDatabase.close();
+      for (const database of liveCodexDatabases) database.close();
     }
     if (result.status !== 0) {
       throw new Error(`OpenClaw-state backup failed (${result.status})\n${result.stdout}\n${result.stderr}`);
@@ -389,6 +432,13 @@ describe('persistent backup runner', () => {
     expect(listing.stdout).toContain('.openclaw/agents/main/agent/codex-home/config.toml');
     expect(listing.stdout).toContain('.openclaw/agents/main/agent/codex-home/memories_1.sqlite');
     expect(listing.stdout).toContain('.openclaw/agents/main/agent/codex-home/goals_1.sqlite');
+    const listingMembers = new Set(listing.stdout.trim().split('\n'));
+    for (const database of ['memories_1.sqlite', 'goals_1.sqlite']) {
+      expect(listingMembers.has(`.openclaw/agents/main/agent/codex-home/${database}`)).toBe(true);
+      expect(listingMembers.has(`.openclaw/agents/main/agent/codex-home/${database}-wal`)).toBe(false);
+      expect(listingMembers.has(`.openclaw/agents/main/agent/codex-home/${database}-shm`)).toBe(false);
+      expect(listingMembers.has(`.openclaw/agents/main/agent/codex-home/${database}-journal`)).toBe(false);
+    }
     for (const excludedMember of [
       '.openclaw/agents/main/agent/codex-home/.tmp/plugin-cache',
       '.openclaw/agents/main/agent/codex-home/sessions/rollout.jsonl',
@@ -415,6 +465,8 @@ describe('persistent backup runner', () => {
         '-xzf', path.join(extractionRoot, 'openclaw-state.tar.gz'),
         '-C', openclawExtractionRoot,
         '.openclaw/state/openclaw.sqlite',
+        '.openclaw/agents/main/agent/codex-home/memories_1.sqlite',
+        '.openclaw/agents/main/agent/codex-home/goals_1.sqlite',
       ],
       { encoding: 'utf8' },
     );
@@ -431,6 +483,18 @@ describe('persistent backup runner', () => {
       expect(restoredDatabase.prepare('PRAGMA quick_check').get()).toEqual({ quick_check: 'ok' });
     } finally {
       restoredDatabase.close();
+    }
+    for (const [filename, value] of codexDatabaseFixtures) {
+      const restoredCodexDatabase = new DatabaseSync(
+        path.join(openclawExtractionRoot, '.openclaw', 'agents', 'main', 'agent', 'codex-home', filename),
+        { readOnly: true },
+      );
+      try {
+        expect(restoredCodexDatabase.prepare('SELECT value FROM durable_record').get()).toEqual({ value });
+        expect(restoredCodexDatabase.prepare('PRAGMA quick_check').get()).toEqual({ quick_check: 'ok' });
+      } finally {
+        restoredCodexDatabase.close();
+      }
     }
 
     const recoveryManifest = JSON.parse(
@@ -703,6 +767,11 @@ describe('persistent backup runner', () => {
     expect(JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'))).toMatchObject({
       type: 'daily',
       status: 'failed',
+      phase: 'portal-data',
+      phaseLabel: 'Archiving Portal data',
+      phaseIndex: 3,
+      phaseTotal: 8,
+      failureDetail: expect.stringContaining('Required recovery source is missing'),
     });
     expect(fs.readdirSync(path.join(backupRoot, 'daily')).filter((name) => name.endsWith('.tar.gz'))).toEqual([]);
   });
