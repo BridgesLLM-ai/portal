@@ -151,3 +151,10 @@ export async function deliverNativeAskUserQuestionDismissal(
     dependencies.releaseDelivery(reservation);
   }
 }
+
+// Provider-neutral names for current callers. Keep the native-prefixed exports
+// as compatibility aliases for the existing restart/ownership test fixtures.
+export type AskUserQuestionChannelDependencies = NativeAskUserQuestionChannelDependencies;
+export const syncAskUserQuestionsForActor = syncNativeAskUserQuestionsForActor;
+export const deliverAskUserQuestionAnswer = deliverNativeAskUserQuestionAnswer;
+export const deliverAskUserQuestionDismissal = deliverNativeAskUserQuestionDismissal;

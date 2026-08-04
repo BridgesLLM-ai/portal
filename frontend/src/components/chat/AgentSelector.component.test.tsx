@@ -266,6 +266,66 @@ describe('AgentSelector', () => {
     );
   });
 
+  it('shows the live dot only for run-attested sessions, never every retained active session', async () => {
+    useAuthStore.setState({ isAuthenticated: true });
+    mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/providers') {
+        return {
+          data: {
+            providers: [{
+              name: 'CODEX',
+              displayName: 'Codex',
+              implemented: true,
+              installed: true,
+              usable: true,
+              native: true,
+              capabilities: { supportsSessionList: true },
+            }],
+          },
+        };
+      }
+      if (url === '/gateway/sessions') {
+        return {
+          data: {
+            sessions: [
+              { sessionId: 'idle-session', status: 'active', runActive: false, title: 'Idle history' },
+              { sessionId: 'running-session', status: 'active', runActive: true, title: 'Running task' },
+            ],
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const user = userEvent.setup();
+    const view = render(
+      <AgentSelector
+        value="CODEX"
+        onChange={vi.fn()}
+        onViewSession={vi.fn()}
+        currentSessionKey="idle-session"
+        currentSessionActive={false}
+      />,
+    );
+
+    const history = await screen.findByTitle('Codex sessions');
+    expect(screen.getByLabelText('Codex has an active turn')).toBeInTheDocument();
+    await user.click(history);
+    expect(await screen.findByLabelText('Running task has an active turn')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Idle history has an active turn')).not.toBeInTheDocument();
+
+    view.rerender(
+      <AgentSelector
+        value="CODEX"
+        onChange={vi.fn()}
+        onViewSession={vi.fn()}
+        currentSessionKey="running-session"
+        currentSessionActive={false}
+      />,
+    );
+    expect(screen.queryByLabelText('Codex has an active turn')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Running task has an active turn')).not.toBeInTheDocument();
+  });
+
   it('shows a sanitized live activity title, then falls back to the durable session title', async () => {
     useAuthStore.setState({ isAuthenticated: true });
     const sessionKey = 'agent:main:parallel-work';
@@ -581,5 +641,114 @@ describe('AgentSelector', () => {
     await waitFor(() => expect(sessionDialog).not.toBeInTheDocument());
     await waitFor(() => expect(sessionOpener).toHaveFocus());
     expect(document.body.style.overflow).toBe('');
+  });
+
+  it('scopes session history to the default agent instead of every agent at once', async () => {
+    useAuthStore.setState({ isAuthenticated: true });
+    const sessionParams: Array<Record<string, string> | undefined> = [];
+    mocks.clientGet.mockImplementation(async (url: string, config?: any) => {
+      if (url === '/gateway/providers') return { data: { providers: providerCatalog } };
+      if (url === '/gateway/agents') return { data: { agents: manyOpenClawAgents } };
+      if (url === '/gateway/sessions') {
+        sessionParams.push(config?.params);
+        return { data: { sessions: [] } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+
+    render(
+      <AgentSelector
+        value="OPENCLAW"
+        onChange={vi.fn()}
+        onViewSession={vi.fn()}
+        currentSessionKey="agent:main:main"
+      />,
+    );
+
+    await waitFor(() => expect(sessionParams.length).toBeGreaterThan(0));
+    // Omitting agentId made the server answer for every agent, so the main
+    // agent's history came back mixed with other agents' sessions.
+    expect(sessionParams[0]).toEqual({ agentId: 'main' });
+  });
+
+  it('refetches history scoped to the main agent when returning from a sub-agent', async () => {
+    useAuthStore.setState({ isAuthenticated: true });
+    const requestedAgentIds: Array<string | undefined> = [];
+    mocks.clientGet.mockImplementation(async (url: string, config?: any) => {
+      if (url === '/gateway/providers') return { data: { providers: providerCatalog } };
+      if (url === '/gateway/agents') return { data: { agents: manyOpenClawAgents } };
+      if (url === '/gateway/sessions') {
+        requestedAgentIds.push(config?.params?.agentId);
+        return { data: { sessions: [] } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+
+    const view = render(
+      <AgentSelector
+        value="OPENCLAW"
+        agentId="openclaw-agent-1"
+        onChange={vi.fn()}
+        onViewSession={vi.fn()}
+        currentSessionKey="agent:openclaw-agent-1:main"
+      />,
+    );
+    await waitFor(() => expect(requestedAgentIds).toContain('openclaw-agent-1'));
+
+    view.rerender(
+      <AgentSelector
+        value="OPENCLAW"
+        onChange={vi.fn()}
+        onViewSession={vi.fn()}
+        currentSessionKey="agent:main:main"
+      />,
+    );
+    await waitFor(() => expect(requestedAgentIds).toContain('main'));
+  });
+
+  it('keeps the default agent selectable while its availability row is rechecking', async () => {
+    mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/providers') {
+        return {
+          data: {
+            providers: [{
+              name: 'OPENCLAW',
+              displayName: 'OpenClaw',
+              installed: true,
+              implemented: true,
+              usable: false,
+              availabilityState: 'stale',
+              checking: true,
+              stale: true,
+            }],
+          },
+        };
+      }
+      if (url === '/gateway/agents') {
+        return {
+          data: {
+            agents: [
+              { id: 'main', name: 'Main' },
+              { id: 'helper-one', name: 'Helper One' },
+            ],
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <AgentSelector value="OPENCLAW" agentId="helper-one" onChange={onChange} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Select agent provider' }));
+    // A sub-agent row is always selectable, so the row that returns to the
+    // default agent must be too. Gating it on availability made "go back to
+    // the main agent" a no-op during a routine recheck.
+    const defaultAgentRow = await screen.findByRole('button', { name: /OpenClaw/i });
+    expect(defaultAgentRow).toBeEnabled();
+    await user.click(defaultAgentRow);
+    expect(onChange).toHaveBeenLastCalledWith({ provider: 'OPENCLAW', agentId: undefined });
   });
 });

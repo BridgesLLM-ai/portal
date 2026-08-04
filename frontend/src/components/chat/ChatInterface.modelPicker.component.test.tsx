@@ -8,9 +8,34 @@ import {
   BlockedAgentChatSendButton,
   ModelPicker,
   ProviderAvailabilityBarrier,
+  planAgentChatSelection,
 } from './ChatInterface';
 
 const originalInnerWidth = window.innerWidth;
+
+describe('Agent Chat provider navigation', () => {
+  it('lets a provider switch restore that provider\'s last session', () => {
+    expect(planAgentChatSelection('OPENCLAW', undefined, {
+      provider: 'CODEX',
+      agentId: undefined,
+    })).toMatchObject({
+      changed: true,
+      providerChanged: true,
+      nextAgentId: undefined,
+    });
+  });
+
+  it('treats switching OpenClaw agents as a scoped navigation', () => {
+    expect(planAgentChatSelection('OPENCLAW', undefined, {
+      provider: 'OPENCLAW',
+      agentId: 'parity',
+    })).toMatchObject({
+      changed: true,
+      providerChanged: false,
+      nextAgentId: 'parity',
+    });
+  });
+});
 
 function useMobileViewport() {
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 720 });

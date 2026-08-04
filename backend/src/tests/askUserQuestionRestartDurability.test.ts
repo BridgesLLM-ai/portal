@@ -136,6 +136,8 @@ function registerPlugin(): Map<string, GatewayHandler> {
     registerGatewayMethod: (method: string, handler: GatewayHandler) => {
       registrations.set(method, handler);
     },
+    registerTool: () => undefined,
+    on: () => undefined,
   });
   return registrations;
 }
@@ -235,7 +237,10 @@ describe('native pending-input restart semantics', () => {
 
     const afterRestart = await invoke(handlers.get(answerMethod)!, answerParams);
     expect(afterRestart.payload?.accepted).not.toBe(true);
-    expect(afterRestart.payload).toMatchObject({ code: 'NO_ACTIVE_RUN' });
+    // The provider-neutral adapter remains loaded after restart, but owns no
+    // pending call from the dead process. Either way the stale answer is
+    // explicitly rejected rather than entering a newer run.
+    expect(afterRestart.payload).toMatchObject({ code: 'NO_PENDING_INPUT' });
     expect(openclaw.settlements).toBe(1);
 
     // A brand new run in the restarted process is a different request. The old

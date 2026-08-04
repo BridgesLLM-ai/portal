@@ -285,6 +285,24 @@ describe('FilesPage mutation dialog ownership', () => {
     expect(mocks.resolve).not.toHaveBeenCalled();
   });
 
+  it('matches an exact stored path locally but attests physical paths through the backend', async () => {
+    const exactRoute = buildFileDeepLink(undefined, FILE.path, TEST_WORKSPACE_BINDING);
+    const exactView = renderFilesPage(exactRoute);
+    expect(await screen.findByTestId('preview-harness')).toBeInTheDocument();
+    expect(mocks.resolve).not.toHaveBeenCalled();
+    exactView.unmount();
+
+    mocks.resolve.mockRejectedValueOnce(new Error('outside actor root'));
+    const outsidePath = '/var/portal-files/user-other/uploads/alpha.txt';
+    renderFilesPage(buildFileDeepLink(undefined, outsidePath, TEST_WORKSPACE_BINDING));
+    await waitFor(() => expect(mocks.resolve).toHaveBeenCalledWith({
+      id: undefined,
+      path: outsidePath,
+    }));
+    expect(screen.queryByTestId('preview-harness')).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId('files-route')).toHaveTextContent(/^\/files$/));
+  });
+
   it('scrubs mismatched and legacy targets without resolving or opening them', async () => {
     const mismatchedRoute = buildFileDeepLink(FILE.id, FILE.path, {
       ...TEST_WORKSPACE_BINDING,

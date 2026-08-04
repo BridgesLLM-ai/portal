@@ -48,4 +48,25 @@ describe('runtimeTurnEvents tool identity', () => {
     });
     expect(normalized.content).toBe('');
   });
+
+  test.each(['run_resumed', 'compaction_start', 'compaction_end'])(
+    'preserves the %s control event across runtime normalization',
+    (eventType) => {
+      const normalized = normalizePortalStreamEventFromTurnEvent({
+        type: eventType,
+        turnEvent: {
+          schema: 'bridgesllm.runtime-turn-event.v1' as const,
+          type: 'assistant_status' as const,
+          seq: 1,
+          visible: false,
+          source: {
+            transport: 'portal-stream-event-bus',
+            eventType,
+          },
+        },
+      });
+
+      expect(normalized.type).toBe(eventType);
+    },
+  );
 });

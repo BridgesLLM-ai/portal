@@ -85,6 +85,7 @@ import {
   createPreambleProgressAccumulator,
   mergePreambleProgressSnapshot,
 } from '../utils/preambleProgress';
+import { isAskUserQuestionNoLongerOpenError } from '../utils/askUserQuestionError';
 
 const DEBUG_CHAT_STATE = import.meta.env.DEV;
 const BUILD_TIME_USE_DIRECT_GATEWAY = import.meta.env.VITE_USE_DIRECT_GATEWAY === 'true';
@@ -279,14 +280,17 @@ function createWsManager(url: string): WsManager {
     if (intentionallyClosed) return;
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
+    let socket: WebSocket;
     try {
-      ws = new WebSocket(url);
+      socket = new WebSocket(url);
+      ws = socket;
     } catch {
       scheduleReconnect();
       return;
     }
 
-    ws.onopen = () => {
+    socket.onopen = () => {
+      if (ws !== socket) return;
       debugLog('[ws-manager] Connected');
       const isReconnect = wasConnectedBefore;
       wasConnectedBefore = true;
@@ -298,7 +302,8 @@ function createWsManager(url: string): WsManager {
       }
     };
 
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (ws !== socket) return;
       let data: any;
       try { data = JSON.parse(event.data); } catch { return; }
       for (const handler of handlers) {
@@ -306,7 +311,10 @@ function createWsManager(url: string): WsManager {
       }
     };
 
-    ws.onclose = (event) => {
+    socket.onclose = (event) => {
+      // Explicit reconnect replaces the socket before the old close event can
+      // arrive. Never let that stale callback erase or reschedule its successor.
+      if (ws !== socket) return;
       debugLog('[ws-manager] Closed: code=' + event.code + ' reason=' + event.reason + ' intentionallyClosed=' + intentionallyClosed);
       ws = null;
 
@@ -344,7 +352,7 @@ function createWsManager(url: string): WsManager {
       }
     };
 
-    ws.onerror = () => {};
+    socket.onerror = () => {};
   }
 
   function scheduleReconnect() {
@@ -380,16 +388,19 @@ function createWsManager(url: string): WsManager {
     reconnect() {
       intentionallyClosed = false;
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      if (ws) {
-        try { ws.close(); } catch {}
-        ws = null;
+      const replacedSocket = ws;
+      ws = null;
+      if (replacedSocket) {
+        try { replacedSocket.close(); } catch {}
       }
       connect();
     },
     close() {
       intentionallyClosed = true;
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      if (ws) { try { ws.close(); } catch {} ws = null; }
+      const closingSocket = ws;
+      ws = null;
+      if (closingSocket) { try { closingSocket.close(); } catch {} }
       handlers.clear();
       disconnectCallbacks.clear();
       reconnectCallbacks.clear();
@@ -1954,6 +1965,7 @@ export interface ChatStateContextValue {
   dismissApproval: (approvalId?: string) => void;
   provider: string;
   setProvider: (p: string) => void;
+  selectProviderAgent: (provider: string, agentId?: string) => void;
   session: string;
   setSession: (s: string) => void;
   agentId: string | undefined;
@@ -2009,6 +2021,19 @@ function getProviderSessionStorageKey(provider: string): string {
   return `${SESSION_STORAGE_PREFIX}${String(provider || 'OPENCLAW').trim().toUpperCase() || 'OPENCLAW'}`;
 }
 
+function openClawAgentStorageId(agentId?: string | null): string {
+  return normalizeStoredAgentId(agentId) || 'main';
+}
+
+function getOpenClawAgentSessionStorageKey(agentId?: string | null): string {
+  return `${getProviderSessionStorageKey('OPENCLAW')}:${openClawAgentStorageId(agentId)}`;
+}
+
+function openClawSessionAgentId(session: string): string | null {
+  const match = String(session || '').trim().match(/^agent:([^:]+):/);
+  return match?.[1]?.trim() || null;
+}
+
 function normalizeInitialSession(provider: string, session: string, agentId?: string | null): string {
   const p = String(provider || '').trim().toUpperCase();
   const aliased = normalizePortalNewSessionAlias(String(session || '').trim() || 'main');
@@ -2023,6 +2048,24 @@ function normalizeInitialSession(provider: string, session: string, agentId?: st
 
 function readStoredSession(provider: string, agentId?: string | null): string {
   if (typeof window === 'undefined') return normalizeInitialSession(provider, 'main', agentId);
+  const normalizedProvider = String(provider || 'OPENCLAW').trim().toUpperCase() || 'OPENCLAW';
+  if (normalizedProvider === 'OPENCLAW') {
+    const targetAgentId = openClawAgentStorageId(agentId);
+    const agentScopedKey = getOpenClawAgentSessionStorageKey(targetAgentId);
+    const candidates = [
+      localStorage.getItem(agentScopedKey),
+      localStorage.getItem(getProviderSessionStorageKey(normalizedProvider)),
+      localStorage.getItem(LEGACY_SESSION_STORAGE_KEY),
+    ];
+    for (const candidate of candidates) {
+      if (!candidate?.trim()) continue;
+      const normalized = normalizeInitialSession(normalizedProvider, candidate, targetAgentId);
+      if (openClawSessionAgentId(normalized) !== targetAgentId) continue;
+      localStorage.setItem(agentScopedKey, normalized);
+      return normalized;
+    }
+    return `agent:${targetAgentId}:main`;
+  }
   const providerScoped = localStorage.getItem(getProviderSessionStorageKey(provider));
   if (providerScoped && providerScoped.trim()) {
     return normalizeInitialSession(provider, providerScoped, agentId);
@@ -2035,6 +2078,10 @@ function persistStoredSession(provider: string, session: string, agentId?: strin
   const normalized = normalizeInitialSession(provider, session, agentId);
   if (typeof window !== 'undefined') {
     localStorage.setItem(getProviderSessionStorageKey(provider), normalized);
+    if (String(provider || '').trim().toUpperCase() === 'OPENCLAW') {
+      const sessionAgentId = openClawSessionAgentId(normalized) || openClawAgentStorageId(agentId);
+      localStorage.setItem(getOpenClawAgentSessionStorageKey(sessionAgentId), normalized);
+    }
     localStorage.setItem(LEGACY_SESSION_STORAGE_KEY, normalized);
   }
   return normalized;
@@ -2301,6 +2348,16 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     agentIdRef.current = normalized;
     setAgentIdRaw(normalized);
   }, []);
+  const selectProviderAgent = useCallback((nextProvider: string, nextAgentId?: string) => {
+    const normalizedProvider = String(nextProvider || 'OPENCLAW').trim().toUpperCase() || 'OPENCLAW';
+    const normalizedAgentId = normalizedProvider === 'OPENCLAW'
+      ? normalizeStoredAgentId(nextAgentId)
+      : undefined;
+    // setAgentId updates its imperative ref synchronously; setProvider can then
+    // restore the exact provider+agent session in the same browser event.
+    setAgentId(normalizedAgentId);
+    setProvider(normalizedProvider);
+  }, [setAgentId, setProvider]);
   const setSelectedModel = useCallback((m: string) => {
     const currentProvider = providerRef.current;
     const normalized = normalizeProviderModel(currentProvider, m);
@@ -2568,7 +2625,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   });
   const drainNextQueuedMessageRef = useRef<() => void>(() => {});
   const portalTurnSequenceRef = useRef<number | null>(null);
-  const portalTurnSequenceSessionRef = useRef<string | null>(null);
+  const portalTurnSequenceScopeRef = useRef<string | null>(null);
   const lastForegroundReconcileAtRef = useRef(0);
   // Throttle refs for streaming text updates — batch text deltas to reduce re-renders
   const textThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2708,12 +2765,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => { sessionRef.current = session; }, [session]);
   useEffect(() => {
     portalTurnSequenceRef.current = null;
-    portalTurnSequenceSessionRef.current = session || null;
+    portalTurnSequenceScopeRef.current = `${provider}:${session || 'main'}`;
     if (streamContinuityRepairTimerRef.current) {
       clearTimeout(streamContinuityRepairTimerRef.current);
       streamContinuityRepairTimerRef.current = null;
     }
-  }, [session]);
+  }, [provider, session]);
   useEffect(() => { providerRef.current = provider; }, [provider]);
   useEffect(() => { agentIdRef.current = agentId; }, [agentId]);
   useEffect(() => { modelRef.current = selectedModel; }, [selectedModel]);
@@ -4064,6 +4121,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
         return false;
       }
+      const priorAcceptedRunId = normalizeRunId(currentRunIdRef.current);
       if (data.runId && !currentRunIdRef.current) {
         currentRunIdRef.current = String(data.runId);
       }
@@ -4077,10 +4135,30 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       debugLog('[ChatState] Active stream found during history load — hydrating');
       if (streamProvider === 'OPENCLAW') setDirectGatewayDemanded(true);
-      applyOpenClawActiveStreamSnapshot(data, {
+      const snapshotApplied = applyOpenClawActiveStreamSnapshot(data, {
         statusTextWhenNoTool: 'Reconnecting to stream…',
         source: streamProvider === 'OPENCLAW' && useDirectGateway ? 'direct' : 'portal',
       });
+      const acceptedSnapshotRunId = normalizeRunId(data?.runId);
+      if (snapshotApplied && acceptedSnapshotRunId && Array.isArray(data?.turnEvents)) {
+        const acceptedSnapshotSequence = latestTurnSequence(data.turnEvents.filter((event: any) => (
+          !normalizeRunId(event?.runId) || normalizeRunId(event?.runId) === acceptedSnapshotRunId
+        )));
+        if (acceptedSnapshotSequence !== null) {
+          const acceptedSnapshotSession = resolveOpenClawSessionKey(sessionRef.current)
+            || sessionRef.current
+            || 'main';
+          const acceptedSnapshotScope = `${providerRef.current}:${acceptedSnapshotSession}`;
+          const currentAcceptedSequence = priorAcceptedRunId === acceptedSnapshotRunId
+            && portalTurnSequenceScopeRef.current === acceptedSnapshotScope
+            ? portalTurnSequenceRef.current
+            : null;
+          portalTurnSequenceScopeRef.current = acceptedSnapshotScope;
+          portalTurnSequenceRef.current = currentAcceptedSequence === null
+            ? acceptedSnapshotSequence
+            : Math.max(currentAcceptedSequence, acceptedSnapshotSequence);
+        }
+      }
       if (options?.reconnect !== false && manager?.isConnected()) {
         manager.send({ type: 'reconnect', session: sessionKey, provider: streamProvider, streamClientId: streamClientIdRef.current });
       }
@@ -4088,7 +4166,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     } catch {
       return false;
     }
-  }, [applyOpenClawActiveStreamSnapshot, preserveLiveTurnThenClear, markStreamRecovery, resetStreamWatchdog, useDirectGateway]);
+  }, [applyOpenClawActiveStreamSnapshot, preserveLiveTurnThenClear, markStreamRecovery, resetStreamWatchdog, resolveOpenClawSessionKey, useDirectGateway]);
 
   // History loader
   const loadHistoryInternal = useCallback(async (sessionKey: string, prov?: string, options?: { force?: boolean; refreshActiveSnapshot?: boolean; preserveLocalMessages?: boolean }): Promise<boolean> => {
@@ -4272,7 +4350,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   }, [loadHistoryInternal]);
 
   const scheduleStreamContinuityRepair = useCallback((gap: { from: number; to: number }) => {
-    if (streamContinuityRepairTimerRef.current || providerRef.current !== 'OPENCLAW') return;
+    if (streamContinuityRepairTimerRef.current || !providerUsesPortalStreamBus(providerRef.current)) return;
     const targetSession = sessionRef.current || 'main';
     const targetProvider = providerRef.current;
     debugLog('[ChatState] Runtime event gap detected; scheduling durable reconciliation', {
@@ -4487,9 +4565,17 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     debugLog('[ChatState] Manual refresh — reloading history');
     const usingDirectGateway = useDirectGateway && currentProvider === 'OPENCLAW';
     const directClient = directClientRef.current;
-    if (usingDirectGateway && isStreamActiveRef.current && !directClient?.isConnected) {
+    const directOwnsTurn = usingDirectGateway
+      && streamTransportRef.current === 'direct'
+      && Boolean(directClient);
+    if (directOwnsTurn && isStreamActiveRef.current && !directClient?.isConnected) {
       directClient?.connect();
       markStreamRecovery('Reconnecting to stream…');
+    } else if (providerUsesPortalStreamBus(currentProvider) && !wsManagerRef.current?.isConnected()) {
+      // Manual refresh is explicit recovery intent, not only a history read.
+      // Cancel any exponential-backoff wait and reopen the shared Portal bus now.
+      wsManagerRef.current?.reconnect();
+      if (isStreamActiveRef.current) markStreamRecovery('Reconnecting to stream…');
     }
     try {
       await loadHistoryInternal(currentSession, currentProvider, { force: true, refreshActiveSnapshot: true });
@@ -4558,6 +4644,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
+    const rawPortalEventType = typeof data?.type === 'string' ? data.type : '';
     data = normalizePortalStreamEventFromTurnEvent(data);
     if (data?.type === 'activity_title') {
       // Only the backend's database-attested, body-free envelope may update a
@@ -4579,16 +4666,20 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const alwaysPassthroughTypes = ['connected', 'keepalive'];
     const resolvedPortalSession = typeof data?.sessionKey === 'string' ? resolveOpenClawSessionKey(data.sessionKey) : '';
     const resolvedCurrentSession = resolveOpenClawSessionKey(sessionRef.current);
+    const resolvedTurnSession = resolvedPortalSession || resolvedCurrentSession || 'main';
+    const resolvedTurnScope = `${providerRef.current}:${resolvedTurnSession}`;
     if (resolvedPortalSession && resolvedCurrentSession && resolvedPortalSession !== resolvedCurrentSession && !alwaysPassthroughTypes.includes(data.type)) {
       return;
     }
 
+    const isVerifiedPortalRunResume = rawPortalEventType === 'run_resumed'
+      || data?.turnEvent?.source?.eventType === 'run_resumed';
     if (incomingPortalRunId && portalStreamTypes.includes(data?.type)) {
       const epochDecision = reconcileIncomingRunEpoch(incomingPortalRunId, {
         // `run_resumed` is emitted only after the backend has verified the
         // continuation epoch. The browser must adopt it before filtering any
         // direct-gateway frames from that new run.
-        continuationVerified: data?.type === 'run_resumed',
+        continuationVerified: isVerifiedPortalRunResume,
       });
       if (epochDecision === 'reject') {
         debugLog('[ChatState] Ignoring portal event outside the active run epoch', {
@@ -4604,6 +4695,18 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         });
         directClientRef.current?.setActiveStreamSession(resolvedPortalSession || resolvedCurrentSession || null);
       }
+      if (isVerifiedPortalRunResume) {
+        portalTurnSequenceRef.current = null;
+        portalTurnSequenceScopeRef.current = resolvedTurnScope;
+      }
+    }
+
+    // A new Portal WebSocket connection is an explicit runtime-sequence epoch.
+    // Verified run_resumed events above are the other reset authority; treating
+    // any arbitrary seq=1 as a restart replayed stale turn windows into the UI.
+    if (data?.type === 'connected') {
+      portalTurnSequenceRef.current = null;
+      portalTurnSequenceScopeRef.current = resolvedTurnScope;
     }
 
     // When the direct gateway transport owns the active turn, it is the only live
@@ -4627,14 +4730,33 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     // must not trigger a reconciliation for the chat the user is viewing.
     const turnEvent = data?.turnEvent;
     if (turnEvent && typeof turnEvent === 'object') {
-      const turnSession = resolvedPortalSession || resolvedCurrentSession;
-      if (turnSession && portalTurnSequenceSessionRef.current !== turnSession) {
-        portalTurnSequenceSessionRef.current = turnSession;
+      const turnSession = resolvedTurnSession;
+      if (portalTurnSequenceScopeRef.current !== resolvedTurnScope) {
+        portalTurnSequenceScopeRef.current = resolvedTurnScope;
         portalTurnSequenceRef.current = null;
       }
       const observation = observeTurnSequence(portalTurnSequenceRef.current, turnEvent.seq);
       portalTurnSequenceRef.current = observation.nextSequence;
-      if (observation.gap) scheduleStreamContinuityRepair(observation.gap);
+      if (observation.disposition === 'gap') {
+        debugLog('[ChatState] Quarantining runtime turn event behind a sequence gap', {
+          session: turnSession,
+          sequence: turnEvent.seq,
+          latestSequence: observation.nextSequence,
+          type: turnEvent.type,
+          gap: observation.gap,
+        });
+        if (observation.gap) scheduleStreamContinuityRepair(observation.gap);
+        return;
+      }
+      if (observation.disposition === 'drop') {
+        debugLog('[ChatState] Dropping stale runtime turn event', {
+          session: turnSession,
+          sequence: turnEvent.seq,
+          latestSequence: observation.nextSequence,
+          type: turnEvent.type,
+        });
+        return;
+      }
     } else if (data?.type === 'stream_resume' && Array.isArray(data.turnEvents)) {
       const resumeSequence = latestTurnSequence(data.turnEvents);
       if (resumeSequence !== null) portalTurnSequenceRef.current = resumeSequence;
@@ -5008,8 +5130,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           }
         }
         scheduleSessionTelemetryRefresh(400);
-        if (providerUsesPortalStreamBus(providerRef.current)
-          && (providerRef.current !== 'OPENCLAW' || graduatedSegments.length === 0)) {
+        if (providerUsesPortalStreamBus(providerRef.current)) {
           // Durable history is the final authority after a bus-backed turn.
           // This restores provider-side deliveries that were not represented in
           // the live lane and heals any terminal frame lost during reconnect.
@@ -5233,7 +5354,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
 
     scheduleSessionTelemetryRefresh(400);
-    if (providerRef.current === 'OPENCLAW' && graduatedSegments.length === 0) {
+    if (providerRef.current === 'OPENCLAW') {
       schedulePostTurnHistorySync(450, 2500);
     }
   }, [buildGraduatedSegments, clearDirectPendingEmptyFinal, clearPendingTextRender, clearStreamWatchdog, ensureStreamingAssistantBubble, resetDirectSnapshotCursor, resolveCurrentStreamModel, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh]);
@@ -6482,6 +6603,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         });
         setStatusText(null);
       } catch (error: any) {
+        if (isAskUserQuestionNoLongerOpenError(error)) {
+          pendingQuestionComposerAnswerRef.current = null;
+          settlePendingUserQuestion(request.id);
+          setStatusText(null);
+          void refreshPendingUserQuestions().catch(() => undefined);
+          return;
+        }
         pending.inFlight = false;
         pendingQuestionComposerAnswerRef.current = pending;
         setStatusText(
@@ -6522,6 +6650,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     pendingActiveSteerRef.current = null;
     pendingUserQuestionsReadyRef.current = false;
     replacePendingUserQuestions([]);
+
+    // Each accepted user turn starts a fresh backend runtime sequence. This is
+    // required for native providers as well as OpenClaw: some continuations do
+    // not publish a separate run_resumed control frame before seq=1 arrives.
+    portalTurnSequenceRef.current = null;
+    portalTurnSequenceScopeRef.current = `${providerRef.current}:${sessionRef.current || 'main'}`;
 
     // Add user message to UI
     const userMsg: ChatMessage = {
@@ -7018,6 +7152,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             assembledRef.current = '';
             thinkingContentRef.current = '';
             streamSegmentsRef.current = [];
+            if (providerUsesPortalStreamBus(providerRef.current)) {
+              schedulePostTurnHistorySync(450, 2500);
+            }
           } else if (evt.type === 'error') {
             clearStreamWatchdog();
             if (compactionTimerRef.current) {
@@ -7064,7 +7201,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       activeSse.resolveSettled();
     }
-  }, [appendThinkingChunk, applyThinkingSubject, applyCompactionState, applyOpenClawActiveStreamSnapshot, buildGraduatedSegments, clearPendingTextRender, clearStreamWatchdog, getCurrentToolStatusText, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, normalizeAgentError, reconcileIncomingRunEpoch, resetStreamWatchdog, resolveOpenClawSessionKey, setLiveRunPhase, settleCancelledTurn]);
+  }, [appendThinkingChunk, applyThinkingSubject, applyCompactionState, applyOpenClawActiveStreamSnapshot, buildGraduatedSegments, clearPendingTextRender, clearStreamWatchdog, getCurrentToolStatusText, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, normalizeAgentError, reconcileIncomingRunEpoch, resetStreamWatchdog, resolveOpenClawSessionKey, schedulePostTurnHistorySync, setLiveRunPhase, settleCancelledTurn]);
   sendViaSSERef.current = sendViaSSE;
 
   stopActiveSseTransportRef.current = async (reason) => {
@@ -7447,6 +7584,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     dismissApproval,
     provider,
     setProvider,
+    selectProviderAgent,
     session,
     setSession,
     agentId,

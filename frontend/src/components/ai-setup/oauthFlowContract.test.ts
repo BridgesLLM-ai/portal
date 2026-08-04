@@ -30,6 +30,7 @@ describe('structured OAuth flow contract', () => {
       expiresAt: 2_000_000_000,
       finalized: false,
       createdProfileId: 'xai:portal-oauth-test',
+      credentialState: 'committed',
       output: 'SECRET_FROM_RAW_TERMINAL_OUTPUT',
     });
 
@@ -42,6 +43,7 @@ describe('structured OAuth flow contract', () => {
       error: null,
       finalized: false,
       createdProfileId: 'xai:portal-oauth-test',
+      credentialState: 'committed',
     });
     expect(JSON.stringify(state)).not.toContain('SECRET_FROM_RAW_TERMINAL_OUTPUT');
   });
@@ -64,6 +66,7 @@ describe('structured OAuth flow contract', () => {
 
     expect(state).toEqual({
       sessionId: 'recovery-session',
+      code: null,
       error: 'Portal is still reconciling the provider process.',
       cleanupPending: true,
       credentialState: 'indeterminate',

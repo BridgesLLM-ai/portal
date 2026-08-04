@@ -1065,11 +1065,19 @@ export const gatewayAPI = {
     return data;
   },
   answerQuestion: async (id: string, answers: Record<string, string>) => {
-    const { data } = await client.post('/gateway/ask-user/answer', { id, answers });
+    const { data } = await client.post(
+      '/gateway/ask-user/answer',
+      { id, answers },
+      { _silent: true } as any,
+    );
     return data;
   },
   dismissQuestion: async (id: string) => {
-    const { data } = await client.post('/gateway/ask-user/dismiss', { id });
+    const { data } = await client.post(
+      '/gateway/ask-user/dismiss',
+      { id },
+      { _silent: true } as any,
+    );
     return data;
   },
   history: async (session = 'agent:main:main', afterId?: string) => {

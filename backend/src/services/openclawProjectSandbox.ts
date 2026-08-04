@@ -62,6 +62,10 @@ const OPENCLAW_PROJECT_TOOL_ALLOW = Object.freeze([
   'write',
   'edit',
   'apply_patch',
+  // Provider-neutral clarification without widening the Project sandbox to
+  // arbitrary plugin tools. OpenClaw optional tools require an exact name in
+  // the allowlist; deny entries still take precedence over exact allows.
+  'ask_user_question',
 ]);
 
 // Explicit direct names accompany groups because OpenClaw automatically adds
@@ -76,7 +80,6 @@ const OPENCLAW_PROJECT_TOOL_DENY = Object.freeze([
   'group:sessions',
   'group:agents',
   'group:openclaw',
-  'group:plugins',
   'web_search',
   'x_search',
   'web_fetch',

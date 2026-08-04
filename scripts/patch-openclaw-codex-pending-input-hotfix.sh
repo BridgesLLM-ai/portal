@@ -2,8 +2,18 @@
 set -Eeuo pipefail
 
 dist_root="${1:-/usr/lib/node_modules/openclaw/dist}"
+readonly expected_package_name="${PORTAL_REQUIRED_OPENCLAW_PACKAGE_NAME:-openclaw}"
 readonly expected_package_version="${PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION:-2026.7.1-2}"
 readonly strict_mode="${PORTAL_OPENCLAW_PENDING_INPUT_STRICT:-1}"
+
+case "${expected_package_name}" in
+  openclaw|@openclaw/codex) ;;
+  *)
+    printf 'unsupported PORTAL_REQUIRED_OPENCLAW_PACKAGE_NAME value: %s\n' \
+      "${expected_package_name}" >&2
+    exit 2
+    ;;
+esac
 
 case "${strict_mode}" in
   0|1) ;;
@@ -19,7 +29,11 @@ esac
   exit 1
 }
 
-python3 - "${dist_root}" "${expected_package_version}" "${strict_mode}" <<'PY'
+python3 - \
+  "${dist_root}" \
+  "${expected_package_name}" \
+  "${expected_package_version}" \
+  "${strict_mode}" <<'PY'
 from __future__ import annotations
 
 import json
@@ -32,8 +46,9 @@ import tempfile
 
 
 dist = Path(sys.argv[1]).resolve()
-expected_version = sys.argv[2]
-strict = sys.argv[3] == "1"
+expected_name = sys.argv[2]
+expected_version = sys.argv[3]
+strict = sys.argv[4] == "1"
 package_path = dist.parent / "package.json"
 
 
@@ -48,11 +63,18 @@ except Exception as error:
 
 observed_name = package.get("name")
 observed_version = package.get("version")
-if observed_name != "openclaw" or observed_version != expected_version:
+if observed_name != expected_name or observed_version != expected_version:
     fail(
         "refusing to patch untested OpenClaw package "
-        f"{observed_name}@{observed_version}; expected openclaw@{expected_version}"
+        f"{observed_name}@{observed_version}; expected {expected_name}@{expected_version}"
     )
+
+runtime_symbol_name = (
+    "bridgesllm.openclaw.pending-input.codex-plugin.v1"
+    if expected_name == "@openclaw/codex"
+    else "bridgesllm.openclaw.pending-input.v1"
+)
+runtime_log_name = "embeddedAgentLog" if expected_name == "@openclaw/codex" else "log"
 
 structural_markers = (
     "function createCodexUserInputBridge(params) {",
@@ -89,7 +111,7 @@ hotfix_marker = (
 )
 patched_contract = (
     hotfix_marker,
-    'Symbol.for("bridgesllm.openclaw.pending-input.v1")',
+    f'Symbol.for("{runtime_symbol_name}")',
     "bridgesllmRegisterPendingInputRun({",
     "bridgesllmUnregisterPendingInputRun(params.sessionId, params.runId, userInputBridgeRef.current);",
     "answerPending(requestId, text)",
@@ -177,6 +199,10 @@ old_bridge = '''function createCodexUserInputBridge(params) {
 \t\t}
 \t};
 }'''
+old_bridge = old_bridge.replace(
+    '\t\t\t\t\tlog.warn("failed to deliver codex user input prompt", { error });',
+    f'\t\t\t\t\t{runtime_log_name}.warn("failed to deliver codex user input prompt", {{ error }});',
+)
 
 runtime_and_bridge = '''const BRIDGESLLM_PENDING_INPUT_HOTFIX_MARKER = "bridgesllm-openclaw-pending-input-v1";
 const BRIDGESLLM_PENDING_INPUT_SYMBOL = Symbol.for("bridgesllm.openclaw.pending-input.v1");
@@ -461,6 +487,13 @@ function createCodexUserInputBridge(params) {
 \t\t}
 \t};
 }'''
+runtime_and_bridge = runtime_and_bridge.replace(
+    'Symbol.for("bridgesllm.openclaw.pending-input.v1")',
+    f'Symbol.for("{runtime_symbol_name}")',
+).replace(
+    '\t\t\t\t\tlog.warn("failed to deliver codex user input prompt", { error });',
+    f'\t\t\t\t\t{runtime_log_name}.warn("failed to deliver codex user input prompt", {{ error }});',
+)
 
 steering_queue_old = '''\treturn {
 \t\tasync queue(text, options) {

@@ -1,6 +1,7 @@
 export interface TurnSequenceObservation {
   nextSequence: number | null;
   gap: { from: number; to: number } | null;
+  disposition: 'apply' | 'drop' | 'gap';
 }
 
 export function latestTurnSequence(events: readonly unknown[]): number | null {
@@ -17,9 +18,11 @@ export function latestTurnSequence(events: readonly unknown[]): number | null {
 }
 
 /**
- * Observe the Portal's monotonic runtime-turn sequence. Duplicate and
- * out-of-order replay frames are harmless; a forward jump means the browser
- * missed live events and should reconcile from durable history.
+ * Observe the Portal's monotonic runtime-turn sequence. Duplicate and stale
+ * replay frames must be dropped before they mutate the visible timeline. A
+ * forward jump is quarantined without advancing the accepted cursor while
+ * durable history repairs the missing interval. Transport reconnection resets
+ * the baseline explicitly at the call site.
  */
 export function observeTurnSequence(
   previousSequence: number | null,
@@ -28,23 +31,19 @@ export function observeTurnSequence(
   const sequence = typeof incomingSequence === 'number' && Number.isSafeInteger(incomingSequence) && incomingSequence > 0
     ? incomingSequence
     : null;
-  if (sequence === null) return { nextSequence: previousSequence, gap: null };
-  if (previousSequence === null) return { nextSequence: sequence, gap: null };
+  if (sequence === null) return { nextSequence: previousSequence, gap: null, disposition: 'drop' };
+  if (previousSequence === null) return { nextSequence: sequence, gap: null, disposition: 'apply' };
 
-  // The Portal process can restart while the browser remains open. Its in-memory
-  // sequence then restarts at one; that is a new baseline, not a 1→N gap.
-  if (sequence === 1 && previousSequence > 1) {
-    return { nextSequence: sequence, gap: null };
-  }
   if (sequence <= previousSequence) {
-    return { nextSequence: previousSequence, gap: null };
+    return { nextSequence: previousSequence, gap: null, disposition: 'drop' };
   }
   if (sequence === previousSequence + 1) {
-    return { nextSequence: sequence, gap: null };
+    return { nextSequence: sequence, gap: null, disposition: 'apply' };
   }
 
   return {
-    nextSequence: sequence,
+    nextSequence: previousSequence,
     gap: { from: previousSequence + 1, to: sequence - 1 },
+    disposition: 'gap',
   };
 }

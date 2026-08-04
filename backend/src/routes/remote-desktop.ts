@@ -22,6 +22,19 @@ import {
   type RemoteDesktopMutationLease,
 } from '../services/remoteDesktopMutationLock';
 import { assertOpenClawGatewayAuthorizationFenceReleased } from '../services/openClawGatewayAuthorizationFence';
+import {
+  openRemoteDesktopPath,
+  RemoteDesktopOpenPathError,
+  selectOpenClawAgentWorkspace,
+  type RemoteDesktopAgentAuthority,
+  type RemoteDesktopProjectAuthority,
+} from '../services/remoteDesktopOpenPath';
+import {
+  ProjectIdentityLifecycleError,
+  ProjectIdentityMismatchError,
+  readProjectIdentity,
+} from '../services/projectIdentity';
+import { gatewayRpcCall } from '../utils/openclawGatewayRpc';
 
 const router = Router();
 router.use(authenticateToken, requireAdmin);
@@ -1620,6 +1633,133 @@ router.get('/clipboard', async (req: Request, res: Response) => {
     const message = error?.message || 'Failed to read desktop clipboard';
     const statusCode = /xclip|xsel|clipboard tool/i.test(message) ? 503 : 500;
     res.status(statusCode).json({ ok: false, error: message });
+  }
+});
+
+// Open one chat-linked VPS file on the visible Remote Desktop. The browser
+// never receives a host path: this endpoint validates an exact server-owned
+// authority, snapshots the regular file for the unprivileged desktop user,
+// and reports only whether the GUI launch was accepted.
+async function readAgentWorkspaceSnapshot(rawAgentId: unknown) {
+  const result = await gatewayRpcCall('agents.list', {}, 5_000);
+  if (!result.ok) {
+    throw new RemoteDesktopOpenPathError(
+      503,
+      'WORKSPACE_AUTHORITY_UNAVAILABLE',
+      'The OpenClaw Agent workspace authority is unavailable',
+    );
+  }
+  return selectOpenClawAgentWorkspace(result.data?.agents, rawAgentId);
+}
+
+router.post('/open-path', async (req: Request, res: Response) => {
+  try {
+    const source = req.body?.source;
+    let agentAuthority: RemoteDesktopAgentAuthority | undefined;
+    let projectAuthority: RemoteDesktopProjectAuthority | undefined;
+    if (source === 'agent-workspace') {
+      const rawAgentId = req.body?.agent;
+      const authoritySnapshot = await readAgentWorkspaceSnapshot(rawAgentId);
+      agentAuthority = {
+        ...authoritySnapshot,
+        isCurrent: async () => {
+          try {
+            const current = await readAgentWorkspaceSnapshot(rawAgentId);
+            return current.agentId === authoritySnapshot.agentId
+              && current.resolvedWorkspace === authoritySnapshot.resolvedWorkspace;
+          } catch {
+            return false;
+          }
+        },
+      };
+    } else if (source === 'project') {
+      const projectName = req.body?.project;
+      const actorUserId = req.user?.userId;
+      if (
+        !actorUserId
+        || typeof projectName !== 'string'
+        || !projectName
+        || projectName.length > 255
+        || projectName === '.'
+        || projectName === '..'
+        || path.basename(projectName) !== projectName
+        || projectName.includes('\\')
+        || /[\u0000-\u001f\u007f]/.test(projectName)
+      ) {
+        res.status(400).json({ ok: false, code: 'INVALID_PROJECT', error: 'An authorized Project is required' });
+        return;
+      }
+      // Project Chat is actor-scoped even for unsandboxed elevated delegates.
+      // Never resolve through getWorkspaceOwnerId(): that helper intentionally
+      // maps a Sub-admin onto the owner's host-operator workspace.
+      const workspaceOwnerId = actorUserId;
+      const identity = await prisma.projectIdentity.findUnique({
+        where: { workspaceOwnerId_projectName: { workspaceOwnerId, projectName } },
+        select: { canonicalRoot: true },
+      });
+      if (!identity) {
+        res.status(404).json({ ok: false, code: 'PROJECT_NOT_FOUND', error: 'The Project is unavailable' });
+        return;
+      }
+      const attestedIdentity = await readProjectIdentity({
+        workspaceOwnerId,
+        projectName,
+        projectRoot: identity.canonicalRoot,
+      });
+      if (!attestedIdentity) {
+        res.status(404).json({ ok: false, code: 'PROJECT_NOT_FOUND', error: 'The Project is unavailable' });
+        return;
+      }
+      const authoritySnapshot = {
+        identityId: attestedIdentity.id,
+        generation: attestedIdentity.generation,
+        canonicalRoot: attestedIdentity.canonicalRoot,
+        rootDevice: attestedIdentity.rootDevice,
+        rootInode: attestedIdentity.rootInode,
+        rootBirthtimeNs: attestedIdentity.rootBirthtimeNs,
+      };
+      projectAuthority = {
+        ...authoritySnapshot,
+        isCurrent: async () => {
+          const current = await readProjectIdentity({
+            workspaceOwnerId,
+            projectName,
+            projectRoot: authoritySnapshot.canonicalRoot,
+          });
+          return Boolean(
+            current
+            && current.id === authoritySnapshot.identityId
+            && current.generation === authoritySnapshot.generation
+            && current.canonicalRoot === authoritySnapshot.canonicalRoot
+            && current.rootDevice === authoritySnapshot.rootDevice
+            && current.rootInode === authoritySnapshot.rootInode
+            && current.rootBirthtimeNs === authoritySnapshot.rootBirthtimeNs,
+          );
+        },
+      };
+    }
+
+    const result = await openRemoteDesktopPath({
+      source,
+      path: req.body?.path,
+      agent: req.body?.agent,
+      line: req.body?.line,
+      column: req.body?.column,
+      agentAuthority,
+      projectAuthority,
+    });
+    res.status(202).json(result);
+  } catch (error: any) {
+    if (error instanceof RemoteDesktopOpenPathError) {
+      res.status(error.statusCode).json({ ok: false, code: error.code, error: error.message });
+      return;
+    }
+    if (error instanceof ProjectIdentityMismatchError || error instanceof ProjectIdentityLifecycleError) {
+      res.status(409).json({ ok: false, code: error.code, error: 'The Project authority changed; reload and try again' });
+      return;
+    }
+    console.error('[Remote Desktop] open-path request failed before launch', error?.name || 'UnknownError');
+    res.status(500).json({ ok: false, code: 'OPEN_PATH_FAILED', error: 'The linked file could not be opened safely' });
   }
 });
 

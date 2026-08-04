@@ -211,7 +211,7 @@ describe('ask-user exact active-run ownership', () => {
     });
   });
 
-  test('fails closed when one actor/session has two dispatched run claims', async () => {
+  test('lets the exact runtime disambiguate an older unresolved run on the same session', async () => {
     const evidence = agentEvidence();
     evidence.openClawHostRun = [
       ...(evidence.openClawHostRun || []),
@@ -224,10 +224,18 @@ describe('ask-user exact active-run ownership', () => {
     await expect(discoverAskUserQuestionRunsForActor({
       actorUserId: 'user-1',
       sessionKey: agentIdentity.sessionKey,
-    }, databaseWithEvidence(evidence))).rejects.toMatchObject({
-      code: 'ASK_USER_RUN_AMBIGUOUS',
-      statusCode: 409,
-    });
+    }, databaseWithEvidence(evidence))).resolves.toEqual([
+      expect.objectContaining({
+        sessionKey: agentIdentity.sessionKey,
+        runId: agentIdentity.runId,
+        authorityId: 'host-run-1',
+      }),
+      expect.objectContaining({
+        sessionKey: agentIdentity.sessionKey,
+        runId: 'upstream-run-2',
+        authorityId: 'host-run-2',
+      }),
+    ]);
   });
 
   test('binds a Project Chat question only to its active turn and durable project authority', async () => {

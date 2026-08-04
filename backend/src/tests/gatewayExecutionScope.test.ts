@@ -131,6 +131,7 @@ describe('Agent Chat execution boundary', () => {
     streamEventBus.clearStream('openclaw-abort-race');
     streamEventBus.clearStream('terminal-global-fanout-done');
     streamEventBus.clearStream('terminal-global-fanout-error');
+    streamEventBus.clearStream('native-reconnect-completed');
     jest.restoreAllMocks();
   });
 
@@ -1380,6 +1381,35 @@ describe('Agent Chat execution boundary', () => {
     }));
     expect(payloads.filter((payload) => payload.type === 'text' && payload.content === 'continued')).toHaveLength(1);
     expect(payloads.filter((payload) => payload.type === 'done')).toHaveLength(1);
+  });
+
+  test('host-native CLI reconnect reports a completed run as safe to clear', async () => {
+    const sessionId = 'native-reconnect-completed';
+    const runId = 'run-native-reconnect-completed';
+    streamEventBus.startStream(sessionId, runId, { provenance: 'via Codex CLI' });
+    streamEventBus.publish(sessionId, { type: 'text', content: 'Completed while disconnected', runId });
+    streamEventBus.publish(sessionId, { type: 'done', content: 'Completed while disconnected', runId });
+    streamEventBus.softClearStream(sessionId, runId);
+
+    const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
+    socket.readyState = 1;
+    socket.send = jest.fn();
+    await __gatewayExecutionScopeTest.handleWsReconnect(
+      socket as any,
+      { session: sessionId, provider: 'CODEX' },
+      { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER' } as any,
+    );
+
+    const payloads = socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
+    expect(payloads).toEqual([
+      expect.objectContaining({
+        type: 'stream_status',
+        sessionKey: sessionId,
+        active: false,
+        inactiveReason: 'terminal',
+        safeToClear: true,
+      }),
+    ]);
   });
 
   test('OpenClaw reconnect suppresses preliminary errors without losing recovered completion', () => {

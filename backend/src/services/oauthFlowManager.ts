@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 import { createHash, randomBytes } from 'crypto';
-import { execFileSync, execSync } from 'child_process';
+import { execFileSync, execSync, spawnSync } from 'child_process';
 import {
   AUTH_PROFILES_PATH,
   invalidateOpenClawAuthStoreProfilesCache,
@@ -34,6 +34,14 @@ import {
 export type OAuthFlowStatus = 'starting' | 'awaiting_callback' | 'polling_device' | 'processing' | 'complete' | 'cancelled' | 'expired' | 'error';
 export type OAuthCompletionResult = { success: boolean; error?: string };
 type NativeCredentialProvider = 'CLAUDE_CODE' | 'CODEX' | 'GEMINI' | 'GROK';
+export type CodexLoginStatus = 'authenticated' | 'signed_out' | 'indeterminate';
+
+export interface NativeCliStartOptions {
+  forceReauth?: boolean;
+  ownerId?: string;
+  /** Test seam for the local, read-only `codex login status` probe. */
+  codexLoginStatusProbe?: () => CodexLoginStatus;
+}
 
 export interface NativeCliCompletionDependencies {
   fetchImpl?: typeof globalThis.fetch;
@@ -1700,6 +1708,12 @@ function updateSessionFromOutput(session: OAuthSession) {
   }
 
   if (/successfully logged in|login complete|authentication complete|oauth complete|provider added|saved profile|setup.token.*generated|token.*saved|successfully authenticated|auth profile:|default model available:/i.test(normalizedText)) {
+    if (session.provider === 'codex' && session.nativeCredentialProvider === 'CODEX') {
+      // Codex prints success before its process-exit credential proof. Keep
+      // the flow non-terminal until onExit verifies the resolved auth file.
+      session.status = 'processing';
+      return;
+    }
     session.status = 'complete';
     session.completedAt = Date.now();
     clearOAuthSessionExpiryTimer(session);
@@ -2624,6 +2638,13 @@ export function getOAuthFlowStatus(sessionId: string, ownerId?: string) {
     expireOAuthSessionRecord(session);
   }
 
+  // Native CLI sessions are attested against their own credential stores.
+  // An unrelated existing OpenClaw profile must never complete or classify
+  // one of these flows before the native process-exit proof.
+  if (session.nativeCredentialProvider) {
+    return buildOAuthFlowStatusPayload(session, null);
+  }
+
   // Bypass the normal status cache while OpenClaw is committing the profile.
   if (session.provider !== 'xai'
     && (session.status === 'complete' || session.status === 'processing' || session.processExited)) {
@@ -2745,10 +2766,17 @@ export function commitClaudeSetupTokenCredential(
 export function markOAuthFlowFinalizationError(sessionId: string, detail: string): boolean {
   const session = sessions.get(sessionId);
   if (!session) return false;
+  // Reaching finalization means the credential write was already attested.
+  // Preserve that committed truth even when model registration or gateway
+  // recovery fails, otherwise cleanup remains pending forever and the
+  // credential-domain lease blocks every future repair attempt.
+  session.credentialResolution = 'committed';
+  session.finalizationPending = false;
   session.status = 'error';
   session.error = `The provider credential was saved, but Portal finalization failed: ${String(detail || 'unknown error').slice(0, 600)}`;
   session.completedAt = Date.now();
   clearOAuthSessionExpiryTimer(session);
+  releaseCredentialLifecycleLease(session, true);
   return true;
 }
 
@@ -3353,7 +3381,69 @@ export async function saveClaudeToken(token: string) {
 // their own credential stores separate from OpenClaw auth profiles.
 
 const HOME_DIR = process.env.HOME || '/root';
-const CODEX_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
+
+/**
+ * Convert known Codex device-login failures into fixed, actionable messages.
+ * Never reflect raw PTY output: it can contain a device code or provider data.
+ */
+export function classifyCodexDeviceLoginError(output: string): string | null {
+  const text = String(output || '');
+  if (/device code login is not enabled/i.test(text)) {
+    return 'Codex device login is disabled. Enable device code login in your personal ChatGPT Security settings or ask your workspace admin to enable it in Permissions, then try again.';
+  }
+  if (/access[_ -]?denied|authorization (?:was )?denied|request denied/i.test(text)) {
+    return 'OpenAI authorization was denied. Start a fresh Codex sign-in when you are ready to approve it.';
+  }
+  if (/device (?:authorization|code).*(?:expired|timed out)|authorization (?:expired|timed out)/i.test(text)) {
+    return 'The OpenAI device authorization expired. Start a fresh Codex sign-in to get a new code.';
+  }
+  if (/certificate|unknown issuer|self[- ]signed|tls handshake|ssl/i.test(text)) {
+    return 'Codex could not establish a trusted TLS connection to OpenAI. Check the server trust store or configure CODEX_CA_CERTIFICATE, then retry.';
+  }
+  if (/network|dns|name resolution|failed to (?:connect|send request)|connection (?:refused|reset)|timed out connecting/i.test(text)) {
+    return 'Codex could not reach OpenAI. Check this server\'s network, DNS, and proxy settings, then retry.';
+  }
+  return null;
+}
+
+export class CodexReauthenticationRequiredError extends Error {
+  readonly statusCode = 409;
+  readonly code = 'CODEX_REAUTHENTICATION_REQUIRED';
+}
+
+const CODEX_FILE_AUTH_CONFIG = 'cli_auth_credentials_store="file"';
+const CODEX_OAUTH_NETWORK_ENV_KEYS = [
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'all_proxy',
+  'no_proxy',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'NODE_EXTRA_CA_CERTS',
+  'CODEX_CA_CERTIFICATE',
+] as const;
+
+interface CodexLoginStatusCommandResult {
+  status: number | null;
+  signal?: string | null;
+  stdout?: string | Buffer | null;
+  stderr?: string | Buffer | null;
+  error?: Error;
+}
+
+export function buildCodexOAuthEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = buildNativeCliEnvironment('CODEX', source);
+  delete env.OPENAI_API_KEY;
+  for (const key of CODEX_OAUTH_NETWORK_ENV_KEYS) {
+    const value = source[key];
+    if (typeof value === 'string' && value.length > 0) env[key] = value;
+  }
+  return env;
+}
 
 function nativeClaudeCredentialsPath(): string {
   return resolveNativeCliCredentialPaths('CLAUDE_CODE')[0]
@@ -3366,6 +3456,40 @@ function findCliBin(command: string): string {
     return execSync(`which ${command}`, { encoding: 'utf-8' }).trim() || command;
   } catch {
     return command;
+  }
+}
+
+export function probeCodexLoginStatus(
+  codexBin = findCliBin('codex'),
+  runner: (file: string, args: string[], options: Record<string, unknown>) => CodexLoginStatusCommandResult = (
+    file,
+    args,
+    options,
+  ) => spawnSync(file, args, options as any),
+): CodexLoginStatus {
+  const env = buildCodexOAuthEnvironment();
+  // This probe must attest auth.json itself. An inherited API key or an
+  // automatic keyring lookup would make "authenticated" refer to a different
+  // credential than the one Portal can bridge into OpenClaw.
+  try {
+    const result = runner(codexBin, ['login', '-c', CODEX_FILE_AUTH_CONFIG, 'status'], {
+      encoding: 'utf8',
+      env,
+      timeout: 8_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const output = `${String(result?.stdout || '')}\n${String(result?.stderr || '')}`.trim();
+    if (!result?.error && !result?.signal && result?.status === 0 && output === 'Logged in using ChatGPT') {
+      return 'authenticated';
+    }
+    // Codex also exits 1 for keyring/config/storage failures. Only its exact,
+    // non-secret signed-out response is absence proof.
+    if (!result?.error && !result?.signal && result?.status === 1 && output === 'Not logged in') {
+      return 'signed_out';
+    }
+    return 'indeterminate';
+  } catch {
+    return 'indeterminate';
   }
 }
 
@@ -3385,6 +3509,26 @@ function checkCredentialFile(filePath: string, requiredKeys: string[]): boolean 
   } catch {
     return false;
   }
+}
+
+export function attestCodexCredentialFile(filePath: string): 'committed' | 'absent' | 'indeterminate' {
+  if (captureNativeCredentialSnapshot([filePath]).state !== 'verified') return 'indeterminate';
+  try {
+    if (!fs.lstatSync(filePath).isFile()) return 'indeterminate';
+  } catch (error: any) {
+    return error?.code === 'ENOENT' ? 'absent' : 'indeterminate';
+  }
+  const parsed = safeReadJson(filePath);
+  const hasUsableCredential = Boolean(
+    parsed?.tokens?.access_token
+      || parsed?.tokens?.refresh_token
+      || (typeof parsed?.OPENAI_API_KEY === 'string' && parsed.OPENAI_API_KEY.trim())
+      || (parsed?.OPENAI_API_KEY && typeof parsed.OPENAI_API_KEY === 'object' && Object.keys(parsed.OPENAI_API_KEY).length > 0),
+  );
+  // An existing file with malformed or unfamiliar content is not proof that
+  // no credential exists. Codex clears auth before device login, so only an
+  // actually missing file may admit ordinary destructive authentication.
+  return hasUsableCredential ? 'committed' : 'indeterminate';
 }
 
 function checkAntigravityCredentials(): boolean {
@@ -3464,7 +3608,7 @@ function checkGrokCredentials(): boolean {
 async function startNativeCliFlowCore(
   provider: 'claude-code' | 'codex' | 'gemini' | 'grok',
   bindSession: CredentialLifecycleSessionBinder,
-  options: { forceReauth?: boolean; ownerId?: string } = {},
+  options: NativeCliStartOptions = {},
 ) {
   const id = createSessionId();
   let session: OAuthSession;
@@ -3529,16 +3673,90 @@ async function startNativeCliFlowCore(
     case 'codex': {
       const codexBin = findCliBin('codex');
       const nativeCredentialPaths = resolveNativeCliCredentialPaths('CODEX');
+      const credentialSnapshotBeforeProbe = captureNativeCredentialSnapshot(nativeCredentialPaths);
+      const codexAuthPath = nativeCredentialPaths[0];
+      const loginStatus = (options.codexLoginStatusProbe || (() => probeCodexLoginStatus(codexBin)))();
       const nativeCredentialSnapshotBefore = captureNativeCredentialSnapshot(nativeCredentialPaths);
+      const credentialPathStable = credentialSnapshotBeforeProbe.state === 'verified'
+        && nativeCredentialSnapshotBefore.state === 'verified'
+        && credentialSnapshotBeforeProbe.fingerprint === nativeCredentialSnapshotBefore.fingerprint;
+      const fileCredentialState = credentialPathStable && codexAuthPath
+        ? attestCodexCredentialFile(codexAuthPath)
+        : 'indeterminate';
+      const alreadyAuthenticated = loginStatus === 'authenticated'
+        || fileCredentialState === 'committed';
+
+      if (!options.forceReauth && loginStatus === 'authenticated' && fileCredentialState === 'committed') {
+        session = {
+          id,
+          provider: 'codex',
+          mode: 'device_code',
+          ownerId: options.ownerId,
+          process: null as any,
+          authUrl: null,
+          callbackHintUrl: null,
+          deviceCode: null,
+          verificationUrl: null,
+          localPort: null,
+          oauthState: null,
+          status: 'complete',
+          error: null,
+          output: '',
+          cleanOutput: '',
+          createdAt: Date.now(),
+          completedAt: Date.now(),
+          profileKeyBefore: [],
+          sentInitialConfirm: false,
+          processExited: true,
+          processExitCode: 0,
+          processExitedAt: Date.now(),
+          nativeCredentialProvider: 'CODEX',
+          nativeCredentialPaths,
+          nativeCredentialSnapshotBefore,
+          credentialResolution: 'committed',
+          alreadyAuthenticated: true,
+          reauthSupported: true,
+        };
+        sessions.set(id, session);
+        bindSession(session);
+        console.log('[NativeCLI] Reusing an attested existing Codex login');
+        break;
+      }
+
+      if (!options.forceReauth && (
+        loginStatus === 'authenticated'
+        || loginStatus === 'indeterminate'
+        || fileCredentialState === 'committed'
+        || fileCredentialState === 'indeterminate'
+      )) {
+        if (loginStatus === 'authenticated' && fileCredentialState !== 'committed') {
+          throw new CodexReauthenticationRequiredError(
+            'Codex is already authenticated, but Portal cannot bridge its current credential to OpenClaw because no usable file-backed auth.json was attested. Configure Codex credential storage to file, then use the explicit replacement action.',
+          );
+        }
+        if (fileCredentialState === 'committed') {
+          throw new CodexReauthenticationRequiredError(
+            'Portal found an existing Codex credential that the Codex CLI did not confirm. Ordinary setup stopped before it could delete that credential. Review it or use the explicit replacement action.',
+          );
+        }
+        if (loginStatus === 'indeterminate') {
+          throw new CodexReauthenticationRequiredError(
+            'Portal could not verify whether Codex is already signed in. Ordinary setup stopped before running destructive reauthentication. Repair the Codex CLI status check or use the explicit replacement action.',
+          );
+        }
+        throw new CodexReauthenticationRequiredError(
+          'Portal could not safely inspect the existing Codex credential path. Ordinary setup stopped before running Codex reauthentication. Review the credential path before replacing it.',
+        );
+      }
       console.log(`[NativeCLI] Starting Codex login, binary=${codexBin}`);
-      
-      const proc = spawnCredentialGatedPty(codexBin, ['login', '--device-auth'], {
+      const codexLoginEnv = buildCodexOAuthEnvironment();
+      const proc = spawnCredentialGatedPty(codexBin, ['login', '-c', CODEX_FILE_AUTH_CONFIG, '--device-auth'], {
         name: 'xterm-256color',
         cols: 120,
         rows: 40,
         cwd: process.cwd(),
         env: {
-          ...process.env,
+          ...codexLoginEnv,
           BROWSER: '/bin/false',
           PORTAL_CREDENTIAL_LIFECYCLE_MARKER: bindSession.leaseId,
         } as Record<string, string>,
@@ -3567,6 +3785,8 @@ async function startNativeCliFlowCore(
         nativeCredentialProvider: 'CODEX',
         nativeCredentialPaths,
         nativeCredentialSnapshotBefore,
+        alreadyAuthenticated,
+        reauthSupported: true,
       };
 
       sessions.set(id, session);
@@ -3582,13 +3802,51 @@ async function startNativeCliFlowCore(
         recordOAuthProcessExit(session, exitCode);
         console.log(`[NativeCLI] Codex PTY exited: code=${exitCode} status=${session.status}`);
         if (isTerminalOAuthStop(session)) return;
-        if (checkCredentialFile(CODEX_AUTH_PATH, ['tokens.access_token'])) {
+        const codexAuthPath = session.nativeCredentialPaths?.[0]
+          || resolveNativeCliCredentialPaths('CODEX')[0];
+        const credentialState = codexAuthPath
+          ? attestCodexCredentialFile(codexAuthPath)
+          : 'indeterminate';
+        const mutationState = nativeCredentialMutationState(session);
+        const credentialCommitted = exitCode === 0
+          && mutationState === 'committed'
+          && credentialState === 'committed';
+        if (credentialCommitted) {
+          session.credentialResolution = 'committed';
           session.status = 'complete';
+          session.error = null;
           session.completedAt = Date.now();
+          clearOAuthSessionExpiryTimer(session);
           console.log('[NativeCLI] Codex credentials verified');
-        } else if (session.status !== 'complete' && !session.error) {
+        } else {
+          const changedUsableCredential = mutationState === 'committed'
+            && credentialState === 'committed';
+          const proofIndeterminate = mutationState === 'indeterminate'
+            || mutationState === 'not_applicable'
+            || credentialState === 'indeterminate';
+          session.credentialResolution = changedUsableCredential
+            ? 'committed'
+            : proofIndeterminate
+              ? 'indeterminate'
+              : 'absent';
           session.status = 'error';
-          session.error = `Codex CLI exited with code ${exitCode}`;
+          session.error = classifyCodexDeviceLoginError(session.cleanOutput)
+            || (changedUsableCredential
+              ? `Codex wrote a usable credential, but the CLI exited with code ${exitCode}. Review or remove that credential before retrying.`
+              : proofIndeterminate
+              ? 'Portal could not safely attest the Codex credential file after login.'
+              : 'Codex login ended without committing a new usable file-backed credential. OpenClaw requires Codex file credential storage; configure Codex to store credentials in auth.json, then retry.');
+          session.completedAt = Date.now();
+          clearOAuthSessionExpiryTimer(session);
+          if (session.credentialResolution === 'committed') {
+            // The credential mutation is authoritative even though the CLI
+            // did not exit cleanly. Commit and release the operation lease so
+            // the user gets an honest review state instead of a hidden 409 on
+            // every future repair attempt.
+            releaseCredentialLifecycleLease(session, true);
+          } else if (session.credentialResolution === 'absent') {
+            releaseCredentialLifecycleLease(session);
+          }
         }
       });
 
@@ -3831,7 +4089,7 @@ async function startNativeCliFlowCore(
 
 export async function startNativeCliFlow(
   provider: 'claude-code' | 'codex' | 'gemini' | 'grok',
-  options: { forceReauth?: boolean; ownerId?: string } = {},
+  options: NativeCliStartOptions = {},
 ) {
   const domain = credentialLifecycleDomainForNative(provider);
   const namespace = `credential-domain:${domain.key}`;

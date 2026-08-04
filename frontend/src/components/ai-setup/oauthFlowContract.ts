@@ -10,11 +10,13 @@ export interface StructuredOAuthFlowState {
   finalized: boolean | null;
   finalizationWarning: string | null;
   createdProfileId: string | null;
+  credentialState: 'absent' | 'committed' | 'indeterminate' | null;
   cleanupPending: boolean;
 }
 
 export interface StructuredOAuthStartFailure {
   sessionId: string | null;
+  code: string | null;
   error: string | null;
   cleanupPending: boolean;
   credentialState: 'absent' | 'committed' | 'indeterminate' | null;
@@ -115,6 +117,11 @@ export function readStructuredOAuthFlowState(payload: unknown): StructuredOAuthF
     finalized: typeof data.finalized === 'boolean' ? data.finalized : null,
     finalizationWarning: readNonEmptyString(data.finalizationWarning),
     createdProfileId: readNonEmptyString(data.createdProfileId),
+    credentialState: data.credentialState === 'absent'
+      || data.credentialState === 'committed'
+      || data.credentialState === 'indeterminate'
+      ? data.credentialState
+      : null,
     cleanupPending: data.cleanupPending === true,
   };
 }
@@ -126,6 +133,9 @@ export function readStructuredOAuthFlowState(payload: unknown): StructuredOAuthF
  */
 export function readStructuredOAuthStartFailure(payload: unknown): StructuredOAuthStartFailure {
   const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
+  const code = data.code === 'CODEX_REAUTHENTICATION_REQUIRED'
+    ? data.code
+    : null;
   const credentialState = data.credentialState === 'absent'
     || data.credentialState === 'committed'
     || data.credentialState === 'indeterminate'
@@ -134,6 +144,7 @@ export function readStructuredOAuthStartFailure(payload: unknown): StructuredOAu
 
   return {
     sessionId: readNonEmptyString(data.sessionId) || readNonEmptyString(data.id),
+    code,
     error: readNonEmptyString(data.error),
     cleanupPending: data.cleanupPending === true,
     credentialState,

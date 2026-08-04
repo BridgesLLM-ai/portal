@@ -3,6 +3,9 @@
   "activation": {
     "onStartup": true
   },
+  "contracts": {
+    "tools": ["ask_user_question"]
+  },
   "enabledByDefault": false,
   "configSchema": {
     "type": "object",

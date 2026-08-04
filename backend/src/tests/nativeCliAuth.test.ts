@@ -103,7 +103,10 @@ describe('native CLI custom credential homes', () => {
     }), { mode: 0o600 });
     process.env.CODEX_HOME = codexHome;
     try {
-      expect(getNativeCliAuthStatus('CODEX')).toMatchObject({ status: 'authenticated' });
+      expect(getNativeCliAuthStatus('CODEX')).toMatchObject({
+        status: 'authenticated',
+        loginCommand: 'codex login',
+      });
     } finally {
       if (previous === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = previous;

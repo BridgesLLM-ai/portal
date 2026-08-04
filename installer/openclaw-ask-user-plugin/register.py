@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Register the BridgesLLM pending-user-input plugin with OpenClaw.
+"""Register the BridgesLLM ask-user plugin with OpenClaw.
 
 Merges into the existing OpenClaw config rather than replacing it: the file is
 shared with every other plugin and with the operator's own settings.
@@ -45,11 +45,11 @@ def main() -> int:
 
     entry = entries.setdefault(PLUGIN_ID, {})
     entry["enabled"] = True
-    # Version 1 used a loopback HTTP broker and a before_tool_call timeout.
-    # Codex requestUserInput bypasses that hook. Remove those stale settings so
-    # the empty v3 schema loads cleanly and no gateway token remains duplicated
-    # in plugin configuration. A positional token is accepted and ignored for
-    # compatibility with older installers.
+    # Version 1 used a loopback HTTP broker and a blocking before_tool_call
+    # hook. Remove those stale settings so the empty v3 schema loads cleanly
+    # and no gateway token remains duplicated in plugin configuration. A
+    # positional token is accepted and ignored for compatibility with older
+    # installers.
     entry["config"] = {}
     entry.pop("hooks", None)
 

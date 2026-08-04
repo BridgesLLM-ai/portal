@@ -468,6 +468,32 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
     expect(provider.hasActiveRun(sessionId)).toBe(false);
   });
 
+  test('soft-clears a completed provider run for authoritative reconnect recovery', async () => {
+    const child = queueChild();
+    const provider = new TestNativeProvider(adapter());
+    const sessionId = createSession();
+    const send = provider.sendMessage(
+      sessionId,
+      'complete while the browser may be disconnected',
+      undefined,
+      undefined,
+      undefined,
+      { label: 'owner', userId: 'owner-1', role: 'OWNER', requestId: 'reconnect-terminal-run' },
+    );
+    await waitFor(() => spawnMock.mock.calls.length === 1, 'child was not spawned');
+
+    child.stdout.emit('data', Buffer.from('authoritative completion\n'));
+    child.emit('close', 0, null);
+    await expect(send).resolves.toMatchObject({ fullText: 'authoritative completion' });
+
+    expect(streamEventBus.getStreamStatus(sessionId)).toBeNull();
+    expect(streamEventBus.getTrackedStream(sessionId)).toMatchObject({
+      active: false,
+      runId: 'reconnect-terminal-run',
+      lastDoneAt: expect.any(Number),
+    });
+  });
+
   test.each([
     ['stdout parser', 'false' as const],
     ['stderr parser', 'error' as const],

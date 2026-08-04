@@ -80,4 +80,20 @@ describe('gatewayAPI.patchSessionModel', () => {
       params: { provider: 'CODEX' },
     });
   });
+
+  it('keeps expected cross-tab ask-user settlement races out of the global error panel', async () => {
+    await gatewayAPI.answerQuestion('askq-1', { choice: 'Alpha' });
+    expect(mocks.post).toHaveBeenLastCalledWith(
+      '/gateway/ask-user/answer',
+      { id: 'askq-1', answers: { choice: 'Alpha' } },
+      expect.objectContaining({ _silent: true }),
+    );
+
+    await gatewayAPI.dismissQuestion('askq-1');
+    expect(mocks.post).toHaveBeenLastCalledWith(
+      '/gateway/ask-user/dismiss',
+      { id: 'askq-1' },
+      expect.objectContaining({ _silent: true }),
+    );
+  });
 });

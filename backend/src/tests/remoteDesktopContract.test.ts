@@ -247,4 +247,30 @@ describe('Remote Desktop release contract', () => {
     expect(route).toContain('websockifyProcessHardened: websockifyProcessPolicy.hardened');
     expect(route).toContain('externalUrlSafe');
   });
+
+  test('chat-linked host files retain elevated, snapshot-only, shell-free opening', () => {
+    const route = readRepo('backend/src/routes/remote-desktop.ts');
+    const service = readRepo('backend/src/services/remoteDesktopOpenPath.ts');
+    const desktopEnv = readRepo('backend/src/utils/desktopEnv.ts');
+    const server = readRepo('backend/src/server.ts');
+
+    expect(route.indexOf('router.use(authenticateToken, requireAdmin)'))
+      .toBeLessThan(route.indexOf("router.post('/open-path'"));
+    expect(route).toContain('const workspaceOwnerId = actorUserId;');
+    expect(route).not.toContain('getWorkspaceOwnerId(req.user!)');
+    expect(route).toContain("gatewayRpcCall('agents.list', {}, 5_000)");
+    expect(route).toContain('selectOpenClawAgentWorkspace(result.data?.agents, rawAgentId)');
+    expect(service).toContain("export const REMOTE_DESKTOP_OPEN_ROOT = '/var/lib/bridgesllm/remote-desktop-open'");
+    expect(service).toContain('The RPC result is the only workspace authority accepted here.');
+    expect(service).not.toContain('readConfiguredAgentWorkspaceRoots');
+    expect(service).not.toContain('openClawConfigPath');
+    expect(service).toContain('fs.constants.O_NOFOLLOW');
+    expect(service).toContain('sameFileIdentity(admission.stat, openedStat)');
+    expect(service).toContain("targetType: 'file'");
+    expect(service).not.toContain("targetType: 'directory'");
+    expect(desktopEnv).toContain('managedDesktopSystemdRunArgv');
+    expect(desktopEnv).toContain("'--',\n    executable,\n    ...args");
+    expect(server).toContain('await startRemoteDesktopOpenPathCleanup()');
+    expect(server).toContain('stopRemoteDesktopOpenPathCleanup();');
+  });
 });

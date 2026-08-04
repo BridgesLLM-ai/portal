@@ -34,6 +34,10 @@ export interface RuntimeTurnEvent {
   terminal?: boolean;
   visible?: boolean;
   tool?: RuntimeTurnEventTool;
+  source?: {
+    transport?: string;
+    eventType?: string;
+  };
 }
 
 export interface PortalStreamEventFromTurnEvent {
@@ -91,7 +95,15 @@ export function normalizePortalStreamEventFromTurnEvent<T extends Record<string,
   const turnEvent = payload?.turnEvent;
   if (!isRuntimeTurnEvent(turnEvent)) return payload as T & PortalStreamEventFromTurnEvent;
 
-  const mappedType = mapRuntimeTurnEventToPortalType(turnEvent) || (typeof payload?.type === 'string' ? payload.type : '');
+  const sourceEventType = typeof turnEvent.source?.eventType === 'string'
+    ? turnEvent.source.eventType
+    : '';
+  const preservedControlType = ['run_resumed', 'compaction_start', 'compaction_end'].includes(sourceEventType)
+    ? sourceEventType
+    : '';
+  const mappedType = preservedControlType
+    || mapRuntimeTurnEventToPortalType(turnEvent)
+    || (typeof payload?.type === 'string' ? payload.type : '');
   if (!mappedType) return payload as T & PortalStreamEventFromTurnEvent;
 
   const text = typeof turnEvent.text === 'string' ? turnEvent.text : '';

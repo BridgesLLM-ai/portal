@@ -439,8 +439,10 @@ export default function FilesPage() {
     const match = files.find((file) => {
       if (requestedId && file.id === requestedId) return true;
       if (!normalizedRequestedPath) return false;
-      return file.path === normalizedRequestedPath
-        || normalizedRequestedPath.endsWith(`/${file.path}`);
+      // Only a stored relative path can be matched locally. Physical storage
+      // paths must pass through the backend's exact actor/root resolver;
+      // basename or suffix matching can select the wrong owner's file.
+      return file.path === normalizedRequestedPath;
     });
 
     if (match) {

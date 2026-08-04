@@ -13,6 +13,7 @@ import {
   UnsupportedProjectChatProviderError,
   assertProjectChatProviderSelectable,
   buildProjectChatCapabilityResponse,
+  buildQualifiedProjectChatProviderCapability,
   buildProjectSandboxExecutionContext,
   buildDiscoveryProjectSandboxExecutionContext,
   buildUnqualifiedProjectSandboxExecutionContext,
@@ -878,6 +879,25 @@ describe('Project Chat provider bindings', () => {
 });
 
 describe('Project Chat provider switching', () => {
+  test('resumes the provider-specific binding when a project switches back', () => {
+    const plan = planProjectChatProviderSwitch({
+      activeProvider: 'CODEX',
+      requestedProvider: 'OPENCLAW',
+      boundProviders: ['CODEX', 'OPENCLAW'],
+      qualifiedCapability: buildQualifiedProjectChatProviderCapability(
+        'OPENCLAW',
+        'Current project qualification is valid.',
+      ),
+    });
+
+    expect(plan).toMatchObject({
+      previousProvider: 'CODEX',
+      requestedProvider: 'OPENCLAW',
+      action: 'resume',
+      preservePortalTranscript: true,
+    });
+  });
+
   test('builds a bounded, quoted handoff from the latest Portal transcript', () => {
     const messages = Array.from({ length: 20 }, (_, index) => ({
       role: index === 3 ? 'system' : index % 2 === 0 ? 'user' : 'assistant',

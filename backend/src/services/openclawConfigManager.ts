@@ -3,6 +3,7 @@ import path from 'path';
 import { execFile, execFileSync } from 'child_process';
 import { isDeepStrictEqual } from 'util';
 import type { AgentProviderName } from '../agents/AgentProvider.interface';
+import { resolveNativeCliCredentialPaths } from '../agents/providers/native/NativeCliEnvironment';
 import {
   getNativeCliAuthStatus,
   getNativeCliAuthStatusAsync,
@@ -24,7 +25,6 @@ export const CONFIG_PATH = path.join(OPENCLAW_HOME, 'openclaw.json');
 export const AUTH_PROFILES_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'auth-profiles.json');
 export const MODELS_JSON_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'models.json');
 export const CODEX_EXTERNAL_CLI_PROFILE_ID = 'openai:codex-cli';
-export const CODEX_CLI_AUTH_PATH = path.join(HOME_DIR, '.codex', 'auth.json');
 export const OPENCLAW_CODEX_HOME_AUTH_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'codex-home', 'auth.json');
 export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.7.1-1';
 const LEGACY_OPENCLAW_HOME = path.join(HOME_DIR, '.clawdbot');
@@ -1595,8 +1595,9 @@ function removeLegacyCodexProfiles(profiles: Record<string, any> | undefined, ke
 }
 
 export function syncCodexCliAuthToOpenClawCodexHome(): boolean {
-  if (!fs.existsSync(CODEX_CLI_AUTH_PATH)) return false;
-  const parsed = safeReadJson<any>(CODEX_CLI_AUTH_PATH, null);
+  const [codexCliAuthPath] = resolveNativeCliCredentialPaths('CODEX');
+  if (!codexCliAuthPath || !fs.existsSync(codexCliAuthPath)) return false;
+  const parsed = safeReadJson<any>(codexCliAuthPath, null);
   const hasUsableCredential = Boolean(
     parsed?.tokens?.access_token
       || parsed?.tokens?.refresh_token
@@ -1606,7 +1607,7 @@ export function syncCodexCliAuthToOpenClawCodexHome(): boolean {
   if (!hasUsableCredential) return false;
 
   fs.mkdirSync(path.dirname(OPENCLAW_CODEX_HOME_AUTH_PATH), { recursive: true });
-  fs.copyFileSync(CODEX_CLI_AUTH_PATH, OPENCLAW_CODEX_HOME_AUTH_PATH);
+  fs.copyFileSync(codexCliAuthPath, OPENCLAW_CODEX_HOME_AUTH_PATH);
   try {
     fs.chmodSync(OPENCLAW_CODEX_HOME_AUTH_PATH, 0o600);
   } catch {
@@ -1623,6 +1624,9 @@ export function syncCodexCliAuthToOpenClawCodexHome(): boolean {
  */
 export function pinCodexExternalCliAuthProfile(profileId = CODEX_EXTERNAL_CLI_PROFILE_ID): { profileId: string; syncedCodexHomeAuth: boolean } {
   const syncedCodexHomeAuth = syncCodexCliAuthToOpenClawCodexHome();
+  if (!syncedCodexHomeAuth) {
+    throw new Error('Portal could not bridge a usable file-backed Codex credential into OpenClaw. No Codex auth profile was pinned.');
+  }
 
   const authData = readAuthProfiles();
   authData.version = authData.version || 2;

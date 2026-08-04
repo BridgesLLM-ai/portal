@@ -2,6 +2,36 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.11] - 2026-08-03
+
+### Added
+- **Ask Questions now works through every embedded provider, not only native Codex.** When an agent needs a decision in the middle of a run it can raise a clarification card in Project Chat whatever model is driving that run. Project Chat admits the single named clarification tool without exposing the rest of the plugin surface, and every question stays bound to the authenticated user, session, run, and tool call. A provider that reuses a tool-call ID across overlapping runs fails closed rather than letting one run consume another run's answer, and a question already answered in another browser reconciles quietly instead of surfacing a generic failure.
+- **Files an Agent links to now open somewhere useful.** Links to Portal-managed uploads navigate to Files and select the exact file. Links to real files in that Agent's own workspace, or in a Project generation, are copied into a private bounded Remote Desktop handoff, opened in the appropriate desktop viewer, and the Portal switches to Remote Desktop to show them. Traversal, symlinks, authority changes, oversized files, and cross-Agent or cross-Project paths all fail closed, and each handoff copy expires on a managed lifetime.
+
+### Changed
+- **The workspace refresh screen now belongs to the Portal.** The opaque privacy curtain uses the installation's uploaded logo as a desaturated translucent mark, layers a restrained radial dot matrix and a slow light sweep over Portal colors, and presents status in a glass pill. It scales down to mobile, degrades cleanly when no logo has been uploaded, and becomes static under reduced-motion preferences. Its first frame is fully opaque, so the workspace behind it is never briefly legible.
+
+### Fixed
+- **Agent Chat recovers when a provider stream drops.** The visible amber reconnect control now exercises the same real socket-recovery path the tests cover, a manual refresh reloads history and reconnects, and a run that finishes while the browser is offline leaves an authoritative terminal snapshot so the yellow rail clears without a hard page reload.
+- **Agent Chat shows the right sessions and an honest account of what a run is doing.** Provider and agent sessions are restored on return instead of collapsing into another agent's history, live activity reflects the actual state of a turn rather than an optimistic guess, a final reply split across several frames is reassembled instead of being truncated, a stale replay from an earlier run is fenced off rather than replacing current output, and a gap in the runtime event sequence quarantines that stream instead of rendering a silently incomplete conversation.
+- **Codex sign-in finishes cleanly and no longer puts an existing login at risk.** The OAuth wizard completes finalization instead of stalling at the last step, credentials are attested before they are committed so a partial or malformed grant cannot be written, and a setup attempt that does not complete leaves any Codex login already on the box untouched.
+- **OpenClaw state backups are smaller and internally consistent under live use.** Reproducible Codex sessions, caches, shell snapshots, operational state databases, and logs no longer churn the recovery archive, while Codex configuration, memories, and goals remain included. The live OpenClaw SQLite database is captured through SQLite's online backup API, so committed write-ahead data lands in one standalone database at the original restore path; stale outbound delivery rows are removed so a restore cannot replay them, and linked, replaced, or otherwise unsafe WAL, SHM, and journal sidecars are refused.
+
+### Security
+- **Dependency advisories are patched on the shipped backend and frontend graphs.** Undici, `ip-address`, PostCSS, `socket.io-parser`, and `brace-expansion` are updated to fixed releases. The remaining React Router advisory is limited to React Server Components, which this client-only Vite build neither imports nor bundles and which the release gate proves unreachable.
+
+## [4.0.10] - 2026-08-03
+
+### Fixed
+- **Backups run again when Portal Files and OpenClaw share stored media.** OpenClaw hard links its media directory to Portal Files uploads, so a single file is reachable from two directories that the backup captures as separate components. The runner required every link of a file to be found inside the component being archived, treated the perfectly normal second link as evidence that the capture was incomplete, and refused the entire backup — daily, weekly, and monthly alike. Both components now accept a link that lives in another backed-up tree. The file's contents are still captured in full in each archive; only the link relationship between the two copies is not preserved through a restore. A link count that is impossible, or one that disagrees with itself, still fails the backup closed, and every other component keeps the original strict check so a hard link cannot smuggle excluded data into an archive.
+
+## [4.0.9] - 2026-08-02
+
+### Fixed
+- **A comprehensive backup no longer stops the Portal to discover it cannot run.** The check that decided whether to quiesce the host only *derived* what the database's peer socket, operating-system user, and roles would be; it never opened a connection. The first code that actually connected ran after the Portal and the OpenClaw gateway had already been stopped. On an installation whose database is reached over TCP — a container, or any remote server — there is no peer socket to open, so that step could only ever fail, and the outage bought an archive that was never possible. Admission now proves a live peer connection before anything is stopped: the host is refused immediately, the message names the cause, and it confirms that no services were stopped. Daily, weekly, and monthly backups do not use this fence and are unaffected.
+- **Agent Chat shows the main agent's sessions again after returning from a sub-agent.** The session list asked the server for a specific agent only when a sub-agent was selected. Switching back to the main agent sent no agent at all, so the server answered for every agent at once and the main agent's history came back mixed with other agents' chats. The selected agent is now always named, including the default one.
+- **Returning to the main agent is no longer a silent no-op.** The main agent's row was disabled whenever its provider availability was still being rechecked, while the sub-agent rows below it were always selectable. Clicking it during a routine recheck did nothing, so the selector appeared to respond only to sub-agents. The row now follows the same rule as its sub-agents, and the status label still reports availability.
+
 ## [4.0.8] - 2026-08-02
 
 ### Fixed

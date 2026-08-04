@@ -117,6 +117,7 @@ function SessionControlsHarness() {
   return (
     <div>
       <output data-testid="session">{chat.session}</output>
+      <output data-testid="provider">{chat.provider}</output>
       <output data-testid="model">{chat.selectedModel}</output>
       <output data-testid="history-error">{chat.historyError || ''}</output>
       <output data-testid="message-count">{chat.messages.length}</output>
@@ -133,6 +134,9 @@ function SessionControlsHarness() {
       <output data-testid="activity-titles">{JSON.stringify(chat.activityTitles)}</output>
       <output data-testid="pending-questions">{chat.pendingUserQuestions.length}</output>
       <output data-testid="status-text">{chat.statusText || ''}</output>
+      <output data-testid="ws-connected">{chat.wsConnected ? 'connected' : 'disconnected'}</output>
+      <output data-testid="is-running">{chat.isRunning ? 'running' : 'idle'}</output>
+      <output data-testid="stream-stale">{chat.isRunning && !chat.wsConnected ? 'stale' : 'clear'}</output>
       <button type="button" onClick={() => void chat.ensureSessionControlsMetadataLoaded({ force: true })}>
         Load controls
       </button>
@@ -147,6 +151,15 @@ function SessionControlsHarness() {
       </button>
       <button type="button" onClick={() => chat.setSession('agent:main:second')}>
         Switch session
+      </button>
+      <button type="button" onClick={() => chat.selectProviderAgent('CODEX')}>
+        Switch to Codex
+      </button>
+      <button type="button" onClick={() => chat.selectProviderAgent('OPENCLAW')}>
+        Switch to OpenClaw main
+      </button>
+      <button type="button" onClick={() => chat.selectProviderAgent('OPENCLAW', 'parity')}>
+        Switch to OpenClaw parity
       </button>
       <button type="button" onClick={() => void chat.refreshChat()}>
         Retry history
@@ -264,6 +277,135 @@ describe('ChatStateProvider session-control ownership', () => {
       }),
     ));
     expect(chatMocks.createSession).not.toHaveBeenCalled();
+  });
+
+  it('restores the last provider-scoped session when the provider changes', async () => {
+    localStorage.setItem('agent-chat-session:CODEX', 'codex-last-session');
+    const user = userEvent.setup();
+    await renderReadyHarness();
+
+    await user.click(screen.getByRole('button', { name: 'Switch to Codex' }));
+
+    await waitFor(() => expect(screen.getByTestId('provider')).toHaveTextContent('CODEX'));
+    expect(screen.getByTestId('session')).toHaveTextContent('codex-last-session');
+    await waitFor(() => expect(chatMocks.clientGet).toHaveBeenCalledWith(
+      '/gateway/history',
+      expect.objectContaining({
+        params: expect.objectContaining({
+          provider: 'CODEX',
+          session: 'codex-last-session',
+        }),
+      }),
+    ));
+
+    await user.click(screen.getByRole('button', { name: 'Switch to OpenClaw main' }));
+    await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent('agent:main:first'));
+    await user.click(screen.getByRole('button', { name: 'Switch to Codex' }));
+    await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent('codex-last-session'));
+  });
+
+  it('uses manual refresh to reconnect a dropped Codex Agent Chat stream', async () => {
+    localStorage.setItem('agent-chat-session:CODEX', 'codex-refresh-session');
+    const user = userEvent.setup();
+    await renderReadyHarness();
+    await user.click(screen.getByRole('button', { name: 'Switch to Codex' }));
+    await waitFor(() => expect(screen.getByTestId('provider')).toHaveTextContent('CODEX'));
+    await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent('codex-refresh-session'));
+
+    const droppedSocket = PendingWebSocket.instances[0];
+    act(() => {
+      droppedSocket.open();
+      droppedSocket.emit({ type: 'connected' });
+      droppedSocket.emit({
+        type: 'text',
+        provider: 'CODEX',
+        sessionKey: 'codex-refresh-session',
+        runId: 'run-codex-refresh',
+        content: 'Partial Codex response',
+      });
+      droppedSocket.onclose?.({
+        code: 1006,
+        reason: '',
+        wasClean: false,
+      } as CloseEvent);
+    });
+    expect(PendingWebSocket.instances).toHaveLength(1);
+    await waitFor(() => expect(screen.getByTestId('stream-stale')).toHaveTextContent('stale'));
+
+    await user.click(screen.getByRole('button', { name: 'Retry history' }));
+    expect(PendingWebSocket.instances).toHaveLength(2);
+
+    const recoveredSocket = PendingWebSocket.instances[1];
+    act(() => {
+      recoveredSocket.open();
+      recoveredSocket.emit({ type: 'connected' });
+    });
+    await waitFor(() => expect(screen.getByTestId('ws-connected')).toHaveTextContent('connected'));
+    expect(screen.getByTestId('stream-stale')).toHaveTextContent('clear');
+    expect(recoveredSocket.sent).toContainEqual(expect.objectContaining({
+      type: 'reconnect',
+      provider: 'CODEX',
+      session: 'codex-refresh-session',
+    }));
+
+    // The provider can finish while the browser transport is down. Reconnect
+    // must settle that stale local run from the backend's authoritative
+    // terminal snapshot; transport recovery alone is not enough.
+    act(() => {
+      recoveredSocket.emit({
+        type: 'stream_status',
+        provider: 'CODEX',
+        sessionKey: 'codex-refresh-session',
+        active: false,
+        inactiveReason: 'terminal',
+        safeToClear: true,
+      });
+    });
+    await waitFor(() => expect(screen.getByTestId('is-running')).toHaveTextContent('idle'));
+    expect(screen.getByTestId('stream-stale')).toHaveTextContent('clear');
+  });
+
+  it('keeps OpenClaw agent sessions independent across provider round trips', async () => {
+    localStorage.setItem('agent-chat-session:OPENCLAW:main', 'agent:main:last-main');
+    localStorage.setItem('agent-chat-session:OPENCLAW:parity', 'agent:parity:last-parity');
+    localStorage.setItem('agent-chat-session:CODEX', 'codex-last-session');
+    const user = userEvent.setup();
+    render(
+      <ChatStateProvider>
+        <SessionControlsHarness />
+      </ChatStateProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent('agent:main:last-main'));
+
+    await user.click(screen.getByRole('button', { name: 'Switch to OpenClaw parity' }));
+    await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent('agent:parity:last-parity'));
+
+    await user.click(screen.getByRole('button', { name: 'Switch to Codex' }));
+    await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent('codex-last-session'));
+
+    await user.click(screen.getByRole('button', { name: 'Switch to OpenClaw main' }));
+    await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent('agent:main:last-main'));
+    expect(localStorage.getItem('agent-chat-session:OPENCLAW:parity')).toBe('agent:parity:last-parity');
+  });
+
+  it('never restores another OpenClaw agent from the legacy provider key', async () => {
+    localStorage.removeItem('agent-chat-session:OPENCLAW:main');
+    localStorage.setItem('agent-chat-session:OPENCLAW', 'agent:parity:last-parity');
+    localStorage.setItem('agent-chat-session', 'agent:parity:last-parity');
+    localStorage.setItem('agent-chat-provider', 'CODEX');
+    localStorage.setItem('agent-chat-session:CODEX', 'codex-last-session');
+    const user = userEvent.setup();
+
+    render(
+      <ChatStateProvider>
+        <SessionControlsHarness />
+      </ChatStateProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent('codex-last-session'));
+
+    await user.click(screen.getByRole('button', { name: 'Switch to OpenClaw main' }));
+    await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent('agent:main:main'));
+    expect(screen.getByTestId('session')).not.toHaveTextContent('parity');
   });
 
   it('single-flights a same-frame fast toggle and rejects its stale response after a session switch', async () => {
@@ -605,6 +747,41 @@ describe('ChatStateProvider session-control ownership', () => {
     await waitFor(() => expect(screen.getByTestId('activity-titles')).toHaveTextContent('{}'));
   });
 
+  it('keeps a replacement socket authoritative when the replaced socket closes late', async () => {
+    const user = userEvent.setup();
+    await renderReadyHarness();
+    const replacedSocket = PendingWebSocket.instances[0];
+    act(() => {
+      replacedSocket.open();
+      replacedSocket.emit({ type: 'connected' });
+      replacedSocket.emit({
+        type: 'text',
+        sessionKey: 'agent:main:first',
+        runId: 'run-socket-replacement',
+        content: 'Still working',
+      });
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Reconnect socket' }));
+    const replacementSocket = PendingWebSocket.instances[1];
+    expect(replacementSocket).toBeDefined();
+    act(() => {
+      replacementSocket.open();
+      replacedSocket.onclose?.({
+        code: 1000,
+        reason: 'replaced',
+        wasClean: true,
+      } as CloseEvent);
+      replacementSocket.emit({ type: 'connected' });
+    });
+
+    expect(replacementSocket.sent).toContainEqual(expect.objectContaining({
+      type: 'reconnect',
+      provider: 'OPENCLAW',
+      session: 'agent:main:first',
+    }));
+  });
+
   it('preserves Agent text/tool chronology and stores only the residual cumulative final segment', async () => {
     await renderReadyHarness();
     const socket = PendingWebSocket.instances[0];
@@ -640,6 +817,304 @@ describe('ChatStateProvider session-control ownership', () => {
       { id: 'tool-one', order: 1 },
       { id: 'tool-two', order: 3 },
     ]);
+  });
+
+  it('drops a stale runtime replay frame before it duplicates the live tool timeline', async () => {
+    const user = userEvent.setup();
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+    act(() => socket.open());
+    const emitTurnEvent = (turnEvent: Record<string, unknown>) => act(() => socket.emit({
+      sessionKey: 'agent:main:first',
+      turnEvent: {
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        sessionKey: 'agent:main:first',
+        runId: 'run-sequence-fence',
+        visible: true,
+        ...turnEvent,
+      },
+    }));
+
+    emitTurnEvent({ type: 'assistant_delta', seq: 1, text: 'A' });
+    emitTurnEvent({
+      type: 'tool_started',
+      seq: 2,
+      tool: { id: 'tool-sequence', name: 'read', status: 'running' },
+    });
+    emitTurnEvent({
+      type: 'tool_output',
+      seq: 3,
+      tool: { id: 'tool-sequence', name: 'read', status: 'done', result: 'config' },
+    });
+    emitTurnEvent({ type: 'assistant_delta', seq: 4, text: ' B' });
+
+    // A maintenance reconnect can replay an older normalized frame after the
+    // browser has already applied later sequence numbers from the same turn.
+    emitTurnEvent({
+      type: 'tool_started',
+      seq: 2,
+      tool: { id: 'tool-sequence', name: 'read', status: 'running' },
+    });
+
+    const parsed = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+    const assistant = parsed.find((message: { role: string }) => message.role === 'assistant');
+    expect(assistant.toolCalls).toEqual([
+      expect.objectContaining({
+        id: 'tool-sequence',
+        name: 'read',
+        status: 'done',
+        result: 'config',
+        order: 1,
+      }),
+    ]);
+
+    act(() => socket.emit({ type: 'connected' }));
+    emitTurnEvent({
+      type: 'tool_started',
+      seq: 1,
+      tool: { id: 'tool-after-reconnect', name: 'exec', status: 'running' },
+    });
+    const afterReconnect = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .find((message: { role: string }) => message.role === 'assistant');
+    expect(afterReconnect.toolCalls).toEqual([
+      expect.objectContaining({ id: 'tool-sequence', status: 'done' }),
+      expect.objectContaining({ id: 'tool-after-reconnect', status: 'running' }),
+    ]);
+
+    emitTurnEvent({
+      type: 'tool_output',
+      seq: 2,
+      tool: { id: 'tool-after-reconnect', name: 'exec', status: 'done', result: 'ok' },
+    });
+    emitTurnEvent({ type: 'assistant_final', seq: 3, text: 'First turn complete.' });
+    await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+    emitTurnEvent({
+      type: 'tool_started',
+      seq: 1,
+      runId: 'run-second-turn',
+      tool: { id: 'tool-second-turn', name: 'read', status: 'running' },
+    });
+
+    const afterNewTurn = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .filter((message: { role: string }) => message.role === 'assistant')
+      .at(-1);
+    expect(afterNewTurn.toolCalls).toEqual([
+      expect.objectContaining({ id: 'tool-second-turn', status: 'running' }),
+    ]);
+  });
+
+  it('quarantines a forward sequence gap until an authoritative snapshot repairs it', async () => {
+    let historyReads = 0;
+    let recoverySnapshotReady = false;
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/history') {
+        historyReads += 1;
+        return {
+          data: {
+            activeStream: recoverySnapshotReady
+              ? {
+                  active: true,
+                  phase: 'tool',
+                  runId: 'run-forward-gap',
+                  content: 'A B',
+                  toolName: 'read',
+                  toolCalls: [{
+                    id: 'tool-future',
+                    name: 'read',
+                    status: 'running',
+                    order: 1,
+                  }],
+                  turnEvents: [
+                    { type: 'assistant_delta', seq: 1, runId: 'run-forward-gap' },
+                    { type: 'assistant_delta', seq: 2, runId: 'run-forward-gap' },
+                    // Older/native snapshots may omit runId; the backend keeps
+                    // those events inside the already attested active snapshot.
+                    { type: 'tool_started', seq: 3 },
+                  ],
+                  lastEventAt: Date.now(),
+                }
+              : { active: false },
+            messages: [],
+            pagination: { beforeCursor: null, hasMoreBefore: false },
+          },
+        };
+      }
+      if (url === '/gateway/stream-status') return { data: { active: false } };
+      return { data: {} };
+    });
+    await renderReadyHarness();
+    const startupHistoryReads = historyReads;
+    expect(startupHistoryReads).toBeGreaterThanOrEqual(1);
+    recoverySnapshotReady = true;
+
+    const socket = PendingWebSocket.instances[0];
+    act(() => {
+      socket.open();
+      socket.emit({ type: 'connected' });
+    });
+    const emitTurnEvent = (turnEvent: Record<string, unknown>) => act(() => socket.emit({
+      sessionKey: 'agent:main:first',
+      turnEvent: {
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        sessionKey: 'agent:main:first',
+        runId: 'run-forward-gap',
+        visible: true,
+        ...turnEvent,
+      },
+    }));
+
+    // Keep Date on the same fake clock as the timeout boundary. Leaving Date
+    // real makes the 449 ms / 450 ms assertions depend on machine load.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      emitTurnEvent({ type: 'assistant_delta', seq: 1, text: 'A' });
+      emitTurnEvent({
+        type: 'tool_started',
+        seq: 3,
+        tool: { id: 'tool-future', name: 'read', status: 'running' },
+      });
+
+      let assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+        .find((message: { role: string }) => message.role === 'assistant');
+      expect(assistant.toolCalls || []).toEqual([]);
+
+      emitTurnEvent({ type: 'assistant_delta', seq: 2, text: ' B' });
+      await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+      assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+        .find((message: { role: string }) => message.role === 'assistant');
+      expect(assistant.content).toBe('A B');
+      expect(assistant.toolCalls || []).toEqual([]);
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(299); });
+      expect(historyReads).toBe(startupHistoryReads);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(historyReads).toBe(startupHistoryReads + 1);
+
+      assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+        .find((message: { role: string }) => message.role === 'assistant');
+      expect(assistant.toolCalls).toEqual([
+        expect.objectContaining({ id: 'tool-future', name: 'read', status: 'running', order: 1 }),
+      ]);
+
+      emitTurnEvent({ type: 'assistant_delta', seq: 4, text: ' C' });
+      await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+      assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+        .find((message: { role: string }) => message.role === 'assistant');
+      expect(assistant.content).toBe('A B C');
+      expect(assistant.toolCalls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('recovers one durable final after a segmented turn loses its terminal content', async () => {
+    let historyReads = 0;
+    let recoveryHistoryReads = 0;
+    let durableRecoveryReady = false;
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/history') {
+        historyReads += 1;
+        if (durableRecoveryReady) recoveryHistoryReads += 1;
+        const messages = durableRecoveryReady && recoveryHistoryReads >= 2
+          ? [{
+              id: 'durable-segmented-final',
+              role: 'assistant',
+              content: 'The complete durable final.',
+              timestamp: new Date().toISOString(),
+              segments: [
+                { kind: 'thinking', subject: 'Checking files', text: 'Need the config', order: 0, ts: Date.now() - 2 },
+                { kind: 'text', text: 'The complete durable final.', order: 2, ts: Date.now() },
+              ],
+              toolCalls: [{
+                id: 'tool-one',
+                name: 'read',
+                status: 'done',
+                result: 'config',
+                order: 1,
+              }],
+            }]
+          : [];
+        return {
+          data: {
+            activeStream: { active: false },
+            messages,
+            pagination: { beforeCursor: null, hasMoreBefore: false },
+          },
+        };
+      }
+      if (url === '/gateway/stream-status') return { data: { active: false } };
+      return { data: {} };
+    });
+    await renderReadyHarness();
+    const startupHistoryReads = historyReads;
+    expect(startupHistoryReads).toBeGreaterThanOrEqual(1);
+    durableRecoveryReady = true;
+
+    // The recovery contract has exact 449 ms / 450 ms boundaries. A real Date
+    // clock can cross that boundary while the full suite is under load.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      const socket = PendingWebSocket.instances[0];
+      const emit = (payload: Record<string, unknown>) => act(() => socket.emit({
+        sessionKey: 'agent:main:first',
+        runId: 'run-segmented-recovery',
+        ...payload,
+      }));
+
+      emit({ type: 'thinking', subject: 'Checking files', content: 'Need the config' });
+      emit({ type: 'tool_start', toolCallId: 'tool-one', toolName: 'read' });
+      emit({ type: 'tool_end', toolCallId: 'tool-one', toolName: 'read', toolResult: 'config' });
+      emit({ type: 'done', content: '' });
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(449); });
+      expect(historyReads).toBe(startupHistoryReads);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(historyReads).toBe(startupHistoryReads + 1);
+      expect(screen.getByTestId('messages')).toHaveTextContent('Need the config');
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(2499); });
+      expect(historyReads).toBe(startupHistoryReads + 1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(historyReads).toBe(startupHistoryReads + 2);
+
+      const parsed = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+      const assistants = parsed.filter((message: { role: string }) => message.role === 'assistant');
+      expect(assistants).toHaveLength(1);
+      expect(assistants[0]).toMatchObject({
+        id: 'durable-segmented-final',
+        content: 'The complete durable final.',
+      });
+      expect(assistants[0].toolCalls).toHaveLength(1);
+      expect(assistants[0].toolCalls[0]).toMatchObject({
+        id: 'tool-one',
+        name: 'read',
+        status: 'done',
+        result: 'config',
+        order: 1,
+      });
+      expect(assistants[0].segments.filter((segment: { kind: string }) => segment.kind === 'text'))
+        .toEqual([expect.objectContaining({ text: 'The complete durable final.', order: 2 })]);
+
+      const chronology = [
+        ...assistants[0].segments.map((segment: { kind: string; text: string; order: number }) => ({
+          kind: segment.kind,
+          label: segment.text,
+          order: segment.order,
+        })),
+        ...assistants[0].toolCalls.map((tool: { name: string; order: number }) => ({
+          kind: 'tool',
+          label: tool.name,
+          order: tool.order,
+        })),
+      ].sort((left, right) => left.order - right.order);
+      expect(chronology).toEqual([
+        { kind: 'thinking', label: 'Need the config', order: 0 },
+        { kind: 'tool', label: 'read', order: 1 },
+        { kind: 'text', label: 'The complete durable final.', order: 2 },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('graduates changed thinking subjects and restores both phases from reconnect history', async () => {

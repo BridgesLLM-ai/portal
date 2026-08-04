@@ -193,6 +193,52 @@ describe('Antigravity native setup catalog boundary', () => {
     expect(mockInvalidateAntigravityModelCache).toHaveBeenCalled();
   });
 
+  test('forwards only an explicit Codex replacement intent to the native manager', async () => {
+    mockStartNativeCliFlow.mockResolvedValue({
+      sessionId: 'native-codex-replacement',
+      status: 'polling_device',
+      deviceCode: 'ABCD-EFGH',
+      verificationUrl: 'https://auth.openai.com/codex/device',
+      alreadyAuthenticated: true,
+      reauthSupported: true,
+    });
+
+    const response = await invokeNativeStart({ provider: 'codex', forceReauth: true });
+
+    expect(response.status).not.toHaveBeenCalled();
+    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
+      success: true,
+      sessionId: 'native-codex-replacement',
+    }));
+    expect(mockStartNativeCliFlow).toHaveBeenCalledWith('codex', {
+      forceReauth: true,
+      ownerId: 'user:native-owner',
+    });
+  });
+
+  test('returns the safe Codex replacement boundary as a structured 409', async () => {
+    mockStartNativeCliFlow.mockRejectedValue(Object.assign(
+      new Error('Portal stopped before replacing the existing Codex sign-in.'),
+      {
+        statusCode: 409,
+        code: 'CODEX_REAUTHENTICATION_REQUIRED',
+      },
+    ));
+
+    const response = await invokeNativeStart({ provider: 'codex' });
+
+    expect(response.status).toHaveBeenCalledWith(409);
+    expect(response.json).toHaveBeenCalledWith({
+      success: false,
+      error: 'Portal stopped before replacing the existing Codex sign-in.',
+      code: 'CODEX_REAUTHENTICATION_REQUIRED',
+    });
+    expect(mockStartNativeCliFlow).toHaveBeenCalledWith('codex', {
+      forceReauth: false,
+      ownerId: 'user:native-owner',
+    });
+  });
+
   test('returns the durable cleanup session when native startup fails after spawning', async () => {
     const startError = Object.assign(new Error('Native login did not produce instructions.'), {
       sessionId: 'native-start-cleanup-session',
@@ -211,6 +257,10 @@ describe('Antigravity native setup catalog boundary', () => {
       sessionId: 'native-start-cleanup-session',
       cleanupPending: true,
       credentialState: 'indeterminate',
+    });
+    expect(mockStartNativeCliFlow).toHaveBeenCalledWith('codex', {
+      forceReauth: false,
+      ownerId: 'user:native-owner',
     });
   });
 

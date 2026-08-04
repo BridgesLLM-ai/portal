@@ -30,7 +30,7 @@ async function withNativeDeadline<T>(operation: Promise<T>, timeoutMs: number, m
   }
 }
 
-type Step = 'start' | 'waiting' | 'paste' | 'device' | 'catalog' | 'model' | 'done' | 'error';
+type Step = 'start' | 'waiting' | 'paste' | 'device' | 'finalizing' | 'catalog' | 'model' | 'done' | 'error';
 
 const PROVIDER_LABELS: Record<string, { name: string; color: string }> = {
   'claude-code': { name: 'Claude Code', color: 'emerald' },
@@ -166,7 +166,7 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
   const pollRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   React.useEffect(() => {
     let disposed = false;
-    if ((step === 'waiting' || step === 'device' || step === 'paste' || (step === 'error' && sessionOwned)) && sessionId) {
+    if ((step === 'waiting' || step === 'device' || step === 'paste' || step === 'finalizing' || (step === 'error' && sessionOwned)) && sessionId) {
       const generation = ++pollGenerationRef.current;
       const schedule = () => {
         if (!disposed && generation === pollGenerationRef.current) {
@@ -195,6 +195,11 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
           }
           if (data?.status === 'complete') {
             setSessionOwned(false);
+            if (provider === 'codex' && data?.finalized !== true) {
+              setError(null);
+              setStep('finalizing');
+              return;
+            }
             if (pollRef.current) clearTimeout(pollRef.current);
             if (provider === 'gemini') {
               setAlreadyAuthenticated(Boolean(data?.alreadyAuthenticated));
@@ -212,6 +217,7 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
             setError(data?.error || `Portal is still stopping and reconciling the ${meta.name} login process.`);
           } else if (data?.status === 'error' || data?.status === 'cancelled' || data?.status === 'expired') {
             setSessionOwned(false);
+            if (data?.credentialState === 'committed') setReviewState('committed');
             setError(data?.error || `${meta.name} login ${data.status}.`);
             setStep('error');
             disposed = true;
@@ -271,7 +277,7 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
     onCancel();
   };
 
-  const startFlow = async () => {
+  const startFlow = async (forceReauth = false) => {
     if (sessionOwned || reviewState || !claimOperation('start')) return;
     setLoading(true);
     setError(null);
@@ -281,9 +287,15 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
       const { data } = await client.post(`${apiBase}/native-cli/start`, {
         provider,
         ...(provider === 'gemini' ? { forceReauth: true } : {}),
+        ...(provider === 'codex' && forceReauth ? { forceReauth: true } : {}),
       });
       if (!data.success) {
         const startFailure = readStructuredOAuthStartFailure(data);
+        if (provider === 'codex' && startFailure.code === 'CODEX_REAUTHENTICATION_REQUIRED') {
+          setError(startFailure.error || 'Portal stopped before replacing the existing Codex sign-in.');
+          setStep('start');
+          return;
+        }
         const disposition = getOAuthStartRecoveryDisposition(startFailure);
         if (disposition === 'cleanup_required' && startFailure.sessionId) {
           setSessionId(startFailure.sessionId);
@@ -318,6 +330,10 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
           await loadAntigravityCatalog();
           return;
         }
+        if (provider === 'codex' && data?.finalized !== true) {
+          setStep('finalizing');
+          return;
+        }
         setStep('done');
         scheduleCompletion();
         return;
@@ -344,6 +360,11 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
     } catch (err: any) {
       const startFailure = readStructuredOAuthStartFailure(err?.response?.data);
       const msg = startFailure.error || err?.message || 'Failed to start native CLI flow';
+      if (provider === 'codex' && startFailure.code === 'CODEX_REAUTHENTICATION_REQUIRED') {
+        setError(msg);
+        setStep('start');
+        return;
+      }
       const disposition = getOAuthStartRecoveryDisposition(startFailure);
       if (disposition === 'cleanup_required' && startFailure.sessionId) {
         setSessionId(startFailure.sessionId);
@@ -426,14 +447,27 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
             <p className="text-sm text-slate-300">
               This will authenticate the <strong>{meta.name}</strong> CLI on the server for use with Agent Chat and other portal features.
             </p>
+            {error ? (
+              <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-100" role="alert">
+                {error}
+              </div>
+            ) : null}
             <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-sm text-amber-100">
               <strong>Note:</strong> This is separate from OpenClaw auth. The native CLI has its own credential store.
               {provider === 'claude-code' ? ' This login is for the portal\'s native Claude Code features, not the OpenClaw Claude provider setup.' : ''}
             </div>
+            {provider === 'codex' ? (
+              <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 px-4 py-3 text-sm text-blue-100">
+                Before starting, enable <strong>device code login</strong> in your personal ChatGPT Security settings, or ask your workspace admin to enable it in Permissions.{' '}
+                <a href="https://developers.openai.com/codex/auth#login-on-headless-devices" target="_blank" rel="noreferrer" className="font-medium text-blue-300 underline hover:text-blue-200">
+                  OpenAI instructions
+                </a>
+              </div>
+            ) : null}
             <div className="flex justify-end">
               <button
                 type="button"
-                onClick={startFlow}
+                onClick={() => { void startFlow(); }}
                 disabled={loading}
                 className={`inline-flex items-center gap-2 rounded-xl bg-${meta.color}-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-${meta.color}-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400`}
               >
@@ -441,6 +475,22 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
                 {provider === 'gemini' ? 'Connect or Re-authenticate Antigravity' : `Start ${meta.name} Login`}
               </button>
             </div>
+            {provider === 'codex' ? (
+              <div className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                <p>
+                  Portal will reuse a verified existing Codex sign-in. Replacing it is destructive: Codex clears the current server credential before device authorization, so a cancelled or failed replacement can leave Codex signed out.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => { void startFlow(true); }}
+                  disabled={loading}
+                  className="mt-3 inline-flex items-center gap-2 rounded-lg border border-amber-400/30 bg-amber-500/15 px-3 py-2 text-xs font-semibold text-amber-100 transition hover:bg-amber-500/25 disabled:cursor-wait disabled:opacity-50"
+                >
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  Replace existing Codex sign-in
+                </button>
+              </div>
+            ) : null}
           </div>
         );
 
@@ -543,6 +593,14 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
               </div>
               <p className="mt-4 text-sm text-slate-400">Waiting for authorization...</p>
             </div>
+          </div>
+        );
+
+      case 'finalizing':
+        return (
+          <div role="status" className="flex items-center gap-3 rounded-xl border border-blue-500/20 bg-blue-500/10 px-4 py-4 text-sm text-blue-100">
+            <Loader2 className="h-5 w-5 animate-spin" />
+            Codex is signed in. Portal is registering models and safely restarting the workspace connection…
           </div>
         );
 

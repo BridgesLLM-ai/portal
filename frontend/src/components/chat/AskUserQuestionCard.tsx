@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Check, HelpCircle, Loader2, X } from 'lucide-react';
 import { gatewayAPI } from '../../api/endpoints';
 import type { GatewayPendingQuestion } from '../../api/endpoints';
+import { isAskUserQuestionNoLongerOpenError } from '../../utils/askUserQuestionError';
 
 export interface AskUserQuestionPrompt {
   id: string;
@@ -16,7 +17,7 @@ export interface AskUserQuestionPrompt {
 export type AskUserQuestionRequest = GatewayPendingQuestion;
 
 /**
- * . When an agent run calls `ask_user_question`, the run is paused and
+ * When an agent run asks for input, the run is paused and
  * this is where the person answers it. Deliberately inline in the transcript
  * rather than a modal: the question belongs to the conversation, and a modal
  * over unrelated work is the thing everyone hates.
@@ -60,11 +61,11 @@ export default function AskUserQuestionCard({
 
   const questionIds = request.questions.map((prompt) => prompt.id);
   const protocolError = request.questions.length === 0
-    ? 'This native prompt did not include an answerable question.'
+    ? 'This agent prompt did not include an answerable question.'
     : new Set(questionIds).size !== questionIds.length
-      ? 'This native prompt reused a question identity, so Portal cannot safely answer it.'
+      ? 'This agent prompt reused a question identity, so Portal cannot safely answer it.'
       : request.questions.some((prompt) => prompt.multiSelect)
-        ? 'This native prompt requested an unsupported multiple-selection answer. Portal will not guess how to encode it.'
+        ? 'This agent prompt requested an unsupported multiple-selection answer. Portal will not guess how to encode it.'
         : null;
 
   const answers = useMemo(() => {
@@ -100,6 +101,11 @@ export default function AskUserQuestionCard({
       setUncertainAnswerFingerprint(null);
       onSettled(request.id);
     } catch (caught: any) {
+      if (isAskUserQuestionNoLongerOpenError(caught)) {
+        setUncertainAnswerFingerprint(null);
+        onSettled(request.id);
+        return;
+      }
       // A late answer is the common failure here, and the server says so.
       const deliveryUnconfirmed = !caught?.response;
       if (deliveryUnconfirmed) setUncertainAnswerFingerprint(answerFingerprint);
@@ -121,6 +127,10 @@ export default function AskUserQuestionCard({
       await gatewayAPI.dismissQuestion(request.id);
       onSettled(request.id);
     } catch (caught: any) {
+      if (isAskUserQuestionNoLongerOpenError(caught)) {
+        onSettled(request.id);
+        return;
+      }
       setError(
         caught?.response?.data?.error
         || caught?.message

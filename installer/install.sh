@@ -25,7 +25,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="4.0.8"
+readonly VERSION="4.0.11"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -85,6 +85,7 @@ readonly MIN_DISK_GB=35
 readonly PIN_OPENCLAW_RUNTIME_VERSION="2026.7.1"
 readonly PIN_OPENCLAW_CORE_PACKAGE_VERSION="2026.7.1-2"
 readonly PIN_OPENCLAW_CODEX_PLUGIN_VERSION="2026.7.1-1"
+readonly PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION="3.2.0"
 readonly PIN_CODEX_CLI_VERSION="0.145.0"
 readonly PIN_CLAUDE_CODE_VERSION="2.1.220"
 readonly PIN_CLAWHUB_VERSION="0.23.1"
@@ -14801,7 +14802,7 @@ auto_apply_openclaw_compatibility_hotfix() {
   fi
 
   if spin "Applying OpenClaw native pending-input hotfix (if needed)" \
-    "PORTAL_OPENCLAW_PENDING_INPUT_STRICT=1 PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION='${PIN_OPENCLAW_CORE_PACKAGE_VERSION}' bash '${pending_input_hotfix_script}' '${openclaw_dist}'"; then
+    "PORTAL_OPENCLAW_PENDING_INPUT_STRICT=1 PORTAL_REQUIRED_OPENCLAW_PACKAGE_NAME='openclaw' PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION='${PIN_OPENCLAW_CORE_PACKAGE_VERSION}' bash '${pending_input_hotfix_script}' '${openclaw_dist}'"; then
     pending_input_hotfix_status=0
   else
     pending_input_hotfix_status=$?
@@ -14862,17 +14863,34 @@ repair_openclaw_portal_model_config() {
 }
 
 bridge_openclaw_codex_cli_auth() {
+  local portal_root="${1:-${PORTAL_DIR}}"
   if $SKIP_OPENCLAW || ! command -v node &>/dev/null; then
     return 0
   fi
 
-  local helper="${PORTAL_DIR}/backend/dist/services/openclawConfigManager.js"
+  local helper="${portal_root}/backend/dist/services/openclawConfigManager.js"
   if [[ ! -f "${helper}" ]]; then
     warn "Portal OpenClaw Codex auth bridge helper is missing. Skipping Codex auth bridge."
     return 0
   fi
 
-  if [[ ! -f "${HOME}/.codex/auth.json" ]]; then
+  local portal_service_codex_home=""
+  local portal_env_file="${portal_root}/backend/.env.production"
+  if [[ -f "${portal_env_file}" ]]; then
+    portal_service_codex_home="$(
+      read_env_value "${portal_env_file}" CODEX_HOME 2>/dev/null || true
+    )"
+  fi
+  # The Portal service EnvironmentFile is the runtime authority. Never borrow
+  # a transient installer-shell CODEX_HOME: an update launched from an agent
+  # can inherit that agent's private Codex home, which the Portal service will
+  # not use after restart.
+  local portal_codex_home="${portal_service_codex_home:-${HOME}/.codex}"
+  if [[ -n "${CODEX_HOME:-}" && "${CODEX_HOME}" != "${portal_codex_home}" ]]; then
+    warn "Ignoring transient installer CODEX_HOME; using the Portal service credential path"
+  fi
+  local -x CODEX_HOME="${portal_codex_home}"
+  if [[ ! -f "${portal_codex_home}/auth.json" ]]; then
     ok "OpenClaw Codex auth bridge skipped (no external Codex CLI auth found)"
     return 0
   fi
@@ -14957,11 +14975,122 @@ process.stdin.on("end", () => {
   return 1
 }
 
+openclaw_codex_plugin_runtime_details() {
+  local inspect_json list_json presence
+  inspect_json="$(OPENCLAW_ALLOW_ROOT=1 openclaw plugins inspect codex --json --runtime 2>>"${LOG_FILE}" || true)"
+  if [[ -n "${inspect_json}" ]] && printf '%s' "${inspect_json}" | node -e '
+let raw = "";
+process.stdin.on("data", chunk => raw += chunk);
+process.stdin.on("end", () => {
+  try {
+    const row = JSON.parse(raw);
+    const plugin = row && typeof row === "object" ? row.plugin || {} : {};
+    const install = row && typeof row === "object" ? row.install || {} : {};
+    if (
+      plugin.id !== "codex"
+      || plugin.status !== "loaded"
+      || plugin.enabled !== true
+      || plugin.activated !== true
+      || !Array.isArray(plugin.agentHarnessIds)
+      || !plugin.agentHarnessIds.includes("codex")
+    ) process.exit(1);
+    for (const value of [
+      plugin.version,
+      plugin.source,
+      plugin.origin,
+      install.source,
+      install.spec,
+      install.installPath,
+      install.version,
+      plugin.rootDir,
+    ]) console.log(typeof value === "string" ? value : "");
+  } catch (_) {
+    process.exit(1);
+  }
+});
+'; then
+    return 0
+  fi
+
+  list_json="$(OPENCLAW_ALLOW_ROOT=1 openclaw plugins list --json 2>>"${LOG_FILE}" || true)"
+  presence="$(printf '%s' "${list_json}" | node -e '
+let raw = "";
+process.stdin.on("data", chunk => raw += chunk);
+process.stdin.on("end", () => {
+  try {
+    const row = JSON.parse(raw);
+    const plugins = Array.isArray(row?.plugins) ? row.plugins : null;
+    if (!plugins) process.exit(1);
+    process.stdout.write(plugins.some(plugin => plugin?.id === "codex") ? "present" : "absent");
+  } catch (_) {
+    process.exit(1);
+  }
+});
+' 2>/dev/null || true)"
+  [[ "${presence}" == "absent" ]] && return 2
+  return 1
+}
+
+openclaw_codex_plugin_catalog_package_dir() {
+  local details="${1:-}"
+  local package_dir package_real source_path
+  local -a fields=()
+  [[ -n "${details}" ]] || details="$(openclaw_codex_plugin_details)" || return 1
+  mapfile -t fields <<< "${details}"
+  source_path="${fields[1]:-${fields[5]:-}}"
+  package_dir="$(openclaw_codex_plugin_package_dir "${source_path}" || true)"
+  package_real="$(readlink -f -- "${package_dir}" 2>/dev/null || true)"
+  [[ -n "${package_real}" && -d "${package_real}" ]] || return 1
+  printf '%s\n' "${package_real}"
+}
+
+openclaw_codex_plugin_active_package_dir() {
+  local details="${1:-}"
+  local source_package_dir root_package_dir
+  local source_real root_real
+  local -a fields=()
+  [[ -n "${details}" ]] || details="$(openclaw_codex_plugin_runtime_details)" || return 1
+  mapfile -t fields <<< "${details}"
+  source_package_dir="$(openclaw_codex_plugin_package_dir \
+    "${fields[1]:-}" || true)"
+  root_package_dir="$(openclaw_codex_plugin_package_dir \
+    "${fields[7]:-}" || true)"
+  [[ -n "${source_package_dir}" \
+    && -n "${root_package_dir}" ]] || return 1
+  source_real="$(readlink -f -- "${source_package_dir}" 2>/dev/null || true)"
+  root_real="$(readlink -f -- "${root_package_dir}" 2>/dev/null || true)"
+  [[ -n "${source_real}" \
+    && "${source_real}" == "${root_real}" \
+    && -d "${source_real}" ]] || return 1
+  printf '%s\n' "${source_real}"
+}
+
+openclaw_codex_plugin_attested_package_dir() {
+  local details="${1:-}"
+  local active_package_dir install_package_dir
+  local active_real install_real
+  local -a fields=()
+  [[ -n "${details}" ]] || details="$(openclaw_codex_plugin_runtime_details)" || return 1
+  mapfile -t fields <<< "${details}"
+  active_package_dir="$(openclaw_codex_plugin_active_package_dir \
+    "${details}" || true)"
+  install_package_dir="$(openclaw_codex_plugin_package_dir \
+    "${fields[5]:-}" || true)"
+  [[ -n "${active_package_dir}" \
+    && -n "${install_package_dir}" ]] || return 1
+  active_real="$(readlink -f -- "${active_package_dir}" 2>/dev/null || true)"
+  install_real="$(readlink -f -- "${install_package_dir}" 2>/dev/null || true)"
+  [[ -n "${active_real}" \
+    && "${active_real}" == "${install_real}" \
+    && -d "${active_real}" ]] || return 1
+  printf '%s\n' "${active_real}"
+}
+
 verify_openclaw_codex_plugin_pin() {
   local expected_version="${1:-${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}}"
   local details package_dir package_name package_version
   local -a fields=()
-  if ! details="$(openclaw_codex_plugin_details)"; then
+  if ! details="$(openclaw_codex_plugin_runtime_details)"; then
     return 1
   fi
   mapfile -t fields <<< "${details}"
@@ -14969,10 +15098,10 @@ verify_openclaw_codex_plugin_pin() {
   local plugin_source="${fields[1]:-}"
   local install_source="${fields[3]:-}"
   local install_spec="${fields[4]:-}"
-  local install_path="${fields[5]:-}"
   local recorded_version="${fields[6]:-}"
 
-  package_dir="$(openclaw_codex_plugin_package_dir "${install_path:-${plugin_source}}" || true)"
+  package_dir="$(openclaw_codex_plugin_attested_package_dir \
+    "${details}" || true)"
   package_name="$(node_package_name_from_dir "${package_dir}" || true)"
   package_version="$(node_package_version_from_dir "${package_dir}" || true)"
 
@@ -14989,6 +15118,191 @@ verify_openclaw_codex_plugin_pin() {
     && -n "${plugin_source}" \
     && "${plugin_source}" != *"/.openclaw/npm/node_modules/@openclaw/codex/"* \
     && "${plugin_source}" != "~/.openclaw/npm/node_modules/@openclaw/codex/"* ]]
+}
+
+resolve_openclaw_codex_plugin_pending_input_hotfix_target() {
+  local details package_dir package_name package_version target
+  verify_openclaw_codex_plugin_pin "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" \
+    || return 1
+  details="$(openclaw_codex_plugin_runtime_details)" || return 1
+  package_dir="$(openclaw_codex_plugin_attested_package_dir \
+    "${details}" || true)"
+  package_name="$(node_package_name_from_dir "${package_dir}" || true)"
+  package_version="$(node_package_version_from_dir "${package_dir}" || true)"
+  [[ "${package_name}" == "@openclaw/codex" \
+    && "${package_version}" == "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" \
+    && -d "${package_dir}/dist" ]] || return 1
+  target="$(resolve_openclaw_pending_input_hotfix_target \
+    "${package_dir}/dist" || true)"
+  [[ -n "${target}" ]] || return 1
+  printf '%s\n' "${target}"
+}
+
+openclaw_codex_plugin_pending_input_hotfix_is_applied() {
+  local target="$1"
+  python3 - "${target}" <<'PY'
+from pathlib import Path
+import sys
+
+marker = 'const BRIDGESLLM_PENDING_INPUT_HOTFIX_MARKER = "bridgesllm-openclaw-pending-input-v1";'
+symbol = 'Symbol.for("bridgesllm.openclaw.pending-input.codex-plugin.v1")'
+try:
+    text = Path(sys.argv[1]).read_text(encoding="utf-8")
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if text.count(marker) == 1 and text.count(symbol) == 1 else 1)
+PY
+}
+
+manage_openclaw_codex_plugin_pending_input_backup() {
+  local target="$1"
+  local hotfix_script="$2"
+  local action="$3"
+  local backup="${target}.bridgesllm-pending-input-v1.bak"
+  python3 - \
+    "${target}" \
+    "${backup}" \
+    "${hotfix_script}" \
+    "${action}" \
+    "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" <<'PY'
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import tempfile
+
+target = Path(sys.argv[1])
+backup = Path(sys.argv[2])
+hotfix_script = Path(sys.argv[3])
+action = sys.argv[4]
+expected_version = sys.argv[5]
+marker = 'const BRIDGESLLM_PENDING_INPUT_HOTFIX_MARKER = "bridgesllm-openclaw-pending-input-v1";'
+symbol = 'Symbol.for("bridgesllm.openclaw.pending-input.codex-plugin.v1")'
+if action not in {"normalize", "retire"}:
+    raise SystemExit(1)
+if backup != target.with_name(target.name + ".bridgesllm-pending-input-v1.bak"):
+    raise SystemExit(1)
+for path in (target, backup, hotfix_script):
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        raise SystemExit(1)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_nlink != 1
+    ):
+        raise SystemExit(1)
+try:
+    package_path = target.parent.parent / "package.json"
+    package_metadata = os.lstat(package_path)
+    if (
+        not stat.S_ISREG(package_metadata.st_mode)
+        or stat.S_ISLNK(package_metadata.st_mode)
+        or package_metadata.st_nlink != 1
+    ):
+        raise OSError
+    package_bytes = package_path.read_bytes()
+    import json
+    package = json.loads(package_bytes.decode("utf-8"))
+    if (
+        package.get("name") != "@openclaw/codex"
+        or package.get("version") != expected_version
+    ):
+        raise OSError
+    target_bytes = target.read_bytes()
+    backup_bytes = backup.read_bytes()
+    target_text = target.read_text(encoding="utf-8")
+    backup_text = backup.read_text(encoding="utf-8")
+except (OSError, UnicodeError, ValueError):
+    raise SystemExit(1)
+if (
+    marker in backup_text
+    or symbol in backup_text
+):
+    raise SystemExit(1)
+
+# The recovery artifact is trusted only if the exact bundled patcher accepts
+# it as the pristine pinned provider source and deterministically reproduces
+# the current patched bytes. Syntax alone is not provenance.
+with tempfile.TemporaryDirectory(prefix="bridgesllm-codex-pending-proof-") as temporary:
+    package_root = Path(temporary) / "package"
+    dist = package_root / "dist"
+    dist.mkdir(parents=True)
+    (package_root / "package.json").write_bytes(package_bytes)
+    fixture = dist / target.name
+    fixture.write_bytes(backup_bytes)
+    environment = os.environ.copy()
+    environment.update({
+        "PORTAL_OPENCLAW_PENDING_INPUT_STRICT": "1",
+        "PORTAL_REQUIRED_OPENCLAW_PACKAGE_NAME": "@openclaw/codex",
+        "PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION": expected_version,
+    })
+    proof = subprocess.run(
+        ["bash", str(hotfix_script), str(dist)],
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if proof.returncode != 0:
+        raise SystemExit(1)
+    reproduced_bytes = fixture.read_bytes()
+
+target_is_patched = (
+    target_text.count(marker) == 1
+    and target_text.count(symbol) == 1
+    and reproduced_bytes == target_bytes
+)
+target_is_pristine = (
+    marker not in target_text
+    and symbol not in target_text
+    and target_bytes == backup_bytes
+)
+if action == "retire":
+    if not target_is_patched:
+        raise SystemExit(1)
+    backup.unlink()
+elif target_is_patched:
+    # Interrupted after publishing the exact patched bytes: restore the proven
+    # original before capturing a fresh package-level rollback baseline.
+    os.replace(backup, target)
+elif target_is_pristine:
+    # Interrupted before publication. The target already is the proven
+    # original, so remove only the byte-identical redundant artifact.
+    backup.unlink()
+else:
+    raise SystemExit(1)
+directory_fd = os.open(target.parent, os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+}
+
+normalize_openclaw_codex_plugin_pending_input_recovery_artifact() {
+  manage_openclaw_codex_plugin_pending_input_backup \
+    "$1" "$2" normalize
+}
+
+retire_openclaw_codex_plugin_pending_input_backup() {
+  manage_openclaw_codex_plugin_pending_input_backup \
+    "$1" "$2" retire
+}
+
+verify_openclaw_codex_plugin_pending_input_hotfix() {
+  if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
+    return 0
+  fi
+  local target backup
+  target="$(resolve_openclaw_codex_plugin_pending_input_hotfix_target || true)"
+  [[ -n "${target}" ]] || return 1
+  backup="${target}.bridgesllm-pending-input-v1.bak"
+  openclaw_codex_plugin_pending_input_hotfix_is_applied "${target}" \
+    && [[ ! -e "${backup}" && ! -L "${backup}" ]] \
+    && node --check "${target}" >/dev/null 2>&1
 }
 
 stage_openclaw_codex_plugin_rollback_package() {
@@ -15020,10 +15334,13 @@ capture_openclaw_codex_plugin_baseline() {
   if details="$(openclaw_codex_plugin_details)"; then
     mapfile -t fields <<< "${details}"
     local plugin_version="${fields[0]:-}"
-    local plugin_source="${fields[1]:-}"
-    local install_path="${fields[5]:-}"
     [[ -n "${plugin_version}" ]] || return 1
-    package_source="${install_path:-${plugin_source}}"
+    # This capture runs before old OpenClaw cores are replaced, so it may not
+    # depend on the new runtime-inspection schema. Prefer the catalog's loaded
+    # source over a stale installPath and prove the packed package/version.
+    package_source="$(openclaw_codex_plugin_catalog_package_dir \
+      "${details}" || true)"
+    [[ -n "${package_source}" ]] || return 1
     stage_openclaw_codex_plugin_rollback_package "${plugin_version}" "${package_source}" || return 1
     OPENCLAW_CODEX_PLUGIN_PREEXISTED=true
     OPENCLAW_CODEX_PLUGIN_PREUPDATE_VERSION="${plugin_version}"
@@ -15049,7 +15366,8 @@ rollback_openclaw_codex_plugin() {
     else
       if details="$(openclaw_codex_plugin_details)"; then
         mapfile -t fields <<< "${details}"
-        package_dir="$(openclaw_codex_plugin_package_dir "${fields[5]:-${fields[1]:-}}" || true)"
+        package_dir="$(openclaw_codex_plugin_catalog_package_dir \
+          "${details}" || true)"
         package_version="$(node_package_version_from_dir "${package_dir}" || true)"
         [[ "${fields[0]:-}" == "${OPENCLAW_CODEX_PLUGIN_PREUPDATE_VERSION}" \
           && "${package_version}" == "${OPENCLAW_CODEX_PLUGIN_PREUPDATE_VERSION}" ]] || rollback_ok=false
@@ -15156,7 +15474,8 @@ verify_openclaw_tested_pair() {
     observed_gateway="$(openclaw_gateway_version || true)"
     if [[ "${observed_gateway}" == "${PIN_OPENCLAW_RUNTIME_VERSION}" ]] \
       && OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1 \
-      && verify_openclaw_codex_plugin_pin "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}"; then
+      && verify_openclaw_codex_plugin_pin "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" \
+      && verify_openclaw_codex_plugin_pending_input_hotfix; then
       return 0
     fi
     echo "tested-pair verify attempt ${attempt}: gateway version '${observed_gateway}' (expected '${PIN_OPENCLAW_RUNTIME_VERSION}')" >> "$LOG_FILE"
@@ -15212,7 +15531,10 @@ verify_bridgesllm_ask_user_plugin_runtime() {
       2>> "${LOG_FILE}"; then
     return 1
   fi
-  python3 - "${output_path}" "${target_dir}" <<'PY'
+  python3 - \
+    "${output_path}" \
+    "${target_dir}" \
+    "${PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION}" <<'PY'
 import json
 import os
 import pathlib
@@ -15220,6 +15542,7 @@ import sys
 
 report_path = pathlib.Path(sys.argv[1])
 target = pathlib.Path(sys.argv[2])
+expected_version = sys.argv[3]
 try:
     report = json.loads(report_path.read_text(encoding="utf-8"))
 except (OSError, UnicodeError, json.JSONDecodeError):
@@ -15227,9 +15550,12 @@ except (OSError, UnicodeError, json.JSONDecodeError):
 plugin = report.get("plugin") if isinstance(report, dict) else None
 diagnostics = report.get("diagnostics") if isinstance(report, dict) else None
 methods = report.get("gatewayMethods") if isinstance(report, dict) else None
+tool_names = plugin.get("toolNames") if isinstance(plugin, dict) else None
+typed_hooks = report.get("typedHooks") if isinstance(report, dict) else None
 if (
     not isinstance(plugin, dict)
     or plugin.get("id") != "bridgesllm-ask-user"
+    or plugin.get("version") != expected_version
     or plugin.get("status") != "loaded"
     or plugin.get("enabled") is not True
     or plugin.get("activated") is not True
@@ -15237,6 +15563,14 @@ if (
     or os.path.realpath(plugin.get("rootDir", "")) != os.path.realpath(target)
     or os.path.realpath(plugin.get("source", ""))
         != os.path.realpath(target / "index.js")
+    or not isinstance(tool_names, list)
+    or "ask_user_question" not in tool_names
+    or plugin.get("hookCount") != 1
+    or not isinstance(typed_hooks, list)
+    or not any(
+        isinstance(item, dict) and item.get("name") == "before_tool_call"
+        for item in typed_hooks
+    )
     or not isinstance(methods, list)
     or not {
         "bridgesllm.ask_user.pending",
@@ -15286,10 +15620,11 @@ PY
 
 install_bridgesllm_ask_user_plugin() {
   # The ask-user bridge is a required part of the Portal/OpenClaw runtime. It
-  # registers gateway methods that read and settle only the exact native Codex
-  # request on the attested active run. Treat its directory and the shared
-  # OpenClaw config as one local transaction: either the new plugin is loaded
-  # and callable, or both are restored before this function fails.
+  # provides non-Codex providers with a real ask-user tool and registers
+  # gateway methods that settle either that tool or native Codex input only on
+  # the exact attested run. Treat its directory and the shared OpenClaw config
+  # as one local transaction: either the new plugin is loaded and callable, or
+  # both are restored before this function fails.
   if $SKIP_OPENCLAW; then
     return 0
   fi
@@ -15425,7 +15760,7 @@ install_bridgesllm_ask_user_plugin() {
   if [[ -z "${failure_reason}" ]] \
     && ! verify_bridgesllm_ask_user_plugin_runtime \
       "${target_dir}" "${inspect_output}"; then
-    failure_reason="OpenClaw could not load the plugin or register its gateway method"
+    failure_reason="OpenClaw could not load the plugin or register its ask-user capabilities"
   fi
   if [[ -z "${failure_reason}" ]] && $gateway_was_active; then
     if ! systemctl restart openclaw-gateway >> "${LOG_FILE}" 2>&1; then
@@ -15548,6 +15883,73 @@ ensure_openclaw_codex_plugin_compatible() {
   ok "OpenClaw Codex plugin ${PIN_OPENCLAW_CODEX_PLUGIN_VERSION} loaded; pair commit pending"
 }
 
+apply_openclaw_codex_plugin_pending_input_hotfix() {
+  if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
+    return 0
+  fi
+
+  local hotfix_script="${PORTAL_DIR}/scripts/patch-openclaw-codex-pending-input-hotfix.sh"
+  local target backup
+  if [[ ! -f "${hotfix_script}" || -L "${hotfix_script}" ]]; then
+    warn "Bundled Codex provider pending-input hotfix is missing or unsafe."
+    return 1
+  fi
+  target="$(resolve_openclaw_codex_plugin_pending_input_hotfix_target || true)"
+  if [[ -z "${target}" ]]; then
+    warn "Could not resolve exactly one run bundle in the pinned OpenClaw Codex provider."
+    return 1
+  fi
+  backup="${target}.bridgesllm-pending-input-v1.bak"
+
+  # A patcher-owned backup means an earlier process stopped between preserving
+  # and committing bytes. Normalize back to the pristine package first; only
+  # then capture the package-level rollback baseline used by this transaction.
+  if [[ -e "${backup}" || -L "${backup}" ]]; then
+    if ! normalize_openclaw_codex_plugin_pending_input_recovery_artifact \
+      "${target}" "${hotfix_script}"; then
+      warn "Codex provider pending-input recovery artifact is ambiguous or unsafe at ${backup}."
+      return 1
+    fi
+  fi
+
+  if verify_openclaw_codex_plugin_pending_input_hotfix; then
+    ok "OpenClaw Codex provider pending-input bridge checked"
+    return 0
+  fi
+  if ! capture_openclaw_codex_plugin_baseline; then
+    warn "Could not preserve the Codex provider before pending-input preparation."
+    return 1
+  fi
+  OPENCLAW_CODEX_PLUGIN_UPDATE_ATTEMPTED=true
+  chmod 755 "${hotfix_script}" 2>/dev/null || true
+
+  info "Applying Codex provider pending-input hotfix (if needed)..."
+  if ! PORTAL_OPENCLAW_PENDING_INPUT_STRICT=1 \
+    PORTAL_REQUIRED_OPENCLAW_PACKAGE_NAME='@openclaw/codex' \
+    PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION="${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" \
+    bash "${hotfix_script}" "$(dirname "${target}")" \
+      >> "${LOG_FILE}" 2>&1 \
+    || ! openclaw_codex_plugin_pending_input_hotfix_is_applied "${target}"; then
+    warn "Codex provider pending-input preparation failed; the package-level rollback remains armed."
+    return 1
+  fi
+  if ! retire_openclaw_codex_plugin_pending_input_backup \
+    "${target}" "${hotfix_script}"; then
+    warn "Codex provider was patched, but its temporary byte backup could not be retired safely; the package-level rollback remains armed."
+    return 1
+  fi
+  if ! verify_openclaw_codex_plugin_pending_input_hotfix; then
+    warn "Codex provider pending-input preparation returned without its exact external-runtime Symbol contract."
+    return 1
+  fi
+
+  # install_bridgesllm_ask_user_plugin performs the transaction's active-
+  # gateway restart after publishing the matching multi-runtime bridge. Until
+  # that restart and tested-pair verification succeed, plugin rollback stays
+  # armed and restores the exact package tarball captured above.
+  ok "OpenClaw Codex provider pending-input bridge prepared; gateway load pending"
+}
+
 commit_openclaw_tested_pair() {
   verify_openclaw_tested_pair || return 1
   commit_openclaw_pending_input_hotfix || return 1
@@ -15575,14 +15977,18 @@ except Exception:
     sys.exit(0)
 
 plugins = data.setdefault("plugins", {})
-plugins.setdefault("enabled", True)
+changed = False
+if plugins.get("enabled") is not True:
+    plugins["enabled"] = True
+    changed = True
 entries = plugins.setdefault("entries", {})
 codex = entries.setdefault("codex", {})
-codex.setdefault("enabled", True)
+if codex.get("enabled") is not True:
+    codex["enabled"] = True
+    changed = True
 config = codex.setdefault("config", {})
 app_server = config.setdefault("appServer", {})
 
-changed = False
 for key, value in {
     "turnCompletionIdleTimeoutMs": 180000,
     "postToolRawAssistantCompletionIdleTimeoutMs": 180000,
@@ -15635,10 +16041,15 @@ prepare_openclaw_runtime_for_portal() {
   run_openclaw_state_repair_notice
   repair_openclaw_portal_model_config
   bridge_openclaw_codex_cli_auth
+  # Runtime attestation below intentionally rejects a disabled or inert Codex
+  # provider. Converge the required harness state before inspecting it.
+  configure_openclaw_codex_harness_defaults
   if ! ensure_openclaw_codex_plugin_compatible; then
     fail "OpenClaw core is healthy, but the tested Codex plugin ${PIN_OPENCLAW_CODEX_PLUGIN_VERSION} could not be installed and loaded. The previous plugin was restored when possible."
   fi
-  configure_openclaw_codex_harness_defaults
+  if ! apply_openclaw_codex_plugin_pending_input_hotfix; then
+    fail "OpenClaw Codex is installed, but its active provider bundle could not be prepared for exact ask-question delivery. The previous plugin was restored when possible."
+  fi
   if ! install_bridgesllm_ask_user_plugin; then
     fail "OpenClaw is healthy, but the Portal ask-question answer channel could not be installed and verified. The previous plugin/config were restored when possible."
   fi
@@ -21154,6 +21565,318 @@ remove_portal_remote_desktop_launcher_lock() {
   exec {lock_fd}>&-
 }
 
+remove_portal_remote_desktop_open_handoffs() {
+  local production_root='/var/lib/bridgesllm/remote-desktop-open'
+  local handoff_root group_entry group_name group_password desktop_gid group_members
+  handoff_root="$(update_transaction_state_path "${production_root}")" \
+    || fail "Remote Desktop file handoff path could not be bounded safely; uninstall was aborted."
+  if [[ ! -e "${handoff_root}" && ! -L "${handoff_root}" ]]; then
+    return 0
+  fi
+
+  group_entry="$(getent group bridgesrd 2>/dev/null)" \
+    || fail "Remote Desktop group identity could not be resolved while file handoffs remain; uninstall was aborted."
+  [[ -n "${group_entry}" && "${group_entry}" != *$'\n'* ]] \
+    || fail "Remote Desktop group identity is ambiguous while file handoffs remain; uninstall was aborted."
+  IFS=: read -r group_name group_password desktop_gid group_members <<< "${group_entry}"
+  [[ "${group_name}" == 'bridgesrd' && "${desktop_gid}" =~ ^[1-9][0-9]*$ ]] \
+    || fail "Remote Desktop group identity is invalid while file handoffs remain; uninstall was aborted."
+
+  python3 - "${handoff_root}" "${desktop_gid}" <<'PY' \
+    || fail "Remote Desktop file handoffs failed exact lifecycle attestation; uninstall was aborted without deleting an unvalidated target."
+import os
+import re
+import stat
+import sys
+
+root_path, desktop_gid_text = sys.argv[1:]
+desktop_gid = int(desktop_gid_text)
+request_pattern = re.compile(r"[a-f0-9]{32}\Z")
+directory_flags = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+file_flags = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+
+if (
+    os.geteuid() != 0
+    or desktop_gid <= 0
+    or not os.path.isabs(root_path)
+    or os.path.normpath(root_path) != root_path
+    or os.path.basename(root_path) != "remote-desktop-open"
+):
+    raise SystemExit(1)
+
+
+def inode_identity(details):
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_nlink,
+        details.st_uid,
+        details.st_gid,
+    )
+
+
+def stable_directory_identity(details):
+    return (
+        details.st_dev,
+        details.st_ino,
+        stat.S_IFMT(details.st_mode),
+        stat.S_IMODE(details.st_mode),
+        details.st_uid,
+        details.st_gid,
+    )
+
+
+def mount_id(descriptor):
+    with open(
+        f"/proc/self/fdinfo/{descriptor}",
+        "r",
+        encoding="ascii",
+        errors="strict",
+    ) as handle:
+        for line in handle:
+            if line.startswith("mnt_id:\t"):
+                value = line.split("\t", 1)[1].strip()
+                if value.isdigit():
+                    return int(value)
+    raise SystemExit(1)
+
+
+def stat_entry(name, directory_fd):
+    return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+
+
+def assert_directory(details, uid, gid, mode, device):
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != uid
+        or details.st_gid != gid
+        or stat.S_IMODE(details.st_mode) != mode
+        or details.st_dev != device
+    ):
+        raise SystemExit(1)
+
+
+def assert_file(details, gids, mode, device):
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != 0
+        or details.st_gid not in gids
+        or stat.S_IMODE(details.st_mode) != mode
+        or details.st_nlink != 1
+        or details.st_dev != device
+    ):
+        raise SystemExit(1)
+
+
+# Every ancestor is root-owned and non-writable before the final parent is
+# pinned. That makes the descriptor-relative identity proofs below stable
+# against unprivileged rename/rebind attempts.
+parent_path = os.path.dirname(root_path)
+current = os.path.sep
+for component in parent_path.strip(os.path.sep).split(os.path.sep):
+    if not component:
+        continue
+    current = os.path.join(current, component)
+    details = os.lstat(current)
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != 0
+        or details.st_mode & 0o022
+    ):
+        raise SystemExit(1)
+
+parent_fd = os.open(parent_path, directory_flags)
+root_fd = -1
+directory_records = []
+try:
+    root_name = os.path.basename(root_path)
+    try:
+        root_entry = stat_entry(root_name, parent_fd)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    root_fd = os.open(root_name, directory_flags, dir_fd=parent_fd)
+    root_opened = os.fstat(root_fd)
+    if inode_identity(root_opened) != inode_identity(root_entry):
+        raise SystemExit(1)
+    assert_directory(root_opened, 0, desktop_gid, 0o710, root_opened.st_dev)
+    root_device = root_opened.st_dev
+    if root_device != os.fstat(parent_fd).st_dev or mount_id(root_fd) != mount_id(parent_fd):
+        raise SystemExit(1)
+
+    request_names = sorted(os.listdir(root_fd))
+    if len(request_names) > 32 or any(not request_pattern.fullmatch(name) for name in request_names):
+        raise SystemExit(1)
+
+    # Pin and prove the complete tree before deleting any member. A malformed
+    # sibling therefore cannot turn a partial cleanup into guessed ownership.
+    for request_name in request_names:
+        request_entry = stat_entry(request_name, root_fd)
+        request_fd = os.open(request_name, directory_flags, dir_fd=root_fd)
+        request_opened = os.fstat(request_fd)
+        try:
+            if inode_identity(request_opened) != inode_identity(request_entry):
+                raise SystemExit(1)
+            assert_directory(request_opened, 0, desktop_gid, 0o750, root_device)
+            if mount_id(request_fd) != mount_id(root_fd):
+                raise SystemExit(1)
+
+            file_names = sorted(os.listdir(request_fd))
+            if len(file_names) > 2:
+                raise SystemExit(1)
+            snapshot_names = [name for name in file_names if name != ".reservation"]
+            if len(snapshot_names) > 1:
+                raise SystemExit(1)
+
+            file_records = []
+            reservation_bytes = None
+            snapshot_details = None
+            for file_name in file_names:
+                is_reservation = file_name == ".reservation"
+                expected_gids = (
+                    {0}
+                    if is_reservation
+                    else ({0, desktop_gid} if ".reservation" in file_names else {desktop_gid})
+                )
+                expected_mode = 0o400 if file_name == ".reservation" else 0o440
+                file_entry = stat_entry(file_name, request_fd)
+                file_fd = os.open(file_name, file_flags, dir_fd=request_fd)
+                file_opened = os.fstat(file_fd)
+                try:
+                    if inode_identity(file_opened) != inode_identity(file_entry):
+                        raise SystemExit(1)
+                    assert_file(file_opened, expected_gids, expected_mode, root_device)
+                    if mount_id(file_fd) != mount_id(root_fd):
+                        raise SystemExit(1)
+                    if is_reservation:
+                        payload = os.read(file_fd, 16)
+                        if os.read(file_fd, 1):
+                            raise SystemExit(1)
+                        try:
+                            reservation_text = payload.decode("ascii")
+                        except UnicodeDecodeError:
+                            raise SystemExit(1)
+                        if not re.fullmatch(r"0|[1-9][0-9]*", reservation_text):
+                            raise SystemExit(1)
+                        reservation_bytes = int(reservation_text)
+                        if reservation_bytes > 256 * 1024 * 1024:
+                            raise SystemExit(1)
+                    else:
+                        snapshot_details = file_opened
+                        if snapshot_details.st_size > 256 * 1024 * 1024:
+                            raise SystemExit(1)
+                    file_records.append((file_name, file_fd, inode_identity(file_opened)))
+                    file_fd = -1
+                finally:
+                    if file_fd >= 0:
+                        os.close(file_fd)
+            if snapshot_details is not None and reservation_bytes is not None:
+                if (
+                    snapshot_details.st_gid == 0
+                    and snapshot_details.st_size > reservation_bytes
+                ) or (
+                    snapshot_details.st_gid == desktop_gid
+                    and snapshot_details.st_size != reservation_bytes
+                ):
+                    raise SystemExit(1)
+            directory_records.append((
+                request_name,
+                request_fd,
+                stable_directory_identity(request_opened),
+                file_records,
+            ))
+            request_fd = -1
+        finally:
+            if request_fd >= 0:
+                os.close(request_fd)
+
+    # Revalidate the full pinned tree once more before the first unlink. The
+    # per-entry check immediately before each mutation then catches a late
+    # replacement without ever following it.
+    if inode_identity(stat_entry(root_name, parent_fd)) != inode_identity(root_opened):
+        raise SystemExit(1)
+    for request_name, request_fd, request_identity, file_records in directory_records:
+        if stable_directory_identity(stat_entry(request_name, root_fd)) != request_identity:
+            raise SystemExit(1)
+        if stable_directory_identity(os.fstat(request_fd)) != request_identity:
+            raise SystemExit(1)
+        for file_name, file_fd, file_identity in file_records:
+            if inode_identity(stat_entry(file_name, request_fd)) != file_identity:
+                raise SystemExit(1)
+            if inode_identity(os.fstat(file_fd)) != file_identity:
+                raise SystemExit(1)
+
+    for request_name, request_fd, request_identity, file_records in directory_records:
+        for file_name, file_fd, file_identity in file_records:
+            if (
+                inode_identity(stat_entry(file_name, request_fd)) != file_identity
+                or inode_identity(os.fstat(file_fd)) != file_identity
+            ):
+                raise SystemExit(1)
+            os.unlink(file_name, dir_fd=request_fd)
+            if os.fstat(file_fd).st_nlink != 0:
+                raise SystemExit(1)
+            os.close(file_fd)
+        os.fsync(request_fd)
+        if os.listdir(request_fd):
+            raise SystemExit(1)
+        if (
+            stable_directory_identity(stat_entry(request_name, root_fd))
+            != request_identity
+            or stable_directory_identity(os.fstat(request_fd))
+            != request_identity
+        ):
+            raise SystemExit(1)
+        os.rmdir(request_name, dir_fd=root_fd)
+        os.close(request_fd)
+
+    os.fsync(root_fd)
+    if os.listdir(root_fd):
+        raise SystemExit(1)
+    if (
+        stable_directory_identity(stat_entry(root_name, parent_fd))
+        != stable_directory_identity(root_opened)
+        or stable_directory_identity(os.fstat(root_fd))
+        != stable_directory_identity(root_opened)
+    ):
+        raise SystemExit(1)
+    os.rmdir(root_name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+    try:
+        stat_entry(root_name, parent_fd)
+    except FileNotFoundError:
+        pass
+    else:
+        raise SystemExit(1)
+finally:
+    for _request_name, request_fd, _request_identity, file_records in directory_records:
+        for _file_name, file_fd, _file_identity in file_records:
+            try:
+                os.close(file_fd)
+            except OSError:
+                pass
+        try:
+            os.close(request_fd)
+        except OSError:
+            pass
+    if root_fd >= 0:
+        os.close(root_fd)
+    os.close(parent_fd)
+PY
+}
+
 remove_portal_remote_desktop_runtime() {
   local data_choice="${1:-1}"
   [[ "${data_choice}" == "1" || "${data_choice}" == "2" ]] \
@@ -21257,6 +21980,12 @@ remove_portal_remote_desktop_runtime() {
         || fail "Remote Desktop user process convergence could not be verified; uninstall was aborted before files or accounts were removed."
     fi
   fi
+
+  # Portal was fenced and stopped before this lifecycle phase. The exact RD
+  # units and, for an attested account, every bridgesrd process are now also
+  # proven stopped, so no product writer can race removal of ephemeral file
+  # handoffs. Both uninstall modes remove these runtime-only snapshots.
+  remove_portal_remote_desktop_open_handoffs
 
   local ai_provider_launcher='/usr/local/bin/bridges-rd-ai-launchers.sh'
   if [[ "${rd_account_is_managed}" == "true" ]]; then

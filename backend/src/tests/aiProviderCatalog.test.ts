@@ -88,6 +88,14 @@ describe('server-owned AI provider catalog', () => {
     expect(`${xai?.pricingNote} ${xai?.description}`).not.toMatch(/free monthly|\$\d+.*credit/i);
   });
 
+  it('documents current Codex device authorization without a stale localhost callback', () => {
+    const codex = getPublicAiProviderCatalog().find((provider) => provider.id === 'openai-codex');
+    const instructions = JSON.stringify(codex?.setupInstructions || []);
+    expect(instructions).toMatch(/device code login/i);
+    expect(instructions).toMatch(/developers\.openai\.com\/codex\/auth/i);
+    expect(instructions).not.toMatch(/127\.0\.0\.1:1455|paste the (?:full|entire) url/i);
+  });
+
   it('publishes Bedrock as AWS SDK setup instead of a fake OAuth flow', () => {
     const bedrock = getPublicAiProviderCatalog().find((provider) => provider.id === 'amazon-bedrock');
     expect(bedrock?.primaryAuthType).toBe('aws_sdk');

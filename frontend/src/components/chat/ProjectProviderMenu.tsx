@@ -138,7 +138,7 @@ function qualificationLabel(
   qualification: ProjectChatProviderQualificationStatus | undefined,
   active: boolean,
 ): string {
-  if (isReady(capability)) return active ? 'Active' : 'Ready';
+  if (isReady(capability)) return active ? 'Selected' : 'Ready';
   // "Preparing" is reserved for an actually running preparation (the button
   // spinner). A provider waiting on operator action must say so: labelling
   // expired auth or an unattempted runtime "Preparing" promised progress

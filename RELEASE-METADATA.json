@@ -1,13 +1,13 @@
 {
   "schema": 1,
-  "version": "4.0.8",
-  "releasedAt": "2026-08-02",
-  "releaseClass": "hotfix",
+  "version": "4.0.11",
+  "releasedAt": "2026-08-03",
+  "releaseClass": "feature",
   "highlights": [
-    "A new project can start Project Chat again: an interrupted first qualification no longer leaves the project permanently unable to connect.",
-    "Stop genuinely cancels an Agent Chat run instead of clearing the composer while the agent keeps working.",
-    "Legacy projects move into Project Chat through a verified copy that leaves the original project, its shares, apps, and deployment untouched.",
-    "Backups run again when the PostgreSQL server sits a patch behind the client security floor, which previously blocked every backup outright.",
-    "Native provider sign-in no longer fails its own attestation, a failed xAI attempt no longer locks the provider, and setup errors name the cause."
+    "Ask Questions now pauses and resumes a run through any embedded provider, not only native Codex, with each question bound to the exact user, session, run, and tool call.",
+    "Files an Agent links to open where they live: Portal uploads in Files, workspace files in a private, bounded Remote Desktop handoff that fails closed on unsafe paths.",
+    "The workspace refresh screen is now a branded Portal curtain using your uploaded logo, a restrained dot matrix, and glass status, opaque from the first frame.",
+    "Agent Chat recovers dropped provider streams, restores the correct provider and agent sessions, and reassembles a final reply split across frames.",
+    "OpenClaw backups omit volatile Codex runtime data, capture committed SQLite WAL state via the online backup API, and strip stale outbound deliveries so a restore cannot replay them."
   ]
 }

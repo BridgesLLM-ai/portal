@@ -7,6 +7,32 @@ import { readRuntimeTurnEvents, recordRuntimeTurnEvent } from '../services/Runti
 import type { RuntimeTurnEvent } from '../services/RuntimeTurnEvents';
 
 describe('gateway history readers', () => {
+  test('separates saved-session lifecycle from exact Agent Chat run activity', () => {
+    const sessions = __gatewayHistoryTest.annotateAgentChatSessionRunActivity([
+      {
+        sessionId: 'idle-host-session',
+        status: 'active' as const,
+        metadata: { executionScope: 'HOST_OPERATOR' },
+      },
+      {
+        sessionId: 'running-host-session',
+        status: 'active' as const,
+        metadata: { executionScope: 'HOST_OPERATOR' },
+      },
+      {
+        sessionId: 'running-project-session',
+        status: 'active' as const,
+        metadata: { executionScope: 'PROJECT_SANDBOX' },
+      },
+    ], (sessionId) => sessionId.startsWith('running-'));
+
+    expect(sessions).toEqual([
+      expect.objectContaining({ sessionId: 'idle-host-session', status: 'active', runActive: false }),
+      expect.objectContaining({ sessionId: 'running-host-session', status: 'active', runActive: true }),
+      expect.objectContaining({ sessionId: 'running-project-session', status: 'active', runActive: false }),
+    ]);
+  });
+
   test('backward cursors stay stable across appends and reject another actor/session scope', () => {
     const messages = Array.from({ length: 120 }, (_, index) => ({
       id: `message-${index + 1}`,

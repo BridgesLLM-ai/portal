@@ -3,8 +3,8 @@ jest.mock('node-pty', () => ({ spawn: jest.fn() }));
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { __resetClaudeSetupStartLeaseForTests, applyPortalOwnedProviderFileRemoval, applyProviderRemovalConfigPatch, buildPortalOwnedProviderFileRemoval, buildProviderRegistrationSeedModels, buildProviderRemovalConfigPatch, captureFileSnapshot, classifyPortalOwnedApiKeyRemoval, classifyProviderRuntimeFailure, classifyRcSafeProviderRemoval, createAiSetupRouter, credentialEntryProofSummary, credentialWriteRequestFingerprint, ExclusiveProviderOperationGate, filterXaiChatModels, getExpectedXaiProbeModel, getOAuthRequestOwnerId, getProviderDefaultModelPayload, getProviderRemovalCapability, getSafeXaiChatModelCatalog, matchesProviderModel, mergeDiscoveredProviderModelsIntoConfig, normalizeModelPayload, portalCredentialProfileContainsSubmittedSecret, presentProviderCredentialEnvironmentVariables, ProviderRemovalPreflightBlockedError, providerCredentialAliases, providerRemovalUsesUnverifiableCredentialSurface, readJsonStrictIfPresent, readStableCredentialWriteProof, removeProviderCredentialRoutingReferences, resolveModelRegistrationProvider, restoreSnapshotsWithCompareAndSwap, runClaudeSetupCompletionOnce, runClaudeSetupStartOnce, runNativeCliCompletionFinalizerOnce, runOAuthCompletionFinalizerOnce, runOpenClawWithSecretInput, shouldParkProviderRemovalFailure } from '../routes/ai-setup';
-import { __deleteOAuthSessionForTests, __setOAuthSessionForTests, type OAuthSession } from '../services/oauthFlowManager';
+import { __resetClaudeSetupStartLeaseForTests, applyPortalOwnedProviderFileRemoval, applyProviderRemovalConfigPatch, buildPortalOwnedProviderFileRemoval, buildProviderRegistrationSeedModels, buildProviderRemovalConfigPatch, captureFileSnapshot, classifyPortalOwnedApiKeyRemoval, classifyProviderRuntimeFailure, classifyRcSafeProviderRemoval, createAiSetupRouter, credentialEntryProofSummary, credentialWriteRequestFingerprint, ensureNativeCliFinalizationStarted, ExclusiveProviderOperationGate, filterXaiChatModels, getExpectedXaiProbeModel, getOAuthRequestOwnerId, getProviderDefaultModelPayload, getProviderRemovalCapability, getSafeXaiChatModelCatalog, matchesProviderModel, mergeDiscoveredProviderModelsIntoConfig, normalizeModelPayload, portalCredentialProfileContainsSubmittedSecret, presentProviderCredentialEnvironmentVariables, ProviderRemovalPreflightBlockedError, providerCredentialAliases, providerRemovalUsesUnverifiableCredentialSurface, readJsonStrictIfPresent, readStableCredentialWriteProof, removeProviderCredentialRoutingReferences, resolveModelRegistrationProvider, restoreSnapshotsWithCompareAndSwap, runClaudeSetupCompletionOnce, runClaudeSetupStartOnce, runNativeCliCompletionFinalizerOnce, runOAuthCompletionFinalizerOnce, runOpenClawWithSecretInput, shouldParkProviderRemovalFailure } from '../routes/ai-setup';
+import { __deleteOAuthSessionForTests, __setOAuthSessionForTests, isOAuthSessionCleanupPending, type OAuthSession } from '../services/oauthFlowManager';
 import {
   __clearProviderCredentialLifecycleLedgerForTests,
   __readProviderCredentialLifecycleLedgerForTests,
@@ -1258,6 +1258,82 @@ describe('ai-setup model normalization', () => {
     await runNativeCliCompletionFinalizerOnce(sessionId, action);
 
     expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  test('starts slow Codex finalization once without awaiting it in a status request', async () => {
+    const sessionId = `native_background_${Date.now()}_${Math.random()}`;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const finalizer = jest.fn(async () => gate);
+    const status = { id: sessionId, provider: 'codex', status: 'complete', credentialState: 'committed' };
+
+    expect(ensureNativeCliFinalizationStarted(status, finalizer)).toBe(true);
+    expect(ensureNativeCliFinalizationStarted(status, finalizer)).toBe(false);
+    expect(finalizer).toHaveBeenCalledTimes(1);
+
+    release();
+    await gate;
+    await new Promise((resolve) => setImmediate(resolve));
+  });
+
+  test('records a rejected background Codex finalizer as committed without eternal cleanup', async () => {
+    const sessionId = `native_background_failure_${Date.now()}_${Math.random()}`;
+    const session = {
+      id: sessionId,
+      provider: 'codex',
+      mode: 'device_code',
+      process: { kill: jest.fn() },
+      processExited: true,
+      status: 'complete',
+      error: null,
+      createdAt: Date.now(),
+      completedAt: Date.now(),
+      profileKeyBefore: [],
+      credentialResolution: 'committed',
+      finalizationPending: false,
+    } as unknown as OAuthSession;
+    __setOAuthSessionForTests(session);
+
+    try {
+      expect(ensureNativeCliFinalizationStarted(
+        { id: sessionId, provider: 'codex', status: 'complete', credentialState: 'committed' },
+        async () => { throw new Error('gateway recovery failed'); },
+      )).toBe(true);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(session).toMatchObject({
+        status: 'error',
+        credentialResolution: 'committed',
+        finalizationPending: false,
+      });
+      expect(session.error).toMatch(/credential was saved.*finalization failed/i);
+      expect(session.error).not.toContain('token');
+      expect(isOAuthSessionCleanupPending(session)).toBe(false);
+    } finally {
+      __deleteOAuthSessionForTests(sessionId);
+    }
+  });
+
+  test('refuses Codex finalization before credential commitment is attested', () => {
+    const finalizer = jest.fn(async () => undefined);
+    expect(ensureNativeCliFinalizationStarted({
+      id: `native_unattested_${Date.now()}_${Math.random()}`,
+      provider: 'codex',
+      status: 'complete',
+      credentialState: 'indeterminate',
+    }, finalizer)).toBe(false);
+    expect(finalizer).not.toHaveBeenCalled();
+  });
+
+  test('refuses Codex finalization when a committed credential came from an unclean login exit', () => {
+    const finalizer = jest.fn(async () => undefined);
+    expect(ensureNativeCliFinalizationStarted({
+      id: `native_unclean_${Date.now()}_${Math.random()}`,
+      provider: 'codex',
+      status: 'error',
+      credentialState: 'committed',
+    }, finalizer)).toBe(false);
+    expect(finalizer).not.toHaveBeenCalled();
   });
 
   test('shares native CLI finalizer failure and permits a verified retry', async () => {

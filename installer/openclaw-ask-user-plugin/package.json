@@ -1,7 +1,7 @@
 {
   "name": "bridgesllm-ask-user",
-  "version": "3.0.0",
-  "description": "Reads and settles exact native Codex pending-input requests on the attested active OpenClaw run.",
+  "version": "3.2.0",
+  "description": "Provides provider-neutral ask-user questions and settles native Codex prompts on the exact attested OpenClaw run.",
   "main": "index.js",
   "private": true,
   "openclaw": {

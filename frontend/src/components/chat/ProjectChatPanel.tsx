@@ -105,6 +105,7 @@ import { sanitizeThinkingSubject } from '../../utils/thinkingSubject';
 import { AskQuestionCard, AskQuestionAnswerProvider, parseAskQuestionPayload, useAskQuestionAnswer } from './AskQuestionCard';
 import AskUserQuestionCard from './AskUserQuestionCard';
 import type { AskUserQuestionRequest } from './AskUserQuestionCard';
+import { isAskUserQuestionNoLongerOpenError } from '../../utils/askUserQuestionError';
 
 import type {
   ToolCall,
@@ -854,7 +855,10 @@ function parseHistoryMessage(m: any): ChatMessage | null {
       result: typeof tc.result === 'string' ? tc.result : undefined,
       startedAt: Number.isFinite(tc.startedAt) ? tc.startedAt : Date.now(),
       endedAt: Number.isFinite(tc.endedAt) ? tc.endedAt : undefined,
-      status: tc.status === 'running' || tc.status === 'error' ? tc.status : 'done' as const,
+      // Durable history is not proof that a tool is still executing. Exact
+      // active-turn replay will project a running tool again when warranted;
+      // without that authority, a stranded historical status must be settled.
+      status: tc.status === 'error' ? 'error' : 'done' as const,
       order: Number.isSafeInteger(tc.order) ? tc.order : undefined,
     }));
   }
@@ -975,7 +979,10 @@ const ToolCallPill = React.memo(function ToolCallPill({ tool }: { tool: ToolCall
     () => (isAskQuestionTool(tool.name) ? parseAskQuestionPayload(tool.arguments) : null),
     [tool.name, tool.arguments],
   );
-  if (askPayload && onAnswerQuestion) {
+  // The exact-run pending card beside the composer owns live answers. Keep the
+  // streamed tool call non-interactive until it has a result so Project Chat
+  // never presents two forms for one runtime request.
+  if (askPayload && onAnswerQuestion && tool.result) {
     return (
       <div className="px-3">
         <AskQuestionCard
@@ -1008,7 +1015,7 @@ const ToolCallPill = React.memo(function ToolCallPill({ tool }: { tool: ToolCall
           </span>
           <span className="text-slate-200">{summary}</span>
           {tool.status === 'running' ? (
-            <Loader2 size={9} className={`animate-spin ${presentation.iconClass}`} />
+            <Loader2 aria-label="Tool turn running" size={9} className={`animate-spin ${presentation.iconClass}`} />
           ) : null}
           {duration && <span className="text-slate-500">· {duration}s</span>}
           {hasDetails && (
@@ -1192,10 +1199,12 @@ export function reconcileProjectPresentationSegments(
 
 const ProjectActivityTimeline = React.memo(function ProjectActivityTimeline({
   messageId,
+  projectName,
   segments,
   tools,
 }: {
   messageId: string;
+  projectName: string;
   segments: NonNullable<ChatMessage['segments']>;
   tools: readonly ToolCall[];
 }) {
@@ -1257,7 +1266,11 @@ const ProjectActivityTimeline = React.memo(function ProjectActivityTimeline({
             ) : null}
             {item.segment.text ? (
               <div className="text-[11px] leading-relaxed">
-                <MarkdownRenderer content={item.segment.text} isStreaming={false} />
+                <MarkdownRenderer
+                  content={item.segment.text}
+                  isStreaming={false}
+                  hostFileContext={{ source: 'project', project: projectName }}
+                />
               </div>
             ) : null}
           </div>
@@ -4570,6 +4583,14 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       }
       return true;
     } catch (error: any) {
+      if (isAskUserQuestionNoLongerOpenError(error)) {
+        pendingQuestionComposerAnswerRef.current = null;
+        setPendingQuestionAnswerPending(false);
+        settlePendingQuestion(request.id);
+        setSessionError(null);
+        void refreshPendingQuestions().catch(() => undefined);
+        return false;
+      }
       pending.inFlight = false;
       pendingQuestionComposerAnswerRef.current = pending;
       setPendingQuestionAnswerPending(false);
@@ -5082,12 +5103,14 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       const verifiedActiveModel = modelData?.verified === true
         ? canonicalizePortalModelId(String(modelData.activeModel || ''))
         : '';
+      const activeTurnRunning = isRunning && Boolean(activeReplayTurnIdRef.current);
       const lines = [
         `Project: ${projectName}`,
         `Provider: ${getProjectProviderLabel(providerRef.current)}`,
         `Runtime: ${runtimeRef.current}`,
         'Execution scope: PROJECT_SANDBOX',
-        `Provider session: ${statusData?.active ? 'active' : 'inactive'}`,
+        `Provider session: ${statusData?.active ? 'verified' : 'unavailable'}`,
+        `Active turn: ${activeTurnRunning ? 'running' : 'idle'}`,
         `Portal transport: ${transportConnected ? 'connected' : 'disconnected'}`,
         `Session key: ${sessionKeyRef.current || 'not ready'}`,
         `Configured model: ${selectedModel || 'not set'}`,
@@ -5098,7 +5121,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     } catch (err: any) {
       appendSystemMessage(`Failed to load session status: ${err?.response?.data?.error || err?.message || 'Unknown error'}`);
     }
-  }, [appendSystemMessage, projectName, selectedModel, transportConnected]);
+  }, [appendSystemMessage, isRunning, projectName, selectedModel, transportConnected]);
 
   const ensureVerifiedProjectModel = useCallback(async (model: string) => {
     const provider = serverSelectedProviderRef.current;
@@ -5541,7 +5564,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
 
   const handleProviderQualification = useCallback(async (
     provider: 'OPENCLAW' | 'CODEX' | 'CLAUDE_CODE' | 'AGENT_ZERO' | 'GEMINI' | 'OLLAMA',
-    options: { automatic?: boolean } = {},
+    _options: { automatic?: boolean } = {},
   ) => {
     if (
       qualificationLeaseRef.current
@@ -6127,7 +6150,11 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           <Bot size={14} className="text-emerald-400 flex-shrink-0" />
           <span className="text-xs font-medium text-white flex-shrink-0">Agent</span>
           <span className="text-[10px] text-slate-500 truncate" title={projectName}>{projectName}</span>
-          <span className={`text-[8px] px-1.5 py-0.5 rounded-full flex-shrink-0 ${transportConnected ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
+          <span
+            aria-label={`Project transport ${transportConnected ? 'connected' : 'disconnected'}`}
+            title={`Project transport ${transportConnected ? 'connected' : 'disconnected'}`}
+            className={`text-[8px] px-1.5 py-0.5 rounded-full flex-shrink-0 ${transportConnected ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}
+          >
             {transportConnected ? '●' : '○'}
           </span>
         </div>
@@ -6707,6 +6734,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                     {hasOrderedTimeline ? (
                       <ProjectActivityTimeline
                         messageId={msg.id}
+                        projectName={projectName}
                         segments={orderedSegments}
                         tools={toolCalls}
                       />
@@ -6729,7 +6757,11 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                               </div>
                               {hasThinkingContent ? (
                                 <div className={`text-[11px] leading-relaxed ${isCurrentlyStreaming && !hasContent ? 'streaming-cursor' : ''}`}>
-                                  <MarkdownRenderer content={visibleThinkingContent} isStreaming={isCurrentlyStreaming && !hasContent} />
+                                  <MarkdownRenderer
+                                    content={visibleThinkingContent}
+                                    isStreaming={isCurrentlyStreaming && !hasContent}
+                                    hostFileContext={{ source: 'project', project: projectName }}
+                                  />
                                 </div>
                               ) : null}
                             </div>
@@ -6756,7 +6788,11 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                                 </div>
                               ) : (
                                 <div className={`text-[11px] leading-relaxed ${isCurrentlyStreaming ? 'streaming-cursor' : ''}`}>
-                                  <MarkdownRenderer content={visibleContent} isStreaming={isCurrentlyStreaming} />
+                                  <MarkdownRenderer
+                                    content={visibleContent}
+                                    isStreaming={isCurrentlyStreaming}
+                                    hostFileContext={{ source: 'project', project: projectName }}
+                                  />
                                 </div>
                               )}
                             </div>

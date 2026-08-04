@@ -238,7 +238,6 @@ import {
   LegacyOpenClawProjectCreationCollisionError,
   LegacyOpenClawProjectCreationScanCapacityError,
   LegacyOpenClawProjectMigrationActiveError,
-  LegacyOpenClawProjectRetirementError,
 } from '../services/legacyOpenClawProjectRetirement';
 import { LEGACY_OPENCLAW_RETIREMENT_PENDING_MESSAGE } from '../services/legacyOpenClawRetirementPolicy';
 import { retireLegacyOpenClawProjectRuntime } from '../services/projectChatLegacyRuntimeCleanup';

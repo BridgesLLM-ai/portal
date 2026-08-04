@@ -121,6 +121,27 @@ describe('workspace authorization quarantine', () => {
     expect(useAuthStore.getState().user?.authorizationVersion).toBe(2);
   });
 
+  it('covers the first frame with an opaque branded composition that remains motion-safe', () => {
+    const favicon = document.createElement('link');
+    favicon.dataset.portalFavicon = 'true';
+    favicon.href = '/static-assets/branding/customer-mark.png';
+    document.head.appendChild(favicon);
+
+    quarantineWorkspaceAuthorization('user-1', 2, vi.fn());
+
+    const curtain = document.getElementById('portal-workspace-authorization-curtain');
+    const mark = curtain?.querySelector<HTMLElement>('[data-portal-curtain-layer="mark"]');
+    const status = curtain?.querySelector<HTMLElement>('[data-portal-curtain-layer="status"]');
+    const styles = document.getElementById('portal-workspace-authorization-curtain-style');
+    expect(curtain?.style.background).toBe('rgb(10, 14, 39)');
+    expect(curtain?.style.opacity).toBe('');
+    expect(mark?.style.backgroundImage).toContain('/static-assets/branding/customer-mark.png');
+    expect(status?.textContent).toContain('Verifying your permissions');
+    expect(styles?.textContent).toContain('@media (prefers-reduced-motion: reduce)');
+
+    favicon.remove();
+  });
+
   it('keeps the shell curtained until a matching socket snapshot arrives', () => {
     const { unmount } = renderHook(() => useWorkspaceAuthorizationLifecycle(vi.fn()));
     const socket = socketHarness.sockets.at(-1)!;

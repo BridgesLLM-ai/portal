@@ -12,11 +12,14 @@ import {
   __resetCredentialLifecycleMemoryForTests,
   __setOAuthSessionForTests,
   authProfileStateFingerprint,
+  attestCodexCredentialFile,
   beginClaudeSetupTokenFinalization,
+  buildCodexOAuthEnvironment,
   buildOAuthFlowStatusPayload,
   buildOAuthLoginArgs,
   buildXaiOAuthProfileId,
   captureNativeCredentialSnapshot,
+  classifyCodexDeviceLoginError,
   cleanupStaleClaudeSetupTokenProcesses,
   ClaudeOrphanLifecycleError,
   cancelOAuthFlow,
@@ -45,6 +48,7 @@ import {
   GROK_BUILD_DEVICE_LOGIN_ARGS,
   googleGeminiCliProfileHasUsableCredential,
   parseAntigravityReauthArgs,
+  probeCodexLoginStatus,
   normalizeTerminalScreenText,
   outputLooksLikeClaudeCliAuthImportSuccess,
   selectCompletedProviderProfileId,
@@ -74,6 +78,30 @@ function silentPty(onKill?: () => void) {
       exitHandler?.({ exitCode: 143, signal: 15 });
     }),
   } as any;
+}
+
+function controllablePty() {
+  let dataHandler: ((chunk: string) => void) | undefined;
+  let exitHandler: ((event: { exitCode: number; signal?: number }) => void) | undefined;
+  return {
+    process: {
+      pid: process.pid,
+      onData: jest.fn((handler: (chunk: string) => void) => { dataHandler = handler; }),
+      onExit: jest.fn((handler: (event: { exitCode: number; signal?: number }) => void) => { exitHandler = handler; }),
+      write: jest.fn(),
+      kill: jest.fn(),
+    } as any,
+    emitData: (chunk: string) => dataHandler?.(chunk),
+    emitExit: (exitCode: number) => exitHandler?.({ exitCode }),
+  };
+}
+
+async function waitForPtyListener(listener: jest.Mock): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (listener.mock.calls.length > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('Timed out waiting for native CLI PTY listeners.');
 }
 
 describe('oauthFlowManager terminal parsing', () => {
@@ -349,6 +377,399 @@ describe('oauthFlowManager terminal parsing', () => {
   test('maps Portal Codex setup to OpenClaw 2026.6 auth provider id', () => {
     expect(getOpenClawOAuthProviderId('openai-codex')).toBe('openai');
     expect(getOpenClawOAuthProviderId('google-gemini-cli')).toBe('google-gemini-cli');
+  });
+
+  test('classifies Codex device-login failures without reflecting terminal output', () => {
+    expect(classifyCodexDeviceLoginError('Error: device code login is not enabled token=must-not-leak'))
+      .toBe('Codex device login is disabled. Enable device code login in your personal ChatGPT Security settings or ask your workspace admin to enable it in Permissions, then try again.');
+    expect(classifyCodexDeviceLoginError('authorization was denied secret=must-not-leak'))
+      .toBe('OpenAI authorization was denied. Start a fresh Codex sign-in when you are ready to approve it.');
+    expect(classifyCodexDeviceLoginError('TLS handshake failed: unknown issuer'))
+      .toBe('Codex could not establish a trusted TLS connection to OpenAI. Check the server trust store or configure CODEX_CA_CERTIFICATE, then retry.');
+    expect(classifyCodexDeviceLoginError('unexpected provider response token=must-not-leak')).toBeNull();
+  });
+
+  test('classifies the read-only Codex login-status probe without exposing command output', () => {
+    const previousApiKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'must-not-cross-the-status-probe';
+    const runner = jest.fn(() => ({
+      status: 0,
+      stdout: '',
+      stderr: 'Logged in using ChatGPT\n',
+    }));
+    try {
+      expect(probeCodexLoginStatus('/fixture/codex', runner)).toBe('authenticated');
+      expect(runner).toHaveBeenCalledWith(
+        '/fixture/codex',
+        ['login', '-c', 'cli_auth_credentials_store="file"', 'status'],
+        expect.objectContaining({
+          env: expect.not.objectContaining({ OPENAI_API_KEY: expect.anything() }),
+        }),
+      );
+      expect(probeCodexLoginStatus('/fixture/codex', jest.fn(() => ({
+        status: 1,
+        stdout: '',
+        stderr: 'Not logged in\n',
+      })))).toBe('signed_out');
+      expect(probeCodexLoginStatus('/fixture/codex', jest.fn(() => ({
+        status: 1,
+        stdout: '',
+        stderr: 'Error checking login status: keyring unavailable\n',
+      })))).toBe('indeterminate');
+      expect(probeCodexLoginStatus('/fixture/codex', jest.fn(() => ({
+        status: 2,
+        stdout: '',
+        stderr: 'unexpected failure\n',
+      })))).toBe('indeterminate');
+    } finally {
+      if (previousApiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousApiKey;
+    }
+  });
+
+  test('passes only allowlisted Codex OAuth network and trust settings', () => {
+    const env = buildCodexOAuthEnvironment({
+      HOME: '/srv/portal',
+      PATH: '/usr/local/bin:/usr/bin',
+      CODEX_HOME: '/srv/portal/codex',
+      OPENAI_API_KEY: 'must-not-cross-oauth',
+      HTTPS_PROXY: 'http://proxy.example:8443',
+      no_proxy: '127.0.0.1,localhost',
+      SSL_CERT_FILE: '/etc/portal/custom-ca.pem',
+      CODEX_CA_CERTIFICATE: '/etc/portal/codex-ca.pem',
+      DATABASE_URL: 'postgres://must-not-cross',
+      PORTAL_JWT_SECRET: 'must-not-cross',
+    });
+
+    expect(env).toMatchObject({
+      HOME: '/srv/portal',
+      PATH: '/usr/local/bin:/usr/bin',
+      CODEX_HOME: '/srv/portal/codex',
+      HTTPS_PROXY: 'http://proxy.example:8443',
+      no_proxy: '127.0.0.1,localhost',
+      SSL_CERT_FILE: '/etc/portal/custom-ca.pem',
+      CODEX_CA_CERTIFICATE: '/etc/portal/codex-ca.pem',
+    });
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.DATABASE_URL).toBeUndefined();
+    expect(env.PORTAL_JWT_SECRET).toBeUndefined();
+  });
+
+  test('treats only a missing Codex auth file as absent', () => {
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-file-attestation-'));
+    const authPath = path.join(codexHome, 'auth.json');
+    try {
+      expect(attestCodexCredentialFile(authPath)).toBe('absent');
+      fs.writeFileSync(authPath, '{not-json', { mode: 0o600 });
+      expect(attestCodexCredentialFile(authPath)).toBe('indeterminate');
+      fs.writeFileSync(authPath, '{}', { mode: 0o600 });
+      expect(attestCodexCredentialFile(authPath)).toBe('indeterminate');
+      fs.writeFileSync(authPath, JSON.stringify({
+        tokens: { access_token: 'fixture-access-token' },
+      }), { mode: 0o600 });
+      expect(attestCodexCredentialFile(authPath)).toBe('committed');
+    } finally {
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test('reuses an attested existing Codex login without spawning destructive reauthentication', async () => {
+    const previousCodexHome = process.env.CODEX_HOME;
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-reuse-'));
+    process.env.CODEX_HOME = codexHome;
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+      tokens: { access_token: 'existing-access-token', refresh_token: 'existing-refresh-token' },
+    }), { mode: 0o600 });
+    (pty.spawn as jest.Mock).mockClear();
+    let sessionId: string | null = null;
+
+    try {
+      const result = await startNativeCliFlow('codex', {
+        ownerId: 'user:codex-reuse',
+        codexLoginStatusProbe: () => 'authenticated',
+      });
+      sessionId = result.sessionId;
+      expect(result).toMatchObject({
+        status: 'complete',
+        alreadyAuthenticated: true,
+        reauthSupported: true,
+      });
+      expect(getOAuthFlowStatus(sessionId, 'user:codex-reuse')).toMatchObject({
+        status: 'complete',
+        credentialState: 'committed',
+        cleanupPending: false,
+      });
+      expect(pty.spawn).not.toHaveBeenCalled();
+    } finally {
+      if (sessionId) __deleteOAuthSessionForTests(sessionId);
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test('requires explicit replacement before touching an existing unconfirmed Codex credential', async () => {
+    const previousCodexHome = process.env.CODEX_HOME;
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-protected-'));
+    process.env.CODEX_HOME = codexHome;
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+      tokens: { access_token: 'protected-access-token', refresh_token: 'protected-refresh-token' },
+    }), { mode: 0o600 });
+    (pty.spawn as jest.Mock).mockClear();
+
+    try {
+      await expect(startNativeCliFlow('codex', {
+        ownerId: 'user:codex-protected',
+        codexLoginStatusProbe: () => 'signed_out',
+      })).rejects.toMatchObject({
+        code: 'CODEX_REAUTHENTICATION_REQUIRED',
+        statusCode: 409,
+        message: expect.stringMatching(/stopped before it could delete/i),
+      });
+      expect(pty.spawn).not.toHaveBeenCalled();
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test('requires explicit replacement when Codex login status is indeterminate', async () => {
+    const previousCodexHome = process.env.CODEX_HOME;
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-indeterminate-'));
+    process.env.CODEX_HOME = codexHome;
+    (pty.spawn as jest.Mock).mockClear();
+
+    try {
+      await expect(startNativeCliFlow('codex', {
+        ownerId: 'user:codex-indeterminate',
+        codexLoginStatusProbe: () => 'indeterminate',
+      })).rejects.toMatchObject({
+        code: 'CODEX_REAUTHENTICATION_REQUIRED',
+        statusCode: 409,
+        message: expect.stringMatching(/could not verify whether Codex is already signed in/i),
+      });
+      expect(pty.spawn).not.toHaveBeenCalled();
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test('blocks ordinary Codex setup when auth.json changes during the status probe', async () => {
+    const previousCodexHome = process.env.CODEX_HOME;
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-probe-race-'));
+    const authPath = path.join(codexHome, 'auth.json');
+    process.env.CODEX_HOME = codexHome;
+    fs.writeFileSync(authPath, JSON.stringify({
+      tokens: { access_token: 'before-probe-token' },
+    }), { mode: 0o600 });
+    (pty.spawn as jest.Mock).mockClear();
+
+    try {
+      await expect(startNativeCliFlow('codex', {
+        ownerId: 'user:codex-probe-race',
+        codexLoginStatusProbe: () => {
+          fs.writeFileSync(authPath, JSON.stringify({
+            tokens: { access_token: 'after-probe-token' },
+          }), { mode: 0o600 });
+          return 'authenticated';
+        },
+      })).rejects.toMatchObject({
+        code: 'CODEX_REAUTHENTICATION_REQUIRED',
+        statusCode: 409,
+      });
+      expect(pty.spawn).not.toHaveBeenCalled();
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test('keeps native Codex non-terminal until CODEX_HOME credential proof succeeds', async () => {
+    const previousCodexHome = process.env.CODEX_HOME;
+    const previousApiKey = process.env.OPENAI_API_KEY;
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-home-'));
+    const ptyControl = controllablePty();
+    process.env.CODEX_HOME = codexHome;
+    process.env.OPENAI_API_KEY = 'must-not-cross-the-device-login';
+    (pty.spawn as jest.Mock).mockReturnValueOnce(ptyControl.process);
+    let sessionId: string | null = null;
+
+    try {
+      const pending = startNativeCliFlow('codex', {
+        ownerId: 'user:codex-home',
+        codexLoginStatusProbe: () => 'signed_out',
+      });
+      await waitForPtyListener(ptyControl.process.onData);
+      const [, args, spawnOptions] = (pty.spawn as jest.Mock).mock.calls.at(-1);
+      expect(args.slice(-4)).toEqual(['login', '-c', 'cli_auth_credentials_store="file"', '--device-auth']);
+      expect(spawnOptions.env.CODEX_HOME).toBe(codexHome);
+      expect(spawnOptions.env.OPENAI_API_KEY).toBeUndefined();
+      ptyControl.emitData('Open https://auth.openai.com/codex/device to continue.');
+      const started = await pending;
+      sessionId = started.sessionId;
+
+      ptyControl.emitData('Successfully logged in');
+      expect(getOAuthFlowStatus(sessionId, 'user:codex-home')).toMatchObject({
+        status: 'processing',
+        credentialState: null,
+        createdProfileId: null,
+      });
+
+      fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+        tokens: { access_token: 'test-access-token', refresh_token: 'test-refresh-token' },
+      }), { mode: 0o600 });
+      ptyControl.emitExit(0);
+
+      expect(getOAuthFlowStatus(sessionId, 'user:codex-home')).toMatchObject({
+        status: 'complete',
+        credentialState: 'committed',
+        cleanupPending: false,
+        createdProfileId: null,
+      });
+    } finally {
+      if (sessionId) __deleteOAuthSessionForTests(sessionId);
+      (pty.spawn as jest.Mock).mockReset();
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousApiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousApiKey;
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test('overrides premature Codex success text when no usable file credential exists', async () => {
+    const previousCodexHome = process.env.CODEX_HOME;
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-empty-'));
+    const ptyControl = controllablePty();
+    process.env.CODEX_HOME = codexHome;
+    (pty.spawn as jest.Mock).mockReturnValueOnce(ptyControl.process);
+    let sessionId: string | null = null;
+
+    try {
+      const pending = startNativeCliFlow('codex', {
+        ownerId: 'user:codex-empty',
+        codexLoginStatusProbe: () => 'signed_out',
+      });
+      await waitForPtyListener(ptyControl.process.onData);
+      ptyControl.emitData('Open https://auth.openai.com/codex/device to continue.');
+      const started = await pending;
+      sessionId = started.sessionId;
+      ptyControl.emitData('Successfully logged in');
+      ptyControl.emitExit(0);
+
+      expect(getOAuthFlowStatus(sessionId, 'user:codex-empty')).toMatchObject({
+        status: 'error',
+        credentialState: 'absent',
+        cleanupPending: false,
+        createdProfileId: null,
+        error: expect.stringMatching(/file-backed credential/i),
+      });
+    } finally {
+      if (sessionId) __deleteOAuthSessionForTests(sessionId);
+      (pty.spawn as jest.Mock).mockReset();
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test('does not mistake an unchanged preexisting Codex credential for a successful reauthentication', async () => {
+    const previousCodexHome = process.env.CODEX_HOME;
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-existing-'));
+    const ptyControl = controllablePty();
+    process.env.CODEX_HOME = codexHome;
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+      tokens: { access_token: 'existing-access-token', refresh_token: 'existing-refresh-token' },
+    }), { mode: 0o600 });
+    (pty.spawn as jest.Mock).mockReturnValueOnce(ptyControl.process);
+    let sessionId: string | null = null;
+
+    try {
+      const pending = startNativeCliFlow('codex', {
+        ownerId: 'user:codex-existing',
+        forceReauth: true,
+        codexLoginStatusProbe: () => 'signed_out',
+      });
+      await waitForPtyListener(ptyControl.process.onData);
+      ptyControl.emitData('Open https://auth.openai.com/codex/device to continue.');
+      const started = await pending;
+      sessionId = started.sessionId;
+      ptyControl.emitData('Successfully logged in');
+      ptyControl.emitExit(1);
+
+      expect(getOAuthFlowStatus(sessionId, 'user:codex-existing')).toMatchObject({
+        status: 'error',
+        credentialState: 'absent',
+        cleanupPending: false,
+        createdProfileId: null,
+        error: expect.stringMatching(/without committing a new usable file-backed credential/i),
+      });
+    } finally {
+      if (sessionId) __deleteOAuthSessionForTests(sessionId);
+      (pty.spawn as jest.Mock).mockReset();
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test('records an unclean changed Codex credential for review without stranding the lifecycle lease', async () => {
+    const previousCodexHome = process.env.CODEX_HOME;
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-unclean-'));
+    const firstPty = controllablePty();
+    const retryPty = controllablePty();
+    process.env.CODEX_HOME = codexHome;
+    (pty.spawn as jest.Mock)
+      .mockReturnValueOnce(firstPty.process)
+      .mockReturnValueOnce(retryPty.process);
+    let firstSessionId: string | null = null;
+    let retrySessionId: string | null = null;
+
+    try {
+      const firstPending = startNativeCliFlow('codex', {
+        ownerId: 'user:codex-unclean',
+        codexLoginStatusProbe: () => 'signed_out',
+      });
+      await waitForPtyListener(firstPty.process.onData);
+      firstPty.emitData('Open https://auth.openai.com/codex/device to continue.');
+      const first = await firstPending;
+      firstSessionId = first.sessionId;
+      fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+        tokens: { access_token: 'changed-access-token', refresh_token: 'changed-refresh-token' },
+      }), { mode: 0o600 });
+      firstPty.emitData('Successfully logged in');
+      firstPty.emitExit(1);
+
+      expect(getOAuthFlowStatus(firstSessionId, 'user:codex-unclean')).toMatchObject({
+        status: 'error',
+        credentialState: 'committed',
+        cleanupPending: false,
+        createdProfileId: null,
+        error: expect.stringMatching(/wrote a usable credential.*exited with code 1/i),
+      });
+
+      const retryPending = startNativeCliFlow('codex', {
+        ownerId: 'user:codex-unclean',
+        forceReauth: true,
+        codexLoginStatusProbe: () => 'signed_out',
+      });
+      await waitForPtyListener(retryPty.process.onData);
+      retryPty.emitData('Open https://auth.openai.com/codex/device to continue.');
+      const retry = await retryPending;
+      retrySessionId = retry.sessionId;
+      expect(retrySessionId).not.toBe(firstSessionId);
+    } finally {
+      if (firstSessionId) __deleteOAuthSessionForTests(firstSessionId);
+      if (retrySessionId) __deleteOAuthSessionForTests(retrySessionId);
+      (pty.spawn as jest.Mock).mockReset();
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
   });
 
   test('uses the exact audited xAI OAuth argv without changing the default model', () => {
@@ -1312,7 +1733,11 @@ describe('oauthFlowManager terminal parsing', () => {
     ['OpenClaw OAuth', 'credential-domain:openai', () => startOAuthFlow('openai-codex', { ownerId: 'user:owner' }), 20_200],
     ['device-code OAuth', 'credential-domain:openclaw:github-copilot', () => startDeviceCodeFlow('github-copilot', 'user:owner'), 20_200],
     ['Claude setup-token', 'credential-domain:anthropic', () => startClaudeSetupTokenFlow('user:owner'), 30_200],
-    ['native Codex', 'credential-domain:openai', () => startNativeCliFlow('codex', { ownerId: 'user:owner' }), 20_200],
+    ['native Codex', 'credential-domain:openai', () => startNativeCliFlow('codex', {
+      ownerId: 'user:owner',
+      forceReauth: true,
+      codexLoginStatusProbe: () => 'signed_out',
+    }), 20_200],
   ])('binds %s PTYs before the first await, then safely handles startup timeout', async (
     _label,
     namespace,
@@ -1375,7 +1800,11 @@ describe('oauthFlowManager terminal parsing', () => {
 
   test.each([
     ['OpenClaw OAuth', () => startOAuthFlow('openai-codex', { ownerId: 'user:bind-failure' })],
-    ['native Codex', () => startNativeCliFlow('codex', { ownerId: 'user:bind-failure' })],
+    ['native Codex', () => startNativeCliFlow('codex', {
+      ownerId: 'user:bind-failure',
+      forceReauth: true,
+      codexLoginStatusProbe: () => 'signed_out',
+    })],
     ['Claude setup-token', () => startClaudeSetupTokenFlow('user:bind-failure')],
   ])('stops and attests a newly spawned %s PTY when durable PID binding fails', async (_label, start) => {
     const originalHome = process.env.HOME;

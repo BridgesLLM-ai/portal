@@ -50,6 +50,10 @@ import ollamaRoutes from './routes/ollama';
 import askUserPluginRoutes from './routes/askUserPlugin';
 import remoteDesktopRoutes, { reconcilePortalVisibleBrowserDefaults, reconcileRemoteDesktopLauncherAssets } from './routes/remote-desktop';
 import { retireInternalProjectIdentityDebris } from './services/projectIdentity';
+import {
+  startRemoteDesktopOpenPathCleanup,
+  stopRemoteDesktopOpenPathCleanup,
+} from './services/remoteDesktopOpenPath';
 import { provisionAgentZeroDesktopLauncherSecret } from './services/agentZeroDesktopLaunch';
 import agentBrowserRoutes, { attachAgentBrowserWebSocket } from './routes/agentBrowser';
 import systemRemediationRoutes from './routes/system-remediation';
@@ -1751,6 +1755,7 @@ const shutdownHandler = async (signal: string) => {
   stopStatusWatcher();
   shutdownCronJobs();
   shutdownChunkedUploadRuntime();
+  stopRemoteDesktopOpenPathCleanup();
   stopTelemetryService();
   stopAudioProxy();
   try {
@@ -1836,6 +1841,16 @@ export const startServer = async () => {
     initializeAgentJobsStorage();
     initializeHostAgentRunStorage();
     initializeChunkedUploadRuntime();
+    try {
+      await startRemoteDesktopOpenPathCleanup();
+    } catch (error: any) {
+      // A drifted handoff root stays unavailable and is retried by the cleanup
+      // interval; it must not take unrelated Portal surfaces offline.
+      console.warn(
+        '[Remote Desktop] staged file cleanup could not complete at startup:',
+        error?.code || error?.name || 'UnknownError',
+      );
+    }
     ensureRuntimeDirectory(HOSTED_APPS_DIR, { mode: 0o755 });
 
     setStartupPhase('database-connection');

@@ -223,7 +223,8 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
             return;
           }
 
-          const completionReady = isOAuthFlowReadyForModel(structured, flowKind === 'oauth');
+          const requiresFinalization = flowKind === 'oauth' || isOpenAI;
+          const completionReady = isOAuthFlowReadyForModel(structured, requiresFinalization);
           if (completionReady) {
             if (isXai && !structured.createdProfileId) {
               stopPolling();
@@ -236,7 +237,15 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
             setSessionOwned(false);
             stopPolling();
             setStep('model');
-          } else if (structured.createdProfileId && (isOAuthFlowExpired(structured) || isOAuthFlowCancelled(structured) || structured.status === 'error')) {
+          } else if (structured.status === 'complete' && requiresFinalization) {
+            // Native Codex authentication has committed. Do not offer
+            // cancellation while Portal finishes setup in the background.
+            if (isOpenAI) {
+              setSessionOwned(false);
+              setStep('finalizing');
+            }
+          } else if ((structured.createdProfileId || structured.credentialState === 'committed')
+            && (isOAuthFlowExpired(structured) || isOAuthFlowCancelled(structured) || structured.status === 'error')) {
             setSessionOwned(false);
             setSessionId(null);
             setReviewState('committed');
@@ -262,12 +271,24 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
         } catch (err: any) {
           if (stopped || generation !== pollGenerationRef.current || operationRef.current || mutationGeneration !== mutationGenerationRef.current) return;
           const structuredError = readStructuredOAuthFlowState(err?.response?.data);
-          if (flowKind === 'oauth' && structuredError.status === 'complete' && structuredError.finalized !== true) {
+          if ((flowKind === 'oauth' || isOpenAI) && structuredError.status === 'complete' && structuredError.finalized !== true) {
+            if (isOpenAI) {
+              setSessionOwned(false);
+              setStep('finalizing');
+            }
             setError(structuredError.error || `${provider.name} sign-in succeeded. Portal is retrying final setup…`);
             return;
           }
           if (step === 'error' && sessionOwned) {
             setFatalError(structuredError.error || err?.message || 'Portal is still reconciling this provider sign-in.');
+            return;
+          }
+          const httpStatus = Number(err?.response?.status || 0);
+          const transientNativeCodexPoll = flowKind === 'native-cli'
+            && isOpenAI
+            && (!err?.response || (httpStatus >= 500 && !structuredError.error));
+          if (transientNativeCodexPoll) {
+            setError('Portal temporarily lost the Codex status connection. Retrying…');
             return;
           }
           if (flowKind === 'native-cli' || (isXai && structuredError.error)) {
@@ -285,9 +306,9 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
     return () => {
       if (pollRef.current) { clearTimeout(pollRef.current); pollRef.current = null; }
     };
-  }, [step, sessionId, sessionOwned, recoverySession, apiBase, flowKind, isXai, provider.name]);
+  }, [step, sessionId, sessionOwned, recoverySession, apiBase, flowKind, isOpenAI, isXai, provider.name]);
 
-  const startFlow = async () => {
+  const startFlow = async (forceReauth = false) => {
     if (sessionOwned || reviewState || !claimOperation('start')) return;
     setLoading(true);
     setError(null);
@@ -298,9 +319,17 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
     try {
       if (isOpenAI) {
         setFlowKind('native-cli');
-        const { data } = await client.post(`${apiBase}/native-cli/start`, { provider: 'codex' });
+        const { data } = await client.post(`${apiBase}/native-cli/start`, {
+          provider: 'codex',
+          ...(forceReauth ? { forceReauth: true } : {}),
+        });
         if (data.success === false) {
           const startFailure = readStructuredOAuthStartFailure(data);
+          if (startFailure.code === 'CODEX_REAUTHENTICATION_REQUIRED') {
+            setError(startFailure.error || 'Portal stopped before replacing the existing Codex sign-in.');
+            setStep('start');
+            return;
+          }
           const disposition = getOAuthStartRecoveryDisposition(startFailure);
           if (disposition === 'cleanup_required' && startFailure.sessionId) {
             setSessionId(startFailure.sessionId);
@@ -327,7 +356,8 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
         setSessionId(nextSessionId);
         setSessionOwned(data.status !== 'complete');
         if (data.status === 'complete') {
-          setStep('model');
+          const structured = readStructuredOAuthFlowState(data);
+          setStep(structured.finalized === true ? 'model' : 'finalizing');
           return;
         }
         const url = data.verificationUrl || 'https://auth.openai.com/codex/device';
@@ -415,6 +445,11 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
       // early-return; the ledger conflict never owns a live session, so this
       // cannot shadow a cleanup path.
       const conflictCode = err?.response?.data?.code;
+      if (isOpenAI && startFailure.code === 'CODEX_REAUTHENTICATION_REQUIRED') {
+        setError(msg);
+        setStep('start');
+        return;
+      }
       const isLifecycleConflict = err?.response?.status === 409
         && !startFailure.sessionId
         && startFailure.credentialState !== 'committed'
@@ -641,6 +676,15 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                       <li className="flex items-start gap-2">
                         <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400" />
                         <span>
+                          Enable <strong className="text-white">device code login</strong> in your personal ChatGPT Security settings, or ask your workspace admin to enable it in Permissions.{' '}
+                          <a href="https://developers.openai.com/codex/auth#login-on-headless-devices" target="_blank" rel="noreferrer" className="font-medium text-sky-400 underline decoration-sky-400/30 hover:text-sky-300">
+                            OpenAI instructions
+                          </a>
+                        </span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400" />
+                        <span>
                           Don't have one?{' '}
                           <a href="https://chatgpt.com/#pricing" target="_blank" rel="noreferrer" className="font-medium text-sky-400 underline decoration-sky-400/30 hover:text-sky-300">
                             Sign up for ChatGPT Plus
@@ -810,13 +854,30 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
 
               <button
                 type="button"
-                onClick={startFlow}
+                onClick={() => { void startFlow(); }}
                 disabled={loading}
                 className="flex w-full items-center justify-center gap-2 rounded-xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 shadow transition hover:bg-slate-100 active:bg-slate-200 disabled:opacity-50"
               >
                 {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ExternalLink className="h-4 w-4" />}
                 Sign in with {providerLabel}
               </button>
+
+              {isOpenAI ? (
+                <div className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                  <p>
+                    Portal will reuse a verified existing Codex sign-in. Replacing it is destructive: Codex clears the current server credential before device authorization, so a cancelled or failed replacement can leave Codex signed out.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => { void startFlow(true); }}
+                    disabled={loading}
+                    className="mt-3 inline-flex items-center gap-2 rounded-lg border border-amber-400/30 bg-amber-500/15 px-3 py-2 text-xs font-semibold text-amber-100 transition hover:bg-amber-500/25 disabled:cursor-wait disabled:opacity-50"
+                  >
+                    <AlertTriangle className="h-3.5 w-3.5" />
+                    Replace existing Codex sign-in
+                  </button>
+                </div>
+              ) : null}
 
               <button type="button" onClick={() => { if (!operationRef.current) setStep('prereqs'); }} disabled={Boolean(operation)} className="w-full text-center text-sm text-slate-500 hover:text-slate-300 transition disabled:cursor-wait disabled:opacity-50">
                 ← Back
@@ -1098,6 +1159,10 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                     <li className="flex items-start gap-2">
                       <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-500" />
                       <span>You don't have a paid ChatGPT subscription (Plus, Pro, or Team).</span>
+                    </li>
+                    <li className="flex items-start gap-2">
+                      <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-500" />
+                      <span>Device code login is disabled in your ChatGPT Security settings or by your workspace admin.</span>
                     </li>
                     <li className="flex items-start gap-2">
                       <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-500" />

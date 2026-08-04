@@ -21,7 +21,7 @@ import { useAgentRuntime, type ChatMessage, type ToolCall } from './useAgentRunt
 import { useChatState, type OpenClawSessionTelemetry, type SessionControlMutationKind } from '../../contexts/ChatStateProvider';
 import { useExecApprovals } from './useExecApprovals';
 import { ExecApprovalModal } from './ExecApprovalModal';
-import MarkdownRenderer from './MarkdownRenderer';
+import MarkdownRenderer, { type HostFileLinkContext } from './MarkdownRenderer';
 import React, { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo } from 'react';
 import {
   Send, StopCircle, Pencil, Settings, X, ChevronDown,
@@ -256,9 +256,20 @@ function normalizeOpenClawAgentSelection(providerName: string, rawAgentId?: stri
   return agentId && agentId !== 'main' ? agentId : undefined;
 }
 
-function getInitialSessionForAgentSelection(providerName: string, agentId?: string): string {
-  if (providerName !== 'OPENCLAW') return 'main';
-  return `agent:${agentId || 'main'}:main`;
+export function planAgentChatSelection(
+  currentProvider: string,
+  currentAgentId: string | undefined,
+  selection: AgentSelection,
+) {
+  const providerChanged = selection.provider !== currentProvider;
+  const nextAgentId = normalizeOpenClawAgentSelection(selection.provider, selection.agentId);
+  const currentNormalizedAgentId = normalizeOpenClawAgentSelection(currentProvider, currentAgentId);
+  const agentChanged = nextAgentId !== currentNormalizedAgentId;
+  return {
+    changed: providerChanged || agentChanged,
+    providerChanged,
+    nextAgentId,
+  };
 }
 
 /* ─── Provider model catalogs ───────────────────────────────────────────── */
@@ -401,6 +412,28 @@ export function BlockedAgentChatSendButton({
       title={title}
     >
       {children}
+    </button>
+  );
+}
+
+export function StreamReconnectButton({
+  visible,
+  onReconnect,
+}: {
+  visible: boolean;
+  onReconnect: () => void;
+}) {
+  if (!visible) return null;
+  return (
+    <button
+      type="button"
+      onClick={onReconnect}
+      aria-label="Reconnect live stream"
+      className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/20 bg-amber-500/10 px-2.5 py-1.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/15 hover:text-amber-200"
+      title="Reconnect live stream"
+    >
+      <RefreshCw size={14} className="animate-spin" aria-hidden="true" />
+      <span className="hidden sm:inline">Reconnect</span>
     </button>
   );
 }
@@ -1754,7 +1787,11 @@ const ToolCallBlock = React.memo(function ToolCallBlock({ tool }: { tool: ToolCa
   // Tool arguments can become valid partway through a stream. Keep every hook
   // above the conditional return so that transition cannot change hook order.
   const [expanded, setExpanded] = useState(false);
-  if (askPayload && onAnswerQuestion) {
+  // The owner-scoped pending card beside the composer is the only answer
+  // surface while the tool is running. Rendering the streamed arguments as a
+  // second live form creates two competing submissions with different answer
+  // encodings. Once settled, retain the compact answered transcript card.
+  if (askPayload && onAnswerQuestion && tool.result) {
     return (
       <div className="px-4">
         <AskQuestionCard
@@ -2319,7 +2356,19 @@ function AttachmentChip({
 
 /* ─── User Message Bubble ───────────────────────────────────────────────── */
 
-const UserBubble = React.memo(function UserBubble({ message, avatarUrl, username, onRemoveQueued }: { message: ChatMessage; avatarUrl?: string | null; username?: string; onRemoveQueued?: () => void }) {
+const UserBubble = React.memo(function UserBubble({
+  message,
+  avatarUrl,
+  username,
+  hostFileContext,
+  onRemoveQueued,
+}: {
+  message: ChatMessage;
+  avatarUrl?: string | null;
+  username?: string;
+  hostFileContext: HostFileLinkContext;
+  onRemoveQueued?: () => void;
+}) {
   const [hovered, setHovered] = useState(false);
   const initial = (username || 'U')[0].toUpperCase();
 
@@ -2334,6 +2383,7 @@ const UserBubble = React.memo(function UserBubble({ message, avatarUrl, username
         <div className={`rounded-2xl rounded-br-sm px-4 py-2.5 shadow-lg shadow-blue-600/15 transition-opacity ${message.queued ? 'bg-blue-600/65 opacity-85' : 'bg-blue-600/90'}`}>
           <MarkdownRenderer
             content={message.content}
+            hostFileContext={hostFileContext}
             className="text-white [&_p]:text-white [&_li]:text-white/95 [&_strong]:text-white [&_em]:text-white/95 [&_code]:text-blue-50 [&_pre]:bg-blue-950/40 [&_pre]:border-white/10 [&_blockquote]:text-blue-100/85 [&_blockquote]:border-blue-200/30 [&_a]:text-cyan-100 [&_a]:decoration-cyan-200/40 hover:[&_a]:text-white hover:[&_a]:decoration-cyan-100/70"
           />
         </div>
@@ -2389,10 +2439,12 @@ export const AssistantThinkingBubble = React.memo(function AssistantThinkingBubb
   content,
   subject,
   isStreaming,
+  hostFileContext,
 }: {
   content: string;
   subject?: string;
   isStreaming: boolean;
+  hostFileContext?: HostFileLinkContext;
 }) {
   if (!content.trim() && !subject) return null;
 
@@ -2411,7 +2463,7 @@ export const AssistantThinkingBubble = React.memo(function AssistantThinkingBubb
       </div>
       {content.trim() ? (
         <div className={isStreaming ? 'streaming-cursor text-slate-300/95' : 'text-slate-300/95'}>
-          <MarkdownRenderer content={content} isStreaming={isStreaming} />
+          <MarkdownRenderer content={content} isStreaming={isStreaming} hostFileContext={hostFileContext} />
         </div>
       ) : null}
     </div>
@@ -2427,6 +2479,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
   liveThinkingContent,
   liveThinkingSubject,
   liveStatusText,
+  hostFileContext,
   onRetry,
 }: {
   agent: AgentIdentity;
@@ -2437,6 +2490,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
   liveThinkingContent?: string;
   liveThinkingSubject?: string;
   liveStatusText?: string | null;
+  hostFileContext?: HostFileLinkContext;
   onRetry?: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
@@ -2477,6 +2531,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
             content={visibleThinkingContent}
             subject={visibleThinkingSubject}
             isStreaming={isCurrentlyStreaming && !hasContent}
+            hostFileContext={hostFileContext}
           />
         )}
 
@@ -2511,7 +2566,11 @@ const AssistantBubble = React.memo(function AssistantBubble({
               </div>
             ) : (
               <div className={isCurrentlyStreaming ? 'streaming-cursor text-slate-300/95' : undefined}>
-                <MarkdownRenderer content={visibleMessageContent} isStreaming={isCurrentlyStreaming} />
+                <MarkdownRenderer
+                  content={visibleMessageContent}
+                  isStreaming={isCurrentlyStreaming}
+                  hostFileContext={hostFileContext}
+                />
               </div>
             )}
           </div>
@@ -2631,6 +2690,7 @@ const TimelineSegmentBubble = React.memo(function TimelineSegmentBubble({
   messageId,
   agent,
   avatarUrl,
+  hostFileContext,
 }: {
   segment: TimelineSegmentLike;
   segmentIndex: number;
@@ -2638,6 +2698,7 @@ const TimelineSegmentBubble = React.memo(function TimelineSegmentBubble({
   messageId: string;
   agent: AgentIdentity;
   avatarUrl?: string;
+  hostFileContext?: HostFileLinkContext;
 }) {
   const isThinking = segment.kind === 'thinking';
   const message = useMemo<ChatMessage>(() => ({
@@ -2656,6 +2717,7 @@ const TimelineSegmentBubble = React.memo(function TimelineSegmentBubble({
       avatarUrl={avatarUrl}
       isLast={false}
       isStreaming={false}
+      hostFileContext={hostFileContext}
     />
   );
 });
@@ -2667,6 +2729,7 @@ const ActivityTimeline = React.memo(function ActivityTimeline({
   fallbackTimestamp,
   agent,
   avatarUrl,
+  hostFileContext,
 }: {
   messageId: string;
   segments: readonly TimelineSegmentLike[];
@@ -2674,6 +2737,7 @@ const ActivityTimeline = React.memo(function ActivityTimeline({
   fallbackTimestamp: number;
   agent: AgentIdentity;
   avatarUrl?: string;
+  hostFileContext?: HostFileLinkContext;
 }) {
   const [revealedEarlier, setRevealedEarlier] = useState(0);
   const timeline = useMemo<TimelineActivity[]>(() => {
@@ -2732,6 +2796,7 @@ const ActivityTimeline = React.memo(function ActivityTimeline({
             messageId={messageId}
             agent={agent}
             avatarUrl={avatarUrl}
+            hostFileContext={hostFileContext}
           />
         ) : (
           <ToolCallBlock key={`timeline-tool-${messageId}-${item.tool.id}`} tool={item.tool} />
@@ -2789,10 +2854,13 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   // Use context for persistent state (survives route navigation)
   const provider = chatState.provider;
   const setProvider = chatState.setProvider;
+  const selectProviderAgent = chatState.selectProviderAgent;
   const agentId = chatState.agentId;
-  const setAgentId = chatState.setAgentId;
+  const agentHostFileContext = useMemo<HostFileLinkContext>(() => ({
+    source: 'agent-workspace',
+    agent: agentId || 'main',
+  }), [agentId]);
   const session = chatState.session;
-  const setSession = chatState.setSession;
   const selectedModel = chatState.selectedModel;
   const setSelectedModel = chatState.setSelectedModel;
   const switchModel = chatState.switchModel;
@@ -3042,7 +3110,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     }
   }, [showCompatibilityHotfix]);
 
-  const loadProviderCommands = useCallback(async (targetProvider: string, options?: { force?: boolean }) => {
+  const _loadProviderCommands = useCallback(async (targetProvider: string, options?: { force?: boolean }) => {
     const cached = !options?.force ? providerCommandsCache.get(targetProvider) : undefined;
     if (cached) {
       setProviderCatalog((prev) => ({
@@ -4180,23 +4248,19 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         setModelSelectionError('Wait for the current model change to finish before switching providers.');
         return;
       }
-      const providerChanged = selection.provider !== provider;
-      const nextAgentId = normalizeOpenClawAgentSelection(selection.provider, selection.agentId);
-      const currentAgentId = normalizeOpenClawAgentSelection(provider, agentId);
-      const agentChanged = nextAgentId !== currentAgentId;
-      if (!providerChanged && !agentChanged) return;
+      const selectionPlan = planAgentChatSelection(provider, agentId, selection);
+      if (!selectionPlan.changed) return;
       // Detach the visible chat from the active stream without aborting it.
       // Switching agents/providers is navigation, not an implicit Stop click.
       // Fix: Clear messages FIRST to prevent stale history from showing.
       // The sequence must be: clear → update state atomically → load new history.
       // clearMessages() increments historyGenRef which invalidates any in-flight loads.
       clearMessages();
-      // Context setters handle localStorage persistence
-      setProvider(selection.provider);
-      setAgentId(nextAgentId);
-      setSession(getInitialSessionForAgentSelection(selection.provider, nextAgentId));
+      // One context-owned transition keeps provider, OpenClaw agent identity,
+      // and the matching last session coherent in the same browser event.
+      selectProviderAgent(selection.provider, selectionPlan.nextAgentId);
     },
-    [blockForChatContextMutation, provider, agentId, clearMessages, setProvider, setAgentId, setSession],
+    [blockForChatContextMutation, provider, agentId, clearMessages, selectProviderAgent],
   );
 
   const handleNewChat = useCallback(() => {
@@ -4285,6 +4349,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 onChange={handleSelectAgent}
                 onViewSession={handleViewGatewaySession}
                 currentSessionKey={session}
+                currentSessionActive={isRunning}
                 activityTitles={activityTitles}
                 agentAvatars={agentAvatars}
                 subAgentAvatars={subAgentAvatars}
@@ -4382,16 +4447,10 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               >
                 {newSessionPending ? <Loader2 size={16} className="animate-spin" aria-hidden="true" /> : <PenSquare size={16} />}
               </button>
-              {showConnectionLost && (
-                <button
-                  onClick={reconnectSocket}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/20 bg-amber-500/10 px-2.5 py-1.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/15 hover:text-amber-200"
-                  title="Reconnect live stream"
-                >
-                  <RefreshCw size={14} className="animate-spin" />
-                  <span className="hidden sm:inline">Reconnect</span>
-                </button>
-              )}
+              <StreamReconnectButton
+                visible={showConnectionLost}
+                onReconnect={reconnectSocket}
+              />
               <button
                 onClick={async () => {
                   if (isRefreshing) return;
@@ -4629,6 +4688,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                             message={isQueuedUserMessage ? { ...msg, queued: true } : msg}
                             avatarUrl={userAvatarUrl}
                             username={user?.username}
+                            hostFileContext={agentHostFileContext}
                             onRemoveQueued={isQueuedUserMessage ? () => removeQueuedMessage(msg.id) : undefined}
                           />
                         ) : msg.role === 'assistant' ? (
@@ -4669,6 +4729,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                     fallbackTimestamp={msg.createdAt.getTime()}
                                     agent={agent}
                                     avatarUrl={agentAvatars[agent.providerName]}
+                                    hostFileContext={agentHostFileContext}
                                   />
                                 );
                               } else {
@@ -4687,6 +4748,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                       fallbackTimestamp={msg.createdAt.getTime()}
                                       agent={agent}
                                       avatarUrl={agentAvatars[agent.providerName]}
+                                      hostFileContext={agentHostFileContext}
                                     />
                                   );
                                 }
@@ -4710,6 +4772,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                         avatarUrl={agentAvatars[agent.providerName]}
                                         isLast={false}
                                         isStreaming={false}
+                                        hostFileContext={agentHostFileContext}
                                       />
                                     ))}
                                     <BoundedToolCallList
@@ -4730,6 +4793,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                           avatarUrl={agentAvatars[agent.providerName]}
                                           isLast={false}
                                           isStreaming={false}
+                                          hostFileContext={agentHostFileContext}
                                         />
                                       )) : undefined}
                                     />
@@ -4818,6 +4882,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                   liveThinkingContent={effectiveLiveThinkingContent}
                                   liveThinkingSubject={effectiveLiveThinkingSubject}
                                   liveStatusText={effectiveLiveStatusText}
+                                  hostFileContext={agentHostFileContext}
                                   onRetry={
                                     idx === messages.length - 1 && lastUserMessage
                                       ? () => {

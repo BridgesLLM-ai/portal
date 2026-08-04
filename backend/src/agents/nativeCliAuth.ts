@@ -186,7 +186,7 @@ function detectCodexAuth(): NativeCliAuthStatus {
       provider: 'CODEX',
       status: 'authenticated',
       message: 'Codex CLI is authenticated on this server.',
-      loginCommand: 'codex auth',
+      loginCommand: 'codex login',
       requiresSeparateLogin: true,
     };
   }
@@ -194,8 +194,8 @@ function detectCodexAuth(): NativeCliAuthStatus {
   return {
     provider: 'CODEX',
     status: 'needs_login',
-    message: 'Codex is installed, but the local Codex CLI is not authenticated. Run `codex auth` on the server. OpenClaw OAuth is separate.',
-    loginCommand: 'codex auth',
+    message: 'Codex is installed, but the local Codex CLI is not authenticated. Run `codex login` on the server. OpenClaw OAuth is separate.',
+    loginCommand: 'codex login',
     requiresSeparateLogin: true,
   };
 }

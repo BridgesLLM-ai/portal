@@ -140,15 +140,11 @@ async function refreshSession(): Promise<boolean> {
 
   // If already refreshing, wait for that result
   if (refreshPromise) {
-    try {
-      await refreshPromise;
-      return true;
-    } catch (error) {
-      // The response interceptor owns the logout decision. Preserve the exact
-      // refresh failure so a missing/expired refresh cookie cannot leave the
-      // persisted UI in a permanently authenticated-looking 401 loop.
-      throw error;
-    }
+    // The response interceptor owns the logout decision. Preserve the exact
+    // refresh failure so a missing/expired refresh cookie cannot leave the
+    // persisted UI in a permanently authenticated-looking 401 loop.
+    await refreshPromise;
+    return true;
   }
 
   refreshPromise = (async () => {
@@ -164,12 +160,8 @@ async function refreshSession(): Promise<boolean> {
     refreshPromise = null;
   });
 
-  try {
-    await refreshPromise;
-    return true;
-  } catch (error) {
-    throw error;
-  }
+  await refreshPromise;
+  return true;
 }
 
 /**

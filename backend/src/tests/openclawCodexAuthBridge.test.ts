@@ -5,6 +5,7 @@ import path from 'path';
 describe('OpenClaw Codex auth bridge', () => {
   const originalHome = process.env.HOME;
   const originalOpenClawHome = process.env.OPENCLAW_HOME;
+  const originalCodexHome = process.env.CODEX_HOME;
   let tempDir: string;
 
   beforeEach(() => {
@@ -12,6 +13,7 @@ describe('OpenClaw Codex auth bridge', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-auth-'));
     process.env.HOME = path.join(tempDir, 'home');
     process.env.OPENCLAW_HOME = path.join(tempDir, 'openclaw');
+    delete process.env.CODEX_HOME;
     fs.mkdirSync(process.env.HOME, { recursive: true });
     fs.mkdirSync(process.env.OPENCLAW_HOME, { recursive: true });
   });
@@ -23,6 +25,8 @@ describe('OpenClaw Codex auth bridge', () => {
     } else {
       process.env.OPENCLAW_HOME = originalOpenClawHome;
     }
+    if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = originalCodexHome;
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -73,6 +77,44 @@ describe('OpenClaw Codex auth bridge', () => {
     expect(config.auth.order).not.toHaveProperty('openai-codex');
     expect(config.auth.profiles['openai:codex-cli']).toMatchObject({ provider: 'openai', mode: 'oauth' });
     expect(JSON.parse(fs.readFileSync(openclawCodexAuthPath, 'utf8')).tokens.access_token).toBe('access-token');
+  });
+
+  test('bridges the exact credential selected by CODEX_HOME', () => {
+    const openclawHome = process.env.OPENCLAW_HOME as string;
+    const customCodexHome = path.join(tempDir, 'custom-codex-home');
+    const authProfilesPath = path.join(openclawHome, 'agents', 'main', 'agent', 'auth-profiles.json');
+    const configPath = path.join(openclawHome, 'openclaw.json');
+    const openclawCodexAuthPath = path.join(openclawHome, 'agents', 'main', 'agent', 'codex-home', 'auth.json');
+    process.env.CODEX_HOME = customCodexHome;
+
+    fs.mkdirSync(path.dirname(authProfilesPath), { recursive: true });
+    fs.mkdirSync(customCodexHome, { recursive: true });
+    fs.writeFileSync(authProfilesPath, JSON.stringify({ version: 2, profiles: {} }));
+    fs.writeFileSync(configPath, JSON.stringify({ auth: { profiles: {}, order: {} } }));
+    fs.writeFileSync(path.join(customCodexHome, 'auth.json'), JSON.stringify({
+      tokens: { access_token: 'custom-home-access', refresh_token: 'custom-home-refresh' },
+    }), { mode: 0o600 });
+
+    const manager = require('../services/openclawConfigManager');
+    expect(manager.pinCodexExternalCliAuthProfile()).toMatchObject({ syncedCodexHomeAuth: true });
+    expect(JSON.parse(fs.readFileSync(openclawCodexAuthPath, 'utf8')).tokens.access_token)
+      .toBe('custom-home-access');
+  });
+
+  test('refuses to pin an OpenClaw profile when no usable file credential was copied', () => {
+    const openclawHome = process.env.OPENCLAW_HOME as string;
+    const authProfilesPath = path.join(openclawHome, 'agents', 'main', 'agent', 'auth-profiles.json');
+    const configPath = path.join(openclawHome, 'openclaw.json');
+    fs.mkdirSync(path.dirname(authProfilesPath), { recursive: true });
+    const originalAuthProfiles = JSON.stringify({ version: 2, profiles: { 'openai:default': { type: 'api_key', provider: 'openai' } } }, null, 2);
+    const originalConfig = JSON.stringify({ auth: { profiles: {}, order: { openai: ['openai:default'] } } }, null, 2);
+    fs.writeFileSync(authProfilesPath, originalAuthProfiles);
+    fs.writeFileSync(configPath, originalConfig);
+
+    const manager = require('../services/openclawConfigManager');
+    expect(() => manager.pinCodexExternalCliAuthProfile()).toThrow(/could not bridge a usable file-backed Codex credential/i);
+    expect(fs.readFileSync(authProfilesPath, 'utf8')).toBe(originalAuthProfiles);
+    expect(fs.readFileSync(configPath, 'utf8')).toBe(originalConfig);
   });
 
   test('removes legacy Codex OAuth profiles while preserving real OpenAI API-key profiles', () => {

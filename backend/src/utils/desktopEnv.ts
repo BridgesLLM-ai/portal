@@ -117,6 +117,11 @@ export function desktopExec(
  */
 export function desktopExecDetached(cmd: string, unitName: string): void {
   const runArgs = managedDesktopSystemdRunArgs(unitName, cmd);
+  resetManagedDesktopUnit(unitName);
+  execFileSync('systemd-run', runArgs, { timeout: 5000, encoding: 'utf8' });
+}
+
+function resetManagedDesktopUnit(unitName: string): void {
   try {
     execFileSync('systemctl', ['stop', unitName], { timeout: 15_000, encoding: 'utf8' });
   } catch {
@@ -127,7 +132,6 @@ export function desktopExecDetached(cmd: string, unitName: string): void {
   } catch {
     // --collect units may already be unloaded after stop.
   }
-  execFileSync('systemd-run', runArgs, { timeout: 5000, encoding: 'utf8' });
 }
 
 function desktopPrivilegeDropArgs(innerCmd: string): string[] {
@@ -177,6 +181,68 @@ export function managedDesktopSystemdRunArgs(unitName: string, cmd: string): str
     '-c',
     withDesktopEnv(cmd),
   ];
+}
+
+/**
+ * Build a Remote Desktop transient service without passing the command through
+ * a shell. Use this for user-influenced argv (for example, a staged filename):
+ * every argument remains one literal execve value, even when it contains shell
+ * metacharacters, quotes, or whitespace.
+ */
+export function managedDesktopSystemdRunArgv(
+  unitName: string,
+  executable: string,
+  args: readonly string[] = [],
+): string[] {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\.service$/.test(unitName)) {
+    throw new Error('Managed Remote Desktop unit name is invalid');
+  }
+  if (!executable.startsWith('/') || /[\u0000-\u001f\u007f]/.test(executable)) {
+    throw new Error('Managed Remote Desktop executable is invalid');
+  }
+  if (args.some((value) => typeof value !== 'string' || /\u0000/.test(value))) {
+    throw new Error('Managed Remote Desktop argv is invalid');
+  }
+
+  const env = {
+    HOME: `/home/${RD_USER}`,
+    USER: RD_USER,
+    LOGNAME: RD_USER,
+    PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    LANG: process.env.LANG || 'C.UTF-8',
+    ...getDesktopEnvVars(),
+  };
+  const runArgs = [
+    '--unit', unitName,
+    `--property=User=${RD_USER}`,
+    `--property=Group=${RD_USER}`,
+    '--property=KillMode=control-group',
+    '--property=TimeoutStopSec=15s',
+    `--property=WorkingDirectory=/home/${RD_USER}`,
+  ];
+  for (const [key, value] of Object.entries(env)) {
+    runArgs.push(`--setenv=${key}=${value}`);
+  }
+  runArgs.push(
+    '--service-type=exec',
+    '--collect',
+    '--no-block',
+    '--',
+    executable,
+    ...args,
+  );
+  return runArgs;
+}
+
+/** Launch a GUI command with literal argv as the unprivileged desktop user. */
+export function desktopExecDetachedArgv(
+  executable: string,
+  args: readonly string[],
+  unitName: string,
+): void {
+  const runArgs = managedDesktopSystemdRunArgv(unitName, executable, args);
+  resetManagedDesktopUnit(unitName);
+  execFileSync('systemd-run', runArgs, { timeout: 5000, encoding: 'utf8' });
 }
 
 export function desktopExecManaged(unitName: string, cmd: string): void {

@@ -27,9 +27,9 @@ import {
   resolveAskUserQuestionRunOwner,
 } from '../services/askUserQuestionSessionOwner';
 import {
-  deliverNativeAskUserQuestionAnswer,
-  deliverNativeAskUserQuestionDismissal,
-  syncNativeAskUserQuestionsForActor,
+  deliverAskUserQuestionAnswer,
+  deliverAskUserQuestionDismissal,
+  syncAskUserQuestionsForActor,
 } from '../services/nativeAskUserQuestionChannel';
 import { getProviderCapabilities } from '../agents/providerAvailability';
 import {
@@ -4015,6 +4015,7 @@ export const __gatewayHistoryTest = {
   reconcileRuntimeCumulativeFinalTail,
   reconcileMergedRuntimeHistoryContent,
   getLatestMeaningfulConversationMarker,
+  annotateAgentChatSessionRunActivity,
 };
 
 /**
@@ -5519,6 +5520,29 @@ router.get('/commands', authenticateToken, requireAdmin, async (req: Request, re
   }
 });
 
+type AgentChatSessionActivitySummary = {
+  sessionId: string;
+  metadata?: Record<string, unknown>;
+};
+
+function annotateAgentChatSessionRunActivity<T extends AgentChatSessionActivitySummary>(
+  sessions: readonly T[],
+  isRunActive: (sessionId: string) => boolean = (sessionId) => (
+    getProviderOwnedBusStreamSnapshot(sessionId).active === true
+  ),
+): Array<T & { runActive: boolean }> {
+  return sessions.map((session) => {
+    // Native Project Chat sessions can share a provider store with Agent Chat,
+    // but their activity belongs to the durable Project coordination rail.
+    // Never project a PROJECT_SANDBOX run into the host-operator session list.
+    const belongsToAgentChat = session.metadata?.executionScope !== 'PROJECT_SANDBOX';
+    return {
+      ...session,
+      runActive: belongsToAgentChat && Boolean(session.sessionId) && isRunActive(session.sessionId),
+    };
+  });
+}
+
 router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
     const providerName = req.query.provider === undefined
@@ -5528,7 +5552,7 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
       try {
         const provider = AgentRegistry.get(providerName);
         const sessions = await provider.listSessions(req.user!.userId);
-        res.json({ sessions });
+        res.json({ sessions: annotateAgentChatSessionRunActivity(sessions) });
         return;
       } catch (err: any) {
         console.warn(`[gateway] Provider ${providerName} listSessions failed: ${err.message}`);
@@ -5567,7 +5591,7 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
     const sessions = agentId
       ? ownedSessions.filter((session) => String(session.sessionId || '').startsWith(`agent:${agentId}:`))
       : ownedSessions;
-    res.json({ sessions });
+    res.json({ sessions: annotateAgentChatSessionRunActivity(sessions) });
     return;
 
   } catch (err: any) {
@@ -10004,7 +10028,7 @@ function normalizeRequestedModel(providerName: AgentProviderName, rawModel: stri
   return model;
 }
 
-/** Native Codex pending-input channel, projected through an owner-scoped broker. */
+/** Provider-neutral ask-user channel, projected through an owner-scoped broker. */
 function askUserErrorResponse(res: Response, error: unknown): void {
   if (error instanceof AskUserQuestionError) {
     if ([
@@ -10013,7 +10037,10 @@ function askUserErrorResponse(res: Response, error: unknown): void {
       'ASK_USER_OWNER_REQUIRED',
       'ASK_USER_AUTHORITY_REQUIRED',
     ].includes(error.code)) {
-      res.status(404).json({ error: 'That question is no longer open.' });
+      res.status(404).json({
+        error: 'That question is no longer open.',
+        code: 'ASK_USER_NOT_OPEN',
+      });
       return;
     }
     res.status(error.statusCode).json({ error: error.message, code: error.code });
@@ -10021,7 +10048,10 @@ function askUserErrorResponse(res: Response, error: unknown): void {
   }
   if (error instanceof PendingUserInputAnswerError) {
     if (error.statusCode === 404) {
-      res.status(404).json({ error: 'That question is no longer open.' });
+      res.status(404).json({
+        error: 'That question is no longer open.',
+        code: 'ASK_USER_NOT_OPEN',
+      });
       return;
     }
     res.status(error.statusCode).json({ error: error.message, code: error.code });
@@ -10031,6 +10061,13 @@ function askUserErrorResponse(res: Response, error: unknown): void {
   res.status(500).json({ error: 'The question channel is unavailable.' });
 }
 
+// Narrow test seam for the privacy-preserving ask-user error projection. The
+// public route must not reveal whether a question belonged to another actor,
+// but clients still need one stable code to reconcile ordinary cross-tab races.
+export const __gatewayAskUserTest = {
+  askUserErrorResponse,
+};
+
 router.get('/ask-user/pending', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const actorUserId = req.user?.userId || '';
@@ -10038,7 +10075,7 @@ router.get('/ask-user/pending', authenticateToken, requireApproved, async (req: 
     const requestedSession = typeof req.query.session === 'string' && req.query.session.trim()
       ? await resolveOpenClawSessionKey(req.query.session, req.user)
       : undefined;
-    const pending = await syncNativeAskUserQuestionsForActor({
+    const pending = await syncAskUserQuestionsForActor({
       actorUserId,
       actorAuthorizationVersion,
       sessionKey: requestedSession,
@@ -10053,7 +10090,7 @@ router.post('/ask-user/answer', authenticateToken, requireApproved, async (req: 
   try {
     const id = String(req.body?.id || '');
     const actorUserId = req.user?.userId || '';
-    const { record, idempotentReplay } = await deliverNativeAskUserQuestionAnswer({
+    const { record, idempotentReplay } = await deliverAskUserQuestionAnswer({
       id,
       answers: (req.body?.answers && typeof req.body.answers === 'object') ? req.body.answers : {},
       actorUserId,
@@ -10068,7 +10105,7 @@ router.post('/ask-user/dismiss', authenticateToken, requireApproved, async (req:
   try {
     const id = String(req.body?.id || '');
     const actorUserId = req.user?.userId || '';
-    const { idempotentReplay } = await deliverNativeAskUserQuestionDismissal({
+    const { idempotentReplay } = await deliverAskUserQuestionDismissal({
       id,
       actorUserId,
     });

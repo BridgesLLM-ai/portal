@@ -170,12 +170,10 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     ],
     setupInstructions: [
       { stepNumber: 1, title: 'You need an eligible paid ChatGPT plan', detail: 'Use a ChatGPT account whose workspace exposes Codex subscription access. Plan names, eligibility, and model access are controlled by OpenAI.', link: { url: 'https://chatgpt.com/', label: 'Open ChatGPT' } },
-      { stepNumber: 2, title: 'Click "Start OpenAI Sign-In" below', detail: 'This opens a new browser tab with OpenAI\'s login page.' },
-      { stepNumber: 3, title: 'Sign in with your OpenAI account', detail: 'Use the same email/password you use for ChatGPT. If you use Google/Microsoft login, click that.' },
-      { stepNumber: 4, title: 'Authorize the connection', detail: 'After signing in, you\'ll be redirected to a URL starting with http://127.0.0.1:1455/.... This page will NOT load — that is completely normal. Your browser will show an error like "This site can\'t be reached."' },
-      { stepNumber: 5, title: 'Copy the ENTIRE URL', detail: 'Click in your browser\'s address bar. Select ALL the text (Ctrl+A or Cmd+A). Copy it (Ctrl+C or Cmd+C). The URL will be long and contain ?code=... parameters.' },
-      { stepNumber: 6, title: 'Paste the URL in the field below', detail: 'Come back to this page and paste the full URL into the redirect URL field.' },
-      { stepNumber: 7, title: 'Click "Complete Sign-In"', detail: 'The portal will exchange the authorization code for access tokens. This takes 2-5 seconds.' },
+      { stepNumber: 2, title: 'Enable device code login', detail: 'In ChatGPT, enable device code login in your personal Security settings. Managed workspaces require an admin to enable it in Permissions.', link: { url: 'https://developers.openai.com/codex/auth#login-on-headless-devices', label: 'OpenAI device-login instructions' } },
+      { stepNumber: 3, title: 'Click "Start OpenAI Sign-In" below', detail: 'Portal will display a short-lived code and open OpenAI\'s device authorization page.' },
+      { stepNumber: 4, title: 'Enter the code and approve access', detail: 'Sign in with the same account you use for ChatGPT, enter the displayed code, and approve the Codex connection.' },
+      { stepNumber: 5, title: 'Wait for final setup', detail: 'Keep this dialog open while Portal links the saved Codex credential, registers models, and safely reconnects OpenClaw.' },
     ],
   },
   {

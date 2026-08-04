@@ -163,6 +163,10 @@ const PORTAL_OWNED_REMOVABLE_API_KEY_PROVIDERS = new Set([
 ]);
 const handledNativeCliCompletions = new Set<string>();
 const nativeCliCompletionFinalizers = new Map<string, Promise<void>>();
+// Codex finalization can include model registration plus a gateway restart.
+// Keep it out of the browser's short status request and deduplicate repeated
+// polls while that work is running.
+const nativeCliFinalizationKickoffs = new Set<string>();
 const handledOAuthCompletions = new Set<string>();
 const oauthCompletionFinalizers = new Map<string, Promise<void>>();
 // Sessions whose finalization has been kicked off in the background from a
@@ -193,6 +197,38 @@ function ensureOAuthFinalizationStarted(status: any): void {
       oauthFinalizationKickoffs.delete(status.id);
       markOAuthFlowFinalizationPending(status.id, false);
     });
+}
+
+export function ensureNativeCliFinalizationStarted(
+  status: any,
+  finalizer: (status: any) => Promise<void> = finalizeNativeCliCompletion,
+): boolean {
+  if (!status?.id
+    || status.provider !== 'codex'
+    || status.status !== 'complete'
+    || status.credentialState !== 'committed') return false;
+  if (handledNativeCliCompletions.has(status.id) || nativeCliFinalizationKickoffs.has(status.id)) return false;
+
+  nativeCliFinalizationKickoffs.add(status.id);
+  markOAuthFlowFinalizationPending(status.id, true);
+  void finalizer(status)
+    .catch((error: any) => {
+      markOAuthFlowFinalizationError(status.id, error?.message || String(error));
+      console.error('[AI-Setup] background Codex finalization failed:', error?.message || error);
+    })
+    .finally(() => {
+      nativeCliFinalizationKickoffs.delete(status.id);
+      markOAuthFlowFinalizationPending(status.id, false);
+    });
+  return true;
+}
+
+function isNativeCliFinalizationComplete(sessionId: string): boolean {
+  // runNativeCliCompletionFinalizerOnce records handled just before the outer
+  // finalizer persists lifecycle completion. The kickoff disappears only
+  // after that outer promise settles, closing that small observation window.
+  return handledNativeCliCompletions.has(sessionId)
+    && !nativeCliFinalizationKickoffs.has(sessionId);
 }
 let activeClaudeSetupStart: {
   ownerId: string;
@@ -4125,11 +4161,26 @@ export function createAiSetupRouter(): Router {
     try {
       const ownerId = getOAuthRequestOwnerId(req);
       const result = await startNativeCliFlow(provider, {
-        forceReauth: provider === 'gemini' && forceReauth === true,
+        forceReauth: (provider === 'gemini' || provider === 'codex') && forceReauth === true,
         ownerId,
       });
       if (result.status === 'complete') {
-        await finalizeNativeCliCompletion(getOAuthFlowStatus(result.sessionId, ownerId));
+        const status = getOAuthFlowStatus(result.sessionId, ownerId);
+        if (provider === 'codex' && status) {
+          ensureNativeCliFinalizationStarted(status);
+          const latest = getOAuthFlowStatus(result.sessionId, ownerId) || status;
+          const finalized = isNativeCliFinalizationComplete(status.id);
+          res.status(finalized ? 200 : 202).json({
+            success: true,
+            ...result,
+            ...latest,
+            sessionId: result.sessionId,
+            finalized,
+            ...(!finalized ? { finalizing: true } : {}),
+          });
+          return;
+        }
+        await finalizeNativeCliCompletion(status);
       }
       res.json({ success: true, ...result });
     } catch (error: any) {
@@ -4143,6 +4194,22 @@ export function createAiSetupRouter(): Router {
     const status = getOAuthFlowStatus(req.params.sessionId, getOAuthRequestOwnerId(req));
     if (!status) {
       res.status(404).json({ error: 'Native CLI session not found' });
+      return;
+    }
+
+    if (status.status === 'complete' && status.provider === 'codex') {
+      ensureNativeCliFinalizationStarted(status);
+      const latest = getOAuthFlowStatus(status.id, getOAuthRequestOwnerId(req)) || status;
+      if (latest.status === 'error') {
+        res.status(200).json({ ...latest, finalized: false });
+        return;
+      }
+      const finalized = isNativeCliFinalizationComplete(status.id);
+      res.status(finalized ? 200 : 202).json({
+        ...latest,
+        finalized,
+        ...(!finalized ? { finalizing: true } : {}),
+      });
       return;
     }
 

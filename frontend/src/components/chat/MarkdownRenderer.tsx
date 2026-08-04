@@ -13,12 +13,13 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   memo,
   type AnchorHTMLAttributes,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 // rehype-raw removed: allowing raw HTML in markdown is dangerous — agent responses
@@ -29,15 +30,85 @@ import { marked } from 'marked';
 import { Copy, Check, Eye, EyeOff, Maximize2, Minimize2 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../../contexts/AuthContext';
+import client from '../../api/client';
+import { isElevated } from '../../utils/authz';
 import {
   buildFileDeepLink,
   type FileDeepLinkTarget,
 } from '../../utils/workspaceNavigation';
 
-function resolvePortalHref(rawHref?: string): {
+export type HostFileLinkContext =
+  | Readonly<{ source: 'agent-workspace'; agent: string }>
+  | Readonly<{ source: 'project'; project: string }>;
+
+interface HostFileTarget {
+  path: string;
+}
+
+const HOST_PATH_PREFIX = /^\/(?:root|home|opt|var|tmp|workspace|portal|mnt|srv)(?:\/|$)/i;
+
+function decodeHostPath(value: string): string | null {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
+function resolveHostFileTarget(
+  rawHref: string,
+  hostFileContext?: HostFileLinkContext,
+): HostFileTarget | null {
+  let pathWithAnchor = rawHref.trim();
+  if (!pathWithAnchor) return null;
+
+  if (/^file:/i.test(pathWithAnchor)) {
+    try {
+      const fileUrl = new URL(pathWithAnchor);
+      if (fileUrl.protocol !== 'file:' || (fileUrl.hostname && fileUrl.hostname !== 'localhost')) return null;
+      pathWithAnchor = `${fileUrl.pathname}${fileUrl.hash}`;
+    } catch {
+      return null;
+    }
+  }
+
+  const decodedPath = decodeHostPath(pathWithAnchor);
+  if (!decodedPath) return null;
+  const hasExactAuthority = hostFileContext?.source === 'project'
+    || (hostFileContext?.source === 'agent-workspace' && Boolean(hostFileContext.agent));
+  if (!hasExactAuthority) return null;
+  const isHostAbsolutePath = HOST_PATH_PREFIX.test(decodedPath);
+  const isRelativeWorkspacePath = hasExactAuthority
+    && !decodedPath.startsWith('/')
+    && !decodedPath.startsWith('#')
+    && !decodedPath.startsWith('?')
+    && !decodedPath.startsWith('//')
+    && !/^[a-z][a-z0-9+.-]*:/i.test(decodedPath.replace(/:[1-9]\d{0,7}(?::\d{1,8})?$/, ''));
+  if (!isHostAbsolutePath && !isRelativeWorkspacePath) return null;
+  if (decodedPath.length > 4096 || /[\u0000-\u001f\u007f]/.test(decodedPath)) return null;
+
+  // Keep editor suffixes in the path. Linux permits both colons and #L in
+  // literal filenames, so only the backend can safely try the exact file
+  // before interpreting a missing suffix as line/column metadata.
+  return { path: decodedPath };
+}
+
+function portalUrlTransform(url: string, hostFileContext?: HostFileLinkContext): string {
+  // react-markdown deliberately strips file: URLs and colon-suffixed relative
+  // paths because browsers interpret them as schemes. Retain only targets that
+  // resolve through an exact Portal workspace context so PortalMarkdownLink
+  // can replace them with the elevated server-side handoff. Every other scheme
+  // keeps the library's default fail-closed transform.
+  return resolveHostFileTarget(url, hostFileContext)
+    ? url
+    : defaultUrlTransform(url);
+}
+
+function resolvePortalHref(rawHref?: string, hostFileContext?: HostFileLinkContext): {
   href: string;
   external?: boolean;
   fileTarget?: FileDeepLinkTarget;
+  hostFileTarget?: HostFileTarget;
 } {
   const href = String(rawHref || '').trim();
   if (!href) return { href: '#' };
@@ -50,7 +121,7 @@ function resolvePortalHref(rawHref?: string): {
         && absolute.origin === window.location.origin
         && /^\/files(?:\/|$)/i.test(absolute.pathname)
       ) {
-        return resolvePortalHref(`${absolute.pathname}${absolute.search}${absolute.hash}`);
+        return resolvePortalHref(`${absolute.pathname}${absolute.search}${absolute.hash}`, hostFileContext);
       }
     } catch {
       // Malformed absolute links remain external and never gain Portal target semantics.
@@ -77,11 +148,24 @@ function resolvePortalHref(rawHref?: string): {
 
   const explicitPath = href.match(/(?:server(?:_|\s)path|path):\s*([^\]\n)]+)/i)?.[1]?.trim()
     || href.match(/^\/?var\/portal-files\/[^\s)]+/i)?.[0]
+    || href.match(/^\/?portal\/files\/[^\s)]+/i)?.[0]
     || href.match(/^\/?(?:root\/)?\.openclaw\/media\/portal-files\/[^\s)]+/i)?.[0]
     || href.match(/^~\/?\.openclaw\/media\/portal-files\/[^\s)]+/i)?.[0];
-  if (explicitPath) return { href: '/files', fileTarget: { path: explicitPath } };
+  if (explicitPath) {
+    const decodedPath = decodeHostPath(explicitPath);
+    if (
+      !decodedPath
+      || decodedPath.length > 2048
+      || /[\u0000-\u001f\u007f]/.test(decodedPath)
+    ) return { href: '/files' };
+    // Decode exactly once. `%2520` therefore still represents a literal
+    // `%20` filename, while ordinary encoded spaces resolve to the DB path.
+    return { href: '/files', fileTarget: { path: decodedPath } };
+  }
 
   if (/^\/files(?:[/?#]|$)/i.test(href)) return { href };
+  const hostFileTarget = resolveHostFileTarget(href, hostFileContext);
+  if (hostFileTarget) return { href: '/desktop', hostFileTarget };
   return { href, external: !href.startsWith('/') };
 }
 
@@ -89,17 +173,57 @@ function PortalMarkdownLink({
   href,
   children,
   onClick,
+  hostFileContext,
   ...props
-}: AnchorHTMLAttributes<HTMLAnchorElement>) {
+}: AnchorHTMLAttributes<HTMLAnchorElement> & { hostFileContext?: HostFileLinkContext }) {
   const navigate = useNavigate();
   const { user } = useAuthStore();
-  const resolved = resolvePortalHref(href);
-  const handleClick = (event: ReactMouseEvent<HTMLAnchorElement>) => {
+  const [hostFileError, setHostFileError] = useState<string | null>(null);
+  const [hostFilePending, setHostFilePending] = useState(false);
+  const hostFilePendingRef = useRef(false);
+  const resolved = resolvePortalHref(href, hostFileContext);
+  const elevated = isElevated(user);
+  const handleClick = async (event: ReactMouseEvent<HTMLAnchorElement>) => {
     onClick?.(event);
-    if (event.defaultPrevented || !resolved.fileTarget) return;
-    // Modified clicks intentionally open the non-sensitive Files root. The
-    // target token is per-tab and is minted only for an ordinary local click.
+    if (event.defaultPrevented) return;
+    // Modified clicks intentionally open only the non-sensitive destination
+    // surface. Files tokens and Remote Desktop launch requests are minted only
+    // by an ordinary same-tab click.
     if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+
+    if (resolved.hostFileTarget) {
+      event.preventDefault();
+      if (!elevated) {
+        setHostFileError('Remote Desktop file opening requires Owner or Sub-admin access.');
+        return;
+      }
+      if (hostFilePendingRef.current) return;
+      if (!hostFileContext) {
+        setHostFileError('The exact chat workspace is unavailable for this link.');
+        return;
+      }
+      hostFilePendingRef.current = true;
+      setHostFilePending(true);
+      setHostFileError(null);
+      try {
+        await client.post('/remote-desktop/open-path', {
+          ...hostFileContext,
+          ...resolved.hostFileTarget,
+        });
+        navigate('/desktop');
+      } catch (error: any) {
+        setHostFileError(
+          error?.response?.data?.error
+          || 'That file could not be handed to Remote Desktop.',
+        );
+      } finally {
+        hostFilePendingRef.current = false;
+        setHostFilePending(false);
+      }
+      return;
+    }
+
+    if (!resolved.fileTarget) return;
     event.preventDefault();
     const authorizationVersion = Number(user?.authorizationVersion ?? 1);
     if (!user?.id || !Number.isSafeInteger(authorizationVersion) || authorizationVersion < 1) {
@@ -116,17 +240,30 @@ function PortalMarkdownLink({
       navigate('/files');
     }
   };
+  const renderedHref = resolved.hostFileTarget && !elevated ? '#' : resolved.href;
   return (
-    <a
-      href={resolved.href}
-      target={resolved.external ? '_blank' : undefined}
-      rel={resolved.external ? 'noopener noreferrer' : undefined}
-      className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 decoration-emerald-400/30 hover:decoration-emerald-400/60 transition-colors"
-      onClick={handleClick}
-      {...props}
-    >
-      {children}
-    </a>
+    <>
+      <a
+        href={renderedHref}
+        target={resolved.external ? '_blank' : undefined}
+        rel={resolved.external ? 'noopener noreferrer' : undefined}
+        className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 decoration-emerald-400/30 hover:decoration-emerald-400/60 transition-colors"
+        onClick={handleClick}
+        {...props}
+        aria-busy={resolved.hostFileTarget && hostFilePending ? 'true' : undefined}
+        aria-disabled={resolved.hostFileTarget && !elevated ? 'true' : undefined}
+        title={resolved.hostFileTarget
+          ? elevated
+            ? 'Open a read-only snapshot in Remote Desktop'
+            : 'Remote Desktop file opening requires elevated access'
+          : props.title}
+      >
+        {children}
+      </a>
+      {hostFileError ? (
+        <span className="ml-1 text-[11px] text-amber-300" role="status">{hostFileError}</span>
+      ) : null}
+    </>
   );
 }
 
@@ -488,6 +625,7 @@ interface MarkdownRendererProps {
   content: string;
   className?: string;
   isStreaming?: boolean;
+  hostFileContext?: HostFileLinkContext;
 }
 
 function closeUnclosedBacktickFence(content: string, isStreaming: boolean): string {
@@ -515,7 +653,7 @@ function buildPortalLinkNode(url: string, label: string) {
 }
 
 function parsePortalTextToNodes(text: string): any[] | null {
-  const pattern = /(Shared Browser|Files section|file section|\/api\/files\/[^\s?#)]+|\/files\?(?:file|path)=[^\s)]+|https?:\/\/[^\s)]+\/files\?(?:file|path)=[^\s)]+|\/?var\/portal-files\/[^\s)]+|\/?(?:root\/)?\.openclaw\/media\/portal-files\/[^\s)]+|~\/?\.openclaw\/media\/portal-files\/[^\s)]+)/gi;
+  const pattern = /(Shared Browser|Files section|file section|\/api\/files\/[^\s?#)]+|\/files\?(?:file|path)=[^\s)]+|https?:\/\/[^\s)]+\/files\?(?:file|path)=[^\s)]+|\/?var\/portal-files\/[^\s)]+|\/?portal\/files\/[^\s)]+|\/?(?:root\/)?\.openclaw\/media\/portal-files\/[^\s)]+|~\/?\.openclaw\/media\/portal-files\/[^\s)]+)/gi;
   let match: RegExpExecArray | null;
   let lastIndex = 0;
   const nodes: any[] = [];
@@ -612,14 +750,28 @@ function wrapBareHtmlInFences(text: string): string {
   return text;
 }
 
-const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, isStreaming = false }: MarkdownRendererProps) {
+const MarkdownRenderer = memo(function MarkdownRenderer({
+  content,
+  className,
+  isStreaming = false,
+  hostFileContext,
+}: MarkdownRendererProps) {
   const renderContent = useMemo(
     () => closeUnclosedBacktickFence(wrapBareHtmlInFences(content), isStreaming),
     [content, isStreaming]
   );
+  const workspaceUrlTransform = useCallback(
+    (url: string) => portalUrlTransform(url, hostFileContext),
+    [hostFileContext],
+  );
 
   const markdownComponents = useMemo(() => ({
     ...components,
+    a: ({ href, children, ...props }: any) => (
+      <PortalMarkdownLink href={href} hostFileContext={hostFileContext} {...props}>
+        {children}
+      </PortalMarkdownLink>
+    ),
     pre: ({ children, ...props }: any) => {
       const childArray = Children.toArray(children);
       const codeChild = childArray.find((child) => isValidElement(child)) as any;
@@ -630,7 +782,7 @@ const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, is
         </PreviewableCodeBlock>
       );
     },
-  }), [isStreaming]);
+  }), [hostFileContext, isStreaming]);
 
   return (
     <div className={`text-sm text-slate-200 leading-relaxed ${className || ''}`}>
@@ -638,6 +790,7 @@ const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, is
         remarkPlugins={[remarkGfm, remarkPortalLinks]}
         rehypePlugins={[rehypeHighlight]}
         components={markdownComponents}
+        urlTransform={workspaceUrlTransform}
       >
         {renderContent}
       </ReactMarkdown>

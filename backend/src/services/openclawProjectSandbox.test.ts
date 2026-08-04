@@ -462,15 +462,16 @@ describe('OpenClaw Project sandbox desired policy', () => {
       'xai/*': { agentRuntime: { id: 'openclaw' } },
     });
     expect(plan.desiredAgent.tools.allow).toEqual([
-      'exec', 'process', 'read', 'write', 'edit', 'apply_patch',
+      'exec', 'process', 'read', 'write', 'edit', 'apply_patch', 'ask_user_question',
     ]);
     expect(plan.desiredAgent.tools.deny).toEqual(expect.arrayContaining([
       'group:web', 'group:media', 'web_search', 'web_fetch', 'image', 'browser', 'gateway',
     ]));
+    expect(plan.desiredAgent.tools.deny).not.toContain('group:plugins');
     expect(plan.desiredAgent.tools.elevated).toEqual({ enabled: false });
     expect(plan.desiredAgent.tools.exec).toMatchObject({ host: 'sandbox', security: 'full', ask: 'off' });
     expect(plan.desiredAgent.tools.sandbox.tools).toEqual({
-      allow: ['exec', 'process', 'read', 'write', 'edit', 'apply_patch'],
+      allow: ['exec', 'process', 'read', 'write', 'edit', 'apply_patch', 'ask_user_question'],
       deny: plan.desiredAgent.tools.deny,
     });
     expect(plan.expectedEnvironment.HTTP_PROXY).toContain('portal-project-egress');

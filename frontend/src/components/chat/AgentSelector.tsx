@@ -112,6 +112,8 @@ interface GatewaySession {
   title?: string;
   preview?: string;
   isMainSession?: boolean;
+  /** Exact host-stream evidence for a currently running turn. */
+  runActive?: boolean;
 }
 
 export interface AgentSelection {
@@ -127,6 +129,7 @@ interface AgentSelectorProps {
   onViewSession?: (sessionKey: string) => void;
   currentSessionKey?: string;
   currentSessionLabel?: string;
+  currentSessionActive?: boolean;
   activityTitles?: Readonly<Record<string, string>>;
   agentAvatars?: Record<string, string>;
   subAgentAvatars?: Record<string, string>;
@@ -160,6 +163,9 @@ const AGENT_IDENTITY_FALLBACK: Record<string, string> = {
 };
 
 /* ─── Helpers ───────────────────────────────────────────────────────────── */
+
+/** The agent Agent Chat shows when no sub-agent is selected. */
+const DEFAULT_OPENCLAW_AGENT_ID = 'main';
 
 function normalizeOpenClawAgentId(rawAgentId?: string | null): string | undefined {
   const value = String(rawAgentId || '').trim();
@@ -295,6 +301,7 @@ function SessionDropdown({
   providerLabel,
   currentSessionKey,
   currentSessionLabel,
+  currentSessionActive,
   activityTitles = {},
   disabled = false,
 }: {
@@ -309,13 +316,22 @@ function SessionDropdown({
   providerLabel: string;
   currentSessionKey?: string;
   currentSessionLabel?: string;
+  currentSessionActive?: boolean;
   activityTitles?: Readonly<Record<string, string>>;
   disabled?: boolean;
 }) {
   const triggerRef = useRef<HTMLButtonElement>(null);
 
-  const activeSessions = sessions.filter(s => s.status === 'active');
-  const otherSessions = sessions.filter(s => s.status !== 'active');
+  const sessionHasActiveRun = (session: GatewaySession): boolean => {
+    const key = getSessionKey(session);
+    if (key && key === currentSessionKey && typeof currentSessionActive === 'boolean') {
+      return currentSessionActive;
+    }
+    return session.runActive === true || Boolean(key && activityTitles[key]);
+  };
+  const runningSessions = sessions.filter(sessionHasActiveRun);
+  const otherSessions = sessions.filter((session) => !sessionHasActiveRun(session));
+  const hasActiveRun = currentSessionActive === true || runningSessions.length > 0;
   const countLabel = loading && sessions.length === 0 ? '…' : hasLoaded ? String(sessions.length) : '—';
   const matchedCurrentSession = currentSessionKey
     ? sessions.find((session) => getSessionKey(session) === currentSessionKey)
@@ -353,8 +369,12 @@ function SessionDropdown({
             {countLabel}
           </span>
         )}
-        {activeSessions.length > 0 && (
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+        {hasActiveRun && (
+          <span
+            aria-label={`${providerLabel} has an active turn`}
+            title={`${providerLabel} has an active turn`}
+            className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"
+          />
         )}
         <ChevronDown
           size={11}
@@ -407,19 +427,24 @@ function SessionDropdown({
             </div>
           )}
 
-          {activeSessions.length > 0 && (
+          {runningSessions.length > 0 && (
             <div>
-              {activeSessions.map((s, idx) => {
+              {runningSessions.map((s, idx) => {
                 const key = getSessionKey(s);
+                const label = getSessionLabel(s, activityTitles[key]);
                 return (
                   <button
                     key={key || `active-${idx}`}
                     onClick={() => { onViewSession(key); onOpenChange(false); }}
                     className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-slate-300 hover:text-white hover:bg-white/[0.06] transition-colors"
                   >
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
+                    <span
+                      aria-label={`${label} has an active turn`}
+                      title={`${label} has an active turn`}
+                      className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0"
+                    />
                     <span className="flex-1 text-left truncate text-[12px] font-medium">
-                      {getSessionLabel(s, activityTitles[key])}
+                      {label}
                     </span>
                     <span className="text-[10px] text-slate-600 flex-shrink-0">
                       {formatTime(s.lastActivityAt || s.createdAt)}
@@ -430,7 +455,7 @@ function SessionDropdown({
             </div>
           )}
 
-          {activeSessions.length > 0 && otherSessions.length > 0 && (
+          {runningSessions.length > 0 && otherSessions.length > 0 && (
             <div className="mx-3 border-t border-white/[0.05] my-1" />
           )}
 
@@ -469,6 +494,7 @@ export default function AgentSelector({
   onViewSession,
   currentSessionKey,
   currentSessionLabel,
+  currentSessionActive,
   activityTitles = {},
   agentAvatars = {},
   subAgentAvatars = {},
@@ -612,7 +638,7 @@ export default function AgentSelector({
     if (!shouldFetchSessions) return;
     let cancelled = false;
     const scopeKey = value === 'OPENCLAW'
-      ? `OPENCLAW:${normalizeOpenClawAgentId(agentId) || 'main'}`
+      ? `OPENCLAW:${normalizeOpenClawAgentId(agentId) || DEFAULT_OPENCLAW_AGENT_ID}`
       : value;
     const cached = sessionCacheRef.current.get(scopeKey);
     setSessions(cached || []);
@@ -623,7 +649,11 @@ export default function AgentSelector({
       try {
         const params: Record<string, string> = {};
         if (value === 'OPENCLAW') {
-          if (agentId) params.agentId = agentId;
+          // Always name the agent, including the default one. Omitting it
+          // asked the server for every agent's sessions at once, so going
+          // back to the main agent replaced its history with a mixed list
+          // that other agents' chats leaked into.
+          params.agentId = normalizeOpenClawAgentId(agentId) || DEFAULT_OPENCLAW_AGENT_ID;
         } else {
           params.provider = value;
         }
@@ -811,15 +841,20 @@ export default function AgentSelector({
               return (
                 <div key={p.name}>
                   {isOpenClaw ? (
+                    // The default agent stays selectable whenever its own
+                    // sub-agents are, which is any time the selector is not
+                    // disabled. Gating this row on availability alone made
+                    // returning from a sub-agent to the main agent silently
+                    // do nothing while a routine availability recheck was in
+                    // flight, because the sub-agent rows below never had
+                    // that gate. The status pill still reports the state.
                     <button
-                      onClick={() => isUsable && handleSelect('OPENCLAW', undefined)}
-                      disabled={disabled || !isUsable}
+                      onClick={() => handleSelect('OPENCLAW', undefined)}
+                      disabled={disabled}
                       className={`w-full flex items-center gap-2.5 px-4 py-2.5 text-sm transition-colors ${
-                        !isUsable
-                          ? 'text-slate-500 cursor-not-allowed opacity-60'
-                          : isSelectedProvider && !effectiveAgentId
-                            ? 'accent-active'
-                            : 'text-slate-300 hover:bg-white/[0.04] hover:text-white'
+                        isSelectedProvider && !effectiveAgentId
+                          ? 'accent-active'
+                          : 'text-slate-300 hover:bg-white/[0.04] hover:text-white'
                       }`}
                     >
                       <AvatarCircle
@@ -839,7 +874,7 @@ export default function AgentSelector({
                       {agentsLoading && (
                         <Loader2 size={11} className="text-slate-600 animate-spin ml-auto flex-shrink-0" />
                       )}
-                      {isSelectedProvider && !effectiveAgentId && isUsable && (
+                      {isSelectedProvider && !effectiveAgentId && (
                         <Check size={14} className="accent-text flex-shrink-0" />
                       )}
                     </button>
@@ -942,6 +977,7 @@ export default function AgentSelector({
           providerLabel={displayLabel}
           currentSessionKey={currentSessionKey}
           currentSessionLabel={currentSessionLabel}
+          currentSessionActive={currentSessionActive}
           activityTitles={activityTitles}
           disabled={disabled}
         />

@@ -10,6 +10,7 @@ import {
   AgentSettingsDrawer,
   CompatibilityHotfixConfirmationDialog,
   SessionControls,
+  StreamReconnectButton,
   useAgentChatHeartbeatModel,
 } from './ChatInterface';
 
@@ -117,6 +118,20 @@ describe('Agent Chat viewport-owned controls', () => {
     vi.restoreAllMocks();
     useAuthStore.setState({ isAuthenticated: false, user: null });
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+  });
+
+  it('renders the real stale-stream rail and invokes its reconnect path', async () => {
+    const user = userEvent.setup();
+    const onReconnect = vi.fn();
+    const { rerender } = render(
+      <StreamReconnectButton visible onReconnect={onReconnect} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Reconnect live stream' }));
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+
+    rerender(<StreamReconnectButton visible={false} onReconnect={onReconnect} />);
+    expect(screen.queryByRole('button', { name: 'Reconnect live stream' })).not.toBeInTheDocument();
   });
 
   it('portals session controls outside clipped chat ancestors and restores the trigger on Escape', async () => {

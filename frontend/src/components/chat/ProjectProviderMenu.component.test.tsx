@@ -113,6 +113,8 @@ describe('ProjectProviderMenu', () => {
     for (const [, displayName] of routedProviders) {
       expect(screen.getByRole('menuitem', { name: `Use ${displayName}` })).toBeVisible();
     }
+    expect(screen.getByText('Selected')).toBeVisible();
+    expect(screen.queryByText('Active')).not.toBeInTheDocument();
   });
 
   it('never labels a waiting provider "Preparing" and keeps the last preparation failure visible', async () => {

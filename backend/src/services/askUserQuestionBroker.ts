@@ -1,11 +1,11 @@
 import crypto from 'crypto';
 
 /**
- * Owner-scoped presentation cache for native Codex `requestUserInput`
- * requests. OpenClaw remains the authority for whether an exact run/request is
- * pending; Portal re-attests and reconciles this bounded in-memory cache before
- * every read or settlement. The generic approval channel cannot carry option
- * or free-text answers, so delivery uses the dedicated exact-run plugin RPC.
+ * Owner-scoped presentation cache for ask-user requests. Native Codex
+ * `requestUserInput` and the provider-neutral OpenClaw `ask_user_question`
+ * tool both arrive through the exact-run plugin RPC. OpenClaw remains the
+ * authority for whether a run/request is pending; Portal re-attests and
+ * reconciles this bounded cache before every read or settlement.
  */
 
 /** Hard ceiling, matching OpenClaw's documented per-hook budget. */
@@ -23,11 +23,11 @@ export interface AskUserQuestionOption {
 }
 
 export interface AskUserQuestion {
-  /** Native Codex question identity. Answers are keyed by this value. */
+  /** Runtime question identity. Answers are keyed by this value. */
   id: string;
   question: string;
   header?: string;
-  /** Native Codex input is single-answer; generic streamed cards own multi-select. */
+  /** The exact-run settlement protocol currently carries one answer per question. */
   multiSelect: false;
   isOther?: boolean;
   isSecret?: boolean;
@@ -221,7 +221,7 @@ export function registerAskUserQuestion(input: {
   ))) {
     throw new AskUserQuestionError(
       'ASK_USER_MULTISELECT_UNSUPPORTED',
-      'Native Codex questions do not support multi-select answers.',
+      'Ask-user questions do not support multi-select answers.',
     );
   }
   if (questions.length === 0) {
@@ -439,7 +439,7 @@ export function prepareAskUserQuestionAnswer(input: {
 }): PreparedAskUserQuestionAnswer {
   expireOverdue();
   const record = assertPendingRecordForActor(input.id, input.actorUserId);
-  // Native question IDs are model/runtime supplied. Require own JSON
+  // Question IDs are model/runtime supplied. Require own JSON
   // properties and store results without an Object prototype so names such as
   // `constructor` and `__proto__` remain ordinary identities.
   const suppliedAnswers = input.answers && typeof input.answers === 'object'
@@ -487,8 +487,8 @@ export function prepareAskUserQuestionAnswer(input: {
   }
   const text = record.questions.length === 1
     ? answers[record.questions[0].id]
-    // OpenClaw's native parser guarantees numeric ordinal keys. Native IDs
-    // containing `-`, `:` or `=` are not parseable as line keys.
+    // The runtime protocol uses numeric ordinal keys for multiple answers.
+    // Model-supplied IDs containing `-`, `:` or `=` are not safe line keys.
     : record.questions.map((question, index) => `${index + 1}: ${answers[question.id]}`).join('\n');
   return {
     recordId: record.id,

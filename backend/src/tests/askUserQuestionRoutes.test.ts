@@ -139,6 +139,48 @@ describe('native ask-user route channel', () => {
     expect(deps.reconcile).toHaveBeenCalledWith(expect.objectContaining({ activeCalls: [] }));
   });
 
+  test('an older unresolved journal row cannot hide the live question on the same session', async () => {
+    const stale = {
+      ...candidate,
+      runId: 'older-unresolved-run',
+      authorityId: 'older-host-run',
+    };
+    const deps = dependencies({
+      discoverRuns: jest.fn(async () => [stale, candidate]),
+      readPending: jest.fn(async (_sessionKey: string, runId: string) => (
+        runId === candidate.runId
+          ? {
+              pending: true as const,
+              runId: candidate.runId,
+              requestId: proof.toolCallId,
+              questions: record.questions,
+              createdAt: record.createdAt,
+              expiresAt: record.expiresAt,
+            }
+          : { pending: false as const }
+      )),
+    });
+
+    await expect(syncNativeAskUserQuestionsForActor({
+      actorUserId: 'user-1',
+      actorAuthorizationVersion: 7,
+      sessionKey: candidate.sessionKey,
+    }, deps)).resolves.toEqual([
+      expect.objectContaining({ id: record.id, surface: 'agent-chat' }),
+    ]);
+    expect(deps.readPending).toHaveBeenCalledWith(stale.sessionKey, stale.runId);
+    expect(deps.readPending).toHaveBeenCalledWith(candidate.sessionKey, candidate.runId);
+    expect(deps.attestRuntimeRequest).toHaveBeenCalledTimes(1);
+    expect(deps.attestRuntimeRequest).toHaveBeenCalledWith(candidate, proof.toolCallId);
+    expect(deps.reconcile).toHaveBeenCalledWith(expect.objectContaining({
+      activeCalls: [{
+        sessionKey: candidate.sessionKey,
+        runId: candidate.runId,
+        toolCallId: proof.toolCallId,
+      }],
+    }));
+  });
+
   test('delivers the exact runtime pair before committing broker state', async () => {
     let accept!: (value: any) => void;
     const runtimeAcceptance = new Promise((resolve) => { accept = resolve; });

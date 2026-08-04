@@ -663,6 +663,58 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(Number(sessionPopoverRoot?.style.zIndex)).toBeLessThan(VIEWPORT_MODAL_Z_INDEX);
   });
 
+  it('distinguishes a verified idle session from transport and active-turn state', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url.endsWith('/chat/session-status')) return { data: { active: true, dbStatus: 'active' } };
+      if (url.endsWith('/assistant/active-model')) {
+        return { data: { verified: true, activeModel: 'openai/gpt-5.5' } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const user = userEvent.setup();
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    expect(await screen.findByLabelText('Project transport connected')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Stop project agent response' })).not.toBeInTheDocument();
+    const composer = screen.getByRole('textbox', { name: 'Message project agent' });
+    await user.type(composer, '/status');
+    await user.click(screen.getByRole('button', { name: 'Send message to project agent' }));
+
+    const statusMessage = await screen.findByText(/Provider session: verified/);
+    expect(statusMessage).toHaveTextContent('Active turn: idle');
+    expect(statusMessage).toHaveTextContent('Portal transport: connected');
+    expect(statusMessage).not.toHaveTextContent('Provider session: active');
+  });
+
+  it('settles stranded running tools from durable history until exact replay proves a live turn', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.chatHistory.mockResolvedValue({
+      messages: [{
+        id: 'historical-tool-message',
+        role: 'assistant',
+        content: '',
+        timestamp: '2026-07-19T08:00:00.000Z',
+        provider: 'OPENCLAW',
+        runtime: 'openclaw-dedicated-project-agent',
+        toolCalls: [{
+          id: 'historical-tool',
+          name: 'exec',
+          arguments: { command: 'echo complete' },
+          status: 'running',
+          startedAt: Date.parse('2026-07-19T08:00:00.000Z'),
+        }],
+      }],
+      pagination: { hasMore: false, nextCursor: null, limit: 100 },
+    });
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    expect(await screen.findByText('Run echo complete')).toBeVisible();
+    expect(screen.queryByLabelText('Tool turn running')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Stop project agent response' })).not.toBeInTheDocument();
+  });
+
   it('single-flights Project session controls, uses response truth, and rolls back failed fast toggles', async () => {
     projectMocks.projectChatProviders.mockResolvedValue(capabilities());
     projectMocks.projectChatModels.mockResolvedValue({

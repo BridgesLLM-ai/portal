@@ -133,6 +133,24 @@ describe('AskUserQuestionCard', () => {
     expect(onSettled).not.toHaveBeenCalled();
   });
 
+  it('reconciles a question answered in another tab without showing an API error', async () => {
+    const user = userEvent.setup();
+    const onSettled = vi.fn();
+    mocks.answerQuestion.mockRejectedValue({
+      response: {
+        status: 404,
+        data: { error: 'That question is no longer open.', code: 'ASK_USER_NOT_OPEN' },
+      },
+    });
+    render(<AskUserQuestionCard request={makeRequest()} onSettled={onSettled} />);
+
+    await user.click(screen.getByRole('button', { name: 'SQLite' }));
+    await user.click(screen.getByRole('button', { name: 'Send answer' }));
+
+    await waitFor(() => expect(onSettled).toHaveBeenCalledWith('askq_1'));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
   it('locks an answer after an ambiguous response and retries the exact payload', async () => {
     const user = userEvent.setup();
     const onSettled = vi.fn();
@@ -178,6 +196,23 @@ describe('AskUserQuestionCard', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('could not be reached');
     expect(onSettled).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: /Skip/ })).toBeEnabled();
+  });
+
+  it('reconciles a question skipped in another tab without showing an API error', async () => {
+    const user = userEvent.setup();
+    const onSettled = vi.fn();
+    mocks.dismissQuestion.mockRejectedValue({
+      response: {
+        status: 404,
+        data: { error: 'That question is no longer open.', code: 'ASK_USER_NOT_OPEN' },
+      },
+    });
+    render(<AskUserQuestionCard request={makeRequest()} onSettled={onSettled} />);
+
+    await user.click(screen.getByRole('button', { name: /Skip/ }));
+
+    await waitFor(() => expect(onSettled).toHaveBeenCalledWith('askq_1'));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('requires an answer for every native question before enabling submit', async () => {

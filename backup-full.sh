@@ -2816,7 +2816,8 @@ run_backup_database_guard_action() {
   local operation_id="$2"
   local authority_env="$3"
   shift 3
-  [[ "${action}" == "acquire" || "${action}" == "assert" \
+  [[ "${action}" == "probe" || "${action}" == "acquire" \
+    || "${action}" == "assert" \
     || "${action}" == "release" || "${action}" == "peer-role-sql" \
     || "${action}" == "peer-psql" || "${action}" == "peer-pg-dump" ]] \
     || return 1
@@ -2828,7 +2829,10 @@ run_backup_database_guard_action() {
   [[ -f "${authority_env}" && ! -L "${authority_env}" \
     && "$(stat -c '%u:%g:%a:%h' "${authority_env}" 2>/dev/null)" \
       == "0:0:600:1" ]] || {
-    [[ "${action}" != "acquire" ]] || return 1
+    # `probe` must answer under exactly the authority `acquire` will demand.
+    # A gate admitted on weaker authority than the operation it guards is not
+    # a gate; it is the failure this admission exists to prevent.
+    [[ "${action}" != "probe" && "${action}" != "acquire" ]] || return 1
   }
   local -a environment=(
     "PATH=/usr/bin:/bin"
@@ -2871,6 +2875,24 @@ PORTAL_ENV_FILE="$5"
 action="$6"
 shift 6
 case "${action}" in
+  probe)
+    # Admission for the exclusive database fence, run BEFORE anything is
+    # quiesced. `capture_restore_database_peer_authority` only derives what
+    # the socket, OS user, and roles would be; deriving is not connecting.
+    # A deployment whose database is reachable only over TCP (a container,
+    # or any remote server) can satisfy every derived value and still have
+    # no peer socket to open, so the fence could only ever fail in
+    # `acquire` -- after the portal and gateway were already stopped.
+    # Proving the connection here is the whole point of the gate: `control`
+    # is the connection `acquire` opens to fence the database, and `target`
+    # is the one the dump itself needs.
+    seal_database_authority_environment
+    capture_restore_database_peer_authority
+    # This case lives inside a single-quoted script, so the statement has to
+    # be double-quoted here; a single quote would terminate that script.
+    run_restore_peer_psql control -qAt --command="SELECT 1" >/dev/null
+    run_restore_peer_psql target -qAt --command="SELECT 1" >/dev/null
+    ;;
   acquire)
     seal_database_authority_environment
     acquire_restore_database_exclusion
@@ -2997,6 +3019,23 @@ if (
 ):
     raise SystemExit(1)
 PY
+}
+
+# Answers "can this host be fenced at all?" while every service is still
+# running, using a throwaway transaction so nothing is left behind either way.
+assert_backup_database_exclusion_admission() {
+  [[ "${RUN_TYPE}" == "comprehensive" ]] || return 0
+  local authority operation probe_status=0 cleanup_status=0
+  authority="$(backup_database_authority_environment)" || return 1
+  operation="${RUN_ID}.admission"
+  prepare_backup_database_transaction "${operation}" || return 1
+  run_backup_database_guard_action probe "${operation}" "${authority}" \
+    || probe_status=$?
+  # The probe writes its derived authority into the throwaway transaction.
+  # Clear it whether the probe passed or failed; a refusal must not leave
+  # state behind that a later run would trip over.
+  cleanup_backup_database_transaction "${operation}" || cleanup_status=$?
+  (( probe_status == 0 && cleanup_status == 0 ))
 }
 
 acquire_backup_database_exclusion() {
@@ -3743,7 +3782,23 @@ list_path = pathlib.Path(sys.argv[2])
 digest_path = pathlib.Path(sys.argv[3])
 raw_options = sys.argv[4:]
 patterns = []
+allow_external_hardlinks = False
+overlay_root_raw = None
+overlay_relative = None
 for option in raw_options:
+    if option == "--allow-external-hardlinks":
+        allow_external_hardlinks = True
+        continue
+    if option.startswith("--overlay-root="):
+        if overlay_root_raw is not None or len(option) <= len("--overlay-root="):
+            raise SystemExit("duplicate or empty recovery archive overlay root")
+        overlay_root_raw = option.removeprefix("--overlay-root=")
+        continue
+    if option.startswith("--overlay-relative="):
+        if overlay_relative is not None or len(option) <= len("--overlay-relative="):
+            raise SystemExit("duplicate or empty recovery archive overlay path")
+        overlay_relative = option.removeprefix("--overlay-relative=")
+        continue
     if (
         not option.startswith("--exclude=")
         or len(option) <= len("--exclude=")
@@ -3752,6 +3807,9 @@ for option in raw_options:
     ):
         raise SystemExit("unsupported recovery archive selection option")
     patterns.append(option.removeprefix("--exclude="))
+
+if (overlay_root_raw is None) != (overlay_relative is None):
+    raise SystemExit("recovery archive overlay is incomplete")
 
 if (
     not source.is_absolute()
@@ -3818,6 +3876,51 @@ def excluded(relative):
             if fnmatch.fnmatchcase("/".join(parts[index:]), pattern):
                 return True
     return False
+
+overlay_root = None
+overlay_path = None
+overlay_root_info = None
+if overlay_root_raw is not None:
+    overlay_root = pathlib.Path(overlay_root_raw)
+    relative_path = pathlib.PurePosixPath(overlay_relative)
+    relative_parts = relative_path.parts
+    if (
+        not overlay_root.is_absolute()
+        or os.path.normpath(overlay_root) != str(overlay_root)
+        or os.path.realpath(overlay_root) != str(overlay_root)
+        or overlay_root.name != source.name
+        or not relative_parts
+        or relative_path.is_absolute()
+        or str(relative_path) != overlay_relative
+        or any(part in {"", ".", ".."} for part in relative_parts)
+        or "\\" in overlay_relative
+        or valid_text(overlay_relative, 4096) is None
+        or not excluded(overlay_relative)
+    ):
+        raise SystemExit("recovery archive overlay authority is invalid")
+    overlay_root_info = os.lstat(overlay_root)
+    if (
+        not stat.S_ISDIR(overlay_root_info.st_mode)
+        or stat.S_ISLNK(overlay_root_info.st_mode)
+        or overlay_root_info.st_uid != 0
+        or overlay_root_info.st_gid != 0
+        or overlay_root_info.st_mode & 0o022
+    ):
+        raise SystemExit("recovery archive overlay root is not trusted")
+    current = overlay_root
+    for part in relative_parts[:-1]:
+        current = current / part
+        info = os.lstat(current)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_dev != overlay_root_info.st_dev
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or info.st_mode & 0o022
+        ):
+            raise SystemExit("recovery archive overlay path is not trusted")
+    overlay_path = current / relative_parts[-1]
 
 FS_IOC_GETFLAGS = (
     (2 << 30)
@@ -3917,8 +4020,8 @@ def add_contract_field(value):
     contract_digest.update(struct.pack(">Q", len(encoded)))
     contract_digest.update(encoded)
 
-def inspect_entry(path, relative):
-    if excluded(relative):
+def inspect_entry(path, relative, *, apply_exclusions=True, expected_device=None):
+    if apply_exclusions and excluded(relative):
         return
     relative_bytes = valid_text(relative or source.name, 4096)
     if relative_bytes is None or any(
@@ -3927,7 +4030,7 @@ def inspect_entry(path, relative):
     ):
         raise SystemExit("recovery source contains an unsafe path")
     info = os.lstat(path)
-    if info.st_dev != root_info.st_dev:
+    if info.st_dev != (root_info.st_dev if expected_device is None else expected_device):
         raise SystemExit("recovery source crossed a filesystem boundary")
     if stat.S_ISDIR(info.st_mode):
         kind = "directory"
@@ -4029,12 +4132,44 @@ def inspect_entry(path, relative):
             raise SystemExit("recovery source directory could not be enumerated")
         for child in children:
             child_relative = child.name if not relative else relative + "/" + child.name
-            inspect_entry(path / child.name, child_relative)
+            inspect_entry(
+                path / child.name,
+                child_relative,
+                apply_exclusions=apply_exclusions,
+                expected_device=expected_device,
+            )
 
 inspect_entry(source, "")
+if overlay_path is not None:
+    overlay_info = os.lstat(overlay_path)
+    if (
+        not stat.S_ISREG(overlay_info.st_mode)
+        or stat.S_ISLNK(overlay_info.st_mode)
+        or overlay_info.st_nlink != 1
+        or overlay_info.st_uid != 0
+        or overlay_info.st_gid != 0
+        or overlay_info.st_mode & 0o022
+    ):
+        raise SystemExit("recovery archive overlay file is not trusted")
+    inspect_entry(
+        overlay_path,
+        overlay_relative,
+        apply_exclusions=False,
+        expected_device=overlay_root_info.st_dev,
+    )
 for paths in hardlinks.values():
     expected = paths[0][1]
-    if expected != len(paths) or any(value != expected for _, value in paths):
+    # `expected` is the inode's link count; `paths` are the links found inside
+    # this component. Fewer links here than the inode reports means the file is
+    # also linked somewhere outside the component -- which is normal for the
+    # components that legitimately share inodes with another backed-up tree.
+    # Finding MORE links than the inode reports, or disagreeing link counts, is
+    # never legitimate and still fails closed.
+    if (
+        expected < len(paths)
+        or any(value != expected for _, value in paths)
+        or (expected != len(paths) and not allow_external_hardlinks)
+    ):
         raise SystemExit(
             "recovery source hard link crosses a component or exclusion boundary"
         )
@@ -4243,6 +4378,39 @@ if contract.hexdigest() != digest_lines[1]:
 PY
 }
 
+materialize_archive_list_without_overlay() {
+  local full_list="$1"
+  local source_list="$2"
+  local expected_overlay_member="$3"
+  python3 - "$full_list" "$source_list" "$expected_overlay_member" <<'PY'
+import os
+import pathlib
+import sys
+
+full_path = pathlib.Path(sys.argv[1])
+source_path = pathlib.Path(sys.argv[2])
+expected = sys.argv[3].encode("utf-8")
+raw = full_path.read_bytes()
+if not raw or not raw.endswith(b"\0"):
+    raise SystemExit(1)
+members = raw[:-1].split(b"\0")
+if len(members) < 2 or members[-1] != expected or len(members) != len(set(members)):
+    raise SystemExit(1)
+descriptor = os.open(
+    source_path,
+    os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+try:
+    payload = b"\0".join(members[:-1]) + b"\0"
+    if os.write(descriptor, payload) != len(payload):
+        raise SystemExit(1)
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+}
+
 archive_dir() {
   local source_dir="$1"
   local target="$2"
@@ -4251,43 +4419,99 @@ archive_dir() {
   local before_digest="${target}.source-before.sha256"
   local after_list="${target}.source-after"
   local after_digest="${target}.source-after.sha256"
+  local source_only_list="${target}.source-only"
   shift 2
+  # `--check-links` makes tar fail when it cannot archive every link of an
+  # inode. For a component that deliberately shares inodes with another
+  # backed-up tree, that is the normal state, not a fault. The options here
+  # are consumed by the source inventory only; tar itself is driven from the
+  # generated file list, so this flag never reaches it.
+  local -a hardlink_options=(--check-links)
+  local option overlay_root="" overlay_relative=""
+  for option in "$@"; do
+    case "${option}" in
+      --allow-external-hardlinks) hardlink_options=() ;;
+      --overlay-root=*) overlay_root="${option#--overlay-root=}" ;;
+      --overlay-relative=*) overlay_relative="${option#--overlay-relative=}" ;;
+    esac
+  done
+  [[ -z "${overlay_root}" && -z "${overlay_relative}" \
+    || ( -n "${overlay_root}" && -n "${overlay_relative}" ) ]] || return 1
   [[ "$source_dir" == /* && -d "$source_dir" && ! -L "$source_dir" ]] || return 1
   [[ ! -e "$target" && ! -L "$target" \
     && ! -e "$diagnostics" && ! -L "$diagnostics" \
     && ! -e "$before_list" && ! -L "$before_list" \
     && ! -e "$before_digest" && ! -L "$before_digest" \
     && ! -e "$after_list" && ! -L "$after_list" \
-    && ! -e "$after_digest" && ! -L "$after_digest" ]] || return 1
+    && ! -e "$after_digest" && ! -L "$after_digest" \
+    && ! -e "$source_only_list" && ! -L "$source_only_list" ]] || return 1
   if ! materialize_archive_source_inventory \
       "$source_dir" "$before_list" "$before_digest" "$@"; then
     rm -f -- "$before_list" "$before_digest"
     return 1
   fi
-  if ! tar --format=pax --sparse --one-file-system --check-links \
-      --acls --xattrs --xattrs-include='*' --selinux \
-      --pax-option=delete=atime,delete=ctime \
-      --atime-preserve=system --no-recursion --null --verbatim-files-from \
-      -czf "$target" -C "$(dirname "$source_dir")" -T "$before_list" \
-      2>"${diagnostics}"; then
-    rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest"
+  local archive_list="$before_list"
+  if [[ -n "${overlay_root}" ]]; then
+    if ! materialize_archive_list_without_overlay \
+        "$before_list" "$source_only_list" \
+        "$(basename "$source_dir")/${overlay_relative}"; then
+      rm -f -- "$before_list" "$before_digest" "$source_only_list"
+      return 1
+    fi
+    archive_list="$source_only_list"
+  fi
+  local tar_status=0
+  if [[ -n "${overlay_root}" ]]; then
+    tar --format=pax --sparse --one-file-system "${hardlink_options[@]}" \
+        --acls --xattrs --xattrs-include='*' --selinux \
+        --pax-option=delete=atime,delete=ctime \
+        --atime-preserve=system --no-recursion --null --verbatim-files-from \
+        -czf "$target" -C "$(dirname "$source_dir")" -T "$archive_list" \
+        -C "$(dirname "$overlay_root")" \
+        "$(basename "$source_dir")/${overlay_relative}" \
+        2>"${diagnostics}" || tar_status=$?
+  else
+    tar --format=pax --sparse --one-file-system "${hardlink_options[@]}" \
+        --acls --xattrs --xattrs-include='*' --selinux \
+        --pax-option=delete=atime,delete=ctime \
+        --atime-preserve=system --no-recursion --null --verbatim-files-from \
+        -czf "$target" -C "$(dirname "$source_dir")" -T "$archive_list" \
+        2>"${diagnostics}" || tar_status=$?
+  fi
+  if (( tar_status != 0 )); then
+    rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest" \
+      "$source_only_list"
     return 1
   fi
   if [[ -s "$diagnostics" ]]; then
-    rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest"
+    rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest" \
+      "$source_only_list"
     return 1
   fi
   rm -f -- "$diagnostics"
   if ! tar --compare --numeric-owner --acls --xattrs \
       --xattrs-include='*' --selinux \
       --atime-preserve=system --no-recursion --null --verbatim-files-from \
-      -zf "$target" -C "$(dirname "$source_dir")" -T "$before_list" \
+      -zf "$target" -C "$(dirname "$source_dir")" -T "$archive_list" \
       >"$diagnostics" 2>&1; then
-    rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest"
+    rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest" \
+      "$source_only_list"
+    return 1
+  fi
+  if [[ -n "${overlay_root}" ]] \
+    && ! tar --compare --numeric-owner --acls --xattrs \
+      --xattrs-include='*' --selinux \
+      --atime-preserve=system --no-recursion \
+      -zf "$target" -C "$(dirname "$overlay_root")" \
+      "$(basename "$source_dir")/${overlay_relative}" \
+      >>"$diagnostics" 2>&1; then
+    rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest" \
+      "$source_only_list"
     return 1
   fi
   if [[ -s "$diagnostics" ]]; then
-    rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest"
+    rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest" \
+      "$source_only_list"
     return 1
   fi
   rm -f -- "$diagnostics"
@@ -4298,10 +4522,11 @@ archive_dir() {
     || ! assert_archive_matches_source_inventory \
       "$target" "$before_list" "$before_digest"; then
     rm -f -- "$target" "$before_list" "$before_digest" \
-      "$after_list" "$after_digest"
+      "$after_list" "$after_digest" "$source_only_list"
     return 1
   fi
-  rm -f -- "$before_list" "$before_digest" "$after_list" "$after_digest"
+  rm -f -- "$before_list" "$before_digest" "$after_list" "$after_digest" \
+    "$source_only_list"
   [[ -s "$target" && -f "$target" && ! -L "$target" ]]
 }
 
@@ -4395,6 +4620,274 @@ archive_required_component_with_retries() {
       die "Required recovery source is missing or could not be archived after ${max_attempts} attempts: ${component_id} (${source_dir})"
     fi
     log "Recovery source changed during capture; retrying ${component_id} ($(( attempt + 1 ))/${max_attempts})"
+    (( attempt += 1 ))
+    sleep 1
+  done
+  local capture_method="live-filesystem-tar"
+  [[ "${RUN_TYPE:-}" == "comprehensive" ]] && capture_method="service-quiesced-tar"
+  record_recovery_component \
+    "$component_id" required captured "$(basename "$target")" "$source_dir" "$capture_method"
+}
+
+snapshot_sqlite_database() {
+  local source_database="$1"
+  local snapshot_database="$2"
+  python3 - "$source_database" "$snapshot_database" <<'PY'
+import os
+import pathlib
+import sqlite3
+import stat
+import sys
+
+source = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+
+def canonical_path(path):
+    return (
+        path.is_absolute()
+        and os.path.normpath(path) == str(path)
+        and os.path.realpath(path) == str(path)
+    )
+
+def trusted_directory(path):
+    info = os.lstat(path)
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and info.st_uid == 0
+        and info.st_gid == 0
+        and not (info.st_mode & 0o022)
+    )
+
+def source_identity(info):
+    return (
+        info.st_dev,
+        info.st_ino,
+        stat.S_IFMT(info.st_mode),
+        stat.S_IMODE(info.st_mode),
+        info.st_uid,
+        info.st_gid,
+        info.st_nlink,
+    )
+
+def attest_source_member(path, parent_device, *, require_nonempty=False):
+    info = os.lstat(path)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or info.st_mode & 0o022
+        or info.st_dev != parent_device
+        or info.st_size < (1 if require_nonempty else 0)
+        or info.st_size > 1024**4
+    ):
+        raise ValueError("unsafe SQLite source member")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    if source_identity(os.fstat(descriptor)) != source_identity(info):
+        os.close(descriptor)
+        raise ValueError("SQLite source member changed during admission")
+    return info, descriptor
+
+created = False
+held_descriptors = []
+try:
+    if (
+        not canonical_path(source)
+        or not canonical_path(source.parent)
+        or not trusted_directory(source.parent)
+        or not target.is_absolute()
+        or os.path.normpath(target) != str(target)
+        or target.exists()
+        or target.is_symlink()
+        or not canonical_path(target.parent)
+        or not trusted_directory(target.parent)
+    ):
+        raise ValueError("unsafe SQLite snapshot authority")
+    parent_info = os.lstat(source.parent)
+    before, source_descriptor = attest_source_member(
+        source,
+        parent_info.st_dev,
+        require_nonempty=True,
+    )
+    held_descriptors.append(source_descriptor)
+    sidecar_suffixes = ("-wal", "-shm", "-journal")
+    sidecars_before = {}
+    for suffix in sidecar_suffixes:
+        candidate = pathlib.Path(str(source) + suffix)
+        if not os.path.lexists(candidate):
+            continue
+        info, descriptor = attest_source_member(candidate, parent_info.st_dev)
+        sidecars_before[suffix] = info
+        held_descriptors.append(descriptor)
+
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(target, flags, 0o600)
+    os.close(descriptor)
+    created = True
+
+    source_connection = sqlite3.connect(
+        source.as_uri() + "?mode=ro",
+        uri=True,
+        timeout=30.0,
+    )
+    destination_connection = sqlite3.connect(str(target), timeout=30.0)
+    try:
+        source_connection.execute("PRAGMA query_only=ON")
+        source_connection.execute("PRAGMA busy_timeout=30000")
+        destination_connection.execute("PRAGMA busy_timeout=30000")
+        source_connection.backup(destination_connection, pages=1024, sleep=0.05)
+        destination_connection.execute("PRAGMA journal_mode=DELETE")
+        destination_connection.commit()
+        queue_table = destination_connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_queue_entries'",
+        ).fetchone()
+        if queue_table:
+            # Match pinned OpenClaw's restore contract: queued outbound
+            # deliveries are runtime work, not durable state. Replaying them
+            # after a restore can resend stale messages to external channels.
+            destination_connection.execute("DELETE FROM delivery_queue_entries")
+            destination_connection.commit()
+            destination_connection.execute("VACUUM")
+        if destination_connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise ValueError("SQLite snapshot integrity check failed")
+    finally:
+        destination_connection.close()
+        source_connection.close()
+
+    after = os.lstat(source)
+    if (
+        source_identity(before) != source_identity(after)
+        or source_identity(before) != source_identity(os.fstat(source_descriptor))
+    ):
+        raise ValueError("SQLite source identity changed")
+    sidecars_after = {
+        suffix
+        for suffix in sidecar_suffixes
+        if os.path.lexists(pathlib.Path(str(source) + suffix))
+    }
+    if sidecars_after != set(sidecars_before):
+        raise ValueError("SQLite sidecar set changed")
+    for index, suffix in enumerate(sidecars_before, start=1):
+        candidate = pathlib.Path(str(source) + suffix)
+        after_sidecar = os.lstat(candidate)
+        held_sidecar = os.fstat(held_descriptors[index])
+        if (
+            source_identity(sidecars_before[suffix]) != source_identity(after_sidecar)
+            or source_identity(sidecars_before[suffix]) != source_identity(held_sidecar)
+        ):
+            raise ValueError("SQLite sidecar identity changed")
+    os.chmod(target, 0o600)
+    final = os.lstat(target)
+    if (
+        not stat.S_ISREG(final.st_mode)
+        or stat.S_ISLNK(final.st_mode)
+        or final.st_uid != 0
+        or final.st_gid != 0
+        or final.st_nlink != 1
+        or stat.S_IMODE(final.st_mode) != 0o600
+        or final.st_size <= 0
+        or any(os.path.lexists(pathlib.Path(str(target) + suffix)) for suffix in sidecar_suffixes)
+    ):
+        raise ValueError("SQLite snapshot did not settle safely")
+    descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory_descriptor = os.open(
+        target.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+except (OSError, sqlite3.Error, ValueError):
+    if created:
+        for candidate in [target, *(pathlib.Path(str(target) + suffix) for suffix in ("-wal", "-shm", "-journal"))]:
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+    raise SystemExit(1)
+finally:
+    for descriptor in held_descriptors:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+PY
+}
+
+archive_openclaw_state_component() {
+  local component_id="$1"
+  local source_dir="$2"
+  local target="$3"
+  local max_attempts="$4"
+  shift 4
+  [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] \
+    || die "Archive retry count must be a positive integer: ${component_id}"
+  local attempt=1
+  local source_database="${source_dir}/state/openclaw.sqlite"
+  while true; do
+    local snapshot_parent overlay_root snapshot_database
+    snapshot_parent="$(mktemp -d "${STAGING_DIR}/.openclaw-snapshot-XXXXXX")" \
+      || die "OpenClaw SQLite snapshot staging could not be allocated"
+    chmod 700 "${snapshot_parent}"
+    overlay_root="${snapshot_parent}/$(basename "${source_dir}")"
+    snapshot_database="${overlay_root}/state/openclaw.sqlite"
+    mkdir -p -m 700 "$(dirname "${snapshot_database}")"
+    local snapshot_present=false attempt_ok=false
+    local -a overlay_options=()
+    if [[ -e "${source_database}" || -L "${source_database}" ]]; then
+      if [[ -f "${source_database}" && ! -L "${source_database}" ]] \
+        && snapshot_sqlite_database "${source_database}" "${snapshot_database}"; then
+        snapshot_present=true
+        overlay_options=(
+          "--overlay-root=${overlay_root}"
+          '--overlay-relative=state/openclaw.sqlite'
+        )
+      fi
+    elif [[ ! -e "${source_database}-wal" && ! -L "${source_database}-wal" \
+      && ! -e "${source_database}-shm" && ! -L "${source_database}-shm" \
+      && ! -e "${source_database}-journal" && ! -L "${source_database}-journal" ]]; then
+      snapshot_present=false
+    fi
+
+    if $snapshot_present || [[ ! -e "${source_database}" && ! -L "${source_database}" ]]; then
+      if archive_dir "$source_dir" "$target" \
+          --exclude='state/openclaw.sqlite' \
+          --exclude='state/openclaw.sqlite-wal' \
+          --exclude='state/openclaw.sqlite-shm' \
+          --exclude='state/openclaw.sqlite-journal' \
+          "$@" "${overlay_options[@]}"; then
+        if $snapshot_present \
+          || [[ ! -e "${source_database}" && ! -L "${source_database}" \
+            && ! -e "${source_database}-wal" && ! -L "${source_database}-wal" \
+            && ! -e "${source_database}-shm" && ! -L "${source_database}-shm" \
+            && ! -e "${source_database}-journal" && ! -L "${source_database}-journal" ]]; then
+          attempt_ok=true
+        else
+          rm -f -- "$target"
+        fi
+      fi
+    fi
+    rm -rf -- "${snapshot_parent}"
+    if $attempt_ok; then
+      break
+    fi
+    rm -f -- "$target"
+    if (( attempt >= max_attempts )); then
+      die "Required recovery source or SQLite snapshot could not be archived after ${max_attempts} attempts: ${component_id} (${source_dir})"
+    fi
+    log "Recovery source or SQLite snapshot changed during capture; retrying ${component_id} ($(( attempt + 1 ))/${max_attempts})"
     (( attempt += 1 ))
     sleep 1
   done
@@ -5768,6 +6261,12 @@ create_backup() {
   log "Starting ${type} backup"
   log "Portal root: ${PORTAL_DIR}"
   if [[ "$type" == "comprehensive" ]]; then
+    # Nothing is stopped until the fence has been proven possible on this
+    # host. A comprehensive backup that cannot fence the database cannot
+    # succeed, and stopping the portal to discover that costs real downtime
+    # for an archive that was never going to exist.
+    assert_backup_database_exclusion_admission \
+      || die "A comprehensive backup must fence the Portal database through a local PostgreSQL peer socket, and that connection could not be opened on this host - most often because the database is reached over TCP, such as a container or a remote server. No services were stopped. Daily, weekly, and monthly backups do not use this fence and still run."
     assert_backup_lock_guard \
       || die "Backup lock guard was lost before source quiescence"
     quiesce_comprehensive_backup_sources \
@@ -5822,7 +6321,12 @@ create_backup() {
       legacy-hosted-apps "$LEGACY_APP_FILES_DIR" "${staging}/legacy-apps.tar.gz" \
       "Legacy app deployment root is not present for this installation profile"
   fi
-  archive_required_component portal-files "$PORTAL_FILES_DIR" "${staging}/portal-files.tar.gz"
+  # OpenClaw hardlinks its media directory to Portal Files uploads, so these
+  # two components share inodes by design. Each archive keeps its own copy of
+  # the data; only the link relationship is not preserved across a restore.
+  archive_required_component_with_retries \
+    portal-files "$PORTAL_FILES_DIR" "${staging}/portal-files.tar.gz" 3 \
+    --allow-external-hardlinks
   archive_required_component upload-storage "$UPLOAD_FILES_DIR" "${staging}/uploads.tar.gz"
   if [[ "$LEGACY_PORTAL_FILES_DIR" != "$PORTAL_FILES_DIR" \
     && "$LEGACY_PORTAL_FILES_DIR" != "$UPLOAD_FILES_DIR" ]]; then
@@ -5959,11 +6463,52 @@ create_backup() {
     # the configuration, sessions, SQLite state, workspaces, skills, and
     # locally installed extensions; the installer recreates managed npm
     # projects from the pinned plugin configuration during restore/update.
-    archive_required_component_with_retries \
+    # Each agent also owns a Codex home, and it is a live runtime directory,
+    # not durable state. A capture of this component is only valid if nothing
+    # under it is written between the pre- and post-inventory, because the
+    # inventory digest covers size, mtime and ctime of every member. Measured
+    # on a production host: with the paths below excluded, a 75-second window
+    # saw zero metadata changes while a Codex workload ran; with only the
+    # scratch roots excluded it saw 51 changes per minute, every one of them
+    # inside a Codex home. Retrying cannot win that race -- an agent fleet
+    # that is busy simply never holds still -- so the volatile and
+    # regenerable members are kept out of the archive instead.
+    #
+    #   .tmp            a full git clone of the remote plugin catalogue,
+    #                   re-synced from .tmp/plugins.sha, replicated per agent
+    #   sessions        Codex rollout transcripts, rewritten continuously;
+    #                   OpenClaw's own transcripts remain the durable record
+    #   cache           model/tool discovery caches, refetched on demand
+    #   shell_snapshots per-command scratch, written several times a minute
+    #   *.sqlite[-wal]  Codex state and log databases plus their WAL sidecars
+    #
+    # Configuration, installation identity, skills, plugins and the memory and
+    # goal databases stay in the archive: they are small, they are what a
+    # restore actually needs, and they are not written on a per-command basis.
+    # The live state/openclaw.sqlite database is different: copying its main
+    # file while SQLite is writing a WAL can produce a torn or incomplete
+    # restore even if tar's metadata inventory happens to remain stable. Take
+    # a verified SQLite online backup, exclude every live journal member, and
+    # overlay the snapshot at the original archive path. The generic archive
+    # contract inventories and compares that overlay exactly like source data.
+    archive_openclaw_state_component \
       openclaw-state "$OPENCLAW_DIR" "${staging}/openclaw-state.tar.gz" 3 \
+      --allow-external-hardlinks \
       --exclude='npm/*' \
+      --exclude='logs/*' \
       --exclude='*/agent/codex-home/tmp' \
-      --exclude='*/agent/codex-home/tmp/*'
+      --exclude='*/agent/codex-home/tmp/*' \
+      --exclude='*/agent/codex-home/.tmp' \
+      --exclude='*/agent/codex-home/.tmp/*' \
+      --exclude='*/agent/codex-home/sessions' \
+      --exclude='*/agent/codex-home/sessions/*' \
+      --exclude='*/agent/codex-home/cache' \
+      --exclude='*/agent/codex-home/cache/*' \
+      --exclude='*/agent/codex-home/shell_snapshots' \
+      --exclude='*/agent/codex-home/shell_snapshots/*' \
+      --exclude='*/agent/codex-home/models_cache.json' \
+      --exclude='*/agent/codex-home/state_*.sqlite*' \
+      --exclude='*/agent/codex-home/logs_*.sqlite*'
   else
     record_absent_component \
       openclaw-state "$OPENCLAW_DIR" \

@@ -397,7 +397,7 @@ const MAX_DISCOVERED_ACTIVE_RUNS = 64;
 /**
  * Discover active Portal-owned OpenClaw runs from server-side journals only.
  * The browser supplies, at most, a session filter; it never supplies a run or
- * native request identity. Multiple active claims for one session fail closed.
+ * runtime request identity. Multiple active claims for one session fail closed.
  */
 export async function discoverAskUserQuestionRunsForActor(
   input: {
@@ -525,24 +525,28 @@ export async function discoverAskUserQuestionRunsForActor(
     (candidate): candidate is AskUserQuestionRunCandidate => Boolean(candidate),
   );
 
-  const seenSessions = new Set<string>();
+  // A transport loss can leave an older DISPATCHED journal row on a durable
+  // session. Keep every distinctly attested run candidate here: the exact
+  // runtime read in syncAskUserQuestionsForActor supplies the missing
+  // liveness proof by matching the exact upstream run id. Rejecting two rows
+  // merely because they share a session hides the live request before that
+  // authoritative check can happen.
   const seenRuns = new Set<string>();
   for (const candidate of candidates) {
     const runKey = `${candidate.sessionKey}\u0000${candidate.runId}`;
-    if (seenSessions.has(candidate.sessionKey) || seenRuns.has(runKey)) {
+    if (seenRuns.has(runKey)) {
       throw new AskUserQuestionError(
         'ASK_USER_RUN_AMBIGUOUS',
-        'The session has conflicting active-run ownership evidence.',
+        'The run has conflicting active-run ownership evidence.',
         409,
       );
     }
-    seenSessions.add(candidate.sessionKey);
     seenRuns.add(runKey);
   }
   return candidates;
 }
 
-/** Re-attest a runtime-discovered native request against the same authority. */
+/** Re-attest a runtime-discovered request against the same authority. */
 export async function attestAskUserQuestionRuntimeRequest(
   candidate: AskUserQuestionRunCandidate,
   requestId: unknown,

@@ -27,6 +27,7 @@ import {
   FILE_LIBRARY_PAGE_SIZE,
   normalizeFileRename,
 } from '../services/fileLibraryPolicy';
+import { normalizeOwnedFileDeepLinkPath } from '../services/fileDeepLinkSelector';
 import {
   admitWorkspaceAuthorizationRequest,
   settleWorkspaceAuthorizationRequestIfResponseEnded,
@@ -434,21 +435,24 @@ router.get('/resolve', authenticateToken, requireApproved, async (req: Request, 
       return;
     }
 
-    const normalizedPath = rawPath.replace(/\\/g, '/');
-    const basename = normalizedPath.split('/').filter(Boolean).pop() || normalizedPath;
+    const normalizedPath = !id && rawPath
+      ? normalizeOwnedFileDeepLinkPath(rawPath, {
+          canonicalUploadsRoot: path.join(BASE_UPLOAD_DIR, `user-${ownerId}`, 'uploads'),
+          mediaMirrorUploadsRoot: path.join(OPENCLAW_MEDIA_MIRROR_BASE, `user-${ownerId}`, 'uploads'),
+          legacyOwnerRoot: path.join('/portal/files', ownerId),
+        })
+      : null;
+    if (!id && rawPath && !normalizedPath) {
+      res.status(404).json({ error: 'File not found' });
+      return;
+    }
     const file = await prisma.file.findFirst({
       where: {
         userId: ownerId,
         ...(id
           ? { id }
-          : {
-              OR: [
-                { path: normalizedPath },
-                { path: basename },
-              ],
-            }),
+          : { path: normalizedPath! }),
       },
-      orderBy: { createdAt: 'desc' },
     });
 
     if (!file) {
