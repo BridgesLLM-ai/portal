@@ -1,4 +1,4 @@
-FROM node:22.22.3-bookworm-slim AS backend-builder
+FROM node:26.6.0-bookworm-slim AS backend-builder
 
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
@@ -20,7 +20,7 @@ COPY backend/ ./
 # Generate from the exact shipped schema before TypeScript compilation.
 RUN npx prisma generate && npm run build && npm prune --omit=dev
 
-FROM node:22.22.3-alpine AS frontend-builder
+FROM node:26.6.0-alpine AS frontend-builder
 
 ARG VITE_API_URL=/api
 ENV VITE_API_URL=${VITE_API_URL}
@@ -33,7 +33,7 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM node:22.22.3-bookworm-slim AS runtime
+FROM node:26.6.0-bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
