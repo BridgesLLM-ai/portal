@@ -1,13 +1,11 @@
 {
   "schema": 1,
-  "version": "4.0.13",
+  "version": "4.0.14",
   "releasedAt": "2026-08-10",
-  "releaseClass": "feature",
+  "releaseClass": "hotfix",
   "highlights": [
-    "A gateway restart no longer destroys the Agent Chat turn you were watching; live runs reattach instead of being abandoned.",
-    "Share links can enforce an owner-selected request throttle, and embeddable origins are now one owner-controlled allowlist.",
-    "Project deployments declare whether Portal or an external service owns the runtime, with honest Refresh, Start, and Restart.",
-    "Stuck provider sign-ins can be reset from the wizard, and a refused login reports the real reason instead of an exit code.",
-    "Portal branding is consistent across auth, icons, metadata, and email, and all frontend dependency advisories are cleared."
+    "Updates no longer fail on ordinary Ubuntu scheduler trees, redirected legacy cleanup jobs, heredocs, NUL-bearing scripts, or inactive backup unit files.",
+    "The Dashboard updater now shows durable, real installer phases, percentage, recent milestones, reconnect state, elapsed time, and exact terminal feedback.",
+    "Update progress survives Portal restarts and page reloads, distinguishes rollback and post-commit errors, and never treats a version string alone as success."
   ]
 }

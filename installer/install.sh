@@ -25,7 +25,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="4.0.13"
+readonly VERSION="4.0.14"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -47,6 +47,7 @@ readonly BACKUP_QUIESCENCE_JOURNAL="/var/lib/bridgesllm/backup-recovery/quiescen
 readonly RESTORE_ACTIVE_JOURNAL="/var/lib/bridgesllm-restore/active-restore.json"
 readonly UPDATE_STATE_HELPER="${UPDATE_STATE_ROOT}/update-transaction-state.py"
 readonly UPDATE_CADDY_RECOVERY_HELPER="${UPDATE_STATE_ROOT}/caddy-managed-config.py"
+readonly DASHBOARD_UPDATE_PROGRESS_HELPER="${UPDATE_STATE_ROOT}/dashboard-update-progress.py"
 readonly UPDATE_BACKUP_ROOT="${INSTALL_ROOT}/backups/update-transactions"
 readonly UPDATE_STAGE_ROOT="${INSTALL_ROOT}/update-staging"
 readonly UPDATE_BOOT_FENCE_DROPIN_DIR="/etc/systemd/system/bridgesllm-product.service.d"
@@ -304,6 +305,10 @@ UPDATE_DISK_RESERVE_MANIFEST=""
 UPDATE_DATABASE_OPERATION_LATCH=""
 UPDATE_DATABASE_OPERATION_SUPERVISOR_PID=""
 UPDATE_DATABASE_OPERATION_SETTLEMENT_IN_PROGRESS=false
+DASHBOARD_UPDATE_PROGRESS_PERCENT=5
+DASHBOARD_UPDATE_PROGRESS_PHASE="installer-download"
+DASHBOARD_UPDATE_PORTAL_COMMITTED=false
+DASHBOARD_UPDATE_FAILURE_MESSAGE=""
 UNINSTALL_TRANSACTION_ID=""
 UNINSTALL_RECOVERED_THIS_RUN=false
 
@@ -376,6 +381,50 @@ warn()     { echo -e "  ${YELLOW}⚠${NC} $*"; }
 info()     { echo -e "  ${DIM}→${NC} $*"; }
 progress() { echo -e "  ${BLUE}${BULLET}${NC} $*"; }
 
+# The Dashboard updater redirects this installer's stdout into a durable,
+# root-only outer log that survives the Portal restart. Emit a small,
+# allowlisted tab-separated protocol only when the fixed systemd wrapper has
+# supplied a valid operation identity. These records are observability only;
+# the signed transaction journal remains the recovery authority.
+dashboard_update_progress() {
+  local status="$1" percent="$2" phase="$3" label="$4" detail="${5:-}"
+  local operation_id="${BRIDGESLLM_DASHBOARD_UPDATE_ID:-}"
+  local helper="${DASHBOARD_UPDATE_PROGRESS_HELPER}"
+  [[ "${UPDATE_MODE:-false}" == "true" \
+    && "${operation_id}" =~ ^[a-f0-9]{32}$ ]] || return 0
+  [[ "${status}" =~ ^(running|recovering|rolled_back|updated_with_errors|recovery_required)$ \
+    && "${percent}" =~ ^[0-9]+$ \
+    && "${phase}" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]] || return 0
+  (( percent <= 99 )) || percent=99
+  if (( percent < DASHBOARD_UPDATE_PROGRESS_PERCENT )); then
+    percent="${DASHBOARD_UPDATE_PROGRESS_PERCENT}"
+  fi
+  label="${label//$'\t'/ }"
+  label="${label//$'\r'/ }"
+  label="${label//$'\n'/ }"
+  detail="${detail//$'\t'/ }"
+  detail="${detail//$'\r'/ }"
+  detail="${detail//$'\n'/ }"
+  label="${label:0:160}"
+  detail="${detail:0:800}"
+  [[ -n "${label}" ]] || label="Update in progress"
+  DASHBOARD_UPDATE_PROGRESS_PERCENT="${percent}"
+  DASHBOARD_UPDATE_PROGRESS_PHASE="${phase}"
+  if [[ ! -f "${helper}" || -L "${helper}" ]] \
+    || ! /usr/bin/python3 "${helper}" update \
+      --operation-id "${operation_id}" \
+      --status "${status}" \
+      --percent "${percent}" \
+      --phase "${phase}" \
+      --label "${label}" \
+      --detail "${detail}"; then
+    # Progress is an observer, never recovery authority. A write failure is
+    # visible through the outer unit reconciliation but must not perturb the
+    # signed transaction or trigger rollback by itself.
+    echo "  Progress observer could not persist phase ${phase}." >&2
+  fi
+}
+
 fail() {
   # A failure inside failure handling must terminate immediately with one
   # line: no second banner, no second recovery attempt, and never the
@@ -385,6 +434,7 @@ fail() {
     exit 1
   fi
   FAIL_TERMINAL_IN_PROGRESS=true
+  DASHBOARD_UPDATE_FAILURE_MESSAGE="$1"
   # fail() never returns; from here on nothing may re-trigger ERR handling.
   trap - ERR
   trap '' SIGINT TERM HUP
@@ -395,6 +445,19 @@ fail() {
     [[ -f "${LOG_FILE}" ]] \
       && echo -e "  ${DIM}Log: ${LOG_FILE}${NC}" >&2
     exit 1
+  fi
+  if [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
+    dashboard_update_progress updated_with_errors \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" updated-with-errors \
+      "Portal updated; follow-up work failed" "$1"
+  elif [[ "${UPDATE_RECOVERY_ARMED:-false}" == "true" ]]; then
+    dashboard_update_progress recovering \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery \
+      "Update stopped — checking recovery" "$1"
+  else
+    dashboard_update_progress running \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" failure \
+      "Update stopped before completion" "$1"
   fi
   echo ""
   echo -e "  ${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -420,12 +483,21 @@ fail() {
   fi
   if [[ "${database_operation_settled}" != "true" ]]; then
     warn "The active database operation could not be proven stopped. Recovery was not started; the Portal remains boot-fenced."
+    dashboard_update_progress recovery_required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "Automatic recovery needs attention" \
+      "The active database operation could not be proven stopped. Do not start another update."
     exit 1
   fi
+  local update_recovery_attempted=false
+  local update_recovery_succeeded=false
   if [[ "${UPDATE_RECOVERY_ARMED:-false}" == "true" ]] && declare -F recover_interrupted_update >/dev/null 2>&1; then
+    update_recovery_attempted=true
     UPDATE_RECOVERY_ARMED=false
     if ! recover_interrupted_update; then
       warn "Update recovery did not complete. Portal remains boot-fenced and recovery artifacts were preserved for the next installer run."
+    else
+      update_recovery_succeeded=true
     fi
   elif declare -F rollback_openclaw_tested_pair >/dev/null 2>&1; then
     rollback_openclaw_tested_pair || warn "The OpenClaw core/plugin pair needs manual recovery; see ${LOG_FILE}."
@@ -477,6 +549,23 @@ fail() {
   if [[ "${preserve_transaction_stage}" == "false" ]] \
     && declare -F release_update_disk_reserves >/dev/null 2>&1; then
     release_update_disk_reserves >/dev/null 2>&1 || true
+  fi
+  if [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
+    dashboard_update_progress updated_with_errors \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" updated-with-errors \
+      "Portal updated; follow-up work failed" \
+      "${DASHBOARD_UPDATE_FAILURE_MESSAGE}"
+  elif [[ "${update_recovery_attempted}" == "true" \
+    && "${update_recovery_succeeded}" == "true" ]]; then
+    dashboard_update_progress rolled_back \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" rolled-back \
+      "Previous Portal restored" \
+      "The update failed, and the previous Portal was restored and verified. ${DASHBOARD_UPDATE_FAILURE_MESSAGE}"
+  elif [[ "${update_recovery_attempted}" == "true" ]]; then
+    dashboard_update_progress recovery_required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "Automatic recovery needs attention" \
+      "Recovery did not complete. Do not start another update; review the root-only transaction journal and installer log."
   fi
   exit 1
 }
@@ -8427,20 +8516,55 @@ handle_installer_signal() {
   trap '' SIGINT TERM HUP
   trap - ERR
   set +e
+  if [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
+    dashboard_update_progress updated_with_errors \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" updated-with-errors \
+      "Portal updated; follow-up work was interrupted" "${message}"
+  elif [[ "${UPDATE_RECOVERY_ARMED:-false}" == "true" ]]; then
+    dashboard_update_progress recovering \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery \
+      "Installer interrupted — checking recovery" "${message}"
+  else
+    dashboard_update_progress running \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" failure \
+      "Installer interrupted" "${message}"
+  fi
   echo ""
   echo -e "\n  ${YELLOW}⚠  ${message}${NC}"
   echo ""
   if ! settle_openclaw_compatibility_hotfix_process; then
     warn "The OpenClaw compatibility patch process could not be proven stopped. Recovery was not started."
+    [[ "${UPDATE_RECOVERY_ARMED:-false}" != "true" ]] \
+      || dashboard_update_progress recovery_required \
+        "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+        "Automatic recovery needs attention" \
+        "A compatibility process could not be proven stopped. Do not start another update."
     exit "${exit_code}"
   fi
   if declare -F settle_active_update_database_operation >/dev/null 2>&1 \
     && ! settle_active_update_database_operation; then
     warn "The active database operation could not be proven stopped. Recovery was not started; the Portal remains boot-fenced."
+    dashboard_update_progress recovery_required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "Automatic recovery needs attention" \
+      "The database operation could not be proven stopped. Do not start another update."
     exit "${exit_code}"
   fi
-  recover_update_after_signal \
-    || warn "Update recovery did not complete. Portal remains boot-fenced and recovery artifacts were preserved."
+  if ! recover_update_after_signal; then
+    warn "Update recovery did not complete. Portal remains boot-fenced and recovery artifacts were preserved."
+    dashboard_update_progress recovery_required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "Automatic recovery needs attention" \
+      "Recovery after interruption did not complete. Do not start another update."
+  elif [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
+    # A cutover receipt recovers forward, not backward. Recovery may have
+    # committed the target Portal after the signal arrived, so preserve that
+    # exact outcome instead of letting the outer nonzero exit look like an
+    # ordinary pre-commit failure.
+    dashboard_update_progress updated_with_errors \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" updated-with-errors \
+      "Portal updated; follow-up work was interrupted" "${message}"
+  fi
   exit "${exit_code}"
 }
 
@@ -8468,17 +8592,39 @@ handle_update_transaction_err() {
   trap - ERR
   trap '' SIGINT TERM HUP
   set +e
+  dashboard_update_progress recovering \
+    "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery \
+    "Unexpected installer error — recovering" \
+    "The durable transaction is restoring or completing a verified Portal state."
   if ! settle_openclaw_compatibility_hotfix_process; then
     warn "The OpenClaw compatibility patch process could not be proven stopped. Recovery was not started."
+    dashboard_update_progress recovery_required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "Automatic recovery needs attention" \
+      "A compatibility process could not be proven stopped. Do not start another update."
     exit "${exit_code}"
   fi
   if declare -F settle_active_update_database_operation >/dev/null 2>&1 \
     && ! settle_active_update_database_operation; then
     warn "The active database operation could not be proven stopped. Recovery was not started; the Portal remains boot-fenced."
+    dashboard_update_progress recovery_required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "Automatic recovery needs attention" \
+      "The database operation could not be proven stopped. Do not start another update."
     exit "${exit_code}"
   fi
-  recover_pending_update_transaction \
-    || warn "Update recovery did not complete. Portal remains boot-fenced and recovery artifacts were preserved."
+  if ! recover_pending_update_transaction; then
+    warn "Update recovery did not complete. Portal remains boot-fenced and recovery artifacts were preserved."
+    dashboard_update_progress recovery_required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "Automatic recovery needs attention" \
+      "The transaction stopped without a verified terminal state. Do not start another update."
+  elif [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
+    dashboard_update_progress updated_with_errors \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" updated-with-errors \
+      "Portal updated; follow-up work failed" \
+      "The cutover recovered forward, but the installer exited before completing host integration."
+  fi
   exit "${exit_code}"
 }
 
@@ -10835,7 +10981,6 @@ converge_unsafe_docker_prune_automation() {
     "${host_root}" \
     "${LEGACY_DOCKER_PRUNE_CRON_PATH}" \
     "${LEGACY_DOCKER_PRUNE_QUARANTINE_PATH}" <<'PY2'
-import codecs
 import ctypes
 import errno
 import hashlib
@@ -10853,6 +10998,9 @@ HELPER_LINE_LIMIT = 16384
 HELPER_DEPTH_LIMIT = 4
 WRAPPER_DEPTH_LIMIT = 16
 SCHEDULER_ENTRY_LIMIT = 16384
+HELPER_CANDIDATE_FILE_LIMIT = 256
+HELPER_CANDIDATE_TOTAL_LIMIT = 4 * 1024 * 1024
+HELPER_CANDIDATE_LINE_LIMIT = 65536
 PORTAL_AUDITED_HELPER_LIMIT = 512 * 1024
 # Exact backup-full.sh payloads from installable Portal 4.0 releases through
 # 4.0.13. The backup service legitimately schedules this larger audited
@@ -11186,6 +11334,57 @@ def word(value):
         prefix = prefix_match.group(0)
         return prefix + os.path.basename(cleaned[len(prefix):])
     return os.path.basename(cleaned)
+
+
+def is_known_legacy_payload(payload):
+    """Recognize the retired Portal cron job plus inert output redirects."""
+    if b"\0" in payload:
+        return False
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    stripped = text.strip()
+    if not stripped or len(stripped.splitlines()) != 1:
+        return False
+    fields = stripped.split(None, 6)
+    if len(fields) != 7 or fields[:6] != ["13", "0", "*", "*", "*", "root"]:
+        return False
+    try:
+        lexer = shlex.shlex(fields[6], posix=True, punctuation_chars="><;&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        command = list(lexer)
+    except ValueError:
+        return False
+    base = [
+        "docker", "image", "prune", "-af", "--filter", "until=24h",
+    ]
+    if command[:len(base)] != base:
+        return False
+    suffix = command[len(base):]
+    seen_stdout, seen_stderr = False, False
+    while suffix:
+        if suffix[:2] == [">", "/dev/null"]:
+            if seen_stdout:
+                return False
+            seen_stdout = True
+            suffix = suffix[2:]
+            continue
+        if suffix[:3] == ["1", ">", "/dev/null"]:
+            if seen_stdout:
+                return False
+            seen_stdout = True
+            suffix = suffix[3:]
+            continue
+        if suffix[:3] == ["2", ">&", "1"]:
+            if seen_stderr:
+                return False
+            seen_stderr = True
+            suffix = suffix[3:]
+            continue
+        return False
+    return True
 
 
 def systemd_effective_argv(arguments):
@@ -11741,10 +11940,13 @@ def shell_command_substitutions(value):
     return substitutions
 
 
-def language_execution_commands(value, kind):
+def language_execution_command_records(value, kind):
     # These APIs execute one literal string through a command shell. Arbitrary
     # strings, assignments, logging calls, and dynamically constructed values
-    # are intentionally not interpreted as executable commands.
+    # are intentionally not interpreted as executable commands. Scan the
+    # complete bounded source rather than one physical line: each supported
+    # language permits whitespace (including newlines) between the call,
+    # opening parenthesis, and literal argument.
     call_names = {
         "python": (("os.system",), False, "#"),
         "perl": (("system", "exec"), True, "#"),
@@ -11768,12 +11970,16 @@ def language_execution_commands(value, kind):
                 quote = None
             index += 1
             continue
-        if character in {"'", '"'}:
+        if character in ({"'", '"', "`"} if kind == "node" else {"'", '"'}):
             quote = character
             index += 1
             continue
         if value.startswith(comment, index):
-            break
+            newline = value.find("\n", index + len(comment))
+            if newline < 0:
+                break
+            index = newline + 1
+            continue
         matched = next(
             (
                 name for name in sorted(names, key=len, reverse=True)
@@ -11792,6 +11998,7 @@ def language_execution_commands(value, kind):
         if matched is None:
             index += 1
             continue
+        call_line = value.count("\n", 0, index) + 1
         cursor = index + len(matched)
         while cursor < len(value) and value[cursor].isspace():
             cursor += 1
@@ -11802,25 +12009,51 @@ def language_execution_commands(value, kind):
         elif not optional_parenthesis:
             index += len(matched)
             continue
-        if cursor >= len(value) or value[cursor] not in {"'", '"'}:
+        argument_quotes = (
+            {"'", '"', "`"} if kind == "node" else {"'", '"'}
+        )
+        if cursor >= len(value) or value[cursor] not in argument_quotes:
             index += len(matched)
             continue
         argument_quote = value[cursor]
         cursor += 1
         argument = []
+        template_interpolation = False
         while cursor < len(value):
             if value[cursor] == "\\" and cursor + 1 < len(value):
                 argument.extend(value[cursor:cursor + 2])
                 cursor += 2
                 continue
+            if argument_quote == "`" and value.startswith("${", cursor):
+                template_interpolation = True
             if value[cursor] == argument_quote:
-                commands.append("".join(argument))
+                command = "".join(argument)
+                lowered_command = command.lower()
+                if (
+                    template_interpolation
+                    and "docker" in lowered_command
+                    and "prune" in lowered_command
+                ):
+                    fail(
+                        "scheduled Node execution template contains "
+                        "interpolation and a Docker prune candidate that "
+                        "cannot be inspected safely"
+                    )
+                if not template_interpolation:
+                    commands.append((command, call_line))
                 cursor += 1
                 break
             argument.append(value[cursor])
             cursor += 1
         index = max(cursor, index + len(matched))
     return commands
+
+
+def language_execution_commands(value, kind):
+    return [
+        command
+        for command, _ in language_execution_command_records(value, kind)
+    ]
 
 
 def dangerous_argv(arguments, depth, stdin_source=None):
@@ -11974,6 +12207,10 @@ def dangerous_argv(arguments, depth, stdin_source=None):
         if plan["kind"] == "here-string":
             return dangerous(plan["value"], shell_syntax=True, depth=depth + 1)
         if plan["kind"] == "opaque":
+            if plan["value"] == "here-document":
+                # A containing shell helper supplies and inspects this body
+                # with its literal delimiter below.
+                return None
             fail(
                 "scheduled stdin-driven shell uses a command source that "
                 f"cannot be inspected safely ({plan['value']})"
@@ -12188,6 +12425,26 @@ def is_unit_name_activation_link(relative, path, metadata):
     return target == f"../{parts[1]}"
 
 
+def is_systemd_loadable_directory(relative):
+    parts = relative.split(os.sep)
+    return len(parts) == 1 and parts[0].endswith(
+        (".d", ".wants", ".requires")
+    )
+
+
+def is_systemd_loadable_leaf(relative):
+    parts = relative.split(os.sep)
+    basename = parts[-1]
+    suffix = os.path.splitext(basename)[1]
+    if len(parts) == 1:
+        return suffix in UNIT_SUFFIXES
+    if len(parts) != 2:
+        return False
+    if parts[0].endswith((".wants", ".requires")):
+        return suffix in UNIT_SUFFIXES
+    return parts[0].endswith(".d") and basename.endswith(".conf")
+
+
 def secure_cron_directory(logical, kind, entry_budget, seen_directories=None):
     lexical_root = host_path(logical)
     resolved_root, masked = resolve_secure_path(
@@ -12258,8 +12515,18 @@ def collect_systemd_root(logical, resolved_root, entry_budget):
             except OSError as exc:
                 fail(f"could not inspect systemd scheduler entry {display(path)}: {exc}")
             if stat.S_ISDIR(entry_metadata.st_mode):
+                if not is_systemd_loadable_directory(relative):
+                    continue
                 require_secure_directory(path, entry_metadata, "systemd scheduler")
                 pending.append((path, relative))
+                continue
+            if not (
+                is_systemd_loadable_leaf(relative)
+                or is_systemd_loadable_directory(relative)
+            ):
+                # systemd ignores backups, editor temporaries, and arbitrary
+                # nested files in a unit load path. Do not attest content that
+                # the scheduler itself cannot load.
                 continue
             if is_unit_name_activation_link(relative, path, entry_metadata):
                 records.append((relative, path, None, False))
@@ -12279,6 +12546,8 @@ def collect_systemd_root(logical, resolved_root, entry_budget):
             if resolved_metadata is None:
                 fail(f"systemd scheduler target {display(resolved)} disappeared")
             if stat.S_ISDIR(resolved_metadata.st_mode):
+                if not is_systemd_loadable_directory(relative):
+                    continue
                 pending.append((resolved, relative))
                 continue
             records.append((relative, path, resolved, False))
@@ -12296,6 +12565,10 @@ def systemd_dropin_owners(unit_name):
         owners.append(prefix + "-" + suffix)
     owners.append(suffix.lstrip("."))
     return list(dict.fromkeys(owners))
+
+
+def locally_managed_scheduler_path(path):
+    return path.startswith(("/etc/", "/run/", "/root/", "/usr/local/"))
 
 
 def effective_systemd_definitions(logical_roots, entry_budget):
@@ -12355,8 +12628,19 @@ def effective_systemd_definitions(logical_roots, entry_budget):
     for unit_name, fallback in activation_fallback.items():
         selected_main.setdefault(unit_name, fallback)
 
-    for unit_name in sorted(selected_main):
-        definition, target, masked = selected_main[unit_name]
+    def definition_priority(item):
+        unit_name, (definition, _, _) = item
+        origin = display(definition)
+        locally_managed = locally_managed_scheduler_path(origin)
+        return (0 if locally_managed else 1, unit_name)
+
+    # Inspect administrator/runtime definitions before vendor definitions so
+    # ordinary distro units cannot consume generic helper work ahead of the
+    # scheduler surface most likely to contain local policy.
+    for unit_name, selected_record in sorted(
+        selected_main.items(), key=definition_priority
+    ):
+        definition, target, masked = selected_record
         if masked:
             continue
         if target is None:
@@ -12592,11 +12876,20 @@ class HelperBudget:
         self.files = 0
         self.bytes = 0
         self.lines = 0
+        self.candidate_files = 0
+        self.candidate_bytes = 0
+        self.candidate_lines = 0
         self.inspected = set()
+        self.warnings = set()
         self.scheduler_entries = scheduler_entries
         self.scheduler_directories = scheduler_directories
 
-    def admit(self, logical_path, path, metadata):
+    def warn_skip(self, key, message):
+        if key not in self.warnings:
+            print(f"Unsafe Docker prune guard warning: {message}", file=sys.stderr)
+            self.warnings.add(key)
+
+    def admit(self, logical_path, path, metadata, candidate=False):
         identity = (metadata.st_dev, metadata.st_ino)
         is_runtime_repair_launcher = (
             os.path.normpath(logical_path) == PORTAL_RUNTIME_REPAIR_LAUNCHER
@@ -12607,39 +12900,135 @@ class HelperBudget:
             )
         if identity in self.inspected:
             return False
-        if self.files + 1 > HELPER_FILE_COUNT_LIMIT:
-            fail("scheduled helper inspection exceeded its 96-file work budget")
-        if self.bytes + metadata.st_size > HELPER_TOTAL_LIMIT:
-            fail("scheduled helper inspection exceeded its 1 MiB aggregate budget")
-        if is_runtime_repair_launcher:
+        if (
+            metadata.st_size > HELPER_FILE_LIMIT
+            and is_audited_portal_backup_helper(
+                logical_path, path, metadata
+            )
+        ):
+            # This exact release helper is always attested, even after generic
+            # helper work has reached a soft ceiling. Its exact bytes are
+            # reviewed and shipped by BridgesLLM, so no line parsing follows.
             self.inspected.add(identity)
             self.files += 1
             self.bytes += metadata.st_size
             return False
         if metadata.st_size > HELPER_FILE_LIMIT:
-            if is_audited_portal_backup_helper(logical_path, path, metadata):
-                # Its exact bytes were reviewed and shipped by BridgesLLM. Do
-                # not spend the generic line budget parsing it, but retain the
-                # aggregate file/byte work accounting.
-                self.inspected.add(identity)
-                self.files += 1
-                self.bytes += metadata.st_size
-                return False
             fail(f"scheduled helper {display(path)} exceeds 128 KiB")
+        generic_exhausted = (
+            self.files + 1 > HELPER_FILE_COUNT_LIMIT
+            or self.bytes + metadata.st_size > HELPER_TOTAL_LIMIT
+        )
+        if candidate and generic_exhausted:
+            if self.files + 1 > HELPER_FILE_COUNT_LIMIT:
+                self.warn_skip(
+                    "files",
+                    "scheduled helper inspection reached its 96-file work "
+                    "budget; prioritized helper candidates continue in the "
+                    "bounded reserve",
+                )
+            else:
+                self.warn_skip(
+                    "bytes",
+                    "scheduled helper inspection reached its 1 MiB aggregate "
+                    "budget; prioritized helper candidates continue in the "
+                    "bounded reserve",
+                )
+            if self.candidate_files + 1 > HELPER_CANDIDATE_FILE_LIMIT:
+                fail(
+                    "scheduled helper candidate inspection exceeded its "
+                    "256-file reserve"
+                )
+            if (
+                self.candidate_bytes + metadata.st_size
+                > HELPER_CANDIDATE_TOTAL_LIMIT
+            ):
+                fail(
+                    "scheduled helper candidate inspection exceeded its "
+                    "4 MiB reserve"
+                )
+            self.inspected.add(identity)
+            self.candidate_files += 1
+            self.candidate_bytes += metadata.st_size
+            return True
+        if self.files + 1 > HELPER_FILE_COUNT_LIMIT:
+            self.warn_skip(
+                "files",
+                "scheduled helper inspection reached its 96-file work budget; "
+                "remaining helper bodies are skipped while literal scheduler "
+                "commands remain inspected",
+            )
+            return False
+        if self.bytes + metadata.st_size > HELPER_TOTAL_LIMIT:
+            self.warn_skip(
+                "bytes",
+                "scheduled helper inspection reached its 1 MiB aggregate "
+                "budget; remaining helper bodies are skipped while literal "
+                "scheduler commands remain inspected",
+            )
+            return False
+        if is_runtime_repair_launcher:
+            self.inspected.add(identity)
+            self.files += 1
+            self.bytes += metadata.st_size
+            return False
         self.inspected.add(identity)
         self.files += 1
         self.bytes += metadata.st_size
         return True
 
-    def admit_line(self):
+    def admit_line(self, candidate=False):
+        if self.lines >= HELPER_LINE_LIMIT:
+            if candidate:
+                self.warn_skip(
+                    "lines",
+                    "scheduled helper inspection reached its 16384-line work "
+                    "budget; prioritized helper candidates continue in the "
+                    "bounded reserve",
+                )
+                self.candidate_lines += 1
+                if self.candidate_lines > HELPER_CANDIDATE_LINE_LIMIT:
+                    fail(
+                        "scheduled helper candidate inspection exceeded its "
+                        "65536-line reserve"
+                    )
+                return True
+            self.warn_skip(
+                "lines",
+                "scheduled helper inspection reached its 16384-line work "
+                "budget; remaining helper bodies are skipped while literal "
+                "scheduler commands remain inspected",
+            )
+            return False
         self.lines += 1
-        if self.lines > HELPER_LINE_LIMIT:
-            fail("scheduled helper inspection exceeded its 16384-line work budget")
+        return True
 
 
 def absolute_token(value):
     cleaned = value.strip("$(){}[]<>,\"'")
     return cleaned if cleaned.startswith("/") else None
+
+
+def helper_prune_candidate(payload):
+    # This is only a priority signal, never a finding: false positives spend a
+    # small reserve and are parsed normally. Keeping the scan byte-oriented
+    # also surfaces ASCII shell commands inside otherwise non-UTF-8 scripts.
+    lowered = payload.lower()
+    return b"docker" in lowered and b"prune" in lowered
+
+
+def shell_text(payload):
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        text = "".join(
+            chr(value) if value in {9, 10, 13} or 32 <= value <= 126 else " "
+            for value in payload
+        )
+    return "".join(
+        character if character in "\t\r\n" or character.isprintable() else " "
+        for character in text
+    )
 
 
 def interpreter_kind(name):
@@ -12906,6 +13295,8 @@ def interpreter_candidates(
                 )
             return [(script, "shell-source")]
         if plan["kind"] == "opaque":
+            if plan["value"] == "here-document":
+                return []
             fail(
                 "scheduled stdin-driven shell uses a command source that "
                 f"cannot be inspected safely ({plan['value']})"
@@ -13250,28 +13641,234 @@ def supported_shebang_invocation(payload):
     return (kind, arguments[1:]) if kind is not None else None
 
 
-def printable_utf8_text(payload):
-    if b"\0" in payload:
-        return False
+def shell_heredoc_lex(command):
+    """Mask arithmetic shifts and describe each real unquoted heredoc operator."""
+    result = []
+    masked = list(command)
+    mask_marker = "\ue000"
+    while mask_marker in command:
+        mask_marker += "\ue001"
+    quote = None
+    escaped = False
+    arithmetic_kind = None
+    arithmetic_depth = 0
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if escaped:
+            if character == "<":
+                # The shell treats this byte as literal. Mask it in the shlex
+                # input too; otherwise `\\<<` or `\\<\\<` can be reassembled
+                # into a false heredoc token even though the operator counter
+                # correctly ignored the escaped byte.
+                masked[index] = mask_marker
+            escaped = False
+            index += 1
+            continue
+        if quote == "'":
+            if character == "<":
+                masked[index] = mask_marker
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if character == "<":
+                masked[index] = mask_marker
+            if character == "\\":
+                escaped = True
+            elif character == '"':
+                quote = None
+            index += 1
+            continue
+        if character == "\\":
+            escaped = True
+            index += 1
+            continue
+        if character in "'\"":
+            quote = character
+            index += 1
+            continue
+        if arithmetic_kind is not None:
+            if command[index:index + 2] == "<<":
+                # shlex otherwise exposes a Bash arithmetic left shift as the
+                # same punctuation token used by a here-document. Preserve
+                # token width while keeping it out of the heredoc stream.
+                masked[index:index + 2] = [mask_marker, mask_marker]
+                index += 2
+                continue
+            if arithmetic_kind == "paren":
+                if character == "(":
+                    arithmetic_depth += 1
+                elif character == ")":
+                    arithmetic_depth -= 1
+                    if arithmetic_depth == 0:
+                        arithmetic_kind = None
+            elif character == "[":
+                arithmetic_depth += 1
+            elif character == "]":
+                arithmetic_depth -= 1
+                if arithmetic_depth == 0:
+                    arithmetic_kind = None
+            index += 1
+            continue
+        if character == "#" and (
+            index == 0 or command[index - 1].isspace()
+            or command[index - 1] in ";|&"
+        ):
+            break
+        if command[index:index + 3] == "$((":
+            arithmetic_kind = "paren"
+            arithmetic_depth = 2
+            index += 3
+            continue
+        if command[index:index + 2] == "((":
+            arithmetic_kind = "paren"
+            arithmetic_depth = 2
+            index += 2
+            continue
+        if command[index:index + 2] == "$[":
+            arithmetic_kind = "bracket"
+            arithmetic_depth = 1
+            index += 2
+            continue
+        if (
+            command[index:index + 2] == "<<"
+            and (index == 0 or command[index - 1] != "<")
+            and command[index:index + 3] != "<<<"
+        ):
+            result.append(command[index + 2:index + 3] == "-")
+            index += 2
+            continue
+        index += 1
+    return "".join(masked), result, mask_marker
+
+
+def shell_heredoc_tab_operators(command):
+    """Record whether each real heredoc operator has a tab-strip dash."""
+    return shell_heredoc_lex(command)[1]
+
+
+def shell_heredoc_specs(command):
+    """Return ordered delimiters with the command that receives each body."""
+    masked_command, tab_operators, mask_marker = shell_heredoc_lex(command)
     try:
-        text = payload.decode("utf-8")
-    except UnicodeDecodeError:
-        return False
-    return all(character in "\t\r\n" or character.isprintable() for character in text)
+        # Non-POSIX mode retains quoting long enough to distinguish a quoted
+        # delimiter (literal body) from an unquoted one (shell substitutions
+        # still execute before the receiving interpreter reads the body).
+        lexer = shlex.shlex(masked_command, posix=False, punctuation_chars="<;&|")
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        parts = list(lexer)
+    except ValueError:
+        return []
+    heredoc_index = 0
+    result = []
+    segment = []
+    index = 0
+    while index < len(parts):
+        if parts[index] in SEPARATORS:
+            segment = []
+            index += 1
+            continue
+        if parts[index] != "<<" or index + 1 >= len(parts):
+            segment.append(parts[index])
+            index += 1
+            continue
+        if heredoc_index >= len(tab_operators):
+            return []
+        strip_tabs = tab_operators[heredoc_index]
+        heredoc_index += 1
+        delimiter_index = index + 1
+        delimiter = parts[delimiter_index]
+        if strip_tabs and delimiter == "-":
+            # shlex separates the valid spaced form `<<- 'EOF'` into
+            # `<<`, `-`, and the delimiter word. Consume the operator dash;
+            # it is never itself the terminator.
+            delimiter_index += 1
+            if delimiter_index >= len(parts):
+                segment.append(parts[index])
+                index += 1
+                continue
+            delimiter = parts[delimiter_index]
+            strip_tabs = True
+        elif strip_tabs and delimiter.startswith("-"):
+            delimiter = delimiter[1:]
+        # Non-operator less-than bytes remain masked in every ordinary token,
+        # but a delimiter is a shell word whose exact quoted/escaped bytes are
+        # semantically significant. Restore only this proven delimiter token;
+        # restoring other tokens could recreate a false `<<` punctuation item.
+        delimiter = delimiter.replace(mask_marker, "<")
+        quoted = any(character in delimiter for character in "'\"\\")
+        try:
+            unquoted = shlex.split(delimiter, comments=False, posix=True)
+        except ValueError:
+            unquoted = []
+        if len(unquoted) == 1 and unquoted[0]:
+            try:
+                receiver_argv = shlex.split(
+                    " ".join(segment), comments=False, posix=True
+                )
+            except ValueError:
+                receiver_argv = []
+            result.append(
+                (
+                    unquoted[0], strip_tabs, not quoted,
+                    wrapped_interpreter_kind(receiver_argv),
+                )
+            )
+        index = delimiter_index + 1
+    return result
 
 
-def printable_utf8_prefix(payload):
-    if b"\0" in payload:
-        return False
-    try:
-        decoder = codecs.getincrementaldecoder("utf-8")("strict")
-        text = decoder.decode(payload, final=False)
-    except UnicodeDecodeError:
-        return False
-    return all(character in "\t\r\n" or character.isprintable() for character in text)
+def wrapped_interpreter_kind(arguments, depth=0):
+    if depth > WRAPPER_DEPTH_LIMIT:
+        return None
+    argv, _ = shell_segment_plan(arguments)
+    while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
+        argv.pop(0)
+    if not argv:
+        return None
+    name = word(argv[0])
+    rest = argv[1:]
+    kind = interpreter_kind(name)
+    if kind is not None:
+        return kind
+    if name == "env":
+        return wrapped_interpreter_kind(env_command_argv(rest), depth + 1)
+    if name in BUILTIN_WRAPPERS:
+        index = 0
+        while index < len(rest) and rest[index].startswith("-"):
+            if rest[index] == "--":
+                index += 1
+                break
+            if name == "exec" and rest[index] == "-a" and index + 1 < len(rest):
+                index += 2
+            else:
+                index += 1
+        return wrapped_interpreter_kind(rest[index:], depth + 1)
+    if name == "timeout":
+        index = 0
+        while index < len(rest):
+            item = rest[index]
+            if item == "--":
+                index += 1
+                break
+            if item in {"-k", "--kill-after", "-s", "--signal"}:
+                index += 2
+                continue
+            if item.startswith("-"):
+                index += 1
+                continue
+            break
+        return (
+            wrapped_interpreter_kind(rest[index + 1:], depth + 1)
+            if index < len(rest) else None
+        )
+    return None
 
 
-def inspect_helper(path_logical, invocation, budget, depth):
+def inspect_helper(path_logical, invocation, budget, depth, priority=False):
     if depth > HELPER_DEPTH_LIMIT:
         fail(f"scheduled helper recursion exceeded depth {HELPER_DEPTH_LIMIT}")
     lexical = host_path(path_logical)
@@ -13279,7 +13876,7 @@ def inspect_helper(path_logical, invocation, budget, depth):
         lexical,
         allow_missing=True,
         allow_mask=False,
-        final_kind="file",
+        final_kind="either",
         # A dedicated service may need read/traverse access to its immutable
         # root-owned helper. Group identity is not mutation authority when no
         # traversed directory or final file grants group/world write. Keep
@@ -13294,7 +13891,16 @@ def inspect_helper(path_logical, invocation, budget, depth):
     metadata = lstat_or_none(resolved)
     if metadata is None:
         fail(f"scheduled helper {path_logical} disappeared")
-    prefix = read_root_prefix(resolved, metadata)
+    if stat.S_ISDIR(metadata.st_mode):
+        # A directory-shaped command token (including a bare `/`) cannot be
+        # executed as a helper and is not evidence of unsafe cleanup.
+        return None
+    prefix = read_root_prefix(
+        resolved,
+        metadata,
+        min(metadata.st_size, HELPER_FILE_LIMIT) + 1,
+    )
+    prune_candidate = priority or helper_prune_candidate(prefix)
     has_shebang = prefix.startswith(b"#!")
     shebang = supported_shebang_invocation(prefix)
     shebang_kind = shebang[0] if shebang is not None else None
@@ -13306,34 +13912,20 @@ def inspect_helper(path_logical, invocation, budget, depth):
     if invocation == "shell-fallback" and shebang_kind is None:
         # Cron invokes its command through a shell, while the supported process
         # wrappers use execvp-style ENOEXEC fallback. In both cases an
-        # executable, printable UTF-8 file without a shebang is interpreted by
-        # /bin/sh. Binary and non-executable files remain opaque just as they
-        # would for the real execution path.
+        # executable non-ELF file without a shebang is interpreted by /bin/sh.
+        # Shell source bytes need not be UTF-8, so preserve ASCII commands and
+        # sanitize other bytes later instead of treating encoding as fatal.
         if (
             has_shebang
             or not metadata.st_mode & 0o111
-            or not printable_utf8_prefix(prefix)
+            or prefix.startswith(b"\x7fELF")
         ):
             return None
-    if invocation == "shell-source" and not printable_utf8_prefix(prefix):
-        # A sourced binary or non-text payload fails as shell syntax; it is not
-        # a statically inspectable helper command.
-        return None
-    if not budget.admit(path_logical, resolved, metadata):
-        return None
-    payload, _ = read_root_file(resolved, require_root_group=False)
-    if (
-        invocation in {"shell-fallback", "shell-source"}
-        and (shebang_kind is None or invocation == "shell-source")
-        and not printable_utf8_text(payload)
+    if not budget.admit(
+        path_logical, resolved, metadata, candidate=prune_candidate
     ):
         return None
-    if b"\0" in payload:
-        fail(f"scheduled helper {display(resolved)} is not a text script")
-    try:
-        text = payload.decode("utf-8")
-    except UnicodeDecodeError:
-        fail(f"scheduled helper {display(resolved)} is not UTF-8 text")
+    payload, _ = read_root_file(resolved, require_root_group=False)
     if invocation == "shell-source":
         # The current shell interprets sourced content. A leading shebang is
         # merely a comment and cannot change the source language.
@@ -13344,6 +13936,42 @@ def inspect_helper(path_logical, invocation, budget, depth):
         language = shebang_kind
     else:
         language = "shell"
+    if b"\0" in payload:
+        if language == "shell":
+            # Bash ignores embedded NUL bytes with a warning. Remove them for
+            # static inspection so the remaining executed shell text is still
+            # checked for a literal unsafe prune.
+            payload = payload.replace(b"\0", b"")
+        elif not prune_candidate:
+            return None
+    if language == "shell":
+        text = shell_text(payload)
+    else:
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            if not prune_candidate:
+                return None
+            # Known interpreter source containing the byte-level Docker/prune
+            # candidate cannot become opaque because of one irrelevant byte.
+            # Preserve its ASCII source and line layout while replacing bytes
+            # whose language semantics cannot be reduced safely.
+            text = "".join(
+                chr(value)
+                if value in {9, 10, 13} or 32 <= value <= 126 else " "
+                for value in payload
+            )
+        if not all(
+            character in "\t\r\n" or character.isprintable()
+            for character in text
+        ):
+            if not prune_candidate:
+                return None
+            text = "".join(
+                chr(value)
+                if value in {9, 10, 13} or 32 <= value <= 126 else " "
+                for value in payload
+            )
 
     def inspect_literal_commands(commands, line_number):
         for command in commands:
@@ -13355,11 +13983,12 @@ def inspect_helper(path_logical, invocation, budget, depth):
             ):
                 if nested_invocation == "run-parts":
                     finding = inspect_run_parts_directory(
-                        nested, budget, depth + 1
+                        nested, budget, depth + 1, priority=prune_candidate
                     )
                 else:
                     finding = inspect_helper(
-                        nested, nested_invocation, budget, depth + 1
+                        nested, nested_invocation, budget, depth + 1,
+                        priority=prune_candidate,
                     )
                 if finding:
                     return finding
@@ -13371,12 +14000,14 @@ def inspect_helper(path_logical, invocation, budget, depth):
         )
         for preload in shebang_plan["preloads"]:
             finding = inspect_helper(
-                preload, f"interpreter:{shebang_kind}", budget, depth + 1
+                preload, f"interpreter:{shebang_kind}", budget, depth + 1,
+                priority=prune_candidate,
             )
             if finding:
                 return finding
         for source in shebang_plan["inline"]:
-            budget.admit_line()
+            if not budget.admit_line(candidate=prune_candidate):
+                return None
             finding = inspect_literal_commands(
                 language_execution_commands(source, shebang_kind), 1
             )
@@ -13386,7 +14017,67 @@ def inspect_helper(path_logical, invocation, budget, depth):
             return None
 
     logical_text = text.replace("\\\n", " ")
+    if language != "shell":
+        for raw in logical_text.splitlines():
+            stripped = raw.strip()
+            if (
+                not stripped
+                or stripped.startswith("#")
+                or (language == "node" and stripped.startswith("//"))
+            ):
+                continue
+            if not budget.admit_line(candidate=prune_candidate):
+                return None
+        for command, line_number in language_execution_command_records(
+            logical_text, language
+        ):
+            finding = inspect_literal_commands([command], line_number)
+            if finding:
+                return finding
+        return None
+
+    heredocs = []
+    heredoc_body = []
+    heredoc_body_start = None
     for line_number, raw in enumerate(logical_text.splitlines(), 1):
+        if heredocs:
+            delimiter, strip_tabs, expand_body, receiver = heredocs[0]
+            comparison = raw.lstrip("\t") if strip_tabs else raw
+            if comparison == delimiter:
+                if receiver not in {None, "shell"} and heredoc_body:
+                    body_text = "\n".join(heredoc_body)
+                    for command, relative_line in language_execution_command_records(
+                        body_text, receiver
+                    ):
+                        finding = inspect_literal_commands(
+                            [command], heredoc_body_start + relative_line - 1
+                        )
+                        if finding:
+                            return finding
+                heredocs.pop(0)
+                heredoc_body = []
+                heredoc_body_start = None
+                continue
+            if receiver is not None:
+                if not budget.admit_line(candidate=prune_candidate):
+                    return None
+                if receiver == "shell":
+                    commands = [raw]
+                else:
+                    if heredoc_body_start is None:
+                        heredoc_body_start = line_number
+                    heredoc_body.append(raw)
+                    commands = language_execution_commands(raw, receiver)
+                finding = inspect_literal_commands(commands, line_number)
+                if finding:
+                    return finding
+            if expand_body:
+                finding = inspect_literal_commands(
+                    shell_command_substitutions(raw), line_number
+                )
+                if finding:
+                    return finding
+            continue
         stripped = raw.strip()
         if (
             not stripped
@@ -13394,7 +14085,8 @@ def inspect_helper(path_logical, invocation, budget, depth):
             or (language == "node" and stripped.startswith("//"))
         ):
             continue
-        budget.admit_line()
+        if not budget.admit_line(candidate=prune_candidate):
+            return None
         commands = (
             [raw] if language == "shell"
             else language_execution_commands(raw, language)
@@ -13402,10 +14094,12 @@ def inspect_helper(path_logical, invocation, budget, depth):
         finding = inspect_literal_commands(commands, line_number)
         if finding:
             return finding
+        if language == "shell":
+            heredocs.extend(shell_heredoc_specs(raw))
     return None
 
 
-def inspect_run_parts_directory(path_logical, budget, depth):
+def inspect_run_parts_directory(path_logical, budget, depth, priority=False):
     if depth > HELPER_DEPTH_LIMIT:
         fail(f"scheduled helper recursion exceeded depth {HELPER_DEPTH_LIMIT}")
     for definition, _, target in secure_cron_directory(
@@ -13414,7 +14108,9 @@ def inspect_run_parts_directory(path_logical, budget, depth):
         budget.scheduler_entries,
         budget.scheduler_directories,
     ):
-        finding = inspect_helper(display(definition), "direct", budget, depth)
+        finding = inspect_helper(
+            display(definition), "direct", budget, depth, priority=priority
+        )
         if finding:
             prune_kind, helper_path, helper_line = finding
             return (
@@ -13425,7 +14121,9 @@ def inspect_run_parts_directory(path_logical, budget, depth):
     return None
 
 
-def inspect_scheduled_command(command, budget, direct_invocation):
+def inspect_scheduled_command(
+    command, budget, direct_invocation, prioritize_helpers=False
+):
     prune_kind = dangerous(
         command,
         shell_syntax=direct_invocation == "shell-fallback",
@@ -13437,9 +14135,13 @@ def inspect_scheduled_command(command, budget, direct_invocation):
         command, direct_invocation=direct_invocation
     ):
         if invocation == "run-parts":
-            finding = inspect_run_parts_directory(helper, budget, 1)
+            finding = inspect_run_parts_directory(
+                helper, budget, 1, priority=prioritize_helpers
+            )
         else:
-            finding = inspect_helper(helper, invocation, budget, 1)
+            finding = inspect_helper(
+                helper, invocation, budget, 1, priority=prioritize_helpers
+            )
         if finding:
             return finding
     return None
@@ -13574,7 +14276,12 @@ def unsafe_jobs(excluded):
             for key in sorted(effective):
                 for origin, number, command in effective[key]:
                     finding = inspect_scheduled_command(
-                        command, helper_budget, "systemd"
+                        command,
+                        helper_budget,
+                        "systemd",
+                        prioritize_helpers=locally_managed_scheduler_path(
+                            display(origin)
+                        ),
                     )
                     if finding:
                         prune_kind, helper_path, helper_line = finding
@@ -13612,7 +14319,7 @@ def unsafe_jobs(excluded):
         inspected.add(identity)
         if kind == "run-parts":
             finding = inspect_helper(
-                display(definition), "direct", helper_budget, 1
+                display(definition), "direct", helper_budget, 1, priority=True
             )
             if finding:
                 prune_kind, helper_path, helper_line = finding
@@ -13632,6 +14339,7 @@ def unsafe_jobs(excluded):
                 command,
                 helper_budget,
                 "shell-fallback",
+                prioritize_helpers=True,
             )
             if finding:
                 prune_kind, helper_path, helper_line = finding
@@ -13710,7 +14418,7 @@ def open_secure_directory_fd(path, context):
         raise
 
 
-def open_attested_legacy(parent_fd, name, expected):
+def open_attested_legacy(parent_fd, name, expected, expected_payload):
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(name, flags, dir_fd=parent_fd)
@@ -13734,7 +14442,7 @@ def open_attested_legacy(parent_fd, name, expected):
             if not chunk:
                 break
             payload += chunk
-        if payload != LEGACY:
+        if payload != expected_payload or not is_known_legacy_payload(payload):
             fail(f"{source_logical} content changed before inode-bound quarantine")
         os.lseek(descriptor, 0, os.SEEK_SET)
         return descriptor, metadata
@@ -13854,7 +14562,7 @@ def restore_tombstone(source_parent_fd, tombstone_name, source_name):
     os.fsync(source_parent_fd)
 
 
-def quarantine_legacy_inode(source, quarantine, expected):
+def quarantine_legacy_inode(source, quarantine, expected, expected_payload):
     source_directory = os.path.dirname(source)
     source_name = os.path.basename(source)
     quarantine_directory = os.path.dirname(quarantine)
@@ -13863,7 +14571,9 @@ def quarantine_legacy_inode(source, quarantine, expected):
         source_directory, "legacy source-parent"
     )
     try:
-        source_fd, held = open_attested_legacy(source_parent_fd, source_name, expected)
+        source_fd, held = open_attested_legacy(
+            source_parent_fd, source_name, expected, expected_payload
+        )
     except BaseException:
         os.close(source_parent_fd)
         raise
@@ -14086,7 +14796,7 @@ source_metadata = None
 
 if source_exists:
     payload, source_metadata = read_root_file(source, {0o644}, True, True)
-    if payload != LEGACY:
+    if not is_known_legacy_payload(payload):
         fail(
             f"{source_logical} differs from the one known legacy job; "
             "disable or replace it manually, then retry"
@@ -14094,7 +14804,7 @@ if source_exists:
 if quarantine_exists:
     ensure_quarantine_parent(quarantine)
     payload, _ = read_root_file(quarantine, {0o600}, True, True)
-    if payload != LEGACY:
+    if not is_known_legacy_payload(payload):
         fail(f"{quarantine_logical} is not the known recovery copy; resolve it manually")
 
 findings = unsafe_jobs(source)
@@ -14124,13 +14834,13 @@ if source_exists and quarantine_exists:
 if source_exists:
     ensure_quarantine_parent(quarantine)
     payload, current = read_root_file(source, {0o644}, True, True)
-    if payload != LEGACY or (
+    if not is_known_legacy_payload(payload) or (
         current.st_dev, current.st_ino, current.st_mtime_ns
     ) != (
         source_metadata.st_dev, source_metadata.st_ino, source_metadata.st_mtime_ns
     ):
         fail(f"{source_logical} changed before quarantine")
-    quarantine_legacy_inode(source, quarantine, current)
+    quarantine_legacy_inode(source, quarantine, current, payload)
     print(f"Quarantined the retired all-images Docker prune job at {quarantine_logical}.")
 
 if os.path.lexists(source):
@@ -14138,7 +14848,7 @@ if os.path.lexists(source):
 fixture_final_scan_hook(source)
 if os.path.lexists(quarantine):
     payload, _ = read_root_file(quarantine, {0o600}, True, True)
-    if payload != LEGACY:
+    if not is_known_legacy_payload(payload):
         fail(f"{quarantine_logical} failed final attestation")
 if unsafe_jobs(None):
     fail(
@@ -26469,6 +27179,130 @@ prepare_update_transaction() {
   UPDATE_TRANSACTION_TARGET_VERSION="${VERSION}"
 }
 
+dashboard_update_progress_for_transaction_phase() {
+  local phase="$1"
+  case "${phase}" in
+    boot_blocked)
+      dashboard_update_progress running 42 portal-transaction \
+        "Opening protected update transaction" \
+        "Step 7 of 13 · Portal boot is fenced before any live runtime mutation."
+      ;;
+    portal_quiesced)
+      dashboard_update_progress running 46 portal-quiesced \
+        "Portal stopped safely" \
+        "Step 7 of 13 · The existing Portal is quiesced and the rollback boundary is active."
+      ;;
+    runtime_snapshot_complete)
+      dashboard_update_progress running 50 rollback-snapshots \
+        "Taking recovery snapshots" \
+        "Step 8 of 13 · Runtime and environment recovery copies are sealed."
+      ;;
+    database_snapshot_complete)
+      dashboard_update_progress running 52 rollback-snapshots \
+        "Taking recovery snapshots" \
+        "Step 8 of 13 · The database recovery snapshot is verified."
+      ;;
+    node_modules_moved)
+      dashboard_update_progress running 55 rollback-snapshots \
+        "Recovery snapshots complete" \
+        "Step 8 of 13 · Runtime, database, routing, and dependency recovery points are sealed."
+      ;;
+    runtime_overlaid)
+      dashboard_update_progress running 62 runtime-install \
+        "Installing signed Portal runtime" \
+        "Step 9 of 13 · Signed runtime files were promoted; environment and database work follows."
+      ;;
+    dependencies_updated)
+      dashboard_update_progress running 66 runtime-install \
+        "Installing signed Portal runtime" \
+        "Step 9 of 13 · Preverified backend dependencies were promoted."
+      ;;
+    database_migrated)
+      dashboard_update_progress running 70 database-migration \
+        "Portal runtime and database installed" \
+        "Step 9 of 13 · Database migrations completed inside the rollback transaction."
+      ;;
+    candidate_started)
+      dashboard_update_progress running 76 candidate-verification \
+        "Starting private candidate" \
+        "Step 10 of 13 · The signed Portal is running on a private validation port."
+      ;;
+    candidate_verified)
+      dashboard_update_progress running 82 candidate-verification \
+        "Private candidate verified" \
+        "Step 10 of 13 · Exact version, schema, and mutation-free readiness checks passed."
+      ;;
+    provenance_committed)
+      dashboard_update_progress running 86 cutover-preparation \
+        "Preparing verified cutover" \
+        "Step 11 of 13 · Signed release provenance is committed."
+      ;;
+    canonical_started)
+      dashboard_update_progress running 91 portal-restarting \
+        "Updated Portal is restarting" \
+        "Step 12 of 13 · Reconnecting automatically while the canonical service starts."
+      ;;
+    canonical_verified)
+      dashboard_update_progress running 93 portal-restarting \
+        "Updated Portal verified" \
+        "Step 12 of 13 · The canonical service passed exact-version and readiness checks."
+      ;;
+    boot_state_restored)
+      dashboard_update_progress running 94 portal-restarting \
+        "Restoring Portal service state" \
+        "Step 12 of 13 · The prior enablement policy is restored before commit."
+      ;;
+    committed)
+      DASHBOARD_UPDATE_PORTAL_COMMITTED=true
+      dashboard_update_progress running 95 portal-committed \
+        "Updated Portal is online" \
+        "Step 12 of 13 · The signed Portal is durably committed; transaction cleanup and host integration remain."
+      ;;
+    recovery_pending|recovery_quiesce_pending)
+      dashboard_update_progress recovering \
+        "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery \
+        "Preparing automatic recovery" \
+        "The updater is preserving the recovery boundary and stopping partial runtime state."
+      ;;
+    recovery_quiesced)
+      dashboard_update_progress recovering \
+        "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery \
+        "Portal stopped for recovery" \
+        "The previous runtime, database, routing, and dependencies can now be restored safely."
+      ;;
+    recovery_database_restored)
+      dashboard_update_progress recovering \
+        "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery \
+        "Database recovery verified" \
+        "The pre-update database snapshot has been restored and attested."
+      ;;
+    recovery_runtime_restored)
+      dashboard_update_progress recovering \
+        "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery \
+        "Previous Portal files restored" \
+        "The pre-update runtime and environment are back in place."
+      ;;
+    recovery_dependencies_restored)
+      dashboard_update_progress recovering \
+        "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery \
+        "Previous dependencies restored" \
+        "The exact pre-update backend dependencies are back in place."
+      ;;
+    recovery_service_restored|recovery_verify_pending)
+      dashboard_update_progress recovering \
+        "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery \
+        "Verifying restored Portal" \
+        "The previous Portal is restarting for exact-version and health verification."
+      ;;
+    recovered)
+      dashboard_update_progress rolled_back \
+        "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" rolled-back \
+        "Previous Portal restored" \
+        "The previous Portal was restored, restarted, and verified after the update stopped."
+      ;;
+  esac
+}
+
 advance_update_transaction_phase() {
   local target="$1" expected_phase="$2" next_phase="$3"
   local generation transaction_id
@@ -26484,6 +27318,7 @@ advance_update_transaction_phase() {
     --phase "${next_phase}" >/dev/null || return 1
   UPDATE_TRANSACTION_ID="${transaction_id}"
   UPDATE_TRANSACTION_GENERATION="$((generation + 1))"
+  dashboard_update_progress_for_transaction_phase "${next_phase}"
 }
 
 cutover_update_transaction() {
@@ -26874,7 +27709,19 @@ complete_update_transaction() {
     || return 1
   finish_update_transaction "${target}" "${terminal_phase}" || return 1
   remove_update_transaction_artifacts journal \
-    "${transaction_id}" "${backup_dir}" "${stage_dir}" "${transaction_dir}"
+    "${transaction_id}" "${backup_dir}" "${stage_dir}" "${transaction_dir}" \
+    || return 1
+  if [[ "${terminal_phase}" == "recovered" ]]; then
+    dashboard_update_progress rolled_back \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" rolled-back \
+      "Previous Portal restored" \
+      "The previous Portal was restored, restarted, and verified after the update stopped."
+  elif [[ "${terminal_phase}" == "committed" ]]; then
+    DASHBOARD_UPDATE_PORTAL_COMMITTED=true
+    dashboard_update_progress running 95 portal-committed \
+      "Updated Portal is online" \
+      "Step 12 of 13 · The signed Portal is committed; final host integration is still running."
+  fi
 }
 
 complete_committed_update_transaction() {
@@ -27532,6 +28379,9 @@ do_update() {
   echo ""
   CURRENT_STEP="update"
 
+  dashboard_update_progress running 10 host-safety \
+    "Checking host safety" \
+    "Step 2 of 13 · Inspecting scheduled Docker cleanup without changing unrelated host jobs."
   converge_unsafe_docker_prune_automation \
     || fail "Unsafe scheduled Docker cleanup remains active. Review the guard details above, disable the unknown job or repair the legacy-file drift, and retry."
 
@@ -27541,6 +28391,10 @@ do_update() {
 
   node_version_meets_minimum \
     || fail "The running Portal uses a Node.js release outside ${OPENCLAW_NODE_ENGINE_RANGE}. Update Node.js on this host first; the Portal updater will not replace a shared runtime without a rollback boundary."
+
+  dashboard_update_progress running 16 portal-preflight \
+    "Validating current Portal and recovery prerequisites" \
+    "Step 3 of 13 · The installed runtime and shared Node.js boundary are attested."
 
   load_existing_telemetry_install_id
   ensure_telemetry_install_id
@@ -27606,6 +28460,10 @@ do_update() {
   ensure_media_toolchain \
     || fail "Animated GIF uploads require ffmpeg and ffprobe, but the updater could not repair the FFmpeg package while the existing Portal was still online. Check ${LOG_FILE}, repair apt, and retry."
 
+  dashboard_update_progress running 22 capacity-preflight \
+    "Checking database, disk, and recovery capacity" \
+    "Step 4 of 13 · Database ownership, disk reserves, and required host tools passed admission."
+
   local existing_install_profile
   existing_install_profile="$(read_env_value "${env_file}" "INSTALL_PROFILE" || true)"
   [[ -n "${existing_install_profile}" ]] && INSTALL_PROFILE="${existing_install_profile}"
@@ -27630,6 +28488,9 @@ do_update() {
   fi
 
   # Stage and prepare the candidate while the old Portal remains online.
+  dashboard_update_progress running 24 signed-release \
+    "Downloading and verifying signed release" \
+    "Step 5 of 13 · Fetching the versioned manifest, signature, and Portal artifact."
   UPDATE_RELEASE_STAGE_DIR="$(
     new_release_stage_dir "${UPDATE_TRANSACTION_ID}"
   )" || fail "Could not create the private update staging directory."
@@ -27638,6 +28499,9 @@ do_update() {
     UPDATE_RELEASE_STAGE_DIR=""
     fail "Update release signature, version, digest, or archive validation failed before downtime."
   fi
+  dashboard_update_progress running 30 signed-release \
+    "Signed release verified" \
+    "Step 5 of 13 · Manifest signature, release version, digest, and archive boundaries passed."
   local staged_update_dir="${UPDATE_RELEASE_STAGE_DIR}/portal"
   # Public 3.26.x installs never shipped build-essential; candidate native
   # module verification needs it. Install while the old Portal is still up.
@@ -27656,6 +28520,10 @@ do_update() {
     fail "The staged candidate could not be admitted for promotion, and not because of free disk. No receipt or downtime was started. Reason: $(update_disk_admission_last_detail). Details: ${LOG_FILE}."
   fi
 
+  dashboard_update_progress running 38 runtime-preparation \
+    "Preparing dependencies and project runtimes" \
+    "Step 6 of 13 · Backend dependencies and additive runtime images are staged and verified."
+
   recover_domain_from_caddyfile
   local existing_public_ip detected_public_ip
   existing_public_ip="$(read_env_value "${env_file}" "PUBLIC_IP" || true)"
@@ -27671,6 +28539,9 @@ do_update() {
   prepare_update_transaction \
     "${previous_portal_version}" "${staged_update_dir}" "${UPDATE_TRANSACTION_ID}" \
     || fail "The durable update transaction could not be created safely."
+  dashboard_update_progress running 40 portal-transaction \
+    "Opening protected update transaction" \
+    "Step 7 of 13 · A durable rollback journal now protects the live cutover."
   arm_update_transaction_traps
 
   advance_update_transaction_phase active prepared boot_block_pending \
@@ -27835,6 +28706,10 @@ do_update() {
     active provenance_committed cutover_pending \
     || fail "Could not record the canonical cutover decision."
 
+  dashboard_update_progress running 88 portal-cutover \
+    "Switching to the verified Portal" \
+    "Step 11 of 13 · The private candidate passed; publishing the durable cutover decision now."
+
   # The receipt move is the durable commit decision. Before it, recovery rolls
   # back. After it, recovery finishes the already verified forward cutover.
   cutover_update_transaction cutover_pending \
@@ -27850,6 +28725,10 @@ do_update() {
 
   # Host-wide tools and optional runtimes stay outside the Portal transaction.
   # The new Portal is already loaded, schema-ready, and provenance-attested.
+  DASHBOARD_UPDATE_PORTAL_COMMITTED=true
+  dashboard_update_progress running 97 postflight \
+    "Completing host services and cleanup" \
+    "Step 13 of 13 · Portal is online while host integration and optional runtimes converge."
   update_dependencies
   telemetry_event "deps_updated"
   info "Checking Remote Desktop..."
@@ -27865,6 +28744,19 @@ do_update() {
   if command -v openclaw &>/dev/null; then
     openclaw devices approve --latest >> "$LOG_FILE" 2>&1 || true
   fi
+
+  # This proof belongs after every post-commit host mutation. The outer
+  # systemd finalizer accepts the 99% checkpoint as its success prerequisite,
+  # so do not publish that checkpoint from a generic, spoofable health body.
+  # Reuse the authenticated update-ready contract, systemd activity/PID proof,
+  # exact version, schema, and canonical-route checks that guarded cutover.
+  verify_canonical_portal_for_transaction \
+    "${VERSION}" "${PORTAL_UPDATE_PROBE_TOKEN}" \
+    || fail "Final authenticated Portal readiness verification failed after host integration."
+
+  dashboard_update_progress running 99 postflight \
+    "Finalizing update receipt" \
+    "Step 13 of 13 · Host integration and authenticated exact-version health verification passed."
 
   echo ""
   echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"

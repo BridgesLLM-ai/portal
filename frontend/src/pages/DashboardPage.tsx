@@ -16,9 +16,19 @@ import TypedConfirmationDialog from '../components/TypedConfirmationDialog';
 import {
   createFreshBackupForUpdate,
   describeUpdateBackup,
-  waitForExpectedPortalVersion,
   type PortalUpdatePreparation,
 } from '../utils/updatePreparation';
+import {
+  isPortalUpdateOperationId,
+  monitorPortalSelfUpdate,
+  parsePortalSelfUpdateProgress,
+  type PortalSelfUpdateProgress,
+} from '../utils/portalUpdateProgress';
+import {
+  forgetPortalUpdateCheckpoint,
+  PORTAL_UPDATE_OPERATION_SESSION_KEY,
+  rememberPortalUpdateCheckpoint,
+} from '../utils/portalUpdateSession';
 import {
   Cpu, HardDrive,
   AlertTriangle, MemoryStick,
@@ -73,6 +83,92 @@ const DASHBOARD_MAINTENANCE_MAX_POLL_DELAY_MS = 8_000;
 const DASHBOARD_GATEWAY_FORCE_PROBE_MAX_ATTEMPTS = 3;
 const DASHBOARD_GATEWAY_FORCE_PROBE_INITIAL_DELAY_MS = 1_600;
 const DASHBOARD_GATEWAY_FORCE_PROBE_MAX_DELAY_MS = 5_000;
+const PORTAL_UPDATE_VERSION_SESSION_KEY = 'dashboard-self-update-expected-version';
+const PORTAL_UPDATE_COLD_DISCOVERY_DELAY_MS = 5_000;
+const PORTAL_UPDATE_COLD_DISCOVERY_MAX_DELAY_MS = 30_000;
+
+type PortalUpdateConnectionState = 'connected' | 'reconnecting';
+type PortalUpdateAttachmentFence = {
+  requireActiveReceipt?: boolean;
+  /** Current receipt observed immediately before POST; undefined means unreadable. */
+  baselineOperationId?: string | null;
+};
+
+function portalUpdateProgressIsActive(progress: PortalSelfUpdateProgress | null): boolean {
+  return ['starting', 'running', 'recovering'].includes(String(progress?.status || ''));
+}
+
+function portalUpdateProgressIsTerminal(progress: PortalSelfUpdateProgress | null): boolean {
+  return [
+    'succeeded',
+    'failed',
+    'rolled_back',
+    'updated_with_errors',
+    'recovery_required',
+  ].includes(String(progress?.status || ''));
+}
+
+function portalUpdateProgressBlocksRetry(progress: PortalSelfUpdateProgress | null): boolean {
+  if (typeof progress?.admissionBlocked === 'boolean') return progress.admissionBlocked;
+  return [
+    'starting',
+    'running',
+    'recovering',
+    'succeeded',
+    'updated_with_errors',
+    'recovery_required',
+  ].includes(String(progress?.status || ''));
+}
+
+function rememberPortalUpdateOperation(operationId: string | null | undefined): void {
+  if (!isPortalUpdateOperationId(operationId)) return;
+  try {
+    sessionStorage.setItem(PORTAL_UPDATE_OPERATION_SESSION_KEY, operationId);
+  } catch {}
+}
+
+function rememberedPortalUpdateOperation(): string | undefined {
+  try {
+    const value = sessionStorage.getItem(PORTAL_UPDATE_OPERATION_SESSION_KEY) || '';
+    return isPortalUpdateOperationId(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function forgetPortalUpdateOperation(): void {
+  try {
+    sessionStorage.removeItem(PORTAL_UPDATE_OPERATION_SESSION_KEY);
+  } catch {}
+}
+
+function rememberPortalUpdateVersion(version: string | null | undefined): void {
+  if (!version || !/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/.test(version)) return;
+  try {
+    sessionStorage.setItem(PORTAL_UPDATE_VERSION_SESSION_KEY, version);
+  } catch {}
+}
+
+function rememberedPortalUpdateVersion(): string | undefined {
+  try {
+    const value = sessionStorage.getItem(PORTAL_UPDATE_VERSION_SESSION_KEY) || '';
+    return /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/.test(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function forgetPortalUpdateVersion(): void {
+  try {
+    sessionStorage.removeItem(PORTAL_UPDATE_VERSION_SESSION_KEY);
+  } catch {}
+}
+
+function forgetPortalUpdateTracking(): void {
+  forgetPortalUpdateOperation();
+  forgetPortalUpdateVersion();
+  forgetPortalUpdateCheckpoint();
+}
 
 type RenderableMaintenanceStatus = MaintenanceStatus & {
   host: NonNullable<MaintenanceStatus['host']>;
@@ -353,6 +449,9 @@ export default function DashboardPage() {
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
   const [updatePlan, setUpdatePlan] = useState<PortalUpdatePlan>('create-backup');
+  const [updateProgress, setUpdateProgress] = useState<PortalSelfUpdateProgress | null>(null);
+  const [updateConnectionState, setUpdateConnectionState] = useState<PortalUpdateConnectionState>('connected');
+  const [updateProgressAmbiguous, setUpdateProgressAmbiguous] = useState(false);
   const [openClawStatus, setOpenClawStatus] = useState<'checking' | 'connected' | 'misconfigured' | 'offline'>('checking');
   const [openClawIssues, setOpenClawIssues] = useState<string[]>([]);
   const [openClawVersion, setOpenClawVersion] = useState<OpenClawVersionStatus | null>(null);
@@ -406,6 +505,8 @@ export default function DashboardPage() {
   const socketRef = useRef<Socket | null>(null);
   const alertSocketRef = useRef<Socket | null>(null);
   const updateSubmissionRef = useRef(false);
+  const updateInteractionLockRef = useRef(false);
+  const updateMonitorGenerationRef = useRef(0);
   const updateNavigationReleaseRef = useRef<(() => void) | null>(null);
   const updateNavigationGuardRef = useRef<{
     url: string;
@@ -417,12 +518,14 @@ export default function DashboardPage() {
   const maintenancePollBudgetRef = useRef<MaintenancePollBudget | null>(null);
 
   const releaseUpdateNavigationLock = useCallback(() => {
+    updateInteractionLockRef.current = false;
     updateNavigationReleaseRef.current?.();
     updateNavigationReleaseRef.current = null;
     updateNavigationGuardRef.current = null;
   }, []);
 
   const acquireUpdateNavigationLock = useCallback(() => {
+    updateInteractionLockRef.current = true;
     if (updateNavigationReleaseRef.current) return;
     const originalPush = routerNavigator?.push;
     const originalReplace = routerNavigator?.replace;
@@ -462,18 +565,18 @@ export default function DashboardPage() {
       );
     };
     const preventUpdateUnload = (event: BeforeUnloadEvent) => {
-      if (!updateSubmissionRef.current) return;
+      if (!updateInteractionLockRef.current) return;
       event.preventDefault();
       event.returnValue = '';
     };
     const preventOutsideUpdateInteraction = (event: Event) => {
-      if (!updateSubmissionRef.current || ownsUpdateInteraction(event.target)) return;
+      if (!updateInteractionLockRef.current || ownsUpdateInteraction(event.target)) return;
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
     };
     const preventHistoryTraversal = (event: PopStateEvent) => {
-      if (!updateSubmissionRef.current) return;
+      if (!updateInteractionLockRef.current) return;
       const guard = updateNavigationGuardRef.current;
       if (!guard) return;
       event.preventDefault();
@@ -984,6 +1087,44 @@ export default function DashboardPage() {
   const updateBackup = updateStatus?.preparation?.backup;
   const updateBackupDescription = useMemo(() => describeUpdateBackup(updateBackup), [updateBackup]);
   const updateBackupRunning = updateBackup?.state === 'running';
+  const updateProgressActive = portalUpdateProgressIsActive(updateProgress);
+  const updateProgressTerminal = portalUpdateProgressIsTerminal(updateProgress);
+  const updateRetryBlocked = updateProgressAmbiguous || portalUpdateProgressBlocksRetry(updateProgress);
+  const updateProgressStatus = String(updateProgress?.status || '');
+  const updateProgressDanger = ['failed', 'recovery_required'].includes(updateProgressStatus);
+  const updateProgressAttention = ['rolled_back', 'updated_with_errors'].includes(updateProgressStatus);
+  const updateProgressRetryable = ['failed', 'rolled_back'].includes(updateProgressStatus);
+  const showUpdateReviewControls = !updateInProgress && !updateRetryBlocked;
+  const updateTargetVersion = updateProgress?.expectedVersion || updateStatus?.latest || null;
+  const updateSourceVersion = updateProgress?.previousVersion || updateStatus?.current || null;
+  const updateLogHref = updateProgress?.logAvailable && updateProgress.operationId
+    ? `/api/admin/self-update/log?operationId=${encodeURIComponent(updateProgress.operationId)}`
+    : null;
+  const showUpdateConfirmAction = !updateProgressAmbiguous
+    && !updateProgressActive
+    && (!updateProgressTerminal || updateProgressRetryable);
+  const updateDialogTitle = updateProgressAmbiguous
+    ? 'Portal update status is unconfirmed'
+    : updateProgressActive
+      ? `Updating Portal${updateTargetVersion ? ` to v${updateTargetVersion}` : ''}`
+      : updateProgressStatus === 'succeeded'
+      ? `Portal${updateTargetVersion ? ` v${updateTargetVersion}` : ''} update complete`
+      : updateProgressStatus === 'rolled_back'
+        ? 'Portal update rolled back'
+        : updateProgressStatus === 'updated_with_errors'
+          ? 'Portal updated with follow-up required'
+          : updateProgressStatus === 'recovery_required'
+            ? 'Portal update needs recovery'
+            : updateProgressStatus === 'failed'
+              ? 'Portal update failed'
+              : `Install Portal ${updateTargetVersion ? `v${updateTargetVersion}` : 'update'}`;
+  const updateDialogDescription = updateProgressAmbiguous
+    ? 'Portal could not verify a terminal updater receipt. A second update is disabled until the existing operation is confirmed.'
+    : updateProgressActive
+      ? 'The signed updater is running on the server. Durable checkpoints continue through Portal restarts, and live feedback reconnects automatically.'
+      : updateProgressTerminal
+      ? 'This is the terminal result recorded by the server-owned updater. Review it before closing or taking another action.'
+      : 'Review the release and recovery plan, then confirm the owner-only update.';
   const visibleMaintenanceIssues = maintenanceStatus?.issues?.slice(0, 5) || [];
   const maintenanceSignature = useMemo(() => (
     maintenanceStatus ? maintenanceDismissSignature(maintenanceStatus) : ''
@@ -1052,8 +1193,112 @@ export default function DashboardPage() {
     }
   }, [canReconnectGateway, fetchData]);
 
+  const readPortalUpdateProgress = useCallback(async (operationId?: string): Promise<unknown> => {
+    const query = operationId ? `?operationId=${encodeURIComponent(operationId)}` : '';
+    const { data } = await client.get(`/admin/self-update/progress${query}`, { _silent: true } as any);
+    return data;
+  }, []);
+
+  const trackPortalSelfUpdate = useCallback(async (
+    expectedVersion: string,
+    operationId?: string,
+    attachmentFence?: PortalUpdateAttachmentFence,
+  ): Promise<void> => {
+    const generation = ++updateMonitorGenerationRef.current;
+    rememberPortalUpdateVersion(expectedVersion);
+    updateSubmissionRef.current = true;
+    setUpdateInProgress(true);
+    setUpdateProgressAmbiguous(false);
+    setUpdateDialogOpen(true);
+    // A POST-returned operation ID is the durable admission boundary. Keep the
+    // global interaction lock only through backup + admission; the server job
+    // continues independently if the owner navigates away.
+    if (operationId) releaseUpdateNavigationLock();
+    try {
+      const readAttachedProgress = async (requestedOperationId?: string): Promise<unknown> => {
+        const raw = await readPortalUpdateProgress(requestedOperationId);
+        if (!attachmentFence?.requireActiveReceipt || operationId || requestedOperationId) return raw;
+        const candidate = parsePortalSelfUpdateProgress(raw);
+        if (!candidate || candidate.status === 'idle') return raw;
+        // A legacy/lost response without an operation ID has no direct
+        // admission identity. An active same-target receipt is safe to pin.
+        // A terminal receipt is safe only when its ID differs from the current
+        // receipt observed immediately before POST, proving this attempt made
+        // durable progress before the response was lost.
+        const changedAfterAdmission = attachmentFence.baselineOperationId !== undefined
+          && candidate.operationId !== attachmentFence.baselineOperationId;
+        if (candidate.expectedVersion !== expectedVersion
+          || (!portalUpdateProgressIsActive(candidate)
+            && !(changedAfterAdmission && portalUpdateProgressIsTerminal(candidate)))) return null;
+        return raw;
+      };
+      const result = await monitorPortalSelfUpdate(expectedVersion, operationId, {
+        readProgress: readAttachedProgress,
+        readPortalVersion: async () => {
+          const response = await fetch('/health', { cache: 'no-store' });
+          if (!response.ok) return null;
+          return response.json().catch(() => null);
+        },
+      }, {
+        onProgress: (progress) => {
+          if (updateMonitorGenerationRef.current !== generation) return;
+          setUpdateProgress(progress);
+          setUpdateMessage(progress.detail || progress.label);
+          rememberPortalUpdateOperation(progress.operationId);
+          rememberPortalUpdateCheckpoint(progress);
+          releaseUpdateNavigationLock();
+        },
+        onConnectionChange: (connection) => {
+          if (updateMonitorGenerationRef.current !== generation) return;
+          setUpdateConnectionState(connection);
+        },
+        delay: (milliseconds) => new Promise<void>((resolve, reject) => {
+          window.setTimeout(() => {
+            if (updateMonitorGenerationRef.current === generation) resolve();
+            else reject(new Error('Portal update monitor detached from the Dashboard.'));
+          }, milliseconds);
+        }),
+      });
+      if (updateMonitorGenerationRef.current !== generation) return;
+
+      if (result.progress) {
+        setUpdateProgress(result.progress);
+        rememberPortalUpdateOperation(result.progress.operationId);
+        rememberPortalUpdateCheckpoint(result.progress);
+      }
+      // Exact health is corroboration, not completion authority. A target
+      // version alone can appear while postflight host work is still running.
+      if (result.outcome === 'succeeded'
+        && result.progress
+        && String(result.progress.status) === 'succeeded') {
+        setUpdateConnectionState('connected');
+        setUpdateMessage(result.progress.detail || `Portal v${expectedVersion} completed the signed update.`);
+        setUpdateProgressAmbiguous(false);
+        setUpdateDialogOpen(true);
+      } else if (result.outcome === 'failed' && result.progress) {
+        setUpdateConnectionState('connected');
+        setUpdateMessage(result.progress.detail || result.error);
+        setUpdateProgressAmbiguous(false);
+        setUpdateDialogOpen(true);
+      } else {
+        setUpdateMessage('Portal could not obtain a terminal updater receipt. Do not start another update until durable progress can be confirmed.');
+        setUpdateProgressAmbiguous(true);
+      }
+    } catch {
+      if (updateMonitorGenerationRef.current !== generation) return;
+      setUpdateMessage('Portal lost contact with the durable updater receipt. Do not start another update until progress can be confirmed.');
+      setUpdateProgressAmbiguous(true);
+      setUpdateConnectionState('reconnecting');
+    }
+
+    if (updateMonitorGenerationRef.current !== generation) return;
+    updateSubmissionRef.current = false;
+    setUpdateInProgress(false);
+    releaseUpdateNavigationLock();
+  }, [readPortalUpdateProgress, releaseUpdateNavigationLock]);
+
   const runSelfUpdate = useCallback(async (confirmation: string) => {
-    if (!canRunSelfUpdate || updateSubmissionRef.current) return;
+    if (!canRunSelfUpdate || updateSubmissionRef.current || updateRetryBlocked) return;
     const expectedVersion = String(updateStatus?.latest || '').trim();
     if (!expectedVersion) {
       setUpdateMessage('The reviewed update version is unavailable. Refresh update status before retrying.');
@@ -1061,8 +1306,14 @@ export default function DashboardPage() {
     }
     updateSubmissionRef.current = true;
     acquireUpdateNavigationLock();
+    let updateAdmissionAttempted = false;
+    let updateAdmissionFence: PortalUpdateAttachmentFence | undefined;
+    const previouslyRememberedVersion = rememberedPortalUpdateVersion();
     try {
       setUpdateInProgress(true);
+      setUpdateProgress(null);
+      setUpdateProgressAmbiguous(false);
+      setUpdateConnectionState('connected');
       let backupDecision: 'use-current' | 'proceed-without-fresh' = updatePlan === 'skip-backup'
         ? 'proceed-without-fresh'
         : 'use-current';
@@ -1091,31 +1342,35 @@ export default function DashboardPage() {
       setUpdateMessage(backupDecision === 'use-current'
         ? 'Verifying the recent backup and starting the reviewed signed release…'
         : 'Backup warning acknowledged. Starting the signed updater…');
+      let baselineOperationId: string | null | undefined;
+      try {
+        const baseline = parsePortalSelfUpdateProgress(await readPortalUpdateProgress());
+        baselineOperationId = baseline?.operationId ?? null;
+      } catch {
+        // Active receipts can still be safely attached without a baseline;
+        // only a terminal-before-first-read remains deliberately ambiguous.
+      }
+      updateAdmissionFence = { requireActiveReceipt: true, baselineOperationId };
+      // Once admission begins, no browser retry path may retain the identity
+      // or checkpoint of an older terminal operation. A lost response will
+      // attach through the fenced current receipt instead.
+      forgetPortalUpdateOperation();
+      forgetPortalUpdateCheckpoint();
+      rememberPortalUpdateVersion(expectedVersion);
+      updateAdmissionAttempted = true;
       const { data } = await client.post('/admin/self-update', {
         confirmation,
         backupDecision,
         expectedVersion,
       });
-      const logFile = data?.logFile;
-      if (logFile) {
-        try {
-          await client.get(`/admin/self-update/log?file=${encodeURIComponent(logFile)}`, { _silent: true } as any);
-        } catch {}
-      }
-      const installedExpectedVersion = await waitForExpectedPortalVersion(expectedVersion);
-      if (installedExpectedVersion) {
-        setUpdateMessage('Update complete. Refreshing…');
-        updateSubmissionRef.current = false;
-        setUpdateInProgress(false);
-        releaseUpdateNavigationLock();
-        window.location.reload();
-        return;
-      }
-
-      setUpdateMessage('The updater did not report the new version within 10 minutes. Check the update log before retrying.');
-      updateSubmissionRef.current = false;
-      setUpdateInProgress(false);
-      releaseUpdateNavigationLock();
+      const operationId = typeof data?.operationId === 'string' && /^[a-f0-9]{32}$/.test(data.operationId)
+        ? data.operationId
+        : undefined;
+      rememberPortalUpdateOperation(operationId);
+      setUpdateMessage(operationId
+        ? 'Updater accepted. Waiting for the first durable installer checkpoint…'
+        : 'Updater accepted. Locating its durable installer receipt…');
+      await trackPortalSelfUpdate(expectedVersion, operationId, operationId ? undefined : updateAdmissionFence);
     } catch (err: any) {
       const serverPreparation = err?.response?.data?.preparation as PortalUpdatePreparation | undefined;
       if (serverPreparation) {
@@ -1123,31 +1378,178 @@ export default function DashboardPage() {
       }
       const responseLost = !err?.response;
       const updaterAlreadyRunning = err?.response?.data?.code === 'PORTAL_UPDATE_BUSY';
-      if (responseLost || updaterAlreadyRunning) {
-        setUpdateMessage(responseLost
-          ? 'The updater response was interrupted. Portal is checking the installed version before allowing another attempt…'
-          : 'Another signed update is already running. Portal is waiting for its installed-version proof…');
-        const installedExpectedVersion = await waitForExpectedPortalVersion(expectedVersion);
-        if (installedExpectedVersion) {
-          setUpdateMessage('Update complete. Refreshing…');
-          updateSubmissionRef.current = false;
-          setUpdateInProgress(false);
-          releaseUpdateNavigationLock();
-          window.location.reload();
-          return;
+      const priorUpdateNeedsAttention = err?.response?.data?.code === 'PORTAL_UPDATE_ATTENTION_REQUIRED';
+      if (priorUpdateNeedsAttention) {
+        try {
+          const prior = parsePortalSelfUpdateProgress(await readPortalUpdateProgress());
+          if (prior && ['updated_with_errors', 'recovery_required'].includes(prior.status)) {
+            setUpdateProgress(prior);
+            rememberPortalUpdateCheckpoint(prior);
+            setUpdateMessage(prior.detail || prior.label);
+            setUpdateProgressAmbiguous(false);
+            setUpdateConnectionState('connected');
+            setUpdateDialogOpen(true);
+            rememberPortalUpdateOperation(prior.operationId);
+            rememberPortalUpdateVersion(prior.expectedVersion);
+            updateSubmissionRef.current = false;
+            setUpdateInProgress(false);
+            releaseUpdateNavigationLock();
+            return;
+          }
+        } catch {
+          // The durable attention receipt remains authoritative even if this
+          // request cannot read it yet. Keep the second update blocked.
         }
-        setUpdateMessage('Portal could not confirm the reviewed version within 10 minutes. Check the updater log and refresh update status before retrying.');
+        setUpdateMessage('A prior update still needs operator attention, but its durable receipt could not be read. Do not start another update.');
+        setUpdateProgressAmbiguous(true);
+        setUpdateConnectionState('reconnecting');
         updateSubmissionRef.current = false;
         setUpdateInProgress(false);
         releaseUpdateNavigationLock();
         return;
       }
+      if ((responseLost && updateAdmissionAttempted) || updaterAlreadyRunning) {
+        setUpdateMessage(responseLost
+          ? 'The admission response was interrupted. Reattaching to the server-owned updater before allowing another attempt…'
+          : 'Another signed update is already running. Reattaching to its durable progress…');
+        const responseOperationId = typeof err?.response?.data?.operationId === 'string'
+          && /^[a-f0-9]{32}$/.test(err.response.data.operationId)
+          ? err.response.data.operationId
+          : undefined;
+        rememberPortalUpdateOperation(responseOperationId);
+        await trackPortalSelfUpdate(
+          expectedVersion,
+          responseOperationId,
+          responseOperationId
+            ? undefined
+            : responseLost
+              ? updateAdmissionFence
+              : { requireActiveReceipt: true },
+        );
+        return;
+      }
+      if (previouslyRememberedVersion) rememberPortalUpdateVersion(previouslyRememberedVersion);
+      else forgetPortalUpdateVersion();
       setUpdateMessage(err?.response?.data?.error || err?.message || 'The update was not started. Check the update log before retrying.');
       updateSubmissionRef.current = false;
       setUpdateInProgress(false);
       releaseUpdateNavigationLock();
     }
-  }, [acquireUpdateNavigationLock, canRunSelfUpdate, releaseUpdateNavigationLock, updatePlan, updateStatus?.latest]);
+  }, [
+    acquireUpdateNavigationLock,
+    canRunSelfUpdate,
+    readPortalUpdateProgress,
+    releaseUpdateNavigationLock,
+    trackPortalSelfUpdate,
+    updatePlan,
+    updateRetryBlocked,
+    updateStatus?.latest,
+  ]);
+
+  useEffect(() => {
+    if (!canRunSelfUpdate) return;
+    let cancelled = false;
+    let coldRetryTimer: number | null = null;
+    let releaseColdRetry: (() => void) | null = null;
+    const waitForColdRetry = (delayMs: number) => new Promise<void>((resolve) => {
+      releaseColdRetry = resolve;
+      coldRetryTimer = window.setTimeout(() => {
+        coldRetryTimer = null;
+        releaseColdRetry = null;
+        resolve();
+      }, delayMs);
+    });
+    const reattach = async () => {
+      const rememberedOperationId = rememberedPortalUpdateOperation();
+      const rememberedExpectedVersion = rememberedPortalUpdateVersion();
+      const monitorRememberedOperation = async (): Promise<boolean> => {
+        if (!rememberedExpectedVersion || cancelled) return false;
+        setUpdateMessage('Reconnecting to the server-owned updater and its durable progress receipt…');
+        setUpdateConnectionState('reconnecting');
+        setUpdateDialogOpen(true);
+        await trackPortalSelfUpdate(
+          rememberedExpectedVersion,
+          rememberedOperationId,
+          rememberedOperationId
+            ? undefined
+            : { requireActiveReceipt: true },
+        );
+        return true;
+      };
+      let parsed: PortalSelfUpdateProgress | null = null;
+      try {
+        parsed = parsePortalSelfUpdateProgress(await readPortalUpdateProgress(rememberedOperationId));
+      } catch {
+        // A cold mount can land during the service restart. The operation ID
+        // and target version are session-owned, so keep polling that exact
+        // operation instead of treating the temporary outage as a fresh page.
+        if (await monitorRememberedOperation()) return;
+        // A brand-new tab has no session identity to pin. During the
+        // intentional Portal restart, retry only the owner current receipt at
+        // a slow bounded cadence; never POST and never lock navigation. Once
+        // the backend returns, attach only a live or blocking-attention state.
+        let coldAttempt = 0;
+        while (!cancelled) {
+          const retryDelay = Math.min(
+            PORTAL_UPDATE_COLD_DISCOVERY_DELAY_MS * (2 ** Math.min(coldAttempt, 3)),
+            PORTAL_UPDATE_COLD_DISCOVERY_MAX_DELAY_MS,
+          );
+          coldAttempt += 1;
+          await waitForColdRetry(retryDelay);
+          if (cancelled) return;
+          try {
+            parsed = parsePortalSelfUpdateProgress(await readPortalUpdateProgress());
+          } catch {
+            continue;
+          }
+          if (!parsed || parsed.status === 'idle') return;
+          if (portalUpdateProgressIsActive(parsed)
+            || ['updated_with_errors', 'recovery_required'].includes(parsed.status)) break;
+          return;
+        }
+        if (!parsed) return;
+      }
+      if (cancelled) return;
+      if (!parsed || parsed.status === 'idle') {
+        await monitorRememberedOperation();
+        return;
+      }
+      // Without a session identity, current progress is only actionable while
+      // it is active. This avoids reopening an old terminal receipt on every
+      // ordinary Dashboard visit.
+      if (!rememberedOperationId
+        && !portalUpdateProgressIsActive(parsed)
+        && !['updated_with_errors', 'recovery_required'].includes(parsed.status)) {
+        await monitorRememberedOperation();
+        return;
+      }
+      setUpdateProgress(parsed);
+      rememberPortalUpdateCheckpoint(parsed);
+      setUpdateMessage(parsed.detail || parsed.label);
+      setUpdateDialogOpen(true);
+      rememberPortalUpdateOperation(parsed.operationId);
+      rememberPortalUpdateVersion(parsed.expectedVersion);
+      if (portalUpdateProgressIsActive(parsed) && parsed.expectedVersion) {
+        await trackPortalSelfUpdate(parsed.expectedVersion, parsed.operationId || undefined);
+        return;
+      }
+      setUpdateInProgress(false);
+      setUpdateProgressAmbiguous(false);
+      setUpdateConnectionState('connected');
+    };
+    void reattach();
+    return () => {
+      cancelled = true;
+      if (coldRetryTimer !== null) window.clearTimeout(coldRetryTimer);
+      coldRetryTimer = null;
+      releaseColdRetry?.();
+      releaseColdRetry = null;
+    };
+  }, [canRunSelfUpdate, readPortalUpdateProgress, trackPortalSelfUpdate]);
+
+  useEffect(() => () => {
+    updateMonitorGenerationRef.current += 1;
+  }, []);
 
   return (
     <motion.div
@@ -1183,6 +1585,66 @@ export default function DashboardPage() {
         </div>
       </div>
 
+      {canRunSelfUpdate
+        && !showUpdateBanner
+        && !updateDialogOpen
+        && (updateProgress || updateProgressAmbiguous) && (
+        <motion.div
+          initial={{ opacity: 0, y: -8 }}
+          animate={{ opacity: 1, y: 0 }}
+          role={updateProgressAmbiguous || updateProgressDanger || updateProgressAttention ? 'alert' : 'status'}
+          className={`rounded-2xl border p-4 ${
+            updateProgressAmbiguous || updateProgressDanger
+              ? 'border-red-400/30 bg-red-500/10'
+              : updateProgressAttention
+                ? 'border-amber-400/30 bg-amber-500/10'
+                : 'border-cyan-400/25 bg-cyan-500/10'
+          }`}
+        >
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 items-start gap-3">
+              {updateProgressActive ? (
+                <Loader2 size={18} className="mt-0.5 shrink-0 animate-spin motion-reduce:animate-none text-cyan-300" aria-hidden="true" />
+              ) : updateProgressAmbiguous || updateProgressDanger || updateProgressAttention ? (
+                <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-300" aria-hidden="true" />
+              ) : (
+                <CheckCircle2 size={18} className="mt-0.5 shrink-0 text-emerald-400" aria-hidden="true" />
+              )}
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-theme-text">
+                  {updateProgressAmbiguous ? 'Portal update status is unconfirmed' : updateProgress?.label}
+                </p>
+                <p className="mt-0.5 text-xs leading-5 text-theme-text-muted">
+                  {updateProgressAmbiguous ? updateMessage : updateProgress?.detail}
+                </p>
+                {updateProgressActive && updateProgress ? (
+                  <div
+                    role="progressbar"
+                    aria-label="Portal update progress"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={updateProgress.percent}
+                    className="mt-2 h-1.5 w-full max-w-xl overflow-hidden rounded-full bg-theme-border/70"
+                  >
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400 transition-[width] duration-500 motion-reduce:transition-none"
+                      style={{ width: `${updateProgress.percent}%` }}
+                    />
+                  </div>
+                ) : null}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setUpdateDialogOpen(true)}
+              className="min-h-[44px] shrink-0 rounded-xl border border-theme-border bg-theme-surface px-4 py-2 text-sm font-semibold text-theme-text transition hover:bg-theme-surface-hover"
+            >
+              {updateProgressActive ? 'View update progress' : 'Review update result'}
+            </button>
+          </div>
+        </motion.div>
+      )}
+
       {canViewOperatorDiagnostics && showUpdateBanner && updateStatus?.latest && (
         <motion.div
           initial={{ opacity: 0, y: -12 }}
@@ -1206,7 +1668,37 @@ export default function DashboardPage() {
                   ? 'Install the latest portal bundle to pick up fixes and improvements.'
                   : 'A newer portal bundle is available. Only the owner can install updates from this dashboard.'}
               </p>
-              {canRunSelfUpdate && (
+              {canRunSelfUpdate && updateProgressActive && !updateDialogOpen ? (
+                <div className="mt-3 max-w-2xl rounded-xl border border-cyan-400/25 bg-theme-surface px-3 py-2.5" role="status">
+                  <div className="flex items-start gap-2.5">
+                    {updateConnectionState === 'reconnecting' ? (
+                      <RefreshCw size={16} className="mt-0.5 flex-none animate-spin motion-reduce:animate-none text-amber-300" aria-hidden="true" />
+                    ) : (
+                      <Loader2 size={16} className="mt-0.5 flex-none animate-spin motion-reduce:animate-none text-cyan-300" aria-hidden="true" />
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="truncate text-xs font-semibold text-theme-text">{updateProgress?.label}</p>
+                        <span className="shrink-0 text-[11px] font-semibold text-cyan-200 tabular-nums">{updateProgress?.percent}%</span>
+                      </div>
+                      <p className="mt-0.5 text-xs leading-5 text-theme-text-muted">{updateProgress?.detail}</p>
+                      <div
+                        role="progressbar"
+                        aria-label="Portal update progress"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={updateProgress?.percent}
+                        className="mt-2 h-1.5 overflow-hidden rounded-full bg-theme-border/70"
+                      >
+                        <div
+                          className="h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400 transition-[width] duration-500 motion-reduce:transition-none"
+                          style={{ width: `${updateProgress?.percent || 0}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : canRunSelfUpdate && !updateProgressActive ? (
                 <div className={`mt-3 flex max-w-2xl items-start gap-2.5 rounded-xl border bg-theme-surface px-3 py-2.5 ${
                   updateBackupDescription.tone === 'good'
                     ? 'border-emerald-400/25'
@@ -1226,8 +1718,8 @@ export default function DashboardPage() {
                     <p className="mt-0.5 text-xs leading-5 text-theme-text-muted">{updateBackupDescription.detail}</p>
                   </div>
                 </div>
-              )}
-              {canRunSelfUpdate && updateMessage && !updateDialogOpen && (
+              ) : null}
+              {canRunSelfUpdate && updateMessage && !updateDialogOpen && !updateProgressActive && (
                 <p className="mt-2 text-sm text-theme-text">{updateMessage}</p>
               )}
               </div>
@@ -1250,15 +1742,27 @@ export default function DashboardPage() {
                 {canRunSelfUpdate ? (
                   <button
                     onClick={() => {
-                      setUpdatePlan(updateBackup?.state === 'fresh' ? 'use-current' : 'create-backup');
+                      if (!updateProgress && !updateProgressAmbiguous) {
+                        setUpdatePlan(updateBackup?.state === 'fresh' ? 'use-current' : 'create-backup');
+                        setUpdateMessage(null);
+                      }
                       setUpdateDialogOpen(true);
-                      setUpdateMessage(null);
                     }}
-                    disabled={updateDialogOpen || updateInProgress || updateBackupRunning}
+                    disabled={updateDialogOpen || updateBackupRunning}
                     className="inline-flex items-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/80 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-70"
                   >
-                    {updateBackupRunning && !updateDialogOpen ? <Loader2 size={16} className="animate-spin" /> : null}
-                    {updateDialogOpen ? 'Update dialog open' : updateBackupRunning ? 'Backup running' : 'Review & update'}
+                    {(updateBackupRunning || updateProgressActive) && !updateDialogOpen
+                      ? <Loader2 size={16} className="animate-spin motion-reduce:animate-none" />
+                      : null}
+                    {updateDialogOpen
+                      ? 'Update dialog open'
+                      : updateProgressActive
+                        ? 'View update progress'
+                        : updateProgressTerminal || updateProgressAmbiguous
+                          ? updateProgressRetryable ? 'Review & retry' : 'Review update status'
+                          : updateBackupRunning
+                            ? 'Backup running'
+                            : 'Review & update'}
                   </button>
                 ) : (
                   <div className="inline-flex items-center rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-300">
@@ -1267,7 +1771,7 @@ export default function DashboardPage() {
                 )}
                 <button
                   onClick={dismissUpdateBanner}
-                  disabled={updateInProgress}
+                  disabled={updateInProgress || updateProgressAmbiguous || updateProgressStatus === 'recovery_required'}
                   className="rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
                 >
                   Dismiss
@@ -1736,20 +2240,51 @@ export default function DashboardPage() {
       </motion.div>
 
       <TypedConfirmationDialog
+        key={updateProgress?.operationId || 'portal-update-review'}
         open={updateDialogOpen}
-        title={`Install Portal ${updateStatus?.latest ? `v${updateStatus.latest}` : 'update'}`}
-        description="Review the release and recovery plan, then confirm the owner-only update."
-        confirmationPhrase={updateStatus?.preparation?.confirmationPhrase || 'UPDATE PORTAL'}
-        confirmLabel={updatePlan === 'create-backup'
-          ? 'Back up & update'
-          : updatePlan === 'skip-backup'
-            ? 'Update without backup'
-            : 'Install update'}
-        busyLabel={updatePlan === 'create-backup' ? 'Backing up safely…' : 'Starting signed updater…'}
+        title={updateDialogTitle}
+        description={updateDialogDescription}
+        confirmationPhrase={showUpdateConfirmAction
+          ? updateStatus?.preparation?.confirmationPhrase || 'UPDATE PORTAL'
+          : null}
+        confirmLabel={updateProgressRetryable
+          ? 'Retry signed update'
+          : updatePlan === 'create-backup'
+            ? 'Back up & update'
+            : updatePlan === 'skip-backup'
+              ? 'Update without backup'
+              : 'Install update'}
+        busyLabel={updateProgress?.label || (updatePlan === 'create-backup' ? 'Backing up safely…' : 'Starting signed updater…')}
         busy={updateInProgress}
-        tone="warning"
+        busyProgress={updateProgress ? updateProgress.percent / 100 : null}
+        busyStartedAt={updateProgress?.startedAt}
+        busyUpdatedAt={updateProgress?.updatedAt}
+        busyPhaseLabel={updateProgress?.label}
+        busyPhaseDetail={updateProgress?.detail || updateMessage}
+        busyConnectionState={updateConnectionState}
+        busySteps={(updateProgress?.events || [])
+          .filter((event) => !(updateProgressActive
+            && event.phase === updateProgress?.phase
+            && event.percent === updateProgress?.percent))
+          .map((event) => ({
+          label: event.label,
+          detail: event.detail,
+          tone: event.status === 'running' ? 'complete' : 'attention',
+          }))}
+        allowDismissWhileBusy={updateProgressActive}
+        confirmDisabled={updateRetryBlocked}
+        showConfirmAction={showUpdateConfirmAction}
+        cancelLabel={updateProgressActive
+          ? 'Hide for now'
+          : updateProgressTerminal || updateProgressAmbiguous
+            ? 'Close'
+            : 'Cancel'}
+        tone={updateProgressDanger || updateProgressAmbiguous ? 'danger' : 'warning'}
         onCancel={() => {
-          if (!updateSubmissionRef.current) setUpdateDialogOpen(false);
+          if (updateProgressTerminal) forgetPortalUpdateTracking();
+          if (!updateSubmissionRef.current || updateProgressActive || updateProgressTerminal) {
+            setUpdateDialogOpen(false);
+          }
         }}
         onConfirm={(confirmation) => { void runSelfUpdate(confirmation); }}
         details={(
@@ -1758,7 +2293,7 @@ export default function DashboardPage() {
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <p className="text-sm font-semibold text-theme-text">
-                    v{updateStatus?.current || '—'} → v{updateStatus?.latest || '—'}
+                    v{updateSourceVersion || '—'} → v{updateTargetVersion || '—'}
                   </p>
                   <p className="mt-0.5 text-xs text-theme-text-muted">
                     {updateDetails
@@ -1784,90 +2319,170 @@ export default function DashboardPage() {
               )}
             </div>
 
-            <div className={`rounded-xl border bg-theme-surface p-3 ${
-              updateBackupDescription.tone === 'good'
-                ? 'border-emerald-400/25'
-                : updateBackupDescription.tone === 'info'
-                  ? 'border-cyan-400/25'
-                  : 'border-amber-400/30'
-            }`}>
-              <p className="text-sm font-semibold text-theme-text">{updateBackupDescription.label}</p>
-              <p className="mt-1 text-xs leading-5 text-theme-text-muted">{updateBackupDescription.detail}</p>
-            </div>
+            {updateProgressTerminal && updateProgress && (
+              <div
+                role={updateProgressStatus === 'succeeded' ? 'status' : 'alert'}
+                className={`rounded-xl border p-3 ${
+                  updateProgressDanger
+                    ? 'border-red-400/30 bg-red-500/10 text-red-100'
+                    : updateProgressAttention
+                      ? 'border-amber-400/30 bg-amber-500/10 text-amber-100'
+                      : 'border-emerald-400/30 bg-emerald-500/10 text-emerald-100'
+                }`}
+              >
+                <div className="flex items-start gap-2.5">
+                  {updateProgressStatus === 'succeeded' ? (
+                    <CheckCircle2 size={17} className="mt-0.5 shrink-0 text-emerald-300" aria-hidden="true" />
+                  ) : (
+                    <AlertTriangle
+                      size={17}
+                      className={`mt-0.5 shrink-0 ${updateProgressDanger ? 'text-red-300' : 'text-amber-300'}`}
+                      aria-hidden="true"
+                    />
+                  )}
+                  <div>
+                    <p className="text-sm font-semibold">{updateProgress.label}</p>
+                    <p className="mt-1 text-xs leading-5 opacity-90">{updateProgress.detail}</p>
+                    {updateProgressRetryable && (
+                      <p className="mt-2 text-xs leading-5 opacity-90">
+                        The updater recorded a safe terminal state. Review the recovery plan below before retrying.
+                      </p>
+                    )}
+                    {updateProgress.admissionBlocked && (
+                      <p className="mt-2 text-xs font-medium leading-5">
+                        A second update is disabled until this host state is reviewed and repaired.
+                      </p>
+                    )}
+                    {!updateProgress.admissionBlocked
+                      && !updateProgress.isCurrent
+                      && ['updated_with_errors', 'recovery_required'].includes(updateProgressStatus) && (
+                      <p className="mt-2 text-xs font-medium leading-5">
+                        This historical receipt is preserved, but its host admission block has been cleared.
+                      </p>
+                    )}
+                    {updateLogHref && (
+                      <a
+                        href={updateLogHref}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="mt-2 inline-flex rounded-md border border-current/20 bg-black/10 px-2 py-1 text-xs font-semibold underline-offset-2 hover:underline"
+                      >
+                        View installer log
+                      </a>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
 
-            <fieldset className="space-y-2">
-              <legend className="mb-2 text-xs font-semibold uppercase tracking-wide text-theme-text-muted">Recovery plan</legend>
-              {updateBackup?.state === 'fresh' && (
-                <label aria-label="Use the recent backup" htmlFor="portal-update-use-current" className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${
-                  updatePlan === 'use-current'
-                    ? 'accent-active'
-                    : 'border-theme-border bg-theme-surface accent-hover'
-                }`}>
-                  <input
-                    id="portal-update-use-current"
-                    type="radio"
-                    name="portal-update-plan"
-                    value="use-current"
-                    checked={updatePlan === 'use-current'}
-                    onChange={() => setUpdatePlan('use-current')}
-                    disabled={updateInProgress}
-                    className="mt-1"
-                    style={{ accentColor: 'var(--accent, #6366f1)' }}
-                  />
-                  <span>
-                    <span className="block text-sm font-semibold text-theme-text">Use the recent backup</span>
-                    <span className="mt-0.5 block text-xs leading-5 text-theme-text-muted">Fastest path; the server will recheck freshness before the updater starts.</span>
-                  </span>
-                </label>
-              )}
-              <label aria-label="Create a fresh backup, then update" htmlFor="portal-update-create-backup" className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${
-                updatePlan === 'create-backup'
-                  ? 'accent-active'
-                  : 'border-theme-border bg-theme-surface accent-hover'
-              }`}>
-                <input
-                  id="portal-update-create-backup"
-                  type="radio"
-                  name="portal-update-plan"
-                  value="create-backup"
-                  checked={updatePlan === 'create-backup'}
-                  onChange={() => setUpdatePlan('create-backup')}
-                  disabled={updateInProgress}
-                  className="mt-1"
-                  style={{ accentColor: 'var(--accent, #6366f1)' }}
-                />
-                <span>
-                  <span className="block text-sm font-semibold text-theme-text">Create a fresh backup, then update</span>
-                  <span className="mt-0.5 block text-xs leading-5 text-theme-text-muted">Recommended. Portal waits for the archive to finish before starting the signed updater.</span>
-                </span>
-              </label>
-              {updateBackup?.state !== 'fresh' && (
-                <label aria-label="Continue without a fresh backup" htmlFor="portal-update-skip-backup" className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${
-                  updatePlan === 'skip-backup'
-                    ? 'accent-active'
-                    : 'border-theme-border bg-theme-surface accent-hover'
-                }`}>
-                  <input
-                    id="portal-update-skip-backup"
-                    type="radio"
-                    name="portal-update-plan"
-                    value="skip-backup"
-                    checked={updatePlan === 'skip-backup'}
-                    onChange={() => setUpdatePlan('skip-backup')}
-                    disabled={updateInProgress}
-                    className="mt-1"
-                    style={{ accentColor: 'var(--accent, #6366f1)' }}
-                  />
-                  <AlertTriangle size={16} className="mt-0.5 flex-none text-amber-300" aria-hidden="true" />
-                  <span>
-                    <span className="block text-sm font-semibold text-theme-text">Continue without a fresh backup</span>
-                    <span className="mt-0.5 block text-xs leading-5 text-theme-text-muted">Available for emergencies, but recovery may rely on an older archive or the updater rollback dump.</span>
-                  </span>
-                </label>
-              )}
-            </fieldset>
+            {updateProgressAmbiguous && (
+              <div role="alert" className="rounded-xl border border-red-400/30 bg-red-500/10 p-3 text-red-100">
+                <div className="flex items-start gap-2.5">
+                  <AlertTriangle size={17} className="mt-0.5 shrink-0 text-red-300" aria-hidden="true" />
+                  <div>
+                    <p className="text-sm font-semibold">Terminal updater receipt unavailable</p>
+                    <p className="mt-1 text-xs leading-5">{updateMessage}</p>
+                    <p className="mt-2 text-xs font-medium leading-5">Do not start another update while this operation remains unconfirmed.</p>
+                    {updateLogHref && (
+                      <a
+                        href={updateLogHref}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="mt-2 inline-flex rounded-md border border-red-200/20 bg-black/10 px-2 py-1 text-xs font-semibold underline-offset-2 hover:underline"
+                      >
+                        View installer log
+                      </a>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
 
-            {updateMessage && (
+            {showUpdateReviewControls && (
+              <>
+                <div className={`rounded-xl border bg-theme-surface p-3 ${
+                  updateBackupDescription.tone === 'good'
+                    ? 'border-emerald-400/25'
+                    : updateBackupDescription.tone === 'info'
+                      ? 'border-cyan-400/25'
+                      : 'border-amber-400/30'
+                }`}>
+                  <p className="text-sm font-semibold text-theme-text">{updateBackupDescription.label}</p>
+                  <p className="mt-1 text-xs leading-5 text-theme-text-muted">{updateBackupDescription.detail}</p>
+                </div>
+
+                <fieldset className="space-y-2">
+                  <legend className="mb-2 text-xs font-semibold uppercase tracking-wide text-theme-text-muted">Recovery plan</legend>
+                  {updateBackup?.state === 'fresh' && (
+                    <label aria-label="Use the recent backup" htmlFor="portal-update-use-current" className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${
+                      updatePlan === 'use-current'
+                        ? 'accent-active'
+                        : 'border-theme-border bg-theme-surface accent-hover'
+                    }`}>
+                      <input
+                        id="portal-update-use-current"
+                        type="radio"
+                        name="portal-update-plan"
+                        value="use-current"
+                        checked={updatePlan === 'use-current'}
+                        onChange={() => setUpdatePlan('use-current')}
+                        className="mt-1"
+                        style={{ accentColor: 'var(--accent, #6366f1)' }}
+                      />
+                      <span>
+                        <span className="block text-sm font-semibold text-theme-text">Use the recent backup</span>
+                        <span className="mt-0.5 block text-xs leading-5 text-theme-text-muted">Fastest path; the server will recheck freshness before the updater starts.</span>
+                      </span>
+                    </label>
+                  )}
+                  <label aria-label="Create a fresh backup, then update" htmlFor="portal-update-create-backup" className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${
+                    updatePlan === 'create-backup'
+                      ? 'accent-active'
+                      : 'border-theme-border bg-theme-surface accent-hover'
+                  }`}>
+                    <input
+                      id="portal-update-create-backup"
+                      type="radio"
+                      name="portal-update-plan"
+                      value="create-backup"
+                      checked={updatePlan === 'create-backup'}
+                      onChange={() => setUpdatePlan('create-backup')}
+                      className="mt-1"
+                      style={{ accentColor: 'var(--accent, #6366f1)' }}
+                    />
+                    <span>
+                      <span className="block text-sm font-semibold text-theme-text">Create a fresh backup, then update</span>
+                      <span className="mt-0.5 block text-xs leading-5 text-theme-text-muted">Recommended. Portal waits for the archive to finish before starting the signed updater.</span>
+                    </span>
+                  </label>
+                  {updateBackup?.state !== 'fresh' && (
+                    <label aria-label="Continue without a fresh backup" htmlFor="portal-update-skip-backup" className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${
+                      updatePlan === 'skip-backup'
+                        ? 'accent-active'
+                        : 'border-theme-border bg-theme-surface accent-hover'
+                    }`}>
+                      <input
+                        id="portal-update-skip-backup"
+                        type="radio"
+                        name="portal-update-plan"
+                        value="skip-backup"
+                        checked={updatePlan === 'skip-backup'}
+                        onChange={() => setUpdatePlan('skip-backup')}
+                        className="mt-1"
+                        style={{ accentColor: 'var(--accent, #6366f1)' }}
+                      />
+                      <AlertTriangle size={16} className="mt-0.5 flex-none text-amber-300" aria-hidden="true" />
+                      <span>
+                        <span className="block text-sm font-semibold text-theme-text">Continue without a fresh backup</span>
+                        <span className="mt-0.5 block text-xs leading-5 text-theme-text-muted">Available for emergencies, but recovery may rely on an older archive or the updater rollback dump.</span>
+                      </span>
+                    </label>
+                  )}
+                </fieldset>
+              </>
+            )}
+
+            {updateMessage && !updateProgressActive && !updateProgressTerminal && !updateProgressAmbiguous && (
               <div role="status" className="rounded-xl border border-cyan-400/25 bg-cyan-500/10 px-3 py-2 text-xs leading-5 text-theme-text">
                 {updateMessage}
               </div>

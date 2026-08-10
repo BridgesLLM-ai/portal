@@ -61,6 +61,11 @@ import {
   launchPortalSelfUpdate,
   PortalSelfUpdateLaunchError,
 } from '../services/updatePreparation';
+import {
+  createPortalSelfUpdateLog,
+  getPortalSelfUpdateLog,
+  getPortalSelfUpdateProgress,
+} from '../services/portalSelfUpdateProgress';
 import { PROJECT_RUNTIME_AUTHORIZATION_POLICY } from '../services/projectRuntimeAuthorizationPolicy';
 import {
   assertNoProjectAuthorizationTransitionActive,
@@ -657,50 +662,64 @@ router.post('/self-update', requireOwner, async (req: Request, res: Response, ne
       }
     }
 
-    const logsDir = '/opt/bridgesllm/logs';
-    fs.mkdirSync(logsDir, { recursive: true });
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const logFile = path.join(logsDir, `self-update-${timestamp}.log`);
-    fs.appendFileSync(logFile, [
+    const logFile = createPortalSelfUpdateLog([
       `[${new Date().toISOString()}] Starting self-update (${originMode} origin)${domain ? ` for ${domain}` : ''} at reviewed release ${releaseAdmission.expectedVersion}`,
       `[${new Date().toISOString()}] Backup decision: ${admission.backupDecision}; readiness: ${preparation.backup.state}`,
       '',
-    ].join('\n'), { encoding: 'utf8', mode: 0o600, flag: 'a' });
+    ].join('\n'));
 
     // The updater stops this service, so register it as a fixed-name transient
     // service in a separate cgroup. The fixed unit name is also the durable
     // host-side single-flight gate for concurrent tabs and request retries.
-    await launchPortalSelfUpdate({
+    const launch = await launchPortalSelfUpdate({
       originMode,
       domain,
       logFile,
+      previousVersion: updateStatus.current,
       expectedVersion: releaseAdmission.expectedVersion,
     });
 
-    res.json({ ok: true, logFile });
+    res.status(202).json({
+      ok: true,
+      operationId: launch.operationId,
+      statusUrl: `/api/admin/self-update/progress?operationId=${launch.operationId}`,
+    });
   } catch (error) {
     if (error instanceof PortalSelfUpdateLaunchError) {
-      res.status(error.statusCode).json({ error: error.message, code: error.code });
+      res.status(error.statusCode).json({
+        error: error.message,
+        code: error.code,
+        ...(error.operationId ? { operationId: error.operationId } : {}),
+      });
       return;
     }
     next(error);
   }
 });
 
+router.get('/self-update/progress', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const operationId = String(req.query.operationId || '').trim();
+    if (operationId && !/^[a-f0-9]{32}$/.test(operationId)) {
+      throw new AppError(400, 'Invalid Portal update operation identifier.');
+    }
+    const progress = await getPortalSelfUpdateProgress(operationId || undefined);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json(progress);
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.get('/self-update/log', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const file = String(req.query.file || '').trim();
-    if (!file) throw new AppError(400, 'Missing log file path');
-    const normalized = path.resolve(file);
-    if (!normalized.startsWith('/opt/bridgesllm/logs/self-update-')) {
-      throw new AppError(400, 'Invalid log file path');
+    const operationId = String(req.query.operationId || '').trim();
+    if (!/^[a-f0-9]{32}$/.test(operationId)) {
+      throw new AppError(400, 'Invalid Portal update operation identifier.');
     }
-    if (!fs.existsSync(normalized)) {
-      throw new AppError(404, 'Log file not found');
-    }
-    const content = fs.readFileSync(normalized, 'utf8');
-    const lines = content.split(/\r?\n/);
-    res.json({ ok: true, file: normalized, content: lines.slice(-200).join('\n') });
+    const log = getPortalSelfUpdateLog(operationId);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ ok: true, ...log });
   } catch (error) {
     next(error);
   }

@@ -14,6 +14,7 @@ import {
   isVendorPortalBrandingPath,
   synchronizePortalIconLinks,
 } from './utils/portalBranding';
+import { usePortalUpdateSessionRecovery } from './hooks/usePortalUpdateSessionRecovery';
 
 const MODULE_RELOAD_PREFIX = 'portal-module-reload:';
 const SETUP_STATUS_TIMEOUT_MS = 8_000;
@@ -130,17 +131,110 @@ function BootstrapFallback() {
   );
 }
 
-function SessionRestoreFallback({
+export function SessionRestoreFallback({
   onRetry,
   onSignOut,
+  updateRecovery,
 }: {
   onRetry: () => void;
   onSignOut: () => void;
+  updateRecovery: ReturnType<typeof usePortalUpdateSessionRecovery>;
 }) {
   // Retry is the right first move, but it is not always the answer: if the
   // cached session cannot be confirmed at all, retrying forever is a dead end.
   // Signing out has to be reachable from this screen.
   const [signingOut, setSigningOut] = useState(false);
+  if (updateRecovery.operationId) {
+    const progress = updateRecovery.checkpoint;
+    const percent = progress?.percent ?? null;
+    const phase = progress?.label || 'Restarting the Portal';
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-theme-bg px-6 text-theme-text">
+        <div className="w-full max-w-lg rounded-2xl border border-theme-border bg-theme-surface p-6 shadow-2xl shadow-black/30">
+          <div className="sr-only" role="status" aria-live="polite">
+            Portal update is continuing. Reconnecting automatically.
+          </div>
+          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-emerald-400">Signed Portal update</p>
+          <h1 className="mt-2 text-xl font-semibold text-theme-text">Portal is restarting</h1>
+          <p className="mt-2 text-sm leading-6 text-theme-muted">
+            The server-owned update is still running. This screen will reconnect automatically; no second update will be started.
+          </p>
+
+          {percent !== null ? (
+            <div className="mt-6">
+              <div className="mb-2 flex items-end justify-between gap-4">
+                <div>
+                  <p className="text-sm font-semibold text-theme-text">{phase}</p>
+                  <p className="mt-1 text-xs text-theme-muted">Last confirmed server checkpoint</p>
+                </div>
+                <span className="text-2xl font-semibold tabular-nums text-emerald-400">{percent}%</span>
+              </div>
+              <div
+                className="h-2.5 overflow-hidden rounded-full bg-theme-bg"
+                role="progressbar"
+                aria-label="Portal update progress"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={percent}
+                aria-valuetext={`${percent}% complete. ${phase}. Portal is restarting and will reconnect automatically.`}
+              >
+                <div
+                  className="h-full rounded-full bg-emerald-500 transition-[width] duration-500 motion-reduce:transition-none"
+                  style={{ width: `${percent}%` }}
+                />
+              </div>
+              {progress?.detail ? (
+                <p className="mt-3 text-xs leading-5 text-theme-muted">{progress.detail}</p>
+              ) : null}
+            </div>
+          ) : (
+            <div className="mt-6 rounded-xl border border-theme-border bg-theme-bg/60 px-4 py-3 text-sm text-theme-muted">
+              Waiting for the first durable progress checkpoint…
+            </div>
+          )}
+
+          <div className="mt-5 flex items-center gap-3 rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3">
+            <span className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-amber-400 motion-reduce:animate-none" />
+            <div>
+              <p className="text-sm font-medium text-amber-100">
+                {updateRecovery.isRetrying ? 'Checking the Portal now…' : 'Reconnecting automatically…'}
+              </p>
+              <p className="mt-0.5 text-xs text-amber-100/70">
+                {updateRecovery.attemptCount === 0
+                  ? 'The first reconnect check is queued.'
+                  : `${updateRecovery.attemptCount} reconnect ${updateRecovery.attemptCount === 1 ? 'check' : 'checks'} completed.`}
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-5 flex flex-col gap-2 sm:flex-row">
+            <button
+              type="button"
+              onClick={() => void updateRecovery.retryNow()}
+              disabled={signingOut || updateRecovery.isRetrying}
+              className="min-h-[44px] flex-1 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-400 disabled:opacity-60"
+            >
+              {updateRecovery.isRetrying ? 'Checking…' : 'Retry now'}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setSigningOut(true);
+                onSignOut();
+              }}
+              disabled={signingOut}
+              className="min-h-[44px] flex-1 rounded-xl border border-theme-border bg-theme-bg/60 px-4 py-2 text-sm font-semibold text-theme-muted hover:text-theme-text disabled:opacity-60"
+            >
+              {signingOut ? 'Signing out…' : 'Sign out instead'}
+            </button>
+          </div>
+          <p className="mt-3 text-xs leading-5 text-theme-muted">
+            Signing out does not stop the server-owned update. An owner can reattach from the Dashboard after signing in again.
+          </p>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="flex min-h-dvh items-center justify-center bg-theme-bg px-6 text-center text-theme-text" role="alert">
       <div className="max-w-md rounded-2xl border border-amber-500/20 bg-amber-500/10 p-6">
@@ -208,6 +302,7 @@ export default function App() {
     restoreSession,
     isAuthenticated,
     sessionRestoreError,
+    sessionRestoreRetryable,
     abandonQuarantinedSession,
   } = useAuthStore();
   const heartbeatRef = useRef<ReturnType<typeof setInterval>>();
@@ -216,6 +311,10 @@ export default function App() {
   const [isReinstall, setIsReinstall] = useState<boolean>(false);
   const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
   const setupModeActive = needsSetup || isReinstall;
+  const updateSessionRecovery = usePortalUpdateSessionRecovery({
+    enabled: sessionRestoreError && sessionRestoreRetryable,
+    restoreSession,
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -282,6 +381,7 @@ export default function App() {
   if (sessionRestoreError) {
     return (
       <SessionRestoreFallback
+        updateRecovery={updateSessionRecovery}
         onRetry={() => {
           setSetupChecked(false);
           setBootstrapAttempt((attempt) => attempt + 1);

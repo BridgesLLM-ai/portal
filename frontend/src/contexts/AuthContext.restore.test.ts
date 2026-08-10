@@ -22,6 +22,7 @@ vi.mock('../api/client', () => ({
 }));
 
 import { useAuthStore } from './AuthContext';
+import { StaleWorkspaceAuthorizationResponseError } from '../utils/workspaceAuthorization';
 import {
   buildFileDeepLink,
   parseFileDeepLink,
@@ -63,6 +64,7 @@ describe('session restore fail-closed contract', () => {
       isAuthenticated: true,
       isLoading: false,
       sessionRestoreError: false,
+      sessionRestoreRetryable: false,
       lastSessionRestoreAt: Date.now(),
     });
   });
@@ -74,7 +76,82 @@ describe('session restore fail-closed contract', () => {
     expect(useAuthStore.getState()).toMatchObject({
       isAuthenticated: true,
       sessionRestoreError: true,
+      sessionRestoreRetryable: true,
       isLoading: false,
+    });
+  });
+
+  it('keeps cached auth quarantined while a reconnect validation is in flight', async () => {
+    const validation = deferred<any>();
+    mocks.me.mockReturnValueOnce(validation.promise);
+    useAuthStore.setState({ sessionRestoreError: true, sessionRestoreRetryable: true });
+
+    const restoring = useAuthStore.getState().restoreSession();
+    expect(useAuthStore.getState()).toMatchObject({
+      isAuthenticated: true,
+      isLoading: true,
+      sessionRestoreError: true,
+    });
+
+    validation.resolve({ id: 'user-1', email: 'user@example.com' });
+    await expect(restoring).resolves.toBe(true);
+    expect(useAuthStore.getState()).toMatchObject({
+      isAuthenticated: true,
+      isLoading: false,
+      sessionRestoreError: false,
+      sessionRestoreRetryable: false,
+    });
+  });
+
+  it('shares one globally serialized validation across concurrent restore callers', async () => {
+    const validation = deferred<any>();
+    mocks.me.mockReturnValueOnce(validation.promise);
+
+    const first = useAuthStore.getState().restoreSession();
+    const second = useAuthStore.getState().restoreSession();
+    expect(second).toBe(first);
+    expect(mocks.me).toHaveBeenCalledTimes(1);
+
+    validation.resolve({ id: 'user-1', email: 'user@example.com' });
+    await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
+  });
+
+  it('cannot let a stale successful restore overwrite a newer logout boundary', async () => {
+    const validation = deferred<any>();
+    mocks.me.mockReturnValueOnce(validation.promise);
+    const restoring = useAuthStore.getState().restoreSession();
+
+    useAuthStore.getState().silentLogout();
+    validation.resolve({ id: 'user-1', email: 'user@example.com' });
+
+    await expect(restoring).resolves.toBe(false);
+    expect(useAuthStore.getState()).toMatchObject({
+      user: null,
+      isAuthenticated: false,
+      sessionRestoreError: false,
+    });
+  });
+
+  it('only marks transport-like restore failures as automatically retryable', async () => {
+    mocks.me.mockRejectedValueOnce({ response: { status: 503 } });
+    await useAuthStore.getState().restoreSession();
+    expect(useAuthStore.getState()).toMatchObject({
+      sessionRestoreError: true,
+      sessionRestoreRetryable: true,
+    });
+
+    mocks.me.mockRejectedValueOnce({ response: { status: 400 } });
+    await useAuthStore.getState().restoreSession();
+    expect(useAuthStore.getState()).toMatchObject({
+      sessionRestoreError: true,
+      sessionRestoreRetryable: false,
+    });
+
+    mocks.me.mockRejectedValueOnce(new StaleWorkspaceAuthorizationResponseError());
+    await useAuthStore.getState().restoreSession();
+    expect(useAuthStore.getState()).toMatchObject({
+      sessionRestoreError: true,
+      sessionRestoreRetryable: false,
     });
   });
 
@@ -91,6 +168,7 @@ describe('session restore fail-closed contract', () => {
       user: null,
       isAuthenticated: false,
       sessionRestoreError: false,
+      sessionRestoreRetryable: false,
     });
     expect(localStorage.getItem('accessToken')).toBeNull();
     const persisted = JSON.parse(localStorage.getItem('bridgesllm-auth') ?? '{"state":{}}');

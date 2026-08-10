@@ -8,7 +8,13 @@ import {
 import { PRIVILEGED_CONFIRMATION, isTypedConfirmationMatch } from '../utils/privilegedConfirmation';
 import type { PortalOriginMode } from '../utils/portalFeatureCapabilities';
 import { isReleaseVersion } from './releaseUpdateDetails';
+import {
+  getPortalSelfUpdateProgress,
+  readPortalSelfUpdateUnitIdentity,
+  type PortalSelfUpdateUnitIdentity,
+} from './portalSelfUpdateProgress';
 import { execFile } from 'child_process';
+import { randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
@@ -19,16 +25,41 @@ const execFileAsync = promisify(execFile);
 const PORTAL_SELF_UPDATE_UNIT = 'bridgesllm-portal-self-update';
 const SYSTEMD_RUN = '/usr/bin/systemd-run';
 const BACKUP_VERIFY_TIMEOUT_MS = 120_000;
+const PORTAL_SELF_UPDATE_PROGRESS_SOURCE_HELPER =
+  '/opt/bridgesllm/portal/installer/dashboard-update-progress.py';
+const PORTAL_SELF_UPDATE_PROGRESS_STABLE_HELPER =
+  '/var/lib/bridgesllm-installer/dashboard-update-progress.py';
 // Domain-origin installs pass their attested domain through; Tailnet and
 // local origins launch a plain --update so the installer reloads only the
 // attested installed-origin state instead of being forced into domain mode.
 const PORTAL_SELF_UPDATE_SCRIPT = [
-  'set -o pipefail',
-  'if [ "$4" = "domain" ]; then',
-  '  /usr/bin/curl -fsSL --proto "=https" --tlsv1.2 "https://bridgesllm.ai/releases/$3/install.sh" | /bin/bash -s -- --update --domain "$1" >> "$2" 2>&1',
+  'set -Eeuo pipefail',
+  'umask 077',
+  'export BRIDGESLLM_DASHBOARD_UPDATE_ID="$5"',
+  '/usr/bin/python3 "$7" update --operation-id "$5" --status running --percent 5 --phase installer-download --label "Downloading versioned installer" --detail "Step 1 of 13 · Fetching the reviewed installer over pinned HTTPS."',
+  'installer_file="$(/usr/bin/mktemp /var/lib/bridgesllm-installer/dashboard-update-installer.XXXXXX)"',
+  'trap \'/bin/rm -f -- "$installer_file"\' EXIT',
+  'set +e',
+  '/usr/bin/curl -fsSL --proto "=https" --tlsv1.2 --connect-timeout 15 --max-time 120 --retry 3 --retry-delay 2 --retry-max-time 300 --retry-all-errors --max-filesize 2097152 -o "$installer_file" "https://bridgesllm.ai/releases/$3/install.sh" >> "$2" 2>&1',
+  'update_rc=$?',
+  'if [ "$update_rc" -eq 0 ]; then',
+  '  /bin/chmod 0600 "$installer_file"',
+  '  if [ "$4" = "domain" ]; then',
+  '    /bin/bash "$installer_file" --update --domain "$1" >> "$2" 2>&1',
+  '    update_rc=$?',
+  '  else',
+  '    /bin/bash "$installer_file" --update >> "$2" 2>&1',
+  '    update_rc=$?',
+  '  fi',
   'else',
-  '  /usr/bin/curl -fsSL --proto "=https" --tlsv1.2 "https://bridgesllm.ai/releases/$3/install.sh" | /bin/bash -s -- --update >> "$2" 2>&1',
+  '  /usr/bin/python3 "$7" update --operation-id "$5" --status running --percent 5 --phase installer-download --label "Installer download stopped" --detail "Step 1 of 13 · The bounded HTTPS download failed; systemd is recording the terminal result." || true',
   'fi',
+  // Terminal state is deliberately absent here. systemd invokes the stable
+  // helper from ExecStopPost only after it has recorded how this main process
+  // died; success also requires install.sh's durable 99% checkpoint, which is
+  // published only after its authenticated canonical update-ready proof.
+  '/bin/sync -f "$2" || true',
+  'exit "$update_rc"',
 ].join('\n');
 
 // systemd starts transient root units with USER set but HOME unset, and the
@@ -87,7 +118,11 @@ export class PortalSelfUpdateLaunchError extends Error {
   constructor(
     message: string,
     public readonly statusCode: 409 | 500,
-    public readonly code: 'PORTAL_UPDATE_BUSY' | 'PORTAL_UPDATE_LAUNCH_FAILED',
+    public readonly code:
+      | 'PORTAL_UPDATE_BUSY'
+      | 'PORTAL_UPDATE_ATTENTION_REQUIRED'
+      | 'PORTAL_UPDATE_LAUNCH_FAILED',
+    public readonly operationId?: string,
   ) {
     super(message);
     this.name = 'PortalSelfUpdateLaunchError';
@@ -107,10 +142,21 @@ function unitAlreadyExists(error: unknown): boolean {
  * replaces itself.
  */
 export async function launchPortalSelfUpdate(
-  input: { originMode: PortalOriginMode; domain: string; logFile: string; expectedVersion: string },
-  dependencies: { execFileImpl?: ExecFileLike } = {},
-): Promise<void> {
-  if (!isReleaseVersion(input.expectedVersion)) {
+  input: {
+    originMode: PortalOriginMode;
+    domain: string;
+    logFile: string;
+    previousVersion: string;
+    expectedVersion: string;
+  },
+  dependencies: {
+    execFileImpl?: ExecFileLike;
+    progressExecFileImpl?: ExecFileLike;
+    readUnitIdentityImpl?: () => Promise<PortalSelfUpdateUnitIdentity>;
+    readProgressImpl?: (operationId: string) => Promise<{ operationId: string | null; status: string }>;
+  } = {},
+): Promise<{ operationId: string }> {
+  if (!isReleaseVersion(input.previousVersion) || !isReleaseVersion(input.expectedVersion)) {
     throw new PortalSelfUpdateLaunchError(
       'The reviewed Portal release version is invalid. Refresh update status before retrying.',
       409,
@@ -140,16 +186,91 @@ export async function launchPortalSelfUpdate(
   }
 
   portalSelfUpdateRegistrationInFlight = true;
+  const operationId = randomBytes(16).toString('hex');
   const execFileImpl = dependencies.execFileImpl || (async (file, args, options) => {
     await execFileAsync(file, [...args], options);
   });
+  const progressExecFileImpl = dependencies.progressExecFileImpl || (async (file, args, options) => {
+    await execFileAsync(file, [...args], options);
+  });
+  const readUnitIdentityImpl = dependencies.readUnitIdentityImpl || readPortalSelfUpdateUnitIdentity;
+  const readProgressImpl = dependencies.readProgressImpl || getPortalSelfUpdateProgress;
   try {
+    try {
+      await progressExecFileImpl('/usr/bin/python3', [
+        PORTAL_SELF_UPDATE_PROGRESS_SOURCE_HELPER,
+        'create',
+        '--operation-id', operationId,
+        '--previous-version', input.previousVersion,
+        '--target-version', input.expectedVersion,
+        '--log-file', input.logFile,
+      ], {
+        timeout: 10_000,
+        maxBuffer: 64 * 1024,
+        windowsHide: true,
+      });
+    } catch (error) {
+      if (Number((error as { code?: unknown })?.code) === 2) {
+        throw new PortalSelfUpdateLaunchError(
+          'A Portal update is already running. Reopen its progress instead of starting another update.',
+          409,
+          'PORTAL_UPDATE_BUSY',
+        );
+      }
+      if (Number((error as { code?: unknown })?.code) === 4) {
+        throw new PortalSelfUpdateLaunchError(
+          'A prior Portal update still needs operator attention. Reopen its durable result and repair that host state before starting another update.',
+          409,
+          'PORTAL_UPDATE_ATTENTION_REQUIRED',
+        );
+      }
+      // The helper can lose its IPC reply after fsyncing both the record and
+      // current pointer. Prove this generated identity before deciding that
+      // admission never happened; if it exists, close the unchanged admission
+      // durably and return its receipt instead of leaving a hidden busy wedge.
+      let durable: { operationId: string | null; status: string } | null = null;
+      try {
+        durable = await readProgressImpl(operationId);
+      } catch {}
+      if (durable?.operationId === operationId && durable.status !== 'idle') {
+        if (!['succeeded', 'failed', 'rolled_back', 'updated_with_errors', 'recovery_required']
+          .includes(durable.status)) {
+          try {
+            await progressExecFileImpl('/usr/bin/python3', [
+              PORTAL_SELF_UPDATE_PROGRESS_STABLE_HELPER,
+              'fail-launch', '--operation-id', operationId,
+            ], { timeout: 10_000, maxBuffer: 64 * 1024, windowsHide: true });
+          } catch {
+            try {
+              const finalized = await readProgressImpl(operationId);
+              if (finalized.operationId === operationId
+                && ['succeeded', 'failed', 'rolled_back', 'updated_with_errors', 'recovery_required']
+                  .includes(finalized.status)) return { operationId };
+            } catch {}
+            durable = null;
+          }
+        }
+        if (durable) {
+          return { operationId };
+        }
+      }
+      throw new PortalSelfUpdateLaunchError(
+        'Portal could not create a durable update operation. No update was started.',
+        500,
+        'PORTAL_UPDATE_LAUNCH_FAILED',
+      );
+    }
     await execFileImpl(SYSTEMD_RUN, [
       `--unit=${PORTAL_SELF_UPDATE_UNIT}`,
       '--collect',
       '--no-block',
       '--quiet',
+      '--property=RuntimeMaxSec=4h',
+      '--property=TimeoutStartSec=4h',
+      '--property=TimeoutStopSec=30min',
+      `--property=ExecStopPost=/usr/bin/python3 ${PORTAL_SELF_UPDATE_PROGRESS_STABLE_HELPER} finalize-service --operation-id ${operationId}`,
       `--setenv=HOME=${selfUpdateHomeDirectory()}`,
+      `--setenv=BRIDGESLLM_DASHBOARD_UPDATE_ID=${operationId}`,
       '/bin/bash',
       '-c',
       PORTAL_SELF_UPDATE_SCRIPT,
@@ -158,17 +279,61 @@ export async function launchPortalSelfUpdate(
       input.logFile,
       input.expectedVersion,
       input.originMode,
+      operationId,
+      input.previousVersion,
+      PORTAL_SELF_UPDATE_PROGRESS_STABLE_HELPER,
     ], {
       timeout: 10_000,
       maxBuffer: 64 * 1024,
       windowsHide: true,
     });
   } catch (error) {
-    if (unitAlreadyExists(error)) {
+    if (error instanceof PortalSelfUpdateLaunchError) throw error;
+    const explicitUnitConflict = unitAlreadyExists(error);
+    // `systemd-run --no-block` can lose its D-Bus reply after systemd has
+    // already queued the transient unit. Never terminalize the durable
+    // receipt unless the fixed unit is provably absent/inactive; otherwise
+    // attach the client to that receipt and let unit/finalizer reconciliation
+    // establish the outcome. An explicit UnitExists response is different:
+    // that proves this new operation never owned the fixed unit, even while
+    // the previous operation's ExecStopPost is still deactivating.
+    let unitIdentity: PortalSelfUpdateUnitIdentity = { activity: 'unknown', operationId: null };
+    let foreignUnitConflict = false;
+    if (!explicitUnitConflict) {
+      try {
+        unitIdentity = await readUnitIdentityImpl();
+      } catch {}
+      if (unitIdentity.activity !== 'inactive') {
+        if (unitIdentity.operationId === operationId || unitIdentity.activity === 'unknown') {
+          return { operationId };
+        }
+        foreignUnitConflict = true;
+      }
+    }
+    try {
+      await progressExecFileImpl('/usr/bin/python3', [
+        PORTAL_SELF_UPDATE_PROGRESS_STABLE_HELPER,
+        'fail-launch', '--operation-id', operationId,
+      ], { timeout: 10_000, maxBuffer: 64 * 1024, windowsHide: true });
+    } catch {
+      // A fast accepted unit can finish and be collected before the activity
+      // query. In that case fail-launch correctly rejects its progressed or
+      // terminal state; reattach if the durable exact operation is terminal.
+      if (!explicitUnitConflict && !foreignUnitConflict) {
+        try {
+          const progress = await readProgressImpl(operationId);
+          if (progress.operationId === operationId && progress.status !== 'idle') {
+            return { operationId };
+          }
+        } catch {}
+      }
+    }
+    if (explicitUnitConflict || foreignUnitConflict) {
       throw new PortalSelfUpdateLaunchError(
         'A Portal update is already running. Wait for it to finish before retrying.',
         409,
         'PORTAL_UPDATE_BUSY',
+        operationId,
       );
     }
     throw new PortalSelfUpdateLaunchError(
@@ -179,6 +344,7 @@ export async function launchPortalSelfUpdate(
   } finally {
     portalSelfUpdateRegistrationInFlight = false;
   }
+  return { operationId };
 }
 
 export function __resetPortalSelfUpdateLaunchStateForTests(): void {

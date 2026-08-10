@@ -100,9 +100,9 @@ const accentContracts: Array<{
   {
     source: 'dashboard',
     expected: [
-      "updatePlan === 'use-current'\n                    ? 'accent-active'",
-      "updatePlan === 'create-backup'\n                  ? 'accent-active'",
-      "updatePlan === 'skip-backup'\n                    ? 'accent-active'",
+      "updatePlan === 'use-current'\n                        ? 'accent-active'",
+      "updatePlan === 'create-backup'\n                      ? 'accent-active'",
+      "updatePlan === 'skip-backup'\n                        ? 'accent-active'",
       'accentColor: \'var(--accent, #6366f1)\'',
     ],
   },

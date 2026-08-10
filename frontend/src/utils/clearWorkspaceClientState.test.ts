@@ -24,6 +24,9 @@ describe('workspace client-state scrub', () => {
     sessionStorage.setItem('bridgesllm.setup.session.v1', 'setup-credential');
     sessionStorage.setItem('cached_userAvatar', '/private/avatar.png');
     sessionStorage.setItem('cached_assistantAvatar', '/private/assistant.png');
+    sessionStorage.setItem('dashboard-self-update-operation-id', '0123456789abcdef0123456789abcdef');
+    sessionStorage.setItem('dashboard-self-update-expected-version', '4.0.15');
+    sessionStorage.setItem('dashboard-self-update-progress-checkpoint', '{"percent":97}');
     sessionStorage.setItem('portal-module-reload:FilesPage', '1');
     sessionStorage.setItem('cached_publicSettings', '{"portalName":"Portal"}');
     sessionStorage.setItem(
@@ -47,6 +50,9 @@ describe('workspace client-state scrub', () => {
     expect(sessionStorage.getItem('bridgesllm.setup.session.v1')).toBeNull();
     expect(sessionStorage.getItem('cached_userAvatar')).toBeNull();
     expect(sessionStorage.getItem('cached_assistantAvatar')).toBeNull();
+    expect(sessionStorage.getItem('dashboard-self-update-operation-id')).toBeNull();
+    expect(sessionStorage.getItem('dashboard-self-update-expected-version')).toBeNull();
+    expect(sessionStorage.getItem('dashboard-self-update-progress-checkpoint')).toBeNull();
     expect(sessionStorage.getItem('portal-module-reload:FilesPage')).toBe('1');
     expect(sessionStorage.getItem('cached_publicSettings')).toBe('{"portalName":"Portal"}');
     expect(sessionStorage.getItem('bridgesllm.agentTools.indeterminateInstall.v1'))

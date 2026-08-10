@@ -22,6 +22,9 @@ const TRANSIENT_WORKSPACE_STORAGE_KEYS = new Set([
   'cached_userAvatar',
   'cached_assistantAvatar',
   'palette-open-file',
+  'dashboard-self-update-operation-id',
+  'dashboard-self-update-expected-version',
+  'dashboard-self-update-progress-checkpoint',
 ]);
 
 const TRANSIENT_WORKSPACE_STORAGE_PREFIXES = [

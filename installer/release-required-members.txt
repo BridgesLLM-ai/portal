@@ -78,6 +78,7 @@ portal/backend/dist/services/openClawGatewayAuthorizationFence.js
 portal/backend/dist/services/openClawHostRunJournal.js
 portal/backend/dist/services/openclawProjectQualification.js
 portal/backend/dist/services/openclawProjectSandbox.js
+portal/backend/dist/services/portalSelfUpdateProgress.js
 portal/backend/dist/services/project-git.service.js
 portal/backend/dist/services/project-lifecycle.service.js
 portal/backend/dist/services/projectAuthorizationTransition.js
@@ -143,6 +144,7 @@ portal/backend/prisma/migrations/migration_lock.toml
 portal/backend/prisma/schema.prisma
 portal/backup-full.sh
 portal/docker-compose.yml
+portal/docs/PORTAL_UPDATE_ATTENTION_RECOVERY.md
 portal/frontend/dist/index.html
 portal/frontend/package.json
 portal/installer/Setup-OllamaTailnet.ps1
@@ -157,6 +159,7 @@ portal/installer/bridgesllm-codex-project-runtime-v1.seccomp.json
 portal/installer/bridgesllm-project-runtime-v1.apparmor
 portal/installer/bridgesllm-project-runtime-v1.seccomp.json
 portal/installer/caddy-managed-config.py
+portal/installer/dashboard-update-progress.py
 portal/installer/grok-build-runtime.sh
 portal/installer/index.html
 portal/installer/install-windows.ps1

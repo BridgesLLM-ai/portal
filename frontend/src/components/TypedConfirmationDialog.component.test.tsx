@@ -132,7 +132,146 @@ describe("TypedConfirmationDialog modal behavior", () => {
         onConfirm={vi.fn()}
       />,
     );
-    expect(screen.getByText("42%")).toBeInTheDocument();
+    expect(screen.getByText(/42% · 0s/)).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Upload progress" })).toHaveAttribute(
+      "aria-valuenow",
+      "42",
+    );
+  });
+
+  it("shows durable phase feedback, reconnect copy, recent steps, and server-owned elapsed time", () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-08-10T12:02:03.000Z"));
+      render(
+        <TypedConfirmationDialog
+          open
+          title="Updating Portal"
+          description="The updater continues on the server."
+          confirmLabel="Update"
+          busy
+          busyProgress={0.64}
+          busyStartedAt="2026-08-10T12:00:00.000Z"
+          busyPhaseLabel="Restarting Portal"
+          busyPhaseDetail="Waiting for the API to return before postflight checks."
+          busyConnectionState="reconnecting"
+          busySteps={[
+            { label: "Release verified", detail: "Signature and manifest matched." },
+            { label: "Database migrated", detail: "Schema is current." },
+          ]}
+          onCancel={vi.fn()}
+          onConfirm={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByText("Restarting Portal")).toBeInTheDocument();
+      expect(screen.getByText(/Waiting for the API to return/)).toBeInTheDocument();
+      expect(screen.getByText(/Portal is restarting or temporarily unavailable/i)).toBeInTheDocument();
+      expect(screen.getByText("Release verified")).toBeInTheDocument();
+      expect(screen.getByText("Database migrated")).toBeInTheDocument();
+      expect(screen.getByText("64% · 2m 03s")).toBeInTheDocument();
+      expect(screen.getByRole("progressbar", { name: "Restarting Portal" })).toHaveAttribute(
+        "aria-valuetext",
+        expect.stringContaining("64% complete"),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("moves initial focus to the durable phase heading while busy", async () => {
+    render(
+      <TypedConfirmationDialog
+        open
+        title="Updating Portal"
+        description="The updater continues on the server."
+        confirmationPhrase="UPDATE PORTAL"
+        confirmLabel="Update"
+        busy
+        busyProgress={0.48}
+        busyPhaseLabel="Installing signed release"
+        showConfirmAction={false}
+        allowDismissWhileBusy
+        onCancel={vi.fn()}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    const phaseHeading = screen.getByText("Installing signed release");
+    await waitFor(() => expect(phaseHeading).toHaveFocus());
+    expect(screen.queryByRole("textbox", { name: /UPDATE PORTAL/i })).not.toBeInTheDocument();
+  });
+
+  it("shows a fixed stale-feedback warning without advancing the progress bar", () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-08-10T12:02:00.000Z"));
+      render(
+        <TypedConfirmationDialog
+          open
+          title="Updating Portal"
+          description="The updater continues on the server."
+          confirmLabel="Update"
+          busy
+          busyProgress={0.48}
+          busyStartedAt="2026-08-10T12:00:00.000Z"
+          busyUpdatedAt="2026-08-10T12:00:29.000Z"
+          busyPhaseLabel="Installing signed release"
+          onCancel={vi.fn()}
+          onConfirm={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByText(/No new installer phase has been reported for over 90 seconds/i)).toBeInTheDocument();
+      expect(screen.getByRole("progressbar", { name: "Installing signed release" })).toHaveAttribute("aria-valuenow", "48");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("can render a terminal status dialog without a second confirmation action", () => {
+    render(
+      <TypedConfirmationDialog
+        open
+        title="Portal update needs recovery"
+        description="Review the terminal updater receipt."
+        confirmationPhrase="UPDATE PORTAL"
+        confirmLabel="Update"
+        showConfirmAction={false}
+        cancelLabel="Close"
+        onCancel={vi.fn()}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("textbox", { name: /UPDATE PORTAL/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Update" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close" })).toBeEnabled();
+  });
+
+  it("lets a durable background operation be hidden without enabling its primary action", async () => {
+    const user = userEvent.setup();
+    const onCancel = vi.fn();
+    render(
+      <TypedConfirmationDialog
+        open
+        title="Updating Portal"
+        description="The updater is server-owned."
+        confirmLabel="Update"
+        busyLabel="Installing signed release"
+        busy
+        allowDismissWhileBusy
+        cancelLabel="Hide for now"
+        onCancel={onCancel}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Installing signed release" })).toBeDisabled();
+    const hide = screen.getByRole("button", { name: "Hide for now" });
+    expect(hide).toBeEnabled();
+    await user.click(hide);
+    expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
   it("fires onConfirm exactly once even on a rapid double click", async () => {

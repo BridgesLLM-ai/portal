@@ -63,7 +63,7 @@ describe('Project runtime image repair launcher', () => {
       '-I',
       '-S',
       '/opt/bridgesllm/portal/installer/project-runtime-image-repair-launcher.py',
-      '4.0.13',
+      '4.0.14',
       '/opt/bridgesllm/logs/project-runtime-image-repair-test.log',
     ]);
     expect(args).not.toContain('--collect');

@@ -2,6 +2,18 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.14] - 2026-08-10
+
+### Added
+- **Dashboard updates now report real server-owned progress.** The update dialog shows completed installer checkpoints, a determinate percentage, concise phase detail, recent milestones, elapsed time, and an explicit reconnecting state while Portal restarts. The operation survives navigation, page reloads, lost admission responses, and backend replacement; success appears only after the protected updater exits cleanly and the exact target Portal reports ready health.
+
+### Fixed
+- **Ordinary scheduler state no longer makes the Portal effectively uninstallable.** The Docker-prune guard recognizes the exact legacy cron job with normal `/dev/null` redirection, ignores non-loadable unit backups and non-command path tokens, understands wrapped and tab-stripping heredocs, handles NUL or non-UTF-8 scheduled script sources without making an unrelated update fatal, and treats scan-budget exhaustion as bounded warning state. A full aged-Ubuntu fixture proves the six production failures while controls still reject literal unsafe prune commands, suffix injection, and helpers hidden after the work budget.
+- **Updater failure and recovery outcomes remain honest across every restart boundary.** Root-owned atomic receipts distinguish stopped-before-change, rollback, post-commit host errors, and manual recovery. Systemd exit finalization, authenticated postflight health, operation-bound unit identity, bounded downloads and runtime, orphan reconciliation, clock rollback, and immutable historical receipts close the races that previously produced endless spinners, early success, hidden failure, or a permanently busy updater.
+
+### Security
+- **Update telemetry is observable without becoming recovery authority.** Operation identifiers, phases, text, percentages, state files, current pointers, helper code, and bounded log tails are strictly validated and protected against symlinks, hardlinks, ownership or mode drift, path escape, control characters, and stale identity. The progress observer cannot alter the installer's transaction journals, and attention blocks require an explicit root repair acknowledgement rather than a browser bypass.
+
 ## [4.0.13] - 2026-08-10
 
 ### Added

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { spawnSync } from 'child_process';
 import {
   __resetPortalSelfUpdateLaunchStateForTests,
   UPDATE_BACKUP_MAX_AGE_HOURS,
@@ -15,6 +16,7 @@ import {
 } from '../services/updatePreparation';
 
 const NOW = Date.parse('2026-07-20T20:00:00.000Z');
+const progressWriter = () => jest.fn().mockResolvedValue(undefined);
 
 function preparation(state: PortalUpdatePreparation['backup']['state']): PortalUpdatePreparation {
   return {
@@ -197,28 +199,49 @@ describe('Portal update backup readiness', () => {
 
   test('registers the genuine updater as one fixed transient service with argument-safe values', async () => {
     const execFileImpl = jest.fn().mockResolvedValue(undefined);
+    const progressExecFileImpl = progressWriter();
     await launchPortalSelfUpdate({
       originMode: 'domain',
       domain: 'portal.example.com',
       logFile: '/opt/bridgesllm/logs/self-update-test.log',
+      previousVersion: '4.0.13',
       expectedVersion: '4.1.0',
-    }, { execFileImpl });
+    }, { execFileImpl, progressExecFileImpl });
 
     expect(execFileImpl).toHaveBeenCalledTimes(1);
+    expect(progressExecFileImpl).toHaveBeenCalledWith('/usr/bin/python3', expect.arrayContaining([
+      'create', '--previous-version', '4.0.13', '--target-version', '4.1.0',
+    ]), expect.any(Object));
     const [file, args, options] = execFileImpl.mock.calls[0];
     expect(file).toBe('/usr/bin/systemd-run');
     expect(args).toEqual(expect.arrayContaining([
       '--unit=bridgesllm-portal-self-update',
       '--collect',
       '--no-block',
+      '--property=RuntimeMaxSec=4h',
+      '--property=TimeoutStartSec=4h',
+      '--property=TimeoutStopSec=30min',
+      expect.stringMatching(/^--property=ExecStopPost=\/usr\/bin\/python3 \/var\/lib\/bridgesllm-installer\/dashboard-update-progress\.py finalize-service --operation-id [a-f0-9]{32}$/),
+      expect.stringMatching(/^--setenv=BRIDGESLLM_DASHBOARD_UPDATE_ID=[a-f0-9]{32}$/),
       '/bin/bash',
       'portal.example.com',
       '/opt/bridgesllm/logs/self-update-test.log',
       '4.1.0',
       'domain',
+      '4.0.13',
     ]));
     const script = args[args.indexOf('-c') + 1];
+    expect(spawnSync('/bin/bash', ['-n'], { input: script }).status).toBe(0);
+    expect(script).toContain('set -Eeuo pipefail');
+    expect(script).not.toContain('finish --operation-id');
+    expect(script).toContain('/bin/sync -f "$2" || true');
     expect(script).toContain('https://bridgesllm.ai/releases/$3/install.sh');
+    expect(script).toContain('--connect-timeout 15 --max-time 120');
+    expect(script).toContain('--retry 3 --retry-delay 2 --retry-max-time 300 --retry-all-errors');
+    expect(script).toContain('--max-filesize 2097152 -o "$installer_file"');
+    expect(script).toContain('/usr/bin/mktemp /var/lib/bridgesllm-installer/dashboard-update-installer.XXXXXX');
+    expect(script).not.toContain('| /bin/bash');
+    expect(script).not.toContain('http://127.0.0.1:4001/health');
     expect(script).toContain('--domain "$1"');
     expect(script).toContain('>> "$2" 2>&1');
     expect(script).not.toContain('portal.example.com');
@@ -230,12 +253,14 @@ describe('Portal update backup readiness', () => {
   test('private-origin updates launch plain --update and never inherit a domain argument', async () => {
     for (const originMode of ['tailnet', 'local'] as const) {
       const execFileImpl = jest.fn().mockResolvedValue(undefined);
+      const progressExecFileImpl = progressWriter();
       await launchPortalSelfUpdate({
         originMode,
         domain: 'stale.example.com',
         logFile: '/opt/bridgesllm/logs/self-update-test.log',
+        previousVersion: '4.0.13',
         expectedVersion: '4.1.0',
-      }, { execFileImpl });
+      }, { execFileImpl, progressExecFileImpl });
 
       const [, args] = execFileImpl.mock.calls[0];
       expect(args).toEqual(expect.arrayContaining([originMode]));
@@ -250,12 +275,14 @@ describe('Portal update backup readiness', () => {
 
   test('rejects an unknown origin mode and a domain-mode launch without a domain', async () => {
     const execFileImpl = jest.fn().mockResolvedValue(undefined);
+    const progressExecFileImpl = progressWriter();
     await expect(launchPortalSelfUpdate({
       originMode: 'public' as never,
       domain: 'portal.example.com',
       logFile: '/opt/bridgesllm/logs/self-update-test.log',
+      previousVersion: '4.0.13',
       expectedVersion: '4.1.0',
-    }, { execFileImpl })).rejects.toMatchObject({
+    }, { execFileImpl, progressExecFileImpl })).rejects.toMatchObject({
       statusCode: 500,
       code: 'PORTAL_UPDATE_LAUNCH_FAILED',
     });
@@ -263,8 +290,9 @@ describe('Portal update backup readiness', () => {
       originMode: 'domain',
       domain: '',
       logFile: '/opt/bridgesllm/logs/self-update-test.log',
+      previousVersion: '4.0.13',
       expectedVersion: '4.1.0',
-    }, { execFileImpl })).rejects.toMatchObject({
+    }, { execFileImpl, progressExecFileImpl })).rejects.toMatchObject({
       statusCode: 500,
       code: 'PORTAL_UPDATE_LAUNCH_FAILED',
     });
@@ -275,15 +303,17 @@ describe('Portal update backup readiness', () => {
     let releaseRegistration!: () => void;
     const pendingRegistration = new Promise<void>((resolve) => { releaseRegistration = resolve; });
     const execFileImpl = jest.fn().mockReturnValueOnce(pendingRegistration);
+    const progressExecFileImpl = progressWriter();
     const input = {
       originMode: 'domain' as const,
       domain: 'portal.example.com',
       logFile: '/opt/bridgesllm/logs/self-update-test.log',
+      previousVersion: '4.0.13',
       expectedVersion: '4.1.0',
     };
 
-    const first = launchPortalSelfUpdate(input, { execFileImpl });
-    await expect(launchPortalSelfUpdate(input, { execFileImpl })).rejects.toMatchObject({
+    const first = launchPortalSelfUpdate(input, { execFileImpl, progressExecFileImpl });
+    await expect(launchPortalSelfUpdate(input, { execFileImpl, progressExecFileImpl })).rejects.toMatchObject({
       statusCode: 409,
       code: 'PORTAL_UPDATE_BUSY',
     });
@@ -294,30 +324,202 @@ describe('Portal update backup readiness', () => {
     const duplicateUnit = Object.assign(new Error('registration rejected'), {
       stderr: 'Failed to start transient service unit: Unit bridgesllm-portal-self-update.service already exists.',
     });
+    const duplicateProgressWriter = progressWriter();
+    const duplicateActivityReader = jest.fn(async () => ({
+      activity: 'active' as const,
+      operationId: 'fedcba9876543210fedcba9876543210',
+    }));
     await expect(launchPortalSelfUpdate(input, {
       execFileImpl: jest.fn().mockRejectedValue(duplicateUnit),
+      progressExecFileImpl: duplicateProgressWriter,
+      readUnitIdentityImpl: duplicateActivityReader,
     })).rejects.toMatchObject({
       statusCode: 409,
       code: 'PORTAL_UPDATE_BUSY',
+      operationId: expect.stringMatching(/^[a-f0-9]{32}$/),
       message: expect.not.stringContaining('systemd'),
     });
+    expect(duplicateActivityReader).not.toHaveBeenCalled();
+    expect(duplicateProgressWriter.mock.calls.flatMap((call) => call[1])).toContain('fail-launch');
+  });
+
+  test('fails before systemd when durable operation creation is busy, unresolved, or unavailable', async () => {
+    const input = {
+      originMode: 'domain' as const,
+      domain: 'portal.example.com',
+      logFile: '/opt/bridgesllm/logs/self-update-test.log',
+      previousVersion: '4.0.13',
+      expectedVersion: '4.1.0',
+    };
+    const execFileImpl = jest.fn().mockResolvedValue(undefined);
+    await expect(launchPortalSelfUpdate(input, {
+      execFileImpl,
+      progressExecFileImpl: jest.fn().mockRejectedValue(Object.assign(new Error('busy'), { code: 2 })),
+    })).rejects.toMatchObject({ statusCode: 409, code: 'PORTAL_UPDATE_BUSY' });
+    expect(execFileImpl).not.toHaveBeenCalled();
+
+    await expect(launchPortalSelfUpdate(input, {
+      execFileImpl,
+      progressExecFileImpl: jest.fn().mockRejectedValue(Object.assign(new Error('attention'), { code: 4 })),
+    })).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'PORTAL_UPDATE_ATTENTION_REQUIRED',
+      message: expect.stringContaining('operator attention'),
+    });
+    expect(execFileImpl).not.toHaveBeenCalled();
+
+    await expect(launchPortalSelfUpdate(input, {
+      execFileImpl,
+      progressExecFileImpl: jest.fn().mockRejectedValue(new Error('state unavailable')),
+    })).rejects.toMatchObject({ statusCode: 500, code: 'PORTAL_UPDATE_LAUNCH_FAILED' });
+    expect(execFileImpl).not.toHaveBeenCalled();
   });
 
   test('keeps updater registration failures bounded and does not expose host diagnostics', async () => {
     const diagnostic = Object.assign(new Error('token=secret command trace'), {
       stderr: 'private host traceback',
     });
+    const progressExecFileImpl = progressWriter();
     await expect(launchPortalSelfUpdate({
       originMode: 'domain',
       domain: 'portal.example.com',
       logFile: '/opt/bridgesllm/logs/self-update-test.log',
+      previousVersion: '4.0.13',
       expectedVersion: '4.1.0',
     }, {
       execFileImpl: jest.fn().mockRejectedValue(diagnostic),
+      progressExecFileImpl,
+      readUnitIdentityImpl: async () => ({ activity: 'inactive', operationId: null }),
     })).rejects.toMatchObject({
       statusCode: 500,
       code: 'PORTAL_UPDATE_LAUNCH_FAILED',
       message: 'Portal could not start the signed updater. Check the Portal service log before retrying.',
     });
+    expect(progressExecFileImpl).toHaveBeenCalledWith('/usr/bin/python3', expect.arrayContaining([
+      '/var/lib/bridgesllm-installer/dashboard-update-progress.py',
+      'fail-launch',
+    ]), expect.any(Object));
+  });
+
+  test.each(['active', 'unknown'] as const)(
+    'reattaches to the durable operation when systemd registration is %s after reply loss',
+    async (unitActivity) => {
+      const progressExecFileImpl = progressWriter();
+      const result = await launchPortalSelfUpdate({
+        originMode: 'domain',
+        domain: 'portal.example.com',
+        logFile: '/opt/bridgesllm/logs/self-update-test.log',
+        previousVersion: '4.0.13',
+        expectedVersion: '4.1.0',
+      }, {
+        execFileImpl: jest.fn().mockRejectedValue(new Error('D-Bus reply was lost')),
+        progressExecFileImpl,
+        readUnitIdentityImpl: async () => {
+          const createArgs = progressExecFileImpl.mock.calls[0][1] as string[];
+          const operationId = createArgs[createArgs.indexOf('--operation-id') + 1];
+          return {
+            activity: unitActivity,
+            operationId: unitActivity === 'active' ? operationId : null,
+          };
+        },
+      });
+
+      expect(result.operationId).toMatch(/^[a-f0-9]{32}$/);
+      expect(progressExecFileImpl).toHaveBeenCalledTimes(1);
+      expect(progressExecFileImpl.mock.calls[0][1]).toContain('create');
+      expect(progressExecFileImpl.mock.calls.flatMap((call) => call[1])).not.toContain('fail-launch');
+    },
+  );
+
+  test('does not attach a lost registration reply to a foreign fixed-unit operation', async () => {
+    const progressExecFileImpl = progressWriter();
+    await expect(launchPortalSelfUpdate({
+      originMode: 'domain',
+      domain: 'portal.example.com',
+      logFile: '/opt/bridgesllm/logs/self-update-test.log',
+      previousVersion: '4.0.13',
+      expectedVersion: '4.1.0',
+    }, {
+      execFileImpl: jest.fn().mockRejectedValue(new Error('ambiguous D-Bus timeout')),
+      progressExecFileImpl,
+      readUnitIdentityImpl: async () => ({
+        activity: 'active',
+        operationId: 'fedcba9876543210fedcba9876543210',
+      }),
+    })).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'PORTAL_UPDATE_BUSY',
+      operationId: expect.stringMatching(/^[a-f0-9]{32}$/),
+    });
+    expect(progressExecFileImpl.mock.calls.flatMap((call) => call[1])).toContain('fail-launch');
+  });
+
+  test('reattaches when an accepted unit progresses before the lost reply is queried', async () => {
+    const progressExecFileImpl = jest.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('receipt already progressed'));
+    const result = await launchPortalSelfUpdate({
+      originMode: 'domain',
+      domain: 'portal.example.com',
+      logFile: '/opt/bridgesllm/logs/self-update-test.log',
+      previousVersion: '4.0.13',
+      expectedVersion: '4.1.0',
+    }, {
+      execFileImpl: jest.fn().mockRejectedValue(new Error('D-Bus reply was lost')),
+      progressExecFileImpl,
+      readUnitIdentityImpl: async () => ({ activity: 'inactive', operationId: null }),
+      readProgressImpl: async (operationId) => ({ operationId, status: 'running' }),
+    });
+
+    expect(result.operationId).toMatch(/^[a-f0-9]{32}$/);
+    expect(progressExecFileImpl.mock.calls.flatMap((call) => call[1])).toContain('fail-launch');
+  });
+
+  test('closes and returns an exact admission fsynced before a create-helper timeout', async () => {
+    const progressExecFileImpl = jest.fn()
+      .mockRejectedValueOnce(new Error('helper IPC timeout'))
+      .mockResolvedValueOnce(undefined);
+    const execFileImpl = jest.fn().mockResolvedValue(undefined);
+    const result = await launchPortalSelfUpdate({
+      originMode: 'domain',
+      domain: 'portal.example.com',
+      logFile: '/opt/bridgesllm/logs/self-update-test.log',
+      previousVersion: '4.0.13',
+      expectedVersion: '4.1.0',
+    }, {
+      execFileImpl,
+      progressExecFileImpl,
+      readProgressImpl: async (operationId) => ({ operationId, status: 'starting' }),
+    });
+
+    expect(result.operationId).toMatch(/^[a-f0-9]{32}$/);
+    expect(execFileImpl).not.toHaveBeenCalled();
+    expect(progressExecFileImpl).toHaveBeenCalledTimes(2);
+    expect(progressExecFileImpl.mock.calls[1][1]).toEqual(expect.arrayContaining([
+      'fail-launch', '--operation-id', result.operationId,
+    ]));
+  });
+
+  test('reattaches when fail-launch fsyncs its receipt before losing the helper reply', async () => {
+    const progressExecFileImpl = jest.fn()
+      .mockRejectedValueOnce(new Error('create helper IPC timeout'))
+      .mockRejectedValueOnce(new Error('fail-launch helper IPC timeout'));
+    let progressRead = 0;
+    const result = await launchPortalSelfUpdate({
+      originMode: 'domain',
+      domain: 'portal.example.com',
+      logFile: '/opt/bridgesllm/logs/self-update-test.log',
+      previousVersion: '4.0.13',
+      expectedVersion: '4.1.0',
+    }, {
+      execFileImpl: jest.fn().mockResolvedValue(undefined),
+      progressExecFileImpl,
+      readProgressImpl: async (operationId) => ({
+        operationId,
+        status: progressRead++ === 0 ? 'starting' : 'failed',
+      }),
+    });
+    expect(result.operationId).toMatch(/^[a-f0-9]{32}$/);
+    expect(progressRead).toBe(2);
   });
 });

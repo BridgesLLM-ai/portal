@@ -16,6 +16,7 @@ import {
   releaseRouteOperation,
 } from './RouteOperationContext';
 import { clearWorkspaceClientState } from '../utils/clearWorkspaceClientState';
+import { StaleWorkspaceAuthorizationResponseError } from '../utils/workspaceAuthorization';
 
 const DEBUG_AUTH = import.meta.env.DEV;
 const debugLog = (...args: unknown[]) => {
@@ -23,6 +24,16 @@ const debugLog = (...args: unknown[]) => {
 };
 
 let logoutOperationSequence = 0;
+let sessionRestoreGeneration = 0;
+let sessionRestoreInFlight: Promise<boolean> | null = null;
+
+function invalidateSessionRestoreAttempts(): void {
+  sessionRestoreGeneration += 1;
+  // The request itself may still settle, but its generation fence prevents it
+  // from mutating auth. Clearing the pointer lets a later legitimate session
+  // establish its own single shared validation request.
+  sessionRestoreInFlight = null;
+}
 
 /** Zustand persist key; also cleared explicitly when abandoning a session. */
 const AUTH_PERSIST_KEY = 'bridgesllm-auth';
@@ -65,6 +76,8 @@ interface AuthState {
   lastSessionRestoreAt: number | null;
   /** True when cached auth exists but the server could not validate it. */
   sessionRestoreError: boolean;
+  /** True only when the failed validation is safe to retry automatically. */
+  sessionRestoreRetryable: boolean;
 
   signup: (email: string, username: string, password: string) => Promise<{ pending?: boolean; message?: string }>;
   login: (email: string, password: string) => Promise<{ requiresTwoFactor?: boolean }>;
@@ -119,6 +132,7 @@ export const useAuthStore = create<AuthState>()(
       twoFactorEmailDelivery: null,
       lastSessionRestoreAt: null,
       sessionRestoreError: false,
+      sessionRestoreRetryable: false,
 
       signup: async (email, username, password) => {
         set({ isLoading: true, error: null });
@@ -136,7 +150,8 @@ export const useAuthStore = create<AuthState>()(
 
           if ('user' in response) {
             const { user } = response;
-            set({ user, isAuthenticated: true, isLoading: false, lastSessionRestoreAt: Date.now(), sessionRestoreError: false });
+            invalidateSessionRestoreAttempts();
+            set({ user, isAuthenticated: true, isLoading: false, lastSessionRestoreAt: Date.now(), sessionRestoreError: false, sessionRestoreRetryable: false });
             startSessionHeartbeat();
             return {};
           }
@@ -185,6 +200,7 @@ export const useAuthStore = create<AuthState>()(
 
           // Normal login (no 2FA)
           const { user } = response;
+          invalidateSessionRestoreAttempts();
           set({
             user,
             isAuthenticated: true,
@@ -195,6 +211,7 @@ export const useAuthStore = create<AuthState>()(
             twoFactorEmailDelivery: null,
             lastSessionRestoreAt: Date.now(),
             sessionRestoreError: false,
+            sessionRestoreRetryable: false,
           });
           startSessionHeartbeat();
           return {};
@@ -215,6 +232,7 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true, error: null });
         try {
           const { user } = await authAPI.twoFactorValidate(twoFactorPendingToken, token);
+          invalidateSessionRestoreAttempts();
           set({
             user,
             isAuthenticated: true,
@@ -225,6 +243,7 @@ export const useAuthStore = create<AuthState>()(
             twoFactorEmailDelivery: null,
             lastSessionRestoreAt: Date.now(),
             sessionRestoreError: false,
+            sessionRestoreRetryable: false,
           });
           startSessionHeartbeat();
         } catch (error: any) {
@@ -252,6 +271,7 @@ export const useAuthStore = create<AuthState>()(
           // not issue a replacement. Mirror that boundary locally before the
           // fresh sign-in screen is shown.
           stopSessionHeartbeat();
+          invalidateSessionRestoreAttempts();
           clearAuthStorage();
           clearWorkspaceClientState();
           set({
@@ -265,6 +285,7 @@ export const useAuthStore = create<AuthState>()(
             twoFactorEmailDelivery: null,
             lastSessionRestoreAt: null,
             sessionRestoreError: false,
+            sessionRestoreRetryable: false,
           });
           return response;
         } catch (error: any) {
@@ -278,6 +299,7 @@ export const useAuthStore = create<AuthState>()(
             // reconciliation: it shows either a normal login (committed) or a
             // new pending Email Code challenge (not committed).
             stopSessionHeartbeat();
+            invalidateSessionRestoreAttempts();
             clearAuthStorage();
             clearWorkspaceClientState();
             set({
@@ -291,6 +313,7 @@ export const useAuthStore = create<AuthState>()(
               twoFactorEmailDelivery: null,
               lastSessionRestoreAt: null,
               sessionRestoreError: false,
+              sessionRestoreRetryable: false,
             });
             throw error instanceof TwoFactorEmailRecoveryIndeterminateError
               ? error
@@ -322,6 +345,7 @@ export const useAuthStore = create<AuthState>()(
         // an owned operation rejects Logout, and an admitted Logout rejects a
         // mutation before either request can reach the server.
         if (!claimRouteOperation(owner)) return;
+        invalidateSessionRestoreAttempts();
         stopSessionHeartbeat();
         try {
           await authAPI.logout();
@@ -333,7 +357,7 @@ export const useAuthStore = create<AuthState>()(
           if (isRouteOperationOwner(owner)) {
             clearAuthStorage();
             clearWorkspaceClientState();
-            set({ user: null, isAuthenticated: false, error: null, twoFactorPending: false, twoFactorPendingToken: null, twoFactorMethod: null, twoFactorEmailDelivery: null, lastSessionRestoreAt: null, sessionRestoreError: false });
+            set({ user: null, isAuthenticated: false, error: null, twoFactorPending: false, twoFactorPendingToken: null, twoFactorMethod: null, twoFactorEmailDelivery: null, lastSessionRestoreAt: null, sessionRestoreError: false, sessionRestoreRetryable: false });
             releaseRouteOperation(owner);
           }
         }
@@ -342,13 +366,15 @@ export const useAuthStore = create<AuthState>()(
       silentLogout: () => {
         // Clear auth state without calling the backend logout endpoint.
         // Used when the token is already invalid (e.g., refresh failed) to prevent cascading 401 errors.
+        invalidateSessionRestoreAttempts();
         stopSessionHeartbeat();
         clearAuthStorage();
         clearWorkspaceClientState();
-        set({ user: null, isAuthenticated: false, error: null, twoFactorPending: false, twoFactorPendingToken: null, twoFactorMethod: null, twoFactorEmailDelivery: null, lastSessionRestoreAt: null, sessionRestoreError: false });
+        set({ user: null, isAuthenticated: false, error: null, twoFactorPending: false, twoFactorPendingToken: null, twoFactorMethod: null, twoFactorEmailDelivery: null, lastSessionRestoreAt: null, sessionRestoreError: false, sessionRestoreRetryable: false });
       },
 
       abandonQuarantinedSession: async () => {
+        invalidateSessionRestoreAttempts();
         stopSessionHeartbeat();
         // Best effort, and strictly bounded: clearing the httpOnly cookie is
         // worth attempting, but the user is already stranded and must not be
@@ -377,46 +403,63 @@ export const useAuthStore = create<AuthState>()(
           twoFactorEmailDelivery: null,
           lastSessionRestoreAt: null,
           sessionRestoreError: false,
+          sessionRestoreRetryable: false,
         });
       },
 
       clearError: () => set({ error: null }),
 
-      restoreSession: async () => {
-        set({ isLoading: true, sessionRestoreError: false });
-        try {
-          // Try /auth/me — works with either localStorage token (Authorization header)
-          // or httpOnly cookie (sent automatically with withCredentials: true).
-          // This handles both normal login (localStorage) and setup wizard (cookie-only).
-          const user = await authAPI.me({ allowSessionRecovery: true });
-          set({ isAuthenticated: true, user, isLoading: false, lastSessionRestoreAt: Date.now(), sessionRestoreError: false });
-          startSessionHeartbeat();
-          return true;
-        } catch (error: any) {
-          // Only clear auth on definitive auth failures (401/403)
-          // Don't clear on network errors — session might still be valid
-          const status = error.response?.status;
-          if (status === 401 || status === 403) {
-            debugLog('[Auth] Session restore failed with', status, '— clearing auth');
-            clearAuthStorage();
-            clearWorkspaceClientState();
-            set({ isAuthenticated: false, user: null, isLoading: false, lastSessionRestoreAt: null, sessionRestoreError: false });
-          } else {
-            // A persisted Zustand snapshot is not proof that the server-side
-            // session is still valid. Preserve it only so a successful retry
-            // can resume cleanly; App blocks the authenticated shell while
-            // sessionRestoreError is true.
-            const currentState = get();
-            if (currentState.user && currentState.isAuthenticated) {
-              debugLog('[Auth] Session restore unavailable — cached auth remains quarantined until retry');
-              stopSessionHeartbeat();
-              set({ isLoading: false, sessionRestoreError: true });
-              return false;
+      restoreSession: () => {
+        if (sessionRestoreInFlight) return sessionRestoreInFlight;
+        const generation = ++sessionRestoreGeneration;
+        const attempt = (async (): Promise<boolean> => {
+          // Preserve an existing quarantine until the server actually validates
+          // the session. Clearing it here would briefly expose the authenticated
+          // shell from cached state during an automatic reconnect attempt.
+          set({ isLoading: true });
+          try {
+            // Try /auth/me — works with either localStorage token (Authorization header)
+            // or httpOnly cookie (sent automatically with withCredentials: true).
+            // This handles both normal login (localStorage) and setup wizard (cookie-only).
+            const user = await authAPI.me({ allowSessionRecovery: true });
+            if (generation !== sessionRestoreGeneration) return false;
+            set({ isAuthenticated: true, user, isLoading: false, lastSessionRestoreAt: Date.now(), sessionRestoreError: false, sessionRestoreRetryable: false });
+            startSessionHeartbeat();
+            return true;
+          } catch (error: any) {
+            if (generation !== sessionRestoreGeneration) return false;
+            // Only clear auth on definitive auth failures (401/403)
+            // Don't clear on network errors — session might still be valid
+            const status = error.response?.status;
+            if (status === 401 || status === 403) {
+              debugLog('[Auth] Session restore failed with', status, '— clearing auth');
+              clearAuthStorage();
+              clearWorkspaceClientState();
+              set({ isAuthenticated: false, user: null, isLoading: false, lastSessionRestoreAt: null, sessionRestoreError: false, sessionRestoreRetryable: false });
+            } else {
+              // A persisted Zustand snapshot is not proof that the server-side
+              // session is still valid. Preserve it only so a successful retry
+              // can resume cleanly; App blocks the authenticated shell while
+              // sessionRestoreError is true.
+              const currentState = get();
+              if (currentState.user && currentState.isAuthenticated) {
+                const retryable = !(error instanceof StaleWorkspaceAuthorizationResponseError)
+                  && (status === undefined || status === 408 || status === 429 || status >= 500);
+                debugLog('[Auth] Session restore unavailable — cached auth remains quarantined until retry');
+                stopSessionHeartbeat();
+                set({ isLoading: false, sessionRestoreError: true, sessionRestoreRetryable: retryable });
+                return false;
+              }
+              set({ isAuthenticated: false, user: null, isLoading: false, sessionRestoreError: false, sessionRestoreRetryable: false });
             }
-            set({ isAuthenticated: false, user: null, isLoading: false, sessionRestoreError: false });
+            return false;
           }
-          return false;
-        }
+        })();
+        sessionRestoreInFlight = attempt;
+        void attempt.finally(() => {
+          if (sessionRestoreInFlight === attempt) sessionRestoreInFlight = null;
+        });
+        return attempt;
       },
 
       refreshSession: async () => {
